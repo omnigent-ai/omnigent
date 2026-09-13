@@ -27,6 +27,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 _OLD_CREATED_AT = 1_700_000_000
 _RECONNECT_BANNER = "Agent disconnected — click to reconnect"
 _OFFLINE_PLACEHOLDER = "Session offline — reconnect below to continue"
@@ -47,7 +49,7 @@ def _force_runner_offline(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         # Age the session out of the startup grace so the runner-down signal is
         # not masked as a cold boot.
@@ -63,7 +65,7 @@ def _force_runner_offline(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         offline = {"runner_online": False, "host_online": None}
         if isinstance(payload.get("sessions"), dict):

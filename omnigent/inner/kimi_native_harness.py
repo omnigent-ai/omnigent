@@ -8,12 +8,12 @@ resolves ``"kimi-native"`` to this module via
 Wraps a :class:`omnigent.inner.kimi_native_executor.KimiNativeExecutor`,
 which injects web-UI messages into the running ``kimi`` TUI (launched by
 ``omnigent kimi`` in the session terminal) via tmux. The bridge dir is read
-from :data:`~omnigent.kimi_native_bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
+from :data:`~omnigent.harnesses.kimi_native.bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
 
 Tool policies: kimi-native enforces Omnigent's tool deny-policy via a
 ``PreToolUse`` hook (registered in the per-session ``config.toml`` built by
-:mod:`omnigent.kimi_native_credentials`, dispatched to
-:mod:`omnigent.kimi_native_hook`). A ``POLICY_ACTION_DENY`` verdict blocks the
+:mod:`omnigent.harnesses.kimi_native.credentials`, dispatched to
+:mod:`omnigent.harnesses.kimi_native.hook`). A ``POLICY_ACTION_DENY`` verdict blocks the
 tool with the policy reason; everything else is "no opinion", so ``kimi``'s own
 in-TUI approval prompt still runs — the deployment's deny-gate and the user's
 own consent are kept as two independent gates. A companion ``PermissionRequest``

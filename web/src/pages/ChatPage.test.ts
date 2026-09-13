@@ -39,9 +39,12 @@ import {
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
+  modelPickerKindForConv,
+  unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
@@ -848,7 +851,7 @@ describe("computeShowsWorking", () => {
 
   it("parent idle stays idle in the main chat", () => {
     // Busy children are surfaced by the sidebar/Agents rail, not by the
-    // main chat's shimmer or pinned "Working…" pill.
+    // main chat's "Working…" shimmer.
     expect(computeShowsWorking("idle", opts())).toBe(false);
   });
 
@@ -1020,75 +1023,77 @@ describe("shouldShowWorkingIndicator", () => {
 
 describe("workingIndicatorLabel — parked on a dialog", () => {
   it("names what the agent is waiting on", () => {
-    expect(workingIndicatorLabel(0, 0, "permission prompt")).toBe("Blocked on: permission prompt");
+    expect(workingIndicatorLabel(0, "permission prompt")).toBe("Blocked on: permission prompt");
   });
 
-  it("outranks the background tally and the rotation", () => {
+  it("outranks the rotation", () => {
     // Being blocked on the user is the one state that needs an action, and the
     // dialog may exist only in the terminal tab — so it must not be buried
-    // under a rotating "Cooking…" or a background-shell count.
-    expect(workingIndicatorLabel(3, 2, "dialog open")).toBe("Blocked on: dialog open");
+    // under a rotating "Cooking…".
+    const label = workingIndicatorLabel(2, "dialog open");
+    expect(WORKING_MESSAGES).not.toContain(label);
+  });
+
+  it("points the user at the terminal for a dialog open", () => {
+    // "dialog open" means the agent is waiting on a dialog that lives only in
+    // the terminal tab. A bare "Blocked on: dialog open" leaves the user with
+    // no idea where to respond, so the label must guide them to the terminal.
+    expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
   });
 
   it("falls back to the normal label when not parked", () => {
-    expect(workingIndicatorLabel(0, 0, null)).toBe("Working…");
-    expect(workingIndicatorLabel(1, 0, null)).toBe("1 background task still running");
+    expect(workingIndicatorLabel(0, null)).toBe("Working…");
   });
 });
 
 describe("workingIndicatorLabel", () => {
-  it("shows the plain Working label when no background tasks remain", () => {
+  it("shows the plain Working label at the first tick", () => {
     expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
-  it("treats a negative count as no background tasks", () => {
-    // Defensive: the store seeds 0, but a stale/negative tally must never
-    // produce a nonsensical "-1 background tasks" label.
-    expect(workingIndicatorLabel(-1)).toBe("Working…");
-  });
-
-  it("uses the singular noun for exactly one background task", () => {
-    expect(workingIndicatorLabel(1)).toBe("1 background task still running");
-  });
-
-  it("pluralizes the noun for more than one background task", () => {
-    expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
+  it("does not report background tasks — the pill owns that count", () => {
+    // The shimmer is the working indicator; the background-task tally lives in
+    // BackgroundTaskPill, so the label never mentions it regardless of tick.
+    expect(workingIndicatorLabel(0)).toBe("Working…");
+    expect(workingIndicatorLabel(5)).toBe(WORKING_MESSAGES[5 % WORKING_MESSAGES.length]);
   });
 
   it("pins the first rotation message to 'Working…'", () => {
     // A fresh tick and the default arg both land on index 0, so this label
-    // must stay "Working…" — the invariant the (0) / (-1) cases rely on.
+    // must stay "Working…".
     expect(WORKING_MESSAGES[0]).toBe("Working…");
-    expect(workingIndicatorLabel(0, 0)).toBe("Working…");
+    expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
   it("rotates through the message pool by tick", () => {
-    expect(workingIndicatorLabel(0, 1)).toBe(WORKING_MESSAGES[1]);
-    expect(workingIndicatorLabel(0, 2)).toBe(WORKING_MESSAGES[2]);
+    expect(workingIndicatorLabel(1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(2)).toBe(WORKING_MESSAGES[2]);
   });
 
   it("wraps the rotation modulo the pool length", () => {
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length)).toBe("Working…");
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
-  });
-
-  it("ignores the tick while background tasks remain", () => {
-    // The count is information, not decoration — it must not rotate away.
-    expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length)).toBe("Working…");
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
   });
 });
 
 // ── isBackgroundTasksOnly ───────────────────────────────────────────────────
 
 describe("isBackgroundTasksOnly", () => {
-  it("is true only when background tasks remain and nothing is blocked", () => {
-    expect(isBackgroundTasksOnly(2, null)).toBe(true);
-    expect(isBackgroundTasksOnly(0, null)).toBe(false);
+  it("is true only once the turn ends with background tasks and nothing blocked", () => {
+    // Turn over (not working) + shells linger → the pill owns the state.
+    expect(isBackgroundTasksOnly(2, null, false)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null, false)).toBe(false);
+  });
+
+  it("yields while the turn is still active so the shimmer shows too", () => {
+    // running/waiting or a local send in flight: the agent's turn is live, so
+    // the "Working…" shimmer wins and the pill sits alongside it.
+    expect(isBackgroundTasksOnly(2, null, true)).toBe(false);
   });
 
   it("yields to a parked dialog so the shimmer still shouts", () => {
     // blockedOn needs an action; it must never sit as a quiet pill.
-    expect(isBackgroundTasksOnly(2, "permission prompt")).toBe(false);
+    expect(isBackgroundTasksOnly(2, "permission prompt", false)).toBe(false);
   });
 });
 
@@ -1145,6 +1150,37 @@ describe("subAgentComposerLabel", () => {
   it("falls back to a generic label when every name field is null", () => {
     // Degenerate snapshot — the tray still needs something to render.
     expect(subAgentComposerLabel(mkSession())).toBe("sub-agent");
+  });
+
+  it("prefers the Task description for a Claude Code sub-agent", () => {
+    // Its title's suffix is an opaque hex id, so the title-split rule
+    // would put "a09d1dd1d8dbc0151" in the tray.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "general-purpose:a09d1dd1d8dbc0151",
+          subAgentName: "general-purpose",
+          labels: {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "wave-worker-696",
+          },
+        }),
+      ),
+    ).toBe("wave-worker-696");
+  });
+
+  it("uses the bare agent name for a description-less namespaced Claude sub-agent", () => {
+    // "rpw-published:debug-lead" carries its own colon, so splitting the
+    // title on the first one left the id half showing.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "rpw-published:debug-lead:a361e6a6aa05689cb",
+          subAgentName: "rpw-published:debug-lead",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ),
+    ).toBe("debug-lead");
   });
 });
 
@@ -1262,9 +1298,22 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    expect(Object.keys(map)).toEqual(Object.keys(BUILTIN_SLASH_COMMANDS));
+    // /btw is gated off by default (claude-native only), so it's excluded here.
+    expect(Object.keys(map)).toEqual(
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+    );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /btw only when showBtw is true (claude-native)", () => {
+    // Off by default and when explicitly false.
+    expect(buildSlashCommandMap([], true, true)["/btw"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false)["/btw"]).toBeUndefined();
+    // On when the session is claude-native.
+    expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/btw"],
+    );
   });
 
   it("omits /effort when effort controls are hidden", () => {
@@ -1314,9 +1363,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills.
+    // surfaces built-ins above user skills. /btw is gated off by default.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
       "/triage-issues",
       "/mlflow-bug",
     ]);
@@ -1640,12 +1689,46 @@ describe("isUnboundCodingFork", () => {
   });
 });
 
+describe("unboundSessionResumableInApp", () => {
+  const owner = { unbound: true, isOwner: true, importSource: null };
+
+  it("is false unless the session is unbound", () => {
+    expect(unboundSessionResumableInApp({ ...owner, unbound: false })).toBe(false);
+  });
+
+  it("is false for a non-owner (launch_runner would 404)", () => {
+    // Regression: a shared viewer must not get a picker that always fails.
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false })).toBe(false);
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false, importSource: "claude" })).toBe(
+      false,
+    );
+  });
+
+  it("allows a non-import unbound session (e.g. an unbound fork)", () => {
+    expect(unboundSessionResumableInApp(owner)).toBe(true);
+  });
+
+  it("allows host-portable import sources", () => {
+    for (const src of ["claude", "codex", "pi", "opencode"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(true);
+    }
+  });
+
+  it("blocks imports whose context does not carry to a chosen host", () => {
+    // kimi has no resume path; kiro/qwen resume only from a local file on the
+    // original machine — a chosen host would launch with no context.
+    for (const src of ["kimi", "kiro", "qwen"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
+    }
+  });
+});
+
 // The routing gates the ChatPage call site uses. The deployment flag is half of
 // each gate: a session-shape-eligible session on a server WITHOUT a routing
 // client must show no routing control at all, and neither must one while the
 // `/v1/info` probe is still in flight.
 describe("routing eligibility gates", () => {
-  function info(smartRouting: boolean): ServerInfo {
+  function info(smartRouting: boolean, sources?: { external: boolean; oss: boolean }): ServerInfo {
     return {
       accounts_enabled: false,
       single_user: false,
@@ -1654,11 +1737,12 @@ describe("routing eligibility gates", () => {
       databricks_features: false,
       managed_sandboxes_enabled: false,
       sandbox_provider: null,
+      enabled_connections: [],
       sharing_mode: "on",
       public_sharing_enabled: true,
       server_version: null,
       smart_routing_enabled: smartRouting,
-      smart_routing_sources: { external: smartRouting, oss: smartRouting },
+      smart_routing_sources: sources ?? { external: smartRouting, oss: smartRouting },
       features: {},
       harness_install_enabled: false,
       installable_harnesses: [],
@@ -1696,9 +1780,73 @@ describe("routing eligibility gates", () => {
     expect(isSubagentRoutingEligible("loading", nativeSession)).toBe(false);
   });
 
-  it("a native terminal session is excluded from cost routing but not subagent routing", () => {
-    expect(isCostRoutingEligible(info(true), nativeSession)).toBe(false);
+  it("a native pane follows the per-family router sources for cost routing", () => {
+    // The judge answers for any family, gateway-backed or not.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), nativeSession)).toBe(
+      true,
+    );
+    // External-only: the family must be gateway-backed on the session's host.
+    const externalOnly = info(true, { external: true, oss: false });
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": false },
+      }),
+    ).toBe(false);
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": true },
+      }),
+    ).toBe(true);
+    // An absent host row reads as backed (older host / no row), like the
+    // landing's gate.
+    expect(isCostRoutingEligible(externalOnly, nativeSession)).toBe(true);
+    // No router at all: the option is withheld.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: false }), nativeSession)).toBe(
+      false,
+    );
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
+  });
+
+  it("evaluates an optimistic (temp) seeded session by the same rules, harness-only", () => {
+    // The in-session temp composer builds this shape from the create seed:
+    // a bound-agent name + the create harness, with NO wrapper labels. Native
+    // detection falls back to the harness, so it is eligible under the judge.
+    const seededNative = {
+      agentName: "coder",
+      parentSessionId: null,
+      harness: "claude-native",
+    } as unknown as Session;
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), seededNative)).toBe(
+      true,
+    );
+    // A seed with no bound agent is NOT eligible — the guard is never bypassed
+    // just because the conversation is a fresh temp id.
+    const seededNoAgent = { ...seededNative, agentName: null } as unknown as Session;
+    expect(isCostRoutingEligible(info(true), seededNoAgent)).toBe(false);
+  });
+
+  it("derives the temp-session native model-picker kind from the seeded native harness (#7039 P1)", () => {
+    // The temp capabilitySource has no server session and no sidebar wrapper
+    // identity, so it derives the wrapper label from the SEEDED native harness
+    // (the create identity). Without this the native model/effort/permission
+    // controls fail closed on the optimistic route. Mirrors the ChatPage
+    // derivation: nativeCodingAgentForHarness(seededHarness).wrapperLabel →
+    // modelPickerKindForConv.
+    for (const [harness, kind] of [
+      ["codex-native", "codex"],
+      ["claude-native", "claude"],
+    ] as const) {
+      const native = nativeCodingAgentForHarness(harness);
+      expect(native).toBeDefined();
+      const capabilitySource = {
+        labels: { [WRAPPER_LABEL_KEY]: native!.wrapperLabel },
+        harness,
+      };
+      expect(modelPickerKindForConv(capabilitySource)).toBe(kind);
+    }
+    // A bundle/SDK harness has no native picker — controls correctly stay hidden
+    // (the seed's pickedHarness fallback for a non-native agent).
+    expect(modelPickerKindForConv({ labels: {}, harness: "claude-sdk" })).toBeNull();
   });
 
   it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {

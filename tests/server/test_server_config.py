@@ -28,6 +28,7 @@ from omnigent.server.server_config import (
     load_branding_snapshot,
     load_server_config,
     resolve_config_path,
+    session_title_instructions,
 )
 
 
@@ -205,6 +206,23 @@ def test_config_str_list_none_is_empty() -> None:
 
 def test_config_str_list_strips_and_drops_empty() -> None:
     assert config_str_list(["  a@x.com  ", "", "  "]) == ["a@x.com"]
+
+
+def test_session_title_instructions_accepts_trimmed_string() -> None:
+    assert (
+        session_title_instructions(
+            {"session_title_instructions": "  Prefix titles with the current date.  "}
+        )
+        == "Prefix titles with the current date."
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "   ", ["not", "a", "string"], "x" * 4_001],
+)
+def test_session_title_instructions_ignores_unset_or_invalid_values(value: object) -> None:
+    assert session_title_instructions({"session_title_instructions": value}) is None
 
 
 def _write_branding_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, logo: str) -> Path:

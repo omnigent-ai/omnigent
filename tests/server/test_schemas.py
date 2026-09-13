@@ -28,6 +28,7 @@ from omnigent.server.schemas import (
     ElicitationRequestEvent,
     ElicitationRequestParams,
     FailedEvent,
+    FailedResponseObject,
     HeartbeatEvent,
     IncompleteEvent,
     InProgressEvent,
@@ -249,10 +250,10 @@ def test_response_envelope_event_carries_real_response_object(
     without a second parse step.
     """
     response = sample_response_object.model_copy(update={"status": status_value})
-    event = event_class(type=type_literal, response=response)
+    event = event_class(type=type_literal, response=response.model_dump())
     # response field must be a real ResponseObject, not a dict — so
     # downstream consumers see typed field access.
-    assert isinstance(event.response, ResponseObject)
+    assert isinstance(event.response, (ResponseObject, FailedResponseObject))
     assert event.response.status == status_value
     # model_dump produces the canonical wire shape with response nested.
     dumped = event.model_dump(exclude_none=True)
@@ -371,9 +372,78 @@ def test_response_stream_event_dispatches_envelope_events(
     )
     # response field round-trips back to a ResponseObject — proves
     # the union didn't downgrade it to a dict.
-    assert isinstance(parsed.response, ResponseObject)
+    assert isinstance(parsed.response, (ResponseObject, FailedResponseObject))
     assert parsed.response.id == "resp_abc123"
     assert parsed.response.status == status_value
+
+
+def test_response_failed_accepts_preallocation_failure_payload() -> None:
+    """Transport failures may occur before response metadata is allocated."""
+    adapter: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
+
+    parsed = adapter.validate_python(
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": "connection_error",
+                    "message": "Harness stream connection error",
+                    "type": "RemoteProtocolError",
+                },
+            },
+        }
+    )
+
+    assert isinstance(parsed, FailedEvent)
+    assert type(parsed.response) is FailedResponseObject
+    assert parsed.response.id is None
+    assert parsed.response.model is None
+    assert parsed.response.created_at is None
+    assert parsed.response.error is not None
+    assert parsed.response.error.code == "connection_error"
+    assert "id" not in parsed.response.model_dump()
+    assert "model" not in parsed.response.model_dump()
+    assert "created_at" not in parsed.response.model_dump()
+
+
+def test_response_failed_accepts_allocated_response_model() -> None:
+    """Harnesses may construct a failed event from a strict response model."""
+    response = ResponseObject(
+        id="resp_abc123",
+        status="failed",
+        model="test-agent",
+        created_at=1,
+        error={"code": "model_not_found", "message": "model not found"},
+    )
+
+    event = FailedEvent(type="response.failed", response=response)
+
+    assert event.response is response
+
+
+@pytest.mark.parametrize(
+    "event_type,status",
+    [
+        ("response.created", "queued"),
+        ("response.queued", "queued"),
+        ("response.in_progress", "in_progress"),
+        ("response.completed", "completed"),
+        ("response.cancelled", "cancelled"),
+        ("response.incomplete", "incomplete"),
+    ],
+)
+def test_nonfailed_response_events_reject_missing_metadata(event_type: str, status: str) -> None:
+    """Only pre-allocation failure events may omit response metadata."""
+    adapter: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {
+                "type": event_type,
+                "response": {"status": status},
+            }
+        )
 
 
 def test_response_stream_event_rejects_unknown_type() -> None:
@@ -609,6 +679,44 @@ def test_session_create_git_requires_host_id() -> None:
         )
 
 
+def test_session_title_request_limits() -> None:
+    """User titles allow 200 characters, while default generated titles allow 100."""
+    from omnigent.entities import (
+        DEFAULT_GENERATED_TITLE_MAX_CHARS,
+        USER_SESSION_TITLE_MAX_CHARS,
+    )
+    from omnigent.server.schemas import (
+        AutomaticSessionRenameRequest,
+        SessionCreateMetadata,
+        SessionCreateRequest,
+        SessionForkRequest,
+        UpdateSessionRequest,
+    )
+
+    user_title = "x" * USER_SESSION_TITLE_MAX_CHARS
+    user_requests = (
+        SessionCreateRequest(agent_id="ag_x", title=user_title),
+        SessionCreateMetadata(title=user_title),
+        SessionForkRequest(title=user_title),
+        UpdateSessionRequest(title=user_title),
+    )
+    assert all(request.title == user_title for request in user_requests)
+
+    for request_type, kwargs in (
+        (SessionCreateRequest, {"agent_id": "ag_x"}),
+        (SessionCreateMetadata, {}),
+        (SessionForkRequest, {}),
+        (UpdateSessionRequest, {}),
+    ):
+        with pytest.raises(ValidationError, match="at most 200 characters"):
+            request_type(title=user_title + "x", **kwargs)
+
+    generated_title = "x" * DEFAULT_GENERATED_TITLE_MAX_CHARS
+    assert AutomaticSessionRenameRequest(title=generated_title).title == generated_title
+    with pytest.raises(ValidationError, match="at most 100 characters"):
+        AutomaticSessionRenameRequest(title=generated_title + "x")
+
+
 def test_session_create_git_with_host_id_ok() -> None:
     """``git`` with ``host_id`` validates cleanly."""
     from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
@@ -652,6 +760,43 @@ def test_session_git_existing_worktree_rejects_base_branch() -> None:
         ValidationError, match="base_branch cannot be set when existing_worktree is true"
     ):
         SessionGitOptions(branch_name="feature/x", base_branch="main", existing_worktree=True)
+
+
+def test_session_git_existing_branch_rejects_base_branch() -> None:
+    """Recreate mode + ``base_branch`` is contradictory and rejected (422).
+
+    An existing branch has no base to fork; sending both would be an
+    ambiguous request.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="base_branch cannot be set when existing_branch is true"
+    ):
+        SessionGitOptions(branch_name="fix-1", base_branch="main", existing_branch=True)
+
+
+def test_session_git_existing_branch_rejects_existing_worktree() -> None:
+    """``existing_branch`` and ``existing_worktree`` are distinct modes (422).
+
+    Bind mode reuses a directory that exists; recreate mode makes a new
+    directory for a branch that exists — both at once is contradictory.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="existing_branch and existing_worktree cannot both be true"
+    ):
+        SessionGitOptions(branch_name="fix-1", existing_branch=True, existing_worktree=True)
+
+
+def test_session_git_existing_branch_ok() -> None:
+    """Recreate mode alone validates cleanly and round-trips the flag."""
+    from omnigent.server.schemas import SessionGitOptions
+
+    git = SessionGitOptions(branch_name="fix-1", existing_branch=True)
+    assert git.existing_branch is True
+    assert git.base_branch is None
 
 
 def test_session_git_existing_worktree_with_host_id_ok() -> None:
@@ -701,7 +846,7 @@ def test_session_create_managed_rejects_path_workspace() -> None:
     """
     from omnigent.server.schemas import SessionCreateRequest
 
-    with pytest.raises(ValidationError, match="takes a git repository URL"):
+    with pytest.raises(ValidationError, match="git repository URL"):
         SessionCreateRequest(agent_id="ag_x", host_type="managed", workspace="/tmp/w")
 
 
@@ -767,6 +912,235 @@ def test_session_create_external_rejects_repo_url_workspace() -> None:
             host_id="host_abc",
             workspace="https://github.com/org/repo",
         )
+
+
+def test_session_create_managed_accepts_multiple_workspaces() -> None:
+    """
+    ``host_type="managed"`` + ``workspaces`` accepts several repository
+    URLs; ``managed_repo_workspaces`` returns them verbatim for the launch
+    path to clone in parallel.
+    """
+    from omnigent.server.schemas import SessionCreateRequest
+
+    repos = ["https://github.com/org/api#main", "git@github.com:org/web.git"]
+    req = SessionCreateRequest(agent_id="ag_x", host_type="managed", workspaces=repos)
+    assert req.managed_repo_workspaces() == repos
+
+
+def test_managed_repo_workspaces_normalizes_single_and_empty() -> None:
+    """A single ``workspace`` yields a one-element list; neither field yields []."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    single = SessionCreateRequest(
+        agent_id="ag_x", host_type="managed", workspace="https://github.com/org/repo"
+    )
+    assert single.managed_repo_workspaces() == ["https://github.com/org/repo"]
+    empty = SessionCreateRequest(agent_id="ag_x", host_type="managed")
+    assert empty.managed_repo_workspaces() == []
+
+
+def test_session_create_managed_rejects_workspace_and_workspaces_together() -> None:
+    """``workspace`` and ``workspaces`` are mutually exclusive — set one, not both."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="not both"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            host_type="managed",
+            workspace="https://github.com/org/a",
+            workspaces=["https://github.com/org/b"],
+        )
+
+
+def test_session_create_managed_rejects_too_many_workspaces() -> None:
+    """The multi-repo list is bounded so an abusive request can't fan out unbounded clones."""
+    from omnigent.server.schemas import _MAX_MANAGED_WORKSPACES, SessionCreateRequest
+
+    too_many = [f"https://github.com/org/r{i}" for i in range(_MAX_MANAGED_WORKSPACES + 1)]
+    with pytest.raises(ValidationError, match="at most"):
+        SessionCreateRequest(agent_id="ag_x", host_type="managed", workspaces=too_many)
+
+
+def test_session_create_managed_rejects_malformed_workspaces_entry() -> None:
+    """Every ``workspaces`` entry must parse as a repository URL, else 422 at validation."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="not a supported repository URL"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            host_type="managed",
+            workspaces=["https://github.com/org/ok", "org/bad-shorthand"],
+        )
+
+
+def test_session_create_external_rejects_workspaces() -> None:
+    """``workspaces`` (multi-repo clone) is managed-only — rejected on an external host."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="requires host_type 'managed'"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            host_id="host_abc",
+            workspaces=["https://github.com/org/repo"],
+        )
+
+
+def test_session_metadata_host_type_defaults_external() -> None:
+    """
+    Multipart ``SessionCreateMetadata.host_type`` defaults to
+    ``"external"`` — every existing bundle-upload client that omits the
+    field keeps its current external-host behaviour (backcompat).
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    assert SessionCreateMetadata().host_type == "external"
+
+
+def test_session_metadata_managed_rejects_host_id() -> None:
+    """
+    Multipart ``host_type="managed"`` + a caller-supplied ``host_id`` is
+    a contradiction (the server provisions the host) — mirrors the JSON
+    path's contract.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="host_id must not be set"):
+        SessionCreateMetadata(host_type="managed", host_id="host_abc")
+
+
+def test_session_metadata_managed_rejects_path_workspace() -> None:
+    """
+    Multipart ``host_type="managed"`` + a PATH workspace 422s — a
+    managed workspace is a repository URL cloned into the sandbox.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="takes a git repository URL"):
+        SessionCreateMetadata(host_type="managed", workspace="/tmp/w")
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "https://github.com/org/repo",
+        "https://github.com/org/repo.git#release-1.2",
+        "git@github.com:org/repo.git",
+    ],
+)
+def test_session_metadata_managed_accepts_repo_url_workspace(workspace: str) -> None:
+    """
+    Multipart ``host_type="managed"`` accepts the ``<repo>[#<branch>]``
+    workspace forms verbatim for the launch path to clone.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed", workspace=workspace)
+    assert meta.workspace == workspace
+
+
+def test_session_metadata_managed_accepts_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` is accepted with ``host_type="managed"`` (chooses
+    which configured provider the server provisions).
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed", sandbox_provider="lakebox")
+    assert meta.sandbox_provider == "lakebox"
+
+
+def test_session_metadata_external_rejects_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` without ``host_type="managed"`` 422s — external
+    hosts are not server-provisioned.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="sandbox_provider only applies"):
+        SessionCreateMetadata(sandbox_provider="lakebox")
+
+
+def test_session_metadata_external_rejects_repo_url_workspace() -> None:
+    """
+    A repository-URL workspace on an external multipart create 422s —
+    there, ``workspace`` is an absolute path on the host.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="requires host_type 'managed'"):
+        SessionCreateMetadata(workspace="https://github.com/org/repo")
+
+
+def test_session_fork_host_type_defaults_external() -> None:
+    """
+    ``SessionForkRequest.host_type`` defaults to ``"external"`` — every
+    existing fork client keeps producing an unbound clone (backcompat).
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    req = SessionForkRequest()
+    assert req.host_type == "external"
+    assert req.sandbox_provider is None
+    assert req.workspace is None
+
+
+def test_session_fork_managed_accepts_provider_and_repo_workspace() -> None:
+    """
+    ``host_type="managed"`` accepts the provider pick and the
+    ``<repo>[#<branch>]`` workspace the launch path clones into the sandbox.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    req = SessionForkRequest(
+        host_type="managed",
+        sandbox_provider="modal",
+        workspace="https://github.com/org/repo#release-1.2",
+    )
+    assert req.sandbox_provider == "modal"
+    assert req.workspace == "https://github.com/org/repo#release-1.2"
+
+
+def test_session_fork_managed_rejects_path_workspace() -> None:
+    """
+    A managed fork's ``workspace`` is a repository URL, not a path — the
+    sandbox has no filesystem to point at until the server makes one.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="takes a git repository URL"):
+        SessionForkRequest(host_type="managed", workspace="/tmp/w")
+
+
+def test_session_fork_external_rejects_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` without ``host_type="managed"`` 422s — an external
+    fork is not server-provisioned, so naming a provider is a contradiction
+    the caller must see rather than have silently dropped.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="sandbox_provider only applies"):
+        SessionForkRequest(sandbox_provider="modal")
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    ["https://github.com/org/repo", "/tmp/w"],
+)
+def test_session_fork_external_rejects_any_workspace(workspace: str) -> None:
+    """
+    ``workspace`` without ``host_type="managed"`` 422s — for EITHER form.
+
+    This is the one place the fork contract deliberately diverges from the
+    create contract: a create's external workspace is a real host path, so
+    only the repository-URL form is rejected there. A fork picks its
+    directory later, when it binds a host, so a path is just as meaningless
+    as a URL and both must fail loud rather than be silently discarded.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="workspace only applies"):
+        SessionForkRequest(workspace=workspace)
 
 
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])

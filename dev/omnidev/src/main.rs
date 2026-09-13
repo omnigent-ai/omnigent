@@ -11,6 +11,7 @@
 //!   against the current checkout's pod via pinned `uv run --python …`, with the pod's
 //!   isolated env applied. Requires a checkout, like the supervisor.
 
+mod browser;
 mod install;
 mod lan;
 mod lock;

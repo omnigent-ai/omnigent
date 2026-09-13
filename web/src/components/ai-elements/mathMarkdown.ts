@@ -1,16 +1,3 @@
-// A lone `$` reads as a shell-style variable reference — `$VAR_NAME` or
-// `${VAR_NAME}` — when followed by a SCREAMING_CASE identifier (an env-var
-// convention), so it's treated as literal text rather than a math opener. The
-// braces already disambiguate `${A}`, so a single char is enough there; the
-// bare form requires 2+ chars so a lone `$X …` still reads as inline math.
-// The bare form also demands a full-token boundary (`(?![A-Za-z0-9_])`) so a
-// mixed token like `$FOOBar$` isn't matched by its uppercase prefix — the
-// lookahead rejects any continuing identifier char so greedy backtracking
-// can't settle on `$FOO`; escaping only the opener would strand the closing
-// `$` and break genuine inline math.
-// Anchored at the `$`, which the caller has already matched.
-const SHELL_VAR_RE = /^\$(?:\{[A-Z_][A-Z0-9_]*\}|[A-Z_][A-Z0-9_]+(?![A-Za-z0-9_]))/;
-
 // Optional 1–3 space indent + a fence run, per CommonMark. Matching the full
 // run (not just the first three chars) also keeps a ````-fenced block from
 // leaking its fourth backtick into inline-code tracking.
@@ -18,24 +5,19 @@ const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 
 /**
  * LLMs often emit TeX delimiters (`\(...\)` and `\[...\]`), while remark-math
- * parses dollar delimiters. Convert them to `$`/`$$`, but only where doing so
- * is safe:
+ * parses dollar delimiters. Convert both to `$$`, the only math delimiter the
+ * renderer honours (single-dollar math is off, so prose dollars stay prose —
+ * see `STREAMDOWN_PLUGINS`), but only where doing so is safe:
  *
  * - Not inside fenced or inline code, so code examples stay verbatim.
- * - Not inside an already `$`/`$$`-delimited math span, so a LaTeX line break
+ * - Not inside an already `$$`-delimited math span, so a LaTeX line break
  *   (`\\[1em]`) inside `$$\begin{aligned}…\end{aligned}$$` isn't mistaken for a
  *   display-math opener and turned into `\$$1em]`.
  * - A literal `\\` or `\$` is copied verbatim so its trailing `\[`/`\(` isn't
  *   read as an explicit delimiter and an escaped dollar isn't re-toggled.
  *
- * A single `$` reads as literal prose rather than an inline-math opener when it
- * looks like currency ($5) or a shell-style variable reference ($LLM_API_KEY,
- * ${OMNIGENT_LLM_API_KEY}), so it's escaped and doesn't flip the math span.
- * Otherwise, with single-dollar math enabled, prose like "it costs $5 or $10"
- * or an error such as "Unresolved variable '$LLM_API_KEY' … Set $LLM_API_KEY"
- * renders as a garbled formula. (Genuine inline math that starts with a digit
- * (`$3x$`) or a SCREAMING_CASE identifier (`$N_A$`) is the rare casualty;
- * currency and env-var references in prose are far more common.)
+ * `$$…$$` inside a paragraph stays inline math, so a converted `\(x\)` reads as
+ * inline math and only a `$$` opening its own line renders as a display block.
  */
 export function normalizeExplicitMathDelimiters(text: string): string {
   let result = "";
@@ -47,7 +29,7 @@ export function normalizeExplicitMathDelimiters(text: string): string {
   // when not in inline code. Tracking the run length lets a ``…`` span close
   // only on a matching-length run, so single backticks inside it don't leak.
   let inlineCodeTicks = 0;
-  // Inside a pre-existing `$…$` / `$$…$$` span (toggled on each run of `$`).
+  // Inside a pre-existing `$$…$$` span (toggled on each run of 2+ `$`).
   let inMath = false;
 
   for (let i = 0; i < text.length; i += 1) {
@@ -99,13 +81,10 @@ export function normalizeExplicitMathDelimiters(text: string): string {
     if (char === "$") {
       let run = 1;
       while (text[i + run] === "$") run += 1;
-      const isLiteralDollar =
-        run === 1 && !inMath && (/\d/.test(text[i + 1] ?? "") || SHELL_VAR_RE.test(text.slice(i)));
-      if (isLiteralDollar) {
-        result += "\\$";
-        continue;
-      }
-      inMath = !inMath;
+      // A lone `$` never delimits math, so it stays literal prose and leaves the
+      // span state alone: "$5 … $10" must not swallow the text in between, and a
+      // `\(x\)` after it still converts.
+      if (run > 1) inMath = !inMath;
       result += text.slice(i, i + run);
       i += run - 1;
       continue;
@@ -113,12 +92,7 @@ export function normalizeExplicitMathDelimiters(text: string): string {
 
     if (!inMath) {
       const pair = text.slice(i, i + 2);
-      if (pair === "\\(" || pair === "\\)") {
-        result += "$";
-        i += 1;
-        continue;
-      }
-      if (pair === "\\[" || pair === "\\]") {
+      if (pair === "\\(" || pair === "\\)" || pair === "\\[" || pair === "\\]") {
         result += "$$";
         i += 1;
         continue;

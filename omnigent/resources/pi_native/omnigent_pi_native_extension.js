@@ -357,7 +357,11 @@ function piResultFromMcpResponse(json) {
   // masquerading as a successful tool result. callOmnigentTool detects and
   // resolves the ASK round-trip BEFORE calling this; treat a stray one as a
   // fail-closed error so an unresolved approval never reports success.
-  if (result && typeof result === "object" && result.resultType === "input_required") {
+  if (
+    result &&
+    typeof result === "object" &&
+    result.resultType === "input_required"
+  ) {
     return {
       content: [
         {
@@ -371,7 +375,11 @@ function piResultFromMcpResponse(json) {
   if (result && Array.isArray(result.content)) {
     const parts = [];
     for (const block of result.content) {
-      if (block && typeof block === "object" && typeof block.text === "string") {
+      if (
+        block &&
+        typeof block === "object" &&
+        typeof block.text === "string"
+      ) {
         parts.push(block.text);
       }
     }
@@ -400,7 +408,11 @@ function piResultFromMcpResponse(json) {
  */
 function mcpInputRequired(json) {
   const result = json && typeof json === "object" ? json.result : undefined;
-  if (!result || typeof result !== "object" || result.resultType !== "input_required") {
+  if (
+    !result ||
+    typeof result !== "object" ||
+    result.resultType !== "input_required"
+  ) {
     return null;
   }
   const inputRequests =
@@ -411,6 +423,56 @@ function mcpInputRequired(json) {
   const requestState =
     typeof result.requestState === "string" ? result.requestState : "";
   return { elicitationId, requestState };
+}
+
+/**
+ * Bounded classification for a 2xx ``/mcp`` reply that is not an MCP JSON body.
+ *
+ * ``resp.ok`` is not proof of a JSON answer: an authenticating edge (reverse
+ * proxy, IdP) in front of the server can answer any route with a sign-in
+ * document and status 200. The text names the classification only — never the
+ * body, headers, or URL — because a sign-in document routinely carries tokens
+ * and tenant identifiers.
+ */
+function nonJsonMcpPiResult() {
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          "Omnigent tool call failed: the server answered 2xx with a non-JSON " +
+          "body, which usually means an authenticating proxy or sign-in page " +
+          "answered instead of Omnigent. Re-authenticate and retry.",
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * False when ``resp`` declares a content type that is not JSON.
+ *
+ * A declared ``text/html`` (the sign-in case) is rejected. An absent or
+ * unreadable content type is not treated as a signal, so the parse attempt
+ * stays the decider there.
+ */
+function mcpContentTypeIsJson(resp) {
+  let declared = null;
+  try {
+    // Both the property read and the lookup are inside the try: a `headers`
+    // getter can throw just as `get()` can.
+    const headers = resp && resp.headers;
+    if (headers && typeof headers.get === "function") {
+      declared = headers.get("content-type");
+    }
+  } catch (_headerErr) {
+    // An unreadable header is not a signal, so fall through to the parse.
+    // Swallow it here: letting it reach the outer catch would put its message —
+    // which can quote header or body text — into the tool result.
+    return true;
+  }
+  if (typeof declared !== "string" || declared.trim() === "") return true;
+  return /^application\/(?:[\w.+-]+\+)?json\s*(?:;|$)/i.test(declared.trim());
 }
 
 /**
@@ -454,7 +516,16 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
         },
       };
     }
-    return { json: await resp.json() };
+    // Status, content type, and parseability must all agree before this body is
+    // treated as an MCP response. A parse failure is classified here rather
+    // than by the outer catch, whose message would echo the offending body back
+    // through ``err.message``.
+    if (!mcpContentTypeIsJson(resp)) return { piResult: nonJsonMcpPiResult() };
+    try {
+      return { json: await resp.json() };
+    } catch (_parseErr) {
+      return { piResult: nonJsonMcpPiResult() };
+    }
   } catch (err) {
     return {
       piResult: {
@@ -894,7 +965,27 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
   let model;
   try {
-    model = listModels().find((m) => m && m.id === id);
+    const models = listModels();
+    const separator = id.indexOf("/");
+    if (separator > 0) {
+      const provider = id.slice(0, separator);
+      const bareId = id.slice(separator + 1);
+      model = models.find(
+        (candidate) =>
+          candidate && candidate.id === bareId && candidate.provider === provider,
+      );
+      if (!model) model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && registry && typeof registry.find === "function") {
+        model = registry.find(provider, bareId);
+      }
+      if (!model) {
+        model = models.find(
+          (candidate) => candidate && candidate.id === bareId && !candidate.provider,
+        );
+      }
+    } else {
+      model = models.find((candidate) => candidate && candidate.id === id);
+    }
   } catch (_err) {
     model = undefined;
   }
@@ -940,6 +1031,13 @@ async function postModelChangeError(config, message) {
   });
 }
 
+function modelReference(model) {
+  const modelId = model && typeof model.id === "string" ? model.id : "";
+  if (!modelId) return "";
+  const provider = model && typeof model.provider === "string" ? model.provider : "";
+  return provider ? `${provider}/${modelId}` : modelId;
+}
+
 /**
  * Report Pi's live model catalog to Omnigent for the Web UI model picker.
  *
@@ -977,11 +1075,13 @@ async function postModelOptions(config, ctx) {
   const options = [];
   const seen = new Set();
   for (const model of models) {
-    const id = model && typeof model.id === "string" ? model.id : "";
+    const modelId = model && typeof model.id === "string" ? model.id : "";
+    const id = modelReference(model);
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    const name = model && typeof model.name === "string" && model.name ? model.name : id;
-    options.push({ id, displayName: name });
+    const name =
+      model && typeof model.name === "string" && model.name ? model.name : modelId;
+    options.push({ id, model: id, displayName: name });
   }
   if (options.length === 0) return;
   await postEvent(config, {
@@ -990,7 +1090,14 @@ async function postModelOptions(config, ctx) {
   });
 }
 
-function startInboxPoller(pi, config, handleInterrupt, handleCompact, handleModelChange) {
+function startInboxPoller(
+  pi,
+  config,
+  handleInterrupt,
+  handleCompact,
+  handleModelChange,
+  handleThinkingLevelChange,
+) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
   // long-lived TUI mustn't grow it unboundedly.
@@ -1117,6 +1224,17 @@ function startInboxPoller(pi, config, handleInterrupt, handleCompact, handleMode
         handleModelChange(
           typeof payload.model === "string" ? payload.model : undefined,
         );
+      }
+      if (payload.type === "thinking_level_change") {
+        // Point-in-time: one delivery attempt, then always consume the file.
+        // Pi's setThinkingLevel is async but fire-and-forget here — success is
+        // visible in Pi's TUI menu and the returned promise is discarded.
+        if (
+          typeof handleThinkingLevelChange === "function" &&
+          typeof payload.thinkingLevel === "string"
+        ) {
+          handleThinkingLevelChange(payload.thinkingLevel);
+        }
       }
       if (id !== null) rememberSeen(id);
       try {
@@ -1408,7 +1526,8 @@ module.exports = function (pi) {
   // carries no identity field at all.
   function usageMessageKey(message, usage) {
     if (message && typeof message === "object") {
-      if (typeof message.id === "string" && message.id) return `id:${message.id}`;
+      if (typeof message.id === "string" && message.id)
+        return `id:${message.id}`;
       if (typeof message.responseId === "string" && message.responseId)
         return `rid:${message.responseId}`;
       if (typeof message.timestamp === "number")
@@ -1707,6 +1826,7 @@ module.exports = function (pi) {
       (customInstructions) =>
         triggerCompaction(config, latestContext, customInstructions),
       (model) => applyModelChange(pi, config, latestContext, model),
+      (level) => pi.setThinkingLevel(level),
     );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
@@ -1721,12 +1841,11 @@ module.exports = function (pi) {
     // ``/login`` session (no Omnigent ``model_override``, no ``llm_model``)
     // shows no active model until the user switches. Mirrors the
     // ``model_select`` handler, but for the startup value ``ctx.model``.
-    const startupModelId =
-      ctx && ctx.model && typeof ctx.model.id === "string" ? ctx.model.id : "";
-    if (startupModelId) {
+    const startupModel = modelReference(ctx ? ctx.model : undefined);
+    if (startupModel) {
       await postEvent(config, {
         type: "external_model_change",
-        data: { model: startupModelId },
+        data: { model: startupModel },
       });
     }
     await postEvent(config, {
@@ -1749,14 +1868,15 @@ module.exports = function (pi) {
     // web-side override. The server dedups against ``model_override``, so a
     // web-initiated switch (which already persisted the value before queuing
     // the inbox ``model_change``) round-trips here as a no-op.
-    const source = event && typeof event.source === "string" ? event.source : "";
+    const source =
+      event && typeof event.source === "string" ? event.source : "";
     if (source === "restore") return;
     const model = event && event.model ? event.model : undefined;
-    const modelId = model && typeof model.id === "string" ? model.id : "";
-    if (!modelId) return;
+    const selectedModel = modelReference(model);
+    if (!selectedModel) return;
     await postEvent(config, {
       type: "external_model_change",
-      data: { model: modelId },
+      data: { model: selectedModel },
     });
   });
 
@@ -1814,7 +1934,8 @@ module.exports = function (pi) {
     if (changed) await postSessionUsage();
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
-    const endResponseId = turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    const endResponseId =
+      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
     await postEvent(config, {
       type: "external_session_status",
@@ -1965,9 +2086,13 @@ module.exports = function (pi) {
     // unsupported API types) as visible error items in the web UI so users
     // aren't left staring at an empty turn.
     const stopReason =
-      message && typeof message.stopReason === "string" ? message.stopReason : "";
+      message && typeof message.stopReason === "string"
+        ? message.stopReason
+        : "";
     const errorMessage =
-      message && typeof message.errorMessage === "string" ? message.errorMessage : "";
+      message && typeof message.errorMessage === "string"
+        ? message.errorMessage
+        : "";
     if (stopReason === "error" && errorMessage) {
       await postEvent(config, {
         type: "external_conversation_item",

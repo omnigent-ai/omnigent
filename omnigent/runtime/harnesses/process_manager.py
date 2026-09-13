@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
@@ -455,12 +456,12 @@ class _SubprocessEntry:
     :param last_used_at: Monotonic timestamp of the most recent
         ``get_client`` call for this conversation. Used by the
         idle reaper to detect abandoned entries.
-    :param model: The ``HARNESS_<H>_MODEL`` value this subprocess
+        :param model: The ``HARNESS_<H>_MODEL`` value this subprocess
         was spawned with (or ``None`` when the spawn env set no
-        model). The model is fixed at spawn time (it's a process
-        env var), so :meth:`HarnessProcessManager.get_client`
-        re-spawns when a later turn requests a different model —
-        e.g. after the user runs ``/model``.
+        model). Most harnesses fix the model at spawn, so
+        :meth:`HarnessProcessManager.get_client` re-spawns on a
+        later model change. Harnesses in
+        :data:`_LIVE_MODEL_CONFIG_HARNESSES` apply it in-process.
     """
 
     def __init__(
@@ -493,6 +494,9 @@ def _model_env_key(harness: str) -> str:
         ``"claude-sdk"`` or ``"HARNESS_CODEX_MODEL"`` for ``"codex"``.
     """
     return f"HARNESS_{harness.upper().replace('-', '_')}_MODEL"
+
+
+_LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
 
 
 def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -561,6 +565,9 @@ class HarnessProcessManager:
         # Pre-allocate the instance dir path so it stays stable
         # across re-entrant ``start()`` calls (idempotent boot).
         self._instance_dir = self._tmp_parent / f"ap-{uuid.uuid4().hex}"
+        # Monotonic clock at ``start()``; the harness_started event reports each
+        # spawn's readiness latency relative to it (harness boot vs manager boot).
+        self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
         # Per-conversation in-flight harness response_id. The runner's
         # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
@@ -676,6 +683,7 @@ class HarnessProcessManager:
             name="harness-process-manager-idle-reaper",
         )
         self._started = True
+        self._started_at = time.monotonic()
         _logger.info(
             "HarnessProcessManager started; instance_dir=%s",
             self._instance_dir,
@@ -800,13 +808,10 @@ class HarnessProcessManager:
                 await self._close_entry(entry)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None:
-                # The model is baked into the subprocess env at spawn time;
-                # a later turn requesting a different model (e.g. after the
-                # user runs ``/model``) must respawn, otherwise the cached
-                # process keeps serving the old model. Only respawn when a
-                # concrete different model is requested — a turn that sets no
-                # model env (``None``) keeps the running process.
+            if entry is not None and harness not in _LIVE_MODEL_CONFIG_HARNESSES:
+                # Most harnesses bake the model into the subprocess env. A
+                # later concrete model change must respawn them; ACP harnesses
+                # in the live-config set instead apply the request in-session.
                 requested_model = (env or {}).get(_model_env_key(harness))
                 if requested_model is not None and requested_model != entry.model:
                     _logger.info(
@@ -988,6 +993,20 @@ class HarnessProcessManager:
             registered.
         """
         return conversation_id in self._in_flight_response_ids
+
+    def note_activity(self, conversation_id: str) -> None:
+        """Refresh the idle lease for an existing harness subprocess.
+
+        Native terminal turns do not pass through ``proxy_stream``, so their
+        terminal activity calls this method instead. No-op when the
+        conversation has no registered subprocess.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        """
+        entry = self._entries.get(conversation_id)
+        if entry is not None:
+            entry.last_used_at = time.monotonic()
 
     def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
         """
@@ -1218,9 +1237,32 @@ class HarnessProcessManager:
             "--parent-pid",
             str(parent_pid),
         ]
+        spawn_started_at = time.monotonic()
         process = await self._spawn_harness_process(runner_argv, effective_env)
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
+            # The harness process has bound its socket and is ready to serve —
+            # the observable "harness started" edge. Report the spawn->ready
+            # latency; on a cold runner the first spawn's manager-relative
+            # latency is the runner_start -> harness_started interval.
+            _now = time.monotonic()
+            _logger.info(
+                "harness started for conversation %s (harness=%s)",
+                conversation_id,
+                harness,
+                extra=debug_event(
+                    "harness_started",
+                    session_id=conversation_id,
+                    harness=harness,
+                    pid=process.pid,
+                    spawn_ms=int((_now - spawn_started_at) * 1000),
+                    since_manager_start_ms=(
+                        int((_now - self._started_at) * 1000)
+                        if self._started_at is not None
+                        else None
+                    ),
+                ),
+            )
 
             # ``base_url`` is required for relative-URL routing; the
             # actual host portion is irrelevant under uds transport,
@@ -1342,7 +1384,10 @@ class HarnessProcessManager:
         finally:
             if entry.process.returncode is None:
                 try:
-                    entry.process.send_signal(signal.SIGTERM)
+                    # Tree-aware backstop: this process parents the sandbox
+                    # launcher, which forks the real agent. Signalling only the
+                    # handle strands both when an executor close() never runs.
+                    _proc.terminate_tree(entry.process)
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
                 except Exception:
                     # Graceful SIGTERM didn't complete — it timed out, or
@@ -1350,7 +1395,7 @@ class HarnessProcessManager:
                     # mid-teardown). Force-kill best-effort; a process that
                     # is already gone is already done.
                     with contextlib.suppress(Exception):
-                        entry.process.kill()
+                        _proc.kill_tree(entry.process)
                         await entry.process.wait()
             with contextlib.suppress(Exception):
                 close_subprocess_transport(entry.process)

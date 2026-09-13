@@ -217,6 +217,80 @@ describe("CommandPalette — input", () => {
   });
 });
 
+describe("CommandPalette — mobile full-screen sheet", () => {
+  // useIsMobileViewport reads window.matchMedia("(max-width: 767.98px)").matches.
+  // The global test-setup stubs matchMedia to always report false (desktop);
+  // flip it here so the palette renders its keyboard-safe mobile layout.
+  function setMobile(isMobile: boolean) {
+    window.matchMedia = ((query: string) => ({
+      matches: isMobile,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+  }
+
+  function dialogContent() {
+    return document.querySelector("[data-slot=dialog-content]");
+  }
+
+  afterEach(() => setMobile(false));
+
+  it("renders a top-anchored full-screen sheet with a close button on mobile", () => {
+    setMobile(true);
+    renderPalette();
+
+    // The sheet drops the centered-card geometry (top-1/4 → top-0, rounded → none)
+    // so it fills the keyboard-aware viewport instead of hiding behind the keyboard.
+    const content = dialogContent();
+    expect(content?.className).toContain("rounded-none");
+    expect(content?.className).not.toContain("top-1/4");
+    // …and offers an explicit close affordance (no ⌘K/Esc hint on touch).
+    expect(screen.getByLabelText("Close search")).toBeTruthy();
+  });
+
+  it("keeps the centered dialog and shows no close button on desktop", () => {
+    setMobile(false);
+    renderPalette();
+
+    expect(dialogContent()?.className).toContain("top-1/4");
+    expect(screen.queryByLabelText("Close search")).toBeNull();
+  });
+
+  it("closes the palette when the mobile close button is tapped", () => {
+    setMobile(true);
+    const onOpenChange = vi.fn();
+    renderPalette({ onOpenChange });
+
+    fireEvent.click(screen.getByLabelText("Close search"));
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("still searches from the mobile input", () => {
+    vi.useFakeTimers();
+    try {
+      setMobile(true);
+      setSessions([conv("c1", "Fix the parser")]);
+      renderPalette();
+
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "deploy" },
+      });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(useConversations).toHaveBeenCalledWith("deploy", true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("CommandPalette — actions", () => {
   it("lists the built-in action commands", () => {
     renderPalette();

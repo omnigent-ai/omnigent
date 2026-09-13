@@ -21,7 +21,13 @@ type StreamdownHardenPlugin = StreamdownPluginTuple & {
 export const STREAMDOWN_PLUGINS = {
   cjk,
   code: lazyCodePlugin,
-  math: createMathPlugin({ singleDollarTextMath: true }),
+  // Only `$$…$$` opens math. A single `$` is prose far more often than it is a
+  // math delimiter — currency ($5), rates ($/PR, $/session), shell variables
+  // ($LLM_API_KEY) — and single-dollar math pairs any two of them up, rendering
+  // the whole span between them as letter-by-letter math soup. Explicit TeX
+  // delimiters (`\(…\)`, `\[…\]`), which is what LLMs emit for real math, are
+  // rewritten to `$$…$$` by `normalizeExplicitMathDelimiters`.
+  math: createMathPlugin({ singleDollarTextMath: false }),
   mermaid,
 };
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
@@ -57,6 +63,42 @@ interface HastElement {
 // keep new-tab opening plus referrer/reverse-tabnabbing protection without the
 // extra confirmation click.
 export const CHAT_LINK_SAFETY: LinkSafetyConfig = { enabled: false };
+
+/** Rewrites safe local `file:` URIs before sanitization removes their hrefs. */
+export function rewriteFileUriLinks() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      if (node.tagName !== "a") return;
+      const href = node.properties?.href;
+      if (typeof href !== "string" || !/^file:/i.test(href)) return;
+      const path = fileUriToLocalPath(href);
+      if (!path) return;
+      node.properties = { ...node.properties, href: path };
+    });
+  };
+}
+
+/** Returns a local absolute path only when rewriting preserves href meaning. */
+function fileUriToLocalPath(href: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "file:" || url.hostname || url.search || url.hash) return null;
+  let path: string;
+  try {
+    path = decodeURIComponent(url.pathname);
+  } catch {
+    return null;
+  }
+  // Keep the rewritten href absolute without introducing URL delimiters.
+  if (!path.startsWith("/") || path.startsWith("//") || path === "/" || /[?#]/.test(path)) {
+    return null;
+  }
+  return path;
+}
 
 /**
  * Moves the href of every file-path link onto {@link WORKSPACE_FILE_LINK_ATTR}
@@ -116,8 +158,15 @@ function isHardenOptions(value: unknown): value is StreamdownHardenOptions {
 
 function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehypePlugins {
   const plugins: StreamdownRehypePlugins = [];
+  let sawSanitize = false;
 
   for (const [key, plugin] of Object.entries(defaultRehypePlugins)) {
+    // Preserve local file URIs before sanitize removes their href.
+    if (key === "sanitize") {
+      sawSanitize = true;
+      if (markFileLinks) plugins.push(rewriteFileUriLinks);
+    }
+
     if (key !== "harden") {
       plugins.push(plugin);
       continue;
@@ -138,6 +187,10 @@ function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehype
       plugin[0],
       { ...plugin[1], allowedImagePrefixes: [] },
     ] satisfies StreamdownPluginTuple);
+  }
+
+  if (markFileLinks && !sawSanitize) {
+    throw new Error("Streamdown default rehype plugins carry no sanitize step");
   }
 
   return plugins;

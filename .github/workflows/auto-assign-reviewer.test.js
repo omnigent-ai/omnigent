@@ -32,6 +32,7 @@ async function run({
   files, load = {}, current = [], currentAssignees = [],
   author = "someexternaldev", fork = true, linkedIssues = [],
   rank = null, // LLM area-fit ranking (array of logins) or null for none
+  action = "opened", // PR event action; `edited` is promote-only
 }) {
   // Point the script at a per-run rank file so real /tmp state can't leak in.
   // `rank: null` writes no file -> the script's fallback (pure load) is tested,
@@ -83,7 +84,7 @@ async function run({
   };
   const context = {
     repo: { owner: "omnigent-ai", repo: "omnigent" },
-    payload: { pull_request: {
+    payload: { action, pull_request: {
       number: PR_NUMBER, draft: false,
       user: { login: author },
       // precise fork detection compares head vs base full_name
@@ -330,4 +331,95 @@ function assert(name, cond, detail) {
   });
   assert("linked-issue adoption overrides the LLM rank",
     JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]), JSON.stringify(r));
+
+  // 21. `edited` event: a `closes #N` link added after open now points at an
+  //     issue assigned to a pool maintainer. The PR currently carries the
+  //     load-balanced pick (dbczumar); the "more matched" issue owner is
+  //     promoted -- swapping BOTH the reviewer and the assignee.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: ["dbczumar"], currentAssignees: ["dbczumar"],
+    linkedIssues: [{ number: 42, assignees: ["TomeHirata"] }],
+  });
+  assert("edited: linked-issue owner is promoted over the current reviewer",
+    JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]) &&
+    JSON.stringify(r.removed) === JSON.stringify(["dbczumar"]), JSON.stringify(r));
+  assert("edited: the PR assignee is swapped to the linked-issue owner too",
+    JSON.stringify(r.assigned) === JSON.stringify(["TomeHirata"]) &&
+    JSON.stringify(r.unassigned) === JSON.stringify(["dbczumar"]), JSON.stringify(r));
+
+  // 22. `edited` event with nothing to adopt WHILE a managed reviewer is already
+  //     set: promote-only, so the existing reviewer/assignee is left untouched
+  //     (no load-balanced fallback) -- a routine title/body edit must not thrash
+  //     a chosen pick.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: ["dbczumar"], currentAssignees: ["dbczumar"],
+    linkedIssues: [],
+  });
+  assert("edited, nothing to adopt, managed reviewer set -> unchanged",
+    r.added.length === 0 && r.removed.length === 0 &&
+    r.assigned.length === 0 && r.unassigned.length === 0, JSON.stringify(r));
+
+  // 23. `edited` event where the linked-issue owner already IS the current pick:
+  //     no-op (nothing added or removed).
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: ["TomeHirata"], currentAssignees: ["TomeHirata"],
+    linkedIssues: [{ number: 42, assignees: ["TomeHirata"] }],
+  });
+  assert("edited: already-correct reviewer is a no-op",
+    r.added.length === 0 && r.removed.length === 0 &&
+    r.assigned.length === 0 && r.unassigned.length === 0, JSON.stringify(r));
+
+  // 24. `edited` event with nothing to adopt AND no managed reviewer currently
+  //     set: the `opened` run was likely cancelled mid-assignment by this edit
+  //     (cancel-in-progress). Must NOT bail -- fall through to the load-balanced
+  //     pick so the PR is never left with no reviewer at all.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: [], currentAssignees: [],
+    linkedIssues: [],
+  });
+  assert("edited, nothing to adopt, no reviewer set -> load-balanced pick",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]) &&
+    JSON.stringify(r.assigned) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+
+  // 25. `edited` with nothing to adopt and only an UNMANAGED (external) reviewer
+  //     present: no managed reviewer means the auto-assigner never picked one, so
+  //     fall through and add one -- while leaving the external reviewer in place.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: ["some-external-human"], currentAssignees: ["some-external-human"],
+    linkedIssues: [],
+  });
+  assert("edited, nothing to adopt, only external reviewer -> adds managed pick, keeps external",
+    r.added.includes("dhruv0811") && !r.removed.includes("some-external-human"),
+    JSON.stringify(r));
+
+  // 26. `edited` with nothing to adopt, a managed ASSIGNEE present but NO
+  //     requested reviewer: models a PR whose managed reviewer already submitted
+  //     a review (GitHub drops them from requested_reviewers but keeps them in
+  //     assignees). The assignee is the durable "already picked" signal, so this
+  //     must be a no-op -- not a re-request/reshuffle of the reviewer.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: [], currentAssignees: ["dbczumar"],
+    linkedIssues: [],
+  });
+  assert("edited, nothing to adopt, managed assignee (post-review) -> unchanged",
+    r.added.length === 0 && r.removed.length === 0 &&
+    r.assigned.length === 0 && r.unassigned.length === 0, JSON.stringify(r));
 })();

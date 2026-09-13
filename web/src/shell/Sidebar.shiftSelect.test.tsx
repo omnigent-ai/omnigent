@@ -340,11 +340,20 @@ describe("Sidebar shift-click selection", () => {
     mockConversations([mine, theirs]);
     renderSidebar();
 
+    // Mixed ownership only shows on "All sessions"; the default "My sessions"
+    // filter hides the shared row, so switch to All before selecting.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
+
     fireEvent.click(screen.getByRole("button", { name: /select/i }));
 
     // Select both rows — "2 selected", but only the owned one is deletable.
     fireEvent.click(await screen.findByRole("link", { name: "mine" }));
-    fireEvent.click(screen.getByRole("link", { name: "theirs" }));
+    fireEvent.click(screen.getByRole("link", { name: /^theirs/ }));
     await waitFor(() => {
       expect(screen.getByText("2 selected")).toBeInTheDocument();
     });

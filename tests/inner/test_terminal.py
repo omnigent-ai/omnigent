@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import shutil
 import subprocess
 import sys
@@ -10,72 +12,20 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
-    TERMINAL_TRANSPORT_CONTROL,
-    TERMINAL_TRANSPORT_PTY,
     TerminalInstance,
     _apply_utf8_locale_default,
     _has_utf8_locale,
     _is_utf8_locale_value,
     create_terminal_instance,
-    resolve_terminal_transport,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
-
-
-def _write_transport_config(config_home: Path, value: str | None) -> None:
-    """Write ``terminal.transport: <value>`` into a scratch config.yaml.
-
-    :param config_home: Directory used as ``OMNIGENT_CONFIG_HOME``.
-    :param value: Transport value to persist, or ``None`` to write a config
-        with no ``terminal`` table.
-    """
-    body = "" if value is None else f"terminal:\n  transport: {value}\n"
-    (config_home / "config.yaml").write_text(body, encoding="utf-8")
-
-
-def test_resolve_terminal_transport_precedence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Override beats spec, spec beats config, config opts out of the control default."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-
-    # No config file at all → control mode is the default.
-    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
-
-    # A config with no terminal table → still control.
-    _write_transport_config(tmp_path, None)
-    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
-
-    # terminal.transport opts OUT to the legacy PTY path.
-    _write_transport_config(tmp_path, "pty")
-    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_PTY
-    _write_transport_config(tmp_path, "false")
-    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_PTY
-
-    # A control/ truthy value keeps control mode.
-    _write_transport_config(tmp_path, "control")
-    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
-
-    # Spec beats config: config opts out globally, but this terminal forces control.
-    _write_transport_config(tmp_path, "pty")
-    assert resolve_terminal_transport(spec_transport="control") == TERMINAL_TRANSPORT_CONTROL
-
-    # Per-attach override beats spec.
-    assert (
-        resolve_terminal_transport(override="pty", spec_transport="control")
-        == TERMINAL_TRANSPORT_PTY
-    )
-    # Unrecognized override values fall through to the spec rather than break.
-    assert (
-        resolve_terminal_transport(override="garbage", spec_transport="pty")
-        == TERMINAL_TRANSPORT_PTY
-    )
 
 
 @dataclass
@@ -130,6 +80,7 @@ def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
     exited = threading.Event()
 
     instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -154,9 +105,10 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
         running=True,
     )
     exited = threading.Event()
-    snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None])
+    snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None, None, None])
 
     instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -165,6 +117,388 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
 
     assert exited.wait(timeout=1.0)
     assert instance.last_pane_text() == "startup failed\ntry config"
+
+
+def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
+    """The exit-diagnostics summary folds in every signal it has."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    # With nothing recorded yet it still states the baseline both ways.
+    baseline = instance._tmux_gone_diagnostics()
+    assert "no web client interaction observed" in baseline
+    assert "last pane: <none captured>" in baseline
+
+    instance._last_capture_probe_error = "tmux command failed (rc=1): no server running on /tmp/x"
+    instance._last_session_probe_error = "tmux command failed (rc=1): no server running on /tmp/x"
+    instance._last_exit_status = 137
+    instance._remember_pane_snapshot("\x1b[31mSegmentation fault\x1b[0m")
+    instance.note_client_interaction()
+
+    summary = instance._tmux_gone_diagnostics()
+    assert "last capture error: tmux command failed (rc=1): no server running" in summary
+    assert "has-session said: tmux command failed (rc=1): no server running" in summary
+    assert "pane exit status: 137" in summary
+    assert "since web client interaction" in summary
+    assert "last pane tail:" in summary and "Segmentation fault" in summary
+
+
+def test_tmux_unavailable_error_log_carries_the_cause(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The 'tmux unavailable' exit ERROR names why: probe stderr + pane tail.
+
+    Drives the real capture/has-session helpers (both failing) so the log
+    proves the probe errors are recorded and surfaced, not just formattable.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    def _fail(*_args: str) -> str:
+        # The has-session stderr distinguishing a whole-server death.
+        raise RuntimeError("tmux command failed (rc=1): no server running on /tmp/x/default")
+
+    instance._tmux_output_sync = _fail  # type: ignore[method-assign]
+    instance._remember_pane_snapshot("running build...\nTraceback (most recent call last): boom")
+    instance.note_client_interaction()
+    exited = threading.Event()
+
+    with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+        assert exited.wait(timeout=2.0)
+
+    unavailable = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR and "tmux unavailable after" in record.getMessage()
+    ]
+    assert unavailable, "expected a 'tmux unavailable' ERROR"
+    message = unavailable[0]
+    assert "no server running" in message  # has-session stderr → whole-server death
+    assert "since web client interaction" in message
+    assert "Traceback" in message  # last pane tail carried into the exit log
+
+
+def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path) -> None:
+    """Successful pane captures reset the consecutive-failure threshold."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    captures = iter([None, None, "recovered once", None, None, "recovered twice"])
+    exited = threading.Event()
+    recovered_twice = threading.Event()
+    successful_ticks = 0
+
+    def _capture() -> str | None:
+        return next(captures, "steady")
+
+    def _on_tick() -> None:
+        nonlocal successful_ticks
+        successful_ticks += 1
+        if successful_ticks >= 2:
+            recovered_twice.set()
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_exit=exited.set,
+        on_tick=_on_tick,
+        poll_interval_s=0.01,
+    )
+
+    assert recovered_twice.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+def test_threaded_idle_watcher_uses_session_probe_to_confirm_capture_failure(
+    tmp_path: Path,
+) -> None:
+    """A live has-session probe prevents a failed capture from becoming exit."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+    confirmed = threading.Event()
+    confirmations = 0
+
+    def _confirm() -> bool:
+        nonlocal confirmations
+        confirmations += 1
+        if confirmations >= 4:
+            confirmed.set()
+        return True
+
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = _confirm  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert confirmed.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+def test_threaded_idle_watcher_treats_probe_start_failure_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Process exhaustion must not be misclassified as terminal exit."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+    retried = threading.Event()
+    attempts = 0
+
+    def _cannot_fork(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 3:
+            retried.set()
+        raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _cannot_fork)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert retried.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+def test_threaded_idle_watcher_treats_confirmation_start_failure_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A confirmation probe that cannot start must not count toward exit."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+    retried = threading.Event()
+    attempts = 0
+
+    def _cannot_fork(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 3:
+            retried.set()
+        raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _cannot_fork)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert retried.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+def test_threaded_idle_watcher_counts_permanent_probe_start_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permanently missing tmux binary follows the normal exit threshold."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+
+    def _missing_tmux(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        raise FileNotFoundError(errno.ENOENT, "tmux not found")
+
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _missing_tmux)
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert exited.wait(timeout=1.0)
+    assert instance.running is False
+
+
+@pytest.mark.asyncio
+async def test_async_idle_watcher_treats_probe_start_failure_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async capture path retries transient process-start failures."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = asyncio.Event()
+    retried = asyncio.Event()
+    attempts = 0
+
+    async def _cannot_fork(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 2:
+            retried.set()
+        raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _cannot_fork)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
+
+    instance.start_idle_watcher(lambda: None, on_exit=exited.set)
+
+    await asyncio.wait_for(retried.wait(), timeout=1.0)
+    await instance._stop_idle_watcher()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async has-session path retries transient process-start failures."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = asyncio.Event()
+    retried = asyncio.Event()
+    confirmation_attempts = 0
+
+    async def _create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _ProcessWithStdout:
+        del stdout, stderr
+        nonlocal confirmation_attempts
+        if "capture-pane" in cmd:
+            return _ProcessWithStdout(returncode=1)
+        assert "has-session" in cmd
+        confirmation_attempts += 1
+        if confirmation_attempts >= 2:
+            retried.set()
+        raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _create_subprocess_exec)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
+
+    instance.start_idle_watcher(lambda: None, on_exit=exited.set)
+
+    await asyncio.wait_for(retried.wait(), timeout=1.0)
+    await instance._stop_idle_watcher()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_path: Path) -> None:
+    """Cleanup kills a surviving tmux server even after a watcher marked it dead."""
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    socket_path = private_dir / "tmux.sock"
+    socket_path.touch()
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=private_dir,
+        running=False,
+    )
+    commands: list[tuple[str, ...]] = []
+
+    async def _tmux(*args: str) -> None:
+        commands.append(args)
+
+    instance._tmux = _tmux  # type: ignore[method-assign]
+
+    await instance.close()
+
+    assert commands == [("kill-server",)]
+    assert not private_dir.exists()
+
+
+def test_capture_probe_logs_command_return_code_and_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Watcher probe errors retain the evidence needed to diagnose tmux failures."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    monkeypatch.setattr(
+        terminal_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=17,
+            stdout=b"",
+            stderr=b"fork failed: resource temporarily unavailable",
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        snapshot = instance._capture_pane_for_idle_or_none()
+
+    assert snapshot is None
+    message = caplog.text
+    assert "rc=17" in message
+    assert str(instance.socket_path) in message
+    assert "capture-pane -t main -p -e" in message
+    assert "fork failed: resource temporarily unavailable" in message
 
 
 def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
@@ -241,6 +575,34 @@ class _ProcessWithStdout:
         return self.stdout, b""
 
 
+@pytest.mark.parametrize(
+    "error_number",
+    [errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOMEM, errno.EMFILE, errno.ENFILE],
+)
+def test_tmux_process_start_error_classifies_resource_pressure_as_transient(
+    error_number: int,
+) -> None:
+    """Only retryable host resource failures produce UNKNOWN liveness."""
+    error = terminal_mod._tmux_process_start_error(
+        ["tmux", "has-session"], OSError(error_number, "resource pressure")
+    )
+
+    assert isinstance(error, terminal_mod._TmuxProcessStartError)
+
+
+@pytest.mark.parametrize("error_number", [errno.ENOENT, errno.EACCES])
+def test_tmux_process_start_error_keeps_permanent_failure_non_transient(
+    error_number: int,
+) -> None:
+    """Missing or inaccessible tmux follows the normal failure path."""
+    error = terminal_mod._tmux_process_start_error(
+        ["tmux", "has-session"], OSError(error_number, "permanent failure")
+    )
+
+    assert isinstance(error, RuntimeError)
+    assert not isinstance(error, terminal_mod._TmuxProcessStartError)
+
+
 def test_threaded_idle_watcher_reports_exit_on_dead_pane(tmp_path: Path) -> None:
     """
     A dead pane (process exited, server kept by remain-on-exit) fires on_exit.
@@ -272,6 +634,81 @@ def test_threaded_idle_watcher_reports_exit_on_dead_pane(tmp_path: Path) -> None
     assert instance.last_pane_text() == "claude exited: boom\nbye"
 
 
+def test_threaded_idle_watcher_retries_unknown_pane_death(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane-death probe that cannot start backs off without reporting exit."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+    retried = threading.Event()
+    attempts = 0
+
+    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
+
+    def _cannot_probe(*args: str) -> NoReturn:
+        del args
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 2:
+            retried.set()
+        raise terminal_mod._TmuxProcessStartError("resource temporarily unavailable")
+
+    instance._tmux_output_sync = _cannot_probe  # type: ignore[method-assign]
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert retried.wait(timeout=3.0)
+    instance._stop_idle_watcher_thread()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_async_idle_watcher_retries_unknown_pane_death(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async watcher also backs off when pane-death liveness is unknown."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = asyncio.Event()
+    retried = asyncio.Event()
+    attempts = 0
+
+    async def _tmux_output(*args: str) -> str:
+        nonlocal attempts
+        if args[0] == "capture-pane":
+            return "steady frame"
+        attempts += 1
+        if attempts >= 2:
+            retried.set()
+        raise terminal_mod._TmuxProcessStartError("resource temporarily unavailable")
+
+    instance._tmux_output = _tmux_output  # type: ignore[method-assign]
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
+
+    instance.start_idle_watcher(lambda: None, on_exit=exited.set)
+
+    await asyncio.wait_for(retried.wait(), timeout=1.0)
+    await instance._stop_idle_watcher()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
 @pytest.mark.asyncio
 async def test_is_alive_false_when_pane_dead(
     tmp_path: Path,
@@ -301,12 +738,7 @@ async def test_is_alive_false_when_pane_dead(
         return _ProcessWithStdout(stdout=b"1\n", returncode=0)
 
     monkeypatch.setattr(
-        terminal_mod,
-        "asyncio",
-        SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
-        ),
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
     instance = TerminalInstance(
@@ -346,12 +778,7 @@ async def test_is_alive_true_when_pane_live(
         return _ProcessWithStdout(stdout=b"0\n", returncode=0)
 
     monkeypatch.setattr(
-        terminal_mod,
-        "asyncio",
-        SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
-        ),
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
     instance = TerminalInstance(
@@ -366,9 +793,108 @@ async def test_is_alive_true_when_pane_live(
     assert instance.running is True
 
 
+@pytest.mark.asyncio
+async def test_is_alive_preserves_running_state_when_probe_cannot_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed fork leaves liveness unknown instead of marking the pane dead."""
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> NoReturn:
+        del cmd, stdout, stderr
+        raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert await instance.is_alive() is True
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_is_alive_false_when_probe_start_failure_is_permanent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permanently missing tmux binary cannot preserve optimistic liveness."""
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> NoReturn:
+        del cmd, stdout, stderr
+        raise FileNotFoundError(errno.ENOENT, "tmux not found")
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert await instance.is_alive() is False
+    assert instance.running is False
+
+
+@pytest.mark.asyncio
+async def test_is_alive_false_when_probe_communication_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OSError after a successful spawn is not a transient start failure."""
+
+    class _CommunicationFailure:
+        returncode = 0
+
+        async def communicate(self) -> NoReturn:
+            raise OSError(errno.EIO, "communication failed")
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _CommunicationFailure:
+        del cmd, stdout, stderr
+        return _CommunicationFailure()
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert await instance.is_alive() is False
+    assert instance.running is False
+
+
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
 @pytest.mark.asyncio
-async def test_server_survives_inner_process_exit_real_tmux(tmp_path: Path) -> None:
+async def test_server_survives_inner_process_exit_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path
+) -> None:
     """
     The private tmux server outlives an inner-process exit (issue #540).
 
@@ -384,7 +910,9 @@ async def test_server_survives_inner_process_exit_real_tmux(tmp_path: Path) -> N
     instance = TerminalInstance(
         name="bash",
         session_key="s1",
-        socket_path=tmp_path / "tmux.sock",
+        # short_tmp_parent (not tmp_path): tmux's AF_UNIX socket path overflows
+        # the macOS 103-byte cap when it embeds pytest's long tmp_path (#4279).
+        socket_path=short_tmp_parent / "tmux.sock",
         private_dir=tmp_path,
         command="sh",
         args=["-c", "exit 0"],
@@ -474,10 +1002,53 @@ async def _capture_launch_argv(
     return captured[0]
 
 
+@pytest.mark.parametrize("version", [(3, 3), (3, 10)])
+def test_require_supported_tmux_accepts_minimum_or_newer(
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int],
+) -> None:
+    """Managed-terminal preflight accepts tmux 3.3 and newer."""
+    monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
+    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+
+    terminal_mod._require_supported_tmux()
+
+
+def test_require_supported_tmux_rejects_missing_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed terminals retain the existing clear missing-tmux error."""
+    monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH"):
+        terminal_mod._require_supported_tmux()
+
+
+@pytest.mark.parametrize(
+    ("version", "message"),
+    [
+        ((3, 2), "tmux 3.2 is too old"),
+        (None, "Could not determine the installed tmux version"),
+    ],
+)
+def test_require_supported_tmux_rejects_old_or_unknown_version(
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int] | None,
+    message: str,
+) -> None:
+    """Managed terminals fail early unless tmux 3.3 support is confirmed."""
+    monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
+    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+
+    with pytest.raises(RuntimeError, match=message):
+        terminal_mod._require_supported_tmux()
+
+
 @pytest.mark.parametrize("keep_alive", [True, False])
 def test_create_terminal_instance_propagates_keep_alive_after_exit(
     tmp_path: Path,
     keep_alive: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     ``create_terminal_instance`` carries ``keep_alive_after_exit`` from the spec
@@ -490,6 +1061,7 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
     :param tmp_path: Temporary directory used as the terminal cwd.
     :param keep_alive: Spec value to propagate.
     """
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
     spec = TerminalEnvSpec(
         command="bash",
         os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)),
@@ -536,6 +1108,61 @@ async def test_launch_omits_keep_alive_options_by_default(
     cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
     assert not contains_subsequence(cmd, ["set-option", "-gq", "remain-on-exit", "on"])
     assert not contains_subsequence(cmd, ["set-option", "-sq", "exit-empty", "off"])
+
+
+@pytest.mark.asyncio
+async def test_launch_enables_tmux_mouse_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Managed terminals enable tmux mouse mode so a native attach can scroll.
+
+    With ``mouse off`` a wheel gesture from a native ``tmux attach`` client is
+    passed through to the pane program, which for an inline CLI such as Codex
+    ignores it, leaving tmux's history unreachable. ``mouse on`` routes the
+    wheel through tmux's ``WheelUpPane`` binding instead.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    assert contains_subsequence(cmd, ["set-option", "-g", "mouse", "on"])
+    assert not contains_subsequence(cmd, ["set-option", "-g", "mouse", "off"])
+
+
+@pytest.mark.asyncio
+async def test_launch_binds_page_up_scrollback_entry_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Managed terminals keep one route into tmux scrollback for attached users.
+
+    The lockdown removes the prefix-key copy-mode entry points (``prefix
+    None``, emptied prefix table) and native clients attach with
+    ``-f /dev/null``, so a keyboard route into the formatted output above the
+    viewport has to be bound explicitly. The binding must pass Page Up through
+    on the alternate screen so full-screen programs keep the key.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    assert contains_subsequence(
+        cmd,
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "PPage",
+            "if-shell",
+            "-F",
+            "#{alternate_on}",
+            "send-keys PPage",
+            "copy-mode -eu",
+        ],
+    )
 
 
 @pytest.mark.asyncio
@@ -604,6 +1231,12 @@ async def test_launch_enables_csi_u_extended_keys_quietly(
     assert contains_subsequence(
         cmd,
         ["set-option", "-sq", "extended-keys-format", "csi-u"],
+    )
+    # tmux copy-mode may export selections to an attached terminal, but pane
+    # applications must not be allowed to create paste buffers through OSC 52.
+    assert contains_subsequence(
+        cmd,
+        ["set-option", "-sq", "set-clipboard", "external"],
     )
 
 
@@ -1336,11 +1969,8 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
     """
     import shutil
 
-    # create_terminal_instance only guards on tmux availability (it does
-    # not launch tmux during construction), so faking the predicate lets
-    # this run in CI without tmux installed — same trick the reaper tests
-    # use — instead of an invisible-coverage-loss skip.
-    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    # Construction enforces tmux compatibility but does not launch tmux.
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
 
     backend_type = "linux_bwrap" if sys.platform == "linux" else "darwin_seatbelt"
     spec = TerminalEnvSpec(

@@ -1,14 +1,14 @@
 """E2E: hover-revealed timestamps on chat message bubbles.
 
-Chat bubbles show their send/receive time on hover next to the Copy/Fork
-controls, without taking permanent vertical space. This drives the full
-browser → SPA → server stack: send a message, wait for the mock-LLM reply,
-and assert for both the user and the assistant bubble that
+Chat bubbles show their send/receive time next to the Copy/Fork controls.
+Earlier rows reveal on hover; the final message row stays partially visible.
+This drives the full browser → SPA → server stack: send a message, wait for
+the mock-LLM reply, and assert for both the user and the assistant bubble that
 
   - the timestamp rides inside the existing 24px action row (no new row),
   - it matches a locale time format (``h:MM AM`` style),
-  - the action row is fully transparent at rest on desktop and reaches full
-    opacity on hover (the hover-reveal contract),
+  - the earlier user row is transparent at rest, while the final assistant
+    row rests at 40% opacity; both reach full opacity on hover,
   - the ordering matches the design target (user: timestamp → Copy at the
     right edge; assistant: Copy/Fork → timestamp at the left edge),
   - the stamp survives a full page reload (server-stamped path, not a
@@ -26,12 +26,15 @@ Selectors:
 from __future__ import annotations
 
 import re
+import sqlite3
 import time
 
 import httpx
 from playwright.sync_api import Browser, Locator, Page, expect
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+from tests.e2e_ui.conftest import _server_state, seed_committed_items
+
+_COMPOSER_PLACEHOLDER = "Send a message…"
 _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
@@ -85,20 +88,6 @@ def _opacity(locator: Locator) -> str:
     return locator.evaluate("el => getComputedStyle(el).opacity")
 
 
-def _wait_opacity(locator: Locator, value: str, timeout_s: float = 5.0) -> None:
-    """Poll the computed opacity until it reaches ``value``.
-
-    ``expect.poll`` is not available in the pinned Playwright, and the
-    hover reveal is a CSS transition (no DOM event to await), so poll.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _opacity(locator) == value:
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"opacity never became {value!r} within {timeout_s}s")
-
-
 def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     page: Page,
     seeded_session: tuple[str, str],
@@ -119,12 +108,12 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
 
     # At rest on a desktop viewport the row is fully transparent — the
     # timestamp must not permanently occupy visual space.
-    assert _opacity(user_row) == "0"
+    expect(user_row).to_have_css("opacity", "0")
     # The row exists at the design's 24px height even while hidden.
     assert round(user_row.bounding_box()["height"]) == 24
 
     user_bubble.hover()
-    _wait_opacity(user_row, "1")
+    expect(user_row).to_have_css("opacity", "1")
 
     # Design order: timestamp → Copy at the bubble's right edge.
     copy_button = user_bubble.get_by_role("button", name="Copy")
@@ -139,11 +128,13 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     expect(assistant_ts).to_have_text(_TIME_RE)
     assistant_row = _action_row(assistant_ts)
 
-    assert _opacity(assistant_row) == "0"
+    # The assistant response is the final message, so its actions remain
+    # partially visible without hover.
+    expect(assistant_row).to_have_css("opacity", "0.4")
     assert round(assistant_row.bounding_box()["height"]) == 24
 
     assistant_bubble.hover()
-    _wait_opacity(assistant_row, "1")
+    expect(assistant_row).to_have_css("opacity", "1")
 
     # Design order: Copy/Fork → timestamp at the bubble's left edge.
     assistant_copy = assistant_bubble.get_by_role("button", name="Copy")
@@ -158,6 +149,99 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     )
     expect(page.locator(_ASSISTANT_BUBBLE).first.locator(_TIMESTAMP)).to_have_text(
         assistant_stamp, timeout=30_000
+    )
+
+
+def test_assistant_bubble_timestamp_tracks_latest_turn_activity(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A multi-item turn's bubble shows the LATEST item's time, not the first.
+
+    Regression: the bubble took the FIRST stamped block of a response
+    group, so a long turn stayed pinned at turn start (30+ minutes stale
+    in the field report) and a refresh reverted to it. Seeds a settled
+    turn whose items span an hour and asserts the hydrated bubble reads
+    the latest item's minute.
+    """
+    from omnigent.db.db_models import uuid_to_bytes
+    from omnigent.entities import MessageData, NewConversationItem
+
+    base_url, session_id = seeded_session
+    response_id = "resp_ts_latest_activity"
+    seed_committed_items(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Long turn probe."}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Turn start."}],
+                    agent="hello_world",
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Turn end."}],
+                    agent="hello_world",
+                ),
+            ),
+        ],
+    )
+    # Spread the turn across an hour: the store stamps created_at at
+    # append time, so backdate directly in the spawned server's sqlite —
+    # the same file the page hydrates from.
+    db_path = str(_server_state["database_uri"]).removeprefix("sqlite:///")
+    turn_end = int(time.time())
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM conversation_items "
+            "WHERE conversation_id = ? AND response_id = ? ORDER BY position",
+            (uuid_to_bytes(session_id), response_id),
+        ).fetchall()
+        assert len(rows) == 3
+        conn.execute(
+            "UPDATE conversation_items SET created_at = ? WHERE id = ?",
+            (turn_end - 3600, rows[1][0]),
+        )
+        conn.execute(
+            "UPDATE conversation_items SET created_at = ? WHERE id = ?",
+            (turn_end, rows[2][0]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    page.goto(f"{base_url}/c/{session_id}")
+    assistant_ts = page.locator(_ASSISTANT_BUBBLE).first.locator(_TIMESTAMP)
+    expect(assistant_ts).to_have_count(1, timeout=30_000)
+
+    # The browser locale decides 12h vs 24h rendering; both describe the
+    # same minute. The turn start is exactly one hour earlier, so it can
+    # never format to either string.
+    end_local = time.localtime(turn_end)
+    twelve_h = (
+        f"{end_local.tm_hour % 12 or 12}:{end_local.tm_min:02d} "
+        f"{'AM' if end_local.tm_hour < 12 else 'PM'}"
+    )
+    twenty_four_h = f"{end_local.tm_hour}:{end_local.tm_min:02d}"
+    stamp = assistant_ts.inner_text()
+    assert stamp in (twelve_h, twenty_four_h), (
+        f"bubble shows {stamp!r}; expected the turn's latest activity "
+        f"({twelve_h!r} or {twenty_four_h!r}), not its start"
     )
 
 

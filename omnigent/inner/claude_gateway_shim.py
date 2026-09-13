@@ -328,7 +328,7 @@ class ClaudeGatewayShim:
                     )
                 await send({"type": "http.response.body", "body": b""})
         except httpx.HTTPError as exc:
-            logger.warning("Claude gateway shim upstream error: %s", exc)
+            logger.exception("Claude gateway shim upstream error: %s", exc)
             error_body = json.dumps(
                 {
                     "type": "error",

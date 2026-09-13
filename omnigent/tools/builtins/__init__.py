@@ -310,11 +310,13 @@ if _hindsight_available():
 # between the reserved-name check and the factory dispatch.
 BUILTIN_NAMES: frozenset[str] = frozenset(_BUILTIN_REGISTRY.keys())
 
-# Subset of names that have a user-facing factory. Used by the
-# onboarding ``list_builtin_tools`` helper, which only lists
-# tools an agent spec can actually enable via
-# ``tools.builtins`` — framework-owned names would just confuse
-# the agent author.
+# Subset of names that have a user-facing factory: the tools an
+# agent spec can actually enable via ``tools.builtins``.
+# The onboarding ``list_builtin_tools`` helper covers the same
+# ground but keeps its own hand-maintained table, because it must
+# not import this package (see that module's docstring), so a new
+# builtin, or a new optional-extra gate, has to be added in both
+# places.
 INSTANTIABLE_BUILTINS: frozenset[str] = frozenset(
     name for name, factory in _BUILTIN_REGISTRY.items() if factory is not None
 )
@@ -355,7 +357,7 @@ def any_skill_has_resources(
     :param skills: The agent's skill list, e.g.
         ``[SkillSpec(name="code-review", ...)]``.
     :returns: ``True`` if at least one skill has a
-        ``skill_dir`` with files in references/, scripts/,
-        or assets/.
+        ``skill_dir`` with files beside SKILL.md, or in
+        references/, scripts/, or assets/.
     """
     return any(list_skill_resources(s) for s in skills)

@@ -80,6 +80,9 @@ def _connect_env(base_env: Mapping[str, str], home: Path) -> dict[str, str]:
     :returns: Environment dict for ``pexpect.spawn``.
     """
     env = dict(base_env)
+    # The suite-level pytest data directory would otherwise override this
+    # test's deliberately isolated HOME in the spawned CLI process.
+    env.pop("OMNIGENT_DATA_DIR", None)
     env["HOME"] = str(home)
     env["TERM"] = "xterm-256color"
     env["LINES"] = "40"

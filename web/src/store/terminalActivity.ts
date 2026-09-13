@@ -13,7 +13,7 @@ interface TerminalActivityState {
  * Fed by the runner-determined ``session.terminal.activity`` SSE event
  * (the runner's pane watcher) and by the mounted terminal's own PTY
  * output. Read by ``useTerminalStatuses`` to drive the "active" badge for
- * ANY terminal — selected or not — without a client PTY attach. This is
+ * ANY terminal — selected or not — without a browser attach. This is
  * what replaced the per-terminal fan-out WebSocket attaches.
  */
 export const useTerminalActivityStore = create<TerminalActivityState>((set) => ({

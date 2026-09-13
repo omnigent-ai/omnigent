@@ -19,11 +19,6 @@ export interface Turn {
   responsePreview: string;
 }
 
-/** Scroll container for the rail; also drives its own scroll for fetch-on-top. */
-interface Scroller {
-  el: HTMLElement;
-}
-
 // Rail scrollTop below which we treat the user as "near the top" and page in
 // older history — mirrors HistoryAutoLoader's transcript threshold.
 const FETCH_TOP_PX = 40;
@@ -36,14 +31,21 @@ const FADE = 32;
 
 export function TurnRail({
   turns,
-  scroller,
   hasMoreHistory,
   loadingMoreHistory,
+  ensureItemVisible,
+  activeTurnId = null,
 }: {
   turns: readonly Turn[];
-  scroller: Scroller | null;
   hasMoreHistory: boolean;
   loadingMoreHistory: boolean;
+  // From the virtualized transcript: pulls a windowed-out turn into the DOM
+  // before a tick click centers on it. Omitted in tests / non-virtualized use.
+  ensureItemVisible?: (id: string) => boolean;
+  // The user turn owning the viewport midpoint, computed by the transcript from
+  // the virtualizer's model (all items, not just the windowed DOM). The rail no
+  // longer scans anchor rects itself — that broke for windowed-out turns.
+  activeTurnId?: string | null;
 }) {
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const railRef = useRef<HTMLDivElement | null>(null);
@@ -62,73 +64,16 @@ export function TurnRail({
   // Last pointer position over the rail, used to pick the settle tick. Starts
   // off-screen so a settle before any pointermove resolves to no element.
   const pointerRef = useRef({ x: -1, y: -1 });
-  // The turn whose content region contains the viewport's vertical midpoint.
-  // Exactly one tick reads as active (black) when the user isn't hovering.
-  const [activeId, setActiveId] = useState<string | null>(null);
+  // The turn whose content region contains the viewport's vertical midpoint —
+  // computed by the transcript from the virtualizer's model and passed in, so
+  // it resolves correctly for turns whose rows are windowed out (which a
+  // DOM-anchor scan here would miss). Exactly one tick reads as active (black)
+  // when the user isn't hovering.
+  const activeId = activeTurnId;
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   // Vertical center of the hovered tick within the rail's own coordinate
   // space, so the (rail-relative) preview box tracks it as the rail scrolls.
   const [previewTop, setPreviewTop] = useState(0);
-  const scrollEl = scroller?.el ?? null;
-
-  // Track the single turn at the viewport's reading position. A turn spans
-  // from its user-message anchor to the next turn's anchor, so the latest
-  // anchor at or above the viewport midpoint owns the center line. This keeps
-  // a long reply associated with its initiating prompt instead of switching
-  // early to whichever user-message anchor happens to be nearest. Clamps to
-  // the first loaded turn when the midpoint is above every available anchor.
-  // At the absolute start of the conversation, the first tick stays active
-  // while its user message remains visible, even if the viewport midpoint has
-  // already crossed into the second turn.
-  // rAF-throttled — scroll fires far faster than we need to recompute, and
-  // reading anchor rects forces layout.
-  useEffect(() => {
-    if (!scrollEl) return;
-    let frame = 0;
-    const recompute = () => {
-      frame = 0;
-      const view = scrollEl.getBoundingClientRect();
-      const midpoint = (view.top + view.bottom) / 2;
-      let firstAvailableId: string | null = null;
-      let nextActiveId: string | null = null;
-      for (const turn of turns) {
-        const anchor = document.querySelector(
-          `[data-user-message-id="${CSS.escape(turn.itemId)}"]`,
-        );
-        if (!anchor) continue;
-        const rect = anchor.getBoundingClientRect();
-        if (firstAvailableId === null) {
-          firstAvailableId = turn.itemId;
-          const firstMessageIsVisible =
-            !hasMoreHistory && rect.bottom > view.top && rect.top < view.bottom;
-          if (firstMessageIsVisible) {
-            nextActiveId = turn.itemId;
-            break;
-          }
-        }
-        if (rect.top <= midpoint) {
-          nextActiveId = turn.itemId;
-        } else {
-          break;
-        }
-      }
-      setActiveId(nextActiveId ?? firstAvailableId);
-    };
-    const schedule = () => {
-      if (frame === 0) frame = requestAnimationFrame(recompute);
-    };
-    // Schedule the initial recompute through the same rAF gate rather than
-    // running it synchronously: `turns` is a fresh array on every stream token,
-    // so a synchronous read here would force a layout pass per token. Deferring
-    // to rAF (and cancelling the pending frame on cleanup) coalesces a burst of
-    // token-level re-renders into at most one layout read per frame.
-    schedule();
-    scrollEl.addEventListener("scroll", schedule, { passive: true });
-    return () => {
-      if (frame !== 0) cancelAnimationFrame(frame);
-      scrollEl.removeEventListener("scroll", schedule);
-    };
-  }, [scrollEl, turns, hasMoreHistory]);
 
   // Keep the active tick reachable in the rail's own viewport as the transcript
   // scrolls, so the highlight tracks your position like a scrollbar thumb.
@@ -346,14 +291,14 @@ export function TurnRail({
               // Keyboard focus shows the preview via onFocus; clear it on blur
               // so tabbing away doesn't leave the preview stranded on-screen.
               onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
-              onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage)}
+              onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage, ensureItemVisible)}
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
               // Full-pitch hit area (h-2.5, no gap between ticks) so clicking
               // anywhere in a tick's band — not just the 2px dash — registers.
               // Matches the hover zone, so any spot that shows the preview also
               // navigates on click. Dash anchored left (justify-start) so the
               // hover-widen grows rightward without nudging the button box.
-              className="group flex h-2.5 w-4 shrink-0 items-center justify-start"
+              className="group flex h-2.5 w-5 shrink-0 cursor-pointer items-center justify-start"
             >
               {/* Dash: subtle by default; black for on-screen turns (or the
                   hovered one); wider only on hover. Transitions keep the color

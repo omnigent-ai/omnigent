@@ -41,12 +41,18 @@ def _set_project_config(base_url: str, project_id: str, config: dict) -> None:
     resp.raise_for_status()
 
 
+def _get_project_config(base_url: str, project_id: str) -> dict:
+    """Read a project's stored config via ``GET /v1/projects/{id}``."""
+    resp = httpx.get(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
+    resp.raise_for_status()
+    return resp.json()["config"]
+
+
 def _open_project_settings(page: Page, project: str) -> None:
     """Open the folder kebab → "Project settings" for *project*."""
-    header = page.get_by_role("button", name=project, exact=True)
-    expect(header).to_be_visible()
-    header.hover()
-    page.get_by_role("button", name=f"Project actions for {project}").click()
+    actions = page.get_by_role("button", name=f"Project actions for {project}", exact=True)
+    expect(actions).to_be_visible()
+    actions.click()
     page.get_by_test_id("project-settings").click()
     # The dialog's Save button confirms the editor mounted + the config fetch
     # settled (Save is disabled while loading).
@@ -122,6 +128,28 @@ def test_project_settings_clears_worktree_toggle(
     expect(page.get_by_test_id("project-settings-worktree")).to_have_attribute(
         "data-state", "unchecked"
     )
+
+
+def test_project_settings_preserves_icon_on_save(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Saving settings preserves config keys owned by other project dialogs."""
+    base_url, session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, project)
+    _set_project_config(base_url, project_id, {"icon": "🔥", "use_worktree": True})
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    _open_project_settings(page, project)
+    expect(page.get_by_test_id("project-settings-worktree")).to_have_attribute(
+        "data-state", "checked"
+    )
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+
+    assert _get_project_config(base_url, project_id) == {"icon": "🔥", "use_worktree": True}
 
 
 def test_project_settings_base_branch_persists(

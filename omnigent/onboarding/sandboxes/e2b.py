@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
@@ -425,7 +426,7 @@ class E2BSandboxLauncher(SandboxLauncher):
                     f"E2B sandbox '{sandbox_id}' not found — it may have passed its "
                     "lifetime cap. Managed sessions provision a replacement on the "
                     "next message; for a CLI host create a fresh one with "
-                    "`omnigent sandbox create --provider e2b`."
+                    f"`{cli_invocation()} sandbox create --provider e2b`."
                 ) from exc
             self._sandboxes[sandbox_id] = handle
         return handle
@@ -591,7 +592,7 @@ class E2BSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 f"E2B sandbox '{sandbox_id}' is not running (it may have passed its "
                 "lifetime cap). Create a fresh one with "
-                "`omnigent sandbox create --provider e2b`."
+                f"`{cli_invocation()} sandbox create --provider e2b`."
             )
 
     def keep_alive(self, sandbox_id: str) -> None:

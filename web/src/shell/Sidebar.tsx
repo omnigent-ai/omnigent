@@ -6,6 +6,7 @@ import {
   type ReactNode,
   type RefObject,
   createContext,
+  memo,
   useCallback,
   useContext,
   useEffect,
@@ -14,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -22,31 +24,38 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
+  CircleAlertIcon,
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
+  GitForkIcon,
   InboxIcon,
   ListChecksIcon,
   ListFilterIcon,
   LaptopIcon,
+  LayoutDashboardIcon,
   Loader2Icon,
   MailIcon,
+  MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   SearchIcon,
   Settings2Icon,
   ShareIcon,
+  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
+  UsersIcon,
   WalletIcon,
   XIcon,
 } from "lucide-react";
@@ -66,7 +75,7 @@ import {
 } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
-import { SidebarHeaderActions } from "./SidebarHeaderActions";
+import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
@@ -101,6 +110,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
   type PinnedConversationsResult,
@@ -115,6 +125,8 @@ import {
   useMoveToProject,
   useDeleteProject,
   useRenameProject,
+  useProjectConfig,
+  useUpdateProjectConfig,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   usePinnedConversations,
@@ -130,27 +142,34 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
+import { showArchiveUndoToast } from "./archiveUndoToast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { ProjectRowIcon } from "./ProjectPicker";
+import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
-import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { useHasSessionDraft } from "@/lib/sessionDrafts";
+import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { useSessionErrors } from "@/hooks/useSessionErrors";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
-  isExplicitlyUnread,
   markConversationUnread,
-  useUnseenTick,
+  useConversationReadState,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
@@ -160,6 +179,11 @@ import {
   readSessionFilter,
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
+import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
+import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { useViewerId } from "@/hooks/useViewerId";
+import { useExtensions } from "@/extensions/ExtensionProvider";
+import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
@@ -176,19 +200,42 @@ import {
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
+  isOwnedByViewer,
+  sessionBelongsToProject,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { TooltipArrow } from "radix-ui/tooltip";
+import { getEmbedRoot } from "../lib/host";
 
-// Positioning for a row's trailing session-state badge. On desktop it shares
-// the controls' right-1 edge and fades on hover so the pin + kebab take its
-// place; on mobile it sits left of the always-visible controls.
+// Positioning for a row's trailing session-state badge. Anchored at the row's
+// trailing icon edge in every viewport: on desktop it fades on hover so the pin
+// + kebab take its place; on mobile those controls are gone, so the badge holds
+// that edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+
+// Small markers (running/starting/unseen dot, or the draft pencil when there's
+// no session state) get a fixed size-6 centered box so their glyph lands 16px
+// from the right edge — lining up vertically with the desktop kebab and the
+// size-6 section-header icons above (the marker column) in every viewport. The
+// "awaiting" pill keeps its natural width — a fixed box would clip its "Needs
+// response" label.
+function isDotMarker(state: SessionState | null): boolean {
+  return state === null || state.kind !== "awaiting";
+}
+const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
 const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
+// Keep a project-folder row highlighted while its actions menu is open (kebab
+// or header context menu, both flagged `data-state=open` inside `group/header`).
+// A right-click opens the context menu in a portal, dropping `:hover` from the
+// header, so the hover highlight alone would leave the row un-highlighted.
+const SIDEBAR_OPEN_MENU_HIGHLIGHT =
+  "group-has-[[data-state=open]]/header:bg-muted group-has-[[data-state=open]]/header:text-foreground dark:group-has-[[data-state=open]]/header:bg-muted/50";
 // Active highlight also wins on hover so active items don't lose their
 // background and flash when the mouse enters them.
 const SIDEBAR_ACTIVE_HIGHLIGHT =
@@ -200,7 +247,20 @@ const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
+// Maps a first-class project id → its chosen emoji icon (only projects that
+// have one), sharing the same list-level lookup as the names map so a row can
+// surface the real project glyph in the pinned flyout without its own query.
+const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
+// Row-invariant values resolved once at the list owner and shared, so a row
+// doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
+// `useViewerId` (an identity-resolve effect) per instance.
+const IsMobileContext = createContext<boolean>(false);
+const ViewerIdContext = createContext<string | null>(null);
+const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
+const RowActivationContext = createContext<
+  (id: string, event: MouseEvent<HTMLAnchorElement>) => void
+>(() => {});
 // Rows report an in-progress inline-rename edit here so ConversationList can
 // hold the sort order for the edit's whole duration — the pointer often
 // leaves the list while typing, and a reorder then would shuffle rows around
@@ -208,18 +268,48 @@ const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // title). See the order-freeze block in ConversationList.
 const RowEditHoldContext = createContext<(id: string, editing: boolean) => void>(() => {});
 
+// Stable callback identity that always runs the latest `fn` — keeps the row
+// handlers from changing on every Sidebar render and defeating the row memo.
+function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn);
+  ref.current = fn;
+  return useCallback((...args: A) => ref.current(...args), []);
+}
+
 function SidebarRowDataProvider({
   projectNamesById,
+  projectIconsById,
   hostsById,
+  isMobile,
+  viewerId,
+  serverInfo,
+  onActivate,
   children,
 }: {
   projectNamesById: Map<string, string>;
+  projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
+  isMobile: boolean;
+  viewerId: string | null;
+  serverInfo: ReturnType<typeof useServerInfo>;
+  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
   children: ReactNode;
 }) {
   return (
     <ProjectNamesContext.Provider value={projectNamesById}>
-      <HostsByIdContext.Provider value={hostsById}>{children}</HostsByIdContext.Provider>
+      <ProjectIconsContext.Provider value={projectIconsById}>
+        <HostsByIdContext.Provider value={hostsById}>
+          <IsMobileContext.Provider value={isMobile}>
+            <ViewerIdContext.Provider value={viewerId}>
+              <ServerInfoContext.Provider value={serverInfo}>
+                <RowActivationContext.Provider value={onActivate}>
+                  {children}
+                </RowActivationContext.Provider>
+              </ServerInfoContext.Provider>
+            </ViewerIdContext.Provider>
+          </IsMobileContext.Provider>
+        </HostsByIdContext.Provider>
+      </ProjectIconsContext.Provider>
     </ProjectNamesContext.Provider>
   );
 }
@@ -296,27 +386,47 @@ interface SidebarProps {
 function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
+  isCanvasPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
+  activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
+  const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
-  const isInboxPage = leaf === "inbox";
-  const isTasksPage = leaf === "tasks";
-  const isUsagePage = leaf === "usage";
+  const isExtensionRoute = extensionPathParts(location.pathname) !== null;
+  const isInboxPage = !isExtensionRoute && leaf === "inbox";
+  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
+  const isTasksPage = !isExtensionRoute && leaf === "tasks";
+  const isUsagePage = !isExtensionRoute && leaf === "usage";
+  const activeExtensionPageId =
+    resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
   const isNewSessionRoute =
-    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage;
+    activeConversationId == null &&
+    !isInboxPage &&
+    !isCanvasPage &&
+    !isTasksPage &&
+    !isUsagePage &&
+    !isExtensionRoute;
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;
   const newSessionProjectName = requestedProject || null;
-  // Exclude inbox/tasks/usage: they also have no `:conversationId`, so they
+  // Exclude non-composer routes: they also have no `:conversationId`, so they
   // would otherwise light up the "New session" button. A project-prefilled
   // new session belongs to that project row instead of the global nav item.
   const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
-  return { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName };
+  return {
+    isNewChatPage,
+    isInboxPage,
+    isCanvasPage,
+    isTasksPage,
+    isUsagePage,
+    activeExtensionPageId,
+    newSessionProjectName,
+  };
 }
 
 /**
@@ -335,18 +445,6 @@ function useActiveNavItem(): {
  *     scrollback is fine; users typically want the conversations list
  *     to stay visible while they switch around.
  */
-/** Toast body shown after archiving a session — links to its new home. */
-function ArchivedToast() {
-  return (
-    <span>
-      View archived sessions in{" "}
-      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
-        Settings
-      </Link>
-    </span>
-  );
-}
-
 /**
  * Compute the set of IDs to add for a shift-click range selection.
  * Returns null when the range can't be computed (missing anchor or id).
@@ -361,11 +459,6 @@ export function computeShiftSelectRange(
   if (anchorIdx === -1 || targetIdx === -1) return null;
   const [start, end] = anchorIdx < targetIdx ? [anchorIdx, targetIdx] : [targetIdx, anchorIdx];
   return visibleIds.slice(start, end + 1);
-}
-
-/** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
-function showArchivedToast() {
-  showToast(<ArchivedToast />);
 }
 
 /** Stable empty array for the pinned-conversations fallback (referential
@@ -466,7 +559,7 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored]);
 }
 
-export function Sidebar({
+function SidebarImpl({
   open,
   onClose,
   onOpen,
@@ -477,6 +570,7 @@ export function Sidebar({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -551,27 +645,94 @@ export function Sidebar({
     [selectionMode, exitSelectionMode],
   );
 
-  // One paginated session list — sessions are no longer split by
-  // connection state, so the sidebar fetches a single undifferentiated
-  // list. Archived sessions are included (`includeArchived: true`) and
-  // peeled into their own "Archived" section at the bottom of the list.
-  // Session search now lives in the command palette (the "Search" button
-  // below), so the sidebar list itself is unfiltered.
+  // All-sessions query — fetches every accessible session (owned + shared)
+  // including archived ones. Used for inbox badge counts and WS reconciliation
+  // so approvals and comment notifications from shared sessions are never missed.
   const conversationsQuery = useConversations("", true, {
     reconcileWhileConnected: true,
+    // Re-render only on fields the sidebar/ConversationList read, so the
+    // live-updates merge's per-frame result-object churn doesn't re-render the
+    // whole row list. Keep in sync with `conversationsQuery.*` reads.
+    notifyOnChangeProps: [
+      "data",
+      "error",
+      "hasNextPage",
+      "isError",
+      "isFetching",
+      "isFetchingNextPage",
+      "isLoading",
+      "fetchNextPage",
+    ],
   });
+
+  // Tab-scoped query — server-filtered for "mine", "shared", or "archived",
+  // disabled on the "all" tab. Paginates only the sessions relevant to the
+  // active tab so the sidebar never churns through hundreds of irrelevant pages
+  // while the user looks at a small filtered set (OMNI-6002).
+  const tabVisibility =
+    activeTab === "mine"
+      ? "mine"
+      : activeTab === "shared"
+        ? "shared"
+        : activeTab === "archived"
+          ? "archived"
+          : undefined;
+  const filteredConversationsQuery = useConversations(
+    "",
+    false,
+    { enabled: tabVisibility !== undefined },
+    undefined,
+    tabVisibility,
+  );
+  // "all" tab reuses the all-sessions query for display; every other tab uses
+  // the server-filtered query so the sentinel only paginates matching sessions.
+  const displayQuery = tabVisibility ? filteredConversationsQuery : conversationsQuery;
+
+  // Bounded background pagination for conversationsQuery (inbox badge / WS
+  // watch-set). On filtered tabs the display sentinel never drives
+  // conversationsQuery, so the badge would stay capped at its initial 30
+  // sessions. We fetch up to BADGE_EXTRA_PAGES extra pages (one at a time,
+  // gated on a ref so we stop and never spam) as soon as the tab mounts.
+  const BADGE_EXTRA_PAGES = 3;
+  const badgeExtraFetched = useRef(0);
+  const lastBadgeTab = useRef<typeof tabVisibility>(undefined);
+  const {
+    hasNextPage: allHasNextPage,
+    isFetchingNextPage: allIsFetching,
+    fetchNextPage: allFetchNextPage,
+  } = conversationsQuery;
+  useEffect(() => {
+    if (!tabVisibility) return;
+    if (lastBadgeTab.current !== tabVisibility) {
+      lastBadgeTab.current = tabVisibility;
+      badgeExtraFetched.current = 0;
+    }
+    if (badgeExtraFetched.current >= BADGE_EXTRA_PAGES) return;
+    if (!allHasNextPage || allIsFetching) return;
+    badgeExtraFetched.current += 1;
+    allFetchNextPage();
+  }, [tabVisibility, allHasNextPage, allIsFetching, allFetchNextPage]);
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
 
-  // Inbox badge — total approval prompts across loaded rows. Same
-  // `pending_elicitations_count` the per-row "awaiting" hand badge
-  // reads (live via WS /v1/sessions/updates), just summed.
-  const loadedRows = useMemo(
-    () => (conversationsQuery.data?.pages ?? []).flatMap((page) => page.data),
-    [conversationsQuery.data],
-  );
+  // Inbox badge — total approval prompts across loaded rows. We read from both
+  // conversationsQuery (all-sessions, page 1 coverage) AND filteredConversationsQuery
+  // (tab-scoped, grows as the user scrolls) so that scrolling any filtered tab
+  // extends badge coverage — the two caches overlap and dedup handles it.
+  const loadedRows = useMemo(() => {
+    const rows = [
+      ...(conversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
+      ...(filteredConversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
+    ];
+    const seen = new Set<string>();
+    return rows.filter((c) => {
+      if (seen.has(c.id)) return false;
+      seen.add(c.id);
+      return true;
+    });
+  }, [conversationsQuery.data, filteredConversationsQuery.data]);
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
   // Plus unseen file comments — the badge counts everything the Inbox
   // page lists. Comment queries are shared with the page/FileViewer
@@ -579,21 +740,26 @@ export function Sidebar({
   const unseenComments = useCommentInbox(loadedRows).items.length;
   const inboxCount = pendingApprovals + unseenComments;
 
-  // Click handler for conversation-row Links in the sidebar. The Link
-  // handles navigation natively, so cmd/ctrl/middle-click opens new
-  // tabs. We still want to close on mobile after a plain primary click,
-  // but NOT for modifier/middle clicks that open a new tab — those
-  // don't change the current view.
-  function onNavClick(e: MouseEvent<HTMLAnchorElement>) {
+  // Row-Link click handler. The Link navigates natively (so modifier/middle
+  // clicks open tabs); we only close the drawer on a plain primary click on
+  // mobile. Stable identity (useStableCallback) so it doesn't defeat the row memo.
+  const onNavClick = useStableCallback((e: MouseEvent<HTMLAnchorElement>) => {
     if (e.defaultPrevented) return;
     if (e.button !== 0) return;
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     if (isMobileViewport()) onClose();
-  }
+  });
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName } =
-    useActiveNavItem();
+  const {
+    isNewChatPage,
+    isInboxPage,
+    isCanvasPage,
+    isTasksPage,
+    isUsagePage,
+    activeExtensionPageId,
+    newSessionProjectName,
+  } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -646,15 +812,13 @@ export function Sidebar({
     () => new Set(pinnedConversations.map((c) => c.id)),
     [pinnedConversations],
   );
-  const togglePinnedConversation = useCallback(
-    (conversationId: string) => {
-      togglePinnedMutation.mutate({
-        id: conversationId,
-        pinned: !pinnedIdSet.has(conversationId),
-      });
-    },
-    [togglePinnedMutation, pinnedIdSet],
-  );
+  // Stable identity (useStableCallback) so its changing deps don't defeat the row memo.
+  const togglePinnedConversation = useStableCallback((conversationId: string) => {
+    togglePinnedMutation.mutate({
+      id: conversationId,
+      pinned: !pinnedIdSet.has(conversationId),
+    });
+  });
 
   // One-time migration: pins used to live only in localStorage. Push any
   // still-local pins up to the server (as the `omnigent.pinned` label) the
@@ -674,6 +838,33 @@ export function Sidebar({
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
 
+  // The mobile drawer is a `fixed inset-0` overlay, so the iOS shell-lock
+  // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
+  // doesn't lift it above the soft keyboard. Pad the drawer's bottom by the
+  // keyboard inset so every session row can still scroll into view while an
+  // inline rename holds the keyboard up. No-op off iOS / keyboard closed.
+  const keyboardInset = useIOSNativeKeyboardInset(effectiveOpen);
+
+  // While the peek card's entry animation is still fading it in, the card is
+  // (nearly) invisible yet already covers the toggle whose hover armed it —
+  // taking pointer events then would swallow a click aimed at that toggle,
+  // landing it on whatever sidebar content sits under the pointer instead.
+  // Stay click-through until the composed entry animation completes.
+  // Children's animations bubble too, so only the card's own end unlocks it.
+  const [peekInteractive, setPeekInteractive] = useState(false);
+  useEffect(() => {
+    if (!peek) {
+      setPeekInteractive(false);
+      return;
+    }
+    // Do not leave the card click-through if animationend is suppressed or missed.
+    const fallback = setTimeout(() => setPeekInteractive(true), 200);
+    return () => clearTimeout(fallback);
+  }, [peek]);
+  const prefersReducedMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
   // While peeking, leaving the card closes it after a short grace period;
   // re-entering before that fires cancels the close so a wobble doesn't
   // dismiss it.
@@ -687,253 +878,262 @@ export function Sidebar({
   useEffect(() => cancelPeekClose, [cancelPeekClose]);
 
   return (
-    <aside
-      aria-label="Conversations"
-      onPointerEnter={cancelPeekClose}
-      onPointerLeave={() => {
-        if (!peek) return;
-        cancelPeekClose();
-        // Defer closing if any context menu is open
-        const tryClose = () => {
-          if (document.querySelector('[role="menu"][data-state="open"]')) {
-            peekCloseTimer.current = setTimeout(tryClose, 200);
-            return;
-          }
-          onClose();
-        };
-        peekCloseTimer.current = setTimeout(tryClose, 200);
-      }}
-      className={cn(
-        // Base: bg + flex column. No transition — expand/collapse snaps
-        // instantly (animating the width also lagged drag-to-resize).
-        // conversations-sidebar only matters under the macOS Electron
-        // shell, where it pushes the card below the traffic lights
-        // (see the [data-electron-mac] rules in index.css).
-        "conversations-sidebar flex flex-col bg-card md:select-none",
-        // Mobile (default): fixed full-screen overlay, slide via
-        // translate-x. Stays edge-to-edge — the floating-card
-        // treatment below is desktop-only.
-        // bg-card-solid (opaque): the overlay sits on top of the chat, and
-        // WebKit drops the glass rule's backdrop-filter once a Radix popper
-        // opens (and never repaints it), letting the chat bleed through the
-        // 60%-alpha glass --card. Desktop keeps the translucent bg-card —
-        // there the sidebar pushes content aside, so nothing sits behind it.
-        "max-md:bg-card-solid",
-        "fixed inset-0 z-50",
-        // Mobile only: animate the slide so the iOS edge-swipe settles
-        // smoothly on release. Suppressed inline while a drag is live (the
-        // overlay must track the finger 1:1). Scoped to transform so it can't
-        // re-introduce the width-animation lag the base comment warns about,
-        // and gated to mobile so the desktop floating card is unaffected.
-        "max-md:transition-transform max-md:duration-200 max-md:ease-out",
-        effectiveOpen ? "translate-x-0" : "-translate-x-full",
-        // Desktop: a full-height panel flush to the window edge, carrying
-        // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
-        // in index.css) and separated from the white content by a right
-        // divider — no outer margin or rounding. Width (the user-resizable
-        // variable) animates →0 to push main; when closed the border
-        // collapses too so nothing lingers.
-        "md:translate-x-0 md:overflow-hidden",
-        // Normal desktop flow: relative panel that pushes main. Suppressed while
-        // peeking so its `md:inset-auto`/`md:relative` don't override the
-        // floating-card positioning below (same `md:` layer, source order wins).
-        !peek && "md:relative md:inset-auto",
-        open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
-        // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
-        // ringed and shadowed, sliding+fading in from the left so it reads as an
-        // overlay rather than a push.
-        peek &&
-          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+    <>
+      {/* Mobile: the drawer stops short of the right edge, leaving a strip of
+      the chat visible; this scrim covers that strip so tapping it dismisses the
+      drawer — the gesture that replaced the collapse icon. Full-bleed and
+      behind the drawer (z-45 vs z-50), so only the strip is actually reachable.
+      Tracks the finger during an edge-swipe drag.
+
+      A labeled <button>, not a bare div: with the collapse toggle gone on
+      mobile this is the drawer's only non-navigational way out, so it has to be
+      reachable by keyboard and announced by a screen reader, not just findable
+      by sighted users with a pointer. Parked, it leaves the tab order and the
+      a11y tree via tabIndex/aria-hidden rather than the `inert` the drawer
+      uses: React 18 doesn't know `inert` as a boolean attribute and drops it,
+      so a focusable control relying on it would stay tabbable while closed.
+
+      z-45, not z-40: chat chrome also sits at z-40 (ChatPage's jump-to-top
+      pill) and renders after the sidebar, so a same-z peer that ever takes
+      pointer events would win the tie inside the exposed strip and swallow the
+      dismiss. Strictly between chat chrome and the drawer's z-50. */}
+      {!inSettings && (
+        <button
+          type="button"
+          data-testid="sidebar-scrim"
+          aria-label="Close sidebar"
+          onClick={onClose}
+          tabIndex={effectiveOpen ? 0 : -1}
+          aria-hidden={!effectiveOpen}
+          className={cn(
+            "fixed inset-0 z-[45] bg-black/25 transition-opacity duration-200 ease-out md:hidden",
+            effectiveOpen ? "opacity-100" : "pointer-events-none opacity-0",
+          )}
+          style={dragging ? { opacity: dragProgress, transition: "none" } : undefined}
+        />
       )}
-      style={
-        {
-          "--sidebar-width": `${sidebarWidth}px`,
-          // Track the finger: map the 0→1 open fraction to translateX
-          // -100%→0% and kill the transition so it follows the drag exactly.
-          ...(dragging
-            ? { transform: `translateX(${(dragProgress - 1) * 100}%)`, transition: "none" }
-            : null),
-        } as CSSProperties
-      }
-      // Hide from the accessibility tree when closed so screen readers
-      // don't see the empty-state contents while focus is elsewhere.
-      aria-hidden={!effectiveOpen}
-      data-collapsed={!effectiveOpen || undefined}
-      // Match the keyboard-focus story: when closed, the sidebar's
-      // children shouldn't receive tabs.
-      inert={!effectiveOpen}
-    >
-      {/* Right-edge resize handle (desktop only), mirroring the right rail's
+      <aside
+        aria-label="Conversations"
+        onAnimationEnd={(event) => {
+          if (event.target === event.currentTarget) setPeekInteractive(true);
+        }}
+        onPointerEnter={cancelPeekClose}
+        onPointerLeave={() => {
+          if (!peek) return;
+          cancelPeekClose();
+          // Defer closing if any context menu is open
+          const tryClose = () => {
+            if (document.querySelector('[role="menu"][data-state="open"]')) {
+              peekCloseTimer.current = setTimeout(tryClose, 200);
+              return;
+            }
+            onClose();
+          };
+          peekCloseTimer.current = setTimeout(tryClose, 200);
+        }}
+        className={cn(
+          // Base: bg + flex column. No transition — expand/collapse snaps
+          // instantly (animating the width also lagged drag-to-resize).
+          // conversations-sidebar only matters under the macOS Electron
+          // shell, where it pushes the card below the traffic lights
+          // (see the [data-electron-mac] rules in index.css).
+          "conversations-sidebar flex flex-col bg-card md:select-none",
+          // Mobile (default): a fixed drawer that slides in via translate-x
+          // and stops short of the right edge, leaving a tappable strip of the
+          // chat behind it. The floating-card treatment below is desktop-only.
+          // bg-card-solid (opaque): the overlay sits on top of the chat, and
+          // WebKit drops the glass rule's backdrop-filter once a Radix popper
+          // opens (and never repaints it), letting the chat bleed through the
+          // 60%-alpha glass --card. Desktop keeps the translucent bg-card —
+          // there the sidebar pushes content aside, so nothing sits behind it.
+          "max-md:bg-card-solid",
+          // `max-md:right-14` is the ChatGPT-style peek strip: the drawer covers
+          // most of the phone but stops short of the right edge so the chat stays
+          // visible (and tappable through the scrim) behind it.
+          "fixed inset-0 z-50",
+          // The settings nav takes the sidebar over and its "Back" row is the
+          // only way out, so there the drawer stays full-bleed (and gets no
+          // dismiss scrim) rather than offering a tap that strands the user.
+          !inSettings && "max-md:right-14",
+          // Mobile only: animate the slide so the iOS edge-swipe settles
+          // smoothly on release. Suppressed inline while a drag is live (the
+          // overlay must track the finger 1:1). Scoped to transform so it can't
+          // re-introduce the width-animation lag the base comment warns about,
+          // and gated to mobile so the desktop floating card is unaffected.
+          "max-md:transition-transform max-md:duration-200 max-md:ease-out",
+          effectiveOpen ? "translate-x-0" : "-translate-x-full",
+          // Desktop: a full-height panel flush to the window edge, carrying
+          // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
+          // in index.css) and separated from the white content by a right
+          // divider — no outer margin or rounding. Width (the user-resizable
+          // variable) animates →0 to push main; when closed the border
+          // collapses too so nothing lingers.
+          "md:translate-x-0 md:overflow-hidden",
+          // Normal desktop flow: relative panel that pushes main. Suppressed while
+          // peeking so its `md:inset-auto`/`md:relative` don't override the
+          // floating-card positioning below (same `md:` layer, source order wins).
+          !peek && "md:relative md:inset-auto",
+          open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+          // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
+          // ringed and shadowed, sliding+fading in from the left so it reads as an
+          // overlay rather than a push.
+          peek &&
+            "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+          // Click-through while fading in (see peekInteractive above): the
+          // click falls through to the header toggle underneath, which pins
+          // the sidebar open — what the user aimed for.
+          peek && !prefersReducedMotion && !peekInteractive && "pointer-events-none",
+        )}
+        style={
+          {
+            "--sidebar-width": `${sidebarWidth}px`,
+            ...(keyboardInset > 0 ? { paddingBottom: keyboardInset } : null),
+            // Track the finger: map the 0→1 open fraction to translateX
+            // -100%→0% and kill the transition so it follows the drag exactly.
+            ...(dragging
+              ? { transform: `translateX(${(dragProgress - 1) * 100}%)`, transition: "none" }
+              : null),
+          } as CSSProperties
+        }
+        // Hide from the accessibility tree when closed so screen readers
+        // don't see the empty-state contents while focus is elsewhere.
+        aria-hidden={!effectiveOpen}
+        data-collapsed={!effectiveOpen || undefined}
+        // Match the keyboard-focus story: when closed, the sidebar's
+        // children shouldn't receive tabs.
+        inert={!effectiveOpen}
+      >
+        {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
           full-screen overlay with no resize affordance; the parent's ``inert``
           when closed also keeps it from being draggable while collapsed.
           Hidden while peeking too — the peek card is a fixed-width flyout, not
           a resizable panel. */}
-      {!peek && (
-        <div
-          {...resizeHandleProps}
-          className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
-        />
-      )}
-      {inSettings ? (
-        <SettingsSidebarBody onNavClick={onNavClick} />
-      ) : (
-        <>
-          {/* sidebar-header-row is the hook for the macOS Electron shell, where
+        {!peek && (
+          <div
+            {...resizeHandleProps}
+            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+          />
+        )}
+        {inSettings ? (
+          <SettingsSidebarBody onNavClick={onNavClick} />
+        ) : (
+          <>
+            {/* sidebar-header-row is the hook for the macOS Electron shell, where
           this row shares the window's top strip with the traffic lights: the
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-          <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
-            {/* Brand mark doubles as the "home" affordance: clicking it
+            <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+              {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
             session. Reuses onNavClick so a plain primary click closes
             the sidebar on mobile (where it's a full-screen overlay) but
             modifier/middle clicks still open `/` in a new tab. */}
-            <Link
-              to="/"
-              onClick={onNavClick}
-              data-testid="sidebar-brand"
-              className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
-            >
-              {branding.app_name ? (
-                <span className="text-[15px] font-semibold tracking-tight">
-                  {branding.app_name}
-                </span>
-              ) : (
-                <img
-                  src={omnigentWordmark}
-                  alt="Omnigent"
-                  data-testid="sidebar-wordmark"
-                  className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
-                />
-              )}
-            </Link>
-            {/* On the macOS shell this copy is hidden and an identical cluster
+              <Link
+                to="/"
+                onClick={onNavClick}
+                data-testid="sidebar-brand"
+                componentId="sidebar.home"
+                className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
+              >
+                {branding.app_name ? (
+                  <span className="text-[15px] font-semibold tracking-tight">
+                    {branding.app_name}
+                  </span>
+                ) : (
+                  <img
+                    src={omnigentWordmark}
+                    alt="Omnigent"
+                    data-testid="sidebar-wordmark"
+                    className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
+                  />
+                )}
+              </Link>
+              {/* On the macOS shell this copy is hidden and an identical cluster
             renders in the title-bar strip instead (see AppShell), so the icons
             keep their place when the sidebar collapses or peeks. Everywhere
             else this is the only copy. */}
-            <SidebarHeaderActions
-              expanded={!peek}
-              // onOpen is optional (the sidebar renders standalone in tests), so
-              // fall back to a no-op rather than widening the child's contract.
-              onToggle={peek ? () => onOpen?.() : onClose}
-              onOpenSearch={onOpenSearch}
-            />
-          </div>
+              <SidebarHeaderActions
+                expanded={!peek}
+                // onOpen is optional (the sidebar renders standalone in tests), so
+                // fall back to a no-op rather than widening the child's contract.
+                onToggle={peek ? () => onOpen?.() : onClose}
+                onOpenSearch={onOpenSearch}
+              />
+            </div>
 
-          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
-            {/* "New session" routes to the home composer ("/"), which now owns
+            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+              {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
             tab; onNavClick still closes the sidebar on a plain mobile tap. */}
-            <Button
-              asChild
-              className={cn(
-                // px-2 + gap-2 puts the icon on the sidebar's left (red) column
-                // and the label on the label (blue) column — matching section
-                // headers and project folders. border-0 drops the Button base's
-                // transparent 1px border so the icon lands exactly on that
-                // column, flush with the Inbox row and folder rows.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              variant="ghost"
-              data-testid="new-chat-button"
-            >
-              {/* New session always creates a session the viewer owns, which
+              <Button
+                asChild
+                className={cn(
+                  // px-2 + gap-2 puts the icon on the sidebar's left (red) column
+                  // and the label on the label (blue) column — matching section
+                  // headers and project folders. border-0 drops the Button base's
+                  // transparent 1px border so the icon lands exactly on that
+                  // column, flush with the Inbox row and folder rows.
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                variant="ghost"
+                data-testid="new-chat-button"
+              >
+                {/* New session always creates a session the viewer owns, which
               lands under "My sessions" — so snap the tab back there on click
               (the button stays visible on both tabs). */}
-              <Link
-                to="/"
-                onClick={(e) => {
-                  switchTab("mine");
-                  onNavClick(e);
-                }}
-              >
-                <SquarePenIcon
-                  className={cn(
-                    "ui-icon",
-                    isNewChatPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                New session
-              </Link>
-            </Button>
-            {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
-            <Button
-              asChild
-              className={cn(
-                // Same shared nav-row construct as "New session" / "Inbox" so
-                // the active-pill, hover, insets, icon column, and text weight
-                // all match post-refactor.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              variant="ghost"
-              data-testid="scheduled-tasks-nav"
-            >
-              <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon
-                  className={cn(
-                    "ui-icon",
-                    isTasksPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Automations
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              data-testid="inbox-button"
-            >
-              <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon
-                  className={cn(
-                    "ui-icon",
-                    isInboxPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Inbox
-                {inboxCount > 0 && (
-                  <span
-                    aria-label={
-                      inboxCount === 1
-                        ? "1 inbox item waiting"
-                        : `${inboxCount} inbox items waiting`
-                    }
+                <Link
+                  to="/"
+                  componentId="sidebar.new_chat"
+                  onClick={(e) => {
+                    switchTab("mine");
+                    onNavClick(e);
+                  }}
+                >
+                  <SquarePenIcon
                     className={cn(
-                      "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
-                      // The active Inbox row already paints the translucent
-                      // --sidebar-active wash; repainting it on the nested
-                      // badge would double-composite to a darker fill.
-                      isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      "ui-icon",
+                      isNewChatPage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
                     )}
-                  >
-                    {inboxCount}
-                  </span>
+                  />
+                  New session
+                </Link>
+              </Button>
+              {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
+              <Button
+                asChild
+                className={cn(
+                  // Same shared nav-row construct as "New session" / "Inbox" so
+                  // the active-pill, hover, insets, icon column, and text weight
+                  // all match post-refactor.
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
-              </Link>
-            </Button>
-            {usagePageEnabled && (
+                variant="ghost"
+                data-testid="scheduled-tasks-nav"
+              >
+                <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
+                  <ClockIcon
+                    className={cn(
+                      "ui-icon",
+                      isTasksPage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Automations
+                </Link>
+              </Button>
               <Button
                 asChild
                 variant="ghost"
@@ -941,64 +1141,143 @@ export function Sidebar({
                   SIDEBAR_ROW,
                   "w-full justify-start border-0 font-normal",
                   SIDEBAR_HOVER_HIGHLIGHT,
-                  isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
-                data-testid="usage-nav"
+                data-testid="inbox-button"
               >
-                <Link to="/usage" onClick={onNavClick}>
-                  <WalletIcon
+                <Link to="/inbox" onClick={onNavClick} componentId="sidebar.inbox">
+                  <InboxIcon
                     className={cn(
                       "ui-icon",
-                      isUsagePage
+                      isInboxPage
                         ? "text-[var(--sidebar-active-foreground)]"
                         : "text-muted-foreground",
                     )}
                   />
-                  Usage
+                  Inbox
+                  {inboxCount > 0 && (
+                    <span
+                      aria-label={
+                        inboxCount === 1
+                          ? "1 inbox item waiting"
+                          : `${inboxCount} inbox items waiting`
+                      }
+                      className={cn(
+                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                        // The active Inbox row already paints the translucent
+                        // --sidebar-active wash; repainting it on the nested
+                        // badge would double-composite to a darker fill.
+                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      )}
+                    >
+                      {inboxCount}
+                    </span>
+                  )}
                 </Link>
               </Button>
-            )}
-          </div>
+              {canvasEnabled && (
+                <PrimaryNavLink
+                  to="/canvas"
+                  label="Canvas"
+                  icon={LayoutDashboardIcon}
+                  active={isCanvasPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.canvas"
+                  testId="canvas-nav"
+                />
+              )}
+              <ExtensionPrimaryNavigation
+                activePageId={activeExtensionPageId}
+                onNavigate={onNavClick}
+              />
+              {usagePageEnabled && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="usage-nav"
+                >
+                  <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
+                    <WalletIcon
+                      className={cn(
+                        "ui-icon",
+                        isUsagePage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Usage
+                  </Link>
+                </Button>
+              )}
+            </div>
 
-          <nav
-            ref={scrollContainerRef}
-            // Keep wheel/touch scrolling without letting classic-scrollbar
-            // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          >
-            <ConversationList
-              conversationsQuery={conversationsQuery}
-              scrollContainerRef={scrollContainerRef}
-              onRowClick={onNavClick}
-              searchQuery=""
-              newSessionProjectName={newSessionProjectName}
-              activeTab={activeTab}
-              onActiveTabChange={switchTab}
-              multiUser={multiUser}
-              pinnedConversationIds={pinnedConversationIds}
-              pinnedConversations={pinnedConversations}
-              onTogglePinned={togglePinnedConversation}
-              onEnterSelectionMode={enterSelectionMode}
-              selectionMode={selectionMode}
-              selectionScope={selectionScope}
-              selectedIds={selectedIds}
-              onToggleSelected={toggleSelected}
-              onDeselectAll={deselectAll}
-              onExitSelectionMode={exitSelectionMode}
-              getVisibleIdsRef={getVisibleIdsRef}
-            />
-          </nav>
+            {/* Wrapper (not the `aside`) anchors the floating Settings button:
+          absolute-positioning inside the aside would place it in the native
+          safe-area padding, under the home indicator. */}
+            <div className="relative flex min-h-0 flex-1 flex-col">
+              <nav
+                ref={scrollContainerRef}
+                // Keep wheel/touch scrolling without letting classic-scrollbar
+                // platforms reserve a wide, permanently visible Sidebar gutter.
+                // max-md:pb-14 is the floating Settings chip's clearance: the
+                // chip is a non-scrolling sibling pinned bottom-right, so
+                // without a gutter the last row's always-visible kebab parks
+                // underneath it and can't be tapped.
+                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-16 [&::-webkit-scrollbar]:hidden"
+              >
+                <ConversationList
+                  conversationsQuery={displayQuery}
+                  scrollContainerRef={scrollContainerRef}
+                  onRowClick={onNavClick}
+                  searchQuery=""
+                  newSessionProjectName={newSessionProjectName}
+                  activeTab={activeTab}
+                  onActiveTabChange={switchTab}
+                  multiUser={multiUser}
+                  pinnedConversationIds={pinnedConversationIds}
+                  pinnedConversations={pinnedConversations}
+                  onTogglePinned={togglePinnedConversation}
+                  onEnterSelectionMode={enterSelectionMode}
+                  selectionMode={selectionMode}
+                  selectionScope={selectionScope}
+                  selectedIds={selectedIds}
+                  onToggleSelected={toggleSelected}
+                  onDeselectAll={deselectAll}
+                  onExitSelectionMode={exitSelectionMode}
+                  getVisibleIdsRef={getVisibleIdsRef}
+                />
+              </nav>
+              {/* Mobile: Settings floats over the bottom of the session list, with
+          Search floating at the top of the header row — the two icons the
+          drawer keeps once the collapse toggle is gone. */}
+              <SidebarSettingsButton
+                testId="sidebar-settings-float"
+                className="absolute right-3 bottom-3 md:hidden"
+              />
+            </div>
 
-          {/* Desktop server picker, pinned below the scrolling session list.
-          Self-hiding: renders nothing outside the Electron shell (see
-          SidebarServerPicker), so browsers keep an unchanged sidebar that ends
-          with the list. */}
-          <SidebarServerPicker />
-        </>
-      )}
-    </aside>
+            {/* Native-shell server picker, pinned below the scrolling session
+          list. Self-hiding: renders nothing outside a shell with the picker
+          bridge (see SidebarServerPicker), so browsers keep an unchanged
+          sidebar that ends with the list. */}
+            <SidebarServerPicker />
+          </>
+        )}
+      </aside>
+    </>
   );
 }
+
+// Memoized so AppShell's frequent re-renders (chatStore status churn during a
+// bind) don't re-render the whole sidebar — its props are stable per switch
+// (AppShell stabilizes the callbacks with useCallback).
+export const Sidebar = memo(SidebarImpl);
 
 /**
  * Auto-loading pagination control. An IntersectionObserver fetches the next
@@ -1071,10 +1350,11 @@ function InfiniteScrollSentinel({
 function ProjectFolder({
   name,
   projectId,
+  icon,
   windowConversations,
+  activeConversationId,
   expanded,
   active,
-  marker,
   onToggleCollapsed,
   pinnedConversationIds,
   activeOverride,
@@ -1091,14 +1371,19 @@ function ProjectFolder({
   name: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** Chosen emoji icon (unicode grapheme), or null/absent for the default
+      folder glyph. */
+  icon?: string | null;
   /** This folder's members from the globally-loaded window (may lag or lead
       the folder's own pages — e.g. a just-moved row carries its optimistic
       membership here before the folder query returns it). */
   windowConversations: Conversation[];
+  /** The active conversation's resolved top-level root id (see
+      ConversationSection) — forwarded to the folder's section for row highlight. */
+  activeConversationId: string | null;
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
-  marker: SessionState | null;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
   activeOverride: ActiveChatOverride | null;
@@ -1136,6 +1421,11 @@ function ProjectFolder({
       frozenSortKeys,
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
+  const errors = useSessionErrors(conversations);
+  const startingConversationId = useChatStore((s) =>
+    s.status === "streaming" || s.terminalPending ? s.conversationId : null,
+  );
+  const marker = projectMarkerState(conversations, errors, startingConversationId);
 
   // Publish the folder's rendered rows upward so projects-scope bulk selection
   // resolves them (the parent sources its action set from these, not the global
@@ -1157,6 +1447,12 @@ function ProjectFolder({
     data: { type: "project", name },
   });
 
+  const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(
+    name,
+    projectId,
+    icon,
+  );
+
   return (
     <div
       ref={setNodeRef}
@@ -1169,7 +1465,9 @@ function ProjectFolder({
       <ConversationSection
         title={name}
         icon={
-          expanded ? (
+          icon ? (
+            <span className="text-[14px] leading-none">{icon}</span>
+          ) : expanded ? (
             <FolderOpenIcon
               className={cn(
                 "ui-icon",
@@ -1188,6 +1486,7 @@ function ProjectFolder({
         active={active}
         marker={marker}
         conversations={conversations}
+        activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
         // Projects default collapsed: shown only when explicitly expanded.
         collapsed={!expanded}
@@ -1218,7 +1517,19 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} projectId={projectId} onNavigate={onRowClick} />
+          <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
+        }
+        // Touch exposes these actions through the header's long-press menu.
+        actionHoverOnly
+        headerContextMenu={
+          <ContextMenuContent className="min-w-40">
+            <ProjectFolderMenuItems
+              components={contextBundle}
+              projectName={name}
+              onNavigate={onRowClick}
+              actions={menuActions}
+            />
+          </ContextMenuContent>
         }
         footer={
           loadingFirstPage ? (
@@ -1234,6 +1545,7 @@ function ProjectFolder({
           )
         }
       />
+      {menuDialogs}
     </div>
   );
 }
@@ -1265,50 +1577,6 @@ interface ConversationListProps {
   getVisibleIdsRef: RefObject<() => string[]>;
 }
 
-// Ownership drives the My-vs-Shared split and every owner-only row action.
-// It is derived purely from the session's `owner` (the creator's user id),
-// NOT from `permission_level` — the sidebar carries no effective-level info,
-// so the server can list rows without resolving the caller's grant per
-// session. A `null`/absent owner (permissions disabled — the server emits
-// `owner` only when a permission store is wired) reads as owned, matching the
-// prior permissive-on-null stance; otherwise the viewer owns it iff they are
-// the owner. In single-user mode the owner grant is the reserved `"local"`
-// id, and `viewerId` is `"local"` too (see `useViewerId`), so it matches via
-// the equality branch. `viewerId` is `null` until identity resolves — treated
-// as "not the owner" for shared rows so they don't briefly flash into "My
-// sessions" before the id lands.
-function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
-  const owner = conversation.owner ?? null;
-  if (owner === null) return true;
-  return owner === viewerId;
-}
-
-// The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
-// (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
-// grant, which in single-user mode is the reserved `"local"` id — and
-// `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
-// would make the viewer's own sessions read as shared and vanish from the
-// default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
-// identical real email in multi-user mode. It is synchronous (populated once
-// `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
-// cold mount it can still be null for a tick, so we also await
-// `resolveIdentity()` and re-render when it lands. Keeping this reactive
-// (rather than a bare module read) means the My/Shared split settles correctly
-// the moment identity is known, without a manual refresh.
-function useViewerId(): string | null {
-  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
-  useEffect(() => {
-    let cancelled = false;
-    void resolveIdentity().then(() => {
-      if (!cancelled) setViewerId(getCurrentUserId());
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return viewerId;
-}
-
 function ConversationList({
   conversationsQuery,
   scrollContainerRef,
@@ -1330,8 +1598,11 @@ function ConversationList({
   onExitSelectionMode,
   getVisibleIdsRef,
 }: ConversationListProps) {
-  // Viewer id for the owner-based My/Shared split below.
+  // Row-invariant values resolved once here and shared with rows via context
+  // (see IsMobileContext etc.), so each row doesn't run its own copy.
   const viewerId = useViewerId();
+  const isMobile = useIsMobileViewport();
+  const serverInfo = useServerInfo();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
   // owner so ordinary rows do not each create their own polling observer.
   const { data: hosts = [] } = useHosts({ includeSandbox: true });
@@ -1360,11 +1631,34 @@ function ConversationList({
     return map;
   }, [projects]);
 
+  // id → emoji icon for rows that want to show the real project glyph (e.g. the
+  // pinned flyout); built alongside the names map and shared the same way.
+  const projectIconsById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of projects) {
+      if (p.id !== null && p.icon) map.set(p.id, p.icon);
+    }
+    return map;
+  }, [projects]);
+
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
   // out from under you. Snapshot is dropped on navigate-away so the
   // chat snaps back to its real position once you've left.
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
+  // Resolve the active conversation's top-level root once here (rows get a plain
+  // `isActive` prop, not their own query). Falls back to the raw id while the
+  // parent walk loads — a top-level session resolves to itself.
+  const activeRootSessionId = useActiveRootSessionId(activeId ?? null);
+  const resolvedActiveId = activeRootSessionId ?? activeId ?? null;
+  const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
+  useEffect(() => setOptimisticActiveId(null), [activeId]);
+  const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    setOptimisticActiveId(id);
+  }, []);
+  const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
   useEffect(() => {
     setActiveOverride((prev) => computeNextActiveOverride(activeId, allConversations, prev));
@@ -1442,24 +1736,26 @@ function ConversationList({
     // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
     const filedIds = new Set<string>();
-    const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
-      projects.map(({ id, name }) => {
-        // Dual-read membership: a session belongs to this folder if it has
-        // the first-class id OR the legacy omni_project label of this name,
-        // and (filing being owner-only) the viewer owns it.
-        const inProject = notArchived.filter(
-          (c) =>
-            isOwnedByViewer(c, viewerId) &&
-            ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-            !pinnedIdSet.has(c.id),
-        );
-        inProject.forEach((c) => filedIds.add(c.id));
-        return {
-          id,
-          name,
-          conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
-        };
-      });
+    const projectGroups: {
+      id: string | null;
+      name: string;
+      icon?: string | null;
+      conversations: Conversation[];
+    }[] = projects.map(({ id, name, icon }) => {
+      // Dual-read membership: a session belongs to this folder if it has
+      // the first-class id OR the legacy omni_project label of this name,
+      // and (filing being owner-only) the viewer owns it.
+      const inProject = notArchived.filter(
+        (c) => sessionBelongsToProject(c, { id, name }, viewerId) && !pinnedIdSet.has(c.id),
+      );
+      inProject.forEach((c) => filedIds.add(c.id));
+      return {
+        id,
+        name,
+        icon,
+        conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+      };
+    });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
@@ -1830,7 +2126,15 @@ function ConversationList({
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
   return (
-    <SidebarRowDataProvider projectNamesById={projectNamesById} hostsById={hostsById}>
+    <SidebarRowDataProvider
+      projectNamesById={projectNamesById}
+      projectIconsById={projectIconsById}
+      hostsById={hostsById}
+      isMobile={isMobile}
+      viewerId={viewerId}
+      serverInfo={serverInfo}
+      onActivate={activateRow}
+    >
       <DndContext
         sensors={sensors}
         collisionDetection={pointerWithin}
@@ -1886,6 +2190,7 @@ function ConversationList({
                     <ConversationSection
                       title="Pinned"
                       conversations={sections.pinned}
+                      activeConversationId={displayedActiveId}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Pinned")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
@@ -1942,12 +2247,11 @@ function ConversationList({
                       key={group.name}
                       name={group.name}
                       projectId={group.id}
+                      icon={group.icon}
                       windowConversations={group.conversations}
+                      activeConversationId={displayedActiveId}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
-                      // Best-effort marker from the globally-loaded window: a
-                      // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
                       onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                       pinnedConversationIds={pinnedConversationIds}
                       activeOverride={activeOverride}
@@ -1983,6 +2287,7 @@ function ConversationList({
                     <ConversationSection
                       title="Sessions"
                       conversations={sections.sessions}
+                      activeConversationId={displayedActiveId}
                       emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
@@ -2060,15 +2365,22 @@ function ConversationList({
             )}
           </div>
         </RowEditHoldContext.Provider>
-        {/* The dragged row's preview follows the pointer (rendered in a portal),
-          a compact card showing the session's title. */}
-        <DragOverlay dropAnimation={null}>
-          {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
-              {activeDrag.label}
-            </div>
-          ) : null}
-        </DragOverlay>
+        {/* The dragged row's preview follows the pointer: a compact card showing
+          the session's title. Portaled to <body>: the aside always carries a CSS
+          translate (the mobile slide-in), which makes it the containing block for
+          fixed descendants, so an inline overlay would resolve its viewport
+          coordinates against the aside's box and drift off the cursor whenever
+          the aside sits away from (0,0) — e.g. the floating peek card. */}
+        {createPortal(
+          <DragOverlay dropAnimation={null}>
+            {activeDrag ? (
+              <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
+                {activeDrag.label}
+              </div>
+            ) : null}
+          </DragOverlay>,
+          getEmbedRoot() ?? document.body,
+        )}
       </DndContext>
     </SidebarRowDataProvider>
   );
@@ -2149,123 +2461,215 @@ function UngroupDropZone() {
   );
 }
 
-/**
- * Aggregate the sidebar marker for a project from its conversations, using
- * the same precedence a row uses (awaiting > unseen > running). Returned as a
- * {@link SessionState} so a collapsed project header can render the exact
- * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
- */
-function projectMarkerState(conversations: Conversation[]): SessionState | null {
+/** Surface the most actionable state across a collapsed project's loaded rows. */
+function projectMarkerState(
+  conversations: Conversation[],
+  errors: readonly boolean[],
+  startingConversationId: string | null,
+): SessionState | null {
   let awaiting = 0;
-  let unseen = false;
   let running = false;
-  for (const c of conversations) {
-    const pending = c.pending_elicitations_count ?? 0;
-    if (pending > 0) {
-      awaiting += pending;
+  let starting = false;
+  let error = false;
+  let unseen = false;
+  for (const [i, c] of conversations.entries()) {
+    const state = getSessionState(c, errors[i]);
+    if (state?.kind === "awaiting") {
+      awaiting += state.count;
+    } else if (state?.kind === "running") {
+      running = true;
+    } else if (c.id === startingConversationId) {
+      starting = true;
+    } else if (state?.kind === "error") {
+      error = true;
     } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
       unseen = true;
-    } else if (c.status === "running") {
-      running = true;
     }
   }
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
-  if (unseen) return { kind: "unseen" };
   if (running) return { kind: "running" };
+  if (starting) return { kind: "starting" };
+  if (error) return { kind: "error" };
+  if (unseen) return { kind: "unseen" };
   return null;
 }
 
 // The shared collapsible header used by every sidebar section and section
-// group, so they all align and animate identically (icon · title · marker ·
-// hover-chevron). Headers carry no count badge.
+// group, so they all align and animate identically (icon · title ·
+// hover-chevron · collapsed marker).
 function SectionHeader({
   title,
   icon,
   marker,
   active = false,
   hasAction,
+  actionHoverOnly,
+  hasPersistentAction,
+  actionFocusVisible,
   collapsed,
   onToggleCollapsed,
+  contextMenu,
+  contextMenuDisabled,
 }: {
   title: string;
   icon?: ReactNode;
   marker?: SessionState | null;
   /** Whether this header represents the current page context. */
   active?: boolean;
-  /** Whether the section also renders a hover-revealed header action (the
-      project-folder kebab), which shares the header's right edge with the
-      collapsed marker. */
+  /** Whether the section also renders header controls overlaid at the right
+      edge. Those overlays are painted whenever hover isn't available (phones,
+      touch tablets/laptops at any width), so the collapsed badges reserve the
+      full control column there; only at rest on hover-capable desktops do the
+      badges return to the rows' badge column. */
   hasAction?: boolean;
+  /** Whether the header action is absent without a fine hover pointer. */
+  actionHoverOnly?: boolean;
+  /** Whether an always-visible control sits at the header's right edge (the
+      Sessions filter), which the collapsed badges must clear even at rest on
+      hover-capable desktops. */
+  hasPersistentAction?: boolean;
+  /** Match badge fades to an overlay revealed by focus-visible rather than
+      focus-within. Section groups use this to ignore pointer-returned focus. */
+  actionFocusVisible?: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Optional context-menu content for the header button. */
+  contextMenu?: ReactNode;
+  /** Suppresses the header context menu while another interaction owns it. */
+  contextMenuDisabled?: boolean;
 }) {
-  return (
-    <h2>
-      <button
-        type="button"
-        aria-expanded={!collapsed}
-        aria-current={active ? "page" : undefined}
-        onClick={onToggleCollapsed}
-        className={
-          icon
-            ? cn(
-                SIDEBAR_ROW,
-                "group flex w-full items-center border-0 text-left text-foreground transition-colors",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                active && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
-        }
-      >
-        {icon ? (
-          // Headers with a leading icon (project folders) swap the folder for a
-          // chevron on desktop hover/focus, so the caret takes the icon's place
-          // rather than trailing the name. Mobile (no hover) keeps the folder
-          // icon and shows the trailing chevron below.
-          <span className="relative flex size-4 shrink-0 items-center justify-center">
-            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
-              {icon}
-            </span>
-            <ChevronRightIcon
-              className={cn(
-                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
-                !collapsed && "rotate-90",
-                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-              )}
-            />
+  const showsMarker = collapsed && marker != null;
+  // Right-edge offset of the marker when no header control is painted: it
+  // matches the rows' badge slot (-mr-1 trims an icon folder's px-2 to the
+  // right-1 edge; mr-1 pushes a padless header out to it). One media condition
+  // governs the whole header-control matrix: overlays hide (and stop
+  // hit-testing) only on md+ displays whose PRIMARY pointer is a fine,
+  // hover-capable one — `hover:hover` alone is not enough, since a convertible
+  // with a coarse primary pointer can still report it, and its first tap would
+  // be captured by the header underneath before any hover state exists.
+  // Everywhere else the controls stay painted and clickable, so with
+  // `hasAction` the cluster reserves the full mr-14 control column, returning
+  // to this rest offset (or clearing the always-visible Sessions filter with
+  // mr-7) only under that same condition. Hover-only actions keep this rest
+  // offset at every capability. On fine-pointer touchscreen laptops a screen
+  // tap still hit-tests before hover applies, so the folder's menu keeps its
+  // "New session" fallback at every breakpoint.
+  const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
+  const clusterHoverDesktopMargin = hasPersistentAction
+    ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
+    : showsMarker
+      ? icon
+        ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
+        : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
+      : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
+  const markerFade = actionHoverOnly
+    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
+    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
+  // The hover-only control's focus reveal (`focus-visible:not-sr-only`) is
+  // ungated by pointer type, so a coarse-pointer tablet with a keyboard can
+  // land focus on it. Its focus fade must therefore fire at every pointer type
+  // too — otherwise the focus-revealed kebab paints over a still-visible
+  // spinner/count. The hover-driven fades above stay pointer-gated (hover only
+  // exists on fine). Every other header keeps its width-gated focus fade.
+  const actionFocusFade = actionFocusVisible
+    ? actionHoverOnly
+      ? "group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+    : actionHoverOnly
+      ? "group-has-[[data-header-controls]:focus-within]/header:opacity-0"
+      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+  const button = (
+    <button
+      type="button"
+      aria-expanded={!collapsed}
+      aria-current={active ? "page" : undefined}
+      onClick={(event) => {
+        // A pointer click would otherwise leave the header focus-within,
+        // keeping the hover-revealed controls up at rest. Keyboard toggles
+        // (detail 0) keep focus for the ring.
+        if (event.detail > 0) event.currentTarget.blur();
+        onToggleCollapsed();
+      }}
+      className={cn(
+        contextMenu && "select-none [-webkit-touch-callout:none]",
+        icon
+          ? cn(
+              SIDEBAR_ROW,
+              "group flex w-full items-center border-0 text-left text-foreground transition-colors",
+              SIDEBAR_HOVER_HIGHLIGHT,
+              contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
+              active && SIDEBAR_ACTIVE_HIGHLIGHT,
+            )
+          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+      )}
+    >
+      {icon ? (
+        // Headers with a leading icon (project folders) swap the folder for a
+        // chevron on desktop hover/focus, so the caret takes the icon's place
+        // rather than trailing the name. Mobile (no hover) keeps the folder
+        // icon and shows the trailing chevron below.
+        <span className="relative flex size-4 shrink-0 items-center justify-center">
+          <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+            {icon}
           </span>
-        ) : null}
-        <span className="min-w-0 truncate">{title}</span>
-        {/* Trailing chevron, rotating on expand. Headers without a leading icon
+          <ChevronRightIcon
+            className={cn(
+              "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+              !collapsed && "rotate-90",
+              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            )}
+          />
+        </span>
+      ) : null}
+      <span className="min-w-0 truncate">{title}</span>
+      {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
-        <ChevronRightIcon
-          className={cn(
-            "size-3.5 shrink-0 transition-[transform,opacity]",
-            !collapsed && "rotate-90",
-            icon
-              ? "md:hidden"
-              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-          )}
-        />
-        {/* A hidden row inside this collapsed section carries a marker — surface
-            the exact same badge a row would show, pinned to the right edge. */}
-        {collapsed && marker && (
-          <span
-            className={cn(
-              "ml-auto flex shrink-0 items-center transition-opacity",
-              // When the header also carries a hover-revealed kebab, keep the
-              // marker clear of it the same way a row's time/marker slot does:
-              // reserve space on mobile (kebab always shown) and fade out on
-              // desktop hover so the kebab takes its place.
-              hasAction &&
-                "mr-14 md:mr-0 md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
-            )}
-          >
-            <SessionStateBadge state={marker} />
-          </span>
+      <ChevronRightIcon
+        className={cn(
+          "size-3.5 shrink-0 transition-[transform,opacity]",
+          !collapsed && "rotate-90",
+          icon
+            ? "md:hidden"
+            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
         )}
-      </button>
+      />
+      {/* A hidden row inside this collapsed section carries a marker — surface
+            the exact same badge a row would show, pinned to the right edge. */}
+      {showsMarker && (
+        <span
+          className={cn(
+            "ml-auto flex shrink-0 items-center justify-center transition-opacity",
+            hasAction && !actionHoverOnly
+              ? cn("mr-14", clusterHoverDesktopMargin)
+              : hasPersistentAction
+                ? "mr-7"
+                : clusterRestMargin,
+            // Dot/spinner markers get the fixed size-6 centered box (center
+            // lands 16px from the edge, matching the rows). The "awaiting"
+            // pill keeps its natural width so its label isn't clipped.
+            isDotMarker(marker) && "w-6",
+            // Fade out so the revealed kebab takes the marker's place,
+            // mirroring a row's time/marker slot.
+            hasAction && cn(markerFade, actionFocusFade),
+          )}
+        >
+          <SessionStateBadge state={marker} />
+        </span>
+      )}
+    </button>
+  );
+
+  return (
+    <h2>
+      {contextMenu && !contextMenuDisabled ? (
+        <ContextMenu>
+          <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
+          {contextMenu}
+        </ContextMenu>
+      ) : (
+        button
+      )}
     </h2>
   );
 }
@@ -2420,7 +2824,8 @@ function SectionGroup({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Optional control overlaid at the group header's right edge (e.g. the
-      "collapse all projects" toggle). Hover/focus-revealed on desktop. */
+      "collapse all projects" toggle). Always shown without hover support and
+      hover/focus-revealed on hover-capable desktop displays. */
   headerAction?: ReactNode;
   /** Optional content rendered directly under the header, above the children
       (and shown even when collapsed) — e.g. the bulk-selection action bar. */
@@ -2433,18 +2838,24 @@ function SectionGroup({
         <SectionHeader
           title={title}
           hasAction={headerAction != null}
+          actionFocusVisible
           collapsed={collapsed}
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
-          // Desktop-only, hover/keyboard-focus-revealed: a group-level bulk
-          // control (e.g. "expand all projects") is a pointer convenience, so it
-          // stays hidden until the header is hovered and never floats on touch
-          // viewports where there's no hover. Reveal on :focus-visible (keyboard)
-          // — NOT :focus-within — so clicking the button with the mouse doesn't
-          // leave it stuck visible: React reuses the same node when it swaps
-          // expand↔revert, so the clicked button keeps focus afterward.
-          <div className="-translate-y-1/2 absolute top-1/2 right-1 hidden items-center transition-opacity md:flex md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
+          // Always visible (and hit-testable) except on md+ displays with a
+          // fine, hover-capable primary pointer — phones, touch tablets and
+          // coarse-pointer convertibles have no reliable hover, and the "New
+          // project" control lives here (the only way to create a project).
+          // On mouse/trackpad desktops it's hover/keyboard-focus-revealed.
+          // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
+          // clicking the button with the mouse doesn't leave it stuck visible:
+          // React reuses the same node when it swaps expand↔revert, so the
+          // clicked button keeps focus afterward.
+          <div
+            data-header-controls
+            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
+          >
             {headerAction}
           </div>
         )}
@@ -2461,6 +2872,7 @@ function ConversationSection({
   marker,
   active,
   conversations,
+  activeConversationId,
   pinnedConversationIds,
   collapsed,
   onToggleCollapsed,
@@ -2472,6 +2884,8 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  actionHoverOnly,
+  headerContextMenu,
   persistentHeaderAction,
   afterHeader,
   footer,
@@ -2485,6 +2899,10 @@ function ConversationSection({
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
+  /** The active conversation's resolved top-level root id, or null — each row
+      derives its own `isActive` by comparing against this. Resolved once by the
+      list owner so a row never runs the (multi-step) active-root query itself. */
+  activeConversationId: string | null;
   pinnedConversationIds: string[];
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
@@ -2498,9 +2916,12 @@ function ConversationSection({
   emptyMessage?: ReactNode;
   /** Indent the rows one extra step (used to nest a project's chats). */
   indentRows?: boolean;
-  /** Optional control overlaid at the header's right edge (e.g. a project's
-      kebab). Hover/focus-revealed on desktop, always shown on mobile. */
+  /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
+  /** Whether `headerAction` is absent without a fine hover pointer. */
+  actionHoverOnly?: boolean;
+  /** Optional context-menu content opened from the header button. */
+  headerContextMenu?: ReactNode;
   /** Optional control that remains visible at the header's right edge. */
   persistentHeaderAction?: ReactNode;
   /** Optional content rendered directly under the header, above the rows (and
@@ -2515,6 +2936,7 @@ function ConversationSection({
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
+  const protectsCollapsedBadge = isCollapsed && marker != null;
   return (
     <section className="group/section relative">
       {title && (
@@ -2527,18 +2949,62 @@ function ConversationSection({
             icon={icon}
             marker={marker}
             active={active}
-            hasAction={headerAction != null || persistentHeaderAction != null}
+            hasAction={headerAction != null}
+            actionHoverOnly={actionHoverOnly}
+            hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            contextMenu={headerContextMenu}
+            contextMenuDisabled={selectionMode}
           />
           {(headerAction || persistentHeaderAction) && (
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+            // The pointer-events gate lives on this OUTER positioned box: CSS
+            // hit-testing on a pointer-events-none child falls through to its
+            // nearest interactive ancestor, so gating only the inner wrapper
+            // would leave this box swallowing clicks aimed at the badges
+            // beneath it. The always-visible control re-enables hit-testing
+            // for itself; the inner wrapper carries the opacity reveal only.
+            // The focus reveal is scoped to focus WITHIN this control cluster
+            // (not the whole header): keyboard focus on the header button must
+            // not paint hit-testable controls over the still-visible badges —
+            // the same scoping the badge fades use, keeping fade and reveal
+            // symmetric.
+            <div
+              data-header-controls
+              className={cn(
+                "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
+                // A hover-only action reveals at every width on a fine hover
+                // pointer (no `md:`), so the badge it overlays is protected from
+                // its at-rest hit target on narrow hover desktops too. Every
+                // other header keeps the width-gated reveal.
+                protectsCollapsedBadge &&
+                  (actionHoverOnly
+                    ? "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:pointer-events-auto"
+                    : "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto"),
+              )}
+            >
               {headerAction && (
-                <div className="flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
+                // Reveal keys off focus WITHIN the controls cluster (not the
+                // whole header): clicking the toggle to expand/collapse focuses
+                // the toggle inside SectionHeader — not this cluster — so it no
+                // longer pins the actions visible, and keyboard-focusing the
+                // control itself still reveals it.
+                <div
+                  className={cn(
+                    "flex items-center transition-opacity",
+                    actionHoverOnly
+                      ? "[@media((hover:hover)_and_(pointer:fine))]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:opacity-100"
+                      : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
+                  )}
+                >
                   {headerAction}
                 </div>
               )}
-              {persistentHeaderAction}
+              {persistentHeaderAction && (
+                <div className="pointer-events-auto flex items-center">
+                  {persistentHeaderAction}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -2568,6 +3034,7 @@ function ConversationSection({
                 <ConversationRow
                   key={conv.id}
                   conversation={conv}
+                  isActive={conv.id === activeConversationId}
                   isPinned={pinnedConversationIds.includes(conv.id)}
                   onClick={onRowClick}
                   onTogglePinned={onTogglePinned}
@@ -2592,9 +3059,11 @@ function ConversationSection({
 // either family satisfy `MenuComponents` so `ConversationMenuItems` can author
 // the menu body once and render it under either menu kind.
 interface MenuItemProps {
+  asChild?: boolean;
   children?: ReactNode;
   className?: string;
   disabled?: boolean;
+  textValue?: string;
   variant?: "default" | "destructive";
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
@@ -2657,6 +3126,7 @@ function ConversationMenuItems({
   moveToProject,
   stopSession,
   setShareOpen,
+  setForkOpen,
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
@@ -2686,6 +3156,7 @@ function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
+  setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
@@ -2700,6 +3171,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -2792,8 +3264,18 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
+      <C.Item data-testid="fork-conversation" onSelect={() => setForkOpen(true)}>
+        <GitForkIcon className="size-3.5" />
+        Fork
+      </C.Item>
       {isOwner ? (
-        <C.Item data-testid="rename-conversation" onSelect={() => setIsEditing(true)}>
+        <C.Item
+          data-testid="rename-conversation"
+          onSelect={() => {
+            trackClick("sidebar.conversation.rename", "button");
+            setIsEditing(true);
+          }}
+        >
           <PencilIcon className="size-3.5" />
           Rename
         </C.Item>
@@ -2961,12 +3443,23 @@ function ConversationMenuItems({
   );
 }
 
+function SessionErrorHint() {
+  return (
+    <p className="mt-1 flex items-center gap-1.5 text-sm text-destructive">
+      <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
+      <span>Latest message is an error</span>
+    </p>
+  );
+}
+
 function SessionTooltipContent({
   conversation,
   hostsById,
+  hasError,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
+  hasError: boolean;
 }) {
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
@@ -3008,6 +3501,7 @@ function SessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
 }
@@ -3016,8 +3510,9 @@ function SessionTooltipContent({
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
-function ConversationRow({
+function ConversationRowImpl({
   conversation,
+  isActive,
   isPinned,
   onClick,
   onTogglePinned,
@@ -3027,6 +3522,10 @@ function ConversationRow({
   onProjectAssigned,
 }: {
   conversation: Conversation;
+  // Computed by the list owner against the resolved top-level root (so a
+  // sub-agent view keeps its owning row highlighted). A prop, not a per-row
+  // read, so only the two rows whose value flips re-render on a switch.
+  isActive: boolean;
   isPinned: boolean;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
@@ -3036,25 +3535,15 @@ function ConversationRow({
   onProjectAssigned?: (projectName: string) => void;
 }) {
   const hostsById = useContext(HostsByIdContext);
-  // `useParams` reads from the active matched route. On `/`, the param is
-  // undefined; on `/c/:conversationId`, it carries the active id.
-  const { conversationId: activeId } = useParams<{ conversationId: string }>();
-  // The sidebar lists only top-level sessions; child (sub-agent) rows are
-  // omitted. When the user clicks a sub-agent in the Agents rail the active
-  // id becomes the child's, which matches no row here — so highlighting on
-  // the raw id alone would leave the owning session unhighlighted. Resolve
-  // the active conversation's top-level root and highlight against that, so
-  // the parent row stays selected while viewing any of its descendants.
-  // While the resolution loads (`null`), fall back to the raw id for that
-  // render — a top-level session resolves to itself, so the common case is
-  // unaffected.
-  const activeRootId = useActiveRootSessionId(activeId ?? null);
-  const isActive = (activeRootId ?? activeId) === conversation.id;
   const navigate = useNavigate();
+  // A client-only `temp:` row (navigate-first create window): no server session
+  // yet, so per-row mutations are disabled until it's rekeyed to the real id —
+  // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
+  const isProvisionalRow = conversation.provisional === true;
   // Mobile has no real hover, so a tap that navigates would also trip the
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
-  const isMobile = useIsMobileViewport();
+  const isMobile = useContext(IsMobileContext);
   // When this row becomes the active conversation (e.g. a freshly created
   // session navigated to via `/c/:id`), scroll it toward the center of the
   // sidebar so it's comfortably in view rather than pinned to an edge.
@@ -3063,6 +3552,7 @@ function ConversationRow({
     if (!isActive) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isActive]);
+  const queryClient = useQueryClient();
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
@@ -3082,6 +3572,7 @@ function ConversationRow({
   // portal), and a passive effect would leave a post-paint frame where churn
   // could reorder — and blur — the just-mounted input before the hold lands.
   const reportRowEditing = useContext(RowEditHoldContext);
+  const activateRow = useContext(RowActivationContext);
   useLayoutEffect(() => {
     if (!isEditing) return;
     reportRowEditing(conversation.id, true);
@@ -3095,11 +3586,8 @@ function ConversationRow({
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
-  // True while an archive is in flight. Drives the "Archiving…" status
-  // row — without it the row shows nothing while the archive completes.
-  // Delete needs no counterpart: it drops its row optimistically.
-  const [isArchiving, setIsArchiving] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
   // effective-permission level, so rename/share/move/drag are owner-only and
@@ -3107,13 +3595,13 @@ function ConversationRow({
   // live on the open-session view, which fetches the caller's real level.)
   // Also the id Leave revokes: leaving is a self-revoke, so it needs the
   // viewer's own id — resolved by the time a non-owned row renders, since
-  // `isOwner` below is derived from it.
-  const viewerId = useViewerId();
+  // `isOwner` below is derived from it. From context (ViewerIdContext).
+  const viewerId = useContext(ViewerIdContext);
   const isOwner = isOwnedByViewer(conversation, viewerId);
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off) reported by
   // /v1/info — disables the row's Share item even for managers. Fail open
-  // (share enabled) while the capability probe is still loading.
-  const serverInfo = useServerInfo();
+  // (share enabled) while the capability probe is still loading. From context.
+  const serverInfo = useContext(ServerInfoContext);
   const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
   // Single-user mode has no other users to share with, so the Share item is
   // hidden entirely (not just disabled) — mirrors the header Share button.
@@ -3148,6 +3636,13 @@ function ConversationRow({
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
+  // First-class projects can carry a chosen emoji; label-only projects have
+  // none, so the flyout falls back to the folder glyph for those.
+  const projectIconsById = useContext(ProjectIconsContext);
+  const projectFlyoutIcon =
+    conversation.project_id != null
+      ? (projectIconsById.get(conversation.project_id) ?? null)
+      : null;
 
   // The title the user just committed. The rename's cache write reaches this
   // row as a prop from the list above, which re-renders a tick after the row's
@@ -3164,10 +3659,19 @@ function ConversationRow({
   }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
 
   const label = pendingTitle ?? conversationDisplayLabel(conversation);
-  // Recompute unseen state the moment the last-seen map changes (e.g. the
-  // user picks "Mark as unread" on this row) rather than waiting for the
-  // next conversations poll.
-  useUnseenTick();
+  // Subscribed so the just-recorded optimistic label flips the row
+  // immediately instead of at the next conversations poll.
+  const optimisticTitle = useOptimisticTitle(conversation.id);
+  const isProvisionalLabel =
+    pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
+  const hasDraft = useHasSessionDraft(conversation.id);
+  // A write for another conversation leaves this primitive snapshot unchanged,
+  // so useSyncExternalStore skips the heavy row render.
+  const readState = useConversationReadState(
+    conversation.id,
+    conversation.updated_at,
+    conversation.status,
+  );
   // The dot shows when the conversation is content-unseen AND either the
   // row isn't the one you're viewing OR you explicitly marked it unread.
   // `isConversationUnseen` still gates on status, so a *running* turn never
@@ -3175,16 +3679,13 @@ function ConversationRow({
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages =
-    isConversationUnseen(conversation.id, conversation.updated_at, conversation.status) &&
-    (!isActive || isExplicitlyUnread(conversation.id));
+  const hasUnseenMessages = readState.unseen && (!isActive || readState.explicitlyUnread);
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
-  // Badge precedence: a pending approval ("Needs response") outranks the
-  // unread dot — a session that's both unread and awaiting input should
-  // surface the actionable approval tag. The row still renders bold (the
-  // unread signal) via `hasUnseenMessages` below.
-  const derivedState = getSessionState(conversation);
+  // Approvals and failures outrank the unread dot without clearing read state.
+  const errorConversations = useMemo(() => [conversation], [conversation]);
+  const [latestMessageIsError] = useSessionErrors(errorConversations);
+  const derivedState = getSessionState(conversation, latestMessageIsError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -3196,11 +3697,18 @@ function ConversationRow({
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
   const sessionState =
-    derivedState?.kind === "awaiting"
+    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
       ? derivedState
-      : hasUnseenMessages
-        ? { kind: "unseen" as const }
-        : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
+      : isStartingUp
+        ? { kind: "starting" as const }
+        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
+  // Drafts share the row's trailing indicator slot, but the active session's
+  // composer already makes its draft visible. Live session state wins while
+  // present; otherwise only an inactive row needs the draft marker.
+  const showDraftIndicator = hasDraft && !isActive;
+  const showSharedIndicator = !isOwner;
+  const hasSessionIndicator = sessionState !== null || showDraftIndicator;
+  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3215,7 +3723,7 @@ function ConversationRow({
   } = useDraggable({
     id: conversation.id,
     data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing,
+    disabled: !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -3271,21 +3779,6 @@ function ConversationRow({
     );
   }
 
-  // Archiving is a single PATCH (see runArchive); show a status row for the
-  // span instead of leaving the row looking idle. The spinner stays up until
-  // the row itself leaves the sidebar: on success the list refetches and this
-  // row unmounts (dropped from the default view), which removes the spinner
-  // with it — it is deliberately NOT cleared on PATCH-settle, or it would
-  // vanish a round-trip before the row does. On failure the flag clears and
-  // the interactive row returns so the user can retry.
-  if (isArchiving) {
-    return (
-      <li>
-        <ArchivingRow label={label} />
-      </li>
-    );
-  }
-
   function confirmDelete() {
     // Fire-and-forget: close the dialog and drop the row immediately so the
     // user isn't blocked on the (potentially slow) DELETE — server-side
@@ -3303,39 +3796,32 @@ function ConversationRow({
 
   function runArchive() {
     const nextArchived = !isArchived;
-    // Unarchiving is a quick flag flip — no status row.
-    if (!nextArchived) {
-      archive.mutate({ id: conversation.id, archived: false });
-      return;
-    }
-    // Archiving sends only the PATCH: the server stops the session (and
-    // tears down a host-spawned runner) in the background once the flag is
-    // committed. Sending a client stop too would race that one against the
-    // same runner, and the loser gets a 503 from the already-killed pane.
+    // The archive PATCH sends only the flag: the server stops the session (and
+    // tears down a host-spawned runner) in the background once it's committed.
+    // A client stop too would race that one against the same runner, and the
+    // loser gets a 503 from the already-killed pane.
     //
-    // "Archiving…" must stay up until the row actually LEAVES the sidebar,
-    // not merely until the PATCH resolves. The PATCH success only kicks off
-    // an async `["conversations"]` refetch (see useArchiveConversation); the
-    // row drops out a round-trip later, once that refetch lands and the
-    // archived row is filtered out of the rendered list. Clearing the
-    // spinner on settle (the old behavior) reopened that gap: the row flashed
-    // back to its plain, clickable form — spinner gone — while the session
-    // was still listed. So we DON'T clear it on success: this row unmounts
-    // when the refetch removes it, which tears the spinner down with it.
-    // Only an error clears the flag, restoring the interactive row for retry.
-    setIsArchiving(true);
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        // Point the user at where the session went — it's no longer in
-        // the sidebar list, so surface its new home in Settings.
-        onSuccess: () => {
-          if (isActive) navigate("/", { replace: true });
-          showArchivedToast();
-        },
-        onError: () => setIsArchiving(false),
-      },
-    );
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate; the list filters archived rows
+    // out client-side), so this component unmounts on the next frame. Leaving
+    // the archived session's chat surface therefore has to happen HERE,
+    // synchronously — not in an onSuccess callback that fires a round-trip
+    // later with a stale `isActive`, which used to jump the user off whatever
+    // session they'd switched to meanwhile. Mirrors confirmDelete.
+    if (nextArchived && isActive) navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: nextArchived });
+    // Offer an Undo (and point at where the session went) — fire NOW, not in a
+    // mutate onSuccess: the optimistic overlay unmounts this row on the next
+    // frame, and per-call mutate callbacks don't fire once their observer
+    // unmounts. A failed archive reconciles the row back with its own error
+    // toast. The toast is driven imperatively (module state + app-level
+    // Toaster), so it survives this row unmounting.
+    if (nextArchived) showArchiveUndoToast(queryClient, [conversation]);
+  }
+
+  function runUnarchive() {
+    const nextArchived = !isArchived;
+    archive.mutate({ id: conversation.id, archived: nextArchived });
   }
 
   function confirmLeave() {
@@ -3383,6 +3869,7 @@ function ConversationRow({
     moveToProject,
     stopSession,
     setShareOpen,
+    setForkOpen,
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
@@ -3403,19 +3890,26 @@ function ConversationRow({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
+        // Mobile drops the pin + kebab (see the trailing controls below), so it
+        // reserves only what the badge needs — the same width desktop uses at
+        // rest, before hover reveals the controls.
         !selectionMode &&
           (sessionState?.kind === "awaiting"
-            ? "pr-48 md:pr-29"
-            : sessionState !== null
-              ? "pr-28 md:pr-8"
-              : "pr-28 md:pr-2"),
+            ? showSharedIndicator
+              ? "pr-36"
+              : "pr-29"
+            : hasSessionIndicator && showSharedIndicator
+              ? "pr-14"
+              : hasTrailingIndicator
+                ? "pr-8"
+                : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
         // on the selected row while the marker stayed put, sliding the title
         // under it.
-        !selectionMode && "md:group-hover:pr-14 md:group-has-[:focus-visible]:pr-14",
-        !selectionMode && menuOpen && "md:pr-14",
+        !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
+        !selectionMode && menuOpen && "md:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -3433,11 +3927,13 @@ function ConversationRow({
           onToggleSelected(conversation.id, e.shiftKey);
           return;
         }
+        activateRow(conversation.id, e);
         onClick(e);
       }}
       onDoubleClick={(e) => {
         if (selectionMode) return;
         if (!isOwner) return;
+        if (isProvisionalRow) return; // no rename before the real session exists
         e.preventDefault();
         // The dblclick's own second click was already recorded above, so
         // exactly ONE recent click means the first click landed on a different
@@ -3453,18 +3949,35 @@ function ConversationRow({
       }}
       title={isMobile ? (conversation.title ?? conversation.id) : undefined}
     >
-      {/* Row 1: the session name. Status markers (working, needs-approval,
-          unseen) render in the trailing session-state slot below, not inline
-          here. Leading icons (agent type, pin, shared) were removed to keep
-          rows text-clean; pinned rows still group under "Pinned". */}
-      <div className="flex w-full items-center gap-1.5">
-        <span className="relative min-w-0 truncate">
+      {/* Row 1: the session name. Working, needs-approval, unseen, and draft
+          markers render in the shared trailing indicator slot below. */}
+      <div className="flex w-full items-center">
+        <span
+          className={cn(
+            "relative min-w-0 truncate",
+            // The optimistic first-prompt label is a placeholder until the
+            // server's title lands — dim it so it doesn't read as final.
+            isProvisionalLabel && "italic text-muted-foreground",
+          )}
+        >
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
     </Link>
   );
+
+  // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
+  // context menu, pin, archive, drag) until the real session exists — those
+  // would POST to `/v1/sessions/temp:*`. Rekey to the real id (`hydrateLocal-
+  // Conversation`) drops `provisional` and the full row renders.
+  if (isProvisionalRow) {
+    return (
+      <li ref={rowRef} className="group relative">
+        {rowLink}
+      </li>
+    );
+  }
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
@@ -3490,7 +4003,9 @@ function ConversationRow({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
+              projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
+              hasError={sessionState?.kind === "error"}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -3498,7 +4013,11 @@ function ConversationRow({
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+            <SessionTooltipContent
+              conversation={conversation}
+              hostsById={hostsById}
+              hasError={sessionState?.kind === "error"}
+            />
           </Tooltip>
         )
       ) : projectFlyoutName ? (
@@ -3518,7 +4037,9 @@ function ConversationRow({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
+            projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
+            hasError={sessionState?.kind === "error"}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -3548,7 +4069,11 @@ function ConversationRow({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+          <SessionTooltipContent
+            conversation={conversation}
+            hostsById={hostsById}
+            hasError={sessionState?.kind === "error"}
+          />
         </Tooltip>
       )}
       {selectionMode ? (
@@ -3559,11 +4084,44 @@ function ConversationRow({
             <SquareIcon className="size-4 text-muted-foreground" />
           )}
         </span>
-      ) : sessionState !== null ? (
-        <span className={SESSION_STATE_SLOT_CLASS}>
-          <SessionStateBadge state={sessionState} />
+      ) : hasSessionIndicator ? (
+        <span
+          className={cn(
+            SESSION_STATE_SLOT_CLASS,
+            "right-1",
+            // The wide "awaiting" pill keeps its natural width; every other
+            // marker (running/starting/unseen dot, or the draft pencil) sits in
+            // the fixed centered box so it lines up under the kebab.
+            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+          )}
+        >
+          {sessionState !== null ? (
+            <SessionStateBadge state={sessionState} />
+          ) : (
+            <span
+              role="img"
+              aria-label="Draft"
+              data-testid="conversation-draft-indicator"
+              className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
+            >
+              <MessageCircleDashedIcon aria-hidden className="size-3.5" />
+            </span>
+          )}
         </span>
       ) : null}
+      {!selectionMode && showSharedIndicator && (
+        <span
+          role="img"
+          aria-label="Shared session"
+          title="Shared with you"
+          className={cn(
+            "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            hasSessionIndicator ? "right-8" : "right-1",
+          )}
+        >
+          <UsersIcon className="size-3.5" aria-hidden="true" />
+        </span>
+      )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.
@@ -3614,6 +4172,49 @@ function ConversationRow({
               )}
             </Button>
           )}
+          {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+              don't get the quick affordance and instead see that item disabled
+              with an explanation. */}
+          {isOwner && (
+            <Tooltip disableHoverableContent>
+              <TooltipContent>
+                <TooltipArrow />
+                {isArchived ? "Unarchive conversation" : "Archive conversation"}
+              </TooltipContent>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                  data-testid="quick-archive-conversation"
+                  className={cn(
+                    "text-muted-foreground transition-opacity",
+                    "hidden md:inline-flex",
+                    "md:opacity-0 md:group-hover:opacity-100",
+                    "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                  )}
+                  onClick={(e) => {
+                    // Keep the toggle click off the surrounding Link (no navigation).
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!isArchived) {
+                      runArchive();
+                    } else {
+                      runUnarchive();
+                    }
+                  }}
+                >
+                  {isArchived ? (
+                    <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                  ) : (
+                    <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+            </Tooltip>
+          )}
+
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>
               <Button
@@ -3622,12 +4223,14 @@ function ConversationRow({
                 size="icon-xs"
                 aria-label="Conversation actions"
                 data-testid="conversation-actions"
-                // On mobile (no hover state) it's always visible. On desktop it
-                // stays hidden until hover / keyboard focus, with `aria-expanded`
-                // keeping it surfaced while the menu is open so the trigger
-                // doesn't vanish under the cursor.
+                // Desktop-only: the chat page's own header menu covers these
+                // per-session actions on mobile, so the row kebab is dropped
+                // there. From `md` up it stays hidden until hover / keyboard
+                // focus, with `aria-expanded` keeping it surfaced while the menu
+                // is open so the trigger doesn't vanish under the cursor.
                 className={cn(
                   "text-muted-foreground transition-opacity",
+                  "hidden md:inline-flex",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}
@@ -3650,7 +4253,26 @@ function ConversationRow({
           </DropdownMenu>
         </div>
       )}
-      <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
+      {/* Mount only while open — one per row, its hook tree + JSX would
+          otherwise run closed on every row re-render. */}
+      {shareOpen && (
+        <PermissionsModal
+          sessionId={conversation.id}
+          open={shareOpen}
+          onOpenChange={setShareOpen}
+        />
+      )}
+      {forkOpen && (
+        <ForkSessionDialog
+          sourceSessionId={conversation.id}
+          sourceTitle={conversation.title}
+          sourceWorkspace={conversation.workspace}
+          sourceHostId={conversation.host_id}
+          sourceGitBranch={conversation.git_branch}
+          open
+          onOpenChange={setForkOpen}
+        />
+      )}
       <Dialog
         open={deleteOpen}
         onOpenChange={(open) => {
@@ -3659,150 +4281,206 @@ function ConversationRow({
           if (!open) setDeleteBranch(false);
         }}
       >
-        <DialogContent
-          // Don't trigger the surrounding Link when the modal opens
-          // — the dialog content is a portal, but defensively belt-
-          // and-braces the click path.
-          onClick={(e) => e.stopPropagation()}
-        >
-          <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
-            <DialogDescription>
-              <span className="font-medium break-all">{label}</span> and all of its history will be
-              removed. This cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          {gitBranch !== null && (
-            <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-              <p className="text-sm text-muted-foreground">
-                Optionally clean up the git worktree. These actions are{" "}
-                <span className="font-semibold text-destructive">irreversible</span>.
-              </p>
-              <label className="flex cursor-pointer items-start gap-2 text-ui">
-                <input
-                  type="checkbox"
-                  data-testid="delete-branch-checkbox"
-                  checked={deleteBranch}
-                  onChange={(e) => setDeleteBranch(e.target.checked)}
-                  className="mt-0.5 size-4 shrink-0 accent-destructive"
-                />
-                <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0">
-                  Delete local branch{" "}
-                  <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
-                    {gitBranch}
-                  </code>
-                </span>
-              </label>
-            </div>
-          )}
-          {/* Drop the default footer divider + muted bar so the actions
+        {/* Body only while open — see the share modal above. */}
+        {deleteOpen && (
+          <DialogContent
+            // Don't trigger the surrounding Link when the modal opens
+            // — the dialog content is a portal, but defensively belt-
+            // and-braces the click path.
+            onClick={(e) => e.stopPropagation()}
+          >
+            <DialogHeader>
+              <DialogTitle>Delete conversation?</DialogTitle>
+              <DialogDescription>
+                <span className="font-medium break-all">{label}</span> and all of its history will
+                be removed. This cannot be undone.
+              </DialogDescription>
+            </DialogHeader>
+            {gitBranch !== null && (
+              <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+                <p className="text-sm text-muted-foreground">
+                  Optionally clean up the git worktree. These actions are{" "}
+                  <span className="font-semibold text-destructive">irreversible</span>.
+                </p>
+                <label className="flex cursor-pointer items-start gap-2 text-ui">
+                  <input
+                    type="checkbox"
+                    data-testid="delete-branch-checkbox"
+                    checked={deleteBranch}
+                    onChange={(e) => setDeleteBranch(e.target.checked)}
+                    className="mt-0.5 size-4 shrink-0 accent-destructive"
+                  />
+                  <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0">
+                    Delete local branch{" "}
+                    <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
+                      {gitBranch}
+                    </code>
+                  </span>
+                </label>
+              </div>
+            )}
+            {/* Drop the default footer divider + muted bar so the actions
               blend into the dialog body (same background). */}
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteOpen(false)}
-              disabled={del.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              onClick={confirmDelete}
-              disabled={del.isPending}
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+            <DialogFooter className="border-t-0 bg-transparent">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setDeleteOpen(false)}
+                disabled={del.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={confirmDelete}
+                disabled={del.isPending}
+                componentId="sidebar.conversation.delete"
+              >
+                Delete
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        )}
       </Dialog>
       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
-        <DialogContent
-          // Keep dialog clicks off the surrounding Link (same defensive
-          // handling as the delete dialog above).
-          onClick={(e) => e.stopPropagation()}
-        >
-          <DialogHeader>
-            <DialogTitle>Leave session?</DialogTitle>
-            <DialogDescription>
-              <span className="font-medium break-all">{label}</span> will be removed from your
-              sidebar. Nothing is deleted — the session and its history stay with its owner, who can
-              share it with you again.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setLeaveOpen(false)}
-              disabled={leave.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              data-testid="confirm-leave-conversation"
-              onClick={confirmLeave}
-              disabled={leave.isPending}
-            >
-              Leave
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+        {leaveOpen && (
+          <DialogContent
+            // Keep dialog clicks off the surrounding Link (same defensive
+            // handling as the delete dialog above).
+            onClick={(e) => e.stopPropagation()}
+          >
+            <DialogHeader>
+              <DialogTitle>Leave session?</DialogTitle>
+              <DialogDescription>
+                <span className="font-medium break-all">{label}</span> will be removed from your
+                sidebar. Nothing is deleted — the session and its history stay with its owner, who
+                can share it with you again.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter className="border-t-0 bg-transparent">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setLeaveOpen(false)}
+                disabled={leave.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                data-testid="confirm-leave-conversation"
+                onClick={confirmLeave}
+                disabled={leave.isPending}
+                componentId="sidebar.conversation.leave"
+              >
+                Leave
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        )}
       </Dialog>
       {/* The stale-error reset lives on the kebab item's onSelect (the only
           open path) — onOpenChange only fires for Radix-initiated closes. */}
       <Dialog open={stopOpen} onOpenChange={setStopOpen}>
-        <DialogContent
-          // Keep dialog clicks off the surrounding Link (same defensive
-          // handling as the delete dialog above).
-          onClick={(e) => e.stopPropagation()}
-        >
-          <DialogHeader>
-            <DialogTitle>Stop session?</DialogTitle>
-            <DialogDescription>
-              This terminates the running session for <span className="font-medium">{label}</span>{" "}
-              and stops its runner. The conversation and its history are kept.
-            </DialogDescription>
-          </DialogHeader>
-          {stopSession.isError && (
-            <p className="text-ui text-destructive" role="alert">
-              Couldn't stop the session
-              {stopSession.error instanceof Error && stopSession.error.message
-                ? `: ${stopSession.error.message}`
-                : " — it may still be running"}
-              . Try again in a moment.
-            </p>
-          )}
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setStopOpen(false)}
-              disabled={stopSession.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              data-testid="stop-session-confirm"
-              onClick={() =>
-                stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
-              }
-              loading={stopSession.isPending}
-            >
-              Stop session
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+        {stopOpen && (
+          <DialogContent
+            // Keep dialog clicks off the surrounding Link (same defensive
+            // handling as the delete dialog above).
+            onClick={(e) => e.stopPropagation()}
+          >
+            <DialogHeader>
+              <DialogTitle>Stop session?</DialogTitle>
+              <DialogDescription>
+                This terminates the running session for <span className="font-medium">{label}</span>{" "}
+                and stops its runner. The conversation and its history are kept.
+              </DialogDescription>
+            </DialogHeader>
+            {stopSession.isError && (
+              <p className="text-ui text-destructive" role="alert">
+                Couldn't stop the session
+                {stopSession.error instanceof Error && stopSession.error.message
+                  ? `: ${stopSession.error.message}`
+                  : " — it may still be running"}
+                . Try again in a moment.
+              </p>
+            )}
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setStopOpen(false)}
+                disabled={stopSession.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                data-testid="stop-session-confirm"
+                onClick={() =>
+                  stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
+                }
+                loading={stopSession.isPending}
+                componentId="sidebar.conversation.stop"
+              >
+                Stop session
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        )}
       </Dialog>
     </li>
   );
 }
+
+// The `conversation` fields the row renders. The comparator below compares
+// these (not object identity), so a live-updates merge that only touches an
+// unrendered field (e.g. an updated_at bump) doesn't re-render the row.
+// Keep in sync with the row + its helpers (conversationDisplayLabel,
+// getSessionState, isOwnedByViewer, isSessionStoppable).
+const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
+  "id",
+  "title",
+  "archived",
+  "status",
+  "updated_at",
+  "git_branch",
+  "host_id",
+  "runner_id",
+  "project_id",
+  "owner",
+  "pending_elicitations_count",
+  "provisional",
+];
+
+function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
+  if (a === b) return true;
+  for (const key of RENDERED_CONVERSATION_FIELDS) {
+    if (a[key] !== b[key]) return false;
+  }
+  // `labels` is an object; compare by value (rename/project moves ride here).
+  return JSON.stringify(a.labels) === JSON.stringify(b.labels);
+}
+
+// Memoized with a render-field comparator (not shallow identity): a row
+// re-renders only when its displayed data or `isActive` changes. Handler props
+// are stabilized at the list owner so they don't defeat it.
+const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
+  return (
+    prev.isActive === next.isActive &&
+    prev.isPinned === next.isPinned &&
+    prev.selectionMode === next.selectionMode &&
+    prev.isSelected === next.isSelected &&
+    prev.onClick === next.onClick &&
+    prev.onTogglePinned === next.onTogglePinned &&
+    prev.onToggleSelected === next.onToggleSelected &&
+    prev.onProjectAssigned === next.onProjectAssigned &&
+    conversationRenderEqual(prev.conversation, next.conversation)
+  );
+});
 
 /**
  * Hover flyout body for a pinned, project-owned conversation row.
@@ -3816,11 +4494,15 @@ function ConversationRow({
 function PinnedProjectFlyoutContent({
   title,
   projectName,
+  projectIcon,
   gitBranch,
+  hasError,
 }: {
   title: string;
   projectName: string;
+  projectIcon: string | null;
   gitBranch: string | null;
+  hasError: boolean;
 }) {
   return (
     <HoverCardContent
@@ -3835,7 +4517,7 @@ function PinnedProjectFlyoutContent({
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <FolderIcon className="size-3.5 shrink-0" />
+        <ProjectRowIcon icon={projectIcon} />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (
@@ -3847,60 +4529,35 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
+      {hasError && <SessionErrorHint />}
     </HoverCardContent>
-  );
-}
-
-/**
- * In-flight status row shown while a session is being archived (the
- * archive PATCH in ConversationRow.runArchive). Delete has no
- * counterpart: it removes its row optimistically, so there is nothing
- * left to show progress on. Archive failures fall back to the
- * interactive row rather than a persistent error state, so there's no
- * retry/dismiss affordance here.
- */
-function ArchivingRow({ label }: { label: string }) {
-  return (
-    <div
-      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
-      data-testid="conversation-archiving"
-      aria-live="polite"
-    >
-      <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-      <span className="min-w-0 flex-1 truncate" title={label}>
-        {label}
-      </span>
-      <span className="shrink-0 text-sm">Archiving…</span>
-    </div>
   );
 }
 
 // ── ProjectFolderActions ──────────────────────────────────────────────────────
 
-/**
- * The hover-revealed controls on a project-folder header: a kebab menu and a
- * pencil that starts a new session pre-filed under this project. The pencil
- * links to the landing composer with `?project=<name>` so its project chip
- * lands already selected.
- */
+/** Fine-hover shortcuts for project actions and starting a pre-filed session. */
 function ProjectFolderActions({
   projectName,
-  projectId,
   onNavigate,
+  actions,
 }: {
   projectName: string;
-  /** First-class project id, or null for a label-only folder. */
-  projectId: string | null;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
 }) {
   return (
     // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
     // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* Desktop-only quick affordance; on mobile it folds into the kebab's
-          "New session" item below. */}
+      {/* A redundant shortcut for the kebab's always-present "New session"
+          item, so it is genuinely absent (not just clipped) wherever no fine
+          hover pointer can reveal it: on touch, folding fully into the kebab
+          instead of leaving a duplicate focus stop for keyboard/AT users. On
+          hover+fine it is display-flex and revealed on hover or keyboard focus
+          by the overlay's opacity. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -3910,7 +4567,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="text-muted-foreground max-md:hidden"
+            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -3927,96 +4584,142 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} projectId={projectId} onNavigate={onNavigate} />
+      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
     </div>
   );
 }
 
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
-/**
- * The kebab on a project-folder header: "Rename project" (O(1) via
- * `PATCH /v1/projects/{id}` for a first-class project; promotes a label-only
- * folder on demand) and "Delete project" (archives + unfiles all members, then
- * removes the container). Delete is confirmed since it archives sessions.
- */
-function ProjectFolderMenu({
+/** The menu body shared by the project-folder kebab and context menu. */
+function ProjectFolderMenuItems({
+  components: C,
   projectName,
-  projectId,
   onNavigate,
+  actions,
 }: {
+  components: MenuComponents;
   projectName: string;
-  projectId: string | null;
-  /** Nav handler for the mobile-only "New session" item (desktop uses the
-      hover-revealed pencil). Closes the sidebar overlay on mobile. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
 }) {
+  useEffect(() => {
+    // Config loading follows the Radix content lifecycle; do not force-mount it.
+    actions.onMenuOpen();
+    return actions.onMenuClose;
+  }, [actions]);
+
+  return (
+    <>
+      <C.Item asChild data-testid="project-new-session-menu">
+        <Link
+          to={`/?project=${encodeURIComponent(projectName)}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onNavigate(e);
+          }}
+        >
+          <SquarePenIcon className="size-3.5" />
+          New session
+        </Link>
+      </C.Item>
+      <C.Item data-testid="rename-project" onSelect={actions.openRename}>
+        <PencilIcon className="size-3.5" />
+        Rename project
+      </C.Item>
+      <C.Item data-testid="project-settings" onSelect={actions.openSettings}>
+        <Settings2Icon className="size-3.5" />
+        Project settings
+      </C.Item>
+      <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
+        <Trash2Icon className="size-3.5" />
+        Delete project
+      </C.Item>
+    </>
+  );
+}
+
+interface ProjectFolderMenuActions {
+  openRename: () => void;
+  openSettings: () => void;
+  openDelete: () => void;
+  onMenuOpen: () => void;
+  onMenuClose: () => void;
+}
+
+/** Owns the dialogs and mutations shared by both project-folder menus. */
+function useProjectFolderMenu(
+  projectName: string,
+  projectId: string | null,
+  icon?: string | null,
+): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  // The icon staged in the rename modal, committed only on Confirm:
+  //   undefined = untouched (show the saved icon), string = a picked emoji,
+  //   null = staged removal. Reset to `undefined` each time the modal opens.
+  const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
+  const updateConfig = useUpdateProjectConfig();
+  // Fetch the full config only while the menu or rename modal is open, so we can
+  // merge the icon onto the other stored defaults (host / workspace / agent)
+  // without a per-folder request on every sidebar render — and without wiping
+  // those defaults on save.
+  const { data: iconConfig, isError: iconConfigError } = useProjectConfig(
+    menuOpen || renameOpen ? projectId : null,
+  );
+  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
+  // fully-loaded config or it silently wipes the other defaults. "Ready" means
+  // the config actually resolved (`!== undefined` — `isLoading` alone is false
+  // on a query *error* too, leaving no data to merge onto) — except a
+  // label-only folder (`projectId === null`), whose base is legitimately `{}`.
+  // This gates only the icon path; renaming the name never needs the config.
+  const configReady = projectId === null || iconConfig !== undefined;
+  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
+  // What the modal's tile shows: the staged pick when touched, else the saved
+  // icon. `null` (staged removal) renders as the empty folder.
+  const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
-  return (
+  const actions = useMemo<ProjectFolderMenuActions>(
+    () => ({
+      openRename: () => {
+        setRenameValue(projectName);
+        setPendingIcon(undefined);
+        setRenameOpen(true);
+      },
+      openSettings: () => setSettingsOpen(true),
+      openDelete: () => setDeleteOpen(true),
+      onMenuOpen: () => setMenuOpen(true),
+      onMenuClose: () => setMenuOpen(false),
+    }),
+    [projectName],
+  );
+
+  const dialogs = (
     <>
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`Project actions for ${projectName}`}
-            data-testid="project-actions"
-            className="text-muted-foreground"
-            // Sits on the folder header; keep its click off the collapse toggle.
-            onClick={(e) => e.stopPropagation()}
-          >
-            <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40">
-          {/* New session — mobile-only (md:hidden); desktop uses the
-              hover-revealed pencil on the folder header. */}
-          <DropdownMenuItem asChild className="md:hidden" data-testid="project-new-session-menu">
-            <Link
-              to={`/?project=${encodeURIComponent(projectName)}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onNavigate(e);
-              }}
-            >
-              <SquarePenIcon className="size-3.5" />
-              New session
-            </Link>
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            data-testid="rename-project"
-            onSelect={() => {
-              setRenameValue(projectName);
-              setRenameOpen(true);
-            }}
-          >
-            <PencilIcon className="size-3.5" />
-            Rename project
-          </DropdownMenuItem>
-          <DropdownMenuItem data-testid="project-settings" onSelect={() => setSettingsOpen(true)}>
-            <Settings2Icon className="size-3.5" />
-            Project settings
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            data-testid="delete-project"
-            variant="destructive"
-            onSelect={() => setDeleteOpen(true)}
-          >
-            <Trash2Icon className="size-3.5" />
-            Delete project
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
+        <DialogContent
+          onClick={(e) => e.stopPropagation()}
+          // emoji-mart preventDefaults the pointer event, so Radix's own
+          // outside-dismissal never fires for clicks elsewhere in the modal.
+          // Catch them in the capture phase and close the picker ourselves,
+          // unless the pointer is inside the picker or on its trigger tile.
+          onPointerDownCapture={(e) => {
+            if (!emojiOpen) return;
+            const target = e.target as Element;
+            if (
+              target.closest('[data-slot="popover-content"]') ||
+              target.closest('[data-testid="rename-project-icon"]')
+            )
+              return;
+            setEmojiOpen(false);
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Rename project</DialogTitle>
           </DialogHeader>
@@ -4024,34 +4727,137 @@ function ProjectFolderMenu({
               doesn't wrap children in one) instead of relying on a manual
               key handler + button lookup. */}
           <form
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
               const newName = renameValue.trim();
-              if (newName === "" || newName === projectName) {
-                setRenameOpen(false);
-                setMenuOpen(false);
+              const nameChanged = newName !== "" && newName !== projectName;
+              const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
+              // Only the icon write needs a loaded config to merge onto; a
+              // name-only rename must proceed even if the config fetch failed.
+              if (iconChanged && !configReady) return;
+              try {
+                // Name first: it promotes a label-only folder (creating the
+                // first-class row) and reconciles members. Capture the resolved
+                // id so the icon write below targets that row — passing the
+                // stale render-time `null` would make the config write try to
+                // create the project a second time and 409 on the duplicate.
+                let targetId = projectId;
+                if (nameChanged) {
+                  targetId = await renameProject.mutateAsync({
+                    id: projectId,
+                    oldName: projectName,
+                    newName,
+                  });
+                }
+                if (iconChanged) {
+                  const next = { ...(iconConfig ?? {}) };
+                  if (pendingIcon === null) delete next.icon;
+                  else next.icon = pendingIcon;
+                  await updateConfig.mutateAsync({
+                    id: targetId,
+                    name: nameChanged ? newName : projectName,
+                    config: next,
+                  });
+                }
+              } catch {
+                // Errors surface via the mutation state below. A rename that
+                // lands before a failed icon write is already persisted; only
+                // the icon needs retrying.
                 return;
               }
-              renameProject.mutate(
-                { id: projectId, oldName: projectName, newName },
-                {
-                  onSuccess: () => {
-                    setRenameOpen(false);
-                    setMenuOpen(false);
-                  },
-                },
-              );
+              setRenameOpen(false);
+              setMenuOpen(false);
             }}
           >
-            <input
-              autoFocus
-              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
-            />
-            {renameProject.isError && (
+            {/* One combined control: emoji tile (left) + name (right) share a
+                single border, so it reads as a single input. The tile opens a
+                picker popover; the pick is staged and committed on Confirm. */}
+            <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
+              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Change project icon"
+                    data-testid="rename-project-icon"
+                    disabled={!configReady}
+                    className={cn(
+                      "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors disabled:cursor-default disabled:opacity-50",
+                      displayIcon ? "bg-muted" : "bg-tag-pink",
+                    )}
+                  >
+                    {displayIcon ? (
+                      <span className="text-xl leading-none">{displayIcon}</span>
+                    ) : (
+                      <SmilePlusIcon className="size-4 text-brand-accent" />
+                    )}
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="start"
+                  // Publish the collision-aware available viewport height (Radix
+                  // exposes it as a CSS var), less the optional "Remove icon"
+                  // header and capped at the picker's natural size, so the
+                  // .emoji-picker-popover rule in index.css shrinks emoji-mart to
+                  // fit — it then scrolls its grid internally (nav + search
+                  // pinned) instead of clipping on short screens.
+                  collisionPadding={8}
+                  style={
+                    {
+                      "--emoji-picker-height": `min(420px, calc(var(--radix-popover-content-available-height) - ${displayIcon ? "38px" : "0px"}))`,
+                    } as CSSProperties
+                  }
+                  className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
+                  // The rename Dialog's scroll lock (react-remove-scroll)
+                  // preventDefaults wheel events over the picker — it can't see
+                  // emoji-mart's scroll region inside shadow DOM. Stop the wheel
+                  // from reaching the document-level lock so the grid scrolls.
+                  onWheel={(e) => e.stopPropagation()}
+                  // Nested in the rename Dialog, emoji-mart's own focus handling
+                  // swallows Radix's default outside-pointer dismissal, so a
+                  // click elsewhere in the modal wouldn't close the picker.
+                  // Close it explicitly on any outside interaction.
+                >
+                  {displayIcon ? (
+                    <div className="shrink-0 border-b p-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-start"
+                        data-testid="rename-project-remove-icon"
+                        onClick={() => {
+                          setPendingIcon(null);
+                          setEmojiOpen(false);
+                        }}
+                      >
+                        <Trash2Icon className="size-3.5" />
+                        Remove icon
+                      </Button>
+                    </div>
+                  ) : null}
+                  <EmojiPicker
+                    onSelect={(native) => {
+                      setPendingIcon(native);
+                      setEmojiOpen(false);
+                    }}
+                  />
+                </PopoverContent>
+              </Popover>
+              <input
+                className="w-full bg-transparent px-3 py-2 text-ui outline-none"
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+              />
+            </div>
+            {iconConfigError && (
               <p className="text-ui text-destructive" role="alert">
-                {(renameProject.error as Error).message}
+                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
+                changing the icon is unavailable until this loads.
+              </p>
+            )}
+            {(renameProject.isError || updateConfig.isError) && (
+              <p className="text-ui text-destructive" role="alert">
+                {((renameProject.error ?? updateConfig.error) as Error).message}
               </p>
             )}
             <DialogFooter className="border-t-0 bg-transparent">
@@ -4059,31 +4865,36 @@ function ProjectFolderMenu({
                 type="button"
                 variant="ghost"
                 onClick={() => setRenameOpen(false)}
-                disabled={renameProject.isPending}
+                disabled={renameProject.isPending || updateConfig.isPending}
               >
                 Cancel
               </Button>
               <Button
                 type="submit"
                 data-testid="rename-project-confirm"
-                loading={renameProject.isPending}
+                loading={renameProject.isPending || updateConfig.isPending}
                 disabled={renameValue.trim() === ""}
+                componentId="sidebar.project.rename"
               >
-                Rename
+                Confirm
               </Button>
             </DialogFooter>
           </form>
         </DialogContent>
       </Dialog>
-      <ProjectSettingsDialog
-        open={settingsOpen}
-        onOpenChange={(o) => {
-          setSettingsOpen(o);
-          if (!o) setMenuOpen(false);
-        }}
-        projectId={projectId}
-        projectName={projectName}
-      />
+      {/* Mount the settings dialog only while open — like the row share modal,
+          it runs a full hook tree even when closed. */}
+      {settingsOpen && (
+        <ProjectSettingsDialog
+          open={settingsOpen}
+          onOpenChange={(o) => {
+            setSettingsOpen(o);
+            if (!o) setMenuOpen(false);
+          }}
+          projectId={projectId}
+          projectName={projectName}
+        />
+      )}
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>
@@ -4134,6 +4945,47 @@ function ProjectFolderMenu({
       </Dialog>
     </>
   );
+
+  return { actions, dialogs };
+}
+
+function ProjectFolderMenu({
+  projectName,
+  onNavigate,
+  actions,
+}: {
+  projectName: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        {/* Revealed on hover for fine hover pointers at any width; otherwise
+            sr-only so touch and assistive tech keep a focusable, announced
+            trigger for the same actions the long-press menu also opens. */}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label={`Project actions for ${projectName}`}
+          data-testid="project-actions"
+          className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-40">
+        <ProjectFolderMenuItems
+          components={dropdownBundle}
+          projectName={projectName}
+          onNavigate={onNavigate}
+          actions={actions}
+        />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 }
 
 // ── ProjectPickerMenu ─────────────────────────────────────────────────────────
@@ -4158,9 +5010,14 @@ function ProjectPickerMenu({
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
 
-  const filtered = search
-    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
+  const trimmed = search.trim();
+  const filtered = trimmed
+    ? projects.filter((p) => p.name.toLowerCase().includes(trimmed.toLowerCase()))
     : projects;
+  // Offer create only when the typed name isn't already an exact project.
+  const canCreate =
+    trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
+  const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -4174,7 +5031,7 @@ function ProjectPickerMenu({
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
+          placeholder="Search or create project"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={swallowKeys}
@@ -4182,20 +5039,42 @@ function ProjectPickerMenu({
       </div>
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((p) => (
-          <C.Item key={p.name} className="px-2 py-1" onSelect={() => onSelect(p.name)}>
+          <C.Item
+            key={p.name}
+            className="px-2 py-1"
+            textValue={p.name}
+            onSelect={() => onSelect(p.name)}
+          >
+            <ProjectRowIcon icon={p.icon} />
             <span className="flex-1 truncate text-left">{p.name}</span>
             {currentProject === p.name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && (
+        {filtered.length === 0 && !canCreate && (
           <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
         )}
       </div>
+      {canCreate && (
+        <div className="border-t pt-1">
+          <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
+            <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            Create{" "}
+            <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
+              {trimmed}
+            </span>
+          </C.Item>
+        </div>
+      )}
       {currentProject && (
         <div className="border-t pt-1">
-          <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
+          <C.Item
+            className="px-2 py-1"
+            textValue={`Remove from ${currentProject}`}
+            onSelect={() => onSelect("")}
+          >
+            <ProjectRowIcon icon={currentProjectIcon} />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
@@ -4267,6 +5146,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <input
         ref={inputRef}
         type="text"
+        maxLength={USER_SESSION_TITLE_MAX_CHARS}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onCompositionStart={() => {
@@ -4324,6 +5204,7 @@ function BulkActionBar({
   onProjectAssigned?: (projectName: string) => void;
 }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
@@ -4420,28 +5301,26 @@ function BulkActionBar({
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
-    bulkArchive.mutate(
-      { ids: nonArchivedSelected.map((c) => c.id), archived: true },
-      {
-        onSuccess: () => {
-          if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
-            navigate("/", { replace: true });
-          onDeselectAll();
-        },
-      },
-    );
+    // The rows leave the sidebar optimistically (useBulkArchiveConversations
+    // flips their cached `archived` flag in onMutate), so this bar unmounts
+    // with the selection. Navigate and deselect NOW rather than in a
+    // mutate-level callback — a callback on the unmounted observer never fires,
+    // and it would carry a stale `activeId` that could jump the user off a
+    // session they switched to meanwhile. Mirrors handleDelete.
+    if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
+      navigate("/", { replace: true });
+    onDeselectAll();
+    bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
+    // Offer Undo for the whole batch. Fire now, before this bar unmounts with
+    // the cleared selection; the toast is driven by module state + the
+    // app-level Toaster, so it outlives this component.
+    showArchiveUndoToast(queryClient, nonArchivedSelected);
   }
 
   function handleUnarchive() {
     if (archivedSelected.length === 0) return;
-    bulkArchive.mutate(
-      { ids: archivedSelected.map((c) => c.id), archived: false },
-      {
-        onSuccess: () => {
-          onDeselectAll();
-        },
-      },
-    );
+    onDeselectAll();
+    bulkArchive.mutate({ ids: archivedSelected.map((c) => c.id), archived: false });
   }
 
   function handleDelete() {

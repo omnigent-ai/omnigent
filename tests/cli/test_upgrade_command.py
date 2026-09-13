@@ -8,12 +8,20 @@ import pytest
 from click.testing import CliRunner
 
 from omnigent.cli import cli
+from omnigent.cli_invocation import WRAPPER_COMMAND_ENV
 from omnigent.host.local_server import LocalServerInfo
 from omnigent.update_check import (
     _build_nightly_upgrade_suggestion,
+    _build_upgrade_suggestion,
     _InstalledWheelInfo,
     _newest_nightly_version,
+    _upgrade_failure_message,
+    _uv_python_pin,
 )
+
+# uv upgrade commands pin the interpreter omnigent is running under, so
+# expectations derive the flag instead of hardcoding a python version.
+_UV_PY = _uv_python_pin()
 
 
 def _uv_registry_info() -> _InstalledWheelInfo:
@@ -325,27 +333,29 @@ def test_upgrade_pre_passes_prerelease_flag_to_installer(
     assert ran == ["uv tool upgrade omnigent --prerelease allow"]
 
 
-# ── ``omni update`` alias ────────────────────────────────────────────
+# ── deprecated ``omni update`` spelling ──────────────────────────────
 
 
-def test_update_is_alias_for_upgrade_same_callback() -> None:
-    """``update`` and ``upgrade`` resolve to the exact same Click command.
+def test_update_is_hidden_and_shares_upgrade_options() -> None:
+    """``update`` is a hidden shim over ``upgrade``, not a second command.
 
-    The alias is registered by handing the *same* Command object to the
-    group under a second name, so its callback, options and help must be
-    identical — there is no second implementation to drift from ``upgrade``.
+    It has to be its own Click object to warn, so the guard is that it reuses
+    ``upgrade``'s parameter objects — the option surface cannot drift.
     """
     update_cmd = cli.commands["update"]
     upgrade_cmd = cli.commands["upgrade"]
 
-    assert update_cmd is upgrade_cmd
-    assert update_cmd.callback is upgrade_cmd.callback
-    # Same option surface (--check / --force / --pre).
-    assert [p.name for p in update_cmd.params] == [p.name for p in upgrade_cmd.params]
+    assert update_cmd is not upgrade_cmd
+    assert update_cmd.hidden is True
+    assert upgrade_cmd.hidden is False
+    # The very same Parameter objects, not merely equally-named ones.
+    assert all(a is b for a, b in zip(update_cmd.params, upgrade_cmd.params, strict=True))
 
 
-def test_update_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
-    """``omni update`` runs the upgrade flow end-to-end (up-to-date path)."""
+def test_update_warns_then_runs_upgrade(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """``omni update`` still works, but warns and names ``upgrade``."""
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
 
     def _must_not_run(*_a: object, **_k: object) -> int:
@@ -356,8 +366,31 @@ def test_update_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None
     result = CliRunner().invoke(cli, ["update"])
 
     assert result.exit_code == 0, result.output
-    assert "up to date" in result.output
-    assert "0.1.0" in result.output
+    assert "`update` is deprecated" in result.stderr
+    assert "upgrade" in result.stderr
+    assert "up to date" in result.stdout
+    assert "0.1.0" in result.stdout
+
+
+def test_update_deprecation_notice_honors_the_wrapper_command(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """Under a wrapper the notice says ``isaac omni upgrade``, not ``omni``.
+
+    The wrapper guard rejects naked ``omnigent`` calls, so a hint spelling the
+    naked binary would name a command that cannot run.
+    """
+    monkeypatch.setenv(WRAPPER_COMMAND_ENV, "isaac omni")
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command",
+        lambda *_a, **_k: pytest.fail("upgrade ran while already up to date"),
+    )
+
+    result = CliRunner().invoke(cli, ["update"])
+
+    assert result.exit_code == 0, result.output
+    assert "`isaac omni upgrade`" in result.stderr
 
 
 def test_update_check_matches_upgrade_check(
@@ -376,8 +409,11 @@ def test_update_check_matches_upgrade_check(
     upgrade_result = runner.invoke(cli, ["upgrade", "--check"])
 
     assert update_result.exit_code == upgrade_result.exit_code == 1
-    assert update_result.output == upgrade_result.output
-    assert "v0.1.0 → v0.2.0" in update_result.output
+    assert update_result.stdout == upgrade_result.stdout
+    assert "v0.1.0 → v0.2.0" in update_result.stdout
+    # The warning is the only difference between the two.
+    assert "`update` is deprecated" in update_result.stderr
+    assert "deprecated" not in upgrade_result.stderr
 
 
 def test_update_suppresses_update_check_like_upgrade() -> None:
@@ -490,7 +526,9 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
     result = CliRunner().invoke(cli, ["upgrade"])
 
     assert result.exit_code == 0, result.output
-    assert ran == ["uv tool install --reinstall git+https://github.com/omnigent-ai/omnigent.git"]
+    assert ran == [
+        f"uv tool install --reinstall{_UV_PY} git+https://github.com/omnigent-ai/omnigent.git"
+    ]
     assert "Updated to git bbbbbbbbb" in result.output
 
 
@@ -578,7 +616,13 @@ def test_nightly_suggestion_shapes_per_installer() -> None:
         )
 
     uv = _build_nightly_upgrade_suggestion(info_for("uv"), version)
-    assert (uv.command, uv.runnable) == (f"uv tool install --force {spec}", True)
+    # ``--reinstall``, never ``--force``: uv's ``--force`` removes the working
+    # install before the replacement is built, and nightlies build from source,
+    # so a failed build would leave nothing behind.
+    assert (uv.command, uv.runnable) == (
+        f"uv tool install --reinstall{_UV_PY} {spec}",
+        True,
+    )
     pipx = _build_nightly_upgrade_suggestion(info_for("pipx"), version)
     assert (pipx.command, pipx.runnable) == (f"pipx install --force {spec}", True)
     pip = _build_nightly_upgrade_suggestion(info_for("pip"), version)
@@ -626,7 +670,8 @@ def test_upgrade_nightly_installs_pinned_tag(
 
     assert result.exit_code == 0, result.output
     assert ran == [
-        "uv tool install --force git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"
+        f"uv tool install --reinstall{_UV_PY} "
+        "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"
     ]
     assert "Upgraded to nightly v0.2.0.dev20260804" in result.output
 
@@ -681,7 +726,7 @@ def test_nightly_suggestion_preserves_and_unions_extras() -> None:
 
     assert suggestion.runnable
     assert suggestion.command == (
-        "uv tool install --force "
+        f"uv tool install --reinstall{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804#egg=omnigent[all,server]"
     )
 
@@ -733,7 +778,7 @@ def test_upgrade_nightly_dry_run_prints_without_running(
 
     assert result.exit_code == 0, result.output
     assert (
-        "Would run: uv tool install --force "
+        f"Would run: uv tool install --reinstall{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804" in result.output
     )
 
@@ -746,3 +791,118 @@ def test_upgrade_nightly_rejects_target_version(
 
     assert result.exit_code == 2, result.output
     assert "mutually exclusive" in result.output
+
+
+def test_nightly_uv_never_uses_destructive_force() -> None:
+    """No uv upgrade command may use ``--force``, whatever the install shape.
+
+    uv's ``--force`` removes the tool environment (and the ``omni`` /
+    ``omnigent`` executables) before the replacement is built. Nightlies build
+    from source, so the build can fail, and then nothing is left to fall back
+    to. ``--reinstall`` performs the same registry-to-git hop and the same
+    tag-to-tag hop while keeping the working install until the new one exists.
+    """
+    version = "0.9.0.dev20260804"
+    for extras in ((), ("databricks",)):
+        for vcs_url in (None, "git+https://github.com/a-fork/omnigent.git"):
+            info = _InstalledWheelInfo(
+                install_time_epoch=0.0,
+                installer="uv",
+                vcs_url=vcs_url,
+                commit_sha=None,
+                is_editable=False,
+                package_version="0.8.2",
+                detected_installer="uv",
+                extras=extras,
+            )
+            command = _build_nightly_upgrade_suggestion(info, version).command
+            assert "--force" not in command, command
+            assert command.startswith(f"uv tool install --reinstall{_UV_PY} ")
+            # Always the nightly tag, never the fork's recorded URL.
+            assert f"git+https://github.com/omnigent-ai/omnigent@v{version}" in command
+
+
+def test_nightly_pipx_spells_out_the_tag_instead_of_reinstall() -> None:
+    """pipx must not fall back to ``reinstall`` for a nightly hop.
+
+    ``pipx reinstall`` re-pulls the spec pipx recorded at install time, i.e.
+    the *old* tag, which would silently no-op the upgrade. Only the extras-less
+    in-place refresh may use it.
+    """
+
+    def pipx_info(vcs_url: str | None) -> _InstalledWheelInfo:
+        return _InstalledWheelInfo(
+            install_time_epoch=0.0,
+            installer="pipx",
+            vcs_url=vcs_url,
+            commit_sha=None,
+            is_editable=False,
+            package_version="0.8.2",
+            detected_installer="pipx",
+        )
+
+    nightly = _build_nightly_upgrade_suggestion(pipx_info(None), "0.9.0.dev20260804")
+    assert nightly.command == (
+        "pipx install --force git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804"
+    )
+    # An ordinary extras-less VCS refresh still uses the cheap re-pull.
+    same_source = _build_upgrade_suggestion(pipx_info("git+https://host/omnigent.git"))
+    assert same_source.command == "pipx reinstall omnigent"
+
+
+def test_upgrade_failure_message_reports_a_destroyed_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed upgrade must not claim the old install survived when it didn't."""
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+    )
+
+    message = _upgrade_failure_message(1, {"databricks"})
+
+    assert "your previous install is intact" not in message
+    assert "no longer installed" in message
+    # Actionable recovery, preserving the extras this install had.
+    assert "install.sh | sh -s -- --extra databricks" in message
+    assert "omnigent login" in message
+    assert "OMNIGENT_SKIP_WEB_UI=true" in message
+
+
+def test_upgrade_failure_message_confirms_a_surviving_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the probe still finds omnigent, the reassuring message is correct."""
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.8.2", None)
+    )
+
+    message = _upgrade_failure_message(1)
+
+    assert message == "Upgrade command exited with status 1; your previous install is intact."
+
+
+def test_upgrade_nightly_failure_surfaces_recovery_when_install_is_gone(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """A failed nightly build that took the install with it must say so.
+
+    This is the reported bug end to end: the web-UI build fails, the installer
+    exits non-zero, and the CLI used to answer "your previous install is
+    intact" purely from the exit code, sending the user to inspect PATH while
+    ``omni`` was actually gone.
+    """
+    monkeypatch.setattr(
+        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+    )
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a: 1)
+    # The installer replaced the environment, then the build failed.
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
+
+    assert result.exit_code != 0
+    assert "your previous install is intact" not in result.output
+    assert "no longer installed" in result.output
+    assert "install.sh" in result.output

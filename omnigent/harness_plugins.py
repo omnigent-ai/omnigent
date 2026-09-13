@@ -7,6 +7,7 @@ packages contribute additional harnesses through the
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import importlib.metadata
 import logging
@@ -37,11 +38,13 @@ from omnigent.harness_capabilities import (
     Elicitation,
     ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 
 _logger = logging.getLogger(__name__)
 
@@ -85,7 +88,7 @@ class NativeHarnessProvider:
     ``NativeCodingAgent`` is pure identity data; behavior lives here as a
     sibling row keyed by the same ``key``. Every value is a dotted import path
     (``module:attr`` or ``module.attr``) resolved lazily at dispatch time via
-    :mod:`omnigent.native_dispatch`, so building the registry never imports the
+    :mod:`omnigent.native.native_dispatch`, so building the registry never imports the
     runner / CLI / native-harness stack. Optional hooks are ``None`` when the
     behavior is not yet a module-level function the resolver can reach (e.g.
     interrupt/stop handlers that are still runner closures, or the inline
@@ -255,21 +258,26 @@ _BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "an
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """Build a built-in provider row from the ``omnigent.<key>_native`` module.
 
-    The built-in native harnesses follow a uniform module layout: each exports
+    The built-in native harnesses follow a uniform package layout under
+    ``omnigent.harnesses.<key>_native``: the ``.main`` module exports
     ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
-    (agent seeding), exposes a ``_launch_<key>`` terminal adapter in
-    ``omnigent.runner.native``, and exposes ``build_<key>_native_spawn_env`` in
-    ``omnigent.<key>_native_bridge``. The remaining hooks (interrupt, stop,
-    bridge-dir) are still runner-local closures / inline dispatch, so they stay
-    ``None`` until those hubs migrate onto the seam.
+    (agent seeding), a ``_launch_<key>`` terminal adapter lives in
+    ``omnigent.runner.native``, and ``build_<key>_native_spawn_env`` lives in the
+    ``.bridge`` submodule. The remaining hooks (interrupt, stop, bridge-dir) are
+    still runner-local closures / inline dispatch, so they stay ``None`` until
+    those hubs migrate onto the seam.
     """
-    module = f"omnigent.{key}_native"
+    pkg = f"omnigent.harnesses.{key}_native"
+    module = f"{pkg}.main"
     return NativeHarnessProvider(
         key=key,
         run_native=f"{module}:run_{key}_native",
         auto_create_terminal=f"omnigent.runner.native:_launch_{key}",
-        spawn_env_builder=f"{module}_bridge:build_{key}_native_spawn_env",
-        bridge_id_label_key=(f"{module}.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None),
+        spawn_env_builder=f"{pkg}.bridge:build_{key}_native_spawn_env",
+        # Session label key — a stable wire identifier, not a module path.
+        bridge_id_label_key=(
+            f"omnigent.{key}_native.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None
+        ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
     )
 
@@ -309,6 +317,7 @@ _EF = EffortFamily
 _MF = ModelFamily
 _AU = AuthModel
 _FH = ForkHistory
+_ID = InstructionDelivery
 
 # Bench shell-tool provocation prompts (moved off the bench's hardcoded
 # _NATIVE_TOOL_PROVOCATION table): the generic variant, and a Bash-specific one
@@ -336,12 +345,13 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
         _EL.JSONRPC,
         _RS.WARM_REATTACH,
-        _EF.OPENAI,
+        _EF.CODEX_NATIVE,
         _MF.GPT,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=True,
@@ -350,6 +360,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -361,7 +372,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _IM.NATIVE_TUI,
         _EL.NONE,
         _RS.WARM_REATTACH,
-        _EF.NONE,
+        _EF.PI,
         _MF.MULTI,
         _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
@@ -370,6 +381,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -385,6 +397,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # No shell-tool provocation: cursor-native was intentionally absent from
         # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -402,6 +415,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -416,6 +430,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="run_command",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "goose-native": _C(
         _IM.NATIVE_TUI,
@@ -430,6 +445,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="developer__shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
@@ -445,6 +461,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="run_shell_command",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -459,6 +476,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -473,6 +491,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
@@ -487,6 +506,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="terminal",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
@@ -500,6 +520,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
@@ -511,17 +532,19 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,
         _EL.NONE,
         _RS.COLD_ONLY,
-        _EF.NONE,
+        _EF.PI,
         _MF.MULTI,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "openai-agents": _C(
         _IM.SDK_IN_PROCESS,
@@ -533,6 +556,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "cursor": _C(
         _IM.SDK_IN_PROCESS,
@@ -544,6 +568,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "antigravity": _C(
         _IM.SDK_IN_PROCESS,
@@ -555,6 +580,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # Generic ACP harness — drives any user-configured ACP agent command. Same
     # profile as goose/qwen (own-auth, cold resume, SSE permission), but its
@@ -569,6 +595,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "goose": _C(
         _IM.ACP_SUBPROCESS,
@@ -580,6 +607,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "qwen": _C(
         _IM.ACP_SUBPROCESS,
@@ -591,6 +619,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "kimi": _C(
         _IM.CLI_SUBPROCESS,
@@ -602,6 +631,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "hermes": _C(
         _IM.CLI_SUBPROCESS,
@@ -613,6 +643,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "copilot": _C(
         _IM.SDK_IN_PROCESS,
@@ -624,6 +655,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
@@ -640,6 +672,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
 }
 
@@ -647,6 +680,15 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 # same generic wrap as the "acp" harness, so they share its declared profile.
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
+
+# Devin is the one row that diverges: its own wrap injects a vendor extension
+# (omnigent.inner.devin), so it surfaces the agent's sub-agents as child sessions
+# where a generic ACP agent cannot. Derived from the extension so this declared
+# capability cannot drift from the dialect that implements it.
+_BUILTIN_CAPABILITIES["devin"] = dataclasses.replace(
+    _BUILTIN_CAPABILITIES["acp"],
+    subagents=DEVIN_ACP_EXTENSION.surfaces_subagents,
+)
 
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
@@ -683,9 +725,12 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         | set(ACP_CLI_HARNESSES)
     ),
     harness_modules={
-        # Every catalog row runs the shared generic ACP wrap.
+        # Every catalog row runs the shared generic ACP wrap...
         **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
+        # ...except a row with vendor behavior, which runs its own thin wrap to
+        # inject an AcpExtension into the same shared executor.
+        "devin": "omnigent.inner.devin.harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -712,10 +757,12 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     aliases={
         **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
         "agy": "antigravity",
+        "agy-native": "antigravity-native",
         "claude": "claude-sdk",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
+        "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
@@ -730,6 +777,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     },
     native_harnesses=frozenset(
         {
+            "agy-native",
             "antigravity-native",
             "claude-native",
             "codex-native",
@@ -738,6 +786,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "hermes-native",
             "kimi-native",
             "kiro-native",
+            "native-agy",
             "native-antigravity",
             "native-claude",
             "native-codex",

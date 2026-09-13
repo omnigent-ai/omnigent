@@ -447,8 +447,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
       // highlight only that one. When occ is missing or out of range (stale
       // offset), fall back to all matches so the comment is at least visible.
       var picked = (typeof c.occ === "number" && c.occ >= 0 && c.occ < rs.length) ? [rs[c.occ]] : rs;
-      var isActive = active && c.anchor_content === active.anchor_content &&
-        (active.occ == null || active.occ === c.occ);
+      var isActive = active && active.comment_id === c.id;
       for (var j = 0; j < picked.length; j++) {
         ranges.push({ id: c.id, range: picked[j] });
         if (isActive) activeHi.push(picked[j]);
@@ -588,8 +587,8 @@ const BRIDGE_SCRIPT_BODY = `(function () {
           repaint();
         } else if (m.type === T.setActive) {
           var next = m.active && m.active.anchor_content ? m.active : null;
-          var prevKey = active ? active.anchor_content + "#" + active.occ : null;
-          var nextKey = next ? next.anchor_content + "#" + next.occ : null;
+          var prevKey = active ? active.comment_id || active.anchor_content + "#" + active.occ : null;
+          var nextKey = next ? next.comment_id || next.anchor_content + "#" + next.occ : null;
           active = next;
           repaint();
           // Only scroll when a comment becomes newly active (e.g. clicked in the

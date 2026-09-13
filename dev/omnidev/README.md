@@ -26,6 +26,9 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
   gitignored files under `omnigent/` (e.g. the build-time `_build_info.py`) are
   skipped so generated churn doesn't reload; the frontend self-reloads through
   Vite HMR;
+- **prefills ten example conversations** after the OSS server first becomes
+  healthy, giving UI and API work realistic short, multi-turn, and tool-call
+  transcripts;
 - gives you **per-process log panes** plus a combined view, each a `less`-style
   pager with wrap and search (see [Keys](#keys)).
 
@@ -57,7 +60,9 @@ in `web/` when needed — `node_modules/` is missing, or `package.json` /
 `pnpm-lock.yaml` is newer than it — so a fresh checkout or a new dependency
 doesn't make Vite fail its dependency scan. Output streams into the `vite` pane.
 
-Open the UI at the `ui` URL shown in the header (the Vite dev server).
+Once Vite begins serving, omnidev opens the `ui` URL shown in the header in
+your default browser. If the platform browser launcher is unavailable, startup
+continues and the combined log tells you to open that URL manually.
 
 ## Isolation
 
@@ -74,7 +79,16 @@ Each pod gets its own `config.yaml` under `<pod>/config/`, pointed to by
 `~/.omnigent/config.yaml` (if present) so the pod works out of the box — it
 keeps your providers — after which the two are independent: server-config edits
 inside a pod (via the UI or `omnigent config`) don't touch your real config.
-`--clean` wipes the pod dir, so the next run re-seeds from your real config.
+
+The OSS pod also imports the curated JSONL transcripts under
+`dev/omnidev/fixtures/conversations/` through `omnigent session import` once the
+server is healthy. Versioned per-fixture markers in the pod make normal starts
+and backend reloads idempotent. The imported rows remain ordinary conversations:
+you can edit, archive, or delete them without omnidev recreating them on the next
+start. External process profiles are not seeded.
+
+`--clean` wipes the pod dir, so the next run re-seeds both config and example
+conversations.
 
 The pod dir defaults to
 `${XDG_CACHE_HOME:-~/.cache}/omnidev/<repo-name>-<hash>/`, keyed to the

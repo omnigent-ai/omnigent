@@ -63,6 +63,8 @@ class FakeAPI:
         issue_comments: dict[int, list[dict[str, Any]]] | None = None,
         review_comments: dict[int, list[dict[str, Any]]] | None = None,
         reviews: dict[int, list[dict[str, Any]]] | None = None,
+        review_by_id: dict[tuple[int, int], dict[str, Any]] | None = None,
+        review_comment_by_id: dict[int, dict[str, Any]] | None = None,
         commits: dict[int, list[dict[str, Any]]] | None = None,
         writers: list[str] | None = None,
     ):
@@ -73,6 +75,8 @@ class FakeAPI:
         self.issue_comments = issue_comments or {}
         self.review_comments = review_comments or {}
         self.reviews = reviews or {}
+        self.review_by_id = review_by_id or {}
+        self.review_comment_by_id = review_comment_by_id or {}
         self.commits = commits or {}
         self.removed: list[tuple[int, str]] = []
         self.closed: list[int] = []
@@ -82,6 +86,12 @@ class FakeAPI:
 
     def get_pull(self, pull_number: int) -> dict[str, Any]:
         return self.pull | {"number": pull_number}
+
+    def get_review(self, pull_number: int, review_id: int) -> dict[str, Any]:
+        return self.review_by_id[(pull_number, review_id)]
+
+    def get_review_comment(self, comment_id: int) -> dict[str, Any]:
+        return self.review_comment_by_id[comment_id]
 
     def remove_label(self, issue_number: int, label: str) -> bool:
         self.removed.append((issue_number, label))
@@ -442,6 +452,21 @@ class AutoWaitingOnAuthorTest(unittest.TestCase):
         )
         self.assertEqual(api.added, [])
 
+    def test_dismissed_review_leaves_the_label_alone(self) -> None:
+        api = self.dispatch(
+            "pull_request_review",
+            {
+                "pull_request": {"number": 12},
+                "review": {
+                    "user": {"login": "maintainer1"},
+                    "state": "dismissed",
+                    "body": "stale feedback",
+                },
+            },
+            pull=pr(labels=[]),
+        )
+        self.assertEqual(api.added, [])
+
     def test_commenting_review_applies_the_label(self) -> None:
         api = self.dispatch(
             "pull_request_review",
@@ -482,6 +507,99 @@ class AutoWaitingOnAuthorTest(unittest.TestCase):
             pull=pr(labels=[]),
         )
         self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_relayed_review_rehydrates_trusted_api_data(self) -> None:
+        pull = pr(labels=[]) | {"base": {"repo": {"full_name": waiting_on_author.CANONICAL_REPO}}}
+        api = FakeAPI(
+            pull=pull,
+            review_by_id={
+                (12, 41): {
+                    "id": 41,
+                    "user": {"login": "maintainer1"},
+                    "state": "changes_requested",
+                    "body": "please fix",
+                }
+            },
+        )
+        event, payload = waiting_on_author.hydrate_relay_event(
+            {"event_name": "pull_request_review", "pull_number": 12, "activity_id": 41},
+            api,
+            waiting_on_author.CANONICAL_REPO,
+            "pull_request_review",
+        )
+
+        waiting_on_author.run(event, payload, api, waiting_on_author.CANONICAL_REPO)
+
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_relayed_review_comment_rehydrates_author_reply(self) -> None:
+        pull = pr(author="alice") | {
+            "base": {"repo": {"full_name": waiting_on_author.CANONICAL_REPO}}
+        }
+        api = FakeAPI(
+            pull=pull,
+            review_comment_by_id={
+                73: {
+                    "id": 73,
+                    "user": {"login": "alice"},
+                    "body": "fixed",
+                    "pull_request_url": (
+                        "https://api.github.com/repos/omnigent-ai/omnigent/pulls/12"
+                    ),
+                }
+            },
+        )
+        event, payload = waiting_on_author.hydrate_relay_event(
+            {
+                "event_name": "pull_request_review_comment",
+                "pull_number": 12,
+                "activity_id": 73,
+            },
+            api,
+            waiting_on_author.CANONICAL_REPO,
+            "pull_request_review_comment",
+        )
+
+        waiting_on_author.run(event, payload, api, waiting_on_author.CANONICAL_REPO)
+
+        self.assertEqual(api.removed, [(12, waiting_on_author.LABEL)])
+
+    def test_relayed_review_comment_must_match_pull(self) -> None:
+        pull = pr() | {"base": {"repo": {"full_name": waiting_on_author.CANONICAL_REPO}}}
+        api = FakeAPI(
+            pull=pull,
+            review_comment_by_id={
+                73: {
+                    "id": 73,
+                    "pull_request_url": (
+                        "https://api.github.com/repos/omnigent-ai/omnigent/pulls/99"
+                    ),
+                }
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            waiting_on_author.hydrate_relay_event(
+                {
+                    "event_name": "pull_request_review_comment",
+                    "pull_number": 12,
+                    "activity_id": 73,
+                },
+                api,
+                waiting_on_author.CANONICAL_REPO,
+                "pull_request_review_comment",
+            )
+
+    def test_relayed_event_must_match_workflow_event(self) -> None:
+        api = FakeAPI()
+
+        with self.assertRaisesRegex(ValueError, "does not match workflow event"):
+            waiting_on_author.hydrate_relay_event(
+                {"event_name": "pull_request_review", "pull_number": 12, "activity_id": 41},
+                api,
+                waiting_on_author.CANONICAL_REPO,
+                "pull_request_review_comment",
+            )
 
     def test_applying_clears_waiting_for_review(self) -> None:
         api = self.dispatch(

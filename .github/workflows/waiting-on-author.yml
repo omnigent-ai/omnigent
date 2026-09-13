@@ -6,16 +6,14 @@ name: Waiting on Author Hygiene
 # once a review is submitted). The two labels are mutually exclusive. PRs left
 # waiting on the author for 7 days are closed. The workflow runs from trusted
 # default-branch code and never checks out PR-authored files.
+# Review events use the read-only -> workflow_run relay in
+# waiting-on-author-review.yml and waiting-on-author-review-run.yml.
 
 on:
   pull_request_target:
     types: [synchronize, labeled]
   issue_comment:
     types: [created]
-  pull_request_review_comment:
-    types: [created]
-  pull_request_review:
-    types: [submitted]
   schedule:
     - cron: "0 */12 * * *"
   workflow_dispatch:

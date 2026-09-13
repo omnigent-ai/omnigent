@@ -31,7 +31,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 
 # Filesystem PUTs land in ``<repo-root>/<session_id>/`` (os_env.cwd: .), so
 # clean that per-session dir up in teardown.
@@ -90,7 +90,7 @@ def _patch_runner_offline_host_online(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = _FAKE_HOST_ID
         payload["host_resumable"] = True
@@ -106,7 +106,7 @@ def _patch_runner_offline_host_online(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         live = {"runner_online": False, "host_online": True}
         if isinstance(payload.get("sessions"), dict):

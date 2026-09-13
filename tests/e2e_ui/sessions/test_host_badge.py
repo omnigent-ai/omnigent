@@ -47,6 +47,8 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 _FAKE_HOST_ID = "host_test_badge"
 # Unix seconds well before now so an offline host is outside the startup grace
 # (STARTING_GRACE_S) and reads its real liveness, not `starting` — see
@@ -59,7 +61,7 @@ def _drop_routes(page: Page) -> Iterator[None]:
     """Drop this module's route handlers before the page closes.
 
     Every test here leaves a ``/health`` poll and snapshot refetches in flight.
-    A handler that calls ``route.fetch()`` as the page tears down raises
+    A handler that replays upstream as the page tears down raises
     ``TargetClosedError``, which surfaces as an error in the NEXT test's setup.
 
     :param page: Playwright page fixture.
@@ -105,7 +107,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = _FAKE_HOST_ID
         payload["host_resumable"] = host_resumable
@@ -132,7 +134,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -150,7 +152,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         live = {"runner_online": runner_online, "host_online": host_online}
         if isinstance(payload.get("sessions"), dict):
@@ -194,15 +196,13 @@ def test_host_badge_shows_host_name_when_online(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
     # The dot is decorative; status is conveyed by the title (mouse hover) and an
     # sr-only word. Online == reachable host. The title also advertises the
     # switch affordance the badge carries for any non-sandbox host.
-    expect(badge).to_have_attribute(
-        "title", "Host e2e-host, online — click to switch", timeout=15_000
-    )
+    expect(badge).to_have_attribute("title", "Host e2e-host, online", timeout=15_000)
 
 
 def test_host_badge_shows_offline_when_host_unreachable(
@@ -232,16 +232,14 @@ def test_host_badge_shows_offline_when_host_unreachable(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
     # No reconnect copy: `omnigent host` is the wrong instruction for a dormant
     # sandbox. The badge is still clickable — that click switches hosts — so the
     # absence of the reconnect affordance is what this pins.
-    expect(badge).to_have_attribute(
-        "title", "Host e2e-host, offline — click to switch", timeout=15_000
-    )
-    expect(badge).not_to_contain_text("click to reconnect")
+    expect(badge).to_have_attribute("title", "Host e2e-host, offline", timeout=15_000)
+    expect(badge).not_to_have_attribute("aria-label", re.compile(re.escape("click to reconnect")))
 
 
 def test_host_badge_offline_host_keeps_name_while_runner_outlives_it(
@@ -271,12 +269,10 @@ def test_host_badge_offline_host_keeps_name_while_runner_outlives_it(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
-    expect(badge).to_have_attribute(
-        "title", "Host e2e-host, offline — click to reconnect", timeout=15_000
-    )
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
+    expect(badge).to_have_attribute("title", "Host e2e-host, offline", timeout=15_000)
     assert badge.evaluate("el => el.tagName") == "BUTTON"
     # The runner is alive, so the session itself is still usable — the offline
     # host must not block the composer here.
@@ -290,7 +286,7 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     """A fully unreachable session names its dropped host instead of generic copy.
 
     This is the ``host_offline`` liveness state, which used to replace the host
-    name with "Host is offline — click to reconnect". The name is what tells the
+    name with "Host is offline". The name is what tells the
     user WHICH machine to go restart, so it stays; the separate band below the
     composer stays suppressed.
 
@@ -311,12 +307,10 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
-    expect(badge).to_have_attribute(
-        "title", "Host e2e-host, offline — click to reconnect", timeout=15_000
-    )
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
+    expect(badge).to_have_attribute("title", "Host e2e-host, offline", timeout=15_000)
     assert badge.evaluate("el => el.tagName") == "BUTTON"
     # The badge owns the affordance; the old band below the composer stays away.
     expect(page.get_by_test_id("disconnected-indicator")).to_have_count(0)
@@ -350,9 +344,10 @@ def test_host_badge_click_shows_host_reconnect_instructions(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     badge.click()
+    page.get_by_role("menuitem", name="Reconnect host", exact=True).click()
 
     dialog = page.get_by_test_id("reconnect-session-dialog")
     expect(dialog).to_be_visible(timeout=15_000)
@@ -390,11 +385,13 @@ def test_host_badge_labels_sandbox_session_by_provider(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     # The managed-<hex> host name is collapsed to the provider label.
-    expect(badge).to_contain_text("Databricks-lakebox Sandbox")
-    expect(badge).not_to_contain_text("managed-cd8f66d0")
+    expect(badge).to_have_attribute(
+        "aria-label", re.compile(re.escape("Databricks-lakebox Sandbox"))
+    )
+    expect(badge).not_to_have_attribute("aria-label", re.compile(re.escape("managed-cd8f66d0")))
 
 
 def _patch_switch_targets(page: Page, session_id: str, *, target_host_id: str) -> list[dict]:
@@ -512,9 +509,10 @@ def test_host_badge_switches_the_session_to_another_host(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     badge.click()
+    page.get_by_role("menuitem", name="Switch host…", exact=True).click()
 
     dialog = page.get_by_test_id("switch-host-dialog")
     expect(dialog).to_be_visible(timeout=15_000)

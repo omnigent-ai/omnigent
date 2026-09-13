@@ -24,11 +24,14 @@
 import {
   type ComponentPropsWithoutRef,
   type ComponentType,
+  type MouseEvent,
   type ReactNode,
   type RefAttributes,
   createContext,
   forwardRef,
+  useCallback,
   useContext,
+  useRef,
 } from "react";
 import {
   Link as RRLink,
@@ -40,6 +43,7 @@ import {
   useParams as useRRParams,
   useSearchParams as useRRSearchParams,
 } from "react-router-dom";
+import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 
 /**
  * The routing contract web depends on. Types are taken verbatim from
@@ -70,14 +74,22 @@ export interface RoutingApi {
   rebasePath: (path: string) => string;
 }
 
-// Standalone Link: react-router-dom's Link, minus the host-only `componentId`
-// (standalone has no analytics sink; passing it to a real <a> would warn on an
-// unknown DOM attribute).
+// Standalone Link: react-router-dom's Link that reports a click to the host
+// analytics sink when a `componentId` is given (see `lib/analytics.ts`). The id
+// is consumed here and never spread onto the real <a>, so it can't warn as an
+// unknown DOM attribute. When no host sink is configured the emit is a no-op.
 const StandaloneLink = forwardRef<HTMLAnchorElement, OmnigentLinkProps>(function StandaloneLink(
-  { componentId: _componentId, ...props },
+  { componentId, onClick, ...props },
   ref,
 ) {
-  return <RRLink ref={ref} {...props} />;
+  const { trackClick } = useOmnigentAnalytics();
+  const handleClick = componentId
+    ? (e: MouseEvent<HTMLAnchorElement>) => {
+        trackClick(componentId, "link");
+        onClick?.(e);
+      }
+    : onClick;
+  return <RRLink ref={ref} {...props} onClick={handleClick} />;
 });
 
 /** Default implementation: plain react-router-dom. */
@@ -144,10 +156,15 @@ export function basenamedRouting(
     ...base,
     useNavigate: () => {
       const navigate = base.useNavigate();
-      return ((to: To | number, options?: NavigateOptions) => {
-        if (typeof to === "number") return navigate(to);
-        return navigate(rebaseTo(to, basename), options);
-      }) as ReturnType<typeof useRRNavigate>;
+      const basenameRef = useRef(basename);
+      basenameRef.current = basename;
+      return useCallback(
+        ((to: To | number, options?: NavigateOptions) => {
+          if (typeof to === "number") return navigate(to);
+          return navigate(rebaseTo(to, basenameRef.current), options);
+        }) as ReturnType<typeof useRRNavigate>,
+        [navigate],
+      );
     },
     Link: forwardRef<HTMLAnchorElement, OmnigentLinkProps>((props, ref) => {
       const Impl = base.Link;

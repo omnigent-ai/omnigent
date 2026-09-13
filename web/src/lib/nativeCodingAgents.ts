@@ -4,6 +4,37 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
+/** Wrapper stamped on a child row that tracks a Claude Code Task sub-agent. */
+export const CLAUDE_NATIVE_SUBAGENT_WRAPPER = "claude-code-native-ui-subagent";
+/** Task-tool `description` forwarded onto that child row, e.g. `"wave-worker-696"`. */
+export const CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description";
+
+/**
+ * Human-readable label for a Claude Code sub-agent session.
+ *
+ * Its title is `"{agentType}:{subagentId}"` — a per-parent uniqueness key
+ * ending in an opaque hex id, so neither half is worth rendering. The Task
+ * description is what a human recognises; without one, the agent type's
+ * trailing segment reads best, since plugin-namespaced types arrive as
+ * `"rpw-published:debug-lead"`.
+ *
+ * @param labels - Session-scoped labels from the child row.
+ * @param subAgentName - The Claude `agentType` recorded on the row.
+ * @returns The label, or `null` when the row is not a Claude sub-agent (or
+ *   carries neither signal), leaving the caller's own fallbacks in charge.
+ */
+export function claudeNativeSubagentLabel(
+  labels: Record<string, string> | undefined,
+  subAgentName: string | null | undefined,
+): string | null {
+  if (labels?.[WRAPPER_LABEL_KEY] !== CLAUDE_NATIVE_SUBAGENT_WRAPPER) return null;
+  const description = labels[CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY]?.trim();
+  if (description) return description;
+  const agentType = subAgentName?.trim();
+  if (!agentType) return null;
+  return agentType.slice(agentType.lastIndexOf(":") + 1) || agentType;
+}
+
 export type NativeCodingAgentIconKind =
   | "claude"
   | "codex"
@@ -17,7 +48,7 @@ export type NativeCodingAgentIconKind =
   | "kimi"
   | "hermes";
 export type NativeCodingAgentCapability =
-  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions";
+  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -53,7 +84,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
-    capabilities: ["permissionMode"],
+    capabilities: ["permissionMode", "modelPicker"],
     fullySupported: true,
   },
   {
@@ -106,6 +137,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 40,
+    capabilities: ["modelPicker"],
   },
   {
     key: "kiro",
@@ -208,6 +240,8 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-cursor": "cursor-native",
   "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",
+  "agy-native": "antigravity-native",
+  "native-agy": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",
@@ -379,6 +413,23 @@ export function isNativeTerminalSession(
   const wrapper = session.labels?.[WRAPPER_LABEL_KEY];
   if (isNativeWrapper(wrapper)) return true;
   return nativeCodingAgentForHarness(session.harness) !== undefined;
+}
+
+/**
+ * Resolve the native coding agent a session runs, from its wrapper label
+ * (authoritative) or its harness field.
+ *
+ * @param session - Session-shaped object with `harness` and `labels`.
+ * @returns The agent spec, or undefined for non-native sessions.
+ */
+export function nativeCodingAgentForSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  if (session == null) return undefined;
+  return (
+    nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForHarness(session.harness)
+  );
 }
 
 export function nativeWrapperLabelsForAgent(

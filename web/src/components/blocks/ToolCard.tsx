@@ -13,6 +13,7 @@ import {
   Loader2Icon,
   Maximize2Icon,
   Minimize2Icon,
+  WrapTextIcon,
   XCircleIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -244,9 +245,9 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
     <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-chat transition-colors hover:text-foreground">
         <span>{label}</span>
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
       <CollapsibleContent className="mt-1 ml-2 space-y-1 border-l pl-3 pt-1 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         {tools.map((item) => {
@@ -318,7 +319,7 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground"
+      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-chat transition-colors hover:text-foreground"
     >
       <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
       <span className="min-w-0 flex-1 truncate">
@@ -400,17 +401,45 @@ function CodePanel({
   copyText: string;
   copyLabel: string;
 }) {
+  // Soft-wrap long lines by default so the panel never needs horizontal
+  // scrolling to read; the toggle restores the scrolling view for when
+  // column alignment matters (same affordance as chat code blocks).
+  const [wrap, setWrap] = useState(true);
   return (
-    <CodeBlock code={text} language="json">
+    <CodeBlock code={text} language="json" wrap={wrap}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
           <span className="truncate font-medium uppercase tracking-wide">{title}</span>
         </CodeBlockTitle>
         <CodeBlockActions>
+          <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
           <CopyTextButton label={copyLabel} text={copyText} />
         </CodeBlockActions>
       </CodeBlockHeader>
     </CodeBlock>
+  );
+}
+
+function WrapTextButton({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
+  const label = wrap ? "Disable word wrap" : "Enable word wrap";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label={label}
+          aria-pressed={wrap}
+          className={cn("size-6 text-muted-foreground", wrap && "text-foreground")}
+          onClick={onToggle}
+          size="icon-xs"
+          type="button"
+          variant="ghost"
+          componentId="diagnostics.tool.toggle_wrap"
+        >
+          <WrapTextIcon className="size-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -449,6 +478,7 @@ function OutputSection({ output }: { output: string }) {
             size="xs"
             type="button"
             variant="outline"
+            componentId="diagnostics.tool.toggle_expanded"
           >
             {isExpanded ? (
               <Minimize2Icon className="size-3" />
@@ -544,6 +574,7 @@ function CopyTextButton({ text, label }: CopyTextButtonProps) {
           size="icon-xs"
           type="button"
           variant="ghost"
+          componentId="diagnostics.tool.copy"
         >
           <Icon className="size-3.5" />
         </Button>

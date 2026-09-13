@@ -26,9 +26,13 @@ import {
   PanelRightIcon,
   SettingsIcon,
   SquarePenIcon,
+  XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   Command,
@@ -101,6 +105,7 @@ export function CommandPalette({
   onToggleRightSidebar,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
 
@@ -219,21 +224,70 @@ export function CommandPalette({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         aria-describedby={undefined}
-        className="top-1/4 translate-y-0 overflow-hidden p-0 sm:max-w-2xl"
+        // Mobile: a top-anchored full-screen sheet sized to the keyboard-aware
+        // visible viewport (--omnigent-viewport-height), so the input and results
+        // sit above the soft keyboard instead of a centered card whose lower half
+        // hides behind it. Desktop keeps the centered command palette.
+        className={cn(
+          "overflow-hidden p-0",
+          isMobile
+            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none"
+            : "top-1/4 translate-y-0 sm:max-w-2xl",
+        )}
+        style={
+          isMobile
+            ? {
+                top: 0,
+                height: "var(--omnigent-viewport-height, 100dvh)",
+                maxHeight: "var(--omnigent-viewport-height, 100dvh)",
+                // Pad both insets: safe-top clears the notch, safe-bottom keeps
+                // the last row above the home indicator when the keyboard is
+                // closed (the visible-viewport height then spans the home bar).
+                paddingTop: "var(--omnigent-safe-top, 0px)",
+                paddingBottom: "var(--omnigent-safe-bottom, 0px)",
+              }
+            : undefined
+        }
         showCloseButton={false}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions
             (see file header). vimBindings=false: keep Ctrl+K/J from doubling as
             list-nav on Win/Linux, where Ctrl+K is also the opener. */}
+        {/* Command's base class is `size-full`, so it already fills the sheet. */}
         <Command shouldFilter={false} vimBindings={false} label="Command palette">
-          <CommandInput
-            value={query}
-            onValueChange={setQuery}
-            placeholder="Search sessions or run a command"
-            data-testid="command-palette-input"
-          />
-          <CommandList>
+          {isMobile ? (
+            // Search field and an explicit close button share a top row; the
+            // full-screen sheet has no ⌘K/Esc affordance the way the desktop
+            // dialog does, so the X is how touch users dismiss it.
+            <div className="flex items-center gap-1 p-1">
+              <div className="min-w-0 flex-1">
+                <CommandInput
+                  value={query}
+                  onValueChange={setQuery}
+                  placeholder="Search sessions or run a command"
+                  data-testid="command-palette-input"
+                />
+              </div>
+              <Button
+                variant="ghost"
+                size="icon-lg"
+                className="shrink-0 rounded-full"
+                onClick={close}
+                aria-label="Close search"
+              >
+                <XIcon className="size-5 text-muted-foreground" />
+              </Button>
+            </div>
+          ) : (
+            <CommandInput
+              value={query}
+              onValueChange={setQuery}
+              placeholder="Search sessions or run a command"
+              data-testid="command-palette-input"
+            />
+          )}
+          <CommandList className={isMobile ? "max-h-none flex-1" : undefined}>
             <CommandEmpty>
               {isFetching && debouncedQuery ? "Searching…" : "No results found"}
             </CommandEmpty>

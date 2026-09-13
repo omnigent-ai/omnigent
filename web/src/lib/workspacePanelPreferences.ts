@@ -1,9 +1,13 @@
 // Persisted, app-global preference for whether a brand-new chat's right
 // Workspace rail (Files / Agents / Shells) starts open or collapsed.
 //
+// Set from Appearance settings, and re-written whenever the user collapses or
+// expands the rail — so the state the rail was last left in carries into the
+// next chat instead of springing back open.
+//
 // This only seeds sessions that have no saved per-chat `open` state. Once a
 // user toggles the rail in a session, that session's own
-// `SessionWorkspaceState.open` wins on restore. Set from Appearance settings.
+// `SessionWorkspaceState.open` wins on restore.
 
 const STORAGE_KEY = "omnigent:default-workspace-panel";
 
@@ -76,4 +80,14 @@ export function writeWorkspacePanelDefault(value: WorkspacePanelDefault): void {
  */
 export function readDefaultWorkspacePanelOpen(): boolean {
   return readWorkspacePanelDefault() === "open";
+}
+
+/**
+ * Record the rail's visibility as the app-global default.
+ *
+ * Called from AppShell's collapse/expand toggle so the state the user left the
+ * rail in becomes the starting state for chats they haven't opened yet.
+ */
+export function writeDefaultWorkspacePanelOpen(open: boolean): void {
+  writeWorkspacePanelDefault(open ? "open" : "collapsed");
 }

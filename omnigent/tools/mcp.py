@@ -14,12 +14,13 @@ is the only production consumer; see designs/RUNNER_MCP.md.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shlex
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlparse
 
+import httpx
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
@@ -359,14 +361,45 @@ def _is_sse_endpoint(url: str) -> bool:
     return urlparse(url).path.rstrip("/").endswith("/sse")
 
 
+def _mapping_digest(mapping: Mapping[str, str] | None) -> str:
+    """
+    Digest a possibly-secret str→str mapping for use inside a cache key.
+
+    Order-insensitive: same entries in any insertion order digest
+    identically. An empty or ``None`` mapping digests to a stable
+    constant so keys stay comparable across processes.
+
+    :param mapping: The env / headers mapping, or ``None``.
+    :returns: A short hex digest, e.g. ``"9f86d081884c7d65"``.
+    """
+    items = sorted((mapping or {}).items())
+    payload = json.dumps(items, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     """
     Build a stable cache key for an MCP server config + stdio cwd.
 
-    Keys include the transport + identifying fields so that two
-    configs pointing at the same live server share the cache
-    entry and two configs pointing at different servers (same
-    name, different url / command / cwd) don't collide.
+    Invariant: the key contains every config field the SERVER can
+    observe — anything that can change what ``tools/list`` returns.
+    For stdio that is the spawned command line (``command`` /
+    ``args`` / ``cwd``) and the ``env`` overlay; for HTTP it is the
+    ``url`` and the request identity (``headers``, and
+    ``databricks_profile``, which resolves to an Authorization
+    header at connect() time). A server may register different
+    tools depending on any of these (an env-gated read-only mode, a
+    remote server that scopes tools per principal), and two configs
+    differing in one must never share a cached tools/list — the
+    second would silently inherit the first's tool surface until
+    the TTL expires. Fields the CLIENT applies after the response
+    (the ``tools:`` allowlist, ``timeout`` / ``retry``,
+    ``description``) stay out so same-server configs keep sharing
+    one entry. When adding a config field, decide which side of
+    that line it falls on.
+
+    The env / headers maps are folded in as a digest, not verbatim:
+    they routinely carry secrets, and cache keys end up in logs.
 
     :param config: The MCP server configuration.
     :param cwd: Optional stdio subprocess working directory;
@@ -376,8 +409,15 @@ def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     if config.transport == "stdio":
         args_part = shlex.join(config.args) if config.args else ""
         cwd_part = "" if cwd is None else str(cwd)
-        return f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}"
-    return f"http:{config.name}:{config.url}"
+        env_part = _mapping_digest(config.env)
+        return f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}:{env_part}"
+    headers_part = _mapping_digest(config.headers)
+    # databricks_profile resolves to an Authorization header at
+    # connect() time, so it is an identity field even though the
+    # static ``headers`` map doesn't show it. A profile name is not
+    # a secret; keyed verbatim.
+    profile_part = config.databricks_profile or ""
+    return f"http:{config.name}:{config.url}:{profile_part}:{headers_part}"
 
 
 def clear_discovery_cache() -> None:
@@ -387,6 +427,63 @@ def clear_discovery_cache() -> None:
     Useful in tests to ensure a clean state.
     """
     _discovery_cache.clear()
+
+
+# Transport-level failures worth recording as an unhealthy-connection
+# signal. ``httpx.NetworkError`` covers connection reset/refused and
+# read/write errors; ``httpx.RemoteProtocolError`` covers the peer
+# closing the connection without a complete response. Timeouts are
+# deliberately excluded: a slow response is a slow server, not a dead
+# transport, and must not make a later request-timeout look retryable.
+_RECORDED_TRANSPORT_ERRORS = (httpx.NetworkError, httpx.RemoteProtocolError)
+
+# ``httpx.Request.extensions`` key carrying the tool-call attempt
+# serial stamped at request-send time — see
+# ``McpServerConnection._stamp_request_serial``.
+_CALL_SERIAL_EXTENSION = "omnigent_mcp_call_serial"
+
+
+class _TransportErrorRecordingStream(httpx.AsyncByteStream):
+    """
+    Response-body stream that reports network failures out of band.
+
+    The MCP SDK's streamable-HTTP client swallows exceptions raised
+    while it reads a response body (``mcp/client/streamable_http.py``:
+    the SSE path logs and returns when no resumable event id was seen;
+    the JSON path forwards the exception to a message handler that
+    drops it by default). A connection reset that lands *after* the
+    request was sent therefore leaves the ``ClientSession`` live while
+    the pending request can never complete — it later surfaces as a
+    request-timeout ``McpError`` indistinguishable from a slow tool.
+    Recording the failure at the httpx layer gives
+    :func:`_is_dead_session_timeout` an explicit unhealthy-transport
+    signal that does not depend on SDK internals. Installed by the
+    response event hook in
+    :meth:`McpServerConnection._make_recording_httpx_client`.
+
+    :param inner: The wrapped httpx response stream.
+    :param on_error: Callback receiving the network failure, e.g.
+        :meth:`McpServerConnection._record_transport_error`.
+    """
+
+    def __init__(
+        self,
+        inner: httpx.AsyncByteStream,
+        on_error: Callable[[BaseException], None],
+    ) -> None:
+        self._inner = inner
+        self._on_error = on_error
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._inner:
+                yield chunk
+        except _RECORDED_TRANSPORT_ERRORS as exc:
+            self._on_error(exc)
+            raise
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 @dataclass
@@ -424,6 +521,30 @@ class McpServerConnection:
     # ``_call_lock`` so only one call is active at a time.
     _active_session_id: str | None = field(default=None, init=False, repr=False)
     _session: ClientSession | None = field(default=None, init=False, repr=False)
+    # Most recent network-level transport failure, recorded by
+    # ``_TransportErrorRecordingTransport``. The MCP SDK can swallow
+    # a mid-response network error entirely (leaving ``_session``
+    # live while the pending request is doomed to time out), so this
+    # is the explicit unhealthy-transport signal that
+    # ``_is_dead_session_timeout`` keys retry classification off.
+    # Recorded only for POST responses (tool-call traffic, not the
+    # SDK's server-initiated GET stream), only when the failure
+    # belongs to the current call attempt (see ``_call_serial``),
+    # and cleared at the start of every attempt and when a fresh
+    # session is established — so the signal is scoped to the
+    # attempt whose classification consumes it.
+    _transport_error: BaseException | None = field(default=None, init=False, repr=False)
+    # Monotonic id of the current tool-call attempt, bumped under
+    # ``_call_lock`` at the start of every request the session
+    # sends. The SDK never cancels the POST task of a timed-out
+    # request, so its response — headers and body alike — can keep
+    # arriving and fail long after the call already raised. Every
+    # outgoing request is stamped with the serial current when it
+    # was SENT (``_stamp_request_serial``), and failures whose
+    # stamp no longer matches the current serial are discarded
+    # instead of recorded, preventing a stale lingering response
+    # from flipping a later genuine slow-tool timeout into a retry.
+    _call_serial: int = field(default=0, init=False, repr=False)
     # Long-lived task that owns the transport + session + their
     # AsyncExitStack. Must be the SAME task that runs the stack's
     # ``__aexit__`` — anyio's stdio_client / sse_client cancel
@@ -565,6 +686,13 @@ class McpServerConnection:
             raise RuntimeError("MCP session not initialized — call connect() first")
         async with self._call_lock:
             self._active_session_id = session_id
+            # Scope the unhealthy-transport signal to this attempt:
+            # bumping the serial invalidates recordings from any
+            # still-lingering response stream of a previous timed-out
+            # call, and the fresh slot only accepts failures from
+            # responses opened during this attempt.
+            self._call_serial += 1
+            self._transport_error = None
             try:
                 result = await self._session.call_tool(name=name, arguments=arguments)
             finally:
@@ -580,6 +708,18 @@ class McpServerConnection:
                 arguments=arguments,
             )
 
+        if session_id:
+            from omnigent.runner.pr_observer import observe_tool_completion
+
+            await asyncio.to_thread(
+                observe_tool_completion,
+                session_id,
+                tool_name=f"{self.config.name}__{name}",
+                arguments=arguments,
+                result=result.model_dump(),
+                successful=not result.isError,
+                source="managed_mcp",
+            )
         return _format_call_result(result)
 
     async def call_tool_with_elicitation(
@@ -623,6 +763,10 @@ class McpServerConnection:
 
         async with self._call_lock:
             self._active_session_id = session_id
+            # Same attempt scoping as _invoke_tool: invalidate stale
+            # recordings and start a clean slot for this request.
+            self._call_serial += 1
+            self._transport_error = None
             try:
                 result = await self._session.send_request(
                     ClientRequest(
@@ -729,6 +873,9 @@ class McpServerConnection:
                 await stack.enter_async_context(session)
                 await session.initialize()
                 self._session = session
+                # Fresh transport — drop any unhealthy-transport
+                # signal recorded on the previous connection.
+                self._transport_error = None
                 discovered = await self._discover_or_use_cache()
                 ready.set_result(discovered)
                 # Hold transport + session open until close() signals.
@@ -841,6 +988,129 @@ class McpServerConnection:
         """
         key = _cache_key(self.config, self.cwd)
         _discovery_cache[key] = tools
+
+    def _record_transport_error(self, exc: BaseException) -> None:
+        """
+        Record *exc* as this connection's unhealthy-transport signal.
+
+        Called from the httpx layer
+        (:class:`_TransportErrorRecordingTransport`) when a request or
+        its response stream fails with a network error. Consumed by
+        :func:`_is_dead_session_timeout` to classify a subsequent
+        request-timeout ``McpError`` as a dead connection worth a
+        reconnect-retry.
+
+        :param exc: The network-level failure, e.g.
+            ``httpx.ReadError("connection reset by peer")``.
+        """
+        _logger.debug(
+            "MCP server %r: network-level transport failure recorded: %s",
+            self.config.name,
+            exc,
+        )
+        self._transport_error = exc
+
+    async def _stamp_request_serial(self, request: httpx.Request) -> None:
+        """
+        httpx request event hook binding the attempt token at send.
+
+        Stamps the current call-attempt serial onto the outgoing
+        request. The stamp must be taken at request-*send* time, not
+        when response headers arrive: the SDK runs every POST as a
+        detached task it never cancels, so a timed-out call's
+        response headers can arrive only after a later attempt has
+        started — a header-arrival token would then carry the later
+        attempt's serial and misattribute the stale failure to it.
+        The send itself happens promptly while the issuing attempt
+        is current (``_call_lock`` is held and the caller yields to
+        the POST task immediately after enqueueing the request).
+
+        :param request: The request about to be sent.
+        """
+        request.extensions[_CALL_SERIAL_EXTENSION] = self._call_serial
+
+    async def _record_response_stream(self, response: httpx.Response) -> None:
+        """
+        httpx response event hook installing the failure recorder.
+
+        Wraps the response body of every client POST in
+        :class:`_TransportErrorRecordingStream` — tool calls, but
+        also ``initialize``/discovery requests, which is harmless
+        because those run outside any attempt window and the slot is
+        reset when a session is established. The SDK's
+        server-initiated GET stream is deliberately not wrapped: its
+        reconnect flaps are unrelated to any in-flight tool call and
+        must not flip a genuine slow-tool timeout into a retry.
+
+        Failures are attributed to the attempt whose serial was
+        stamped on the request at send time
+        (:meth:`_stamp_request_serial`); a failure from a request
+        sent by a superseded attempt is discarded rather than
+        recorded, so a lingering response of a timed-out call cannot
+        taint a later call's timeout classification.
+
+        :param response: The response whose body is about to be read.
+        """
+        if response.request.method != "POST":
+            return
+        stream = response.stream
+        if not isinstance(stream, httpx.AsyncByteStream):  # pragma: no cover
+            return
+        sent_serial = response.request.extensions.get(_CALL_SERIAL_EXTENSION)
+
+        def on_error(exc: BaseException) -> None:
+            if sent_serial == self._call_serial:
+                self._record_transport_error(exc)
+            else:
+                _logger.debug(
+                    "MCP server %r: discarding transport failure from a "
+                    "superseded call attempt: %s",
+                    self.config.name,
+                    exc,
+                )
+
+        response.stream = _TransportErrorRecordingStream(stream, on_error)
+
+    def _make_recording_httpx_client(
+        self,
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        """
+        Build an httpx client that records network failures.
+
+        Drop-in ``httpx_client_factory`` for the SDK's HTTP
+        transports. Mirrors the defaults of the SDK's
+        ``create_mcp_http_client`` (``follow_redirects=True``,
+        30s/300s timeouts when none are supplied) and installs a
+        response event hook so mid-response network failures the SDK
+        swallows still surface through :attr:`_transport_error`.
+
+        The recorder is a response hook rather than a custom
+        ``transport=`` on purpose: httpx only mounts
+        ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` environment
+        proxies when no explicit transport is supplied
+        (``allow_env_proxies = trust_env and transport is None``,
+        httpx 0.28 ``_client.py``), and MCP servers behind an egress
+        proxy must keep working exactly as with the SDK's default
+        client.
+
+        :param headers: Headers forwarded by the SDK transport.
+        :param timeout: Timeout forwarded by the SDK transport.
+        :param auth: Auth forwarded by the SDK transport.
+        :returns: A configured ``httpx.AsyncClient``.
+        """
+        return httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=(timeout if timeout is not None else httpx.Timeout(30.0, read=300.0)),
+            headers=headers,
+            auth=auth,
+            event_hooks={
+                "request": [self._stamp_request_serial],
+                "response": [self._record_response_stream],
+            },
+        )
 
     async def _open_transport(
         self,
@@ -967,6 +1237,9 @@ class McpServerConnection:
                 headers=headers,
                 timeout=float(timeout) if timeout is not None else 30,
                 sse_read_timeout=float(timeout) if timeout is not None else 300,
+                # Record response-stream network failures the SDK
+                # would otherwise swallow — see _is_dead_session_timeout.
+                httpx_client_factory=self._make_recording_httpx_client,
             )
         )
         return read_stream, write_stream
@@ -999,6 +1272,9 @@ class McpServerConnection:
                 timeout=float(timeout) if timeout is not None else 5,
                 # MCP SDK default: 300s (5 min) for SSE event read.
                 sse_read_timeout=float(timeout) if timeout is not None else 300,
+                # Record response-stream network failures the SDK
+                # would otherwise swallow — see _is_dead_session_timeout.
+                httpx_client_factory=self._make_recording_httpx_client,
             )
         )
         return read_stream, write_stream
@@ -1212,13 +1488,31 @@ def _collect_problematic_keywords(
 
 # Exception types that indicate a dead/broken connection
 # rather than a legitimate tool error. These are worth
-# retrying after a reconnect.
+# retrying after a reconnect. ``httpx.NetworkError`` (connection
+# reset/refused, read/write errors) mirrors the LLM retry path's
+# transient classification in ``omnigent/runtime/llm_retry.py``.
 _CONNECTION_ERROR_TYPES = (
     EOFError,
     BrokenPipeError,
     ConnectionError,
     OSError,
+    httpx.NetworkError,
+    # Peer closed the connection without a complete response. Usually
+    # swallowed inside the SDK and surfaced through the recorded
+    # transport-error 408 path instead, but retried here too if it
+    # ever propagates directly.
+    httpx.RemoteProtocolError,
 )
+
+
+# The streamable-HTTP transport reports a dead server-side session as
+# ``ErrorData(code=32600, message="Session terminated")`` (mcp 1.29.0,
+# mcp/client/streamable_http.py). The code is an upstream typo of JSON-RPC's
+# invalid-request ``-32600`` -- positive 32600 is not in the specification --
+# so match on both the code and the message: the SDK could fix the sign of the
+# code at any time, and the message is what the session-lost path emits.
+_SESSION_TERMINATED_CODE = 32600
+_SESSION_TERMINATED_MESSAGE = "session terminated"
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -1227,8 +1521,11 @@ def _is_connection_error(exc: BaseException) -> bool:
 
     Returns ``True`` for transport-level failures (broken pipe,
     EOF, connection reset) and MCP-level connection-closed
-    errors. Returns ``False`` for tool-level errors (invalid
-    args, tool not found) which should not trigger a reconnect.
+    errors, including the streamable-HTTP transport's
+    ``Session terminated`` (32600) raised when the server no longer
+    knows the session id (e.g. it restarted). Returns ``False`` for
+    tool-level errors (invalid args, tool not found) which should not
+    trigger a reconnect.
 
     :param exc: The exception to classify.
     :returns: ``True`` if the error is connection-related.
@@ -1236,8 +1533,73 @@ def _is_connection_error(exc: BaseException) -> bool:
     if isinstance(exc, _CONNECTION_ERROR_TYPES):
         return True
     if isinstance(exc, McpError):
-        return exc.error.code == CONNECTION_CLOSED
+        if exc.error.code == CONNECTION_CLOSED:
+            return True
+        return exc.error.code == _SESSION_TERMINATED_CODE or (
+            isinstance(exc.error.message, str)
+            and exc.error.message.strip().lower() == _SESSION_TERMINATED_MESSAGE
+        )
     return False
+
+
+# The MCP SDK surfaces a request whose response never arrives as an
+# ``McpError`` with ``code=httpx.codes.REQUEST_TIMEOUT`` (408). When
+# the transport died mid-call, the response can never arrive, so a
+# dead connection surfaces as this timeout while the underlying
+# network error is swallowed by the lifecycle task.
+_REQUEST_TIMEOUT_CODE = int(httpx.codes.REQUEST_TIMEOUT)
+
+
+def _is_dead_session_timeout(exc: BaseException, conn: McpServerConnection) -> bool:
+    """
+    Detect a request timeout caused by a dead transport.
+
+    A transient network failure mid-call (connection reset, brief
+    refusal window) kills the transport's lifecycle task; the
+    in-flight request then never receives a response and surfaces
+    as the SDK's request-timeout ``McpError`` instead of the
+    underlying network error. Distinguish that from a live-but-slow
+    server by two explicit signals, either of which classifies the
+    timeout as a connection failure worth a reconnect-retry:
+
+    - The lifecycle task died and cleared ``_session`` (e.g. the
+      transport task group crashed on a pre-response failure).
+    - A network-level failure was recorded at the httpx layer
+      (``_transport_error``). This is the common production shape:
+      with the locked MCP SDK, a reset that lands *after* the
+      request was sent is swallowed inside the streamable-HTTP
+      client (the SSE response path logs and returns without a
+      resumable event id; the JSON path forwards the exception to a
+      message handler that drops it by default), so the lifecycle
+      task stays alive and ``_session`` stays live while the
+      pending request can never complete.
+
+    A timeout with a live session and a clean transport is a
+    genuine tool timeout and must not be retried — MCP tools are
+    not guaranteed idempotent.
+
+    Two caveats, both deliberate:
+
+    - Retrying the recorded-error branch is at-least-once delivery:
+      the response was lost after the server may have fully executed
+      the tool, so the retry can re-execute it. This matches the
+      existing ``_is_connection_error`` mid-call reconnect semantics
+      and is the standard network-retry trade-off.
+    - Detecting the swallowed case relies on the session read
+      timeout (``MCPServerConfig.timeout``): without one the SDK
+      never raises the 408 and a swallowed reset hangs the pending
+      request — pre-existing behavior this fix does not change.
+
+    :param exc: The exception raised by the tool invocation.
+    :param conn: The connection the invocation ran on.
+    :returns: ``True`` if the timeout is attributable to a dead
+        transport.
+    """
+    if not isinstance(exc, McpError):
+        return False
+    if exc.error.code != _REQUEST_TIMEOUT_CODE:
+        return False
+    return conn._session is None or conn._transport_error is not None
 
 
 def _backoff_delay(attempt: int, retry: RetryPolicy) -> float:
@@ -1295,14 +1657,24 @@ async def _call_tool_with_reconnect(
     """
     last_exc: Exception | None = None
     total_tries = retry.max_retries + 1
+    needs_reconnect = False
 
     for attempt in range(total_tries):
         try:
+            # Reconnect first when the previous attempt broke the
+            # session. Inside the try so a reconnect that fails on a
+            # still-recovering network is itself classified and
+            # retried on the next attempt instead of aborting the
+            # whole call.
+            if needs_reconnect:
+                await conn._reconnect()
+                needs_reconnect = False
             return await conn._invoke_tool(name, arguments, session_id=session_id)
         except Exception as exc:
-            if not _is_connection_error(exc):
+            if not (_is_connection_error(exc) or _is_dead_session_timeout(exc, conn)):
                 raise
             last_exc = exc
+            needs_reconnect = True
             # Last attempt — don't reconnect, just raise.
             if attempt + 1 >= total_tries:
                 break
@@ -1317,7 +1689,6 @@ async def _call_tool_with_reconnect(
                 delay,
             )
             await _sleep(delay)
-            await conn._reconnect()
 
     # All attempts exhausted — re-raise the last connection error.
     assert last_exc is not None

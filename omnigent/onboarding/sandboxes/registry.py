@@ -37,6 +37,16 @@ class _WorkspaceHostLauncherFactory(Protocol):
         pass
 
 
+class _ServerUrlLauncherFactory(Protocol):
+    def __call__(self, *, server_url: str) -> SandboxHostLauncher:
+        pass
+
+
+class _ConfiguredLauncherFactory(Protocol):
+    def __call__(self, *, config: object) -> SandboxHostLauncher:
+        pass
+
+
 @dataclass(frozen=True)
 class SandboxProviderMetadata:
     """Static metadata for one sandbox provider.
@@ -149,6 +159,13 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 launcher_class="omnigent.onboarding.sandboxes.boxlite:BoxliteSandboxLauncher",
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
+            "microsandbox": SandboxProviderMetadata(
+                name="microsandbox",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.microsandbox:MicrosandboxSandboxLauncher"
+                ),
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
             "cwsandbox": SandboxProviderMetadata(
                 name="cwsandbox",
                 launcher_class="omnigent.onboarding.sandboxes.cwsandbox:CWSandboxLauncher",
@@ -162,6 +179,11 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 name="e2b",
                 launcher_class="omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
             ),
+            "gensee": SandboxProviderMetadata(
+                name="gensee",
+                launcher_class="omnigent.onboarding.sandboxes.gensee:GenseeSandboxLauncher",
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
             "openshell": SandboxProviderMetadata(
                 name="openshell",
                 launcher_class="omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
@@ -170,6 +192,13 @@ def _builtin_contribution() -> SandboxProviderContribution:
             "kubernetes": SandboxProviderMetadata(
                 name="kubernetes",
                 launcher_class="omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
+            "agent_sandbox": SandboxProviderMetadata(
+                name="agent_sandbox",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.agent_sandbox:AgentSandboxLauncher"
+                ),
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
         },
@@ -288,15 +317,27 @@ def instantiate(
     name: str,
     *,
     workspace_host: str | None = None,
+    server_url: str | None = None,
+    config: Mapping[str, object] | None = None,
 ) -> SandboxHostLauncher:
     """Import and instantiate a registered provider's launcher class.
 
     :param name: Registered provider name.
     :param workspace_host: Optional Databricks workspace host passed
         to the Lakebox launcher constructor.
+    :param server_url: Optional CLI target passed to the microsandbox launcher
+        so it can scope guest-to-host access before provisioning.
+    :param config: The provider's ``sandbox.<name>`` block, or ``None``.
+        Only used when the provider declares a
+        :attr:`SandboxProviderMetadata.config_model`: the block is
+        validated through that model and the result is passed to the
+        launcher constructor as ``config=``. Providers that declare no
+        model — which is every built-in — ignore this entirely, so the
+        argument changes nothing for them.
     :returns: A fresh launcher instance.
-    :raises SandboxRegistryError: If the provider is unknown or its
-        class cannot be imported/instantiated.
+    :raises SandboxRegistryError: If the provider is unknown, its class
+        cannot be imported/instantiated, or *config* fails validation
+        against the declared model.
     """
     meta = get_provider_metadata(name)
     if meta is None:
@@ -315,4 +356,19 @@ def instantiate(
     if name == "lakebox" and workspace_host is not None:
         launcher_factory = cast(_WorkspaceHostLauncherFactory, launcher_cls)
         return launcher_factory(workspace_host=workspace_host)
+    if name == "microsandbox" and server_url is not None:
+        launcher_factory = cast(_ServerUrlLauncherFactory, launcher_cls)
+        return launcher_factory(server_url=server_url)
+    if meta.config_model is not None:
+        # The docstring on `config_model` already describes it as validating
+        # "the provider-specific `sandbox.<name>` config block"; this is the
+        # call that makes that true. Kept inside the `is not None` branch so a
+        # provider that declares no model keeps a zero-argument constructor.
+        try:
+            validated = meta.config_model(**dict(config or {}))
+        except Exception as exc:
+            raise SandboxRegistryError(
+                f"invalid 'sandbox.{name}' config for provider '{name}': {exc}"
+            ) from exc
+        return cast(_ConfiguredLauncherFactory, launcher_cls)(config=validated)
     return launcher_cls()

@@ -1278,6 +1278,259 @@ require(extensionPath)(pi);
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_mcp_200_html_signin_is_classified_not_parsed_as_json(
+    tmp_path: Path,
+) -> None:
+    """A ``200 text/html`` sign-in page is an auth failure, not an MCP response.
+
+    ``resp.ok`` is true for a sign-in document served with status 200, so status
+    alone cannot distinguish it from a real answer. Before the fix the bare
+    ``resp.ok`` check fell straight through to ``resp.json()``, which threw and
+    surfaced an unclassified parse error whose ``err.message`` echoed the start
+    of the sign-in body back to the model.
+
+    Asserts, at the ``/mcp`` tool-call call site only:
+
+    1. a declared ``text/html`` 200 resolves to ``isError: true`` naming an
+       authentication / sign-in classification, without throwing;
+    2. the message leaks no part of the body, no header value, and no URL;
+    3. a declared ``application/json`` 200 still round-trips normally;
+    4. a JSON content type with an unparseable body is classified the same
+       bounded way rather than echoing the body through the outer catch;
+    5. a header accessor that *throws* is treated as an unreadable content type
+       rather than escaping to the outer catch, whose message would carry the
+       header/body text the accessor complained about — covering both a throwing
+       ``headers.get()`` and a throwing ``headers`` property getter.
+
+    Not covered here, and unchanged from ``main``: the outer catch still reports
+    a *transport* error's ``err.message``, which can name the request URL. That
+    predates this change and is asserted by
+    ``test_mcp_unreachable_fails_closed_without_throwing``.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const inboxDir = path.join(tmpDir, "inbox");
+const configPath = path.join(tmpDir, "config.json");
+
+fs.mkdirSync(inboxDir, { recursive: true });
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "conv_abc",
+    inboxDir,
+    authHeaders: {},
+    tools: [
+      { name: "sys_os_shell", description: "", parameters: { type: "object", properties: {} } },
+    ],
+  }),
+);
+
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+// A realistic edge sign-in document: served 200, carries an identifier a
+// classification string must never echo back to the model.
+const SIGNIN_HTML =
+  '<!DOCTYPE html><html><head><title>Sign in</title></head><body>' +
+  '<form action="/oauth2/authorize"><input name="state" ' +
+  'value="SECRET-STATE-b3f9c1"></form></body></html>';
+
+function headersOf(contentType) {
+  return { get: (name) => (String(name).toLowerCase() === "content-type" ? contentType : null) };
+}
+
+let mode = "html";
+global.fetch = async () => {
+  if (mode === "html") {
+    return {
+      ok: true,
+      status: 200,
+      headers: headersOf("text/html; charset=utf-8"),
+      async json() {
+        // What a real Response does with an HTML body: the message quotes it.
+        throw new SyntaxError(
+          'Unexpected token \'<\', "' + SIGNIN_HTML.slice(0, 24) + '"... is not valid JSON',
+        );
+      },
+      async text() {
+        return SIGNIN_HTML;
+      },
+    };
+  }
+  if (mode === "throwing-headers-getter") {
+    return {
+      ok: true,
+      status: 200,
+      get headers() {
+        throw new Error(
+          'headers getter blew up: set-cookie=SESSION=SECRET-STATE-b3f9c1; body=' + SIGNIN_HTML,
+        );
+      },
+      async json() {
+        return {
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: "real answer" }] },
+        };
+      },
+    };
+  }
+  if (mode === "throwing-headers") {
+    return {
+      ok: true,
+      status: 200,
+      headers: {
+        get() {
+          throw new Error(
+            'header parse failed: set-cookie=SESSION=SECRET-STATE-b3f9c1; body=' + SIGNIN_HTML,
+          );
+        },
+      },
+      async json() {
+        return {
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: "real answer" }] },
+        };
+      },
+    };
+  }
+  if (mode === "json-unparseable") {
+    return {
+      ok: true,
+      status: 200,
+      headers: headersOf("application/json"),
+      async json() {
+        throw new SyntaxError('Unexpected token \'x\', "SECRET-STATE-b3f9c1" is not valid JSON');
+      },
+    };
+  }
+  return {
+    ok: true,
+    status: 200,
+    headers: headersOf("application/json; charset=utf-8"),
+    async json() {
+      return {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { content: [{ type: "text", text: "real answer" }] },
+      };
+    },
+  };
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const registered = {};
+const pi = {
+  registerCommand() {},
+  on() {},
+  registerTool(spec) { registered[spec.name] = spec; },
+  sendUserMessage() {},
+};
+
+require(extensionPath)(pi);
+
+function soleText(result) {
+  assert.ok(result && Array.isArray(result.content), JSON.stringify(result));
+  return result.content.map((block) => block.text || "").join("");
+}
+
+(async () => {
+  // 1. A 200 text/html sign-in page is a classified auth/edge failure.
+  const html = await registered.sys_os_shell.execute("call-1", {});
+  assert.equal(html.isError, true, JSON.stringify(html));
+  const htmlText = soleText(html);
+  assert.ok(
+    /sign-in|sign in|authenticat/i.test(htmlText),
+    "message does not name an authentication classification: " + htmlText,
+  );
+
+  // 2. No part of the body, no header value, and no URL may appear.
+  for (const forbidden of [
+    "SECRET-STATE-b3f9c1",
+    "<!DOCTYPE",
+    "<html",
+    "oauth2/authorize",
+    "text/html",
+    "http://omnigent.test",
+    "conv_abc",
+  ]) {
+    assert.ok(
+      htmlText.indexOf(forbidden) === -1,
+      "classification leaked " + forbidden + ": " + htmlText,
+    );
+  }
+
+  // 3. A declared application/json 200 still round-trips unchanged.
+  mode = "json";
+  const good = await registered.sys_os_shell.execute("call-2", {});
+  assert.equal(good.isError, false, JSON.stringify(good));
+  assert.equal(soleText(good), "real answer");
+
+  // 4. A JSON content type with an unparseable body is bounded the same way.
+  mode = "json-unparseable";
+  const bad = await registered.sys_os_shell.execute("call-3", {});
+  assert.equal(bad.isError, true, JSON.stringify(bad));
+  const badText = soleText(bad);
+  assert.ok(
+    badText.indexOf("SECRET-STATE-b3f9c1") === -1,
+    "parse-failure path leaked the body: " + badText,
+  );
+
+  // 5. An unreadable (throwing) header accessor must not become an error
+  //    message carrying header or body text.
+  mode = "throwing-headers";
+  const thrower = await registered.sys_os_shell.execute("call-4", {});
+  const throwerText = soleText(thrower);
+  for (const forbidden of ["SECRET-STATE-b3f9c1", "<!DOCTYPE", "set-cookie", "oauth2/authorize"]) {
+    assert.ok(
+      throwerText.indexOf(forbidden) === -1,
+      "throwing header accessor leaked " + forbidden + ": " + throwerText,
+    );
+  }
+  // Unreadable is not a signal, so the parse still decides: this body is valid
+  // JSON and must round-trip.
+  assert.equal(thrower.isError, false, JSON.stringify(thrower));
+  assert.equal(throwerText, "real answer");
+
+  //    Same for a throwing `headers` *property* getter, not just get().
+  mode = "throwing-headers-getter";
+  const getterThrower = await registered.sys_os_shell.execute("call-5", {});
+  const getterText = soleText(getterThrower);
+  for (const forbidden of ["SECRET-STATE-b3f9c1", "<!DOCTYPE", "set-cookie", "oauth2/authorize"]) {
+    assert.ok(
+      getterText.indexOf(forbidden) === -1,
+      "throwing headers getter leaked " + forbidden + ": " + getterText,
+    );
+  }
+  assert.equal(getterThrower.isError, false, JSON.stringify(getterThrower));
+  assert.equal(getterText, "real answer");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+
+    result = subprocess.run(
+        [node, "-e", script, str(_extension_path()), str(tmp_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_input_required_denied_fails_closed_not_false_success(tmp_path: Path) -> None:
     """A declined ASK gate fails CLOSED (isError) — never reports false success.
 
@@ -2668,9 +2921,9 @@ const setModelCalls = [];
 // The catalog Pi's modelRegistry exposes; setModel returns false for a model
 // with no configured API key (mirrors Pi's real contract).
 const catalog = [
-  { id: "databricks-claude-sonnet-4-6", name: "Sonnet", hasKey: true },
-  { id: "databricks-claude-opus-4-1", name: "Opus", hasKey: true },
-  { id: "no-key-model", name: "NoKey", hasKey: false },
+  { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet", hasKey: true },
+  { provider: "omnigent", id: "databricks-claude-opus-4-1", name: "Opus", hasKey: true },
+  { provider: "omnigent", id: "no-key-model", name: "NoKey", hasKey: false },
 ];
 const pi = {
   registerCommand() {},
@@ -2692,10 +2945,11 @@ const ctx = {
   // external_model_change). ``getAvailable`` returns only auth-configured
   // models (what the picker should show); ``getAll`` is Pi's full built-in
   // catalog (the fallback for older Pi).
-  model: { id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+  model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
   modelRegistry: {
     getAll: () => catalog,
     getAvailable: () => catalog.filter((m) => m.hasKey),
+    find: (provider, id) => catalog.find((m) => m.provider === provider && m.id === id),
   },
 };
 
@@ -2747,7 +3001,8 @@ def test_inbox_model_change_applies_via_set_model(tmp_path: Path) -> None:
         + r"""
 (async () => {
   await handlers.session_start({}, ctx); // starts the inbox poller
-  await deliverModelChange("databricks-claude-opus-4-1");
+  delete ctx.modelRegistry.find;
+  await deliverModelChange("omnigent/databricks-claude-opus-4-1");
 
   assert.equal(setModelCalls.length, 1, JSON.stringify(setModelCalls));
   assert.equal(setModelCalls[0].id, "databricks-claude-opus-4-1");
@@ -2814,23 +3069,23 @@ def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
   // resolves from the start; ignore that when checking the user switch.
   const startupChanges = posted.filter((e) => e.type === "external_model_change");
   assert.equal(startupChanges.length, 1, JSON.stringify(posted));
-  assert.equal(startupChanges[0].data.model, "databricks-claude-sonnet-4-6");
+  assert.equal(startupChanges[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
 
   // A genuine user switch mirrors back.
   await handlers.model_select(
-    { source: "set", model: { id: "databricks-claude-opus-4-1" } },
+    { source: "set", model: { provider: "omnigent", id: "databricks-claude-opus-4-1" } },
     ctx,
   );
   // A startup restore must be ignored (could clobber a pending web override).
   await handlers.model_select(
-    { source: "restore", model: { id: "databricks-claude-sonnet-4-6" } },
+    { source: "restore", model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6" } },
     ctx,
   );
 
   const changes = posted.filter((e) => e.type === "external_model_change");
   // Two total: the startup mirror + the one user switch (restore ignored).
   assert.equal(changes.length, 2, JSON.stringify(posted));
-  assert.equal(changes[1].data.model, "databricks-claude-opus-4-1");
+  assert.equal(changes[1].data.model, "omnigent/databricks-claude-opus-4-1");
   finish();
 })().catch((error) => {
   finish();
@@ -2870,7 +3125,10 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
   // getAvailable() filters out ``no-key-model`` (no configured auth).
   assert.deepEqual(
     models.map((m) => m.id),
-    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
     JSON.stringify(models),
   );
   // Display name falls back to the model's ``name``.
@@ -2879,7 +3137,55 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
   // The launch model is mirrored so the pill/active-row resolve immediately.
   const changes = posted.filter((e) => e.type === "external_model_change");
   assert.equal(changes.length, 1, JSON.stringify(posted));
-  assert.equal(changes[0].data.model, "databricks-claude-sonnet-4-6");
+  assert.equal(changes[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_models_without_provider_keep_bare_id_behavior(tmp_path: Path) -> None:
+    """Older Pi model objects without ``provider`` still populate and mirror."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const legacyCatalog = catalog.map(({ provider: _provider, ...model }) => model);
+  const legacyCtx = {
+    ...ctx,
+    model: { id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+    modelRegistry: {
+      getAll: () => legacyCatalog,
+      getAvailable: () => legacyCatalog.filter((model) => model.hasKey),
+    },
+  };
+
+  await handlers.session_start({}, legacyCtx);
+  const opts = posted.filter((event) => event.type === "external_model_options");
+  assert.deepEqual(
+    opts[0].data.models.map((model) => model.id),
+    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+  );
+  assert.equal(opts[0].data.models[0].displayName, "Sonnet");
+
+  await handlers.model_select(
+    { source: "set", model: { id: "databricks-claude-opus-4-1" } },
+    legacyCtx,
+  );
+  const changes = posted.filter((event) => event.type === "external_model_change");
+  assert.deepEqual(
+    changes.map((event) => event.data.model),
+    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+  );
   finish();
 })().catch((error) => {
   finish();

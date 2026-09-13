@@ -17,10 +17,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { WorkspacePicker, isNavigablePath, parentOf } from "./WorkspacePicker";
+import {
+  WorkspacePicker,
+  isNavigablePath,
+  parentOf,
+  resolveWorkspacePath,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
-import { isValidWorkspace, normalizeWorkspacePath } from "./NewChatDialog";
+import { normalizeWorkspacePath } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -164,8 +169,13 @@ export function SwitchHostDialog({
     onOpenChange(next);
   }
 
-  const workspaceTrimmed = normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = isValidWorkspace(workspace);
+  // Resolve a typed "~/…" path to its absolute form against the host's home
+  // (resolvedHome, above), so it's directly submittable without opening the
+  // tree browser (the server never expands ~). Already-absolute values pass
+  // through; a tilde path stays unresolved until the home listing arrives.
+  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
+  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
+  const workspaceValid = resolvedWorkspace !== null;
 
   function commitWorkspacePath(path: string): void {
     handleWorkspaceChange(path);
@@ -198,6 +208,7 @@ export function SwitchHostDialog({
       // sitting in "Switching…" long after the move has landed.
       handleOpenChange(false);
       void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["session-agent", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");
@@ -224,7 +235,11 @@ export function SwitchHostDialog({
           <>
             <div className="flex flex-col gap-2">
               <span className="text-xs font-medium text-muted-foreground">Host</span>
-              <Select value={selectedHostId ?? ""} onValueChange={(v) => setSelectedHostId(v)}>
+              <Select
+                value={selectedHostId ?? ""}
+                onValueChange={(v) => setSelectedHostId(v)}
+                componentId="switch_host.host"
+              >
                 <SelectTrigger className="w-full text-xs" data-testid="switch-host-select">
                   <SelectValue placeholder="Select a host" />
                 </SelectTrigger>

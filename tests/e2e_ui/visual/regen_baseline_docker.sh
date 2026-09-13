@@ -9,7 +9,7 @@
 #
 # Only a container runtime is required (no local Node/Python/uv).  Set
 # OMNIGENT_CONTAINER_RUNTIME=podman to use Podman instead of Docker.  It:
-#   1. builds the web SPA in a Node 20 container, then
+#   1. builds the web SPA and static Storybook in a Node 20 container, then
 #   2. compares the whole visual suite in the pinned Playwright image and
 #      rewrites only the baselines that drift (or are missing) -- baselines that
 #      already match are left byte-for-byte untouched, mirroring the label-driven
@@ -19,10 +19,9 @@
 # Usage:
 #   tests/e2e_ui/visual/regen_baseline_docker.sh [--skip-build]
 #
-#   --skip-build  Reuse an existing omnigent/server/static/web-ui build (e.g.
-#                 from a prior `cd web && npm run build`) instead of building
-#                 in a container. The bundle is platform-independent, so a host
-#                 build renders the same pixels.
+#   --skip-build  Reuse existing SPA and Storybook builds instead of building
+#                 in a container. The bundles are platform-independent, so host
+#                 builds render the same pixels.
 set -euo pipefail
 
 # Keep these in lockstep with ui-snapshot.yml / ui-snapshot-update.yml.
@@ -33,10 +32,10 @@ NODE_IMAGE="node:20-bookworm"
 # same Chromium build -- otherwise the local PNG diverges from the gate. On
 # arm64 this runs under emulation (slower; needs Docker's binfmt/qemu).
 PLATFORM="linux/amd64"
-# Match CI's npm pin (.github/actions/setup-node) so the SPA bundle the build
-# produces is identical to the one the gate renders.
-NPM_VERSION="11.12.1"
+# Match the workspace package-manager pin used by CI.
+PNPM_VERSION="11.15.1"
 BUILD_OUTPUT="omnigent/server/static/web-ui"
+STORYBOOK_OUTPUT="web/storybook-static"
 SNAP_ROOT="tests/e2e_ui/visual/snapshots"
 
 SKIP_BUILD=false
@@ -53,15 +52,15 @@ command -v "$CONTAINER_RUNTIME" >/dev/null || { echo "error: $CONTAINER_RUNTIME 
 cd "$(git rev-parse --show-toplevel)"
 
 if [ "$SKIP_BUILD" = true ]; then
-  [ -f "$BUILD_OUTPUT/index.html" ] || {
-    echo "error: --skip-build but no SPA build at $BUILD_OUTPUT. Build it first or drop the flag." >&2
+  [ -f "$BUILD_OUTPUT/index.html" ] && [ -f "$STORYBOOK_OUTPUT/index.json" ] || {
+    echo "error: --skip-build requires builds at $BUILD_OUTPUT and $STORYBOOK_OUTPUT." >&2
     exit 1
   }
-  echo "Reusing existing SPA build at $BUILD_OUTPUT."
+  echo "Reusing existing SPA and Storybook builds."
 else
-  echo "Building the web SPA (Node container) ..."
-  "$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work/web "$NODE_IMAGE" \
-    bash -c "npm install -g npm@${NPM_VERSION} && npm ci --legacy-peer-deps --no-audit --no-fund && npm run build"
+  echo "Building the web SPA and Storybook (Node container) ..."
+  "$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work "$NODE_IMAGE" \
+    bash -c "npm install -g pnpm@${PNPM_VERSION} && pnpm install --frozen-lockfile --filter web && pnpm --filter web run build && pnpm --filter web run build:storybook"
 fi
 
 echo "Rendering + comparing the baselines in the pinned Playwright image ..."
@@ -69,11 +68,12 @@ echo "Rendering + comparing the baselines in the pinned Playwright image ..."
 # baselines that still pass (a sub-threshold re-render changes the bytes). Plain
 # compare leaves passing baselines alone and rewrites only the drift. GITHUB_ACTIONS
 # is set so the plugin behaves exactly as the CI gate does: it updates a mismatching
-# baseline IN PLACE (and creates a missing one) under snapshots/, so the git diff
-# below is the real signal. The run "fails" by design on any drift, so `|| true` is
-# expected. UV_PROJECT_ENVIRONMENT lives in the container (not the mounted repo) so
-# no root-owned .venv leaks out.
-"$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
+# baseline IN PLACE (and creates a missing one) under snapshots/. The first run may
+# fail by design on drift; the second must pass, separating baseline updates from
+# render failures. UV_PROJECT_ENVIRONMENT lives in the container (not the mounted
+# repo) so no root-owned .venv leaks out.
+RENDER_FAILED=false
+if ! "$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
   -e CI=1 \
   -e GITHUB_ACTIONS=true \
   -e OMNIGENT_PW_NO_SANDBOX=1 \
@@ -83,9 +83,13 @@ echo "Rendering + comparing the baselines in the pinned Playwright image ..."
   "$PW_IMAGE" bash -c '
     pip install --quiet uv &&
     uv sync --extra all --group test &&
+    (uv run pytest tests/e2e_ui/visual -m visual \
+      -p no:rerunfailures --ui-skip-build || true) &&
     uv run pytest tests/e2e_ui/visual -m visual \
       -p no:rerunfailures --ui-skip-build
-  ' || true
+  '; then
+  RENDER_FAILED=true
+fi
 
 # Files the container wrote are root-owned; hand them back so git add works unprivileged.
 # Includes web (node_modules + build intermediates the Node container wrote).
@@ -93,10 +97,14 @@ echo "Rendering + comparing the baselines in the pinned Playwright image ..."
   chown -R "$(id -u):$(id -g)" /work/tests/e2e_ui/visual /work/"$BUILD_OUTPUT" /work/web 2>/dev/null || true
 
 echo
-if git diff --quiet -- "$SNAP_ROOT"; then
-  echo "Baselines unchanged — they already match this render (or the render failed; check the output above)."
+if [ "$RENDER_FAILED" = true ]; then
+  echo "error: the verification render failed; review the output above." >&2
+  exit 1
+fi
+if [ -z "$(git status --porcelain -- "$SNAP_ROOT")" ]; then
+  echo "Baselines unchanged — they already match this render."
 else
-  git --no-pager diff --stat -- "$SNAP_ROOT" || true
+  git status --short -- "$SNAP_ROOT"
   echo
   echo "Updated baseline(s) under: $SNAP_ROOT"
   echo "Next: review the image(s), then commit + push:"

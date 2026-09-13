@@ -47,6 +47,15 @@ const getRecognitionCtor = (): SpeechRecognitionCtor | null => {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 };
 
+const getDefaultDictationLang = (): string => {
+  if (typeof navigator === "undefined") return "en-US";
+  try {
+    return navigator.language || "en-US";
+  } catch {
+    return "en-US";
+  }
+};
+
 // FFT bin ranges per bar, weighted toward voice frequencies (~100Hz–3kHz).
 const BAR_BINS: readonly (readonly [number, number])[] = [
   [1, 3],
@@ -59,6 +68,7 @@ const BAR_BASELINE = 0.2;
 
 export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
+  className?: string;
   /**
    * Streaming partial transcripts (server dictation only): called with the
    * revisable in-progress utterance as it forms, and with "" when the take
@@ -88,9 +98,10 @@ const isPermissionError = (error: unknown): boolean =>
 
 export const ComposerMicButton = ({
   onTranscript,
+  className,
   onInterim,
   disabled,
-  lang = "en-US",
+  lang = getDefaultDictationLang(),
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,
@@ -486,6 +497,7 @@ export const ComposerMicButton = ({
         isListening &&
           "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
         error && "text-destructive",
+        className,
       )}
     >
       {isListening ? (

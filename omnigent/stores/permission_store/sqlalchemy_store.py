@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import collections
+import os
+import threading
+import time
+from collections.abc import Callable
 from typing import cast
 
 from sqlalchemy import delete, exists, literal, select, update
@@ -9,10 +14,15 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
-from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    run_write_transaction,
+)
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 from omnigent.server.auth import (
     LEVEL_OWNER,
@@ -25,6 +35,60 @@ from omnigent.stores.permission_store import PermissionStore
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
 # list is identical across auth modes.
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
+
+# Short-lived cache of resolve_access() results. The per-event access-control
+# check on a busy session otherwise re-reads session_permissions + users on
+# every streamed event, for a session whose grants are stable across the turn.
+# Only a *positive* standing is cached — a no-access result is never stored, so
+# a freshly granted user is authorized on their next request, not after the TTL.
+# This store's own grant/revoke/reassign/set_admin writes evict, and a
+# generation counter stops an in-flight reader from re-storing a pre-commit
+# positive on top of that eviction, so once such a write returns this instance
+# serves no stale decision. Role changes made through the separate accounts
+# store (admin demote, user delete) are NOT evicted here and propagate within
+# the TTL. Across replicas there is no invalidation broadcast either, so a
+# revoke can be up to the TTL late elsewhere; that window is LEVEL_EDIT only —
+# the destructive stop/kill path re-gates LEVEL_OWNER separately, and a deleted
+# session still 404s on its uncached conversation read. Entries are keyed by
+# (conversation_id, user_id):
+# conversation ids are globally unique, so eviction needs no workspace context,
+# and the map is an LRU bounded by a hard entry cap so a long-lived replica
+# cannot grow it without limit (resolve_access is on the snapshot path too, not
+# just the hot event path). Set the TTL env to 0 to disable (zero overhead).
+_RESOLVE_ACCESS_CACHE_TTL_ENV = "OMNIGENT_ACL_RESOLVE_CACHE_TTL_S"
+_DEFAULT_RESOLVE_ACCESS_CACHE_TTL_S = 5.0
+_RESOLVE_ACCESS_CACHE_MAX_ENTRIES_ENV = "OMNIGENT_ACL_RESOLVE_CACHE_MAX_ENTRIES"
+_DEFAULT_RESOLVE_ACCESS_CACHE_MAX_ENTRIES = 50_000
+
+
+def _resolve_access_cache_ttl_s() -> float:
+    """Read the resolve_access cache TTL (seconds) from the environment.
+
+    Defaults to :data:`_DEFAULT_RESOLVE_ACCESS_CACHE_TTL_S`; a value <= 0
+    disables the cache. An unparseable value falls back to the default.
+    """
+    raw = os.environ.get(_RESOLVE_ACCESS_CACHE_TTL_ENV)
+    if raw is None:
+        return _DEFAULT_RESOLVE_ACCESS_CACHE_TTL_S
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return _DEFAULT_RESOLVE_ACCESS_CACHE_TTL_S
+
+
+def _resolve_access_cache_max_entries() -> int:
+    """Read the resolve_access cache entry cap from the environment.
+
+    Defaults to :data:`_DEFAULT_RESOLVE_ACCESS_CACHE_MAX_ENTRIES`; ``0`` means
+    unbounded. An unparseable value falls back to the default.
+    """
+    raw = os.environ.get(_RESOLVE_ACCESS_CACHE_MAX_ENTRIES_ENV)
+    if raw is None:
+        return _DEFAULT_RESOLVE_ACCESS_CACHE_MAX_ENTRIES
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return _DEFAULT_RESOLVE_ACCESS_CACHE_MAX_ENTRIES
 
 
 def _to_account(row: SqlUser) -> Account:
@@ -78,6 +142,32 @@ class SqlAlchemyPermissionStore(PermissionStore):
             self._engine,
             query_name_prefix="omnigent.permission_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.permission_store",
+            immediate=True,
+        )
+        # resolve_access cache (see _RESOLVE_ACCESS_CACHE_TTL_ENV). An LRU keyed
+        # (conversation_id, user_id) -> (expiry, access). conversation ids are
+        # globally unique, so grant/revoke can drop a whole session's entries —
+        # including the shared __public__ grant, which affects every user of
+        # that session — without depending on the ambient workspace context.
+        # The hard entry cap bounds memory on a long-lived replica. Per store
+        # instance, so each replica caches independently and tests get a fresh
+        # cache with each store. ``_resolve_cache_clock`` is injectable for
+        # deterministic TTL tests.
+        self._resolve_cache_ttl_s = _resolve_access_cache_ttl_s()
+        self._resolve_cache_max_entries = _resolve_access_cache_max_entries()
+        self._resolve_cache: collections.OrderedDict[
+            tuple[str, str], tuple[float, ResolvedAccess]
+        ] = collections.OrderedDict()
+        self._resolve_cache_lock = threading.Lock()
+        self._resolve_cache_clock: Callable[[], float] = time.monotonic
+        # Bumped by every invalidation. resolve_access samples it before its DB
+        # read and refuses to store a result sampled under an older generation,
+        # so a reader whose snapshot predates a concurrent grant/revoke commit
+        # cannot re-poison the cache after that write already evicted.
+        self._resolve_cache_generation = 0
 
     def grant(
         self,
@@ -86,7 +176,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
         level: int,
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
-        with self._session("grant_permission") as session:
+
+        def write(session: Session) -> None:
             dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
@@ -120,15 +211,24 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
             session.flush()
-            return SessionPermission(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                level=level,
-            )
+
+        run_write_transaction(
+            self._session_immediate,
+            "grant_permission",
+            write,
+        )
+        # Evict after commit: the grant changed this session's access picture.
+        self._invalidate_resolve_cache_for_session(conversation_id)
+        return SessionPermission(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            level=level,
+        )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant. See base class for contract."""
-        with self._session("revoke_permission") as session:
+
+        def write(session: Session) -> bool:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -140,6 +240,16 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 ),
             )
             return result.rowcount > 0
+
+        deleted = run_write_transaction(
+            self._session_immediate,
+            "revoke_permission",
+            write,
+        )
+        # Evict after commit: a revoke must not be served stale from this
+        # instance's cache.
+        self._invalidate_resolve_cache_for_session(conversation_id)
+        return deleted
 
     def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
         """Look up a single grant. See base class for contract."""
@@ -167,8 +277,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
             ``"alice"``.
         :returns: The number of grants repointed to *to_user_id*.
         """
-        moved = 0
-        with self._session("reassign_user_grants") as session:
+
+        def write(session: Session) -> tuple[int, bool]:
             # FK target: ensure the destination users.id row exists. Don't
             # downgrade an existing admin flag; only create it if missing.
             if session.get(SqlUser, (current_workspace_id(), to_user_id)) is None:
@@ -185,7 +295,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 .all()
             )
             if not rows:
-                return 0
+                return 0, False
             conversation_ids = [r.conversation_id for r in rows]
             # Single query: which conversation_ids does to_user already hold?
             existing_to = set(
@@ -221,8 +331,18 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     )
                     .values(user_id=to_user_id)
                 )
-                moved = len(reassign_ids)
-            return moved
+            return len(reassign_ids), True
+
+        moved, changed = run_write_transaction(
+            self._session_immediate,
+            "reassign_user_grants",
+            write,
+        )
+        # Grants moved between users across sessions; drop this store's cache
+        # only when the transaction found source grants to change.
+        if changed:
+            self._invalidate_resolve_cache_all()
+        return moved
 
     def list_for_session(
         self,
@@ -296,7 +416,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         """Upsert a user row. See base class for contract."""
-        with self._session("ensure_user") as session:
+
+        def write(session: Session) -> None:
             dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
             stmt: Insert
@@ -321,6 +442,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
 
+        run_write_transaction(self._session_immediate, "ensure_user", write)
+
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session("list_users") as session:
@@ -343,7 +466,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user. See base class for contract."""
-        with self._session("set_user_admin_status") as session:
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -352,6 +476,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
                 .values(is_admin=is_admin)
             )
+
+        run_write_transaction(self._session_immediate, "set_user_admin_status", write)
+        # The admin flag flips access on every session for this user; drop
+        # this store's cache.
+        self._invalidate_resolve_cache_all()
 
     def check_access(
         self,
@@ -391,6 +520,66 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return public_grant.level
         return None
 
+    def _resolve_cache_lookup(self, conversation_id: str, user_id: str) -> ResolvedAccess | None:
+        """Return a live cached resolve_access result, or ``None`` on miss/expiry."""
+        now = self._resolve_cache_clock()
+        key = (conversation_id, user_id)
+        with self._resolve_cache_lock:
+            entry = self._resolve_cache.get(key)
+            if entry is None:
+                return None
+            expiry, access = entry
+            if now >= expiry:
+                del self._resolve_cache[key]
+                return None
+            self._resolve_cache.move_to_end(key)  # LRU: mark most-recently used
+            return access
+
+    def _resolve_cache_generation_now(self) -> int:
+        """Sample the invalidation generation before a read begins."""
+        with self._resolve_cache_lock:
+            return self._resolve_cache_generation
+
+    def _resolve_cache_store(
+        self,
+        conversation_id: str,
+        user_id: str,
+        access: ResolvedAccess,
+        generation: int,
+    ) -> None:
+        """Cache one *granted* resolve_access result until now + TTL.
+
+        Dropped when *generation* is stale — an invalidation landed while this
+        result was being read, so the value may predate that write and must not
+        be stored on top of the eviction it already performed. Enforces the LRU
+        entry cap so the cache cannot grow without bound on a long-lived replica.
+        """
+        key = (conversation_id, user_id)
+        expiry = self._resolve_cache_clock() + self._resolve_cache_ttl_s
+        with self._resolve_cache_lock:
+            if generation != self._resolve_cache_generation:
+                return
+            self._resolve_cache[key] = (expiry, access)
+            self._resolve_cache.move_to_end(key)
+            max_entries = self._resolve_cache_max_entries
+            if max_entries > 0:
+                while len(self._resolve_cache) > max_entries:
+                    self._resolve_cache.popitem(last=False)  # drop least-recently used
+
+    def _invalidate_resolve_cache_for_session(self, conversation_id: str) -> None:
+        """Drop every cached decision for one session (all users + ``__public__``)."""
+        with self._resolve_cache_lock:
+            self._resolve_cache_generation += 1
+            stale = [key for key in self._resolve_cache if key[0] == conversation_id]
+            for key in stale:
+                del self._resolve_cache[key]
+
+    def _invalidate_resolve_cache_all(self) -> None:
+        """Drop the whole cache — for admin-flag or bulk-grant changes."""
+        with self._resolve_cache_lock:
+            self._resolve_cache_generation += 1
+            self._resolve_cache.clear()
+
     def resolve_access(
         self,
         user_id: str | None,
@@ -403,6 +592,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 user_grant_level=None,
                 public_grant_level=None,
             )
+        workspace_id = current_workspace_id()
+        cache_enabled = self._resolve_cache_ttl_s > 0
+        generation = 0
+        if cache_enabled:
+            cached = self._resolve_cache_lookup(conversation_id, user_id)
+            if cached is not None:
+                return cached
+            # Sampled before the read: an invalidation landing while the rows
+            # below are being fetched makes this result unstorable, so a write
+            # committed mid-read can't be undone by a stale positive.
+            generation = self._resolve_cache_generation_now()
         # One session = one connection checkout + transaction. Against a
         # remote DB (Lakebase) this is the round-trip that matters; the three
         # primary-key reads below pipeline on the same connection rather than
@@ -410,19 +610,29 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # calling is_admin + check_access + get_permission_level separately
         # did — see the GET /v1/sessions/{id} snapshot path).
         with self._session("resolve_access") as session:
-            user_row = session.get(SqlUser, (current_workspace_id(), user_id))
+            user_row = session.get(SqlUser, (workspace_id, user_id))
             user_grant = session.get(
-                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
+                SqlSessionPermission, (workspace_id, user_id, conversation_id)
             )
             public_grant = session.get(
                 SqlSessionPermission,
-                (current_workspace_id(), RESERVED_USER_PUBLIC, conversation_id),
+                (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
             )
-            return ResolvedAccess(
+            access = ResolvedAccess(
                 is_admin=user_row is not None and user_row.is_admin,
                 user_grant_level=user_grant.level if user_grant is not None else None,
                 public_grant_level=public_grant.level if public_grant is not None else None,
             )
+        # Cache only a positive standing: a no-access result is left uncached so
+        # a freshly granted user is authorized on their next request, not after
+        # the TTL elapses.
+        if cache_enabled and (
+            access.is_admin
+            or access.user_grant_level is not None
+            or access.public_grant_level is not None
+        ):
+            self._resolve_cache_store(conversation_id, user_id, access, generation)
+        return access
 
     def has_any_grants(self, conversation_id: str) -> bool:
         """Check for any permission rows. See base class for contract."""

@@ -225,6 +225,44 @@ describe("useUnseenTick", () => {
   });
 });
 
+describe("useConversationReadState", () => {
+  it("does not re-render a row whose read state did not change", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 1_000 },
+      { id: "conv-2", viewer_last_seen: 1_000 },
+    ]);
+    let conv1Renders = 0;
+    let conv2Renders = 0;
+    const conv1 = renderHook(() => {
+      conv1Renders += 1;
+      return mod.useConversationReadState("conv-1", 2_000, "idle");
+    });
+    const conv2 = renderHook(() => {
+      conv2Renders += 1;
+      return mod.useConversationReadState("conv-2", 2_000, "idle");
+    });
+    const conv2Before = conv2Renders;
+
+    act(() => mod.markConversationSeen("conv-1", 2_000));
+
+    expect(conv1.result.current.unseen).toBe(false);
+    expect(conv1Renders).toBeGreaterThan(1);
+    expect(conv2.result.current.unseen).toBe(true);
+    expect(conv2Renders).toBe(conv2Before);
+  });
+
+  it("reports the explicit-unread bit independently of automatic unseen state", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    const { result } = renderHook(() => mod.useConversationReadState("conv-1", 2_000, "running"));
+
+    act(() => mod.markConversationUnread("conv-1", 2_000));
+
+    expect(result.current).toEqual({ unseen: false, explicitlyUnread: true });
+  });
+});
+
 describe("useMarkConversationSeen", () => {
   it("marks the active thread seen on mount when focused (after seed)", async () => {
     const mod = await loadFresh();
@@ -236,6 +274,22 @@ describe("useMarkConversationSeen", () => {
 
     expect(mod.isConversationUnseen("conv-1", 4_000, "idle")).toBe(false);
     expect(lastPutBody()).toEqual({ last_seen: 5_000, unread: false });
+  });
+
+  it("anchors the baseline to the viewed updated_at when the server clock leads the client", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    // Client wall clock (5000) lags the server updated_at (6000) the user is
+    // reading — clock skew between the hosted server and the desktop app.
+    vi.useFakeTimers({ now: 5_000_000 });
+
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 6_000));
+
+    // The just-read idle turn must not reappear as unseen, and the synced
+    // baseline is the viewed updated_at, not the lagging wall clock.
+    expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(false);
+    expect(lastPutBody()).toEqual({ last_seen: 6_000, unread: false });
   });
 
   it("does NOT mark seen while the window is blurred", async () => {

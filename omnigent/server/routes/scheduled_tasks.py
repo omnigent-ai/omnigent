@@ -29,8 +29,10 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
+    validate_permission_mode_agent_support,
     validate_session_agent,
     validate_session_model_metadata,
+    validate_session_permission_mode,
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
@@ -52,6 +54,10 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
+    # Native-harness permission mode (Claude Code), e.g. "acceptEdits". The fire
+    # path derives the runner's --permission-mode launch arg from it.
+    permission_mode: str | None = None
+    max_cost_usd: float | None = Field(default=None, gt=0)
     # Optional: no PINNED host/workspace. When both are unset the fire path
     # resolves the owner's online host at fire time and defaults the workspace to
     # that host's home directory (a failed run is recorded if none is online) —
@@ -71,9 +77,15 @@ class UpdateScheduledTaskRequest(BaseModel):
     name: str | None = None
     prompt: str | None = None
     rrule: str | None = None
+    # Rebinding the agent switches the harness the task fires with. The
+    # per-agent settings below do not survive the switch — see the PATCH
+    # handler, which clears any the caller does not resend.
+    agent_id: str | None = Field(default=None, min_length=1)
     timezone: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    permission_mode: str | None = None
+    max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     state: str | None = None
@@ -87,6 +99,8 @@ class UpdateScheduledTaskRequest(BaseModel):
             raise ValueError("workspace cannot be null")
         if "host_id" in self.model_fields_set and self.host_id is None:
             raise ValueError("host_id cannot be null")
+        if "agent_id" in self.model_fields_set and self.agent_id is None:
+            raise ValueError("agent_id cannot be null")
         return self
 
 
@@ -121,6 +135,8 @@ def _to_response(
         "created_at": task.created_at,
         "model_override": task.model_override,
         "reasoning_effort": task.reasoning_effort,
+        "permission_mode": task.permission_mode,
+        "max_cost_usd": task.max_cost_usd,
         "workspace": task.workspace,
         "host_id": task.host_id,
         "state": task.state,
@@ -208,6 +224,7 @@ def create_scheduled_tasks_router(
         workspace: str | None,
         model_override: str | None,
         reasoning_effort: str | None,
+        permission_mode: str | None,
     ) -> tuple[str | None, str | None, str | None]:
         """Validate inputs that scheduled tasks persist into future sessions.
 
@@ -230,6 +247,14 @@ def create_scheduled_tasks_router(
         validated_model, validated_effort = validate_session_model_metadata(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+        )
+        # Gate permission_mode on the resolved agent's harness (Claude Code
+        # only), mirroring the web dialog's capability gate. A non-Claude agent
+        # carrying a mode would break the fire (unknown --permission-mode flag).
+        await validate_permission_mode_agent_support(
+            permission_mode=permission_mode,
+            agent=agent,
+            agent_cache=agent_cache,
         )
         if workspace is None:
             # No pinned workspace: the fire path defaults it to the launch host's
@@ -292,6 +317,7 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
+        permission_mode = validate_session_permission_mode(body.permission_mode)
         workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
             owner=owner,
@@ -300,6 +326,7 @@ def create_scheduled_tasks_router(
             workspace=body.workspace,
             model_override=body.model_override,
             reasoning_effort=body.reasoning_effort,
+            permission_mode=permission_mode,
         )
         task = store.create(
             scheduled_task_id=uuid.uuid4().hex,
@@ -311,6 +338,8 @@ def create_scheduled_tasks_router(
             timezone=body.timezone,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+            permission_mode=permission_mode,
+            max_cost_usd=body.max_cost_usd,
             workspace=workspace,
             host_id=body.host_id,
         )
@@ -473,6 +502,15 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        target_agent_id = fields.get("agent_id") or existing.agent_id
+        agent_changed = target_agent_id != existing.agent_id
+        if agent_changed:
+            # A harness switch invalidates the per-agent settings stored beside
+            # it: a model id is provider-bound and permission_mode is Claude-only.
+            # Clear whichever the caller did not resend so a switched task never
+            # fires the new harness with the old one's flags.
+            for stale in ("model_override", "reasoning_effort", "permission_mode"):
+                fields.setdefault(stale, None)
         if {"model_override", "reasoning_effort"}.intersection(fields):
             model_override, reasoning_effort = validate_session_model_metadata(
                 model_override=fields.get("model_override", existing.model_override),
@@ -482,15 +520,38 @@ def create_scheduled_tasks_router(
                 fields["model_override"] = model_override
             if "reasoning_effort" in fields:
                 fields["reasoning_effort"] = reasoning_effort
-        if {"workspace", "host_id"}.intersection(fields):
+        if "permission_mode" in fields:
+            new_mode = validate_session_permission_mode(fields["permission_mode"])
+            fields["permission_mode"] = new_mode
+            # Gate a newly-SET mode on the (immutable) agent's harness. Clearing
+            # to null needs no gate — the fire path injects nothing for null.
+            if new_mode is not None:
+                agent = await validate_session_agent(
+                    user_id=owner_id,
+                    agent_id=target_agent_id,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    conversation_store=conversation_store,
+                )
+                await validate_permission_mode_agent_support(
+                    permission_mode=new_mode,
+                    agent=agent,
+                    agent_cache=agent_cache,
+                )
+        if agent_changed or {"workspace", "host_id"}.intersection(fields):
+            # On a switch this runs the full create-time gauntlet against the NEW
+            # agent: existence + bindability, and the pinned workspace re-checked
+            # against that agent's os_env boundary (the boundary is per-agent, so
+            # a workspace valid for the old harness need not be valid here).
             workspace, _, _ = await _validate_launch_inputs(
                 request,
                 owner=owner,
-                agent_id=existing.agent_id,
+                agent_id=target_agent_id,
                 host_id=fields.get("host_id", existing.host_id),
                 workspace=fields.get("workspace", existing.workspace),
                 model_override=fields.get("model_override", existing.model_override),
                 reasoning_effort=fields.get("reasoning_effort", existing.reasoning_effort),
+                permission_mode=None,
             )
             if "workspace" in fields:
                 fields["workspace"] = workspace

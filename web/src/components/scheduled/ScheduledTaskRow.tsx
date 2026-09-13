@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
@@ -56,6 +57,7 @@ export function ScheduledTaskRow({
   busy: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const { trackClick } = useOmnigentAnalytics();
   const paused = task.state === "paused";
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
@@ -131,15 +133,33 @@ export function ScheduledTaskRow({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem onSelect={() => onRunNow(task)} data-testid="task-run-now">
+          <DropdownMenuItem
+            onSelect={() => {
+              trackClick("tasks.scheduled.run_now", "button");
+              onRunNow(task);
+            }}
+            data-testid="task-run-now"
+          >
             <ZapIcon className="size-4" />
             Run now
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => onEdit(task)} data-testid="task-edit">
+          <DropdownMenuItem
+            onSelect={() => {
+              trackClick("tasks.scheduled.edit", "button");
+              onEdit(task);
+            }}
+            data-testid="task-edit"
+          >
             <PencilIcon className="size-4" />
             Edit
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => onPauseToggle(task)} data-testid="task-pause-toggle">
+          <DropdownMenuItem
+            onSelect={() => {
+              trackClick("tasks.scheduled.pause_resume", "button");
+              onPauseToggle(task);
+            }}
+            data-testid="task-pause-toggle"
+          >
             {paused ? (
               <>
                 <PlayIcon className="size-4" />
@@ -154,7 +174,10 @@ export function ScheduledTaskRow({
           </DropdownMenuItem>
           <DropdownMenuItem
             variant="destructive"
-            onSelect={() => onDelete(task)}
+            onSelect={() => {
+              trackClick("tasks.scheduled.delete", "button");
+              onDelete(task);
+            }}
             data-testid="task-delete"
           >
             <Trash2Icon className="size-4" />

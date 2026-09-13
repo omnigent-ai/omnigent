@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import json
 import logging
 import os
 import signal
@@ -24,9 +25,11 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
@@ -34,6 +37,7 @@ if TYPE_CHECKING:
 
     from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
+    from omnigent.spec.types import AgentSpec
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
 _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
@@ -43,6 +47,7 @@ _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
+_AUTH_DISCOVERY_RETRY_INTERVAL_S = 5.0
 # The runner offloads short native-CLI/IPC ops via asyncio.to_thread. Python's
 # default executor sizes to min(32, cpu+4) threads, which on a many-core host
 # inflates RSS (thread stacks + glibc arenas) for little benefit. Cap it small.
@@ -66,6 +71,34 @@ _logger = logging.getLogger(__name__)
 # shares the proxy bearer, even after RUNNER_INITIAL_AUTH_TOKEN has been
 # popped from the environment.
 _runner_auth_factory: Callable[[], str | None] | None = None
+
+
+def _host_interactive_shells_from_env() -> list[str] | None:
+    """Read the host daemon's ordered shell inventory from runner wiring."""
+    from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+
+    raw = os.environ.get(RUNNER_INTERACTIVE_SHELLS_ENV_VAR)
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    shells = normalize_interactive_shells(decoded)
+    return shells or None
+
+
+def _apply_host_interactive_shells(spec: AgentSpec) -> None:
+    """Replace a native wrapper's portable terminals with its host inventory."""
+    from omnigent.native.native_coding_agents import (
+        native_coding_agent_for_agent_name,
+        native_shell_terminal_specs,
+    )
+
+    shells = _host_interactive_shells_from_env()
+    if shells is None or native_coding_agent_for_agent_name(getattr(spec, "name", None)) is None:
+        return
+    spec.terminals = native_shell_terminal_specs(shells)
 
 
 def _set_runner_auth_factory(factory: Callable[[], str | None] | None) -> None:
@@ -245,13 +278,14 @@ async def _run_inactivity_monitor(
             _logger.info(
                 "runner idle timeout reached after %.1fs with no active work; shutting down",
                 elapsed_s,
+                extra={"session_id": runner_primary_session_id()},
             )
             request_shutdown()
             return
         await asyncio.sleep(min(poll_interval_s, idle_timeout_s - elapsed_s))
 
 
-class _RunnerDatabricksAuth(httpx.Auth):
+class _RunnerDatabricksAuth(ThreadedAuth):
     """httpx Auth that mints a fresh Databricks OAuth token per request.
 
     Used by the runner's HTTP client for callbacks to the Omnigent server
@@ -316,15 +350,34 @@ class _RunnerDatabricksAuth(httpx.Auth):
 
             request.headers.update(databricks_request_headers(self._server_url))
         if self._factory is not None:
-            token = self._factory()
+            token, declined = _call_factory_with_declined(self._factory)
             if not token:
-                if getattr(self._factory, "declined", False):
-                    # The server definitively refuses to mint for this runner
-                    # (managed mint factory hit HTTP 400/404 after install —
-                    # e.g. its construction probe lost a boot race to a
-                    # no-auth server). Bare requests are correct there; do
-                    # NOT fail closed or the runner bricks every callback.
-                    yield request
+                if declined:
+                    # The mint path declined for this runner (HTTP 400/404
+                    # no-auth/header mode, or a 5xx from an intermediary).
+                    # Bare requests are correct on a no-auth server; do NOT
+                    # fail closed or the runner bricks every callback.
+                    response = yield request
+                    if not _is_login_redirect_or_unauthorized(response):
+                        return
+                    # The bare request was rejected, so the server DOES
+                    # require auth and the decline was wrong (e.g. an
+                    # intermediary 5xx latched it while the server was
+                    # briefly down). Clear the latch and try a fresh mint
+                    # so a recovered server re-authenticates the runner.
+                    # Only a 5xx-latched decline is recoverable; a genuine
+                    # no-auth refusal (400/404) must not re-probe the mint
+                    # endpoint on every rejected callback.
+                    if not getattr(self._factory, "declined_by_server_error", False):
+                        return
+                    reset = getattr(self._factory, "reset_decline", None)
+                    if not callable(reset):
+                        return
+                    reset()
+                    token = self._factory()
+                    if token:
+                        request.headers["Authorization"] = f"Bearer {token}"
+                        yield request
                     return
                 raise httpx.RequestError("Databricks token refresh returned no token")
             request.headers["Authorization"] = f"Bearer {token}"
@@ -371,6 +424,26 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     return "/oidc/" in location or "/.auth/" in location
 
 
+def _call_factory_with_declined(
+    factory: Callable[[], str | None],
+) -> tuple[str | None, bool]:
+    """Fetch a token and the factory's ``declined`` state as one snapshot.
+
+    Factories that expose ``call_with_declined`` produce the pair atomically
+    (under their own lock), so a concurrent decline-reset+mint can't leave a
+    caller seeing ``(None, False)`` when a token exists or a decline is
+    latched. Plain factories fall back to two reads.
+
+    :param factory: Runner auth token factory.
+    :returns: ``(token, declined)`` — the token (or ``None``) and whether the
+        factory has definitively declined.
+    """
+    snapshot = getattr(factory, "call_with_declined", None)
+    if callable(snapshot):
+        return cast("tuple[str | None, bool]", snapshot())
+    return factory(), getattr(factory, "declined", False)
+
+
 def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
     """Invalidate a bootstrap token factory when it supports that operation.
 
@@ -400,58 +473,103 @@ class _InitialAuthTokenFactory:
         self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
-        self._fallback_resolved = False
+        self._retry_discovery_at = 0.0
         self._no_credential_logged = False
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
         """Return the host bearer or a token from the lazy local fallback."""
         with self._lock:
-            if self._initial_token is not None:
-                return self._initial_token
-            if not self._fallback_resolved:
-                self._fallback_factory = _make_auth_token_factory(
-                    self._server_url,
-                    _allow_initial_token=False,
-                    _proxy_bearer=self._last_initial_token,
-                )
-                self._fallback_resolved = True
+            return self._call_locked()
+
+    def _call_locked(self) -> str | None:
+        """Body of :meth:`__call__`, run under :attr:`_lock`.
+
+        :returns: See :meth:`__call__`.
+        """
+        if self._initial_token is not None:
+            return self._initial_token
+        if self._fallback_factory is None:
+            if time.monotonic() < self._retry_discovery_at:
+                return None
+            self._fallback_factory = _make_auth_token_factory(
+                self._server_url,
+                _allow_initial_token=False,
+                _proxy_bearer=self._last_initial_token,
+            )
+        token = self._fallback_factory() if self._fallback_factory is not None else None
+        # Managed mint cannot renew itself when its proxy bearer expires —
+        # the injected host bearer before a first mint, or the minted JWT
+        # once a session outlives it. Re-resolve SDK/OIDC in the same call
+        # so the request that hit the failure still gets a credential.
+        if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
+            self._fallback_factory = _make_auth_token_factory(
+                self._server_url,
+                _allow_initial_token=False,
+                _allow_delegated_mint=False,
+            )
             token = self._fallback_factory() if self._fallback_factory is not None else None
-            # Managed mint cannot renew itself when its proxy bearer expires —
-            # the injected host bearer before a first mint, or the minted JWT
-            # once a session outlives it. Re-resolve SDK/OIDC in the same call
-            # so the request that hit the failure still gets a credential.
-            if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
-                self._fallback_factory = _make_auth_token_factory(
-                    self._server_url,
-                    _allow_initial_token=False,
-                    _allow_delegated_mint=False,
-                )
-                token = self._fallback_factory() if self._fallback_factory is not None else None
-            if self._fallback_factory is None and not self._no_credential_logged:
-                # This state is terminal for the process, so say it once
-                # rather than on every subsequent callback.
+        if self._fallback_factory is None:
+            self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
+            if not self._no_credential_logged:
                 self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    "to renew it; run `databricks auth login` to re-authenticate"
+                    "to renew it; run `databricks auth login` to re-authenticate",
+                    extra={"session_id": runner_primary_session_id()},
                 )
-            return token
+        elif token:
+            self._no_credential_logged = False
+        return token
 
     @property
     def declined(self) -> bool:
         """True when the inner fallback factory has definitively declined."""
         with self._lock:
-            f = self._fallback_factory
-            return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
+            return self._declined_locked()
+
+    def _declined_locked(self) -> bool:
+        """Body of :attr:`declined`, run under :attr:`_lock`.
+
+        :returns: See :attr:`declined`.
+        """
+        f = self._fallback_factory
+        return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
+
+    def call_with_declined(self) -> tuple[str | None, bool]:
+        """Return ``(token, declined)`` as one atomic snapshot.
+
+        :returns: The token (or ``None``) and whether the inner fallback
+            factory has definitively declined, read under one lock
+            acquisition so callers decide from a consistent state.
+        """
+        with self._lock:
+            return self._call_locked(), self._declined_locked()
+
+    @property
+    def declined_by_server_error(self) -> bool:
+        """True when the inner fallback factory's decline came from a 5xx."""
+        with self._lock:
+            return bool(getattr(self._fallback_factory, "declined_by_server_error", False))
+
+    def reset_decline(self) -> None:
+        """Clear the inner fallback factory's ``declined`` latch, if any."""
+        with self._lock:
+            reset = getattr(self._fallback_factory, "reset_decline", None)
+            if callable(reset):
+                reset()
 
     def invalidate(self) -> bool:
-        """Discard the host bearer so the next call resolves local auth."""
+        """Invalidate the host bearer or the resolved fallback credential."""
         with self._lock:
             if self._initial_token is None:
-                return False
+                invalidate = getattr(self._fallback_factory, "invalidate", None)
+                return bool(invalidate()) if callable(invalidate) else False
             self._initial_token = None
-            _logger.info("host bootstrap bearer rejected; resolving runner-local auth")
+            _logger.info(
+                "host bootstrap bearer rejected; resolving runner-local auth",
+                extra={"session_id": runner_primary_session_id()},
+            )
             return True
 
 
@@ -530,7 +648,10 @@ def _make_auth_token_factory(
         else ""
     )
     if initial_token and resolved_server_url:
-        _logger.info("using host-provided bearer for runner bootstrap")
+        _logger.info(
+            "using host-provided bearer for runner bootstrap",
+            extra={"session_id": runner_primary_session_id()},
+        )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
     from omnigent.inner.databricks_executor import (
@@ -613,11 +734,34 @@ def _make_auth_token_factory(
         """
         # Check stored OIDC token first.
         if resolved_server_url:
-            from omnigent.cli_auth import load_token
+            from omnigent.cli_auth import (
+                REFRESH_MIN_REMAINING_SECONDS,
+                load_token,
+                refresh_stored_token,
+            )
 
-            oidc_token = load_token(resolved_server_url)
+            # Require enough remaining life that the token cannot lapse
+            # mid-handshake; a token inside that window falls through to
+            # the renewal path below rather than being used and rejected.
+            oidc_token = load_token(
+                resolved_server_url,
+                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+            )
             if oidc_token:
                 return oidc_token
+            # Expired or near-lapse: renew from the login-issued refresh
+            # grant when one exists. This is what keeps an unattended host
+            # alive past session-JWT expiry — the tunnel rebuilds headers
+            # through this factory on every reconnect.
+            refreshed = refresh_stored_token(resolved_server_url)
+            if refreshed:
+                return refreshed
+            # Nothing to renew with: a near-expiry token that has NOT
+            # actually lapsed still authenticates, so prefer it over
+            # falling through to no credential at all.
+            still_valid = load_token(resolved_server_url)
+            if still_valid:
+                return still_valid
         return _sdk_token()
 
     # Probe once to check if a user credential is available.
@@ -678,7 +822,10 @@ def _make_managed_mint_factory(
         the runner then uses the legacy credential path. A *transient* probe
         failure still installs the factory, which re-mints on the next
         callback (so a blip at boot does not leave the runner unauthenticated
-        until process restart). If such a post-install mint then gets a
+        until process restart). A probe 5xx (an intermediary answering for
+        the mint endpoint) installs the factory with ``declined`` latched:
+        callbacks go out bare, and a rejected bare request clears the latch
+        and re-mints once the server recovers. If a post-install mint gets a
         definitive refusal, the factory latches ``declined`` and returns
         ``None`` thereafter, and :class:`_RunnerDatabricksAuth` falls back to
         bare requests. A post-install 401/403 with no still-valid cache
@@ -692,16 +839,23 @@ def _make_managed_mint_factory(
 
     # Construction probe. Decline to install the factory ONLY when the
     # server definitively will not mint for this runner — HTTP 400 (no auth
-    # provider / header mode), 404 (an older server without the endpoint), or
-    # an Apps OAuth redirect that happens before the request reaches Omnigent.
-    # Every other outcome installs the factory: a success seeds the cache; a
-    # transient failure (network blip, 5xx, timeout) installs it anyway so the
-    # next callback re-mints, rather than leaving the runner unauthenticated
-    # until process restart.
+    # provider / header mode), 404 (an older server without the endpoint),
+    # or an Apps OAuth redirect that happens before the request reaches
+    # Omnigent. Every other outcome installs the factory: a success seeds
+    # the cache; a transient failure (network blip, timeout) installs it
+    # anyway so the next callback re-mints; a 5xx from an intermediary
+    # installs it with declined latched so callbacks go bare but can
+    # recover via reset_decline once the server is reachable again.
     factory = _ManagedMintTokenFactory(
         mint_url, server_url, binding_token, proxy_bearer=proxy_bearer
     )
     factory()
+    if factory.declined and factory.declined_by_server_error:
+        # An intermediary 5xx at boot: install the factory anyway, declined
+        # latched. Callbacks go out bare, and a rejected bare request clears
+        # the latch and re-mints once the server is reachable again —
+        # dropping the factory here would lose that recovery path.
+        return factory
     if factory.declined or factory.proxy_auth_failed:
         return None
     return factory
@@ -712,8 +866,8 @@ class _ManagedMintTokenFactory:
 
     Each call returns the cached JWT until it nears expiry, then re-mints
     via :func:`_mint_managed_owner_token`. When a mint gets a *definitive*
-    refusal (HTTP 400 no-auth/header mode, 404 older server, or an Apps OAuth
-    redirect), the
+    refusal (HTTP 400 no-auth/header mode, 404 older server, an Apps OAuth
+    redirect, or a 5xx from an intermediary before any successful mint), the
     :attr:`declined` latch is set and every subsequent call returns
     ``None`` without touching the network —
     :meth:`_RunnerDatabricksAuth.auth_flow` reads the latch to send bare
@@ -750,7 +904,15 @@ class _ManagedMintTokenFactory:
         self._proxy_bearer = proxy_bearer
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
+        # Serializes mint/latch state across concurrent callbacks so a
+        # decline reset and a re-mint cannot interleave into duplicate
+        # mints or a declined-latch alongside a freshly cached token.
+        self._lock = threading.Lock()
         self.declined = False
+        # True when ``declined`` was latched by an intermediary 5xx rather
+        # than a genuine server refusal — that latch is recoverable via
+        # :meth:`reset_decline`, so the factory stays installed.
+        self.declined_by_server_error = False
         # Set when mint fails with 401/403 on the proxy bearer (not a server
         # refusal). Unlike ``declined``, this means the caller should try
         # another credential path (SDK/OIDC) rather than sending bare requests.
@@ -760,10 +922,18 @@ class _ManagedMintTokenFactory:
         """Return a fresh owner JWT, or ``None``.
 
         :returns: The cached or freshly-minted JWT; ``None`` after a
-            definitive server decline (sets :attr:`declined`), after a mint
-            401/403 with no still-valid cached token (sets
-            :attr:`proxy_auth_failed`), or on a transient mint failure with
-            no still-valid cached token.
+            definitive server decline or a 5xx with no prior successful
+            mint (sets :attr:`declined`), after a mint 401/403 with no
+            still-valid cached token (sets :attr:`proxy_auth_failed`), or
+            on a transient mint failure with no still-valid cached token.
+        """
+        with self._lock:
+            return self._call_locked()
+
+    def _call_locked(self) -> str | None:
+        """Body of :meth:`__call__`, run under :attr:`_lock`.
+
+        :returns: See :meth:`__call__`.
         """
         if self.declined:
             return None
@@ -782,15 +952,21 @@ class _ManagedMintTokenFactory:
             )
         except httpx.HTTPStatusError as exc:
             response = exc.response
-            if response.status_code in (400, 404) or (
-                response.is_redirect and _is_login_redirect_or_unauthorized(response)
+            if (
+                response.status_code in (400, 404)
+                or response.is_server_error
+                or (response.is_redirect and _is_login_redirect_or_unauthorized(response))
             ):
                 # Only treat as a definitive refusal if we have never
                 # successfully minted. A 400/404 mid-session (e.g. during an
                 # IP ACL flip) is transient — the server already proved it
-                # mints for this runner.
+                # mints for this runner. A 5xx with no cache means an
+                # intermediary (e.g. an Apps relay's Bad Gateway page) is
+                # answering for the mint endpoint; latch declined so
+                # callbacks go out bare instead of failing closed forever.
                 if self._cached_token is None:
                     self.declined = True
+                    self.declined_by_server_error = response.is_server_error
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
@@ -815,6 +991,44 @@ class _ManagedMintTokenFactory:
         # through the Apps proxy are authenticated with a valid credential.
         self._proxy_bearer = token
         return token
+
+    def call_with_declined(self) -> tuple[str | None, bool]:
+        """Return ``(token, declined)`` as one atomic snapshot.
+
+        :returns: The token (or ``None``) and the ``declined`` latch, read
+            under the same lock acquisition so callers decide from a
+            consistent state.
+        """
+        with self._lock:
+            return self._call_locked(), self.declined
+
+    def reset_decline(self) -> None:
+        """Clear the ``declined`` latch so the next call re-attempts a mint.
+
+        Used when a bare request is rejected with a re-auth signal: the
+        server does require auth, so a decline latched by an intermediary
+        5xx (rather than a genuine no-auth server) must not stick once the
+        server is reachable again.
+        """
+        with self._lock:
+            self.declined = False
+            self.declined_by_server_error = False
+
+    def invalidate(self) -> bool:
+        """Discard the cached JWT so the next call re-mints.
+
+        Called when the server rejects the minted credential mid-session
+        (e.g. a signing-key rotation revoked it); without this the cache
+        still looks valid locally and is re-sent on every retry.
+
+        :returns: ``True`` when a cached token was discarded.
+        """
+        with self._lock:
+            if self._cached_token is None:
+                return False
+            self._cached_token = None
+            self._cached_expires_at = 0.0
+            return True
 
     def _still_valid_cached_token(self, now: float) -> str | None:
         """Return the cached token if it hasn't expired outright.
@@ -1012,6 +1226,7 @@ def _run_parent_death_killer(
         "runner exiting: parent process died and graceful shutdown did not "
         "complete within %.1fs; forcing hard exit",
         grace_s,
+        extra={"session_id": runner_primary_session_id()},
     )
     # os._exit skips buffer flushing, so flush logs first for diagnosability.
     with contextlib.suppress(Exception):
@@ -1115,6 +1330,7 @@ async def _resolve_agent_spec_from_server(
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
             path,
+            extra={"session_id": session_id},
         )
         return None
     if resp.status_code != 200:
@@ -1144,6 +1360,7 @@ async def _resolve_agent_spec_from_server(
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
@@ -1295,7 +1512,25 @@ def create_app(
         _logger.info(
             "Reaped %d orphaned terminal tmux server(s) from prior runs",
             _reaped_terminals,
+            extra={"session_id": runner_primary_session_id()},
         )
+
+    # Reap per-session native-harness bridge dirs (bridge.json token, MCP/
+    # policy config, permission_hook.json) leaked by a prior runner that died
+    # without running the explicit delete path. Dynamic across all native
+    # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
+    # Best-effort: a sweep failure must never crash runner startup.
+    try:
+        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
+        if _reaped_bridge_dirs:
+            _logger.info(
+                "Reaped %d orphaned native bridge dir(s) from prior runs",
+                _reaped_bridge_dirs,
+            )
+    except Exception:  # noqa: BLE001 — housekeeping must never block startup
+        _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
@@ -1332,9 +1567,14 @@ def create_app(
                     "runner MCP prewarm registered for %s (servers=%d)",
                     prewarm_path,
                     len(prewarm_spec.mcp_servers or []),
+                    extra={"session_id": runner_primary_session_id()},
                 )
             except Exception:
-                _logger.exception("runner MCP prewarm failed for %s", prewarm_path)
+                _logger.exception(
+                    "runner MCP prewarm failed for %s",
+                    prewarm_path,
+                    extra={"session_id": runner_primary_session_id()},
+                )
         # Native-pane idle reaper (#1349): reclaims idle native CLI panes.
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
@@ -1345,18 +1585,36 @@ def create_app(
         # boot reaps any such orphan whose owner lock is no longer held (its
         # runner is gone), so a fresh runner on the host cleans up what a dead
         # predecessor left. Held owner locks (live sibling runners) are skipped.
-        from omnigent.codex_native_process_registry import (
+        from omnigent.harnesses.codex_native.process_registry import (
             reconcile_codex_native_process_registry,
         )
 
         with contextlib.suppress(Exception):
             await asyncio.to_thread(reconcile_codex_native_process_registry)
+        # Liveness backstop for sub-agent dispatches wedged in ``launching``:
+        # a child that never emits any edge would otherwise hold the parent's
+        # work handle open forever with no error surfaced. The app's
+        # wake-scheduling seam is passed so a reaped failure also wakes the
+        # idle parent — the inbox insert alone would never be read.
+        from omnigent.runner.app import run_subagent_launch_reaper
+
+        app.state.subagent_launch_reaper = asyncio.create_task(
+            run_subagent_launch_reaper(
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            ),
+            name="runner-subagent-launch-reaper",
+        )
 
     async def _stop_pm() -> None:
         """Stop runner-owned resources for graceful process exit.
 
         :returns: None.
         """
+        _launch_reaper = getattr(app.state, "subagent_launch_reaper", None)
+        if _launch_reaper is not None:
+            _launch_reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _launch_reaper
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
@@ -1437,7 +1695,11 @@ async def _run_tunnel_from_env() -> None:
 
         telemetry.init("omni-runner")
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
-        _logger.debug("telemetry init failed in runner", exc_info=True)
+        _logger.debug(
+            "telemetry init failed in runner",
+            exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
+        )
 
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
@@ -1452,6 +1714,30 @@ async def _run_tunnel_from_env() -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
+
+    # asyncio funnels unretrieved task exceptions and callback errors through
+    # the loop's exception handler. Those are not our own _logger callsites
+    # (e.g. a discarded ``ws.recv()`` task on a normal tunnel close), so this is
+    # the one place we can attribute them to the runner's session and keep them
+    # out of asyncio's default, untagged "Task exception was never retrieved".
+    from websockets.exceptions import ConnectionClosedOK
+
+    def _handle_loop_exception(
+        loop: asyncio.AbstractEventLoop,  # noqa: ARG001 — signature mandated by asyncio
+        context: dict[str, object],
+    ) -> None:
+        exc = context.get("exception")
+        message = context.get("message") or "unhandled asyncio exception"
+        extra = {"session_id": runner_primary_session_id()}
+        if isinstance(exc, asyncio.CancelledError | ConnectionClosedOK):
+            # Benign teardown — keep it quiet but still attributed.
+            _logger.debug("asyncio: %s", message, exc_info=exc, extra=extra)
+        elif isinstance(exc, BaseException):
+            _logger.error("asyncio: %s", message, exc_info=exc, extra=extra)
+        else:
+            _logger.error("asyncio: %s (context=%r)", message, context, extra=extra)
+
+    loop.set_exception_handler(_handle_loop_exception)
 
     def _mark_activity() -> None:
         """Record real runner work for the inactivity watchdog.
@@ -1535,7 +1821,11 @@ async def _run_tunnel_from_env() -> None:
                     )
                 )
         except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
-            _logger.warning("direct-attach listener setup failed", exc_info=True)
+            _logger.warning(
+                "direct-attach listener setup failed",
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
             direct_attach_listener = None
     tunnel_task = asyncio.create_task(
         serve_tunnel(
@@ -1638,7 +1928,11 @@ async def _run_tunnel_from_env() -> None:
         # A crash unwinding through here is attributed by sys.excepthook with
         # its traceback, so only record the reason for an orderly shutdown.
         if sys.exc_info()[0] is None:
-            _logger.info("runner exiting: %s", exit_reason or "shutdown requested")
+            _logger.info(
+                "runner exiting: %s",
+                exit_reason or "shutdown requested",
+                extra={"session_id": runner_primary_session_id()},
+            )
         for task in wait_tasks:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1713,6 +2007,7 @@ def _install_signal_handlers(
                 "Signal handler registration failed; continuing without "
                 "graceful-shutdown signal handling",
                 exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
             )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1762,6 +2057,7 @@ def _install_crash_logging() -> None:
                 exc_type.__name__,
                 exc,
                 exc_info=(exc_type, exc, traceback),
+                extra={"session_id": runner_primary_session_id()},
             )
         previous_hook(exc_type, exc, traceback)
 
@@ -1816,7 +2112,7 @@ def main() -> None:
             raise
         # A fatal server rejection is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
-        _logger.error("runner exiting: %s", exc)
+        _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 

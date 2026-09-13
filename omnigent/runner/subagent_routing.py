@@ -531,7 +531,7 @@ def model_in_family(family: str | None, model: str) -> bool:
     """
     if family is None or family == "pi":
         return True
-    from omnigent.model_catalog import model_family_token
+    from omnigent.models.model_catalog import model_family_token
 
     token = model_family_token(model)
     return token == "claude" if family == "claude" else token == "openai"
@@ -618,7 +618,7 @@ def _with_unadvertised_arms(models: list[str], family: str | None) -> list[str]:
     """
     if not models or family != _UNADVERTISED_ARM_FAMILY:
         return models
-    from omnigent.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
+    from omnigent.models.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
 
     extra = [
         model
@@ -1176,7 +1176,7 @@ def _handler_factory(
             self.wfile.write(raw)
 
         def log_message(self, format: str, *args: Any) -> None:
-            _logger.debug("subagent-router: " + format, *args)
+            _logger.debug("subagent-router: " + format, *args, extra={"session_id": session_id})
 
     return _Handler
 
@@ -1356,7 +1356,7 @@ def ensure_session_router(
     # Nothing from the rendezvous is logged — neither the URL nor the paths
     # and ids that reach it — so a log file can never carry the bearer token
     # or the identifiers that address it. The advertisement on disk names both.
-    _logger.info("subagent router started")
+    _logger.info("subagent router started", extra={"session_id": session_id})
     return router
 
 
@@ -1478,7 +1478,7 @@ def _prune_router_dirs(router: SubagentRouter) -> None:
     Only dirs under the subagent-router root: the native harnesses' bridge
     dirs are advertised in too and belong to the bridge, not to this router.
     """
-    from omnigent.claude_native_bridge import subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import subagent_router_bridge_root
 
     root = subagent_router_bridge_root()
     for bridge_dir in (*router.advertised_dirs, router.bridge_dir):
@@ -1502,7 +1502,10 @@ def router_dir_for_session(session_id: str) -> Path:
     :returns: Created directory, mode ``0o700``.
     :raises RuntimeError: If an ancestor fails the ownership check.
     """
-    from omnigent.claude_native_bridge import ensure_secure_dir, subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import (
+        ensure_secure_dir,
+        subagent_router_bridge_root,
+    )
 
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     path = subagent_router_bridge_root() / digest

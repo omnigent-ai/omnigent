@@ -31,6 +31,15 @@
 //     area pick) -- "the person who owns the issue reviews the fix".
 //   - Whoever ends up the reviewer is then assigned onto any linked issue that
 //     has NO assignee yet, so an unowned issue inherits the PR's reviewer.
+// The workflow also fires on `edited` so a `closes #N` link added AFTER open
+// (e.g. a PR opened with a stub body, then filled in) is not missed. On an
+// `edited` event the action is PROMOTE-ONLY: it adopts a linked-issue assignee
+// if there now is one, and otherwise leaves the existing pick untouched -- it
+// won't re-run the load-balanced fallback on top of a chosen reviewer, so an
+// unrelated edit can't thrash it. The one exception: if the PR has NO managed
+// reviewer yet (the `opened` run may have been cancelled mid-assignment by this
+// edit under cancel-in-progress), the edit DOES fall through to the pick, so a
+// PR is never left unassigned. See the guard in the body.
 // Adoption is restricted to the managed reviewers pool (not the wider MAINTAINER
 // set) so an adopted reviewer is always removable by the reconcile step -- a
 // MAINTAINER not in the pool would be unremovable and could break the "exactly
@@ -194,6 +203,42 @@ module.exports = async ({ github, context, core }) => {
   const issueReviewers = [
     ...new Set(linkedIssues.flatMap((li) => li.assignees)),
   ].filter((u) => managed.has(u.toLowerCase()) && u.toLowerCase() !== author);
+
+  // On an `edited` event, act ONLY to adopt a linked-issue assignee -- the case
+  // where a PR is opened with a stub body and the real description (carrying the
+  // `closes #N` link) is pasted in seconds later, after this workflow already
+  // ran on `opened` and saw no linked issue. A linked-issue assignee is a "more
+  // matched" reviewer than the load-balanced area pick, so it may override the
+  // current one; but with nothing to adopt, normally leave the existing
+  // reviewer/assignee untouched rather than re-running the load-balanced
+  // fallback -- otherwise a routine title/body edit would thrash a
+  // deliberately-chosen reviewer.
+  //
+  // EXCEPTION: if the PR currently has NO managed pick, don't bail -- fall
+  // through to the load-balanced pick. Under `cancel-in-progress: true` this
+  // same edit can cancel the still-running `opened` job before it assigned
+  // anyone (its LLM ranking step is network-bound and slow); bailing here would
+  // then leave the PR permanently unassigned. Skipping only when a managed pick
+  // is already in place preserves the anti-thrash intent (there is nothing to
+  // thrash when none is set) while guaranteeing every PR gets one.
+  //
+  // "Managed pick" checks BOTH requested reviewers and assignees: GitHub drops a
+  // reviewer from `requested_reviewers` once they submit a review, but leaves
+  // them in `assignees` (the two are kept in sync when we assign). Checking only
+  // reviewers would treat a post-review edit as "nothing set" and re-request /
+  // reshuffle -- the exact thrash this guard prevents -- so the assignee, which
+  // survives review, is the durable signal.
+  const action = context.payload && context.payload.action;
+  if (action === "edited" && issueReviewers.length === 0) {
+    const hasManagedPick =
+      (pr.requested_reviewers || []).some((r) => managed.has((r.login || "").toLowerCase())) ||
+      (pr.assignees || []).some((a) => managed.has((a.login || "").toLowerCase()));
+    if (hasManagedPick) {
+      core.info("Edited event, nothing to adopt, managed reviewer/assignee already set; leaving reviewer/assignee unchanged.");
+      return;
+    }
+    core.info("Edited event, nothing to adopt and no managed reviewer/assignee set (opened run may have been cancelled); assigning the load-balanced pick.");
+  }
 
   // --- Global open-review load (stateless fairness signal).
   const openPRs = await github.paginate(github.rest.pulls.list, {

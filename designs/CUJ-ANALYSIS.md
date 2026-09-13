@@ -411,8 +411,9 @@ all ❌ except `supports_tool_calling`) + native permission modules. SDK and nat
 - **queue** = `supports_live_message_queue()` (mid-turn steer).
 - **subagents** = a sub-agent shows up as a child session — gated by the **tool surface** (SDK harnesses bridge
   `sys_session_send`; claude-native via `external_subagent_start`), *not* an executor flag.
-- **reasoning effort** = accepts a reasoning_effort **param** (≠ merely streaming thinking/`ReasoningChunk`, which
-  cursor & pi do without effort control).
+- **reasoning effort** = accepts a reasoning_effort **param** (≠ merely streaming thinking/`ReasoningChunk`):
+  cursor streams thinking without effort control; **pi has 7-level effort control (`--thinking`), and the omnigent
+  harness plumbs it** (canonical `none` → pi's `off`).
 - **elicitation** = can surface a policy/permission prompt (via bridge/hook/policy layer, not the executor).
 - **mid-session model** = model change applies without a restart.
 
@@ -420,6 +421,7 @@ all ❌ except `supports_tool_calling`) + native permission modules. SDK and nat
 |---|---|---|---|---|---|---|
 | claude-sdk | ✅ | ✅ | ✅ | ✅ {low,med,high,xhigh,max} | ✅ | ✅ |
 | codex | ✅ | ✅ | ⚠️† | ✅ {none,minimal,low,med,high,xhigh} | ⚠️‡ | ⚠️ per-turn (resets at session) |
+| pi | ✅ | ✅ | ❌ | ✅ {none,minimal,low,med,high,xhigh,max} ⚠️§ | ❌ | ⚠️ (respawns the RPC subprocess) |
 
 | Native harness | interrupt | queue | subagents | reasoning effort | elicitation | mid-session model |
 |---|---|---|---|---|---|---|
@@ -432,13 +434,19 @@ and inherit that harness's capabilities. A Polly agent on claude-sdk reads exact
 † **codex subagents** = implicit via subprocess `CODEX_HOME` isolation, not a declared capability.
 ‡ **codex (SDK) elicitation** = executor returns base ❌; the forwarder *may* handle it but unverified at the executor
 boundary (codex-*native* elicitation is ✅ via the forwarder hook).
+§ **pi row** is read off the declared capabilities (`harness_plugins.py`) and the pi CLI/RPC surface, not a live bench
+run — treat the cells as unverified against a real session. Effort maps `none → --thinking off`, applies mid-session
+via `set_thinking_level`, and clamps to the model's reported levels; pi-native keeps `--thinking off` on
+gateway-routed models regardless of effort.
 
-Notes: all four accept mid-session model change but the *mechanism* varies (SDK `set_model`/per-turn config;
+Notes: every row accepts mid-session model change but the *mechanism* varies (SDK `set_model`/per-turn config;
+pi respawns its RPC subprocess and re-asserts the thinking level on the new one;
 codex-native `thread/settings/update`; claude-native statusLine mirror, next turn only). "own-config propagation"
 (§2.B #3) is strongest for claude-native (`use_claude_config`) and codex-native (`~/.codex/config.toml`).
 
 **Reasoning-effort source of truth = `omnigent/reasoning_effort.py`** (in-scope families):
-`CLAUDE/ANTHROPIC = {low,medium,high,xhigh,max}`, `OPENAI/CODEX = {none,minimal,low,medium,high,xhigh}`.
+`CLAUDE/ANTHROPIC = {low,medium,high,xhigh,max}`, `OPENAI/CODEX = {none,minimal,low,medium,high,xhigh}`,
+`PI = {none,minimal,low,medium,high,xhigh,max}` (`none` is sent to pi as `off`).
 Effort is selectable at session start (NewChatDialog) and mid-session (`/effort <level>`); claude-native mirrors
 in-pane `/effort` back to the session row.
 

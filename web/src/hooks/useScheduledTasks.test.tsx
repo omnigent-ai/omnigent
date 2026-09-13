@@ -37,6 +37,7 @@ const TASK: api.ScheduledTask = {
   updatedAt: 2,
   modelOverride: null,
   reasoningEffort: null,
+  permissionMode: null,
   workspace: null,
   hostId: null,
   state: "active",

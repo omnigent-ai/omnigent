@@ -30,6 +30,7 @@ from omnigent.server.auth import (
     _RESERVED_USERS,
     UnifiedAuthProvider,
 )
+from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import (
     _GITHUB_EMAILS_ENDPOINT,
     derive_code_challenge,
@@ -37,6 +38,7 @@ from omnigent.server.oidc import (
     mint_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
+from omnigent.server.routes.device_auth import issue_login_grant
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -67,11 +69,16 @@ class _CliTicket:
         fulfills the ticket. ``None`` while pending.
     :param user_id: The authenticated user's email, set when
         fulfilled. ``None`` while pending.
+    :param refresh_token: Login-issued refresh grant material, set at
+        fulfillment when a grant store is wired. ``None`` while pending
+        or when grants are unavailable. Handed to the CLI exactly once
+        by the poll response.
     """
 
     created_at: float = field(default_factory=time.time)
     token: str | None = None
     user_id: str | None = None
+    refresh_token: str | None = None
 
 
 def create_auth_router(
@@ -80,6 +87,7 @@ def create_auth_router(
     admin_list: AdminList,
     account_store: SqlAlchemyAccountStore | None = None,
     allowed_domains: frozenset[str] | None = None,
+    device_grant_store: DeviceGrantStore | None = None,
 ) -> APIRouter:
     """Create an :class:`APIRouter` with OIDC login/callback/logout routes.
 
@@ -100,6 +108,12 @@ def create_auth_router(
         ``allowed_domains:`` key, union'd with
         ``OMNIGENT_OIDC_ALLOWED_DOMAINS`` and the runtime-editable file
         in the admission policy.
+    :param device_grant_store: When set, a CLI-ticket login also issues
+        a refresh grant (see
+        :func:`omnigent.server.routes.device_auth.issue_login_grant`)
+        so hosts and CLIs can renew without a human re-running
+        ``omnigent login``. ``None`` keeps the legacy
+        session-JWT-only response.
     :returns: A FastAPI router with ``/login``, ``/callback``,
         ``/logout`` (and ``/invite`` when invites are enabled).
     """
@@ -163,6 +177,12 @@ def create_auth_router(
         # before the callback redeems it. Only meaningful when invites
         # are enabled; ignored otherwise.
         invite = request.query_params.get("invite") if _invites_enabled else None
+        # Forced re-authentication for the device-consent anti-phishing
+        # gate: reauth=1 tells the IdP to require the user to
+        # re-authenticate rather than reusing an existing session
+        # (OIDC Core 3.1.2.1 `prompt=login`, `max_age=0`).
+        # Not applicable to GitHub OAuth, which has no prompt parameter.
+        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
 
         # Store state + code_verifier in a short-lived signed cookie.
         state_payload: dict[str, str | int] = {
@@ -175,10 +195,15 @@ def create_auth_router(
             state_payload["ticket"] = ticket
         if invite:
             state_payload["invite"] = invite
+        if reauth:
+            # Record when we demanded fresh auth so /callback can verify the
+            # id_token's auth_time proves the IdP actually re-authenticated
+            # after this point (rather than silently reusing its session).
+            state_payload["reauth_at"] = int(time.time())
         state_jwt = jwt.encode(state_payload, config.cookie_secret, algorithm="HS256")
 
         # Build the authorization URL.
-        params = {
+        params: dict[str, str] = {
             "response_type": "code",
             "client_id": config.client_id,
             "redirect_uri": config.redirect_uri,
@@ -187,6 +212,11 @@ def create_auth_router(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
+        if reauth:
+            # Ask the IdP to force the user to re-enter credentials
+            # rather than silently reusing an existing IdP session.
+            params["prompt"] = "login"
+            params["max_age"] = "0"
         auth_url = config.authorization_endpoint + "?" + urlencode(params)
 
         response = RedirectResponse(url=auth_url, status_code=302)
@@ -310,6 +340,37 @@ def create_auth_router(
                 content={"error": "Could not determine user email from IdP"},
             )
 
+        # Forced re-auth verification (anti-phishing device-consent gate).
+        # /login stamped reauth_at when it sent prompt=login + max_age=0.
+        # A conformant IdP must then set the id_token's auth_time to the
+        # actual (re-)authentication instant; if it silently reused its
+        # session, auth_time predates our demand and we must refuse rather
+        # than mint a fresh session that would pass the freshness gate.
+        # GitHub has no id_token / auth_time, so reauth is never set for it.
+        reauth_at = state_payload.get("reauth_at")
+        if isinstance(reauth_at, int):
+            auth_time = _resolve_oidc_auth_time(token_json, config)
+            if auth_time is None:
+                _logger.warning(
+                    "Rejecting reauth login: IdP id_token has no auth_time claim, "
+                    "so forced re-authentication (prompt=login) cannot be verified"
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "IdP did not confirm re-authentication"},
+                )
+            if auth_time < reauth_at:
+                _logger.warning(
+                    "Rejecting reauth login: id_token auth_time %d predates the "
+                    "re-authentication demand at %d (IdP reused its session)",
+                    auth_time,
+                    reauth_at,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "IdP did not re-authenticate the user"},
+                )
+
         # Normalize email to lowercase.
         email = email.lower()
 
@@ -367,6 +428,19 @@ def create_auth_router(
             ticket = _cli_tickets[ticket_id]
             ticket.token = session_jwt
             ticket.user_id = email
+            # A CLI login is a long-lived unattended credential holder
+            # (hosts especially) — issue a refresh grant so it can renew
+            # instead of dying at session-JWT expiry. Best-effort: a
+            # grant-store failure must not break login itself.
+            if device_grant_store is not None:
+                try:
+                    ticket.refresh_token = issue_login_grant(
+                        device_grant_store,
+                        user_id=email,
+                        cookie_secret=config.cookie_secret,
+                    )
+                except Exception:
+                    _logger.exception("cli-login: refresh grant issuance failed")
             # Return a simple HTML page — the CLI is polling
             # /auth/cli-poll and will pick up the token.
             import html as _html
@@ -560,15 +634,18 @@ def create_auth_router(
         # Fulfilled — return the token and clean up.
         token = ticket.token
         user_id = ticket.user_id
+        refresh_token = ticket.refresh_token
         del _cli_tickets[ticket_id]
-        return JSONResponse(
-            status_code=200,
-            content={
-                "token": token,
-                "user_id": user_id,
-                "expires_in": config.session_ttl_hours * 3600,
-            },
-        )
+        content: dict[str, object] = {
+            "token": token,
+            "user_id": user_id,
+            "expires_in": config.session_ttl_hours * 3600,
+        }
+        # Only present when a grant store is wired — old CLIs ignore the
+        # extra key, new CLIs against old servers see it absent.
+        if refresh_token is not None:
+            content["refresh_token"] = refresh_token
+        return JSONResponse(status_code=200, content=content)
 
     # ── Admin: read-only user list ────────────────────────────────
 
@@ -767,6 +844,75 @@ def _claim_is_verified_true(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
+def _validate_id_token(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+) -> dict[str, object] | None:
+    """Validate the OIDC ``id_token`` and return its decoded claims.
+
+    Checks the JWT signature against the IdP's JWKS and verifies the
+    ``iss`` and ``aud`` claims. A valid signature proves IdP provenance
+    only — callers must still gate on individual claims (email
+    verification, ``auth_time`` freshness, …).
+
+    :param token_json: Token endpoint response JSON with ``id_token``.
+    :param config: OIDC config supplying JWKS URI, issuer, audience.
+    :returns: Decoded claims, or ``None`` if the token is
+        missing/malformed or fails validation.
+    """
+    id_token = token_json.get("id_token")
+    if not isinstance(id_token, str) or not id_token:
+        return None
+    if config.jwks_uri is None:
+        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
+        return None
+
+    try:
+        jwks_client = jwt.PyJWKClient(config.jwks_uri)
+        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
+        return jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            audience=config.client_id,
+            issuer=config.issuer,
+        )
+    except jwt.InvalidTokenError as exc:
+        _logger.warning("id_token validation failed: %s", exc)
+        return None
+
+
+def _resolve_oidc_auth_time(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+) -> int | None:
+    """Return the id_token's ``auth_time`` (last authentication instant).
+
+    ``auth_time`` is the epoch second at which the IdP actually
+    authenticated the end user. It is REQUIRED in the id_token when the
+    request carried ``max_age`` (OIDC Core §3.1.3.7), which is exactly
+    the forced-re-auth case. Used to verify the IdP honored
+    ``prompt=login``/``max_age=0`` rather than silently reusing its
+    session.
+
+    :param token_json: Token endpoint response JSON with ``id_token``.
+    :param config: OIDC config for signature/claim validation.
+    :returns: ``auth_time`` as an int, or ``None`` when the token is
+        invalid or the claim is absent/non-numeric.
+    """
+    claims = _validate_id_token(token_json, config)
+    if claims is None:
+        return None
+    auth_time = claims.get("auth_time")
+    if isinstance(auth_time, bool):
+        return None
+    if isinstance(auth_time, int):
+        return auth_time
+    if isinstance(auth_time, float):
+        return int(auth_time)
+    return None
+
+
 def _resolve_oidc_email(
     token_json: dict[str, object],
     config: OIDCConfig,
@@ -805,25 +951,8 @@ def _resolve_oidc_email(
         ``email_verified`` is not truthy (and verification is not
         skipped via config).
     """
-    id_token = token_json.get("id_token")
-    if not isinstance(id_token, str) or not id_token:
-        return None
-    if config.jwks_uri is None:
-        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
-        return None
-
-    try:
-        jwks_client = jwt.PyJWKClient(config.jwks_uri)
-        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
-        claims = jwt.decode(
-            id_token,
-            signing_key.key,
-            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
-            audience=config.client_id,
-            issuer=config.issuer,
-        )
-    except jwt.InvalidTokenError as exc:
-        _logger.warning("id_token validation failed: %s", exc)
+    claims = _validate_id_token(token_json, config)
+    if claims is None:
         return None
 
     email = claims.get(config.email_claim)

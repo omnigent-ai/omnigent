@@ -8,10 +8,11 @@ import json
 import logging
 import os
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
-    BACKGROUND_TITLE_INSTRUCTIONS,
     BackgroundTitleContext,
+    build_background_title_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.claude_native")
@@ -19,8 +20,13 @@ _logger = logging.getLogger("omnigent.runner.background_titles.claude_native")
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated Claude Code print-mode process."""
+    from omnigent._platform import resolve_cli_binary
     from omnigent.claude_launcher import resolve_claude_launch
-    from omnigent.claude_native import (
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeNativeHookInterpreterMismatchError,
+        validate_claude_hook_interpreter_compatibility,
+    )
+    from omnigent.harnesses.claude_native.main import (
         build_native_claude_terminal_env,
         resolve_native_claude_config,
     )
@@ -33,17 +39,19 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             "background Claude Code title could not resolve provider config; "
             "falling back to Claude Code's native login",
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         claude_config = None
     effective_model = (
-        context.spawn_env.get("HARNESS_CLAUDE_SDK_MODEL")
+        context.title_model
+        or context.spawn_env.get("HARNESS_CLAUDE_SDK_MODEL")
         or context.model_override
         or (claude_config.model if claude_config is not None else None)
     )
     args = [
         "--safe-mode",
         "--system-prompt",
-        BACKGROUND_TITLE_INSTRUCTIONS,
+        build_background_title_instructions(context.additional_instructions),
         "-p",
         f"<user_message>\n{context.prompt}\n</user_message>",
         "--tools",
@@ -56,10 +64,34 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     ]
     if effective_model:
         args.extend(("--model", effective_model))
-    if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+    settings: dict[str, object] = {}
+    if claude_config is not None:
+        if claude_config.api_key_helper:
+            settings["apiKeyHelper"] = claude_config.api_key_helper
+        if claude_config.model_overrides:
+            settings["modelOverrides"] = claude_config.model_overrides
+    if settings:
+        args.extend(("--settings", json.dumps(settings)))
 
     command, launch_args = resolve_claude_launch("claude", args)
+    if command == "claude":
+        # Mirrors the check in _auto_create_claude_terminal: this bare
+        # "claude" is resolved against this process's PATH by
+        # create_subprocess_exec's env=... below, so validate the same
+        # binary that will actually run. Degrades to a skipped title
+        # (like the config-resolution fallback above) rather than raising,
+        # since a background title is best-effort, not session-critical.
+        resolved_claude = resolve_cli_binary("claude")
+        if resolved_claude is not None:
+            try:
+                validate_claude_hook_interpreter_compatibility(resolved_claude)
+            except ClaudeNativeHookInterpreterMismatchError:
+                _logger.warning(
+                    "background Claude Code title skipped: %s is Windows-native "
+                    "under WSL and cannot run Omnigent's hook command",
+                    resolved_claude,
+                )
+                return None
     env = dict(os.environ)
     env.update(build_native_claude_terminal_env(claude_config))
     for name in _claude_terminal_env_unset(claude_config):
@@ -89,6 +121,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             "background Claude Code title failed returncode=%s detail=%s",
             process.returncode,
             detail[-1000:],
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
     return stdout.decode(errors="replace").strip()

@@ -18,11 +18,29 @@ interface Scroller {
 
 /** Thumb height. Constant — that is the whole point of this component. */
 const THUMB_PX = 56;
+/**
+ * Smallest scroll range worth a thumb. Fractional content heights round into
+ * `scrollHeight`, and LatestTurnSpacer's 1px write-hysteresis can leave the
+ * document a couple of pixels taller than the viewport — painting a thumb for
+ * that noise advertises hidden content that does not exist. The trade: a real
+ * range under 4px also goes unindicated — imperceptible at these sizes.
+ */
+const MIN_SCROLL_RANGE_PX = 4;
 /** Track inset from the top, clearing the ChatHeader overlay's controls. */
 const TRACK_TOP_PX = 64;
 const TRACK_BOTTOM_PX = 12;
 
-export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null }) {
+export function TranscriptScrollbar({
+  scroller,
+  // Top inset of the track. Defaults to clearing the floating ChatHeader; when
+  // the Plan accordion is pinned above, the scroll container already starts
+  // below the header, so the caller passes a small inset instead — otherwise
+  // the thumb can't reach the top of the (already-cleared) viewport.
+  topInset = TRACK_TOP_PX,
+}: {
+  scroller: Scroller | null;
+  topInset?: number;
+}) {
   const [offset, setOffset] = useState(0);
   const [scrollable, setScrollable] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -34,8 +52,8 @@ export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null })
 
   /** Usable thumb travel: the track minus the thumb's own height. */
   const travelOf = useCallback(
-    (node: HTMLElement) => node.clientHeight - TRACK_TOP_PX - TRACK_BOTTOM_PX - THUMB_PX,
-    [],
+    (node: HTMLElement) => node.clientHeight - topInset - TRACK_BOTTOM_PX - THUMB_PX,
+    [topInset],
   );
 
   useEffect(() => {
@@ -43,7 +61,7 @@ export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null })
     const measure = () => {
       const max = el.scrollHeight - el.clientHeight;
       const travel = travelOf(el);
-      if (max < 1 || travel <= 0) {
+      if (max < MIN_SCROLL_RANGE_PX || travel <= 0) {
         setScrollable(false);
         return;
       }
@@ -107,7 +125,7 @@ export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null })
       aria-hidden
       data-testid="transcript-scrollbar"
       className="pointer-events-none absolute right-1 z-10 w-3"
-      style={{ top: TRACK_TOP_PX, bottom: TRACK_BOTTOM_PX }}
+      style={{ top: topInset, bottom: TRACK_BOTTOM_PX }}
     >
       <div
         data-testid="transcript-scrollbar-thumb"
@@ -116,7 +134,10 @@ export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null })
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
         className={cn(
-          "pointer-events-auto absolute right-0.5 w-1.5 cursor-default rounded-full",
+          // touch-none: the drag is pointer-event driven, so the browser's
+          // native touch-pan arbitration must not steal the gesture (it fires
+          // pointercancel right after pointerdown and the drag dies).
+          "pointer-events-auto absolute right-0.5 w-1.5 cursor-default touch-none rounded-full",
           "bg-foreground/20 transition-[width,background-color] duration-150",
           "hover:w-2.5 hover:bg-foreground/40",
           dragging && "w-2.5 bg-foreground/50",

@@ -15,6 +15,7 @@ import importlib
 import sys
 from pathlib import Path
 from typing import NoReturn
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -83,6 +84,42 @@ def test_entrypoint_imports_without_side_effects(
     # build_app()/main() rather than being imported or executed at module import.
     for module_name in _BOOT_MODULES:
         assert module_name not in sys.modules
+
+
+def test_run_migrations_uses_central_schema_initializer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deploy.docker.entrypoint import run_migrations
+    from omnigent.db import utils
+
+    engine = MagicMock()
+    create_engine = MagicMock(return_value=engine)
+    initialize = MagicMock()
+    monkeypatch.setattr(utils, "_create_engine", create_engine)
+    monkeypatch.setattr(utils, "_initialize_or_verify_schema", initialize)
+
+    run_migrations("cockroachdb://root@db/omnigent")
+
+    normalized = "cockroachdb+psycopg://root@db/omnigent"
+    create_engine.assert_called_once_with(normalized)
+    initialize.assert_called_once_with(engine, normalized)
+    engine.dispose.assert_called_once_with()
+
+
+def test_run_migrations_preserves_sqlite_startup(tmp_path: Path) -> None:
+    from sqlalchemy import create_engine
+
+    from deploy.docker.entrypoint import run_migrations
+    from omnigent.db.utils import _get_current_db_revision, _get_head_db_revision
+
+    database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
+    run_migrations(database_url)
+
+    engine = create_engine(database_url)
+    try:
+        assert _get_current_db_revision(engine) == _get_head_db_revision(database_url)
+    finally:
+        engine.dispose()
 
 
 # ── artifact-store resolution + selection ────────────────────────────────
@@ -185,3 +222,16 @@ def test_build_routing_defaults_without_a_routing_block() -> None:
     client, settings = _build_routing({}, None)
     assert client is None
     assert settings == RoutingSettings()
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected_timeout"),
+    [
+        ({"execution_timeout": 86_400}, 86_400),
+        ({}, 7_200),
+    ],
+)
+def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -> None:
+    from deploy.docker.entrypoint import _resolve_execution_timeout
+
+    assert _resolve_execution_timeout(cfg) == expected_timeout

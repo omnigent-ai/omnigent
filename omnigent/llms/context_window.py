@@ -60,6 +60,52 @@ _FALLBACK_CACHE_READ_INPUT_RATIO: float = 0.10
 _FALLBACK_CACHE_WRITE_INPUT_RATIO: float = 1.25
 
 
+def find_model_context_window(model: str) -> int | None:
+    """
+    Look up the model's context window in tokens, or ``None`` when unknown.
+
+    Same resolution as :func:`get_model_context_window` (env override,
+    model-id markers, catalog, litellm) but with no default fallback, for
+    callers that must omit the window rather than report a guessed one
+    (e.g. the kimi-native forwarder's context ring).
+
+    :param model: The model identifier, e.g. ``"openai/gpt-4o"``.
+    :returns: Context window size in tokens, or ``None`` when no
+        metadata source resolves the model.
+    """
+    override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
+    if override is not None:
+        return int(override)
+    encoded = _encoded_context_window(model)
+    if encoded is not None:
+        return encoded
+    catalog_window = _catalog_context_window(model)
+    if catalog_window is not None:
+        return catalog_window
+    try:
+        litellm = cast(_LiteLLM, importlib.import_module("litellm"))
+    except ImportError:
+        return None
+    try:
+        info = litellm.get_model_info(model)
+        if info:
+            limit = info.get("max_input_tokens")
+            if isinstance(limit, (int, float, str)) and limit:
+                return int(limit)
+    except Exception:
+        pass
+    if model.startswith("databricks-"):
+        try:
+            info = litellm.get_model_info(f"databricks/{model}")
+            if info:
+                limit = info.get("max_input_tokens")
+                if isinstance(limit, (int, float, str)) and limit:
+                    return int(limit)
+        except Exception:
+            pass
+    return None
+
+
 def get_model_context_window(model: str) -> int:
     """
     Look up the model's context window size in tokens.
@@ -80,36 +126,9 @@ def get_model_context_window(model: str) -> int:
         ``"databricks-gpt-5-5"``.
     :returns: Context window size in tokens.
     """
-    override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
-    if override is not None:
-        return int(override)
-    encoded = _encoded_context_window(model)
-    if encoded is not None:
-        return encoded
-    catalog_window = _catalog_context_window(model)
-    if catalog_window is not None:
-        return catalog_window
-    try:
-        litellm = cast(_LiteLLM, importlib.import_module("litellm"))
-    except ImportError:
-        return _DEFAULT_CONTEXT_WINDOW
-    try:
-        info = litellm.get_model_info(model)
-        if info:
-            limit = info.get("max_input_tokens")
-            if isinstance(limit, (int, float, str)) and limit:
-                return int(limit)
-    except Exception:
-        pass
-    if model.startswith("databricks-"):
-        try:
-            info = litellm.get_model_info(f"databricks/{model}")
-            if info:
-                limit = info.get("max_input_tokens")
-                if isinstance(limit, (int, float, str)) and limit:
-                    return int(limit)
-        except Exception:
-            pass
+    window = find_model_context_window(model)
+    if window is not None:
+        return window
     return _DEFAULT_CONTEXT_WINDOW
 
 
@@ -220,11 +239,11 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
             ),
         )
 
-    prices = {
-        price for info in find_catalog_models(model) if (price := _extract(info)) is not None
-    }
+    matches = find_catalog_models(model)
+    prices = {price for info in matches if (price := _extract(info)) is not None}
     if len(prices) == 1:
         return next(iter(prices))
+    # Contradictory or unpriced catalog metadata is authoritative uncertainty.
     return None
 
 
@@ -287,3 +306,108 @@ def compute_llm_cost(usage: dict[str, Any], pricing: ModelPricing) -> float:
         + cache_read * cache_read_rate
         + cache_write * cache_write_rate
     )
+
+
+def fetch_model_pricing_with_provider(
+    model: str,
+    provider_config: dict[str, Any] | None = None,
+    harness: str | None = None,
+) -> ModelPricing | None:
+    """
+    Fetch model pricing, checking provider config first then catalog.
+
+    Resolution order:
+    1. Provider config custom pricing (for self-hosted/gateway models with configured rates)
+    2. MLflow catalog via :func:`fetch_model_pricing` (for known vendor models)
+    3. ``None`` (unpriced)
+
+    This enables cost tracking for self-hosted models (Ollama, vLLM, custom
+    gateways) and gateway endpoints that expose catalog-known model IDs but
+    charge their own configured rates. Custom pricing takes precedence when
+    configured, so a self-hosted provider serving ``claude-opus-4`` can
+    override the vendor catalog rate with its own.
+
+    Example provider config::
+
+        providers:
+          ollama-local:
+            kind: local
+            openai:
+              base_url: http://localhost:11434/v1
+              api_key: ollama
+              pricing:
+                input_per_million: 0.0
+                output_per_million: 0.0
+
+    :param model: Model identifier, e.g. ``"llama3.2:latest"`` or
+        ``"anthropic/claude-sonnet-4-6"``.
+    :param provider_config: Parsed provider config from
+        :func:`~omnigent.onboarding.provider_config.load_config`. When
+        ``None``, skips provider lookup and falls through to catalog.
+    :param harness: Harness name to determine which provider family to check,
+        e.g. ``"claude-sdk"`` or ``"codex"``. When ``None``, skips provider
+        lookup and falls through to catalog. SDK executors may pass
+        executor-style spellings (``claude_sdk``, ``agents_sdk``) which are
+        normalized internally.
+    :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
+        pricing is unavailable.
+
+    .. note::
+        LIMITATION: This function uses ``default_provider_for_harness`` to
+        resolve the provider, which returns the DEFAULT provider for the given
+        harness, not necessarily the provider actually used by the session.
+        Sessions using named providers (via ``ProviderAuth``) that differ from
+        the default may be priced incorrectly. A future improvement should
+        thread the actual ``ProviderEntry`` from launch/session state instead
+        of re-resolving the default.
+    """
+    # Step 1: Check provider config custom pricing first (configured rates take precedence)
+    # Canonicalize harness to handle SDK executor spellings (claude_sdk -> claude-sdk)
+    if provider_config is not None and harness is not None:
+        from omnigent.harness_aliases import canonicalize_harness
+
+        canonical_harness = canonicalize_harness(harness) or harness
+        # Lazy import to avoid circular dependency. provider_config imports
+        # this module at top level, so we import it only when needed here.
+        from omnigent.onboarding.provider_config import (
+            default_provider_for_harness,
+        )
+
+        try:
+            provider = default_provider_for_harness(provider_config, canonical_harness)
+            if provider is not None:
+                # Determine which family (anthropic/openai) this harness uses
+                from omnigent.onboarding.provider_config import provider_family_for_harness
+
+                family_name = provider_family_for_harness(canonical_harness)
+                if family_name is not None:
+                    # Get the family config with custom pricing (if any)
+                    family = provider.family(family_name)
+                    if family is not None and family.pricing is not None:
+                        # Convert per-million prices to per-token
+                        return ModelPricing(
+                            input_per_token=family.pricing.input_per_million / 1_000_000,
+                            output_per_token=family.pricing.output_per_million / 1_000_000,
+                            cache_read_per_token=(
+                                family.pricing.cache_read_per_million / 1_000_000
+                                if family.pricing.cache_read_per_million is not None
+                                else None
+                            ),
+                            cache_write_per_token=(
+                                family.pricing.cache_write_per_million / 1_000_000
+                                if family.pricing.cache_write_per_million is not None
+                                else None
+                            ),
+                        )
+        except Exception:
+            # If provider lookup fails (e.g., malformed config, import error),
+            # fall through to catalog rather than breaking cost tracking entirely.
+            pass
+
+    # Step 2: Fall back to catalog pricing when provider pricing is not configured
+    catalog_pricing = fetch_model_pricing(model)
+    if catalog_pricing is not None:
+        return catalog_pricing
+
+    # Step 3: No pricing available
+    return None

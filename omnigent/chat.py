@@ -46,20 +46,25 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
-from omnigent.conversation_browser import open_conversation_link_if_enabled
+from omnigent.cli_invocation import cli_invocation
+from omnigent.conversation_browser import (
+    announce_conversation_url,
+    open_conversation_link_if_enabled,
+)
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native_dispatch import resolve_hook_for_key
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     logs_root,
     open_process_log_file,
+    process_log_dir_reference,
 )
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
@@ -257,6 +262,36 @@ class _SessionToolAdapter:
             iteration=0,
         )
         return self.tool_handler.execute(legacy_info)
+
+
+def _on_session_known(
+    *,
+    base_url: str,
+    session_id: str,
+    auto_open_conversation: bool,
+) -> None:
+    """Announce (and optionally open) the conversation URL at session start.
+
+    Called the moment the session id is known — before the turn runs — so a
+    headless wrapper can surface the session link immediately. Always prints
+    the stable ``Omnigent session: <url>`` line; additionally opens the
+    browser when the user opted in.
+
+    :param base_url: Omnigent server base URL.
+    :param session_id: The freshly created/resumed conversation id.
+    :param auto_open_conversation: Whether to also open the browser link.
+    """
+    announce_conversation_url(
+        base_url=base_url,
+        conversation_id=session_id,
+        echo=lambda message: click.echo(message, err=True),
+    )
+    open_conversation_link_if_enabled(
+        base_url=base_url,
+        conversation_id=session_id,
+        enabled=auto_open_conversation,
+        warn=lambda message: click.echo(message, err=True),
+    )
 
 
 def run_chat(
@@ -558,10 +593,13 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
+        from omnigent.util.server_url import display_server_url
+
         raise click.ClickException(
-            f"Session {conversation_id} has no online runner on {base_url} — its "
+            f"Session {conversation_id} has no online runner on "
+            f"{display_server_url(base_url)} — its "
             "host is offline. `attach` never starts a runner; bring the host back "
-            "(`omnigent run` locally, or reconnect it with `omnigent host`), "
+            f"(`{cli_invocation()} run` locally, or reconnect it with `{cli_invocation()} host`), "
             "then attach again."
         )
 
@@ -648,6 +686,7 @@ def _remote_headers(
     server_url: str | None = None,
     *,
     host_id: str | None,
+    org_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build headers for remote AP-server requests.
@@ -673,6 +712,8 @@ def _remote_headers(
         request that keys off the runner-env host_id). Required-keyword with
         no default so every call site consciously decides — pass the request
         path's host when it has one rather than silently defaulting to unkeyed.
+    :param org_id: Workspace selector captured from the current server URL, or
+        ``None`` to fall back to the stored login record.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
     # Resolve the bearer in the documented precedence order (one credential
@@ -708,7 +749,7 @@ def _remote_headers(
     if server_url:
         from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_request_headers(server_url, host_id=host_id))
+        headers.update(databricks_request_headers(server_url, host_id=host_id, org_id=org_id))
     return headers
 
 
@@ -1210,6 +1251,26 @@ def _finish_native_redirect_progress(
     )
 
 
+def _server_get(url: str, **kwargs: Any) -> httpx.Response:
+    """
+    ``httpx.get`` that never routes a loopback target through the env proxy.
+
+    Loopback traffic must not use a proxy, and httpx's env-derived proxy
+    setup can itself fail at client construction when the environment
+    carries an entry it cannot parse as ``host:port`` (e.g.
+    ``NO_PROXY=fe80::/10`` raises ``httpx.InvalidURL`` before any request
+    is sent), so skip it entirely for loopback URLs. Non-loopback targets
+    keep httpx's default proxy handling.
+
+    :param url: Absolute request URL, e.g. ``"http://127.0.0.1:6767/v1/info"``.
+    :param kwargs: Extra ``httpx.get`` keyword arguments.
+    :returns: The HTTP response.
+    """
+    if is_loopback_url(url):
+        kwargs["trust_env"] = False
+    return httpx.get(url, **kwargs)
+
+
 def _wrapper_label_for_conversation(
     *,
     base_url: str,
@@ -1230,12 +1291,12 @@ def _wrapper_label_for_conversation(
     :returns: Wrapper label value, or ``None``.
     """
     try:
-        resp = httpx.get(
+        resp = _server_get(
             f"{base_url}/v1/sessions/{conversation_id}",
             headers=_remote_headers(server_url=base_url, host_id=None),
             timeout=10.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         logger.warning(
             "wrapper-label probe failed for %s on %s: %s",
             conversation_id,
@@ -1319,12 +1380,12 @@ def _attach_session_info(
     """
     empty = _AttachSessionInfo(runner_online=False, agent_name=None, harness=None)
     try:
-        resp = httpx.get(
+        resp = _server_get(
             f"{base_url}/v1/sessions/{conversation_id}",
             headers=_remote_headers(server_url=base_url, host_id=None),
             timeout=10.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         logger.warning("session probe failed for %s on %s: %s", conversation_id, base_url, exc)
         return empty
     if resp.status_code != 200:
@@ -1376,15 +1437,22 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
     :param quiet: When ``True``, suppress interactive prompts and
         auto-select the first available agent.
     :returns: The chosen agent name.
-    :raises click.ClickException: If no sessions exist or no
-        agent name can be discovered.
+    :raises click.ClickException: If the server is unreachable, no
+        sessions exist, or no agent name can be discovered.
     """
-    resp = httpx.get(
-        f"{base_url}/v1/sessions",
-        headers=_remote_headers(server_url=base_url, host_id=None),
-        params={"limit": 100},
-        timeout=10.0,
-    )
+    try:
+        resp = _server_get(
+            f"{base_url}/v1/sessions",
+            headers=_remote_headers(server_url=base_url, host_id=None),
+            params={"limit": 100},
+            timeout=10.0,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.InvalidURL) as exc:
+        # No connection was ever established — a stale/unreachable server URL
+        # or a proxy environment httpx cannot parse is an environment problem,
+        # not a crash. Same guard as the daemon path
+        # (_prepare_chat_session_via_daemon).
+        raise click.ClickException(_unreachable_server_message(base_url)) from exc
     resp.raise_for_status()
     sessions = resp.json()["data"]
 
@@ -1484,10 +1552,11 @@ def _await_accounts_first_run_setup(
     if cli_auth.load_token(base_url) is not None:
         return
     try:
-        info = httpx.get(f"{base_url}/v1/info", timeout=5.0).json()
-    except (httpx.HTTPError, ValueError):
-        # /v1/info unreachable / unparseable: don't block — let the normal
-        # path run and surface any real error.
+        info = _server_get(f"{base_url}/v1/info", timeout=5.0).json()
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        # /v1/info unreachable / unparseable, or a proxy environment httpx
+        # cannot parse (InvalidURL is not an HTTPError): don't block — let
+        # the normal path run and surface any real error.
         return
     if not (isinstance(info, dict) and info.get("accounts_enabled") and info.get("needs_setup")):
         # Header / OIDC, or an admin already exists (token minted at boot):
@@ -1531,13 +1600,47 @@ def _unreachable_server_message(base_url: str) -> str:
     if is_loopback_url(base_url):
         return (
             f"Could not connect to the local Omnigent server at {base_url}. "
-            "It may have stopped — run `omnigent stop`, then try again. "
-            "Server logs are under ~/.omnigent/logs/server/."
+            f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
+            f"Server logs are under {process_log_dir_reference('server')}."
         )
+    from omnigent.util.server_url import display_server_url
+
     return (
-        f"Could not connect to the Omnigent server at {base_url}. "
+        f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
         "Check the URL, your network connection, and any HTTP proxy settings."
     )
+
+
+def _unparseable_proxy_env_error(base_url: str, exc: httpx.InvalidURL) -> click.ClickException:
+    """
+    Build the CLI error for a proxy environment httpx cannot parse.
+
+    For non-loopback servers ``trust_env`` stays on, so any client build can
+    raise ``httpx.InvalidURL`` (not an ``HTTPError``) on a proxy value it
+    cannot split as ``host:port`` (e.g. ``NO_PROXY=fe80::/10``) — an
+    environment problem, not a crash.
+
+    :param base_url: Server base URL the request targeted.
+    :param exc: The construction-time parse failure.
+    :returns: The actionable error naming the URL and the parse failure.
+    """
+    return click.ClickException(
+        f"{_unreachable_server_message(base_url)} "
+        f"(the proxy environment could not be parsed: {exc})"
+    )
+
+
+@contextlib.contextmanager
+def _actionable_proxy_env(base_url: str) -> Generator[None, None, None]:
+    """
+    Degrade an unparseable proxy environment to a clean CLI error.
+
+    :param base_url: Server base URL for the error message.
+    """
+    try:
+        yield
+    except httpx.InvalidURL as exc:
+        raise _unparseable_proxy_env_error(base_url, exc) from exc
 
 
 async def _prepare_chat_session_via_daemon(
@@ -1593,24 +1696,25 @@ async def _prepare_chat_session_via_daemon(
         wait_for_host_online,
         wait_for_runner_online,
     )
-    from omnigent.native_terminal import bind_session_runner
+    from omnigent.native.native_terminal import bind_session_runner
 
-    try:
+    async def resolve_session() -> tuple[str, bool]:
+        """Fork, resume, or create the session to bind, and say if it is fresh.
+
+        :returns: The session id and whether it was created just now.
+        :raises click.ClickException: If the server rejects the create/fork.
+        """
         async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
             try:
                 if fork_session_id is not None:
                     fork_result = await sdk.sessions.fork(fork_session_id)
-                    session_id = fork_result["id"]
-                    fresh_session = False
-                elif resume_conversation_id is not None:
-                    session_id = resume_conversation_id
-                    fresh_session = False
-                else:
-                    created = await sdk.sessions.create(
-                        bundle, filename="agent.tar.gz", workspace=workspace
-                    )
-                    session_id = created.id
-                    fresh_session = True
+                    return fork_result["id"], False
+                if resume_conversation_id is not None:
+                    return resume_conversation_id, False
+                created = await sdk.sessions.create(
+                    bundle, filename="agent.tar.gz", workspace=workspace
+                )
+                return created.id, True
             except ClientOmnigentError as exc:
                 # Any create/fork/resume rejection here is a server-side answer, not
                 # a client bug worth a traceback: a wrong base URL that answers
@@ -1621,6 +1725,7 @@ async def _prepare_chat_session_via_daemon(
                     f"Could not start a session on {base_url}: {exc}"
                 ) from exc
 
+    try:
         # A separate raw httpx client for the host-runner protocol (the daemon
         # launch helpers operate on httpx, not the SDK), pinned to the host's replica.
         timeout = httpx.Timeout(30.0, read=120.0)
@@ -1629,8 +1734,11 @@ async def _prepare_chat_session_via_daemon(
         ) as client:
             if progress is not None:
                 progress.update(STARTUP_PHASE_CONNECTING)
-            await wait_for_host_online(
-                client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+            (session_id, fresh_session), _ = await asyncio.gather(
+                resolve_session(),
+                wait_for_host_online(
+                    client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+                ),
             )
             if progress is not None:
                 progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
@@ -1658,7 +1766,31 @@ async def _prepare_chat_session_via_daemon(
         # --server URL, or a proxy refusing the tunnel. These three are
         # siblings under TransportError, so each has to be named.
         raise click.ClickException(_unreachable_server_message(base_url)) from exc
+    except httpx.InvalidURL as exc:
+        # Raised at client construction when the proxy environment carries a
+        # value httpx cannot parse as host:port; not an HTTPError, so it
+        # needs its own guard.
+        raise _unparseable_proxy_env_error(base_url, exc) from exc
     return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
+
+
+def _stop_headless_session(*, base_url: str, session_id: str) -> None:
+    """Stop a finished one-shot session's daemon-owned runner, best-effort.
+
+    A ``-p`` run is complete when it returns and nothing reattaches to it, but
+    the daemon only tears a runner down on an explicit stop; otherwise it lives
+    until the runner's own idle self-exit, holding its harness subtree open.
+
+    :param base_url: Omnigent server base URL.
+    :param session_id: The finished session's id, e.g. ``"conv_abc123"``.
+    """
+    from omnigent.cli import _stop_session_on_server
+
+    # Teardown must never turn a completed run into a failed one.
+    try:
+        _stop_session_on_server(base_url=base_url, session_id=session_id)
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
 def _chat_via_daemon(
@@ -1793,24 +1925,30 @@ def _chat_via_daemon(
             # client refreshes its own auth per request. ``progress`` is handed
             # off so ``_chat_with_server`` clears the spinner the instant before
             # the REPL paints (or before it redirects to a native wrapper).
-            _chat_with_server(
-                base_url,
-                tool_handler,
-                initial_message=initial_message,
-                resume_conversation_id=prepared.session_id,
-                fork_session_id=None,
-                agent_name=agent_name,
-                runner_id=prepared.runner_id,
-                runner_recover=None,
-                log=log,
-                agent_yaml=spec_path,
-                session_bundle=bundle_bytes,
-                debug_events=debug_events,
-                resume_parts=resume_parts,
-                skills=all_skills or None,
-                auto_open_conversation=auto_open_conversation,
-                progress=progress,
-            )
+            try:
+                _chat_with_server(
+                    base_url,
+                    tool_handler,
+                    initial_message=initial_message,
+                    resume_conversation_id=prepared.session_id,
+                    fork_session_id=None,
+                    agent_name=agent_name,
+                    runner_id=prepared.runner_id,
+                    runner_recover=None,
+                    log=log,
+                    agent_yaml=spec_path,
+                    session_bundle=bundle_bytes,
+                    debug_events=debug_events,
+                    resume_parts=resume_parts,
+                    skills=all_skills or None,
+                    auto_open_conversation=auto_open_conversation,
+                    progress=progress,
+                )
+            finally:
+                # One-shot only: an interactive REPL session stays online for
+                # the next turn, so it must not be torn down here.
+                if initial_message is not None:
+                    _stop_headless_session(base_url=base_url, session_id=prepared.session_id)
     finally:
         _cleanup_materialized_override_bundle(spec_path)
 
@@ -1919,7 +2057,7 @@ def _poll_remote_runner(
     start = time.monotonic()
     deadline = start + timeout
     status_url = f"{base_url}/v1/runners/{runner_id}/status"
-    last_error: httpx.HTTPError | None = None
+    last_error: Exception | None = None
     last_status: int | None = None
     while time.monotonic() < deadline:
         if runner_proc.poll() is not None:
@@ -1928,16 +2066,22 @@ def _poll_remote_runner(
                 f"{format_runner_log_tail(log_path)}"
             )
         try:
-            resp = httpx.get(status_url, headers=headers, timeout=2.0)
+            resp = _server_get(status_url, headers=headers, timeout=2.0)
             if resp.status_code == 200 and resp.json().get("online") is True:
                 return
             last_status = resp.status_code
             if resp.status_code in {401, 403}:
                 raise click.ClickException(
                     f"Remote runner status check was rejected ({resp.status_code}); "
-                    "run `omnigent login <server-url>` or check remote auth credentials."
+                    f"run `{cli_invocation()} login <server-url>` "
+                    "or check remote auth credentials."
                     f"{format_runner_log_tail(log_path)}"
                 )
+        except httpx.InvalidURL as exc:
+            # Construction-time proxy-env parse failure (not an HTTPError,
+            # e.g. NO_PROXY=fe80::/10): deterministic on every poll, so fail
+            # fast with the actionable error instead of burning the timeout.
+            raise _unparseable_proxy_env_error(base_url, exc) from exc
         except httpx.HTTPError as exc:
             last_error = exc
         elapsed = time.monotonic() - start
@@ -2214,7 +2358,8 @@ def _run_headless_prompt(
                 print(result_text)
 
     try:
-        asyncio.run(_main())
+        with _actionable_proxy_env(base_url):
+            asyncio.run(_main())
     except ClientOmnigentError as exc:
         # SETUP-phase failure: SessionsChat.send raises on a terminal
         # ``session.status: failed`` (no response.failed is emitted).
@@ -2276,13 +2421,13 @@ async def _query_sessions_once(
         if runner_id is None:
             raise RuntimeError(
                 "This server has no online runner to run the turn. Start one against "
-                "it with `omnigent host --server <url>` (or run the agent locally "
-                "with `omnigent run <agent.yaml>`), then retry."
+                f"it with `{cli_invocation()} host --server <url>` (or run the agent locally "
+                f"with `{cli_invocation()} run <agent.yaml>`), then retry."
             )
     if runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
-            "Start through `omnigent run <agent>` or pass --server so the CLI "
+            f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
             "can launch and bind a runner."
         )
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
@@ -2752,7 +2897,8 @@ def _assert_resume_conversation_exists(
             await client.sessions.get(conversation_id)
 
     try:
-        asyncio.run(_lookup())
+        with _actionable_proxy_env(base_url):
+            asyncio.run(_lookup())
     except ClientOmnigentError as exc:
         if exc.status_code == 404:
             raise click.ClickException(f"Conversation {conversation_id!r} not found.") from exc
@@ -2804,7 +2950,8 @@ def _run_picker(
                 agent_name_filter=agent_name,
             )
 
-    return asyncio.run(_lookup())
+    with _actionable_proxy_env(base_url):
+        return asyncio.run(_lookup())
 
 
 def _resolve_latest_conversation_id(
@@ -2843,7 +2990,8 @@ def _resolve_latest_conversation_id(
                 agent_name=agent_name,
             )
 
-    return asyncio.run(_lookup())
+    with _actionable_proxy_env(base_url):
+        return asyncio.run(_lookup())
 
 
 async def _resolve_latest_conversation_id_async(
@@ -3637,12 +3785,12 @@ def _wait_for_server(port: int, server: LocalServer, timeout: float = 45.0) -> N
         if server.proc.poll() is not None:
             _raise_server_failed(server)
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=2.0)
+            resp = _server_get(f"{base_url}/health", timeout=2.0)
             if resp.status_code == 200:
                 runner_id = server.runner_id
                 if runner_id is None:
                     return
-                runner_resp = httpx.get(
+                runner_resp = _server_get(
                     f"{base_url}/v1/runners/{runner_id}/status",
                     timeout=2.0,
                 )
@@ -4013,16 +4161,15 @@ def _run_repl(
                 used_families=used_families,
                 attach_only=attach_only,
                 on_session_start=(
-                    lambda session_id: open_conversation_link_if_enabled(
+                    lambda session_id: _on_session_known(
                         base_url=base_url,
-                        conversation_id=session_id,
-                        enabled=auto_open_conversation,
-                        warn=lambda message: click.echo(message, err=True),
+                        session_id=session_id,
+                        auto_open_conversation=auto_open_conversation,
                     )
                 ),
             )
 
-    with contextlib.suppress(KeyboardInterrupt):
+    with contextlib.suppress(KeyboardInterrupt), _actionable_proxy_env(base_url):
         asyncio.run(_main())
 
 
@@ -4080,11 +4227,10 @@ def _run_one_shot(
                 runner_id=runner_id,
                 resume_conversation_id=resume_conversation_id,
                 on_session_ready=(
-                    lambda session_id: open_conversation_link_if_enabled(
+                    lambda session_id: _on_session_known(
                         base_url=base_url,
-                        conversation_id=session_id,
-                        enabled=auto_open_conversation,
-                        warn=lambda message: click.echo(message, err=True),
+                        session_id=session_id,
+                        auto_open_conversation=auto_open_conversation,
                     )
                 ),
             )
@@ -4092,7 +4238,8 @@ def _run_one_shot(
                 click.echo(text)
 
     try:
-        asyncio.run(_main())
+        with _actionable_proxy_env(base_url):
+            asyncio.run(_main())
     except ClientOmnigentError as exc:
         # A turn that fails before the LLM stream starts (SETUP-phase
         # failure: spec resolution, spawn-env build) ends with only a

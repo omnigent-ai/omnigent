@@ -146,12 +146,15 @@ class _AlwaysHtml:
 
 @pytest.fixture
 def fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Shrink the poll interval so the wait loops iterate in milliseconds.
+    """Shrink the poll intervals so the wait loops iterate in milliseconds.
 
-    Patches the module's own constant (read at call time inside the
-    loops), keeping each test well under 100ms instead of multiples
-    of the real 0.5s cadence.
+    Patches the module's own constants (read at call time by
+    ``daemon_poll_intervals``), keeping each test well under 100ms
+    instead of multiples of the real cadence. Both the opening interval
+    and the steady-state cap are shrunk — leaving the opening one at its
+    real value would dominate these short loops.
     """
+    monkeypatch.setattr(daemon_launch, "DAEMON_POLL_INITIAL_INTERVAL_S", 0.01)
     monkeypatch.setattr(daemon_launch, "DAEMON_POLL_INTERVAL_S", 0.01)
 
 
@@ -392,3 +395,26 @@ async def test_open_daemon_client_no_slice_key_without_host() -> None:
     """A hostless (local) session leaves routing to the default fallback."""
     async with open_daemon_client("https://ws.example.com/api/2.0/omnigent", {}, None) as client:
         assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+
+
+def test_daemon_poll_intervals_open_tight_then_hold_at_the_cadence() -> None:
+    """
+    Readiness probes start tight and ease off to the steady cadence.
+
+    These waits gate every native-harness launch and usually resolve in
+    the first probe or two, so the opening interval must be well under
+    the steady cadence — otherwise a resource that became ready
+    immediately still costs a full interval of dead time. The sequence
+    must also be monotonic and never exceed the cadence, so a long wait
+    does not hammer the server.
+    """
+    intervals = daemon_launch.daemon_poll_intervals()
+    first_ten = [next(intervals) for _ in range(10)]
+
+    assert first_ten[0] == daemon_launch.DAEMON_POLL_INITIAL_INTERVAL_S
+    assert first_ten[0] < daemon_launch.DAEMON_POLL_INTERVAL_S
+    assert first_ten == sorted(first_ten)
+    assert max(first_ten) == daemon_launch.DAEMON_POLL_INTERVAL_S
+    # Reaching "ready" on the third probe must cost less than the old flat
+    # cadence would have spent getting there.
+    assert sum(first_ten[:2]) < 2 * daemon_launch.DAEMON_POLL_INTERVAL_S

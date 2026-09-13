@@ -123,13 +123,15 @@ export function highlightRectsForPage(
   for (const c of comments) {
     const anchor = decodePdfAnchor(c.anchor_content);
     if (!anchor || anchor.page !== page) continue;
-    const active = activeSelection != null && commentsMatchOffsets(activeSelection, c);
+    const active = activeSelection?.comment_id === c.id;
     out.push({ key: c.id, rects: anchor.rects, active, comment: c });
   }
 
-  if (activeSelection) {
+  if (activeSelection && activeSelection.comment_id == null) {
     const pending = decodePdfAnchor(activeSelection.anchor_content);
-    const alreadySaved = comments.some((c) => commentsMatchOffsets(activeSelection, c));
+    const alreadySaved = comments.some(
+      (c) => c.status === "draft" && commentsMatchOffsets(activeSelection, c),
+    );
     if (pending && pending.page === page && !alreadySaved) {
       out.push({ key: "pending", rects: pending.rects, active: true });
     }

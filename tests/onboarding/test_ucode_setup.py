@@ -20,21 +20,20 @@ from omnigent.onboarding.ucode_setup import (
 )
 
 
-def test_find_ucode_command_prefers_uvx_from_main() -> None:
-    """Prefers an ephemeral uvx run pinned to main, even if ucode is installed.
+def test_find_ucode_command_prefers_uvx_pinned_commit() -> None:
+    """Prefers an ephemeral uvx run pinned to a fixed commit, even if ucode is
+    installed.
 
     The locally-installed binary may be stale (predating
-    ``configure --workspaces``), so uvx-from-main must win when both are
-    present. ``--refresh-package ucode`` forces re-resolution of the mutable
-    ``main`` ref so the cache can't serve an old commit.
+    ``configure --workspaces``), so uvx-from-pinned-commit must win when both
+    are present. The ref is a full SHA so setup resolves a reproducible ucode
+    rather than a moving ``main`` HEAD.
     """
     with patch("shutil.which", return_value="/usr/bin/uvx"):
         assert find_ucode_command() == [
             "/usr/bin/uvx",
-            "--refresh-package",
-            "ucode",
             "--from",
-            "git+https://github.com/databricks/ucode@main",
+            "git+https://github.com/databricks/ucode@304e4a29c5ca73b3bfaaf1911e38d0080833fda4",
             "ucode",
         ]
 
@@ -80,6 +79,7 @@ def test_build_ucode_configure_command_uses_workspaces() -> None:
         "https://one.example.databricks.com,https://two.example.databricks.com",
         "--agents",
         "claude,codex,pi",
+        "--enable-fable",
     ]
 
 
@@ -88,10 +88,8 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
     command = build_ucode_configure_command(
         (
             "/usr/bin/uvx",
-            "--refresh-package",
-            "ucode",
             "--from",
-            "git+https://github.com/databricks/ucode@main",
+            "git+https://github.com/databricks/ucode@304e4a29c5ca73b3bfaaf1911e38d0080833fda4",
             "ucode",
         ),
         workspace_urls=("https://one.example.databricks.com",),
@@ -99,16 +97,15 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
 
     assert command == [
         "/usr/bin/uvx",
-        "--refresh-package",
-        "ucode",
         "--from",
-        "git+https://github.com/databricks/ucode@main",
+        "git+https://github.com/databricks/ucode@304e4a29c5ca73b3bfaaf1911e38d0080833fda4",
         "ucode",
         "configure",
         "--workspaces",
         "https://one.example.databricks.com",
         "--agents",
         "claude,codex,pi",
+        "--enable-fable",
     ]
 
 
@@ -194,6 +191,7 @@ def test_configure_ucode_for_workspace_targets_single_workspace() -> None:
             "https://example.cloud.databricks.com",
             "--agents",
             "claude,codex,pi",
+            "--enable-fable",
         ]
     ]
 
@@ -232,4 +230,36 @@ def test_build_ucode_configure_command_normalizes_pasted_url() -> None:
         "https://example.cloud.databricks.com",
         "--agents",
         "claude",
+        "--enable-fable",
     ]
+
+
+def test_build_ucode_configure_command_for_profile_broker_mode() -> None:
+    from omnigent.onboarding.ucode_setup import build_ucode_configure_command_for_profile
+
+    argv = build_ucode_configure_command_for_profile(
+        ["ucode"], profile="omnigent", agents=["claude", "codex", "pi"]
+    )
+    assert argv == [
+        "ucode",
+        "configure",
+        "--profiles",
+        "omnigent",
+        "--agents",
+        "claude,codex,pi",
+        "--skip-validate",
+        "--skip-upgrade",
+        "--skip-unavailable",
+    ]
+    # broker mode: no --use-pat (the caller supplies DATABRICKS_BEARER_COMMAND)
+    assert "--use-pat" not in argv
+
+
+def test_build_ucode_configure_command_for_profile_pat_mode() -> None:
+    from omnigent.onboarding.ucode_setup import build_ucode_configure_command_for_profile
+
+    argv = build_ucode_configure_command_for_profile(
+        ["ucode"], profile="DEFAULT", agents=["claude"], use_pat=True
+    )
+    assert argv[-1] == "--use-pat"  # lakebox authenticates from the injected profile PAT
+    assert "claude" in argv[argv.index("--agents") + 1]

@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.content.Context
 import android.net.Uri
 import android.os.Looper
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -19,12 +20,19 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
     @Test
-    fun `page start does not inject into the outgoing document`() {
+    fun `page start notifies the shell without injecting into the outgoing document`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
-        val client = client(shouldInjectBridgeAtPageReady = false)
+        var navigationStarts = 0
+        val client =
+            client(
+                shouldInjectBridgeAtPageReady = false,
+                onNavigationStarted = { navigationStarts++ },
+            )
 
         client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageStarted(webView, "about:blank", null)
 
+        assertEquals(1, navigationStarts)
         assertTrue(webView.evaluatedScripts.isEmpty())
     }
 
@@ -66,9 +74,8 @@ class OmnigentWebViewClientTest {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val client = client(shouldInjectBridgeAtPageReady = false)
 
-        // A post-login landing on the pinned server's root, and the `/omnigent`
-        // mount the CLI records — neither starts with `/ml/omnigents`. Both must
-        // still get the CSS or the workspace switcher stays visible.
+        // A post-login landing on the pinned server's root and a nested app route
+        // both need the CSS or the workspace switcher stays visible.
         client.onPageFinished(webView, "$PINNED_ORIGIN/")
         client.onPageFinished(webView, "$PINNED_ORIGIN/omnigent/c/abc")
 
@@ -289,6 +296,36 @@ class OmnigentWebViewClientTest {
         assertNull(webView.loadedUrl)
     }
 
+    @Test
+    fun `renderer death hands the dying WebView and crash flag to the recovery callback`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var recovered: WebView? = null
+        var reportedCrash: Boolean? = null
+        val client =
+            client(
+                onRendererGone = { view, didCrash ->
+                    recovered = view
+                    reportedCrash = didCrash
+                },
+            )
+
+        val handled =
+            client.onRenderProcessGone(
+                webView,
+                object : RenderProcessGoneDetail() {
+                    override fun didCrash(): Boolean = true
+
+                    override fun rendererPriorityAtExit(): Int = WebView.RENDERER_PRIORITY_IMPORTANT
+                },
+            )
+
+        assertTrue(handled)
+        assertEquals(webView, recovered)
+        // The client must forward detail.didCrash() so the host can budget
+        // recovery for real crashes distinctly from system reclaims.
+        assertEquals(true, reportedCrash)
+    }
+
     /** Run posted bounces (see the client's mainHandler) before asserting. */
     private fun idleMainLooper() = shadowOf(Looper.getMainLooper()).idle()
 
@@ -296,12 +333,16 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
+        onRendererGone: (WebView, Boolean) -> Unit = { _, _ -> },
         onPageReady: (String?) -> Unit = {},
+        onNavigationStarted: () -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
+        onNavigationStarted = onNavigationStarted,
         onLoginRequired = onLoginRequired,
+        onRendererGone = onRendererGone,
     )
 
     private fun request(

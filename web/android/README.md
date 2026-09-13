@@ -86,9 +86,8 @@ WebView is committing a navigation can be dropped.
 
 Host matching is by domain (`*.databricks.com`, `*.azuredatabricks.net`) — no
 probe request. `*.databricksapps.com` is excluded: Apps serve their own app at
-the root and have no workspace mount. Note the desktop and iOS shells still
-expand to `/ml/omnigents` after a `server: databricks` probe; that divergence is
-intentional for now (see the comment in `web/electron/src/url.js`).
+the root and have no workspace mount. All three native shells redirect a bare
+workspace root to `/omnigent`.
 
 ## Managed configuration (org-preset servers)
 

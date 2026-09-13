@@ -172,7 +172,9 @@ def test_pinned_section_ignores_the_session_filter(
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
 
-        # Pin both from the default "All sessions" view, where both rows show.
+        # Switch to "All sessions" so both rows show, then pin both. (The
+        # default "My sessions" hides the shared row, leaving nothing to pin.)
+        _set_filter(page, "all")
         _pin_row(page, owned)
         _pin_row(page, shared)
         _pinned_has(page, owned)
@@ -281,6 +283,9 @@ def test_shared_session_stays_in_flat_list_on_project_name_collision(
         page = ctx.new_page()
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
+        # The shared row is hidden under the default "My sessions"; switch to
+        # "All sessions", since this test is about where that shared row lands.
+        _set_filter(page, "all")
 
         # The folder exists (the owned session filed it), but the shared session
         # is NOT filed away: it stays in the flat Sessions list, not the folder.

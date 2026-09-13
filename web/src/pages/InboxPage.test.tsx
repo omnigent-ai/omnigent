@@ -30,18 +30,28 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     elicitationId,
     message,
     status,
+    allowAutoMode,
     onSubmit,
   }: {
     elicitationId: string;
     message: string;
     status: string;
-    onSubmit: (id: string, action: "accept" | "decline") => void;
+    allowAutoMode?: boolean;
+    onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
   }) => (
     <div data-testid="approval-card" data-status={status}>
       <span>{message}</span>
       <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
         Stub Accept
       </button>
+      {allowAutoMode && (
+        <button
+          type="button"
+          onClick={() => onSubmit(elicitationId, "accept", { allow_auto_mode: true })}
+        >
+          Stub Auto Mode
+        </button>
+      )}
     </div>
   ),
 }));
@@ -213,7 +223,9 @@ describe("InboxPage approval items", () => {
     renderPage();
 
     const item = await screen.findByTestId("inbox-item");
-    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+    const toggle = within(item).getByRole("button", { name: /My Session/ });
+    expect(toggle).toHaveClass("cursor-pointer");
+    fireEvent.click(toggle);
     await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
     expect(screen.queryByTestId("approval-card")).not.toBeInTheDocument();
   });
@@ -236,6 +248,29 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
+  });
+
+  it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
+    const row = conversation({ id: "parent" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_auto", "Claude needs permission", {
+          target_session_id: "child",
+          allow_auto_mode: true,
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Auto Mode" }));
+    await waitFor(() =>
+      expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_auto", {
+        action: "accept",
+        content: { allow_auto_mode: true },
+      }),
+    );
+    expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded");
   });
 
   it("rolls back the optimistic verdict when approve() rejects", async () => {

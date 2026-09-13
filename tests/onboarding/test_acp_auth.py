@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.onboarding.acp_auth import acp_agents, acp_agents_settings
+from omnigent.onboarding.acp_auth import (
+    acp_agents,
+    acp_agents_settings,
+    shadowed_builtin_acp_rows,
+)
 
 
 def test_omnigent_mcp_round_trips_only_when_disabled() -> None:
@@ -123,3 +127,31 @@ def test_env_passthrough_rejects_a_value_instead_of_a_name() -> None:
 def test_env_passthrough_rejects_non_names(value: object) -> None:
     with pytest.raises(ValueError, match="env_passthrough"):
         acp_agents({"acp": {"agents": [{"name": "A", "command": "a", "env_passthrough": value}]}})
+
+
+def test_shadowed_builtin_acp_rows_matches_row_ids_only() -> None:
+    """Only a slug equal to a row id shadows it — an alias-shaped name does not.
+
+    "Devin" slugifies onto the ``devin`` row id, so the two name the same harness
+    and the row is dropped in favor of the user's command. "Grok Build" slugifies
+    to ``grok-build``, which is a *different* harness id from the ``grok`` row
+    (the ``acp:`` prefix survives canonicalization), so both stay addressable.
+    """
+    entries = acp_agents(
+        {
+            "acp": {
+                "agents": [
+                    {"name": "Devin", "command": "devin acp --model swe-1-7-medium"},
+                    {"name": "Grok Build", "command": "grok agent stdio"},
+                    {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
+                ]
+            }
+        }
+    )
+    assert [e.slug for e in entries] == ["devin", "grok-build", "gemini-cli"]
+    assert shadowed_builtin_acp_rows(entries) == {"devin"}
+
+
+def test_shadowed_builtin_acp_rows_empty_without_config() -> None:
+    """No configured agents → no rows suppressed (the common case)."""
+    assert shadowed_builtin_acp_rows([]) == frozenset()

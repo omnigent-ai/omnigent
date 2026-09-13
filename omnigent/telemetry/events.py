@@ -86,6 +86,81 @@ class SessionDeletedEvent:
 
 
 @dataclass
+class TurnEndEvent:
+    """Fired at the end of each LLM turn.
+
+    Emitted on two paths:
+
+    - **Relay / SDK harnesses**: once per terminal ``response.*`` event
+      (``completed``, ``failed``, ``cancelled``, ``incomplete``).
+      ``latency_ms`` and token fields are populated when available.
+    - **Native harnesses** (claude-native, codex-native): once per
+      ``external_session_status`` event with ``status`` in
+      ``{"idle", "failed"}``.  ``latency_ms`` and token fields are
+      always ``None`` on this path (native harnesses report cumulative
+      totals separately via ``SessionDeletedEvent``).
+
+    Token fields are only present on ``status="completed"`` relay turns;
+    they are ``None`` for all other statuses and for the native path.
+
+    :param installation_id: Server-side installation ID.
+    :param session_id: Omnigent conversation/session identifier.
+    :param status: Terminal status of the turn: ``"completed"``,
+        ``"failed"``, ``"cancelled"``, or ``"incomplete"``.
+    :param latency_ms: Wall-clock turn duration in milliseconds from
+        ``response.in_progress`` to the terminal event.  ``None`` when
+        the start timestamp was not captured (e.g. stream reconnect).
+    :param model: LLM model name, e.g. ``"claude-3-7-sonnet-20250219"``.
+        ``None`` when not reported by the harness.
+    :param input_tokens: Input tokens for this turn (per-turn delta).
+        ``None`` for non-completed turns or when not reported.
+    :param output_tokens: Output tokens for this turn (per-turn delta).
+        ``None`` for non-completed turns or when not reported.
+    :param cost_usd: Cost for this turn in USD (per-turn delta).
+        ``None`` when the model is unpriced or the turn did not complete.
+    """
+
+    installation_id: str | None
+    session_id: str
+    status: str
+    latency_ms: float | None
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: float | None
+
+
+@dataclass
+class NativeSessionUsageEvent:
+    """Fired on each ``external_session_usage`` flush from a native harness.
+
+    Native harnesses (claude-native, codex-native) report *cumulative*
+    session totals rather than per-turn deltas, so this event carries
+    running totals at the time of the flush.  Multiple events per session
+    are expected; consumers should take the last one (or compute deltas
+    between consecutive events) to derive per-turn spend.
+
+    :param installation_id: Server-side installation ID.
+    :param session_id: Omnigent conversation/session identifier.
+    :param input_tokens: Cumulative input tokens at time of flush.
+        ``None`` when not reported in this flush.
+    :param output_tokens: Cumulative output tokens at time of flush.
+        ``None`` when not reported in this flush.
+    :param cost_usd: Cumulative cost in USD at time of flush.
+        ``None`` when the session is unpriced or not reported.
+    :param model: LLM model name forwarded by the harness, e.g.
+        ``"claude-opus-4-5"``.  ``None`` when not reported.
+    """
+
+    installation_id: str | None
+    session_id: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: float | None
+    model: str | None
+
+
+@dataclass
 class PolicyRegisteredEvent:
     """Fired when a policy is created via the API.
 

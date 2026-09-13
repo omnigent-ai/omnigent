@@ -1,0 +1,55 @@
+name: Kustomize validate
+
+# Renders every deploy/kubernetes overlay with `kustomize build` so manifest
+# drift (duplicate bases, missing patches, invalid YAML) is caught in CI
+# rather than at deploy time. Only runs when overlay or base files change.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'deploy/kubernetes/**'
+  push:
+    branches:
+      - main
+      - 'release/v[0-9]*'
+    paths:
+      - 'deploy/kubernetes/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kustomize-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Kustomize build (overlays)
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Render all overlays
+        run: |
+          failed=0
+          for overlay in deploy/kubernetes/overlays/*/; do
+            name="$(basename "$overlay")"
+            echo "::group::$name"
+            if kustomize build "$overlay"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error::kustomize build failed for overlay '$name'"
+              failed=1
+            fi
+          done
+          exit "$failed"

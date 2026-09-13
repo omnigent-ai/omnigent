@@ -181,6 +181,7 @@ export function SharingPage() {
                 onCheckedChange={togglePublic}
                 disabled={!publicEditable || setMode.isPending}
                 aria-label="Public access"
+                componentId="settings.sharing.public_access"
               />
             </div>
             {error && <p className="mt-3 text-ui text-destructive">{error}</p>}

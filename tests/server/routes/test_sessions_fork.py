@@ -14,9 +14,19 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.testclient import TestClient
 
+from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
 from omnigent.errors import OmnigentError
-from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
+from omnigent.server.managed_hosts import (
+    MANAGED_REPO_LABEL_KEY,
+    ManagedLaunchTracker,
+    parse_sandbox_config,
+    resolve_managed_agent_label,
+)
+from omnigent.server.routes import _session_create_validation as create_validation
+from omnigent.server.routes.sessions import create_sessions_router, routes_core
+from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -110,6 +120,30 @@ class _ConversationStore:
         self._convs = conversations
         self._items = items_by_conv or {}
         self.fork_calls: list[dict[str, Any]] = []
+        self.label_writes: list[tuple[str, dict[str, str]]] = []
+
+    def set_labels(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        """
+        Upsert labels on a conversation, recording the call.
+
+        The managed launch re-stamps its repository here, so applying the
+        write (not just recording it) is what lets a test read the fork's
+        settled labels.
+
+        :param conversation_id: Conversation the labels land on.
+        :param updates: Label keys to upsert.
+        :param updated_at: Ignored by the stub.
+        """
+        del updated_at
+        self.label_writes.append((conversation_id, dict(updates)))
+        conv = self._convs.get(conversation_id)
+        if conv is not None:
+            conv.labels.update(updates)
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
@@ -131,6 +165,14 @@ class _ConversationStore:
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -184,6 +226,14 @@ class _ConversationStore:
                 "cloned_agent_description": cloned_agent_description,
                 "copy_model_settings": copy_model_settings,
                 "copy_terminal_launch_args": copy_terminal_launch_args,
+                "override_model_override": override_model_override,
+                "override_model_override_set": override_model_override_set,
+                "override_reasoning_effort": override_reasoning_effort,
+                "override_reasoning_effort_set": override_reasoning_effort_set,
+                "override_terminal_launch_args": override_terminal_launch_args,
+                "override_terminal_launch_args_set": override_terminal_launch_args_set,
+                "dropped_label_keys": dropped_label_keys,
+                "extra_labels": extra_labels,
                 "carry_history_into_native": carry_history_into_native,
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
@@ -216,14 +266,31 @@ class _ConversationStore:
             )
             source_items = source_items[: cutoff_index + 1]
         self._items[fork_id] = source_items
-        return Conversation(
+        # Mirror the real store's label handling for the three rules the route
+        # depends on: source labels are copied EXCEPT the store's own fork-only
+        # denylist and the keys the route asked to drop, then extra_labels are
+        # stamped on top (so a deliberate opt-in beats the drop). Without this
+        # the stub returned a label-less fork, so no test could see a source
+        # label riding onto the clone. presentation_labels is deliberately NOT
+        # modelled — the route's own assertions read it off the recorded call
+        # above.
+        fork_labels = {
+            key: value
+            for key, value in src.labels.items()
+            if key not in (_FORK_ONLY_DROPPED_LABEL_KEYS | dropped_label_keys)
+        }
+        fork_labels.update(extra_labels or {})
+        fork = Conversation(
             id=fork_id,
             created_at=100,
             updated_at=100,
             root_conversation_id=fork_id,
             title=title or f"Fork of {src.title}",
             agent_id=effective_agent_id,
+            labels=fork_labels,
         )
+        self._convs[fork_id] = fork
+        return fork
 
     def list_items(
         self,
@@ -245,12 +312,18 @@ class _ConversationStore:
         :param type: Item type filter.
         :returns: A PagedList of items.
         """
-        items = self._items.get(conversation_id, [])
+        items = list(self._items.get(conversation_id, []))
+        # Honor order + limit like the real store, so route tests can pin
+        # which page of the copied history a response carries.
+        if order == "desc":
+            items.reverse()
+        has_more = len(items) > limit
+        items = items[:limit]
         return PagedList(
             data=items,
             first_id=items[0].id if items else None,
             last_id=items[-1].id if items else None,
-            has_more=False,
+            has_more=has_more,
         )
 
 
@@ -262,6 +335,7 @@ def _make_conversation(
     agent_id: str | None = "087b7cb7ac30abf4debfaa578d052ec6",
     title: str = "Source Chat",
     kind: str = "default",
+    labels: dict[str, str] | None = None,
 ) -> Conversation:
     """
     Build a minimal Conversation entity for testing.
@@ -271,6 +345,8 @@ def _make_conversation(
     :param title: Title string.
     :param kind: Conversation kind, e.g. ``"default"`` or
         ``"sub_agent"``.
+    :param labels: Session labels, e.g. the sandbox repository a managed
+        source recorded. Empty when omitted.
     :returns: A Conversation.
     """
     return Conversation(
@@ -281,6 +357,7 @@ def _make_conversation(
         agent_id=agent_id,
         title=title,
         kind=kind,
+        labels=dict(labels or {}),
     )
 
 
@@ -309,6 +386,7 @@ def _make_item(item_id: str, text: str, response_id: str = "resp_001") -> Conver
 def _build_app(
     store: _ConversationStore,
     agent_store: _AgentStore | None = None,
+    auth_provider: AuthProvider | None = None,
 ) -> FastAPI:
     """
     Build a FastAPI app with the sessions router and error handler.
@@ -320,6 +398,8 @@ def _build_app(
     :param store: The conversation store stub.
     :param agent_store: The agent store stub. Defaults to a
         pre-populated stub with ``087b7cb7ac30abf4debfaa578d052ec6``.
+    :param auth_provider: Auth provider supplying the caller identity, or
+        ``None`` (the default) for an auth-disabled app.
     :returns: A configured FastAPI app ready for TestClient.
     """
     if agent_store is None:
@@ -337,6 +417,7 @@ def _build_app(
     router = create_sessions_router(
         conversation_store=store,  # type: ignore[arg-type]
         agent_store=agent_store,  # type: ignore[arg-type]
+        auth_provider=auth_provider,
     )
     app = FastAPI()
 
@@ -360,7 +441,7 @@ def _build_app(
 
 
 @pytest.mark.asyncio
-async def test_fork_session_happy_path() -> None:
+async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """POST /sessions/{id}/fork returns 201, clones the agent, and
     binds the fork to the cloned agent.
 
@@ -392,6 +473,15 @@ async def test_fork_session_happy_path() -> None:
         }
     )
     client = TestClient(_build_app(conv_store, agent_store=agent_store))
+    original_resolver = create_validation.resolve_project_session_create
+    chokepoint_calls = 0
+
+    async def _recording_resolver(**kwargs: Any) -> Any:
+        nonlocal chokepoint_calls
+        chokepoint_calls += 1
+        return await original_resolver(**kwargs)
+
+    monkeypatch.setattr(create_validation, "resolve_project_session_create", _recording_resolver)
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={"title": "My Fork"}
@@ -421,6 +511,7 @@ async def test_fork_session_happy_path() -> None:
         f"Copied items should preserve content and order, got {item_texts}"
     )
     assert body["title"] == "My Fork"
+    assert chokepoint_calls == 1
 
     # The agent clone is created INSIDE fork_conversation (atomically), not
     # via a separate agent_store.create — a pre-created row would leak as a
@@ -449,6 +540,99 @@ async def test_fork_session_happy_path() -> None:
     assert fork_call["agent_id"] == body["agent_id"], (
         "Fork must bind the same cloned agent id it asked the store to create"
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_session_run_config_overrides_pass_through() -> None:
+    """The dialog's model / effort / launch-args picks reach the store as
+    explicit overrides with their set-flags on.
+
+    Omitting these fields must leave the store on the inherit path
+    (``override_*_set=False``), so the flags gate on the request having sent
+    each field — a regression here would either drop a user's pick or clobber
+    an inherited value the user never touched.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={
+            "model_override": "opus",
+            "reasoning_effort": "high",
+            "terminal_launch_args": ["--permission-mode", "auto"],
+        },
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["override_model_override_set"] is True
+    assert fork_call["override_model_override"] == "opus"
+    assert fork_call["override_reasoning_effort_set"] is True
+    assert fork_call["override_reasoning_effort"] == "high"
+    assert fork_call["override_terminal_launch_args_set"] is True
+    assert fork_call["override_terminal_launch_args"] == ["--permission-mode", "auto"]
+    # Explicit launch args ⇒ drop the source's copied mode labels so a stale
+    # permission-mode label can't shadow the freshly chosen mode.
+    assert "omnigent.claude_native.permission_mode" in fork_call["dropped_label_keys"]
+
+
+@pytest.mark.asyncio
+async def test_fork_session_run_config_omitted_inherits() -> None:
+    """A fork with no run-config fields leaves every override unset, so the
+    store keeps today's inherit behavior (and drops no mode labels)."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["override_model_override_set"] is False
+    assert fork_call["override_reasoning_effort_set"] is False
+    assert fork_call["override_terminal_launch_args_set"] is False
+    # No run-config pick, so the route asks for no conditional drop at all.
+    assert fork_call["dropped_label_keys"] == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_fork_session_run_config_clear_aliases() -> None:
+    """A "default" model/effort (the picker's Default row) reaches the store as
+    a cleared override — set-flag on, value None — resetting the fork to the
+    bound agent's default rather than inheriting the source's."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"model_override": "default", "reasoning_effort": "default"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["override_model_override_set"] is True
+    assert fork_call["override_model_override"] is None
+    assert fork_call["override_reasoning_effort_set"] is True
+    assert fork_call["override_reasoning_effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_fork_session_400_invalid_model_override() -> None:
+    """A shell-/flag-shaped model id is rejected before any fork happens."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"model_override": "--rm -rf"},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls == [], "No fork should happen on a bad model override"
 
 
 @pytest.mark.asyncio
@@ -486,6 +670,48 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     # appearing means the store ignored the cutoff.
     assert [item["response_id"] for item in body["items"]] == ["resp_001", "resp_001"], (
         f"Fork should contain only resp_001 items, got {body['items']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_response_is_bounded_to_newest_item_page() -> None:
+    """The 201 body must not carry the whole copied transcript.
+
+    The fork dialog blocks on this response and uses only the clone's id,
+    so a body that ships every copied item makes the user's wait scale
+    with history size (tens of MB for a long session). Like the
+    GET-session snapshot, the route returns the newest item page in
+    chronological order.
+    """
+    conv = _make_conversation()
+    items = [
+        _make_item(f"{index:032x}", f"turn {index}", response_id=f"resp_{index:03d}")
+        for index in range(150)
+    ]
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201 Created, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert len(body["items"]) == 100, (
+        f"fork response must carry at most one item page (100), got "
+        f"{len(body['items'])} of 150 copied items — a full-transcript body "
+        f"makes the user-blocked fork response scale with source size"
+    )
+    texts = [
+        part["text"]
+        for item in body["items"]
+        for part in item.get("data", {}).get("content", [])
+        if part.get("type") == "input_text"
+    ]
+    assert texts[0] == "turn 50" and texts[-1] == "turn 149", (
+        f"fork response should carry the NEWEST page in chronological order, "
+        f"got first={texts[0]!r} last={texts[-1]!r}"
     )
 
 
@@ -766,6 +992,140 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     # The fork binds the cloned agent id it asked the store to create.
     assert fork_call["agent_id"] is not None
     assert fork_call["agent_id"] != "087b7cb7ac30abf4debfaa578d052ec6"
+
+
+@pytest.mark.asyncio
+async def test_fork_switch_drops_claude_permission_mode_label() -> None:
+    """An agent switch drops the source's claude-native permission-mode label.
+
+    That label is Claude-specific and rides alongside launch args, which a
+    switching fork already drops. Carrying the label onto a switched fork would
+    leave stale mode metadata that could hydrate a wrong mode in native-wrapper
+    UI state, so the route lists it in ``dropped_label_keys`` whenever the agent
+    changes — independent of whether the dialog sent explicit launch args.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")
+            ]
+        },
+    )
+    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    dropped = conv_store.fork_calls[0]["dropped_label_keys"]
+    assert "omnigent.claude_native.permission_mode" in dropped, (
+        f"agent switch must drop the claude permission-mode label, got {dropped!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_same_agent_keeps_permission_mode_label() -> None:
+    """A same-agent fork with no explicit launch args drops NO mode labels.
+
+    The permission-mode label is Claude-specific but valid for a same-agent
+    fork (same CLI), so it must carry over — the drop is gated on an agent
+    switch or an explicit launch-args pick, neither of which applies here.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    # Nothing conditional to drop, so the permission-mode label carries over.
+    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_fork_codex_bypass_stamps_label_on_codex_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bypass opt-in stamps the codex label via ``extra_labels``.
+
+    The source's own bypass label is always dropped (instance-scoped), so this
+    explicit, banner-gated request field is the ONLY path that arms bypass on a
+    fork — and the store applies ``extra_labels`` AFTER the drop, so the opt-in
+    wins. Gated on the target actually being codex-native.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    # The codex target (44b4…) must report codex-native so the route stamps.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache(
+            {
+                "087b7cb7ac30abf4debfaa578d052ec6": "claude_sdk",
+                "44b4151dd6cdfed6ee19430832398e05": "codex-native",
+            }
+        ),
+    )
+    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05", "codex_bypass_sandbox": True},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    extra = conv_store.fork_calls[0]["extra_labels"]
+    assert extra == {"omnigent.codex_native.bypass_sandbox": "1"}, (
+        f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_codex_bypass_rejected_on_non_codex_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arming bypass for a non-codex target is a 400 (the label is inert there).
+
+    Refusing rather than silently ignoring keeps the dangerous flag from being
+    set on a fork it can't apply to — the request is a client bug.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache(
+            {
+                "087b7cb7ac30abf4debfaa578d052ec6": "claude_sdk",
+                "280d725b404d2915f9e9d6cccce91303": "claude-native",
+            }
+        ),
+    )
+    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303", "codex_bypass_sandbox": True},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls == [], "no fork should happen on an invalid bypass opt-in"
 
 
 @pytest.mark.asyncio
@@ -1121,6 +1481,456 @@ async def test_fork_reversed_native_spelling_carry_gating(
         f"A {harness} fork should set carry_history_into_native={expect_carry}: "
         "reversed native spellings must be treated like their canonical form."
     )
+
+
+# ── Managed-sandbox fork ─────────────────────────────────────────
+
+
+def _arm_managed_app(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch, *, provider: str = "modal"
+) -> list[dict[str, Any]]:
+    """
+    Wire the app for managed forks and capture the scheduled launches.
+
+    Supplies the three ``app.state`` pieces the managed guard requires
+    (sandbox deployment, host store, launch tracker) and replaces the
+    background launch with a recorder, so a managed fork exercises the
+    real route path without provisioning anything.
+
+    :param app: The app under test.
+    :param monkeypatch: Fixture used to swap the background launch.
+    :param provider: Sandbox provider to configure. ``"modal"`` (default) is
+        single-repo; pass ``"kubernetes"`` for a multi-repo provider.
+    :returns: The list the recorder appends each launch's kwargs to.
+    """
+    app.state.sandbox_config = parse_sandbox_config(
+        {"provider": provider, "server_url": "https://managed-test.example.com"}
+    )
+    # Never dereferenced: the recorder replaces the only consumer.
+    app.state.host_store = object()
+    app.state.managed_launches = ManagedLaunchTracker()
+    launches: list[dict[str, Any]] = []
+
+    async def _record(**kwargs: Any) -> None:
+        """Record the launch the route scheduled instead of provisioning."""
+        launches.append(kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", _record)
+    return launches
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_schedules_sandbox_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed fork schedules the same background sandbox launch a create does.
+
+    The clone is the launch's subject, not the source: binding the source's
+    id here would provision a second sandbox for the session the user is
+    cloning FROM and leave the clone unbound.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "sandbox_provider": "modal"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert len(launches) == 1, "a managed fork must schedule exactly one sandbox launch"
+    launch = launches[0]
+    assert launch["session_id"] == body["id"]
+    assert launch["provider"] == "modal"
+    # No repository on either side, so the clone gets an empty sandbox.
+    assert launch["repos"] == []
+    assert conv_store.label_writes == []
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_launch_uses_session_scoped_clone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The managed launch is handed the fork's OWN session-scoped agent clone.
+
+    Only a genuine built-in may classify a managed runner (the ``omnigent.ai/
+    agent`` label an admission policy selects on to inject a privileged
+    credential). A fork always binds a session-scoped clone, which fails that
+    gate — so a forked runner carries no classifier and attracts no injected
+    credential. Passing the built-in the clone derives from would re-stamp the
+    label and hand a clone of anyone's session the built-in's credential.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    agent_store = _AgentStore(
+        agents={
+            "087b7cb7ac30abf4debfaa578d052ec6": Agent(
+                id="087b7cb7ac30abf4debfaa578d052ec6",
+                created_at=1,
+                name="code-reviewer",
+                bundle_location="087b7cb7ac30abf4debfaa578d052ec6/hash",
+                version=1,
+            ),
+            # The built-in a "switch the fork's agent" pick would name.
+            builtin_agent_id("code-reviewer"): Agent(
+                id=builtin_agent_id("code-reviewer"),
+                created_at=1,
+                name="code-reviewer",
+                bundle_location="builtin/hash",
+                version=1,
+            ),
+        }
+    )
+    app = _build_app(conv_store, agent_store=agent_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "agent_id": builtin_agent_id("code-reviewer")},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_agent_id = resp.json()["agent_id"]
+    launch_agent_id = launches[0]["agent_id"]
+    assert launch_agent_id == fork_agent_id, (
+        "the launch must classify on the fork's own bound agent, not the source's"
+    )
+    assert launch_agent_id != builtin_agent_id("code-reviewer"), (
+        "a fork must never launch under the built-in id — that would restore the "
+        "runner's agent classifier and with it the injected credential"
+    )
+    # The gate the classifier applies to that id: a fork's clone is
+    # session-scoped, so it resolves to no label.
+    assert (
+        resolve_managed_agent_label(
+            _AgentStore(
+                agents={
+                    fork_agent_id: Agent(
+                        id=fork_agent_id,
+                        created_at=1,
+                        name="code-reviewer",
+                        bundle_location="builtin/hash",
+                        version=1,
+                        session_id=resp.json()["id"],
+                    ),
+                }
+            ),  # type: ignore[arg-type]
+            fork_agent_id,
+            session_id=resp.json()["id"],
+        )
+        is None
+    ), "a forked session's runner must carry no omnigent.ai/agent classifier"
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_registers_sandbox_to_forking_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fork's sandbox is owned by whoever forked, not by the source's owner.
+
+    ``owner`` becomes the ``hosts`` row's ``user_id``, and that is the single
+    identity ``GET /v1/hosts/{id}/credentials/{provider}`` resolves a vended
+    credential from (see ``routes/host_credentials.py``, which reads
+    ``resolve_launch_token(...).user_id``). Passing the source's owner here
+    would hand the forker the source owner's GitHub token — a credential
+    crossing from one user to another on a plain read-access fork.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store, auth_provider=UnifiedAuthProvider(source="header"))
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+        headers={"X-Forwarded-Email": "forker@example.com"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert launches[0]["owner"] == "forker@example.com"
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_inherits_source_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An omitted workspace clones the repository the SOURCE recorded.
+
+    Cloning a sandbox session should land in the same checkout; without the
+    inherit the clone would come up in an empty sandbox and the copied
+    transcript's file references would resolve to nothing.
+    """
+    conv = _make_conversation(
+        labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2"}
+    )
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    repos = launches[0]["repos"]
+    assert len(repos) == 1
+    assert repos[0].url == "https://github.com/org/repo"
+    assert repos[0].branch == "release-1.2"
+    # Recorded on the FORK too (one label per repo, plus the bare compat key),
+    # so its own sandbox relaunch re-clones it. The source here uses the legacy
+    # single-value label, exercising the read fallback.
+    assert conv_store.label_writes == [
+        (
+            resp.json()["id"],
+            {
+                f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/repo#release-1.2",
+                MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_inherits_all_source_repositories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-repo source hands the fork EVERY repository it recorded.
+
+    The source records one label per repo; the fork reads them all back and
+    re-stamps its own per-repo labels — cloning a multi-repo sandbox session
+    lands the fork with all of its checkouts, not just the first.
+    """
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    # Multi-repo provider — inheriting several repos is only allowed where the
+    # provider supports it (a single-repo provider rejects it; see the guard test).
+    launches = _arm_managed_app(app, monkeypatch, provider="kubernetes")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    repos = launches[0]["repos"]
+    assert [(r.url, r.branch) for r in repos] == [
+        ("https://github.com/org/api", "main"),
+        ("https://github.com/org/web", None),
+    ]
+    # The fork re-stamps its own per-repo labels (plus the bare compat key) for
+    # relaunch.
+    assert conv_store.label_writes == [
+        (
+            resp.json()["id"],
+            {
+                f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+                f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+                MANAGED_REPO_LABEL_KEY: "https://github.com/org/api#main https://github.com/org/web",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_explicit_workspace_overrides_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit workspace wins over the source's recorded repository.
+
+    ``null`` is a real choice here (an empty sandbox), so the route must
+    branch on the field being SENT, not on its value — otherwise a caller
+    asking for an empty sandbox would silently get the source's repo.
+    """
+    conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    chosen = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "workspace": "https://github.com/org/other"},
+    )
+    emptied = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "workspace": None},
+    )
+
+    assert chosen.status_code == 201, f"got {chosen.status_code}: {chosen.text}"
+    assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
+    assert [r.url for r in launches[0]["repos"]] == ["https://github.com/org/other"]
+    assert launches[1]["repos"] == [], "an explicit null workspace means an empty sandbox"
+
+
+@pytest.mark.asyncio
+async def test_fork_never_inherits_source_sandbox_repo_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork that cleared its repository does not keep the source's label.
+
+    The label is per-session state a sandbox RELAUNCH re-clones from
+    (``orchestration._maybe_relaunch_managed_sandbox``). The store copies
+    source labels by default, so without the fork-only drop a fork that
+    asked for an empty sandbox would boot empty and then have the source's
+    repo re-cloned into it on the first relaunch — silently undoing the
+    user's choice. An external fork of a sandbox source must not carry it
+    either: the clone has no sandbox, and the stale label would seed the
+    fork dialog's own repository prefill. The drop is unconditional in the
+    store, so the route asks for nothing here; this covers the route's two
+    entries into that path.
+    """
+    conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    emptied = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "workspace": None},
+    )
+    external = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
+    assert external.status_code == 201, f"got {external.status_code}: {external.text}"
+    # Neither clone ends up carrying one, so no relaunch re-clones.
+    for response in (emptied, external):
+        fork = conv_store.get_conversation(response.json()["id"])
+        assert fork is not None
+        assert MANAGED_REPO_LABEL_KEY not in fork.labels
+    assert conv_store.label_writes == [], "no workspace resolved, so nothing to re-stamp"
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_restamps_resolved_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repository the fork DID resolve lands back on its own label.
+
+    The drop above is unconditional, so the managed launch re-stamping the
+    resolved repository is the only thing that keeps a fork's own sandbox
+    relaunchable into the same checkout.
+    """
+    conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "workspace": "https://github.com/org/other#dev"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.0"] == "https://github.com/org/other#dev"
+
+
+@pytest.mark.asyncio
+async def test_fork_external_schedules_no_sandbox_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default (external) fork stays unbound — no sandbox is provisioned.
+
+    A managed-capable server must not start spending on a sandbox for every
+    clone; compute is opt-in.
+    """
+    conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert launches == [], "an external fork must not provision a sandbox"
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_rejects_unconfigured_server() -> None:
+    """A managed fork on a server with no ``sandbox:`` config fails the POST.
+
+    Failing synchronously names the misconfiguration; deferring it to the
+    background launch would leave a clone stuck at "provisioning" forever.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert "managed hosts are not configured" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_rejects_unoffered_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider this server doesn't offer fails the POST, naming what it has."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "sandbox_provider": "daytona"},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert "is not configured on this server" in resp.json()["error"]["message"]
+    assert launches == []
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-repo source forked onto a single-repo provider fails the POST with
+    a clear 400 (modal is exec-model → single-repo), rather than a background
+    clone failure. The web picker caps this per provider; this guards the API."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)  # provider "modal" (single-repo)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert "clones only one repository" in resp.json()["error"]["message"]
+    assert launches == [], "a rejected multi-repo fork must schedule no launch"
 
 
 @pytest.mark.asyncio

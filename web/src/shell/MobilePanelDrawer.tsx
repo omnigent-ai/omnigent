@@ -59,7 +59,10 @@ export function MobilePanelDrawer({
       data-testid={testId}
       data-state={open ? "open" : "closed"}
       className={cn(
-        "flex flex-col overflow-hidden bg-card transition-[translate] duration-150 ease-out",
+        // `mobile-panel-drawer` is the hook the native shells use to inset the
+        // drawer past the status bar / home indicator (see index.css); without
+        // it the header sits under the notch and Close is untappable.
+        "mobile-panel-drawer flex flex-col overflow-hidden bg-card transition-[translate] duration-150 ease-out",
         "fixed inset-0 z-50 shadow-lg md:hidden",
         open ? "translate-x-0" : "translate-x-full",
       )}

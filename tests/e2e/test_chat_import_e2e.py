@@ -302,7 +302,8 @@ def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Pa
         env=env,
     )
 
-    match = re.search(r"Imported \d+ item\(s\) into (\S+)\.", result.stdout)
+    # Output is the session's browser URL (…/c/<id>); pull the id back out.
+    match = re.search(r"Imported \d+ item\(s\) into \S+/c/(\S+)", result.stdout)
     assert match is not None, result.stdout
     session_id = match.group(1)
     session = httpx.get(
@@ -374,7 +375,7 @@ def test_cli_imports_recent_claude_chats_as_batch(live_server: str, tmp_path: Pa
     )
 
     imported = re.findall(
-        r"Imported \d+ item\(s\) from (\S+) into (\S+)\.",
+        r"Imported \d+ item\(s\) from (\S+) into \S+/c/(\S+)",
         result.stdout,
     )
     assert [source_id for source_id, _ in imported] == list(source_session_ids[1:])
@@ -464,7 +465,7 @@ def test_cli_imports_recent_codex_chats_as_batch(live_server: str, tmp_path: Pat
     )
 
     imported = re.findall(
-        r"Imported \d+ item\(s\) from (\S+) into (\S+)\.",
+        r"Imported \d+ item\(s\) from (\S+) into \S+/c/(\S+)",
         result.stdout,
     )
     assert [source_id for source_id, _ in imported] == list(source_session_ids[1:])
@@ -516,7 +517,7 @@ def test_cli_force_replaces_imported_chat(
         timeout=30,
         env=env,
     )
-    first_match = re.search(r"into (\S+)\.", first.stdout)
+    first_match = re.search(r"into \S+/c/(\S+)", first.stdout)
     assert first_match is not None, first.stdout
 
     _write_force_import_fixture(tmp_path, harness, "new prompt")
@@ -528,7 +529,7 @@ def test_cli_force_replaces_imported_chat(
         timeout=30,
         env=env,
     )
-    replaced_match = re.search(r"into (\S+)\.", replaced.stdout)
+    replaced_match = re.search(r"into \S+/c/(\S+)", replaced.stdout)
     assert replaced_match is not None, replaced.stdout
     assert replaced_match.group(1) == first_match.group(1)
 
@@ -586,7 +587,7 @@ def test_cli_imports_jsonl_harness_chat_end_to_end(
     )
 
     match = re.search(
-        rf"Imported 2 item\(s\) from {re.escape(source_session_id)} into (\S+)\.",
+        rf"Imported 2 item\(s\) from {re.escape(source_session_id)} into \S+/c/(\S+)",
         result.stdout,
     )
     assert match is not None, result.stdout
@@ -653,7 +654,7 @@ def test_cli_imports_opencode_export_end_to_end(
     )
 
     match = re.search(
-        rf"Imported 4 item\(s\) from {source_session_id} into (\S+)\.",
+        rf"Imported 4 item\(s\) from {source_session_id} into \S+/c/(\S+)",
         result.stdout,
     )
     assert match is not None, result.stdout

@@ -1,19 +1,20 @@
-// Persisted, app-global preferences for the CODE font — the size and family of
+// Persisted, app-global preferences for the CODE font — size, family, and weight
 // the code editor (Monaco) and the terminal (xterm), kept separate from the
 // chrome/UI font (see lib/uiFontPreferences.ts).
 //
 // The chrome font rides CSS custom properties (`--ui-font-*`) that feed desktop
 // typography tokens. Monaco and xterm can't: they're fixed-pixel canvas/DOM
-// widgets that read an absolute px size + family once, at
+// widgets that read absolute font options once, at
 // construction, and only re-measure when told to. So instead of a CSS variable
 // this module exposes a tiny in-module pub/sub — `subscribeCodeFont` — that the
 // write helpers fire after persisting. An already-mounted editor or terminal
-// subscribes on mount and re-applies the new size/family imperatively
+// subscribes on mount and re-applies the new options imperatively
 // (editor.updateOptions / term.options + refit) so a Settings change lands live
 // without a reload or reconnect.
 
 const SIZE_STORAGE_KEY = "omnigent:code-font-size";
 const FAMILY_STORAGE_KEY = "omnigent:code-font-family";
+const WEIGHT_STORAGE_KEY = "omnigent:code-font-weight";
 
 // Code widgets read smaller than the chrome by convention, and a monospaced
 // grid tolerates a wider useful range than body text — hence bounds distinct
@@ -22,6 +23,11 @@ export const CODE_FONT_SIZE_DEFAULT = 13;
 export const CODE_FONT_SIZE_MIN = 10;
 export const CODE_FONT_SIZE_MAX = 24;
 export const CODE_FONT_SIZE_STEP = 1;
+
+export const CODE_FONT_WEIGHT_NORMAL = 400;
+export const CODE_FONT_WEIGHT_HEAVIER = 500;
+export const CODE_FONT_WEIGHT_DEFAULT = CODE_FONT_WEIGHT_NORMAL;
+export type CodeFontWeight = typeof CODE_FONT_WEIGHT_NORMAL | typeof CODE_FONT_WEIGHT_HEAVIER;
 
 /** Empty string = "editor default": no override, falls back to the mono stack. */
 export const CODE_FONT_FAMILY_DEFAULT = "";
@@ -42,7 +48,12 @@ export function clampCodeFontSizePx(px: number): number {
   return Math.min(CODE_FONT_SIZE_MAX, Math.max(CODE_FONT_SIZE_MIN, Math.round(px)));
 }
 
-function isValidPx(value: unknown): value is number {
+/** Resolve arbitrary or legacy values to one of the supported presets. */
+function normalizeCodeFontWeight(weight: number): CodeFontWeight {
+  return weight >= CODE_FONT_WEIGHT_HEAVIER ? CODE_FONT_WEIGHT_HEAVIER : CODE_FONT_WEIGHT_NORMAL;
+}
+
+function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
@@ -59,7 +70,7 @@ export function readCodeFontSizePx(): number {
     const raw = window.localStorage.getItem(SIZE_STORAGE_KEY);
     if (!raw) return CODE_FONT_SIZE_DEFAULT;
     const parsed: unknown = JSON.parse(raw);
-    if (!isValidPx(parsed)) return CODE_FONT_SIZE_DEFAULT;
+    if (!isFiniteNumber(parsed)) return CODE_FONT_SIZE_DEFAULT;
     return clampCodeFontSizePx(parsed);
   } catch {
     return CODE_FONT_SIZE_DEFAULT;
@@ -83,7 +94,33 @@ export function writeCodeFontSizePx(px: number): void {
   // Broadcast the intended value, not a storage re-read: if the write above
   // failed (quota/denied), mounted editors/terminals must still re-font to the
   // new size now rather than snapping back to the stale/default stored value.
-  emit({ sizePx, family: readCodeFontFamily() });
+  emit({ sizePx, family: readCodeFontFamily(), weight: readCodeFontWeight() });
+}
+
+/** Read the persisted normal-text weight for code widgets. */
+export function readCodeFontWeight(): CodeFontWeight {
+  if (typeof window === "undefined") return CODE_FONT_WEIGHT_DEFAULT;
+  try {
+    const raw = window.localStorage.getItem(WEIGHT_STORAGE_KEY);
+    if (!raw) return CODE_FONT_WEIGHT_DEFAULT;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isFiniteNumber(parsed)) return CODE_FONT_WEIGHT_DEFAULT;
+    return normalizeCodeFontWeight(parsed);
+  } catch {
+    return CODE_FONT_WEIGHT_DEFAULT;
+  }
+}
+
+/** Persist and live-apply the normal-text weight for code widgets. */
+export function writeCodeFontWeight(weight: CodeFontWeight): void {
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(weight));
+    } catch {
+      // localStorage quota or access errors shouldn't break the app.
+    }
+  }
+  emit({ sizePx: readCodeFontSizePx(), family: readCodeFontFamily(), weight });
 }
 
 /**
@@ -143,7 +180,7 @@ export function writeCodeFontFamily(name: string): void {
   }
   // Broadcast the intended value, not a storage re-read: a failed write must
   // still live-apply the new family to mounted editors/terminals.
-  emit({ sizePx: readCodeFontSizePx(), family });
+  emit({ sizePx: readCodeFontSizePx(), family, weight: readCodeFontWeight() });
 }
 
 /**
@@ -159,17 +196,23 @@ export function codeFontFamilyForEditor(family: string): string {
   return normalized ? `${normalized}, ${CODE_FONT_FAMILY_FALLBACK}` : CODE_FONT_FAMILY_FALLBACK;
 }
 
-/** The current code font size + family, read together for widget construction. */
+/** The current code font options, read together for widget construction. */
 export interface CodeFont {
   /** Font size in px, already clamped to the supported range. */
   sizePx: number;
   /** Custom family, or "" for the editor/terminal default. */
   family: string;
+  /** Normal-text weight, resolved to one of the supported presets. */
+  weight: CodeFontWeight;
 }
 
-/** Read both code font preferences at once. Handy on editor/terminal mount. */
+/** Read all code font preferences at once. Handy on editor/terminal mount. */
 export function readCodeFont(): CodeFont {
-  return { sizePx: readCodeFontSizePx(), family: readCodeFontFamily() };
+  return {
+    sizePx: readCodeFontSizePx(),
+    family: readCodeFontFamily(),
+    weight: readCodeFontWeight(),
+  };
 }
 
 type CodeFontListener = (font: CodeFont) => void;
@@ -178,7 +221,7 @@ const listeners = new Set<CodeFontListener>();
 
 /**
  * Subscribe to code font changes. The callback fires with the current
- * {@link CodeFont} whenever the size or family is written (e.g. from Settings),
+ * {@link CodeFont} whenever an option is written (e.g. from Settings),
  * letting an already-mounted editor or terminal re-apply the change live —
  * these fixed-pixel widgets can't ride a CSS variable the way the chrome font
  * does. Returns an unsubscribe function.

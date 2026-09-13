@@ -6,8 +6,10 @@ in-chat "N background tasks still running" indicator survives the trailing
 PTY-activity ``idle`` (which carries no count) and a reload.
 
 The tally must clear on an authoritative ``Stop``-hook ``0`` (the shell
-finished), on a new turn (``running``), and on a failure — but NOT on the
-countless trailing ``idle`` edges that carry no count. It must never make
+finished) and on a failure — but NOT on the countless trailing ``idle`` edges
+that carry no count, and NOT on a new ``running`` turn (background shells
+outlive turn boundaries, so the composer pill stays lit alongside the working
+shimmer until the next authoritative count). It must never make
 ``_session_status_with_child_rollup`` report ``running``: the turn is over
 and the session takes a new message immediately.
 """
@@ -26,8 +28,14 @@ from omnigent.server.routes.sessions import (
     _publish_status,
     _session_status_with_child_rollup,
 )
+from omnigent.server.schemas import BackgroundTaskInfo
 
 _SID = "conv_bg_test"
+
+
+def _tasks(*descriptions: str) -> list[BackgroundTaskInfo]:
+    """Detail entries for the given shell descriptions."""
+    return [BackgroundTaskInfo(status="running", description=d) for d in descriptions]
 
 
 def _conv(kind: str, *, labels: dict[str, str] | None = None) -> object:
@@ -40,10 +48,12 @@ def _clear_caches() -> None:
     """Isolate each case from leaked module-level cache state."""
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
+    _sessions_mod._session_background_tasks_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
     yield
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
+    _sessions_mod._session_background_tasks_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
 
 
@@ -85,10 +95,14 @@ def test_authoritative_zero_clears_tally_and_list_drops_to_idle() -> None:
     assert _session_status_with_child_rollup(_SID, []) == "idle"
 
 
-def test_new_turn_running_clears_tally() -> None:
+def test_new_turn_running_keeps_tally() -> None:
+    # A new ``running`` turn does NOT clear the tally: background shells outlive
+    # turn boundaries, so the composer pill stays lit alongside the working
+    # shimmer until the next authoritative count (the trailing ``running`` edge
+    # carries none).
     _publish_status(_SID, "idle", background_task_count=2)
     _publish_status(_SID, "running")
-    assert _SID not in _sessions_mod._session_background_task_count_cache
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
 
 
 def test_failure_clears_tally_and_wins_over_count() -> None:
@@ -97,6 +111,47 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
     assert _SID not in _sessions_mod._session_background_task_count_cache
     # ``failed`` is authoritative for the list row, never masked by a tally.
     assert _session_status_with_child_rollup(_SID, []) == "failed"
+
+
+# ── background-task detail rides with the tally ─────────────────────────────
+
+
+def test_background_tasks_detail_stored_with_positive_count() -> None:
+    # The per-shell detail is cached in lockstep with the count so a
+    # reload/reconnect can restore the individual shells.
+    tasks = _tasks("Wait for CI", "Build check")
+    _publish_status(_SID, "idle", background_task_count=2, background_tasks=tasks)
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
+    assert _sessions_mod._session_background_tasks_cache.get(_SID) == tasks
+
+
+def test_background_tasks_detail_empty_when_count_only() -> None:
+    # An older runner posts the count with no detail: the tally sticks and the
+    # detail cache holds [] (pill shows the number, no per-shell detail).
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=None)
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 1
+    assert _sessions_mod._session_background_tasks_cache.get(_SID) == []
+
+
+def test_background_tasks_detail_sticky_on_trailing_idle() -> None:
+    # The trailing PTY-activity idle carries no count: it must not wipe the
+    # detail the Stop hook just set (same rule as the count).
+    tasks = _tasks("Wait for CI")
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=tasks)
+    _publish_status(_SID, "idle", background_task_count=None)
+    assert _sessions_mod._session_background_tasks_cache.get(_SID) == tasks
+
+
+def test_background_tasks_detail_cleared_on_authoritative_zero() -> None:
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=_tasks("Wait for CI"))
+    _publish_status(_SID, "idle", background_task_count=0)
+    assert _SID not in _sessions_mod._session_background_tasks_cache
+
+
+def test_background_tasks_detail_cleared_on_failure() -> None:
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=_tasks("Wait for CI"))
+    _publish_status(_SID, "failed")
+    assert _SID not in _sessions_mod._session_background_tasks_cache
 
 
 # ── background-task delivery status (ended-turn collapse) ───────────────────

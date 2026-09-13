@@ -16,12 +16,13 @@ import logging
 import secrets
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from fastapi import Response
 
-from omnigent.errors import ElicitationDeclinedError
+from omnigent.debug_logging import phase_scope
+from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -31,6 +32,9 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -56,6 +60,7 @@ _logger = logging.getLogger(__name__)
 
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
 _OBSERVED_TOOL_CALL_STATUS = "in_progress"
+_COMPLETED_TOOL_CALL_STATUS = "completed"
 
 
 # Prefix for Claude SDK MCP-registered tool names (e.g. ``mcp__omnigent__sys_terminal_launch``).
@@ -66,8 +71,10 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 # Interrupt and reap use SEPARATE budgets: the short slice keeps a wedged interrupt from
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
+# _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
+# slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
 INTERRUPT_TIMEOUT_S = 3.0
-_INTERRUPT_SLICE_S = 1.5
+_INTERRUPT_SLICE_S = 3.0
 
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
@@ -132,8 +139,9 @@ class ExecutorAdapter(HarnessApp):
         # Per-session tracing context; created lazily on first turn and reused across turns.
         self._tracing_ctx: TracingContext | None = None
         # Detached bounded background tasks (abnormal-exit _safe_interrupt). Strongly referenced
-        # until completion; drained on shutdown. Never awaited inline to avoid blocking teardown.
-        self._bg_tasks: set[asyncio.Task[None]] = set()
+        # until completion; drained before recovery and on shutdown.
+        self._bg_tasks: set[asyncio.Task[bool]] = set()
+        self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -141,6 +149,15 @@ class ExecutorAdapter(HarnessApp):
         # dispatch_tool emits the function_call_output, so ToolCallComplete for these ids
         # must be suppressed in _translate_event to avoid duplicates.
         self._dispatched_call_ids: set[str] = set()
+        # Observed (harness-run) tool calls → (name, arguments) from the inline
+        # ToolCallRequest, so the matching ToolCallComplete can re-emit a *completed*
+        # function_call. The initial observed emission is status "in_progress", which
+        # the turn-persist filter drops (only completed function_calls are durable), so
+        # without the re-emission an observed tool card renders live but vanishes on
+        # reload. Dispatched calls never reach this — their ToolCallComplete
+        # short-circuits — so it is observed-only.
+        self._observed_tool_calls: dict[str, tuple[str, str]] = {}
+        self._pr_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """Drive the inner executor for one turn, translating its events to Omnigent SSE.
@@ -171,6 +188,15 @@ class ExecutorAdapter(HarnessApp):
             executor._tool_executor = self._stable_tool_executor  # type: ignore[attr-defined]
         if getattr(executor, "_elicitation_handler", None) is None:
             executor._elicitation_handler = self._stable_elicitation_handler  # type: ignore[attr-defined]
+        # ACP-shaped executors also accept a choice bridge, to offer the agent's own
+        # permission scopes; the others don't define the attribute at all.
+        if (
+            hasattr(executor, "_elicitation_choice_handler")
+            and executor._elicitation_choice_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
+                self._stable_elicitation_choice_handler
+            )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
@@ -183,11 +209,13 @@ class ExecutorAdapter(HarnessApp):
         # bounded interrupt only on abnormal exits (CancelledError, ExecutorError, etc.).
         clean_exit = False
         self._dispatched_call_ids.clear()
+        self._observed_tool_calls.clear()
+        self._pr_tool_calls.clear()
 
         tracing = is_tracing_enabled()
         from omnigent.runtime.telemetry import current_session_id, session_scope
 
-        turn_session_id = current_session_id() or self._session_key
+        turn_session_id = ctx.session_id or current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
             self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
@@ -212,7 +240,7 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with session_scope(turn_session_id), trace_cm:
+            with session_scope(turn_session_id), phase_scope(ErrorPhase.TURN), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -290,6 +318,13 @@ class ExecutorAdapter(HarnessApp):
                                 error=event.message,
                             )
                             agent_span = None
+                        # Keep any usage the executor observed before the
+                        # failure: the scaffold's terminal-event builder reads
+                        # ctx.provider_usage, so the response.failed event still
+                        # carries context_tokens and the occupancy meter doesn't
+                        # freeze at the previous turn's value.
+                        if event.usage is not None:
+                            ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
                         raise RuntimeError(f"inner executor error: {detail}")
@@ -332,14 +367,14 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
-            # On abnormal exit, detach and interrupt the executor synchronously before scheduling
-            # the background reap — a continuation turn must not reuse the abandoned executor.
+            # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
                 abandoned_executor = self._executor
                 self._executor = None
                 interrupt_task = asyncio.create_task(
                     self._safe_interrupt(abandoned_executor, self._session_key)
                 )
+                self._abandoned_executor_cleanup = interrupt_task
                 self._bg_tasks.add(interrupt_task)
                 interrupt_task.add_done_callback(self._bg_tasks.discard)
 
@@ -354,15 +389,20 @@ class ExecutorAdapter(HarnessApp):
             await self._executor.interrupt_session(self._session_key)
         return response
 
-    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> None:
+    async def _prepare_turn_retry(self) -> bool:
+        """Wait for confirmed teardown without cancelling the background reap."""
+        cleanup = self._abandoned_executor_cleanup
+        return cleanup is not None and await asyncio.shield(cleanup)
+
+    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> bool:
         """Best-effort bounded interrupt + close of a detached abandoned executor.
 
-        Scheduled (never awaited inline) from run_turn's finally on abnormal exit. The interrupt
+        Scheduled from run_turn's finally and awaited before any recovery retry. The interrupt
         gets a short slice; the reap (close_session + close) always runs under its own budget so
         a wedged interrupt can never starve the subprocess reap.
         """
         if executor is None:
-            return
+            return True
         try:
             await asyncio.wait_for(
                 executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
@@ -374,14 +414,25 @@ class ExecutorAdapter(HarnessApp):
                 exc_info=True,
             )
 
-        async def _reap() -> None:
-            with contextlib.suppress(Exception):
+        async def _reap() -> bool:
+            closed = True
+            try:
                 await executor.close_session(session_key)
-            with contextlib.suppress(Exception):
+            except Exception:
+                _logger.exception("abandoned executor close_session failed")
+                closed = False
+            try:
                 await executor.close()
+            except Exception:
+                _logger.exception("abandoned executor close failed")
+                closed = False
+            return closed
 
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+        try:
+            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+        except Exception:
+            _logger.exception("abandoned executor teardown failed or timed out")
+            return False
 
     async def _maybe_resync_on_orphan(self, *, force: bool = False) -> None:
         """Tier-1 SDK reset after repeated orphan callbacks (or immediately when ``force=True``).
@@ -544,6 +595,25 @@ class ExecutorAdapter(HarnessApp):
             return False
 
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        params = self._permission_card(tool_name, tool_input)
+        result = await ctx.elicit(elicitation_id, params)
+        if result.action == "decline":
+            # Signal via ctx.cancelled (the SDK swallows exceptions from control-request tasks).
+            ctx.cancelled.set()
+        return result.action == "accept"
+
+    def _permission_card(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        *,
+        requested_schema: dict[str, Any] | None = None,
+    ) -> ElicitationRequestParams:
+        """Build the approval-card params for a tool-permission elicitation.
+
+        With *requested_schema* the card renders one button per choice instead of
+        Approve/Reject; without it, the usual binary card.
+        """
         # Build a concise preview: truncate long args so the UI widget
         # stays readable. 300 chars matches AP's policy-engine preview.
         try:
@@ -553,21 +623,61 @@ class ExecutorAdapter(HarnessApp):
         preview = preview[:300]
 
         label = self._harness_label
-        policy_name = f"{label.lower()}_sdk_permission"
-        params = ElicitationRequestParams(
+        return ElicitationRequestParams(
             mode="form",
             message=f"{label} wants to use **{tool_name}**",
-            requestedSchema=None,
+            requestedSchema=requested_schema,
             url=None,
             phase="tool_call",
-            policy_name=policy_name,
+            policy_name=f"{label.lower()}_sdk_permission",
             content_preview=f"{tool_name}({preview})",
         )
+
+    async def _stable_elicitation_choice_handler(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        options: Sequence[str],
+    ) -> str | None:
+        """Stable bridge for a multiple-choice tool-permission elicitation.
+
+        Same gate as :meth:`_stable_elicitation_handler`, but the card offers the
+        harness's own permission scopes as buttons and the chosen label comes back,
+        so the user can grant the scope the agent already supports instead of
+        re-approving the same action every time.
+
+        :returns: The chosen label, or ``None`` when declined, cancelled, or the
+            reply carried no readable answer.
+        """
+        ctx = self._current_ctx
+        if ctx is None:
+            # No active turn — decline by default, as the binary card does.
+            _logger.error(
+                "elicitation choice callback fired with no active turn context "
+                "(tool=%s); declining by default",
+                tool_name,
+            )
+            return None
+
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        # An ``answer`` enum is what the approval card renders as one button per
+        # option, and the reply names the chosen label in ``content["answer"]``.
+        params = self._permission_card(
+            tool_name,
+            tool_input,
+            requested_schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string", "enum": list(options)}},
+                "required": ["answer"],
+            },
+        )
         result = await ctx.elicit(elicitation_id, params)
-        if result.action == "decline":
-            # Signal via ctx.cancelled (the SDK swallows exceptions from control-request tasks).
-            ctx.cancelled.set()
-        return result.action == "accept"
+        if result.action != "accept":
+            if result.action == "decline":
+                ctx.cancelled.set()
+            return None
+        answer = (result.content or {}).get("answer")
+        return answer if isinstance(answer, str) else None
 
     async def _stable_policy_evaluator(
         self,
@@ -646,19 +756,38 @@ class ExecutorAdapter(HarnessApp):
             # so the post-stream dispatch reuses the same call_id for deduplication.
             # Emit bare names (strip MCP prefix) to match the Omnigent wire shape.
             tool_use_id = _call_id_from_metadata(event.metadata)
-            if tool_use_id is not None:
+            # Observed native tools already ran inside their harness. They must
+            # never enter the queue consumed by Omnigent's dispatch bridge.
+            if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
+            self._pr_tool_calls[call_id] = (event.name, event.args or {})
             bare_name = _strip_mcp_tool_prefix(event.name)
+            arguments_json = _serialize_args(event.args)
+            if event.metadata.get("observed_call_completed") is True:
+                # The executor already emits this call's durable completed form
+                # itself (e.g. a codex built-in re-emitted at completion). Emit it
+                # completed in one shot and drop any live entry cached from an
+                # earlier in_progress emit of the same call, so the ToolCallComplete
+                # below does not re-emit a second, duplicate completed card.
+                status = _COMPLETED_TOOL_CALL_STATUS
+                self._observed_tool_calls.pop(call_id, None)
+            else:
+                # A live observation. The turn-persist filter drops "in_progress",
+                # so remember name/args; the matching ToolCallComplete re-emits it as
+                # a durable completed function_call (see that branch) — which is what
+                # keeps an observed card from vanishing on reload.
+                status = _OBSERVED_TOOL_CALL_STATUS
+                self._observed_tool_calls[call_id] = (bare_name, arguments_json)
             ctx.emit(
                 OutputItemDoneEvent(
                     type="response.output_item.done",
                     item={
                         "id": f"fc_{uuid.uuid4().hex[:12]}",
                         "type": "function_call",
-                        "status": _OBSERVED_TOOL_CALL_STATUS,
+                        "status": status,
                         "name": bare_name,
-                        "arguments": _serialize_args(event.args),
+                        "arguments": arguments_json,
                         "call_id": call_id,
                         "agent": ctx.response_id,
                     },
@@ -671,6 +800,46 @@ class ExecutorAdapter(HarnessApp):
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
             if not call_id or call_id in self._dispatched_call_ids:
                 return
+            # A live observed call cached at ToolCallRequest is re-emitted here as a
+            # durable COMPLETED function_call so it survives reload — the in_progress
+            # one is dropped by the turn-persist filter. Same call_id → the web dedupes
+            # this with the live render into one card. A call already emitted completed
+            # (observed_call_completed) was never cached, so it is not re-emitted — that
+            # is what prevents a duplicate card. This mirrors how a dispatched call
+            # re-emits completed once its dispatch resolves.
+            observed = self._observed_tool_calls.pop(call_id, None)
+            pr_call = self._pr_tool_calls.pop(call_id, None)
+            if pr_call is not None:
+                from omnigent.runner.pr_observer import observe_tool_completion
+
+                session_id = ctx.session_id
+                if session_id:
+                    observe_tool_completion(
+                        session_id,
+                        tool_name=pr_call[0],
+                        arguments=pr_call[1],
+                        result=event.result,
+                        successful=event.status == "success",
+                        call_id=call_id,
+                        source="sdk",
+                    )
+            if observed is not None:
+                observed_name, observed_args = observed
+                ctx.emit(
+                    OutputItemDoneEvent(
+                        type="response.output_item.done",
+                        item={
+                            "id": f"fc_{uuid.uuid4().hex[:12]}",
+                            "type": "function_call",
+                            "status": _COMPLETED_TOOL_CALL_STATUS,
+                            "name": observed_name,
+                            "arguments": observed_args,
+                            "call_id": call_id,
+                            "agent": ctx.response_id,
+                        },
+                    )
+                )
+            raw_args = getattr(event, "metadata", {}).get("arguments")
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
                 "type": "function_call_output",
@@ -678,7 +847,6 @@ class ExecutorAdapter(HarnessApp):
                 # Cap the mirror; the inner SDK already consumed the full result.
                 "output": cap_tool_output(_serialize_tool_result(event)),
             }
-            raw_args = getattr(event, "metadata", {}).get("arguments")
             if isinstance(raw_args, dict):
                 item["arguments"] = raw_args
             ctx.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
@@ -706,6 +874,40 @@ class ExecutorAdapter(HarnessApp):
                     summary=event.summary,
                     summary_model=event.model,
                     compacted_messages=event.compacted_messages,
+                )
+            )
+        elif isinstance(event, SubAgentStarted):
+            from omnigent.server.schemas import SubagentStartedEvent
+
+            ctx.emit(
+                SubagentStartedEvent(
+                    type="subagent.started",
+                    child_key=event.child_key,
+                    title=event.title,
+                    task=event.task,
+                )
+            )
+        elif isinstance(event, SubAgentCompleted):
+            from omnigent.server.schemas import SubagentCompletedEvent
+
+            ctx.emit(
+                SubagentCompletedEvent(
+                    type="subagent.completed",
+                    child_key=event.child_key,
+                    ok=event.ok,
+                    summary=event.summary,
+                )
+            )
+        elif isinstance(event, SubAgentToolCall):
+            from omnigent.server.schemas import SubagentToolCallEvent
+
+            ctx.emit(
+                SubagentToolCallEvent(
+                    type="subagent.tool_call",
+                    child_key=event.child_key,
+                    call_id=event.call_id,
+                    name=event.name,
+                    arguments=_serialize_args(event.args),
                 )
             )
         # ExecutorError handled by the caller (re-raises so the

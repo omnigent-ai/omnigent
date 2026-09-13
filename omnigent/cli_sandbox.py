@@ -17,6 +17,7 @@ from pathlib import Path
 
 import click
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.sandboxes import (
     SandboxHostLauncher,
@@ -146,8 +147,12 @@ def _print_ready_banner(provider: str, sandbox_id: str, server_url: str) -> None
     ui.console.print()
     ui.success("Sandbox ready.")
     ui.console.print()
+    from omnigent.util.server_url import display_server_url
+
     ui.kv("Sandbox", f"{sandbox_id}  (provider: {provider})")
-    ui.kv("Server", server_url)
+    # Display form (workspace /omnigent URL); the suggested command below
+    # keeps the wire URL — both round-trip, but the command is what runs.
+    ui.kv("Server", display_server_url(server_url))
     ui.console.print()
     click.echo("To register the sandbox as a host with your server:")
     click.echo(
@@ -216,8 +221,8 @@ def sandbox() -> None:
     help=(
         "Server URL the sandbox will register with. Determines the "
         "Databricks workspace the sandbox is created in (same "
-        "inference as `omnigent login`), and the bootstrap finishes "
-        "by logging the sandbox in to it (`omnigent login` inside the "
+        f"inference as `{cli_invocation()} login`), and the bootstrap finishes "
+        f"by logging the sandbox in to it (`{cli_invocation()} login` inside the "
         "sandbox — one browser step)."
     ),
 )
@@ -273,7 +278,11 @@ def sandbox_create(
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
     launcher = _require_cli_bootstrap(
-        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
+        get_launcher(
+            provider,
+            workspace_host=workspace.host if workspace is not None else None,
+            server_url=app_url,
+        )
     )
     # The in-sandbox login only exists for providers that can forward
     # the browser's callback port — others skip it automatically, no
@@ -310,7 +319,7 @@ def sandbox_create(
     required=True,
     help=(
         "Server URL to log the sandbox in to. The in-sandbox "
-        "`omnigent login` infers the fronting Databricks workspace "
+        f"`{cli_invocation()} login` infers the fronting Databricks workspace "
         "from it automatically."
     ),
 )
@@ -332,7 +341,11 @@ def sandbox_auth(
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
     launcher = _require_cli_bootstrap(
-        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
+        get_launcher(
+            provider,
+            workspace_host=workspace.host if workspace is not None else None,
+            server_url=app_url,
+        )
     )
     login_app_oauth_in_sandbox(
         launcher,
@@ -397,7 +410,11 @@ def sandbox_connect(
     # the same workspace to find it.
     workspace = derive_workspace(app_url)
     launcher = _require_cli_bootstrap(
-        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
+        get_launcher(
+            provider,
+            workspace_host=workspace.host if workspace is not None else None,
+            server_url=app_url,
+        )
     )
     connect_sandbox_host(
         launcher,

@@ -156,7 +156,11 @@ export function SwitchAgentDialog({
           >
             Agent
           </label>
-          <Select value={agentChoice || undefined} onValueChange={setAgentChoice}>
+          <Select
+            value={agentChoice || undefined}
+            onValueChange={setAgentChoice}
+            componentId="switch_agent.agent"
+          >
             <SelectTrigger
               id="switch-agent-select"
               data-testid="switch-agent-select"

@@ -10,7 +10,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -207,6 +207,17 @@ function SearchFilterInput({
 // ---------------------------------------------------------------------------
 
 /**
+ * Browse location per conversation, surviving unmount/remount within a JS
+ * session. Opening a file swaps this panel for the FileViewer (see
+ * WorkspacePanel's content slot), which unmounts it — with plain state,
+ * closing the viewer snapped the tree back to the workspace root instead of
+ * the directory the file was opened from. Same pattern as FolderTree's
+ * expandedPathsCache. Keyed by conversation, so a session switch still lands
+ * on that session's own last location (or its root), never another's.
+ */
+const browseLocationCache = new Map<string, string>();
+
+/**
  * Right-side Files card. Always visible on desktop.
  *
  * - Flat view: changed files only (registry-backed, any depth).
@@ -272,13 +283,21 @@ export function FilesPanel({
   // The picker browses the host's filesystem, the same source the new-session
   // workspace chip uses.
   const { session } = useSession(conversationId);
-  // Absolute path currently browsed. Null tracks the workspace root, so the
-  // panel keeps opening there and a session switch never strands the user in
-  // a directory belonging to the session they just left.
-  const [browseLocation, setBrowseLocation] = useState<string | null>(null);
+  // Absolute path currently browsed. Null tracks the workspace root. Seeded
+  // from the per-conversation cache so the location survives the panel
+  // unmounting while a file is open in the viewer.
+  const [browseLocation, setBrowseLocation] = useState<string | null>(
+    () => (conversationId && browseLocationCache.get(conversationId)) || null,
+  );
   const [browseError, setBrowseError] = useState<string | null>(null);
+  // On an in-place conversation switch (no remount), land on the NEW
+  // session's own cached location or its root — never the previous
+  // session's directory. The ref keeps mount itself from wiping the seed.
+  const browseForRef = useRef(conversationId);
   useEffect(() => {
-    setBrowseLocation(null);
+    if (browseForRef.current === conversationId) return;
+    browseForRef.current = conversationId;
+    setBrowseLocation((conversationId && browseLocationCache.get(conversationId)) || null);
     setBrowseError(null);
   }, [conversationId]);
   const workingDir = browseLocation ?? workspaceRoot;
@@ -290,28 +309,45 @@ export function FilesPanel({
   // workspace they can already read.
   const locationParam = relativizeToWorkspace(browseLocation, workspaceRoot);
 
-  function navigateTo(absolutePath: string) {
-    setBrowseError(null);
-    setBrowseLocation(absolutePath === workspaceRoot ? null : absolutePath);
-  }
+  const navigateTo = useCallback(
+    (absolutePath: string) => {
+      setBrowseError(null);
+      const next = absolutePath === workspaceRoot ? null : absolutePath;
+      if (conversationId) {
+        if (next === null) browseLocationCache.delete(conversationId);
+        else browseLocationCache.set(conversationId, next);
+      }
+      setBrowseLocation(next);
+    },
+    [workspaceRoot, conversationId],
+  );
 
+  // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.
   /** Re-root onto a directory of the current tree (double-click to open). */
-  function navigateToChild(relativePath: string) {
-    if (!workingDir) return;
-    navigateTo(`${workingDir.replace(/\/$/, "")}/${relativePath}`);
-  }
+  const navigateToChild = useCallback(
+    (relativePath: string) => {
+      if (!workingDir) return;
+      navigateTo(`${workingDir.replace(/\/$/, "")}/${relativePath}`);
+    },
+    [workingDir, navigateTo],
+  );
 
   /**
    * Open a file the TREE named. Tree paths are relative to the browsed
-   * location while the viewer resolves against the workspace root, so an
-   * in-workspace location has to be re-attached — otherwise a file opened
-   * after navigating into a folder is looked for in the wrong place. An
-   * absolute location has no workspace-relative form to hand over, so it is
-   * passed through as before.
+   * location, so the location is re-attached before handing the file to the
+   * viewer. For an in-workspace location that yields a workspace-relative
+   * path; for a location OUTSIDE the workspace it yields the file's absolute
+   * path, which the viewer fetches host-absolutely (see `fetchFileContent`).
+   * Without this a file opened while browsing an absolute location like
+   * `/tmp` would be looked up by its bare name under the workspace root and
+   * 404.
    */
-  function openTreeFile(path: string) {
-    onFileSelect(locationParam.startsWith("/") ? path : joinBrowseLocation(locationParam, path));
-  }
+  const openTreeFile = useCallback(
+    (path: string) => {
+      onFileSelect(joinBrowseLocation(locationParam, path));
+    },
+    [onFileSelect, locationParam],
+  );
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
   // A refused location must say so on the bar. Rendering an empty tree instead
@@ -351,6 +387,17 @@ export function FilesPanel({
     return () => clearTimeout(timer);
   }, [treeSearch, treeInclude, treeExclude]);
 
+  // Exit search when a folder is revealed from the results. Clears BOTH the raw
+  // and debounced queries: FolderTree renders search mode off the debounced
+  // value, so clearing only `treeSearch` would leave the flat results list up
+  // for the ~300ms debounce window — during which the tree's reveal scroll
+  // fires against rows that aren't mounted yet and never re-fires. Clearing the
+  // debounced value too drops back to the tree synchronously so the scroll lands.
+  const exitTreeSearch = useCallback(() => {
+    setTreeSearch("");
+    setDebouncedTreeSearch("");
+  }, []);
+
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
   const treeSearchQuery = useWorkspaceFileSearch(
@@ -387,7 +434,7 @@ export function FilesPanel({
     >
       {/* Header — single row: [title · workingDir] [eye] [close?] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        <span className="shrink-0 font-medium text-ui">Working folder</span>
+        <h2 className="shrink-0 font-medium text-ui">{flatView ? "Changes" : "Working folder"}</h2>
         {workingDir && workspaceRoot && (
           <BrowseLocationBar
             current={workingDir}
@@ -561,12 +608,18 @@ export function FilesPanel({
             sort={changedSort}
             runnerWentOffline={runnerWentOffline}
             searchQuery={debouncedTreeSearch}
-            searchResults={treeSearchQuery.data}
+            // Suppress keep-previous placeholder data: while a new query is in
+            // flight React Query returns the PRIOR term's results (isPlaceholderData),
+            // which would otherwise render as if they matched the new term. Drop
+            // them so the tree shows "Searching…" until the real results land.
+            searchResults={treeSearchQuery.isPlaceholderData ? undefined : treeSearchQuery.data}
             isSearching={treeSearchQuery.isFetching}
             isSearchError={treeSearchQuery.isError}
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
             browseLocation={locationParam}
             onNavigateDir={navigateToChild}
+            onExitSearch={exitTreeSearch}
+            scrollParentRef={scrollRef}
           />
         )}
       </section>

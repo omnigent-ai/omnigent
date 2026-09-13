@@ -47,7 +47,18 @@ export type LivenessRow = Pick<Conversation, "host_id" | "permission_level" | "c
    * reconnect modal). Absent ⇒ treated as ``"default"``.
    */
   kind?: "default" | "sub_agent";
+  /**
+   * Whether this session was imported from a local harness transcript (the
+   * `omnigent.import.source` label). An import has no runner booting, so it
+   * must skip the cold-boot startup grace — otherwise it shows "Connecting…"
+   * for {@link STARTING_GRACE_S} before settling to `local_stranded`, when it
+   * should offer the resume picker immediately. Absent ⇒ treated `false`.
+   */
+  imported?: boolean;
 };
+
+/** Label marking a session imported from a local harness transcript. */
+export const IMPORT_SOURCE_LABEL_KEY = "omnigent.import.source";
 
 /**
  * Build a {@link LivenessRow} from the single-session snapshot
@@ -61,7 +72,10 @@ export type LivenessRow = Pick<Conversation, "host_id" | "permission_level" | "c
  */
 export function livenessRowFromSession(
   session:
-    | Pick<Session, "hostId" | "permissionLevel" | "createdAt" | "hostResumable" | "kind">
+    | Pick<
+        Session,
+        "hostId" | "permissionLevel" | "createdAt" | "hostResumable" | "kind" | "labels"
+      >
     | null
     | undefined,
 ): LivenessRow | null {
@@ -72,6 +86,7 @@ export function livenessRowFromSession(
     created_at: session.createdAt,
     host_resumable: session.hostResumable ?? false,
     kind: session.kind,
+    imported: Boolean(session.labels?.[IMPORT_SOURCE_LABEL_KEY]),
   };
 }
 
@@ -201,6 +216,29 @@ export function useSessionLiveness(
   conv: LivenessRow | null | undefined,
   opts?: { turnActive?: boolean; launchedAt?: number | null },
 ): SessionLiveness {
+  const raw = useSessionLivenessRaw(sessionId, conv, opts);
+  // Identity-stabilize: the raw computation returns a fresh object literal
+  // every render, so consumers (ChatPage, Composer, WorkspacePanel, ...) would
+  // re-render on every unrelated store/poll tick even when the value is
+  // unchanged. Keep the previous object when the value is structurally equal.
+  const prev = useRef<SessionLiveness | null>(null);
+  if (prev.current !== null && livenessEqual(prev.current, raw)) return prev.current;
+  prev.current = raw;
+  return raw;
+}
+
+/** Structural equality for the small `SessionLiveness` union. */
+function livenessEqual(a: SessionLiveness, b: SessionLiveness): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "host_offline" && b.kind === "host_offline") return a.isOwner === b.isOwner;
+  return true;
+}
+
+function useSessionLivenessRaw(
+  sessionId: string | undefined,
+  conv: LivenessRow | null | undefined,
+  opts?: { turnActive?: boolean; launchedAt?: number | null },
+): SessionLiveness {
   const runnerOnline = useSessionRunnerOnline(sessionId);
   const hostOnline = useSessionHostOnline(sessionId);
 
@@ -241,6 +279,7 @@ export function useSessionLiveness(
   const createdAt = conv?.created_at;
   if (
     !runnerEverOnline &&
+    !conv?.imported &&
     typeof createdAt === "number" &&
     createdAt > 0 &&
     Date.now() / 1000 - createdAt < STARTING_GRACE_S

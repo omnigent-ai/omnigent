@@ -125,9 +125,8 @@ def test_claude_native_subagent_reads_as_the_product(
     page.goto(f"{base_url}/c/{child_id}")
     expect(page.get_by_role("link", name="Back to parent session")).to_be_visible(timeout=30_000)
 
-    # Header breadcrumb: the product, captioned as a sub-agent.
+    # Header breadcrumb: the sub-agent segment names the product.
     expect(page.get_by_text("Claude Code", exact=True).first).to_be_visible(timeout=30_000)
-    expect(page.get_by_text("Sub-agent", exact=True)).to_be_visible()
 
     # Claude Code drives its own children, so the composer is read-only.
     expect(page.get_by_placeholder("Claude Code sub-agents are read-only")).to_be_visible()
@@ -161,10 +160,9 @@ def test_subagent_tab_title_uses_agent_name(
 
     page.goto(f"{base_url}/c/{child_id}")
 
-    # The header confirms the page renders as a sub-agent (child) view:
-    # the back-to-parent affordance and the "Sub-agent" identity caption.
+    # The header confirms the page renders as a sub-agent (child) view via the
+    # back-to-parent affordance on the breadcrumb title.
     expect(page.get_by_role("link", name="Back to parent session")).to_be_visible(timeout=30_000)
-    expect(page.get_by_text("Sub-agent", exact=True)).to_be_visible()
 
     # The tab is named after the sub-agent, not "New session". The leading
     # "● " working-indicator prefix is tolerated so a mid-turn child still

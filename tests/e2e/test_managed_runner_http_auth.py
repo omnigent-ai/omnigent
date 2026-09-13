@@ -352,7 +352,7 @@ def test_managed_runner_callback_authenticates_end_to_end(
 
     monkeypatch.setenv("RUNNER_SERVER_URL", base_url)
     monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
     monkeypatch.setattr(
         "omnigent.inner.databricks_executor._resolve_databricks_auth",
         _no_databricks_creds,
@@ -423,7 +423,7 @@ def test_managed_runner_survives_mint_403_after_token_expiry(
         monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
         monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, owner_cookie)
         monkeypatch.setenv(RUNNER_DELEGATED_AUTH_ENV_VAR, "1")
-        monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: owner_cookie)
+        monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: owner_cookie)
 
         factory = _make_auth_token_factory()
         assert isinstance(factory, _InitialAuthTokenFactory)

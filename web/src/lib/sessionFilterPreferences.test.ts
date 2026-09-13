@@ -11,10 +11,10 @@ afterEach(() => {
 });
 
 describe("sessionFilterPreferences", () => {
-  it('defaults to "all" when nothing is stored', () => {
-    // A first-time viewer sees the whole list, as before persistence existed.
-    expect(DEFAULT_SESSION_FILTER).toBe("all");
-    expect(readSessionFilter(true)).toBe("all");
+  it('defaults to "mine" when nothing is stored', () => {
+    // A first-time viewer lands on their own sessions rather than the whole list.
+    expect(DEFAULT_SESSION_FILTER).toBe("mine");
+    expect(readSessionFilter(true)).toBe("mine");
   });
 
   it("round-trips every filter value", () => {
@@ -28,17 +28,17 @@ describe("sessionFilterPreferences", () => {
     // Guards against a hand-edited entry or a filter this build dropped:
     // scoping the list to a slice with no menu entry would strand the viewer.
     localStorage.setItem("omnigent:session-filter", "starred");
-    expect(readSessionFilter(true)).toBe("all");
+    expect(readSessionFilter(true)).toBe("mine");
 
     localStorage.setItem("omnigent:session-filter", "");
-    expect(readSessionFilter(true)).toBe("all");
+    expect(readSessionFilter(true)).toBe("mine");
   });
 
   it('ignores a stored "shared" on a single-user server', () => {
     // A loopback-only server drops "Shared sessions" from the menu, so honoring
     // it would show an empty list the viewer has no control to leave.
     writeSessionFilter("shared");
-    expect(readSessionFilter(false)).toBe("all");
+    expect(readSessionFilter(false)).toBe("mine");
     // Still honored where the option exists.
     expect(readSessionFilter(true)).toBe("shared");
   });
@@ -59,6 +59,6 @@ describe("sessionFilterPreferences", () => {
       throw new Error("access denied");
     });
     expect(() => writeSessionFilter("mine")).not.toThrow();
-    expect(readSessionFilter(true)).toBe("all");
+    expect(readSessionFilter(true)).toBe("mine");
   });
 });

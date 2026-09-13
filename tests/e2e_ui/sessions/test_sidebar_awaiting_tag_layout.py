@@ -26,6 +26,8 @@ from urllib.parse import urlparse
 import httpx
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 _UPDATES_WS_RE = re.compile(r"/v1/sessions/updates")
 
 # Long enough that the title must truncate at the default font size — a short
@@ -72,7 +74,7 @@ def _force_pending_approval(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         for conv in payload.get("data", []):
             if conv.get("id") == session_id:

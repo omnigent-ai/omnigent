@@ -17,9 +17,11 @@
 > enforcement in `omnigent/server/auth.py` (`delegated_path_allowed`,
 > `set_grant_revocation_check`). Wired in `omnigent/server/app.py`,
 > **opt-in and default-off** via `OMNIGENT_DEVICE_GRANT_ENABLED` (the
-> `/oauth/*` routes are unmounted unless it is truthy), and then only in
-> **accounts** mode (OIDC delegates login to the IdP via the cli-ticket
-> flow and never mounts these routes).
+> `/oauth/device/*` consent routes are unmounted unless it is truthy), and
+> then only in **accounts** mode (OIDC delegates login to the IdP via the
+> cli-ticket flow and never mounts the consent routes). The token/revoke
+> half (`/oauth/token`, `/oauth/revoke`) mounts **unconditionally** in both
+> accounts and OIDC modes: login-issued refresh grants (below) need it.
 > Slack: `integrations/slack/src/omnigent_slack/oauth.py`,
 > `tokens.py` (Fernet-encrypted `oauth_tokens`), `auth_manager.py`, plus
 > the bearer/refresh wiring in `omnigent.py` (`ClientAuth`,
@@ -182,15 +184,20 @@ approved it.
 
 ### Router `omnigent/server/routes/device_auth.py`
 
-Mounted in `app.py` only when **`OMNIGENT_DEVICE_GRANT_ENABLED` is truthy**
-(opt-in, **default-off** — the `/oauth/*` routes are absent otherwise), and
-then **only in `accounts` mode** (OIDC delegates login to the IdP via the
-cli-ticket flow and never mounts these routes; header mode has no
-server-mintable identity — see `create_device_auth_router`, which raises if
-constructed for any other source). The `device_grants` table is created
-unconditionally by the migration regardless of the flag; only the router
-mount is gated. This router **owns** `mint_delegated_token` and
-`DELEGATED_SCOPE`.
+The RFC 8628 consent surface (`/oauth/device/*`) is mounted in `app.py`
+only when **`OMNIGENT_DEVICE_GRANT_ENABLED` is truthy** (opt-in,
+**default-off**), and then **only in `accounts` mode** (the in-browser
+consent needs the accounts login page; header mode has no server-mintable
+identity — see `create_device_auth_router`, which raises if constructed for
+any other source). The token/revoke half is factored into
+`create_oauth_token_router` and mounts **unconditionally** in both accounts
+and OIDC modes — login-issued refresh grants need `/oauth/token` even where
+the device flow is off; a standalone mount refuses the `device_code` grant
+type with `unsupported_grant_type`. The `device_grants` table is created
+unconditionally by the migration regardless of the flag; only the consent
+mount is gated. This router also **owns** `mint_delegated_token` and
+`DELEGATED_SCOPE` (moved here from `oidc.py`, which retains only
+`mint_session_token` / `mint_session_cookie`).
 
 - `POST /oauth/device/authorize` — **public** (rate-limited). Generates a
   high-entropy `device_code` (`secrets.token_urlsafe`, stored **hashed**), a
@@ -355,3 +362,72 @@ stateless. This added invariant is the main thing for reviewers to scrutinize.
 - Applying the same delegated grant to other non-browser clients (the CLI could
   use it too, superseding the in-memory `_cli_tickets` store).
 - Per-scope consent granularity beyond the single "session APIs, no admin" scope.
+
+## Login-issued refresh grants
+
+The fix for unattended hosts dying at session-JWT expiry (a host
+authenticated via `omnigent login` previously had **no renewal path** —
+the stored `{token, user_id, expires_at}` record simply lapsed, default
+8 h, and the next tunnel reconnect got a misleading 403).
+
+- **Issuance** — both interactive login flows create a grant born
+  `redeemed` (`DeviceGrantStore.create_redeemed_grant`; the interactive
+  login *is* the consent step, so no device-code dance): the OIDC
+  cli-ticket fulfillment always, and accounts `POST /auth/login` when the
+  body carries `issue_refresh: true` (sent by the CLI, never the web
+  form — a browser must not receive refresh material). The raw refresh
+  token rides back once (`/auth/cli-poll` / the login response) as an
+  optional `refresh_token` key — old CLIs ignore it, new CLIs against old
+  servers see it absent. `client_id` is `"omnigent-cli"`.
+- **Authority** — a refreshed login-grant token carries `grant_id` (so
+  revocation still kills it) but **no `scope` claim**, so the delegated
+  path allowlist does not apply: it renews the session JWT and keeps that
+  same authority. Scoping it like a third-party device grant instead made
+  every non-allowlisted route (`/v1/usage`, `/v1/scheduled-tasks`,
+  `/v1/policy-registry`) 401 after the first refresh. `LOGIN_GRANT_CLIENT_ID`
+  is the marker and is **reserved** — `/oauth/device/authorize` refuses a
+  request naming it, so a device client cannot self-declare into this class.
+- **No rotation** — login grants return the SAME refresh token on every
+  renewal. Rotation + reuse detection is right for a browser-adjacent
+  third-party client, but for an unattended host it turns any ambiguous
+  network failure (lost response, crash between the server committing and
+  the client persisting) into a permanently revoked grant. Only the
+  short-lived access token is renewed; revocation and the absolute lifetime
+  cap still bound exposure. Device grants keep rotating.
+- **Renewal** — `omnigent.cli_auth.refresh_stored_token` POSTs
+  `grant_type=refresh_token`, persists the result, and returns the
+  fresh access token. The runner/host auth-token factory
+  calls it when the stored token lapses, and the host tunnel rebuilds
+  headers through that factory on every reconnect — so an unattended
+  host renews itself for the grant's lifetime. Refreshes on one machine
+  are serialized by an advisory file lock with a re-check after acquire,
+  so a losing racer picks up the winner's rotated pair instead of
+  replaying the stale token (which reuse detection would punish by
+  revoking the grant).
+- **One grant per host replica (recommended)** — since login grants do
+  not rotate, N replicas sharing one token file no longer revoke each
+  other. A per-replica login is still preferred so a single host can be
+  revoked without cutting off the rest.
+- **Lifetime** — the absolute grant lifetime stays 30 days by default;
+  `OMNIGENT_GRANT_MAX_LIFETIME_DAYS` lets an operator extend it
+  deliberately for long-lived unattended hosts. Invalid values fall back
+  to the default (never fail open to unbounded).
+- **Client-secret interaction** — `OMNIGENT_DEVICE_CLIENT_SECRET` gates
+  the endpoints that mint from an ephemeral code (device authorize + the
+  `device_code` exchange). Refresh and revoke are NOT gated: the presented
+  refresh/access token is itself the credential, and a CLI renewing its own
+  login has no way to carry that secret (gating it made every automatic
+  refresh 401 in a Slack-serving deployment).
+- **Housekeeping** — `/oauth/token` opportunistically purges expired and
+  aged-out grants. The device flow purges on `authorize`, which a
+  standalone token-router mount does not have, so login-grant rows would
+  otherwise accumulate one per login.
+
+### Known limitation
+
+General CLI commands (`omnigent usage`, session commands, direct
+remote-URL chat) still read the stored token without attempting a refresh —
+only the host/runner auth-token factory renews today. An expired login with
+valid refresh material therefore leaves those commands unauthenticated
+until something on the host path renews the shared file. Wiring the
+remaining CLI entrypoints is follow-up work.

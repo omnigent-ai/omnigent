@@ -25,17 +25,17 @@ if TYPE_CHECKING:
     # import annotations`` is in effect).
     from omnigent.inner.datamodel import OSEnvSpec
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
     ConversationItem,
     NewConversationItem,
 )
-from omnigent.env_credentials import expand_envvars_with_omnigent_prefix
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms import Client as LLMClient
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -46,6 +46,7 @@ from omnigent.onboarding.detected import (
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
+    CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     OPENAI_FAMILY,
@@ -85,6 +86,7 @@ from omnigent.spec.types import (
     RetryPolicy,
 )
 from omnigent.stores import ConversationStore
+from omnigent.util.env_credentials import expand_envvars_with_omnigent_prefix
 
 # ── Module-level constants ────────────────────────────────────
 
@@ -437,7 +439,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
     # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
     # so Omnigent cannot thread a Databricks gateway through. Users configure
-    # providers via ``kimi provider add`` in ``~/.kimi/config.toml``
+    # providers via ``kimi provider add`` in ``~/.kimi-code/config.toml``
     # (Omnigent-side provider injection is a deferred follow-up).
 }
 
@@ -562,7 +564,7 @@ def configure_agent_harness_with_provider(
         )
     if entry.kind == BEDROCK_KIND:
         # Bedrock mode is wired only into the native ``omnigent claude`` launch
-        # (:func:`omnigent.claude_native._bedrock_config_for_native_claude`),
+        # (:func:`omnigent.harnesses.claude_native.main._bedrock_config_for_native_claude`),
         # which sets CLAUDE_CODE_USE_BEDROCK + AWS_BEARER_TOKEN_BEDROCK directly.
         # The in-process / gateway harnesses have no Bedrock path, so emitting
         # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
@@ -740,8 +742,18 @@ def _apply_provider_family(
     :param harness_type: ``"claude-sdk"`` or ``"codex"``.
     :param family: The resolved provider family for this harness.
     :raises OmnigentError: If no model is resolvable (neither the spec nor
-        the family declares one).
+        the family declares one), or if a Codex provider is configured for
+        the unsupported Chat Completions wire API.
     """
+    if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
+        raise OmnigentError(
+            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+            f"provider endpoint {family.base_url!r} is configured with "
+            "'wire_api: chat'. Choose a Responses-capable endpoint and set "
+            "'wire_api: responses', or use a harness that supports Chat Completions.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     cfg = _UCODE_HARNESS_CONFIGS[harness_type]
     env[_HARNESS_GATEWAY_FLAG[harness_type]] = "true"
     env[cfg.base_url_key] = family.base_url
@@ -901,7 +913,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     (:func:`default_provider_for_harness`), so when that default is a
     ``cli-config`` Databricks AI Gateway, this path must route it rather than
     fail loud. We reuse the pi-native translation
-    (:func:`omnigent.pi_native_credentials._cli_config_pi_provider`) — which
+    (:func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`) — which
     reads the codex ``[model_providers.X]`` transport, rewrites the base URL to
     the gateway's Anthropic Messages surface (``/anthropic``) Pi speaks
     natively, and builds the per-request bearer-token ``!command`` apiKey — then
@@ -919,7 +931,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     """
     # Imported lazily: pi_native_credentials is on the runner's session-create
     # hot path and pulls onboarding-only deps; keep this off workflow import.
-    from omnigent.pi_native_credentials import _cli_config_pi_provider
+    from omnigent.harnesses.pi_native.credentials import _cli_config_pi_provider
 
     # The spec model (if any) is already in HARNESS_PI_MODEL; thread it so the
     # gateway translation honors an explicit override, else its default.
@@ -1045,7 +1057,7 @@ def _resolve_provider_for_build(
             raise OmnigentError(
                 f"executor.auth references provider {auth.name!r}, but no such provider is "
                 "configured under 'providers:' in ~/.omnigent/config.yaml. "
-                "Run `omnigent setup --no-internal-beta` to configure one.",
+                f"Run `{cli_invocation()} setup --no-internal-beta` to configure one.",
                 code=ErrorCode.INVALID_INPUT,
             )
         return entry
@@ -1173,7 +1185,10 @@ def _build_claude_sdk_spawn_env(
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:
-        env["HARNESS_CLAUDE_SDK_MODEL"] = model
+        # Specs may pin the provider-routed spelling ("anthropic/<name>") so
+        # generic clients route correctly, but the claude CLI rejects
+        # vendor-prefixed model ids — hand it the bare name.
+        env["HARNESS_CLAUDE_SDK_MODEL"] = model.removeprefix("anthropic/")
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
@@ -1514,6 +1529,7 @@ def _build_acp_cli_spawn_env(
     harness: str,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
 
@@ -1548,6 +1564,10 @@ def _build_acp_cli_spawn_env(
     env = {
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
+        # Rows whose CLI doesn't yet support session-scoped MCP and ignores
+        # session/new mcpServers (e.g. jcode) opt out of advertising the
+        # Omnigent MCP server.
+        "HARNESS_ACP_OMNIGENT_MCP": "1" if row.omnigent_mcp else "0",
     }
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
@@ -1556,6 +1576,36 @@ def _build_acp_cli_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    # Permission stance for approval cards. Absent leaves the harness wrap on its
+    # ``auto`` default (prompt); ``bypassPermissions`` skips the card for a call no
+    # policy had an opinion on, so a headless ACP worker doesn't park on a prompt.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
+
+    # Managed-connect support for jcode: point it at a session-private JCODE_HOME
+    # (with a config.toml pinning the gateway provider) + a fresh broker bearer. A
+    # no-op when not connected (connect_jcode_gateway_env returns None), and — like the
+    # other connect harnesses — suppressed when the spec configures its own API key, so
+    # an explicit key is never silently rerouted through the owner's gateway.
+    if harness == "jcode":
+        from omnigent.host.databricks_credential import api_key_auth_precludes_broker
+        from omnigent.host.jcode_databricks import connect_jcode_gateway_env
+
+        gateway_env = (
+            None
+            if api_key_auth_precludes_broker(spec)
+            else connect_jcode_gateway_env(session_id=session_id)
+        )
+        if gateway_env is not None:
+            env.update(gateway_env)
+            # The ACP wrap forwards only passthrough-named vars to the jcode subprocess,
+            # so name every managed-connect var (JCODE_DBX_TOKEN / JCODE_HOME /
+            # JCODE_RUNTIME_DIR). Preserve any existing value, dedupe, and join.
+            existing = env.get("HARNESS_ACP_ENV_PASSTHROUGH", "").split(",")
+            names = {n.strip() for n in existing if n.strip()} | set(gateway_env)
+            env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(names))
+
     return env
 
 
@@ -1614,6 +1664,9 @@ def _build_acp_spawn_env(
         omnigent_mcp = embedded.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
+        inject_system_prompt = embedded.get("inject_system_prompt", True)
+        if not isinstance(inject_system_prompt, bool):
+            raise ValueError("executor acp_agent inject_system_prompt must be a boolean")
         session_id_mode = embedded.get("session_id_mode", "server")
         if session_id_mode not in ("server", "client"):
             raise ValueError(
@@ -1634,6 +1687,7 @@ def _build_acp_spawn_env(
             session_id_mode=session_id_mode,
             send_model=send_model,
             omnigent_mcp=omnigent_mcp,
+            inject_system_prompt=inject_system_prompt,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
@@ -1649,6 +1703,8 @@ def _build_acp_spawn_env(
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
+        if not agent.inject_system_prompt:
+            env["HARNESS_ACP_INJECT_SYSTEM_PROMPT"] = "0"
         if agent.env_passthrough:
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
@@ -1668,6 +1724,12 @@ def _build_acp_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    # Permission stance for approval cards. Absent leaves the harness wrap on its
+    # ``auto`` default (prompt); ``bypassPermissions`` skips the card for a call no
+    # policy had an opinion on, so a headless ACP worker doesn't park on a prompt.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 
@@ -1735,6 +1797,18 @@ def _config_flag_is_true(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
+def _set_openai_agents_reasoning_item_id_policy_env(
+    env: dict[str, str],
+    value: object | None,
+) -> None:
+    """Validate and encode the OpenAI Agents SDK reasoning replay policy."""
+    if value is None:
+        return
+    if not isinstance(value, str) or value not in {"preserve", "omit"}:
+        raise ValueError("reasoning_item_id_policy must be 'preserve', 'omit', or unset")
+    env["HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY"] = value
+
+
 def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Build the env-var dict the openai-agents harness wrap reads.
@@ -1742,7 +1816,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     Maps spec.executor fields → the ``HARNESS_OPENAI_AGENTS_*``
     env vars defined in
     ``omnigent/inner/openai_agents_sdk_harness.py``. Threads
-    model + auth + use_responses.
+    model + auth + Responses replay settings.
 
     Auth resolution order (highest priority first):
 
@@ -1770,6 +1844,10 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_OPENAI_AGENTS_MODEL"] = model
+    _set_openai_agents_reasoning_item_id_policy_env(
+        env,
+        spec.executor.config.get("reasoning_item_id_policy"),
+    )
 
     # ── Auth resolution ────────────────────────────────────────────────
     # Priority: generic provider → spec.executor.auth → global config auth →
@@ -1949,7 +2027,7 @@ def _build_kimi_spawn_env(
     The upstream Kimi Code CLI has no per-spawn provider override flag
     (no ``--config-file`` / ``--mcp-config-file``), so this builder
     only threads the model, working directory, and ``os_env`` sandbox
-    spec. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    spec. Provider routing for kimi lives in ``~/.kimi-code/config.toml``
     and is managed out-of-band via ``kimi provider add``. Unlike the
     sibling builders, ``_build_kimi_spawn_env`` never calls
     :func:`configure_agent_harness_with_provider` (there is no env-var
@@ -1979,7 +2057,8 @@ def _build_kimi_spawn_env(
             "auth injection: upstream kimi has no per-spawn config override "
             "(no ``--config-file`` / ``--mcp-config-file``). Remove "
             "``executor.auth`` from the spec and configure the provider once "
-            "via `kimi provider add` in ~/.kimi/config.toml, then pin the "
+            "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
+            "~/.kimi-code/config.toml), then pin the "
             "resulting model id in the agent spec. Omnigent-side provider "
             "injection is a deferred follow-up.",
             code=ErrorCode.INVALID_INPUT,
@@ -2878,33 +2957,9 @@ def _find_spec_by_name(
     child ``__web_researcher`` session boots by re-parsing the bundle
     fresh (``runner/_entry.py`` spec resolver), so the researcher is
     absent from the re-parsed tree and a plain search returns ``None``.
-    Every caller swaps to the resolved sub-spec only ``if ... is not
-    None`` and otherwise keeps the parent spec, which boots the child as
-    a full clone of the parent (runaway recursion via ``sys_session_send``
-    when the parent is a coordinator). To keep that fallback safe, the
-    researcher is reconstructed deterministically from the parent (the
-    same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
-    but only when some node in the tree actually declares the ``web_fetch``
-    builtin. That builtin is the sole reason the researcher ever exists, so a
-    tree without it anywhere has no such child and the name falls through to
-    normal resolution (``None``). Reconstructing unconditionally would let a
-    caller-controlled ``sub_agent_name`` coerce any parent into a
-    shell-capable researcher (``build_researcher_spec`` synthesizes an
-    ``OSEnvSpec``), widening the parent's tool boundary.
+    The root is never matched against itself, even when ``spec.name == name``.
 
-    The owning node need not be the root: a nested sub-agent may own
-    ``web_fetch`` while the handed-in root does not. The gate locates the
-    ``web_fetch`` owner via a root-first pre-order walk
-    (:func:`_find_web_fetch_owner`) and reconstructs from THAT owner, not the
-    root, so the researcher inherits the owner's LLM and sandbox/egress
-    boundary (``build_researcher_spec`` derives both from its argument). When
-    several nodes own ``web_fetch`` the first pre-order owner wins; this is a
-    deliberate limitation tied to the ``__web_researcher`` name not being
-    unique per owner (plumbing an "effective parent" through every call site
-    is out of scope). The root-owner case is unchanged: the owner is the
-    root, so the output is identical to before.
-
-    :param spec: The root agent spec to search.
+    :param spec: The root agent spec to search under.
     :param name: The sub-agent name to find,
         e.g. ``"researcher"``.
     :returns: The matching sub-agent spec, the reconstructed
@@ -2922,35 +2977,13 @@ def _find_spec_by_name(
     # so reconstruct from the owner (root-first pre-order) — never the root —
     # to inherit the owner's LLM and sandbox/egress boundary. Imported lazily
     # to keep the tools layer off this module's import path.
-    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
 
     if name == RESEARCHER_NAME:
-        owner = _find_web_fetch_owner(spec)
-        if owner is not None:
-            from omnigent.tools.builtins.web_fetch import build_researcher_spec
-
-            return build_researcher_spec(owner)
-    return None
-
-
-def _find_web_fetch_owner(spec: AgentSpec) -> AgentSpec | None:
-    """
-    Find the first node owning the ``web_fetch`` builtin, root-first.
-
-    Pre-order DFS (root, then children left-to-right), mirroring
-    :func:`_search_sub_agent_tree`. The ``web_fetch`` owner is the node whose
-    ``tools.builtins`` carries an entry named ``web_fetch``; that node's spec
-    is the correct parent for ``build_researcher_spec`` (its LLM + sandbox).
-
-    :param spec: The agent spec whose sub-tree to search.
-    :returns: The first node (root-first) owning ``web_fetch``, or ``None``.
-    """
-    if any(entry.name == "web_fetch" for entry in spec.tools.builtins):
-        return spec
-    for sa in spec.sub_agents:
-        owner = _find_web_fetch_owner(sa)
-        if owner is not None:
-            return owner
+        return reconstruct_researcher_spec(spec)
     return None
 
 

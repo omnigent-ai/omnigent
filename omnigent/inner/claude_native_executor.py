@@ -8,13 +8,16 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudePromptTimeout,
+    TmuxSessionNotAdvertised,
     inject_slash_command,
     inject_user_message,
+    is_auth_slash_command,
+    kill_session,
     read_active_session_id,
     read_claude_status_model,
     read_launch_model,
@@ -32,6 +35,7 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
 
@@ -96,6 +100,14 @@ class ClaudeNativeExecutor(Executor):
         text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
+        if is_auth_slash_command(text):
+            # Same dead end as in run_turn(): /login and /logout must
+            # never be typed into the pane. Refusing the live injection
+            # keeps the runner's buffered copy (no injection.consumed is
+            # emitted), so the message re-arrives as the next turn and
+            # run_turn's short-circuit answers it with the `omni setup`
+            # guidance instead of spending a model turn on it.
+            return False
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(
@@ -123,9 +135,12 @@ class ClaudeNativeExecutor(Executor):
         :param tools: Tool schemas from Omnigent. Ignored here;
             Claude-native output/tool activity is terminal-originated
             and mirrored from Claude's transcript.
-        :param system_prompt: System prompt from the agent spec. The
-            native Claude Code terminal controls its own prompt/settings,
-            so this is ignored.
+        :param system_prompt: Per-turn composed system prompt. Ignored here:
+            claude-native delivers raw author instructions once, at terminal
+            launch, via ``--append-system-prompt`` (see
+            ``omnigent.runner.native.orchestration`` and
+            ``omnigent.harnesses.claude_native.main``) — not per-turn through this
+            parameter.
         :param config: Per-turn executor config. Only ``config.model``
             is used: when intelligent routing picks a model for this turn,
             it arrives here (adapter maps ``request.model_override`` →
@@ -146,6 +161,23 @@ class ClaudeNativeExecutor(Executor):
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
+            return
+        if is_auth_slash_command(text):
+            # Claude Code's sign-in flow is an interactive TUI handoff the
+            # bridge cannot drive, so /login is escaped into plain text and
+            # reaches the model as a prompt. An expired login answers it with
+            # "Login expired · Please run /login" — a loop. Point at the host
+            # command that does re-authenticate instead of typing anything.
+            # `omni setup` covers both directions: its harness menu signs in
+            # (`claude auth login --claudeai`) and signs out (`claude auth
+            # logout`), so one pointer serves /login and /logout alike.
+            yield ExecutorError(
+                message=(
+                    "Claude Code's sign-in runs in its own terminal, so /login and "
+                    "/logout do nothing from the web chat. Run omni setup on the host "
+                    "to sign in again — or to sign out — then retry."
+                )
+            )
             return
         from omnigent.runtime import telemetry
 
@@ -192,10 +224,43 @@ class ClaudeNativeExecutor(Executor):
                         self._bridge_dir,
                         content=text,
                     )
+        except ClaudePromptTimeout as exc:
+            _logger.exception(
+                "claude-native: prompt delivery to harness timed out",
+                extra={"session_id": self._request_session_id},
+            )
+            cleanup_error = self._reap_failed_turn()
+            message = describe_exception(exc)
+            if cleanup_error is not None:
+                message = f"{message} Cleanup also failed: {cleanup_error}"
+            yield ExecutorError(message=message)
+            return
         except RuntimeError as exc:
+            _logger.exception(
+                "claude-native: failed to deliver message to harness",
+                extra={"session_id": self._request_session_id},
+            )
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    def _reap_failed_turn(self) -> str | None:
+        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+        try:
+            kill_session(self._bridge_dir, timeout_s=1.0)
+        except TmuxSessionNotAdvertised:
+            _logger.debug(
+                "claude-native: timed-out session already disappeared",
+                extra={"session_id": self._request_session_id},
+            )
+        except RuntimeError as exc:
+            _logger.warning(
+                "claude-native: failed to reap timed-out session",
+                exc_info=True,
+                extra={"session_id": self._request_session_id},
+            )
+            return describe_exception(exc)
+        return None
 
     def _model_command_arg(self, wanted_model: str | None) -> str | None:
         """
@@ -217,12 +282,16 @@ class ClaudeNativeExecutor(Executor):
             should be typed.
         """
         if wanted_model is None:
-            _logger.info("claude-native: turn carries no routed model; not typing /model")
+            _logger.info(
+                "claude-native: turn carries no routed model; not typing /model",
+                extra={"session_id": self._request_session_id},
+            )
             return None
         if not self._should_switch_model(wanted_model):
             _logger.info(
                 "claude-native: skipping /model — pane is already on %s",
                 wanted_model,
+                extra={"session_id": self._request_session_id},
             )
             return None
         env = read_model_env(self._bridge_dir) or None
@@ -233,6 +302,7 @@ class ClaudeNativeExecutor(Executor):
                 "session accepts (pins=%s); sending the turn on the current model",
                 wanted_model,
                 sorted(env or ()),
+                extra={"session_id": self._request_session_id},
             )
             return None
         if (
@@ -245,12 +315,14 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: skipping /model — %r resolves to %r, already applied",
                 wanted_model,
                 wanted_arg,
+                extra={"session_id": self._request_session_id},
             )
             return None
         _logger.info(
             "claude-native: typing /model %s for routed model %s",
             wanted_arg,
             wanted_model,
+            extra={"session_id": self._request_session_id},
         )
         return wanted_arg
 

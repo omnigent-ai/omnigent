@@ -34,7 +34,7 @@ interface HostsResponse {
   hosts: Host[];
 }
 
-async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
+export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
@@ -92,9 +92,21 @@ async function fetchHostModelOptions(
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
   );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { models?: NativeModelOption[] };
-  return body.models ?? [];
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // Non-JSON error body — keep the status-line detail.
+    }
+    throw new Error(detail);
+  }
+  const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
+  const models = body.models ?? [];
+  // Backward compatibility with servers that encoded probe failure in a 200.
+  if (models.length === 0 && body.error) throw new Error(body.error);
+  return models;
 }
 
 /** Model choices available before launch, resolved on the selected host. */
@@ -103,8 +115,19 @@ export function useHostModelOptions(hostId: string | null, harness: string, enab
     queryKey: ["host-model-options", hostId, harness],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
-    staleTime: 30_000,
-    retry: false,
+    // The host's provider can change underneath an open picker (`omni setup`
+    // re-pointing the Claude default): poll while mounted so the list follows
+    // the host's current catalog, which it re-resolves on every request.
+    staleTime: 15_000,
+    refetchInterval: enabled && hostId !== null ? 15_000 : false,
+    // A request racing the host's boot probe gets a structured failure;
+    // the probe itself completes shortly after
+    // (single-flight in the host's catalog store). Retry with backoff so a
+    // picker opened during that warm-up window fills in instead of pinning
+    // the transient error until reopen. A genuinely failing probe still
+    // surfaces its error once the retries exhaust (~22 s).
+    retry: 6,
+    retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
 }
 

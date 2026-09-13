@@ -40,6 +40,9 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Protocol
 
+import httpx
+
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,
@@ -329,9 +332,14 @@ class TunnelRegistry:
                     "Deregistering runner %s; aborting %d in-flight request(s)",
                     runner_id,
                     in_flight_count,
+                    extra={"session_id": runner_primary_session_id()},
                 )
             else:
-                _logger.info("Deregistering runner %s; no in-flight requests", runner_id)
+                _logger.info(
+                    "Deregistering runner %s; no in-flight requests",
+                    runner_id,
+                    extra={"session_id": runner_primary_session_id()},
+                )
             self._abort_session_inflight(
                 removed,
                 ConnectionError("tunnel closed before request completed"),
@@ -416,6 +424,7 @@ class TunnelRegistry:
                 overflow_reason,
                 runner_id,
                 timeout_s,
+                extra={"session_id": runner_primary_session_id()},
             )
             await asyncio.sleep(timeout_s)
             return self.get(runner_id)
@@ -661,6 +670,7 @@ class TunnelRegistry:
                     _logger.warning(
                         "ws-channel %s: dropping frame with malformed base64",
                         frame.ch_id,
+                        extra={"session_id": runner_primary_session_id()},
                     )
                     return False
                 item = ("data", decoded)
@@ -669,6 +679,7 @@ class TunnelRegistry:
                     "ws-channel %s: dropping frame with unknown encoding %r",
                     frame.ch_id,
                     frame.encoding,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return False
 
@@ -750,8 +761,18 @@ class TunnelRegistry:
             self.close_request(runner_id, req_id, session=current)
             return False
         if isinstance(frame, ResponseEndFrame):
-            if _call_soon_threadsafe(state, lambda: _end_response_body(state)):
-                return True
+            if frame.error is not None:
+                # Runner signalled an abnormal stream end (mid-stream raise).
+                # Abort so the consumer raises instead of seeing clean EOF.
+                err = httpx.RemoteProtocolError(
+                    f"runner stream error: {frame.error}",
+                    request=None,  # type: ignore[arg-type]
+                )
+                if _call_soon_threadsafe(state, lambda: _abort_request_state(state, err)):
+                    return True
+            else:
+                if _call_soon_threadsafe(state, lambda: _end_response_body(state)):
+                    return True
             self.close_request(runner_id, req_id, session=current)
             return False
         return False
@@ -851,6 +872,7 @@ def _resolve_connect_waiter(
             "Dropping runner-connect wakeup for closed waiter loop (runner_id=%s)",
             session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
 
 
@@ -909,6 +931,7 @@ def _call_soon_threadsafe(state: RequestState, callback: Callable[[], None]) -> 
             "Dropping tunnel response wakeup for closed request loop (runner_id=%s)",
             state.session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         return False
     return True
@@ -938,6 +961,7 @@ def _call_channel_soon_threadsafe(
             "Dropping ws-channel wakeup for closed loop (runner_id=%s)",
             state.session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         return False
     return True

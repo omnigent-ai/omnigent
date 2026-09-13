@@ -88,6 +88,225 @@ describe("buildBubbles — bubble grouping", () => {
     expect((asst.items[0] as Extract<RenderItem, { kind: "text" }>).text).toBe("Hi!");
   });
 
+  it("keeps a response expanded after a user interjects into that response", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_merge" }),
+        fullText: "Waiting for the merge bot.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_merge" }),
+        content: [{ type: "input_text", text: "Does this conflict?" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "checking", responseId: "resp_merge" }),
+        fullText: "Checking.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "tool", responseId: "resp_merge" }),
+        executions: [mkExec("shell", "call_1")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_merge" }),
+        fullText: "No conflict.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "cleanup", responseId: "resp_merge" }),
+        executions: [mkExec("shell", "call_2")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "done", responseId: "resp_merge" }),
+        fullText: "Merged.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    const continuation = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(continuation.items.map((item) => item.kind)).toEqual([
+      "text",
+      "tool",
+      "text",
+      "tool",
+      "text",
+    ]);
+    expect(continuation.defaultExpanded).toBe(true);
+  });
+
+  it("does not mark an ordinary next turn or anonymous live fragments as an interjection", () => {
+    const ordinary: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_1" }),
+        fullText: "First answer.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_2" }),
+        content: [{ type: "input_text", text: "Next question" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "work", responseId: "resp_2" }),
+        fullText: "Working.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "tool", responseId: "resp_2" }),
+        executions: [mkExec("shell", "call_1")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "done", responseId: "resp_2" }),
+        fullText: "Second answer.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const ordinaryReply = buildBubbles(ordinary, null)[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(ordinaryReply.defaultExpanded).toBeUndefined();
+
+    const anonymous = ordinary.map((block) => ({
+      ...block,
+      ctx: { ...block.ctx, responseId: "" },
+    })) as AnyBlock[];
+    const anonymousReply = buildBubbles(anonymous, null)[2] as Extract<
+      Bubble,
+      { kind: "assistant" }
+    >;
+    expect(anonymousReply.defaultExpanded).toBeUndefined();
+  });
+
+  it("does not detect an interjection across a completed-response marker", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_reused" }),
+        fullText: "First answer.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "response_end",
+        ctx: ctx({ responseId: "resp_reused" }),
+        status: "completed",
+        response: { id: "resp_reused", status: "completed", model: "test" },
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_reused" }),
+        content: [{ type: "input_text", text: "Next question" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_reused" }),
+        fullText: "Second answer.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    const reply = buildBubbles(blocks, null)[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(reply.defaultExpanded).toBeUndefined();
+  });
+
+  it("does not leak interjection expansion across system or response boundaries", () => {
+    const before: AnyBlock = {
+      type: "text_done",
+      ctx: ctx({ itemId: "before", responseId: "resp_reused" }),
+      fullText: "Waiting for work.",
+      hasCodeBlocks: false,
+    };
+    const human: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "question", responseId: "resp_reused" }),
+      content: [{ type: "input_text", text: "Does this conflict?" }],
+    };
+    const answer = (responseId: string): AnyBlock => ({
+      type: "text_done",
+      ctx: ctx({ itemId: `answer_${responseId}`, responseId }),
+      fullText: "Done.",
+      hasCodeBlocks: false,
+    });
+    const lastAssistant = (blocks: AnyBlock[]) =>
+      buildBubbles(blocks, null).filter(
+        (bubble): bubble is Extract<Bubble, { kind: "assistant" }> => bubble.kind === "assistant",
+      )[1]!;
+
+    const system: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "wake", responseId: "resp_reused" }),
+      content: [{ type: "input_text", text: "[System: timer timer_1 fired]" }],
+    };
+    expect(lastAssistant([before, system, answer("resp_reused")]).defaultExpanded).toBeUndefined();
+    expect(lastAssistant([before, system, human, answer("resp_reused")]).defaultExpanded).toBe(
+      true,
+    );
+
+    const restarted: AnyBlock = {
+      type: "response_start",
+      ctx: ctx({ responseId: "resp_reused" }),
+      model: "test",
+      responseId: "resp_reused",
+      conversationId: null,
+    };
+    expect(
+      lastAssistant([before, human, restarted, answer("resp_reused")]).defaultExpanded,
+    ).toBeUndefined();
+
+    expect(lastAssistant([before, human, answer("resp_new")]).defaultExpanded).toBeUndefined();
+  });
+
+  it("detects an interjection identically through the incremental bubble cache", () => {
+    const cache = createBubbleCache();
+    const before: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_merge" }),
+        fullText: "Waiting for merge.",
+        hasCodeBlocks: false,
+      },
+    ];
+    buildBubbles(before, null, cache);
+    const withQuestion: AnyBlock[] = [
+      ...before,
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_merge" }),
+        content: [{ type: "input_text", text: "Does this conflict?" }],
+      },
+    ];
+    buildBubbles(withQuestion, null, cache);
+    const withAnswer: AnyBlock[] = [
+      ...withQuestion,
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_merge" }),
+        fullText: "No conflict.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    expect(buildBubbles(withAnswer, null, cache)).toEqual(buildBubbles(withAnswer, null));
+    const reply = buildBubbles(withAnswer, null, cache)[2] as Extract<
+      Bubble,
+      { kind: "assistant" }
+    >;
+    expect(reply.defaultExpanded).toBe(true);
+  });
+
   it("propagates ctx.createdBy onto the user bubble", () => {
     const blocks: AnyBlock[] = [
       {
@@ -315,6 +534,107 @@ describe("buildBubbles — bubble grouping", () => {
     expect(turn.items.map((i) => i.kind)).toEqual(["tool", "elicitation", "text"]);
   });
 
+  it("a Claude background-task wake splits the turn so the finished answer keeps its bubble", () => {
+    // Claude Code resumes on a `<task-notification>` (mirrored as a meta
+    // user item) with no human message in between. Grouping every
+    // assistant item after the real question into one bubble folded the
+    // finished answer behind the follow-up work's "Worked for" row; the
+    // wake must land as a system marker that starts a new bubble.
+    const items: ConversationItem[] = [
+      {
+        id: "u_q",
+        response_id: "resp_q",
+        type: "message",
+        status: "completed",
+        role: "user",
+        content: [{ type: "input_text", text: "what is this latency?" }],
+      },
+      {
+        id: "a_answer",
+        response_id: "resp_answer",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "It is end-to-end launch latency." }],
+      },
+      {
+        id: "u_wake",
+        response_id: "resp_wake",
+        type: "message",
+        status: "completed",
+        role: "user",
+        is_meta: true,
+        content: [
+          {
+            type: "input_text",
+            text: [
+              "<task-notification>",
+              "<task-id>b3f9a2c1d</task-id>",
+              "<status>completed</status>",
+              "<summary>Background command completed (exit code 0)</summary>",
+              "</task-notification>",
+            ].join("\n"),
+          },
+        ],
+      },
+      {
+        id: "a_followup_1",
+        response_id: "resp_followup",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "Both runs finished — checking metrics." }],
+      },
+      {
+        id: "fc_runs",
+        response_id: "resp_followup",
+        type: "function_call",
+        status: "completed",
+        model: "claude-native-ui",
+        name: "shell",
+        arguments: '{"command": "air runs list"}',
+        call_id: "call_runs",
+      },
+      {
+        id: "fo_runs",
+        response_id: "resp_followup",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_runs",
+        output: "run 1: 40s\nrun 2: 35s\n",
+      },
+      {
+        id: "a_followup_2",
+        response_id: "resp_followup",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "Both additional runs succeeded." }],
+      },
+    ];
+
+    const bubbles = buildBubbles(itemsToBlocks(items), null);
+
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "user", "assistant"]);
+    const answer = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    // Text only: nothing to fold, so the answer renders in full.
+    expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
+    expect((answer.items[0] as Extract<RenderItem, { kind: "text" }>).text).toBe(
+      "It is end-to-end launch latency.",
+    );
+    const marker = bubbles[2] as Extract<Bubble, { kind: "user" }>;
+    expect(marker.itemId).toBe("u_wake");
+    expect((marker.content[0] as { text: string }).text).toBe(
+      "[System: background task b3f9a2c1d completed]\nBackground command completed (exit code 0)",
+    );
+    const followup = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
+    expect(followup.responseId).toBe("resp_followup");
+    expect(followup.items.some((i) => i.kind === "tool")).toBe(true);
+  });
+
   it("two response_ids produce two assistant bubbles in order", () => {
     const blocks: AnyBlock[] = [
       {
@@ -377,6 +697,27 @@ describe("buildBubbles — bubble grouping", () => {
     ]);
   });
 
+  it("error block level reaches the render item", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "First" }],
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_info", responseId: "resp_1" }),
+        source: "harness",
+        code: "codex_thread_reset",
+        message: "Codex started a fresh thread.",
+        level: "info",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const asst = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(asst.items[0]).toMatchObject({ kind: "error", level: "info" });
+  });
+
   it("compaction block becomes a standalone compaction bubble", () => {
     const blocks: AnyBlock[] = [
       {
@@ -424,6 +765,84 @@ describe("buildBubbles — bubble grouping", () => {
     ];
     const bubbles = buildBubbles(blocks, null);
     expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "compaction"]);
+  });
+
+  it("repeated compaction_loading blocks refresh one spinner instead of stacking", () => {
+    // A long compaction re-announces in_progress on every status poll. The
+    // walker must fold the repeats into the ONE live spinner — anchored to
+    // the server-reported start — or completion later orphans the extras.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }), startedAtS: 900 },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }), startedAtS: 900 },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction_loading"]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(900);
+  });
+
+  it("a spinner refresh without a server start keeps the first client receive time", () => {
+    // An emitter that doesn't track started_at must not re-anchor the
+    // elapsed counter to the later announcement's receive time.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }) },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }) },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction_loading"]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(1_000);
+  });
+
+  it("completion clears every compaction spinner, leaving only the marker", () => {
+    // Regression: each re-announcement used to stack a spinner and
+    // completion removed only the most recent one — the orphan kept
+    // counting and flashing beside the "Conversation compacted" marker.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }) },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }) },
+      { type: "compaction", ctx: ctx({ itemId: "comp_1", responseId: "resp_compact" }) },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction"]);
+  });
+
+  it("incremental appends fold re-announcements and clear the spinner on completion", () => {
+    // The cached walk must behave exactly like the full rebuild across the
+    // announce → re-announce → complete sequence (the live-stream path).
+    const cache = createBubbleCache();
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+      content: [{ type: "input_text", text: "hello" }],
+    };
+    const first: AnyBlock = {
+      type: "compaction_loading",
+      ctx: ctx({ clientCreatedAtS: 1_000, responseId: "resp_compact" }),
+      startedAtS: 900,
+    };
+    const again: AnyBlock = {
+      type: "compaction_loading",
+      ctx: ctx({ clientCreatedAtS: 1_060, responseId: "resp_compact" }),
+      startedAtS: 900,
+    };
+    const done: AnyBlock = {
+      type: "compaction",
+      ctx: ctx({ itemId: "comp_1", responseId: "resp_compact" }),
+    };
+
+    let blocks: AnyBlock[] = [user, first];
+    expect(buildBubbles(blocks, null, cache).map((b) => b.kind)).toEqual([
+      "user",
+      "compaction_loading",
+    ]);
+
+    blocks = [...blocks, again];
+    let bubbles = buildBubbles(blocks, null, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "compaction_loading"]);
+    expect((bubbles[1] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(900);
+
+    blocks = [...blocks, done];
+    bubbles = buildBubbles(blocks, null, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "compaction"]);
   });
 
   it("UserMessageBlock with mixed content preserves attachments", () => {
@@ -2846,6 +3265,12 @@ describe("bubblesEqual — React.memo comparator", () => {
     );
   });
 
+  it("reports not-equal when interjection expansion changes", () => {
+    const collapsed = assistant("Done", "completed") as Extract<Bubble, { kind: "assistant" }>;
+    const expanded: Bubble = { ...collapsed, defaultExpanded: true };
+    expect(bubblesEqual(collapsed, expanded)).toBe(false);
+  });
+
   it("reports not-equal when the item count changes", () => {
     const oneItem = assistant("Hi", "completed");
     const twoItems: Bubble = {
@@ -3087,7 +3512,7 @@ describe("buildBubbles — bubble display timestamps", () => {
     expect(bubble.createdAtS).toBeUndefined();
   });
 
-  it("stamps an assistant group from its first stamped block", () => {
+  it("stamps an assistant group from its freshest stamped block", () => {
     const bubble = buildBubbles(
       [
         textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
@@ -3095,19 +3520,110 @@ describe("buildBubbles — bubble display timestamps", () => {
       ],
       null,
     )[0] as Extract<Bubble, { kind: "assistant" }>;
-    expect(bubble.createdAtS).toBe(1_753_900_010);
-    // The FIRST stamped block wins — the stamp marks when the response
-    // started, even when a later block carries a different clock (the
-    // live-first/server-tail mix can't occur in practice, but the walk
-    // is deterministic either way).
+    expect(bubble.createdAtS).toBe(1_753_900_020);
+    // The FRESHEST stamp wins regardless of which clock carried it —
+    // a mid-turn reload pairs server-stamped history with a live tail,
+    // and the display must reflect the latest activity, not whichever
+    // block walked first.
     const reloaded = buildBubbles(
       [
-        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
-        textDone("a2", { createdAtS: 1_753_900_005 }),
+        textDone("a1", { createdAtS: 1_753_900_005 }),
+        textDone("a2", { clientCreatedAtS: 1_753_900_010 }),
       ],
       null,
     )[0] as Extract<Bubble, { kind: "assistant" }>;
     expect(reloaded.createdAtS).toBe(1_753_900_010);
+  });
+
+  it("keeps a long turn's timestamp current instead of pinned to turn start", () => {
+    // Regression: a long turn under one response id showed the FIRST
+    // item's stamp, so an actively streaming "latest message" read
+    // 30+ minutes behind the wall clock.
+    const turnStart = 1_753_900_000;
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { createdAtS: turnStart }),
+        textDone("a2", { createdAtS: turnStart + 40 * 60 }),
+        textDone("a3", { createdAtS: turnStart + 41 * 60 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(turnStart + 41 * 60);
+  });
+
+  it("never moves the group timestamp backwards for a backdated tail block", () => {
+    // A late-arriving block can carry an older stamp (a relay-backdated
+    // tool result); the displayed time must not jump back.
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { createdAtS: 1_753_900_000 }),
+        textDone("a2", { createdAtS: 1_753_900_300 }),
+        textDone("a3", { createdAtS: 1_753_900_100 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_300);
+  });
+
+  it("does not stamp a bubble from a foreign absorbed tool result", () => {
+    // A delayed function_call_output is relay-backdated to its original
+    // turn's response id, so it lands after the next bubble's blocks and
+    // is absorbed into that bubble's group. It renders into its own
+    // turn's card via crossBubbleResults — it must not stamp the bubble
+    // that merely absorbed it.
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_a", responseId: "resp_A", createdAtS: 1_753_900_000 }),
+        executions: [mkExec("spawn_agent", "c1")],
+        iteration: 0,
+      },
+      userBlock({ createdAtS: 1_753_900_100 }),
+      textDone("b1", { createdAtS: 1_753_900_200 }),
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_a", responseId: "resp_A", createdAtS: 1_753_900_300 }),
+        name: "",
+        callId: "c1",
+        agentName: "test",
+        output: "late output",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "user", "assistant"]);
+    // Premise: the absorbed result renders into bubble A's tool card.
+    const bubbleA = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(
+      bubbleA.items.some((item) => item.kind === "tool" && item.output === "late output"),
+    ).toBe(true);
+    // Bubble B keeps its own freshest stamp, not the foreign result's.
+    const bubbleB = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubbleB.createdAtS).toBe(1_753_900_200);
+  });
+
+  it("still stamps from a tool result whose call lives in the same bubble", () => {
+    // A turn's latest activity is often its trailing tool result —
+    // excluding results wholesale would re-pin the timestamp.
+    const bubble = buildBubbles(
+      [
+        {
+          type: "tool_group",
+          ctx: ctx({ itemId: "fc_1", responseId: "resp_1", createdAtS: 1_753_900_000 }),
+          executions: [mkExec("Bash", "c1")],
+          iteration: 0,
+        },
+        {
+          type: "tool_result",
+          ctx: ctx({ itemId: "fco_1", responseId: "resp_1", createdAtS: 1_753_900_050 }),
+          name: "",
+          callId: "c1",
+          agentName: "test",
+          output: "ok",
+        },
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_050);
   });
 });
 

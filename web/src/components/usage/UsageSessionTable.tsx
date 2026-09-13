@@ -6,6 +6,7 @@ import { formatSessionCostUsd } from "@/lib/formatCost";
 
 interface Props {
   sessions: SessionUsage[];
+  now?: Date;
 }
 
 type SortKey = "title" | "harness" | "costUsd" | "updatedAt";
@@ -25,9 +26,8 @@ function primaryModel(models: Record<string, number>): string | null {
   return entries[0][0];
 }
 
-function formatRelativeDate(epochSec: number): string {
-  const now = Date.now() / 1000;
-  const diff = now - epochSec;
+function formatRelativeDate(epochSec: number, now: Date): string {
+  const diff = now.getTime() / 1000 - epochSec;
   if (diff < 60) return "just now";
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
@@ -54,7 +54,8 @@ function compareSessions(a: SessionUsage, b: SessionUsage, key: SortKey, dir: So
   return dir === "asc" ? cmp : -cmp;
 }
 
-export function UsageSessionTable({ sessions }: Props) {
+export function UsageSessionTable({ sessions, now }: Props) {
+  const currentTime = now ?? new Date();
   const [sortKey, setSortKey] = useState<SortKey>("updatedAt");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
 
@@ -116,15 +117,37 @@ export function UsageSessionTable({ sessions }: Props) {
                 {primaryModel(s.models) && (
                   <span className="ml-2 text-xs text-muted-foreground">
                     {primaryModel(s.models)}
+                    {Object.keys(s.models).length > 1 && (
+                      <span
+                        className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                        title={Object.entries(s.models)
+                          .sort(([, a], [, b]) => b - a)
+                          .slice(1)
+                          .map(([name]) => name)
+                          .join(", ")}
+                      >
+                        +{Object.keys(s.models).length - 1}
+                      </span>
+                    )}
                   </span>
                 )}
               </td>
-              <td className="px-3 py-2 text-muted-foreground">{s.harness ?? "—"}</td>
+              <td className="px-3 py-2 text-muted-foreground">
+                {s.harness ?? "—"}
+                {s.otherHarnesses && s.otherHarnesses.length > 0 && (
+                  <span
+                    className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                    title={s.otherHarnesses.join(", ")}
+                  >
+                    +{s.otherHarnesses.length}
+                  </span>
+                )}
+              </td>
               <td className="px-3 py-2 text-right tabular-nums">
                 {formatSessionCostUsd(s.costUsd)}
               </td>
               <td className="whitespace-nowrap px-3 py-2 text-right text-muted-foreground">
-                {formatRelativeDate(s.updatedAt)}
+                {formatRelativeDate(s.updatedAt, currentTime)}
               </td>
             </tr>
           ))}

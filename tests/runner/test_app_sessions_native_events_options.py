@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
@@ -9,16 +11,14 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-    cursor_native_bridge,
-    kiro_native_bridge,
-    qwen_native_bridge,
-)
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
@@ -27,19 +27,35 @@ from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
+    _sse,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.fixture(autouse=True)
+def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient ``ANTHROPIC_DEFAULT_*_MODEL`` gateway pins (#4279).
+
+    claude-native model resolution reads these from ``os.environ``; a developer
+    whose shell pins them (anyone driving Claude through a gateway) otherwise
+    gets a different model-change verdict and these tests fail spuriously.
+    """
+    for var in (
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "effort_value",
-    # ``EFFORT_VALUES`` is a superset of ``CLAUDE_EFFORTS``:
-    # PATCH accepts {none, minimal, low, medium, high, xhigh, max}
-    # but Claude Code's ``/effort`` slash only accepts the last five.
-    # ``none`` and ``minimal`` must skip injection (typing ``/effort
-    # none`` would land as a TUI error). ``None`` (clear) must skip
-    # too — Claude has no slash form for "use spawn default".
+    # ``EFFORT_VALUES`` is a superset of ``CLAUDE_EFFORTS``: PATCH accepts the
+    # full effort vocabulary, but Claude Code's ``/effort`` slash only accepts
+    # low/medium/high/xhigh/max. ``none`` and ``minimal`` must skip injection
+    # (typing ``/effort none`` would land as a TUI error). ``None`` (clear) must
+    # skip too — Claude has no slash form for "use spawn default".
     ["none", "minimal", None],
 )
 async def test_events_effort_change_on_native_session_skips_inject_for_unsupported_level(
@@ -202,12 +218,12 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
     """
     Non-native sessions accept effort_change and 204 without side effects.
 
-    In-process harnesses (default / claude-sdk / openai-agents / codex)
-    re-read the persisted ``reasoning_effort`` from store on each
-    turn, so they need no runtime notification when it changes. The
-    Omnigent server still POSTs ``effort_change`` to ``/events`` for every
-    PATCH (it's harness-agnostic), so the runner must accept the
-    event and 204 — never reach the slash-command injector, never
+    In-process harnesses (default / claude-sdk / openai-agents / codex / pi)
+    get the new effort on their next turn, from the ``reasoning`` block the
+    runner threads onto the forwarded body — so the event needs no injection
+    and no immediate forward. The Omnigent server POSTs ``effort_change`` to
+    ``/events`` for every PATCH (it's harness-agnostic), so the runner must
+    accept the event and 204 — never reach the slash-command injector, never
     forward to the harness scaffold.
     """
     from omnigent.spec.types import ExecutorSpec
@@ -273,6 +289,189 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+async def test_events_permission_mode_change_on_native_session_switches_and_echoes_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``permission_mode_change`` cycles the pane and returns the settled mode.
+
+    Claude Code's ``--permission-mode`` is launch-only, so the runner drives
+    the TUI's shift+tab cycle via the bridge. The 200 body echoes the mode the
+    pane actually landed on — the Omnigent server persists that value, so a
+    regression returning 204 (or dropping the body) would leave the web UI
+    showing a mode the session isn't in.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    calls: list[str] = []
+
+    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
+        """Record the requested mode; report it as reached."""
+        del bridge_dir, timeout_s
+        calls.append(mode)
+        return mode
+
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "2f77519bd9daa4e9bc2df649fe468500",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/2f77519bd9daa4e9bc2df649fe468500/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"permission_mode": "auto"}
+    assert calls == ["auto"], f"Expected one switch to auto, got {calls!r}"
+
+
+@pytest.mark.asyncio
+async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed switch surfaces 503 so the label is never persisted.
+
+    ``auto`` is only in the shift+tab cycle for accounts that have the mode.
+    The Omnigent server treats a non-2xx as "the pane did not move" and skips
+    persisting the label, so this must not report success.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
+        """Fail the way an unreachable mode does."""
+        del bridge_dir, mode, timeout_s
+        raise RuntimeError("The mode is not available in this session's cycle.")
+
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "3f88519bd9daa4e9bc2df649fe468511",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/3f88519bd9daa4e9bc2df649fe468511/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    # The error CODE names the failure category; the runner deliberately
+    # redacts exception text from client-facing details (the cause is logged
+    # server-side instead), so the detail is the fixed safe string.
+    assert body.get("error") == "claude_native_permission_mode_failed", body
+
+
+@pytest.mark.asyncio
+async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only claude-native sessions act on ``permission_mode_change``.
+
+    No other harness has Claude's shift+tab cycle, so the dispatch must
+    short-circuit before reaching the bridge.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
+        """Fail the test if a non-native session reaches the bridge."""
+        del bridge_dir, mode, timeout_s
+        raise AssertionError(
+            "set_permission_mode must never be called for non-claude-native sessions."
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
+
+    default_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the default spec for any agent_id."""
+        del agent_id
+        return default_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "4f99519bd9daa4e9bc2df649fe468522",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/4f99519bd9daa4e9bc2df649fe468522/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto"},
+        )
+
+    assert resp.status_code == 204, (
+        f"Non-native permission_mode_change must 204 no-op; got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -288,10 +487,9 @@ async def test_events_compact_on_native_session_types_slash_command(
     types the slash command into the pane.
 
     The 200 (not 204) is load-bearing: the Omnigent server reads it to know
-    the control was handled in the terminal and skips its own
-    in-process compaction. A regression returning 204 here would make
-    the Omnigent server fall through to ``_run_compact_locked``, which 400s
-    on the LLM-less claude-native pseudo-agent — the original bug.
+    the control was handled in the terminal. A regression returning 204 here
+    would make the server return a 400 "not available for this session type"
+    error instead of the native compact succeeding.
     """
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
@@ -360,11 +558,9 @@ async def test_events_compact_on_native_session_types_slash_command(
                 if isinstance(item, dict):
                     queued_events.append(item)
 
-    # 200 = native dispatch routed to the compact handler and it
-    # injected successfully. 204 would mean the handler returned the
-    # in-process no-op (wrong harness branch) → Omnigent falls through to
-    # _run_compact_locked and 400s. 404 = the dispatch fell through to
-    # the generic harness-forward.
+    # 200 = native dispatch routed to the compact handler and injected
+    # successfully. 204 would mean the wrong harness branch fired (→ server
+    # returns 400). 404 = dispatch fell through to the generic forward.
     assert resp.status_code == 200, (
         f"Native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
     )
@@ -463,7 +659,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_codex_native_injects_slash_command(
+async def test_events_compact_on_codex_native_types_settles_then_submits(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -477,17 +673,38 @@ async def test_events_compact_on_codex_native_injects_slash_command(
     registry (not a ``tmux.json`` sidecar).  The 200 return is
     load-bearing: the Omnigent server reads it to skip its own
     AP-side compaction.
+
+    The settle between typing and Enter is load-bearing too: typing
+    ``/compact`` opens Codex's slash-command popup, which draws
+    asynchronously, and an Enter sent back-to-back is swallowed by the
+    still-opening popup — the command is left un-submitted in the TUI
+    composer and the user sees no compaction feedback at all.
     """
+    import time as real_time
+    from typing import Any as _Any
+
+    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
-    captured: list[tuple[str, list[str]]] = []
+    events: list[tuple[str, object]] = []
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
         """Record tmux send-keys calls without touching tmux."""
-        captured.append((socket_path, list(args)))
+        events.append(("tmux", (socket_path, list(args))))
+
+    class _RecordingTime:
+        """Delegate to the real ``time`` module but record ``sleep`` calls."""
+
+        def __getattr__(self, name: str) -> _Any:
+            return getattr(real_time, name)
+
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            events.append(("sleep", seconds))
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(runner_app, "time", _RecordingTime())
 
     codex_native_spec = AgentSpec(
         spec_version=1,
@@ -543,34 +760,39 @@ async def test_events_compact_on_codex_native_injects_slash_command(
     )
 
     # Exactly 3 tmux send-keys calls: C-u, -l /compact, Enter.
-    assert len(captured) == 3, (
-        f"Expected 3 tmux send-keys calls (C-u, /compact, Enter), got {len(captured)}."
-    )
     socket = str(instance.socket_path)
-    # 1. Clear draft: C-u
-    assert captured[0] == (socket, ["send-keys", "-t", "main", "C-u"]), (
-        f"First call must clear draft with C-u; got {captured[0]!r}."
-    )
-    # 2. Type /compact literally
-    assert captured[1] == (socket, ["send-keys", "-l", "-t", "main", "/compact"]), (
-        f"Second call must type /compact literally; got {captured[1]!r}."
-    )
-    # 3. Submit with Enter
-    assert captured[2] == (socket, ["send-keys", "-t", "main", "Enter"]), (
-        f"Third call must submit with Enter; got {captured[2]!r}."
+    tmux_calls = [payload for kind, payload in events if kind == "tmux"]
+    assert tmux_calls == [
+        (socket, ["send-keys", "-t", "main", "C-u"]),
+        (socket, ["send-keys", "-l", "-t", "main", "/compact"]),
+        (socket, ["send-keys", "-t", "main", "Enter"]),
+    ], f"Expected C-u, literal /compact, Enter; got {tmux_calls!r}."
+
+    # A settle pause must separate typing the command from the submit Enter,
+    # or the asynchronously-rendered slash-command popup swallows the Enter
+    # and the command never submits.
+    typed = ("tmux", (socket, ["send-keys", "-l", "-t", "main", "/compact"]))
+    entered = ("tmux", (socket, ["send-keys", "-t", "main", "Enter"]))
+    settles = [
+        payload
+        for kind, payload in events[events.index(typed) + 1 : events.index(entered)]
+        if kind == "sleep"
+    ]
+    assert settles and all(isinstance(s, float | int) and s > 0 for s in settles), (
+        "Typing /compact and pressing Enter must be separated by a settle "
+        f"pause for the slash-command popup to render; got events={events!r}."
     )
     # /compact is a control signal, not a state change.
     assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> None:
+async def test_events_compact_on_codex_native_returns_503_when_no_terminal() -> None:
     """
-    Codex-native compact returns 204 when no live terminal is registered.
+    Codex-native compact returns 503 when no live terminal is registered.
 
-    Without a running codex terminal the ``/compact`` slash command
-    has nowhere to go.  204 tells the Omnigent server to fall back to
-    its own AP-side compaction (or skip it).
+    Without a running codex terminal the ``/compact`` slash command has
+    nowhere to go. 503 tells the caller to reconnect first.
     """
     codex_native_spec = AgentSpec(
         spec_version=1,
@@ -607,8 +829,8 @@ async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> 
             json={"type": "compact"},
         )
 
-    assert resp.status_code == 204, (
-        f"Codex-native compact with no terminal must return 204; "
+    assert resp.status_code == 503, (
+        f"Codex-native compact with no terminal must return 503; "
         f"got {resp.status_code}: {resp.text}"
     )
 
@@ -693,9 +915,8 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
     cursor-agent manages its own context window in the TUI, so explicit
     compaction must run there (its built-in ``/summarize`` command) rather
     than as AP-side compaction — the same rationale as the claude-native
-    path.  The 200 (not 204) is load-bearing: the Omnigent server reads it to
-    skip its own ``_run_compact_locked`` (which 400s on the LLM-less native
-    pseudo-agent).
+    path. The 200 (not 204) is load-bearing: the Omnigent server reads it to
+    know the control was handled in the terminal.
 
     Two properties are pinned here:
 
@@ -928,7 +1149,7 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
     2. A ``compact_*`` payload is written to the session's bridge inbox.
     3. /compact is a control signal and publishes no ``session.status`` events.
     """
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -1015,7 +1236,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
     ``pi_native_compact_failed`` code rather than silently swallowing the
     request; the Omnigent server then treats it as not-handled.
     """
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "9c52b3dbe1d543718c1678a256017326"
@@ -1080,7 +1301,7 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
     Unlike cursor, injection is file-based: a ``submit`` line routes through
     qwen's ``RemoteInputWatcher`` then ``submitQuery``, which processes the slash
     command (no autocomplete-dropdown trap). The 200 is load-bearing (server
-    skips its own ``_run_compact_locked``). The handler publishes only
+    reads it to know the control was handled). The handler publishes only
     ``in_progress``; the ``completed`` edge is the compaction mirror's job once
     the ``chat_compression`` record lands (covered in test_qwen_native_forwarder).
     """
@@ -1215,7 +1436,7 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
 class _FakeOpenCodeCompactClient:
     """OpenCode client stub recording ``summarize`` calls for compact tests.
 
-    Stands in for :class:`omnigent.opencode_native_client.OpenCodeClient` so
+    Stands in for :class:`omnigent.harnesses.opencode_native.client.OpenCodeClient` so
     the opencode-native compact handler's model-resolution + ``/summarize``
     call is observable without a live ``opencode serve``.
     """
@@ -1305,9 +1526,9 @@ async def _drive_opencode_native_compact(
     :param summarize_error: When set, ``summarize`` raises it (503 path).
     :returns: ``(response, fake_client)`` for the compact POST.
     """
-    from omnigent import opencode_native_bridge
-    from omnigent.opencode_native_bridge import OpenCodeNativeBridgeState
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _AUTO_OPENCODE_SERVERS, _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
     from tests.runner.helpers import make_test_terminal_instance
@@ -1381,7 +1602,7 @@ def test_resolve_opencode_compact_model_prefers_latest_assistant_message() -> No
     must iterate in reverse and ignore user-role messages, picking the live
     model even when a session ``model`` and a ``model_override`` also resolve.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload(
@@ -1416,7 +1637,7 @@ def test_resolve_opencode_compact_model_falls_back_to_session_model() -> None:
     ``modelID``). An assistant message missing ``modelID`` must be skipped so
     the session field is used.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload(
@@ -1437,7 +1658,7 @@ def test_resolve_opencode_compact_model_falls_back_to_model_override() -> None:
     A model id may itself contain ``/`` (e.g. an OpenRouter slug), so only the
     FIRST separator delimits provider from model.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload({"id": "ses_x"})
@@ -1456,7 +1677,7 @@ def test_resolve_opencode_compact_model_returns_none_when_unresolvable() -> None
     Covers the live Omnigent flow: the session is created without a model and
     has no assistant turn yet, and no override is set.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload({"id": "ses_x"})
@@ -1564,14 +1785,15 @@ async def test_events_compact_on_opencode_native_summarizes_from_model_override(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
+async def test_events_compact_on_opencode_native_503_when_model_unresolvable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    No resolvable model → 204 and ``/summarize`` is never called.
+    No resolvable model → 503 and ``/summarize`` is never called.
 
-    The 204 tells the Omnigent server to run its own AP-side compaction.
+    Without a model the compaction has nowhere to go; 503 tells the caller
+    to switch the model first.
     """
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
@@ -1582,8 +1804,8 @@ async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
         model_override=None,
     )
 
-    assert resp.status_code == 204, (
-        f"opencode-native compact must 204 when no model resolves; "
+    assert resp.status_code == 503, (
+        f"opencode-native compact must 503 when no model resolves; "
         f"got {resp.status_code}: {resp.text}"
     )
     assert client.summarize_calls == [], (
@@ -1602,7 +1824,7 @@ async def test_events_compact_on_opencode_native_503_when_summarize_raises(
     The Omnigent server must see the failure (rather than a silent fallback)
     so it does not run a duplicate compaction.
     """
-    from omnigent.opencode_native_client import OpenCodeClientError
+    from omnigent.harnesses.opencode_native.client import OpenCodeClientError
 
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
@@ -1638,12 +1860,10 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     """
     Non-native sessions accept compact and 204 without side effects.
 
-    For in-process harnesses, explicit compaction is an AP-side
-    operation (``_run_compact_locked`` → ``compact_conversation_now``).
-    The Omnigent server forwards ``compact`` to ``/events`` for every harness
-    (it stays harness-agnostic), so the runner must accept the event
-    and 204 — never reach the slash-command injector. The 204 tells the
-    Omnigent server to run its own compaction.
+    The Omnigent server forwards ``compact`` to ``/events`` for every harness,
+    so the runner must accept the event and 204 — never reach the
+    slash-command injector. The server then returns a 400 to the client
+    (SDK harnesses control their own context; AP-side compaction is not available).
     """
     from omnigent.spec.types import ExecutorSpec
 
@@ -1711,7 +1931,7 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     "event_payload,inject_attr",
     # ``/fork`` creates a new conversation that reuses the
     # same Claude process (same bridge_dir), so the new session has
-    # bridge_id != conv_id, stored on the ``omnigent.claude_native
+    # bridge_id != conv_id, stored on the ``omnigent.harnesses.claude_native.main
     # .bridge_id`` label. The runner-side native dispatch MUST
     # resolve bridge_id via ``_claude_native_bridge_id_for_session``
     # so the slash command lands in the right pane. Using
@@ -1933,6 +2153,290 @@ async def test_events_model_change_on_native_session_types_slash_command(
     assert confirm_hint == claude_native_bridge.SWITCH_MODEL_DIALOG_HINT
     assert queued_events == [], (
         f"model_change must not publish session events; got {queued_events!r}."
+    )
+
+
+async def _post_model_change_with_status_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    status_values: list[str | None],
+    pane_status: str | None = None,
+) -> Any:
+    """Run one claude-native ``model_change`` with a scripted status file.
+
+    ``status_values`` are successive ``read_claude_status_model`` answers
+    (the first is the pre-injection baseline); the last value repeats once
+    the script is exhausted. Injection is stubbed; the confirm pacing is
+    tightened so the unconfirmed path stays fast.
+
+    :returns: The ``/events`` HTTP response.
+    """
+    from omnigent.runner import app as runner_app_module
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
+    script = list(status_values)
+
+    def _scripted_status(_bridge_dir: Any) -> str | None:
+        return script.pop(0) if len(script) > 1 else script[0]
+
+    monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
+    # No tmux behind these tests: the in-loop dialog check must not spend a
+    # real 1 s tmux-info wait per poll.
+    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", lambda _b, *, hint: False)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "68c7c1acc5eeec3978c5e62043da51a5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        if pane_status is not None:
+            app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = pane_status
+        return await client.post(
+            "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_confirms_against_the_status_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The switch replies success only after the pane's status shows it.
+
+    The statusLine snapshot starts on the old model and flips to the picked
+    one after the injection — the design's confirmed-switch contract: the
+    reply follows the pane, not the keystroke.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"],
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_without_status_omits_bridge_path_from_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unverifiable model switch logs session context without the bridge path."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        resp = await _post_model_change_with_status_sequence(monkeypatch, [None])
+
+    assert resp.status_code == 204, resp.text
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "model change" in record.getMessage() and "could not be verified" in record.getMessage()
+    ]
+    assert messages == [
+        "claude-native model change for session=68c7c1acc5eeec3978c5e62043da51a5 "
+        "could not be verified: no statusLine snapshot"
+    ]
+    bridge_dir = bridge_dir_for_bridge_id("68c7c1acc5eeec3978c5e62043da51a5")
+    assert str(bridge_dir) not in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_unconfirmed_switch_answers_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane that never switches makes the ask fail loud, not pass silent.
+
+    The statusLine snapshot keeps reporting the old model for the whole
+    confirmation budget on an IDLE pane (the swallowed-dialog case): the
+    runner must answer non-2xx so the server surfaces the divergence
+    instead of the row claiming the pick.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+    )
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"] == "claude_native_model_unconfirmed"
+    assert "did not confirm" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_mid_turn_defers_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch during an active turn is deferred, never a visible failure.
+
+    Claude queues a mid-turn ``/model`` and applies it when the turn
+    settles — possibly well past the confirmation budget. With the pane
+    reporting ``running``, the timeout answers success (a detached watcher
+    keeps answering the late confirm dialog) so the user does not get a
+    "was not switched" error for a switch that is still on its way; the
+    harness's report settles the picker when it lands.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pins", "picked", "expected_command"),
+    [
+        # The reported bug: a gateway config pins the three families but not
+        # fable; picking the probed ``fable`` row injected ``/model opus`` —
+        # the resolver swapped the alias for the provider default and the
+        # vocabulary re-spelled that as its pinned alias.
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
+            },
+            "fable",
+            "/model fable",
+            id="gateway-unpinned-family-is-never-swapped-for-the-default",
+        ),
+        # Bracket aliases are the harness's own /model vocabulary. On a
+        # pinned env the old vocabulary had no spelling for them (503);
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+            },
+            "sonnet[1m]",
+            "/model sonnet[1m]",
+            id="pinned-bracket-alias-passes-through",
+        ),
+        # on a bare login it stepped down to the family alias, silently
+        # dropping the 1M-context marker.
+        pytest.param(
+            {},
+            "sonnet[1m]",
+            "/model sonnet[1m]",
+            id="bare-login-bracket-alias-keeps-its-context-marker",
+        ),
+    ],
+)
+async def test_events_model_change_applies_the_picked_alias_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    pins: dict[str, str],
+    picked: str,
+    expected_command: str,
+) -> None:
+    """
+    A picker alias reaches the pane as itself, never as another model.
+
+    The harness enumerated these aliases itself (they are its ``/model``
+    vocabulary), so the injected command must carry the pick verbatim and
+    leave resolution to Claude — anything else switches the pane to a
+    model the user did not choose.
+    """
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+
+    captured: list[str] = []
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        """Record the injected command without touching tmux."""
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        captured.append(command)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "read_model_env", lambda _bridge_dir: dict(pins))
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ()
+    )
+    config = (
+        ClaudeNativeUcodeConfig(env=dict(pins), model=pins.get("ANTHROPIC_DEFAULT_OPUS_MODEL"))
+        if pins
+        else None
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: config,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = uuid.uuid4().hex
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": picked},
+        )
+
+    assert resp.status_code == 204, (
+        f"model_change for {picked!r} must apply; got {resp.status_code}: {resp.text}"
+    )
+    assert captured == [expected_command], (
+        f"picking {picked!r} must inject {expected_command!r}; injecting anything else "
+        f"switches the pane to a model the user did not choose (got {captured!r})"
     )
 
 
@@ -2545,3 +3049,595 @@ async def test_events_effort_change_on_cursor_native_session_is_disabled_noop(
     assert resp.status_code == 204, (
         f"cursor-native effort_change must 204 (disabled); got {resp.status_code}: {resp.text}"
     )
+
+
+def _body_carries_text(body: dict[str, Any], needle: str) -> bool:
+    """Return whether *needle* appears in any ``input_text`` block of *body*.
+
+    The runner forwards history as nested ``message`` items, so the
+    ``input_text`` block carrying the text can sit one or more levels deep
+    inside ``content`` lists; walk them recursively.
+
+    :param body: A harness request body (from ``posted_bodies``).
+    :param needle: Substring to search for in ``input_text`` blocks.
+    :returns: ``True`` if any ``input_text`` block contains *needle*.
+    """
+
+    def _walk(node: Any) -> bool:
+        if isinstance(node, dict):
+            if node.get("type") == "input_text" and needle in (node.get("text") or ""):
+                return True
+            return _walk(node.get("content"))
+        if isinstance(node, list):
+            return any(_walk(child) for child in node)
+        return False
+
+    return _walk(body.get("content"))
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a claude-sdk session
+    dispatches a ``/compact`` turn to the harness and returns 200.
+
+    The Claude SDK owns its own context window in the harness subprocess;
+    the only effective way to compact it is to send the literal ``/compact``
+    slash command to the live client, which triggers native compaction (the
+    same PreCompact path the auto-compact machinery already handles and whose
+    ``response.compaction.completed`` the executor already emits). The runner
+    turns the compact control into a resumed ``/compact`` turn and forwards it
+    to the harness like any user message.
+
+    The 200 (not 204) is load-bearing: the Omnigent server reads it to know
+    the harness handled the control and skips its own (transcript-only,
+    ineffective for SDK) compaction. A regression returning 204 would make
+    the server surface a 400 "not available for this session type" error.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    hc = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(hc)
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the claude-sdk spec for any agent_id."""
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    sid = "b1d0f6a2c3e14f5a9b8c7d6e5f403122"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact"},
+        )
+
+        # The turn runs in the background; wait for it to forward the
+        # synthesized /compact message to the harness.
+        for _ in range(100):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.02)
+
+    # 200 = handled by the harness (server skips its own compaction).
+    # 204 would make the server return 400 "not available for this
+    # session type" — the regression this pins against.
+    assert resp.status_code == 200, (
+        f"claude-sdk compact must return 200 (handled) from /events; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    # Exactly one forwarded turn. 0 = compact didn't dispatch; 2+ = it
+    # dispatched more than a single compact turn.
+    assert len(hc.posted_bodies) == 1, (
+        f"Expected exactly one forwarded turn from claude-sdk compact, "
+        f"got {len(hc.posted_bodies)}: {hc.posted_bodies}"
+    )
+    # Body contract: the literal ``/compact`` is what the Claude CLI
+    # interprets as the slash command that runs native compaction. Plain
+    # prompt text (missing slash) would land as a normal chat turn instead.
+    assert _body_carries_text(hc.posted_bodies[0], "/compact"), (
+        f"The forwarded turn must carry the literal '/compact' slash command "
+        f"so the SDK runs native compaction; got {hc.posted_bodies[0]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None:
+    """
+    Compact on a busy claude-sdk session buffers ``/compact`` for the next
+    turn instead of starting a second concurrent one.
+
+    The harness holds a single live client per conversation, so a ``/compact``
+    issued while a turn is in flight must not race it. The runner buffers the
+    synthesized ``/compact`` message; the normal continuation drain runs it
+    once the active turn ends. It still returns 200 (handled) so the server
+    skips its own compaction.
+    """
+    hc = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(hc)
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the claude-sdk spec for any agent_id."""
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    sid = "c2e1a7b3d4f05a6b8c9d0e1f20314233"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        # Simulate an in-flight turn holding the slot (a non-Task sentinel so
+        # nothing tries to await/cancel it during teardown).
+        active_turns = app.state.active_turns
+        sentinel = object()
+        active_turns[sid] = sentinel
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact"},
+        )
+
+    # 200 = handled (buffered for the next turn); the server skips its own
+    # compaction just as it would for an immediately-dispatched compact.
+    assert resp.status_code == 200, (
+        f"claude-sdk compact on a busy session must still return 200; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    # The active slot must be untouched — no second turn was started.
+    assert app.state.active_turns.get(sid) is sentinel, (
+        "compact must not start a second turn while one is in flight; the "
+        "active-turn slot was replaced."
+    )
+    # The /compact message was buffered for the continuation drain.
+    buffered = app.state.session_message_buffers.get(sid) or []
+    assert len(buffered) == 1, f"Expected exactly one buffered /compact message, got {buffered!r}."
+    assert _body_carries_text(buffered[0], "/compact"), (
+        f"Buffered message must carry the literal '/compact'; got {buffered[0]!r}."
+    )
+    # Nothing was forwarded to the harness yet — it runs after the active turn.
+    assert hc.posted_bodies == [], (
+        f"Buffered compact must not forward to the harness immediately; got {hc.posted_bodies!r}."
+    )
+
+
+async def _accumulate_session_events(
+    sid: str,
+    *,
+    until_types: set[str],
+    timeout_s: float = 3.0,
+) -> list[dict[str, Any]]:
+    """Drain a session's event queue repeatedly until a terminal type appears.
+
+    The compact turn runs in the background, so its events land on the queue
+    over time. Accumulate across polls (the drain is destructive) and stop once
+    any of ``until_types`` is seen or the timeout elapses.
+
+    :param sid: Conversation id whose queue to drain.
+    :param until_types: Event ``type`` values that end the wait.
+    :param timeout_s: Upper bound on how long to poll.
+    :returns: Every dict event seen, in arrival order.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    seen: list[dict[str, Any]] = []
+    waited = 0.0
+    while waited < timeout_s:
+        seen.extend(_drain_session_event_queue(_session_event_queues_ref.get(sid)))
+        if any(e.get("type") in until_types for e in seen):
+            return seen
+        await asyncio.sleep(0.02)
+        waited += 0.02
+    return seen
+
+
+def _build_claude_sdk_compact_app(
+    sse_frames: list[str],
+) -> tuple[Any, _FakeProcessManager, _ScriptedHarnessClient]:
+    """Wire a runner app whose claude-sdk turn streams *sse_frames*.
+
+    :param sse_frames: The SSE frames the scripted harness relays for the
+        dispatched ``/compact`` turn.
+    :returns: ``(app, process_manager, harness_client)``.
+    """
+    hc = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(hc)
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return app, pm, hc
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_publishes_in_progress_up_front() -> None:
+    """A claude-sdk `/compact` publishes `response.compaction.in_progress` at once.
+
+    Native `/compact` shows a "Compacting conversation…" spinner immediately;
+    the claude-sdk turn otherwise only surfaces the generic running status
+    ("Working…") until the executor's own late `in_progress` (fired when the
+    SDK PreCompact hook hits). Publishing up front gives the same instant
+    feedback as the other harnesses.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "d3f0a1b2c3d4e5f60718293a4b5c6d7e"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(
+            sid, until_types={"response.compaction.in_progress"}
+        )
+
+    in_progress = [e for e in events if e.get("type") == "response.compaction.in_progress"]
+    assert in_progress, (
+        f"claude-sdk compact must publish response.compaction.in_progress up front so the "
+        f"'Compacting conversation…' spinner shows immediately; got events {events!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_swallows_executor_duplicate_in_progress() -> None:
+    """The executor's own `in_progress` is swallowed so the web shows one spinner.
+
+    The runner publishes an up-front `in_progress`; the executor then emits its
+    own when the PreCompact hook fires. Two spinners would leave one stranded
+    (the web removes only a single `compaction_loading` on `completed`), so the
+    relay must drop the executor's duplicate. On a real compaction (a
+    `completed` arrives), no `failed` is published.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.compaction.in_progress"}),
+        _sse(
+            {
+                "type": "response.compaction.completed",
+                "summary": "compacted",
+                "total_tokens": 1234,
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    }
+                ],
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "e4a1b2c3d4e5f60718293a4b5c6d7e8f"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(
+            sid, until_types={"response.compaction.completed"}
+        )
+
+    in_progress = [e for e in events if e.get("type") == "response.compaction.in_progress"]
+    completed = [e for e in events if e.get("type") == "response.compaction.completed"]
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    assert len(in_progress) == 1, (
+        f"Exactly one in_progress must reach the web (up-front published, executor's "
+        f"duplicate swallowed); got {len(in_progress)}: {events!r}"
+    )
+    assert len(completed) == 1, f"Expected the completed event to pass through; got {events!r}"
+    assert failed == [], (
+        f"No failed must be published when compaction actually completes; got {events!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_publishes_failed_when_no_compaction() -> None:
+    """When the `/compact` turn ends with no compaction, publish `failed`.
+
+    The up-front spinner is only cleared by `completed` (→ marker) or `failed`
+    (→ removed). If the turn ends without the executor reporting a compaction
+    (e.g. nothing to compact), the runner must publish `failed` so the spinner
+    is not stranded.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "f5b2c3d4e5f60718293a4b5c6d7e8f90"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(sid, until_types={"response.compaction.failed"})
+
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    completed = [e for e in events if e.get("type") == "response.compaction.completed"]
+    assert failed, (
+        f"A compact turn that ends without a compaction must publish failed to clear the "
+        f"stranded spinner; got {events!r}"
+    )
+    assert completed == [], f"No completed should appear when nothing compacted; got {events!r}"
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_clears_flag_on_pre_stream_failure() -> None:
+    """A `/compact` turn that fails before streaming still clears the spinner.
+
+    The up-front `response.compaction.in_progress` and the in-progress flag are
+    set before the turn task runs, but the loop that clears them runs only once
+    streaming starts. A setup-phase failure (here: no live harness) ends the turn
+    before that loop, so cleanup cannot live only inside the stream loop:
+    `_on_proxy_stream_end` — reached on every turn-end path — must publish
+    `failed` and discard the flag. Otherwise the spinner is stranded and the
+    stale flag corrupts the NEXT turn's compaction signalling (a real
+    `in_progress` is swallowed, or an unrelated turn emits a spurious `failed`).
+    """
+
+    class _FailingProcessManager(_FakeProcessManager):
+        """Process manager that fails to hand out a client once armed."""
+
+        def __init__(self, client: _ScriptedHarnessClient) -> None:
+            super().__init__(client)
+            self.fail_get_client = False
+
+        async def get_client(
+            self, conversation_id: str, harness: str, env: Any = None
+        ) -> _ScriptedHarnessClient:
+            if self.fail_get_client:
+                raise RuntimeError("no live harness")
+            return await super().get_client(conversation_id, harness, env)
+
+    hc = _ScriptedHarnessClient([])
+    pm = _FailingProcessManager(hc)
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    sid = "a6c3d4e5f60718293a4b5c6d7e8f9012"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        # Arm the setup-phase failure, then dispatch /compact. The handler still
+        # returns 200 (the turn runs in the background); the failure lands inside
+        # the turn task, before any streaming.
+        pm.fail_get_client = True
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(sid, until_types={"response.compaction.failed"})
+
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    assert failed, (
+        f"A /compact turn that fails during setup (before streaming) must still publish "
+        f"failed to clear the up-front spinner; got {events!r}"
+    )
+    # The flag must not leak past the turn: a stale entry would swallow the next
+    # turn's real in_progress or make an unrelated turn emit a spurious failed.
+    assert sid not in app.state.sdk_compact_inprogress, (
+        "the in-progress flag must be cleared on the setup-failure path; a leaked "
+        "entry corrupts later compaction signalling for this conversation."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_buffered_compact_dispatches_standalone() -> None:
+    """A buffered /compact ahead of a follow-up message still dispatches on its own.
+
+    The non-native continuation drain coalesces the whole buffer and dispatches
+    only the last body. Left unguarded, a /compact buffered behind an active turn
+    with a user message queued after it would be buried in history (never the
+    turn prompt) and silently no-op — the runner already returned 200, so the
+    server won't fall back. The drain must dispatch a buffered /compact as its
+    own turn instead.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "b7d4e5f60718293a4b5c6d7e8f901234"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        # Post-active-turn state: a /compact buffered first, then a follow-up
+        # user message queued after it (the ordering that would bury /compact).
+        app.state.session_message_buffers[sid] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "/compact"}],
+                "conversation_id": sid,
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "a follow-up message"}],
+                "conversation_id": sid,
+            },
+        ]
+
+        # Drain as the prior turn's continuation would, then wait for the turns
+        # it dispatches to reach the harness.
+        await app.state.check_and_start_next_turn(sid)
+
+        for _ in range(200):
+            if len(hc.posted_bodies) >= 2:
+                break
+            await asyncio.sleep(0.02)
+
+    # The fix drains one at a time when a /compact is buffered, so /compact
+    # dispatches as its OWN turn and the follow-up as a SECOND turn (the scripted
+    # /compact turn completes immediately, kicking off the next drain) → two
+    # dispatches. The buggy coalescing drain folds both into ONE turn (follow-up
+    # as the prompt, /compact buried in history, never run as a slash command)
+    # → a single dispatch. Assert on the count, not body content: the harness
+    # fake captures the shared history list by reference, so a later append is
+    # visible on an already-captured body.
+    n = len(hc.posted_bodies)
+    assert n == 2, (
+        "a buffered /compact must dispatch as its own turn (two dispatches: /compact, then "
+        f"the follow-up), not be coalesced into one; got {n} dispatch(es)"
+    )
+    assert _body_carries_text(hc.posted_bodies[0], "/compact"), (
+        "the first dispatched turn must carry the /compact command"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -> None:
+    """A buffered /compact that drains and ends with no compaction still clears the spinner.
+
+    When a buffered /compact dispatches as its own turn, the executor can emit
+    `response.compaction.in_progress` (the PreCompact hook) without a matching
+    `response.compaction.completed` (e.g. the compaction-complete event resolves
+    to None). The buffered path must set `_sdk_compact_inprogress` like the idle
+    path so `_on_proxy_stream_end` publishes `response.compaction.failed` and the
+    "Compacting…" spinner is not stranded — and so the relay swallows the
+    executor's own in_progress, leaving exactly one spinner on the web.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.compaction.in_progress"}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "c8e5f60718293a4b5c6d7e8f90123456"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        # A /compact buffered behind an active turn drains as its own turn.
+        app.state.session_message_buffers[sid] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "/compact"}],
+                "conversation_id": sid,
+            },
+        ]
+        await app.state.check_and_start_next_turn(sid)
+
+        events = await _accumulate_session_events(sid, until_types={"response.compaction.failed"})
+
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    in_progress = [e for e in events if e.get("type") == "response.compaction.in_progress"]
+    completed = [e for e in events if e.get("type") == "response.compaction.completed"]
+    assert failed, (
+        "a buffered /compact that ends without a compaction must publish failed to clear the "
+        "spinner (the busy path must set the in-progress flag like the idle path); "
+        f"got types {[e.get('type') for e in events]}"
+    )
+    assert len(in_progress) == 1, (
+        "exactly one in_progress must reach the web (up-front published, executor's duplicate "
+        f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
+    )
+    assert completed == [], "no completed should appear when nothing compacted"

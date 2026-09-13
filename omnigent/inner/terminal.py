@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import re
@@ -22,7 +23,9 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.cli_invocation import cli_invocation
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -55,136 +58,6 @@ logger = logging.getLogger(__name__)
 
 _TMUX_CONFIG_PATH = os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
-
-# Web-terminal attach transports. ``pty`` forks a full ``tmux attach`` client
-# and streams the rendered screen (see terminals/ws_bridge.py); ``control``
-# attaches a ``tmux -C`` control-mode client and streams per-pane ``%output``
-# so the browser xterm owns scrollback + selection (see
-# terminals/control_bridge.py). Both speak the identical browser wire protocol
-# so they are interchangeable per attach.
-TERMINAL_TRANSPORT_PTY = "pty"
-TERMINAL_TRANSPORT_CONTROL = "control"
-_VALID_TERMINAL_TRANSPORTS = frozenset({TERMINAL_TRANSPORT_PTY, TERMINAL_TRANSPORT_CONTROL})
-# Values that select the PTY path in the config file, beyond the canonical
-# ``pty`` name — the common falsy spellings so ``transport: false`` / ``: off``
-# reads as PTY. Any other value (including ``control`` and truthy spellings)
-# falls through to the control default.
-_TRANSPORT_PTY_ALIASES = frozenset({TERMINAL_TRANSPORT_PTY, "0", "false", "no", "off"})
-# Config-file location for the global default (``~/.omnigent/config.yaml``,
-# honoring ``OMNIGENT_CONFIG_HOME`` for test isolation — same resolution the
-# runner and CLI use). The transport lives under the ``terminal:`` table as
-# ``terminal.transport``.
-_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
-_TERMINAL_CONFIG_TABLE = "terminal"
-_TERMINAL_TRANSPORT_CONFIG_KEY = "transport"
-
-
-def _global_config_path() -> Path:
-    """Return the global Omnigent config path visible to this process.
-
-    Mirrors :func:`omnigent.runner._entry._runner_config_path` (kept local to
-    avoid an inner→runner import): honors :envvar:`OMNIGENT_CONFIG_HOME` for
-    test isolation and subprocess consistency, else ``~/.omnigent/config.yaml``.
-
-    :returns: Config path, e.g. ``Path("~/.omnigent/config.yaml")``.
-    """
-    config_home = os.environ.get(_CONFIG_HOME_ENV_VAR)
-    if config_home:
-        return Path(config_home).expanduser() / "config.yaml"
-    return Path.home() / ".omnigent" / "config.yaml"
-
-
-def _global_terminal_transport_default() -> str:
-    """Resolve the process-wide default web-terminal transport from config.
-
-    Reads ``terminal.transport`` from ``~/.omnigent/config.yaml`` at call time
-    (not import time) so a config edit takes effect on the next attach without
-    a restart, and tests can point :envvar:`OMNIGENT_CONFIG_HOME` at a scratch
-    config. Control mode is the default; set ``terminal.transport`` to a PTY
-    alias to opt out. Recognized values (case-insensitive):
-
-    - Missing / ``control`` / ``1`` / ``true`` / ``yes`` / ``on`` → ``control``.
-    - ``pty`` / ``0`` / ``false`` / ``no`` / ``off`` → ``pty``.
-    - Anything else → ``control`` (the default), so a typo can't strand an
-      operator on the legacy path.
-
-    A missing file, unreadable file, malformed YAML, or missing key all fall
-    back to the control default — reading the transport must never crash an
-    attach.
-
-    :returns: ``"control"`` or ``"pty"``.
-    """
-    raw = _read_terminal_transport_config()
-    if raw is not None and raw.strip().lower() in _TRANSPORT_PTY_ALIASES:
-        return TERMINAL_TRANSPORT_PTY
-    return TERMINAL_TRANSPORT_CONTROL
-
-
-def _read_terminal_transport_config() -> str | None:
-    """Read ``terminal.transport`` from the global config, or ``None``.
-
-    Best-effort: any failure (missing/unreadable file, non-mapping YAML,
-    absent table/key, non-string/bool value) returns ``None`` so the caller
-    uses the control default. Never raises.
-
-    An unquoted YAML ``true``/``false`` parses as a real bool rather than a
-    string, so a bool value is normalized to its lowercase string spelling
-    before returning — ``terminal.transport: false`` still selects the PTY
-    alias in :data:`_TRANSPORT_PTY_ALIASES`.
-
-    :returns: The raw configured transport string, or ``None`` when unset.
-    """
-    import yaml
-
-    path = _global_config_path()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    try:
-        raw = yaml.safe_load(text)
-    except yaml.YAMLError:
-        return None
-    if not isinstance(raw, dict):
-        return None
-    table = raw.get(_TERMINAL_CONFIG_TABLE)
-    if not isinstance(table, dict):
-        return None
-    value = table.get(_TERMINAL_TRANSPORT_CONFIG_KEY)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return value if isinstance(value, str) else None
-
-
-def resolve_terminal_transport(
-    *,
-    override: str | None = None,
-    spec_transport: str | None = None,
-) -> str:
-    """Pick the web-terminal attach transport for one attach.
-
-    Resolution order (first match wins):
-
-    1. ``override`` — a per-attach ``?transport=control|pty`` query, letting a
-       dev A/B two open terminals side by side right now.
-    2. ``spec_transport`` — the per-terminal / per-harness
-       :attr:`TerminalEnvSpec.terminal_transport`, the gradual-rollout dial.
-    3. The global default from :func:`_global_terminal_transport_default`
-       — ``control`` unless ``terminal.transport`` in ``~/.omnigent/config.yaml``
-       opts out to ``pty``.
-
-    Unrecognized values at any level are ignored (fall through) so a stray
-    query string can never break an attach.
-
-    :param override: Per-attach transport request, e.g. ``"control"``.
-    :param spec_transport: The terminal spec's declared transport, or ``None``.
-    :returns: ``"control"`` or ``"pty"``.
-    """
-    for candidate in (override, spec_transport):
-        if candidate is not None and candidate.strip().lower() in _VALID_TERMINAL_TRANSPORTS:
-            return candidate.strip().lower()
-    return _global_terminal_transport_default()
-
 
 _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # Each terminal instance lives in a private tmpdir with this prefix
@@ -245,6 +118,7 @@ def _tmux_managed_option_commands(
     commands = [
         *_tmux_input_option_commands(scrollback),
         *_tmux_lockdown_commands(),
+        *_tmux_scrollback_key_commands(),
         *_tmux_status_option_commands(),
     ]
     if keep_alive_after_exit:
@@ -294,9 +168,17 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
     Build tmux options for scrollback and pane input behavior.
 
     ``history-limit`` is generated per terminal because it comes from
-    ``TerminalEnvSpec.scrollback``. ``mouse on`` makes the attached web
-    terminal scrollable. ``focus-events on`` lets interactive programs
-    observe pane focus changes. ``extended-keys`` with CSI-u formatting
+    ``TerminalEnvSpec.scrollback``. ``set-clipboard external`` exports tmux
+    copy-mode selections without trusting pane OSC 52 requests. ``mouse on``
+    is what lets a native ``tmux attach`` client reach the pane's scrollback:
+    tmux's default ``WheelUpPane`` binding forwards the wheel to the pane when
+    it is on the alternate screen or tracking the mouse, and only scrolls tmux
+    history for the inline CLIs that ignore it. The cost is that click-drag
+    selection on such a pane goes through tmux copy mode (which exports to the
+    attached terminal via ``set-clipboard``) rather than the terminal's own
+    selection, so native selection uses its Shift/Option-drag override.
+    ``focus-events on`` lets interactive programs observe pane
+    focus changes. ``extended-keys`` with CSI-u formatting
     lets programs inside tmux receive Kitty Keyboard Protocol keys such
     as Shift+Enter when the attached terminal supports them. Terminals
     without that protocol ignore tmux's request, and the quiet tmux
@@ -311,9 +193,42 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
         ["set-option", "-g", "history-limit", str(scrollback)],
         ["set-option", "-sq", "extended-keys", "on"],
         ["set-option", "-sq", "extended-keys-format", "csi-u"],
+        # Export tmux copy-mode selections to attached terminals without letting
+        # pane applications create tmux buffers through OSC 52.
+        ["set-option", "-sq", "set-clipboard", "external"],
         ["set-option", "-g", "mouse", "on"],
         ["set-option", "-g", "focus-events", "on"],
         ["set-option", "-g", "escape-time", "0"],
+    ]
+
+
+def _tmux_scrollback_key_commands() -> list[list[str]]:
+    """
+    Build root-table bindings that let attached users reach scrollback.
+
+    The managed lockdown removes the prefix-key routes into tmux copy mode
+    (``prefix None``, ``prefix2 None``, an emptied prefix table), and native
+    clients attach with ``-f /dev/null`` so a user's own tmux.conf cannot
+    restore one. The wheel reaches history through ``mouse on``; Page Up is
+    the keyboard equivalent, entering copy mode scrolled up one page (``-e``
+    returns to the live view once the user scrolls back to the bottom). On the
+    alternate screen the key passes through instead, so full-screen programs
+    keep their own Page Up handling.
+
+    :returns: Tmux commands binding scrollback entry keys in the root table.
+    """
+    return [
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "PPage",
+            "if-shell",
+            "-F",
+            "#{alternate_on}",
+            "send-keys PPage",
+            "copy-mode -eu",
+        ],
     ]
 
 
@@ -382,6 +297,42 @@ def _tmux_status_option_commands() -> list[list[str]]:
 # tests can lower them instead of waiting the full threshold per assertion.
 _IDLE_THRESHOLD_SECONDS = 10.0
 _IDLE_POLL_INTERVAL_SECONDS = 1.0
+# A running tmux client can fail transiently while the server and pane remain
+# healthy. Require repeated capture + session-probe failures before exit.
+_IDLE_EXIT_FAILURE_THRESHOLD = 3
+# Avoid adding probe pressure while the host cannot start another process.
+_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+
+# Process creation can fail temporarily while the host is under resource
+# pressure. Only those errno values leave terminal liveness unknown; permanent
+# launch failures retain the existing confirmed-failure behavior.
+_TRANSIENT_TMUX_PROCESS_START_ERRNOS = frozenset(
+    {
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+        errno.ENOMEM,
+        errno.EMFILE,
+        errno.ENFILE,
+    }
+)
+
+
+class _TmuxProcessStartError(RuntimeError):
+    """A tmux subprocess transiently could not start, so liveness is unknown."""
+
+
+def _is_transient_tmux_process_start_error(exc: OSError) -> bool:
+    """Return whether a tmux process launch can reasonably be retried."""
+    return exc.errno in _TRANSIENT_TMUX_PROCESS_START_ERRNOS
+
+
+def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
+    """Classify a tmux launch failure without masking permanent errors."""
+    detail = f"tmux command could not start: {' '.join(cmd)}: {exc}"
+    if _is_transient_tmux_process_start_error(exc):
+        return _TmuxProcessStartError(detail)
+    return RuntimeError(detail)
+
 
 # When a web client interacts with the terminal (attach/detach, focus
 # in/out, mouse, keystroke, resize — all stamped via
@@ -491,7 +442,7 @@ class _IdleDetector:
         # (the diff track's edge). Read by the watcher loop to drive an
         # ``on_activity`` callback — the runner-determined "this terminal's
         # PTY produced output" signal that powers the web activity badge,
-        # without any client PTY attach.
+        # without any browser client attached.
         self.changed_this_tick: bool = False
 
     def tick(self, snapshot: str, suppress_activity: bool = False) -> bool:
@@ -714,6 +665,25 @@ def _apply_utf8_locale_default(env: dict[str, str]) -> None:
 def _tmux_available() -> bool:
     """Check if tmux is installed."""
     return shutil.which("tmux") is not None
+
+
+def _require_supported_tmux() -> None:
+    """Fail before terminal setup when tmux is missing, unknown, or too old."""
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        raise RuntimeError("tmux is not installed or not on PATH")
+    version = tmux_version(tmux)
+    if version is None:
+        raise RuntimeError(
+            "Could not determine the installed tmux version; managed terminals require "
+            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
+        )
+    if version < MIN_TMUX_VERSION:
+        detected = f"{version[0]}.{version[1]}"
+        raise RuntimeError(
+            f"tmux {detected} is too old; managed terminals require "
+            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
+        )
 
 
 def _process_alive(pid: int) -> bool:
@@ -969,11 +939,6 @@ class TerminalInstance:
     # Enabled for the claude-native agent terminal so a single inner-CLI exit no
     # longer reaps the server and cascades into ``no server running`` (#540).
     keep_alive_after_exit: bool = False
-    # Preferred web-attach transport for this terminal (``"pty"`` /
-    # ``"control"``), or ``None`` to defer to the global default. Read by the
-    # attach routes via :func:`resolve_terminal_transport`; does not affect how
-    # the tmux server itself is launched.
-    terminal_transport: str | None = None
     running: bool = False
     launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
@@ -1005,6 +970,14 @@ class TerminalInstance:
     # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
     # until the process exits or when tmux reports no numeric status.
     _last_exit_status: int | None = field(default=None, repr=False)
+    # Diagnostics for the "tmux unavailable" exit path: the stderr of the last
+    # failed capture-pane probe, and of the has-session probe that then
+    # confirmed the session gone. The has-session stderr is what separates a
+    # whole-server death ("no server running on <socket>" — machine slept, tmux
+    # killed, socket dir reaped) from a single-session kill ("can't find
+    # session"). ``None`` until such a probe fails.
+    _last_capture_probe_error: str | None = field(default=None, repr=False)
+    _last_session_probe_error: str | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1048,6 +1021,37 @@ class TerminalInstance:
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
+
+    def _tmux_gone_diagnostics(self) -> str:
+        """Summarize why tmux vanished, for the "tmux unavailable" exit log.
+
+        The bare exit message can't tell an expected teardown (user quit, the
+        web client just detached, the pane already exited cleanly) from a real
+        fault (a crash frame left in the pane, a whole-server death). This
+        gathers the signals that do: the last capture-pane and has-session
+        stderr, how long since a web client last touched the terminal, any
+        recorded pane exit status, and the tail of the last captured pane.
+
+        :returns: A single-line, ``; ``-joined diagnostic summary.
+        """
+        parts: list[str] = []
+        if self._last_capture_probe_error:
+            parts.append(f"last capture error: {self._last_capture_probe_error}")
+        if self._last_session_probe_error:
+            parts.append(f"has-session said: {self._last_session_probe_error}")
+        if self._last_exit_status is not None:
+            parts.append(f"pane exit status: {self._last_exit_status}")
+        last_interaction = self._last_client_interaction_at
+        if last_interaction == float("-inf"):
+            parts.append("no web client interaction observed")
+        else:
+            idle_s = time.monotonic() - last_interaction
+            parts.append(f"{idle_s:.0f}s since web client interaction")
+        # The bottom of the pane is the most telling: a shell prompt or
+        # "[Process exited]" reads as clean teardown; a traceback as a fault.
+        tail = self.last_pane_text()
+        parts.append(f"last pane tail: {tail[-240:]!r}" if tail else "last pane: <none captured>")
+        return "; ".join(parts)
 
     def last_exit_status(self) -> int | None:
         """Return the inner process's exit code, if the pane has died.
@@ -1403,10 +1407,14 @@ class TerminalInstance:
         await self._stop_idle_watcher()
         self._stop_idle_watcher_thread()
 
-        if self.running:
+        # The watcher and is_alive() both set ``running=False`` when they
+        # observe a failure. A private socket can still belong to a live tmux
+        # server (or a remain-on-exit pane), so cleanup must not trust that
+        # advisory flag before issuing kill-server.
+        if self.running or self.socket_path.exists():
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
-            self.running = False
+        self.running = False
 
         if self.os_env is not None:
             self.os_env.close()
@@ -1494,6 +1502,7 @@ class TerminalInstance:
                 return False
             return True
 
+        consecutive_capture_failures = 0
         while self.running:
             await asyncio.sleep(_IDLE_POLL_INTERVAL_SECONDS)
             if not self.running:
@@ -1506,15 +1515,53 @@ class TerminalInstance:
                     "-p",
                     "-e",
                 )
-            except RuntimeError:
-                # tmux server likely gone.
+            except _TmuxProcessStartError as exc:
+                logger.warning(
+                    "tmux capture-pane probe could not start for terminal %s:%s; "
+                    "liveness remains unknown: %s",
+                    self.name,
+                    self.session_key,
+                    exc,
+                )
+                consecutive_capture_failures = 0
+                await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
+                continue
+            except RuntimeError as exc:
+                self._last_capture_probe_error = str(exc)
+                logger.warning(
+                    "tmux capture-pane probe failed for terminal %s:%s: %s",
+                    self.name,
+                    self.session_key,
+                    exc,
+                )
+                session_exists = await self._tmux_session_exists_async()
+                if session_exists is not False:
+                    consecutive_capture_failures = 0
+                    if session_exists is None:
+                        await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
+                    continue
+                consecutive_capture_failures += 1
+                if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
+                    continue
+                logger.error(
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s (%s)",
+                    consecutive_capture_failures,
+                    self.name,
+                    self.session_key,
+                    self._tmux_gone_diagnostics(),
+                )
                 self.running = False
                 if on_exit is not None:
                     await _fire(on_exit, "exit")
                 return
 
+            consecutive_capture_failures = 0
             self._remember_pane_snapshot(snapshot)
-            if await self._pane_is_dead_async():
+            pane_dead = await self._pane_is_dead_async()
+            if pane_dead is None:
+                await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
+                continue
+            if pane_dead:
                 # remain-on-exit kept the server alive after the inner CLI
                 # exited; report the exit rather than treating the frozen pane
                 # as an idle agent. Detach all clients so attached tmux attach
@@ -1642,8 +1689,8 @@ class TerminalInstance:
         Runs on the daemon thread spawned by
         :meth:`start_idle_watcher_thread`. Stops cleanly when
         ``stop_event`` is set or when ``self.running`` flips to
-        ``False`` (close path), and exits silently if ``tmux
-        capture-pane`` fails (server likely gone).
+        ``False`` (close path). A failed ``capture-pane`` is confirmed with
+        ``has-session`` and must repeat before the watcher reports exit.
 
         :param stop_event: Event the close path sets to signal
             shutdown. Doubles as the poll-interval sleep via
@@ -1667,6 +1714,7 @@ class TerminalInstance:
         """
         detector = _IdleDetector(idle_threshold_s=idle_threshold_s)
         interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
+        consecutive_capture_failures = 0
         while self.running:
             # ``Event.wait`` doubles as the poll-interval sleep, so
             # ``stop_event.set()`` from :meth:`close` returns within
@@ -1675,14 +1723,51 @@ class TerminalInstance:
                 return
             if not self.running:
                 return
-            snapshot = self._capture_pane_for_idle_or_none()
+            try:
+                snapshot = self._capture_pane_for_idle_or_none()
+            except _TmuxProcessStartError as exc:
+                logger.warning(
+                    "tmux capture-pane probe could not start for terminal %s:%s; "
+                    "liveness remains unknown: %s",
+                    self.name,
+                    self.session_key,
+                    exc,
+                )
+                consecutive_capture_failures = 0
+                if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
+                    return
+                continue
             if snapshot is None:
+                session_exists = self._tmux_session_exists_sync()
+                if session_exists is not False:
+                    consecutive_capture_failures = 0
+                    if session_exists is None and stop_event.wait(
+                        _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS
+                    ):
+                        return
+                    continue
+                consecutive_capture_failures += 1
+                if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
+                    continue
+                logger.error(
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s (%s)",
+                    consecutive_capture_failures,
+                    self.name,
+                    self.session_key,
+                    self._tmux_gone_diagnostics(),
+                )
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
                 return
+            consecutive_capture_failures = 0
             self._remember_pane_snapshot(snapshot)
-            if self._pane_is_dead():
+            pane_dead = self._pane_is_dead()
+            if pane_dead is None:
+                if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
+                    return
+                continue
+            if pane_dead:
                 # The inner CLI exited but remain-on-exit kept the server, so
                 # capture-pane still succeeds (the snapshot above is the final
                 # frame, now remembered for diagnostics). Report the exit
@@ -1731,17 +1816,45 @@ class TerminalInstance:
         """
         Capture the pane for an idle tick, or signal "tmux gone".
 
-        :returns: Pane bytes from ``tmux capture-pane -p -e``, or
-            ``None`` when the tmux subprocess raised — the
-            threaded loop reads ``None`` as "stop watching, the
-            server is no longer there".
+        :returns: Pane bytes from ``tmux capture-pane -p -e``, or ``None`` when
+            tmux ran and rejected the command. The threaded loop confirms and
+            counts that failure before treating it as exit.
+        :raises _TmuxProcessStartError: When the probe process could not start
+            and terminal liveness is therefore unknown.
         """
         try:
             return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
-        except RuntimeError:
+        except _TmuxProcessStartError:
+            raise
+        except RuntimeError as exc:
+            self._last_capture_probe_error = str(exc)
+            logger.warning(
+                "tmux capture-pane probe failed for terminal %s:%s: %s",
+                self.name,
+                self.session_key,
+                exc,
+            )
             return None
 
-    def _pane_is_dead(self) -> bool:
+    def _tmux_session_exists_sync(self) -> bool | None:
+        """Confirm tmux exists, or return ``None`` when the probe cannot start."""
+        try:
+            self._tmux_output_sync("has-session", "-t", self.tmux_target)
+        except _TmuxProcessStartError as exc:
+            logger.warning(
+                "tmux has-session probe could not start for terminal %s:%s; "
+                "liveness remains unknown: %s",
+                self.name,
+                self.session_key,
+                exc,
+            )
+            return None
+        except RuntimeError as exc:
+            self._last_session_probe_error = str(exc)
+            return False
+        return True
+
+    def _pane_is_dead(self) -> bool | None:
         """
         Report whether the pane's process exited while tmux kept the pane.
 
@@ -1752,15 +1865,24 @@ class TerminalInstance:
         to report the exit deterministically once ``capture-pane`` still
         succeeds against the surviving server.
 
-        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``.
-            ``False`` when the pane is live, or when the probe itself fails
-            (server already gone) — the caller's capture step already handles
-            the vanished-server path.
+        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
+            ``False`` when the pane is live or tmux rejects the probe (the
+            caller's capture step handles a vanished server); ``None`` when
+            the probe process cannot start and liveness is unknown.
         """
         try:
             out = self._tmux_output_sync(
                 "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
+        except _TmuxProcessStartError as exc:
+            logger.warning(
+                "tmux pane-death probe could not start for terminal %s:%s; "
+                "liveness remains unknown: %s",
+                self.name,
+                self.session_key,
+                exc,
+            )
+            return None
         except RuntimeError:
             return False
         self._remember_exit_status(out)
@@ -1850,12 +1972,13 @@ class TerminalInstance:
         exists AND its pane process has not exited.
 
         When the session is gone (probe exits non-zero), the pane is dead, or
-        the probe cannot start, this marks ``self.running`` false. That side
-        effect is intentional: subsequent pollers use the in-memory flag as a
-        fast path instead of re-forking tmux after the process has exited.
+        the probe has a permanent launch or communication failure, this marks
+        ``self.running`` false. A transient resource-related launch failure
+        leaves liveness unknown and preserves the optimistic in-memory state.
 
-        :returns: ``True`` when the session exists and its pane process is
-            still running; otherwise ``False``.
+        :returns: ``True`` when the pane is live or a transient launch failure
+            preserves the optimistic state; ``False`` on confirmed death or a
+            permanent probe failure.
         """
         if not self.running:
             return False
@@ -1870,6 +1993,20 @@ class TerminalInstance:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
+        except OSError as exc:
+            if _is_transient_tmux_process_start_error(exc):
+                logger.warning(
+                    "tmux liveness probe could not start for terminal %s:%s; "
+                    "preserving optimistic running state: %s",
+                    self.name,
+                    self.session_key,
+                    exc,
+                )
+                return self.running
+            self.running = False
+            return False
+
+        try:
             stdout, _ = await proc.communicate()
             # rc != 0 → session/server gone; a "1" line → the pane process
             # exited but the session was kept alive by remain-on-exit. Both mean
@@ -1884,46 +2021,86 @@ class TerminalInstance:
             self.running = False
             return False
 
-    async def _pane_is_dead_async(self) -> bool:
+    async def _pane_is_dead_async(self) -> bool | None:
         """
         Async sibling of :meth:`_pane_is_dead` for the asyncio idle watcher.
 
         :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
-            ``False`` when the pane is live or the probe fails (server gone,
-            which the caller's capture step handles).
+            ``False`` when the pane is live or tmux rejects the probe (the
+            caller's capture step handles a vanished server); ``None`` when
+            the probe process cannot start and liveness is unknown.
         """
         try:
             out = await self._tmux_output(
                 "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
+        except _TmuxProcessStartError as exc:
+            logger.warning(
+                "tmux pane-death probe could not start for terminal %s:%s; "
+                "liveness remains unknown: %s",
+                self.name,
+                self.session_key,
+                exc,
+            )
+            return None
         except RuntimeError:
             return False
         self._remember_exit_status(out)
         return out.split()[:1] == ["1"]
 
+    async def _tmux_session_exists_async(self) -> bool | None:
+        """Confirm tmux exists, or return ``None`` when the probe cannot start."""
+        try:
+            await self._tmux_output("has-session", "-t", self.tmux_target)
+        except _TmuxProcessStartError as exc:
+            logger.warning(
+                "tmux has-session probe could not start for terminal %s:%s; "
+                "liveness remains unknown: %s",
+                self.name,
+                self.session_key,
+                exc,
+            )
+            return None
+        except RuntimeError as exc:
+            self._last_session_probe_error = str(exc)
+            return False
+        return True
+
     async def _tmux(self, *args: str) -> None:
         """Run a tmux command against this instance's server."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._tmux_base_cmd(),
-            *args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        cmd = [*self._tmux_base_cmd(), *args]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise _tmux_process_start_error(cmd, exc) from exc
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
-            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
+            detail = stderr.decode(errors="replace").strip() or "<no stderr>"
+            raise RuntimeError(
+                f"tmux command failed (rc={proc.returncode}): {' '.join(cmd)}: {detail}"
+            )
 
     async def _tmux_output(self, *args: str) -> str:
         """Run a tmux command and return stdout."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._tmux_base_cmd(),
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        cmd = [*self._tmux_base_cmd(), *args]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise _tmux_process_start_error(cmd, exc) from exc
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
+            detail = stderr.decode(errors="replace").strip() or "<no stderr>"
+            raise RuntimeError(
+                f"tmux command failed (rc={proc.returncode}): {' '.join(cmd)}: {detail}"
+            )
         return stdout.decode()
 
     def _tmux_output_sync(self, *args: str) -> str:
@@ -1938,13 +2115,20 @@ class TerminalInstance:
         :param args: Args to pass after ``tmux -S <socket>``,
             e.g. ``("capture-pane", "-t", "main", "-p", "-e")``.
         :returns: The captured stdout, decoded as UTF-8.
-        :raises RuntimeError: When the tmux subprocess exits
-            non-zero (typically because the server has gone away).
+        :raises _TmuxProcessStartError: When the tmux subprocess transiently
+            cannot start because of host resource pressure.
+        :raises RuntimeError: When the subprocess permanently cannot start or
+            exits non-zero (typically because the server has gone away).
         """
-        proc = subprocess.run([*self._tmux_base_cmd(), *args], capture_output=True, check=False)
+        cmd = [*self._tmux_base_cmd(), *args]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, check=False)
+        except OSError as exc:
+            raise _tmux_process_start_error(cmd, exc) from exc
         if proc.returncode != 0:
+            detail = proc.stderr.decode(errors="replace").strip() or "<no stderr>"
             raise RuntimeError(
-                f"tmux command failed: {' '.join(args)}: {proc.stderr.decode().strip()}"
+                f"tmux command failed (rc={proc.returncode}): {' '.join(cmd)}: {detail}"
             )
         return proc.stdout.decode()
 
@@ -2017,11 +2201,10 @@ def create_terminal_instance(
     if IS_WINDOWS:
         raise RuntimeError(
             "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
-            "Run an SDK-based harness via `omnigent run <agent.yaml>` (e.g. the "
+            f"Run an SDK-based harness via `{cli_invocation()} run <agent.yaml>` (e.g. the "
             "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
         )
-    if not _tmux_available():
-        raise RuntimeError("tmux is not installed or not on PATH")
+    _require_supported_tmux()
 
     # Create the instance's private directory.
     private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))
@@ -2112,7 +2295,6 @@ def create_terminal_instance(
         tmux_allow_passthrough=spec.tmux_allow_passthrough,
         tmux_start_on_attach=spec.tmux_start_on_attach,
         keep_alive_after_exit=spec.keep_alive_after_exit,
-        terminal_transport=spec.terminal_transport,
     )
 
     return TerminalCreateResult(instance=instance, cwd=cwd)

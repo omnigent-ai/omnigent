@@ -1,7 +1,8 @@
 # UI diff snapshot tests
 
-One committed visual-regression baseline per page, each captured full-viewport at
-1280×800 with the color scheme pinned to `light`, gated together in CI.
+Committed visual-regression baselines for full app pages and opted-in Storybook
+component states, each captured at 1280×800 with the color scheme pinned to
+`light` and gated together in CI.
 
 Each page's data calls are stubbed via `page.route` with fixed fixtures, so the
 rendered view is a pure function of the committed bundle and needs no element
@@ -23,6 +24,10 @@ Pages covered:
   transcript that mounts the left-edge tick minimap (the rail only renders for
   two or more turns), guarding the spacing between the transcript column and the
   rail. [`test_chat_turn_rail_snapshot.py`](test_chat_turn_rail_snapshot.py)
+- **Storybook component states** — every story tagged `visual-snapshot` in the
+  generated Storybook index is rendered through `iframe.html` and parameterized
+  as an independent snapshot case.
+  [`test_storybook_snapshot.py`](test_storybook_snapshot.py)
 
 Baselines are committed under `snapshots/<test_module>/<test_name>/<name>[chromium][linux].png`.
 
@@ -61,7 +66,8 @@ inputs skips the render via the `detect` job's `if` gate, and a job skipped by
 
 - On every PR that touches a render input (web, the visual tests + fixtures,
   or the pinned toolchain — see the `detect` job in `ui-snapshot.yml`),
-  `ui-snapshot.yml` renders each page and compares it to its committed baseline.
+  `ui-snapshot.yml` builds the SPA and Storybook, then renders each page and
+  tagged story and compares it to its committed baseline.
   Any pixel difference on any page fails the check; PRs that touch none of those
   skip the render (reported as a passing skip).
 - **Every run (pass or fail)** uploads one artifact and links it in the job
@@ -142,6 +148,24 @@ upserts a PR comment pointing back to these paths. It runs as `workflow_run` so
 it can comment without ever executing PR/fork code, which means it only activates
 once merged to `main` (it does not fire on its own PR).
 
+## Adding a Storybook component snapshot
+
+1. Add a co-located `ComponentName.stories.tsx` using Component Story Format.
+2. Model meaningful visual states as separate named story exports with fixed,
+   deterministic data.
+3. Add `tags: ["visual-snapshot"]` to the story metadata only when every story
+   in that file is stable enough for pixel comparison. Stories without the tag
+   remain available for development but are not added to the snapshot gate.
+4. Run `pnpm --filter web run storybook` to inspect the states, then regenerate
+   and review the pinned-renderer PNGs using one of the update flows above.
+
+Removing, renaming, or untagging a story makes the gate reject its stale PNG.
+The pinned update flows remove those orphaned baselines from the restored tree.
+
+The shared Storybook preview imports the app styles and provides theme and
+Tooltip contexts. Add narrowly scoped per-story decorators for other providers;
+do not make stories depend on a live backend.
+
 ## Adding a new page snapshot
 
 Each page is one `@pytest.mark.visual` test in its own `test_<page>_snapshot.py`.
@@ -175,6 +199,7 @@ uv sync --extra all --group test
 uv run --no-sync playwright install --with-deps chromium
 pnpm install --frozen-lockfile --filter web
 pnpm --filter web run build
+pnpm --filter web run build:storybook
 # First run with no baseline creates one (and fails); subsequent runs compare:
 uv run --no-sync pytest tests/e2e_ui/visual -m visual --ui-skip-build
 ```

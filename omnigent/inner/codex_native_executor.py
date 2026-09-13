@@ -12,19 +12,29 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
-from omnigent.codex_native_app_server import client_for_transport
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native.app_server import (
+    CodexAppServerClient,
+    CodexAppServerResponseError,
+    client_for_transport,
+)
+from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    CodexNativeBridgeState,
     cancel_pending_mcp_startup,
+    clear_active_turn_id_if_matches,
     mcp_startup_waiting_detail,
     read_bridge_startup_error,
     read_bridge_state,
     read_mcp_startup,
     update_active_turn_id,
+    write_codex_config_effort,
     write_codex_config_model,
 )
-from omnigent.inner.codex_goal_command import goal_objective_from_content
+from omnigent.inner.codex_goal_command import (
+    goal_objective_from_content,
+    goal_objective_length_error,
+)
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -40,9 +50,193 @@ from omnigent.inner.native_attachments import (
     parse_data_uri,
     unresolved_attachment_marker,
 )
-from omnigent.reasoning_effort import CODEX_EFFORTS, effort_for_model_switch, validate_effort
+from omnigent.util.reasoning_effort import (
+    CODEX_NATIVE_EFFORTS,
+    effort_for_model_switch,
+    validate_effort,
+)
 
 _logger = logging.getLogger(__name__)
+
+_NO_ACTIVE_TURN_ERROR_CODE = -32600
+_NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
+_ACTIVE_TURN_MISMATCH_MARKERS = ("expected active turn id", "but found")
+
+
+def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
+    """Return whether Codex explicitly rejected a steer because the turn ended."""
+    return (
+        error.code == _NO_ACTIVE_TURN_ERROR_CODE
+        and error.message is not None
+        and error.message.strip().casefold() == _NO_ACTIVE_TURN_ERROR_MESSAGE
+    )
+
+
+def _is_active_turn_mismatch(error: CodexAppServerResponseError) -> bool:
+    """Return whether a newer turn replaced the one we recorded.
+
+    The app-server rejects a steer/interrupt with ``expected active turn id `X`
+    but found `Y``` (also code -32600) when a turn started after we read the
+    bridge's ``active_turn_id``. Match on the phrasing, not the ids, since the
+    message quotes them and the backtick formatting varies across builds.
+    """
+    if error.code != _NO_ACTIVE_TURN_ERROR_CODE or error.message is None:
+        return False
+    message = error.message.casefold()
+    return all(marker in message for marker in _ACTIVE_TURN_MISMATCH_MARKERS)
+
+
+def _is_stale_active_turn(error: CodexAppServerResponseError) -> bool:
+    """Return whether our recorded active turn is no longer the thread's active one.
+
+    Covers both -32600 shapes: the turn ended ("no active turn to steer") and a
+    newer turn replaced it ("expected active turn id X but found Y"). Both call
+    for the same recovery — re-read bridge state and retarget the live turn.
+    """
+    return _is_no_active_turn_to_steer(error) or _is_active_turn_mismatch(error)
+
+
+async def _start_codex_turn(
+    client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    input_items: list[dict[str, object]],
+    settings_overrides: Mapping[str, object],
+) -> None:
+    """Apply optional settings and start one Codex turn on an idle thread."""
+    if settings_overrides:
+        await client.request(
+            "thread/settings/update",
+            {
+                "threadId": state.thread_id,
+                **settings_overrides,
+            },
+        )
+        switched_model = settings_overrides.get("model")
+        if isinstance(switched_model, str) and switched_model:
+            if not write_codex_config_model(bridge_dir, switched_model):
+                _logger.warning(
+                    "Failed to mirror codex model switch into config.toml: model=%s",
+                    switched_model,
+                )
+        # Mirror an applied effort the same way (after the model write, whose
+        # clamp may have rewritten the stale effort line): the forwarder's
+        # effort mirror treats config.toml as the source of truth, and a fresh
+        # forwarder state (thread resume / reconnect) re-reads it — without
+        # this write it would revert a composer-picked effort to the stale
+        # launch value.
+        switched_effort = settings_overrides.get("effort")
+        if isinstance(switched_effort, str) and switched_effort:
+            if not write_codex_config_effort(bridge_dir, switched_effort):
+                _logger.warning(
+                    "Failed to mirror codex effort switch into config.toml: effort=%s",
+                    switched_effort,
+                )
+    response = await client.request(
+        "turn/start",
+        {
+            "threadId": state.thread_id,
+            "input": input_items,
+            "environments": [
+                {
+                    "environmentId": "local",
+                    "cwd": state.cwd or str(Path.cwd()),
+                }
+            ],
+        },
+    )
+    result = _json_object(response.get("result"))
+    turn = _json_object(result.get("turn")) if result is not None else None
+    turn_id = turn.get("id") if turn is not None else None
+    if isinstance(turn_id, str) and turn_id:
+        update_active_turn_id(bridge_dir, turn_id)
+        _logger.info("Codex native started turn: turn_id=%s", turn_id)
+
+
+async def _steer_codex_turn(
+    client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    input_items: list[dict[str, object]],
+) -> None:
+    """Steer one bridge-recorded active Codex turn."""
+    assert state.active_turn_id is not None
+    response = await client.request(
+        "turn/steer",
+        {
+            "threadId": state.thread_id,
+            "expectedTurnId": state.active_turn_id,
+            "input": input_items,
+        },
+    )
+    result = _json_object(response.get("result"))
+    turn_id = result.get("turnId") if result is not None else None
+    if isinstance(turn_id, str) and turn_id:
+        update_active_turn_id(bridge_dir, turn_id)
+        _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+
+
+async def _inject_codex_turn(
+    client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    input_items: list[dict[str, object]],
+    settings_overrides: Mapping[str, object],
+) -> None:
+    """Steer an active turn or start one, recovering one proven stale steer."""
+    if state.active_turn_id is None:
+        await _start_codex_turn(
+            client,
+            bridge_dir=bridge_dir,
+            state=state,
+            input_items=input_items,
+            settings_overrides=settings_overrides,
+        )
+        return
+
+    expected_turn_id = state.active_turn_id
+    try:
+        await _steer_codex_turn(
+            client,
+            bridge_dir=bridge_dir,
+            state=state,
+            input_items=input_items,
+        )
+        return
+    except CodexAppServerResponseError as error:
+        if not _is_stale_active_turn(error):
+            raise
+
+    # Codex authoritatively says A is no longer the active turn (it ended, or a
+    # newer turn B replaced it). Clear A only if it is still the bridge's value;
+    # a concurrent turn/started(B) must survive this recovery.
+    clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
+    recovered_state = read_bridge_state(bridge_dir)
+    if recovered_state is None or recovered_state.session_id != state.session_id:
+        raise RuntimeError("Codex native bridge changed while recovering a stale turn")
+    if recovered_state.active_turn_id is not None:
+        _logger.info(
+            "Codex native stale steer raced with a newer turn; steering turn_id=%s",
+            recovered_state.active_turn_id,
+        )
+        await _steer_codex_turn(
+            client,
+            bridge_dir=bridge_dir,
+            state=recovered_state,
+            input_items=input_items,
+        )
+        return
+    _logger.info("Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id)
+    await _start_codex_turn(
+        client,
+        bridge_dir=bridge_dir,
+        state=recovered_state,
+        input_items=input_items,
+        settings_overrides=settings_overrides,
+    )
 
 
 class CodexNativeExecutor(Executor):
@@ -105,24 +299,18 @@ class CodexNativeExecutor(Executor):
             )
             await client.connect()
             try:
-                response = await client.request(
-                    "turn/steer",
-                    {
-                        "threadId": state.thread_id,
-                        "expectedTurnId": state.active_turn_id,
-                        "input": input_items,
-                    },
+                await _inject_codex_turn(
+                    client,
+                    bridge_dir=self._bridge_dir,
+                    state=state,
+                    input_items=input_items,
+                    settings_overrides={},
                 )
             except Exception:  # noqa: BLE001 - steering is best-effort from the runner facade.
                 _logger.warning("Codex native turn/steer failed", exc_info=True)
                 return False
             finally:
                 await client.close()
-            result = _json_object(response.get("result"))
-            turn_id = result.get("turnId") if result is not None else None
-            if isinstance(turn_id, str) and turn_id:
-                update_active_turn_id(self._bridge_dir, turn_id)
-                _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
             return True
 
     async def interrupt_session(self, session_key: str) -> bool:
@@ -172,13 +360,25 @@ class CodexNativeExecutor(Executor):
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
-                await client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
-                )
+                try:
+                    await client.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                        },
+                    )
+                except CodexAppServerResponseError as error:
+                    # The recorded turn already ended or was replaced by a newer
+                    # one, so there is nothing left to interrupt — not a failure.
+                    # The local cancel map was already flipped above.
+                    if not _is_stale_active_turn(error):
+                        raise
+                    _logger.info(
+                        "Codex native interrupt: recorded turn already advanced; "
+                        "nothing to interrupt (turn_id=%s)",
+                        state.active_turn_id,
+                    )
         finally:
             await client.close()
         return True
@@ -210,6 +410,13 @@ class CodexNativeExecutor(Executor):
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
         goal_objective = goal_objective_from_content(latest_user_content)
+        if goal_objective is not None:
+            # Reject over-long objectives here so the app-server's raw
+            # JSON-RPC -32600 error never reaches the user.
+            length_error = goal_objective_length_error(goal_objective)
+            if length_error is not None:
+                yield ExecutorError(message=length_error)
+                return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
             if goal_objective is not None
@@ -272,62 +479,15 @@ class CodexNativeExecutor(Executor):
                                 "objective": goal_objective,
                             },
                         )
-                    if state.active_turn_id is not None:
-                        response = await client.request(
-                            "turn/steer",
-                            {
-                                "threadId": state.thread_id,
-                                "expectedTurnId": state.active_turn_id,
-                                "input": input_items,
-                            },
-                        )
-                        result = _json_object(response.get("result"))
-                        turn_id = result.get("turnId") if result is not None else None
-                        if isinstance(turn_id, str) and turn_id:
-                            update_active_turn_id(self._bridge_dir, turn_id)
-                            _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
-                    else:
-                        # A web ``/model`` pick reaches Codex through
-                        # ``thread/settings/update`` (its
-                        # ``ThreadSettingsUpdateParams`` carries ``model`` /
-                        # ``effort``), NOT ``turn/start`` — whose params are
-                        # input/context only. Apply settings first so the
-                        # change persists for this and later turns, then send
-                        # the bare turn.
-                        if settings_overrides:
-                            await client.request(
-                                "thread/settings/update",
-                                {
-                                    "threadId": state.thread_id,
-                                    **settings_overrides,
-                                },
-                            )
-                            # Mirror the accepted switch into config.toml —
-                            # the file the forwarder's model mirror and the
-                            # cost-gate hook read. thread/settings/update does
-                            # not write it, so without this the stale launch
-                            # model is mirrored back at the next turn/started
-                            # and silently reverts the switch.
-                            switched_model = settings_overrides.get("model")
-                            if isinstance(switched_model, str) and switched_model:
-                                if not write_codex_config_model(self._bridge_dir, switched_model):
-                                    _logger.warning(
-                                        "Failed to mirror codex model switch into "
-                                        "config.toml: model=%s",
-                                        switched_model,
-                                    )
-                        turn_params: dict[str, object] = {
-                            "threadId": state.thread_id,
-                            "input": input_items,
-                        }
-                        response = await client.request("turn/start", turn_params)
-                        result = _json_object(response.get("result"))
-                        turn = _json_object(result.get("turn")) if result is not None else None
-                        turn_id = turn.get("id") if turn is not None else None
-                        if isinstance(turn_id, str) and turn_id:
-                            update_active_turn_id(self._bridge_dir, turn_id)
-                            _logger.info("Codex native started turn: turn_id=%s", turn_id)
-                except Exception as exc:  # noqa: BLE001 - converted into a harness error event.
+                    await _inject_codex_turn(
+                        client,
+                        bridge_dir=self._bridge_dir,
+                        state=state,
+                        input_items=input_items,
+                        settings_overrides=settings_overrides,
+                    )
+                except Exception as exc:
+                    _logger.exception("Codex native turn injection failed")
                     error_msg = f"Codex native executor error: {exc}"
                     # Name the servers a still-unsettled MCP startup is
                     # blocked on — the most common cause of an injection
@@ -373,7 +533,7 @@ def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
         overrides["model"] = model
     raw_effort = config.extra.get("reasoning_effort")
     try:
-        effort = validate_effort(raw_effort, "codex", CODEX_EFFORTS)
+        effort = validate_effort(raw_effort, "codex", CODEX_NATIVE_EFFORTS)
     except ValueError:
         # A bad effort must not sink the turn — drop it and keep Codex's
         # current effort rather than failing the whole dispatch.

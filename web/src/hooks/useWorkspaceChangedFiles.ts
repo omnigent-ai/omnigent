@@ -14,14 +14,17 @@
 // gracefully when the runner has no OS environment for the session
 // (e.g. cloud-only agents).
 
-import { useEffect, useRef } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef } from "react";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSession } from "@/hooks/useSession";
+import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
+import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
 /** True when `id` is the focused conversation and its agent loop is live. */
-function useSessionActive(conversationId: string | undefined): boolean {
+export function useSessionActive(conversationId: string | undefined): boolean {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   if (!conversationId || conversationId !== focusedId) return false;
@@ -62,7 +65,7 @@ export function useWorkspaceServeable(conversationId: string | undefined): boole
  * invalidate refetches once so the panel reflects end-of-turn state without
  * the user having to reload the page.
  */
-function useTrailingInvalidate(
+export function useTrailingInvalidate(
   conversationId: string | undefined,
   sessionActive: boolean,
   queryKeyPrefix: string,
@@ -146,13 +149,9 @@ export class PathUnreachableError extends Error {
 
 // ── Runner-boot retry policy ──────────────────────────────────────────────────
 //
-// A freshly-bound session whose runner is still booting/connecting its WS
-// tunnel answers 503 (``runner_unavailable``) until it comes up. The previous
-// budget — 3 retries at a flat 1.5s (~4.5s) — gave up before a cold runner
-// finished, so the Working-folder panel flashed "Failed to load: 503". These
-// queries instead retry the runner-offline case with capped exponential
-// backoff for ~2 minutes, long enough to outlast a cold boot; the reconnect
-// hint only shows once that budget is exhausted (a genuinely offline runner).
+// A runner that is still connecting answers 503 (``runner_unavailable``).
+// Retry only while session liveness says that connection is imminent; a 503
+// from a stale or dead runner will not clear because of a background GET.
 
 /**
  * Max retry attempts for a still-connecting runner. With the backoff schedule
@@ -175,16 +174,20 @@ export function shouldRetryRunnerOffline(failureCount: number, error: Error): bo
 }
 
 /**
- * Whether a 503 response is the app's `runner_unavailable` error rather
- * than a generic infrastructure 503.
- *
- * A 503 is NOT always the bound runner being offline: the Databricks Apps
- * front door / gateway returns 503 while the app restarts or cold-starts.
- * Only the app-level error carries `{"error": {"code": "runner_unavailable"}}`,
- * so match on that — a bare/HTML 503 falls through to the normal
- * error+retry path instead of the (misleading) "agent is asleep" hint.
+ * Whether retrying a runner-offline response can plausibly succeed.
  */
+function useRunnerRecovering(conversationId: string | undefined): boolean {
+  const { session, isLoading } = useSession(conversationId);
+  const turnActive = useSessionActive(conversationId);
+  const liveness = useSessionLiveness(conversationId, livenessRowFromSession(session), {
+    turnActive,
+  });
+  return isLoading || liveness.kind === "starting";
+}
+
+/** Whether `res` is the app's runner-offline 503 response. */
 export async function isRunnerUnavailable503(res: Response): Promise<boolean> {
+  if (res.status !== 503) return false;
   try {
     const body = (await res.json()) as { error?: { code?: string } };
     return body?.error?.code === "runner_unavailable";
@@ -264,6 +267,7 @@ export function useWorkspaceChangedFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
+  const recovering = useRunnerRecovering(conversationId);
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -277,11 +281,7 @@ export function useWorkspaceChangedFiles(
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    // Capped-backoff retry of the runner-offline case (see
-    // shouldRetryRunnerOffline). Whether the eventual error reads as
-    // "asleep" vs the plain empty state is decided by the session's
-    // `failed` status, not by retries.
-    retry: shouldRetryRunnerOffline,
+    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     // No polling: the SSE ``session.changed_files.invalidated`` event
     // (runner-emitted after file-mutating tools, throttled) drives
@@ -357,8 +357,11 @@ async function fetchWorkspaceAllFiles(
   location = "",
 ): Promise<WorkspaceAllFilesResult> {
   const segment = browseLocationSegment(location);
+  const params = new URLSearchParams({ limit: "1000", order: "asc" });
+  const base = browseLocationBase(location);
+  if (base) params.set("base", base);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?limit=1000&order=asc`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?${params}`,
   );
   if (res.status === 404) {
     return { available: false, data: [] };
@@ -402,6 +405,7 @@ export function useWorkspaceAllFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
+  const recovering = useRunnerRecovering(conversationId);
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -415,12 +419,16 @@ export function useWorkspaceAllFiles(
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    // Capped-backoff retry of the runner-offline case (see
-    // shouldRetryRunnerOffline). The asleep-vs-empty decision is made by
-    // the session's `failed` status downstream, not by retries.
-    retry: shouldRetryRunnerOffline,
+    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
-    staleTime: 5_000,
+    // Keep the tree warm on revisits: within staleTime a return to a
+    // previously-loaded conversation/location paints its cached tree with no
+    // loading flash. Freshness on turn-completion is still handled by
+    // useTrailingInvalidate above. No cross-key placeholderData — carrying the
+    // previous conversation's tree under a new conversation's key fed stale
+    // files into the folder tree's default-expansion cache; virtualization
+    // already keeps the per-switch render cheap, so the warm-carry isn't needed.
+    staleTime: 30_000,
   });
 }
 
@@ -438,12 +446,29 @@ export function useWorkspaceAllFiles(
  * @returns The encoded path segment to append to a filesystem route.
  */
 export function browseLocationSegment(location: string): string {
-  if (location === "" || location === "/") {
-    return location === "/" ? "%2F" : "";
-  }
-  const absolute = location.startsWith("/");
-  const encoded = location.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
-  return absolute ? `%2F${encoded}` : encoded;
+  if (location === "" || location === "/") return "";
+  // A per-segment-encoded path with LITERAL slash separators and NO leading
+  // "%2F" — for BOTH workspace-relative and host-absolute locations. An
+  // absolute location's leading slash is stripped here and re-added by the
+  // server, exactly as the host filesystem endpoint does; its base is named
+  // out of band via `?base=host` (see `browseLocationBase`). A "%2F" leading
+  // marker would decode to a "//" that reverse proxies — the Databricks Apps
+  // front door among them — merge back to a single "/", silently turning an
+  // absolute path into a workspace-relative one and listing a nonexistent
+  // path under the workspace.
+  return location.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * The `base` query value naming how a browse location's `{path}` is rooted:
+ * `"host"` for an absolute path on the host, `null` for a workspace-relative
+ * one (the default, omitted from the URL).
+ *
+ * @param location Browse location, ``""`` for the workspace root.
+ * @returns ``"host"`` when absolute, else ``null``.
+ */
+export function browseLocationBase(location: string): "host" | null {
+  return location.startsWith("/") ? "host" : null;
 }
 
 /**
@@ -500,6 +525,8 @@ async function fetchWorkspaceFileSearch(
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
   const segment = browseLocationSegment(location);
+  const base = browseLocationBase(location);
+  if (base) params.set("base", base);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
   );
@@ -507,6 +534,7 @@ async function fetchWorkspaceFileSearch(
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
   if (res.status === 404) return [];
+  if (await isRunnerUnavailable503(res)) return [];
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return mapFilesystemEntries((await res.json()) as FilesystemListResponse, location);
 }
@@ -564,8 +592,11 @@ async function fetchWorkspaceDirectory(
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
   const encodedPath = browseLocationSegment(target);
+  const params = new URLSearchParams({ limit: "1000", order: "asc" });
+  const base = browseLocationBase(target);
+  if (base) params.set("base", base);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?limit=1000&order=asc`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?${params}`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // The tree addresses children relative to the location it is rooted at, one
@@ -693,6 +724,7 @@ async function fetchDirEntriesTolerant(
   // 404 = the directory (or the whole OS environment) is absent, so the file
   // can't exist. Degrade to "no entries" rather than surfacing an error.
   if (res.status === 404) return [];
+  if (await isRunnerUnavailable503(res)) return [];
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
 }
@@ -813,15 +845,20 @@ async function fetchWorkspaceEnvironment(conversationId: string): Promise<Worksp
  * (``metadata.root`` absent in the 200 response).
  */
 export function useWorkspaceEnvironment(
-  conversationId: string | undefined,
+  rawConversationId: string | undefined,
   options: WorkspaceQueryOptions = {},
 ) {
+  // A `temp:*` id (navigate-first new-chat window) has no server workspace —
+  // normalize to undefined so nothing (env, and the changed/all-files queries
+  // that gate on its result) hits `/v1/sessions/temp:*/resources/*`.
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
+  const recovering = useRunnerRecovering(conversationId);
   return useQuery({
     queryKey: ["workspace-environment", conversationId],
     queryFn: () => fetchWorkspaceEnvironment(conversationId!),
     enabled: (options.enabled ?? true) && !!conversationId && serveable !== false,
-    retry: shouldRetryRunnerOffline,
+    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 60_000,
   });
@@ -845,5 +882,61 @@ export function useWorkspaceDirectory(
     queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!, location),
     enabled: !!conversationId && !!dirPath && serveable !== false,
     staleTime: 5_000,
+  });
+}
+
+/** One expanded lazy directory's fetched children + load/error state. */
+export interface DirectoryResult {
+  data: WorkspaceFile[] | undefined;
+  isLoading: boolean;
+  isError: boolean;
+}
+
+/**
+ * Batched form of {@link useWorkspaceDirectory}: subscribe to the listings of
+ * many expanded lazy directories at once, keyed by path.
+ *
+ * The virtualized tree flattens the visible node list from a central place, so
+ * it can't call one hook per rendered row (rows come and go with scrolling, and
+ * a scrolled-off row unmounting would drop its fetch). Fetching here — once,
+ * for every currently-expanded lazy dir — keeps the queries alive regardless of
+ * which rows are windowed in, and shares the same cache entries as the singular
+ * hook (identical query keys).
+ */
+export function useWorkspaceDirectories(
+  conversationId: string | undefined,
+  dirPaths: string[],
+  location = "",
+): Map<string, DirectoryResult> {
+  const serveable = useWorkspaceServeable(conversationId);
+  const enabled = !!conversationId && serveable !== false;
+  // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
+  // reference check on the combine fn (`combine !== lastCombine`), so the
+  // callback must be stable — an inline closure is a fresh fn every render and
+  // defeats the gate, rebuilding the Map (and re-running the tree's flatten
+  // memo + widening effect) on every render, including every scroll frame.
+  // Keyed on `dirPaths`, which the caller holds stable at its widening fixpoint.
+  const combine = useCallback(
+    (results: { data?: WorkspaceFile[]; isLoading: boolean; isError: boolean }[]) => {
+      const map = new Map<string, DirectoryResult>();
+      dirPaths.forEach((dirPath, i) => {
+        map.set(dirPath, {
+          data: results[i]?.data,
+          isLoading: results[i]?.isLoading ?? false,
+          isError: results[i]?.isError ?? false,
+        });
+      });
+      return map;
+    },
+    [dirPaths],
+  );
+  return useQueries({
+    queries: dirPaths.map((dirPath) => ({
+      queryKey: ["workspace-dir", conversationId, dirPath, location],
+      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
+      enabled,
+      staleTime: 5_000,
+    })),
+    combine,
   });
 }

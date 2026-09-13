@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 
 def _patch_session_as_kiro_native(page: Page, session_id: str) -> list[dict]:
     """Patch the browser's session snapshot into a kiro-native response.
@@ -34,7 +36,7 @@ def _patch_session_as_kiro_native(page: Page, session_id: str) -> list[dict]:
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":
@@ -93,17 +95,16 @@ def test_kiro_native_picker_lists_models_and_persists_pick(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
     # The discovered Kiro catalog renders with its display names.
-    haiku_row = page.locator('[role="option"][data-model-id="claude-haiku-4.5"]')
+    haiku_row = page.locator('[role="menuitemcheckbox"][data-model-id="claude-haiku-4.5"]')
     expect(haiku_row).to_be_visible()
     expect(haiku_row).to_contain_text("Claude Haiku 4.5")
-    expect(page.locator('[role="option"][data-model-id="glm-5"]')).to_be_visible()
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="glm-5"]')).to_be_visible()
 
     # Picking a model drafts it; Save PATCHes model_override (consumed at
     # launch via --model).
-    page.locator('[role="option"][data-model-id="glm-5"]').click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -111,6 +112,6 @@ def test_kiro_native_picker_lists_models_and_persists_pick(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.locator('[role="menuitemcheckbox"][data-model-id="glm-5"]').click()
 
     assert patch_bodies[-1] == {"model_override": "glm-5"}

@@ -3,16 +3,32 @@ import { cva, type VariantProps } from "class-variance-authority";
 import * as TabsPrimitive from "radix-ui/tabs";
 
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 
 function Tabs({
   className,
   orientation = "horizontal",
+  componentId,
+  onValueChange,
   ...props
-}: React.ComponentProps<typeof TabsPrimitive.Root>) {
+}: React.ComponentProps<typeof TabsPrimitive.Root> & {
+  // Opt-in analytics id on the tab group. When set, switching tabs reports the
+  // selected value to the host sink (see `lib/analytics.ts`) — instrumenting the
+  // root covers every trigger. Tab values are a bounded set, so the value is sent.
+  componentId?: string;
+}) {
+  const { trackValueChange } = useOmnigentAnalytics();
+  const handleValueChange = componentId
+    ? (value: string) => {
+        trackValueChange(componentId, "tabs", value, { valueHasNoPii: true });
+        onValueChange?.(value);
+      }
+    : onValueChange;
   return (
     <TabsPrimitive.Root
       data-slot="tabs"
       data-orientation={orientation}
+      onValueChange={handleValueChange}
       className={cn("group/tabs flex gap-2 data-horizontal:flex-col", className)}
       {...props}
     />

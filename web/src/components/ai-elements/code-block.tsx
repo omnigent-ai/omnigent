@@ -105,6 +105,8 @@ type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   code: string;
   language: BundledLanguage;
   showLineNumbers?: boolean;
+  /** Soft-wrap long lines instead of horizontal scrolling. */
+  wrap?: boolean;
 };
 
 interface TokenizedCode {
@@ -358,10 +360,13 @@ export const CodeBlockContent = ({
   code,
   language,
   showLineNumbers = false,
+  wrap = false,
 }: {
   code: string;
   language: BundledLanguage;
   showLineNumbers?: boolean;
+  /** Soft-wrap long lines instead of horizontal scrolling. */
+  wrap?: boolean;
 }) => {
   // Memoized raw tokens for immediate display
   const rawTokens = useMemo(() => createRawTokens(code), [code]);
@@ -399,8 +404,15 @@ export const CodeBlockContent = ({
   const tokenized = asyncTokens ?? syncTokens;
 
   return (
-    <div className="relative overflow-auto">
-      <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} />
+    <div
+      className="relative overflow-auto"
+      data-code-highlighted={tokenized === rawTokens ? "false" : "true"}
+    >
+      <CodeBlockBody
+        className={wrap ? "whitespace-pre-wrap wrap-anywhere" : undefined}
+        showLineNumbers={showLineNumbers}
+        tokenized={tokenized}
+      />
     </div>
   );
 };
@@ -409,6 +421,7 @@ export const CodeBlock = ({
   code,
   language,
   showLineNumbers = false,
+  wrap = false,
   className,
   children,
   ...props
@@ -419,7 +432,12 @@ export const CodeBlock = ({
     <CodeBlockContext.Provider value={contextValue}>
       <CodeBlockContainer className={className} language={language} {...props}>
         {children}
-        <CodeBlockContent code={code} language={language} showLineNumbers={showLineNumbers} />
+        <CodeBlockContent
+          code={code}
+          language={language}
+          showLineNumbers={showLineNumbers}
+          wrap={wrap}
+        />
       </CodeBlockContainer>
     </CodeBlockContext.Provider>
   );

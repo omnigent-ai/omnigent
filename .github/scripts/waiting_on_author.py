@@ -21,6 +21,7 @@ REVIEW_LABEL = "waiting-for-review"
 WAITING_DAYS = 7
 CANONICAL_REPO = "omnigent-ai/omnigent"
 MAX_CLOSURES_PER_RUN = 30
+REVIEW_EVENTS = {"pull_request_review", "pull_request_review_comment"}
 
 
 def label_names(item: dict[str, Any]) -> list[str]:
@@ -113,6 +114,16 @@ class GitHubAPI:
     def get_pull(self, pull_number: int) -> dict[str, Any]:
         pull, _ = self.request("GET", f"/repos/{self.repo}/pulls/{pull_number}")
         return pull
+
+    def get_review(self, pull_number: int, review_id: int) -> dict[str, Any]:
+        review, _ = self.request(
+            "GET", f"/repos/{self.repo}/pulls/{pull_number}/reviews/{review_id}"
+        )
+        return review
+
+    def get_review_comment(self, comment_id: int) -> dict[str, Any]:
+        comment, _ = self.request("GET", f"/repos/{self.repo}/pulls/comments/{comment_id}")
+        return comment
 
     def remove_label(self, issue_number: int, label: str) -> bool:
         quoted = urllib.parse.quote(label, safe="")
@@ -355,9 +366,13 @@ def apply_waiting_on_maintainer_activity(
         pull_number = payload["pull_request"]["number"]
         review = payload.get("review") or {}
         actor = (review.get("user") or {}).get("login")
+        review_state = (review.get("state") or "").lower()
         # An approval asks nothing of the author; it means the PR is ready.
-        if (review.get("state") or "").lower() == "approved":
+        if review_state == "approved":
             print(f"#{pull_number}: approving review, leaving the label alone.")
+            return False
+        if review_state not in {"commented", "changes_requested"}:
+            print(f"#{pull_number}: {review_state or 'unknown'} review, leaving the label alone.")
             return False
         if is_slash_command(review.get("body")):
             return False
@@ -473,6 +488,42 @@ def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
     return closed
 
 
+def relay_integer(record: dict[str, Any], field: str) -> int:
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"Relay field {field!r} must be a positive integer")
+    return value
+
+
+def hydrate_relay_event(
+    record: dict[str, Any], api: GitHubAPI, repo: str, expected_event: str
+) -> tuple[str, dict[str, Any]]:
+    event_name = record.get("event_name")
+    if event_name not in REVIEW_EVENTS:
+        raise ValueError(f"Unsupported relayed event: {event_name!r}")
+    if event_name != expected_event:
+        raise ValueError(
+            f"Relayed event {event_name!r} does not match workflow event {expected_event!r}"
+        )
+
+    pull_number = relay_integer(record, "pull_number")
+    activity_id = relay_integer(record, "activity_id")
+    pull = api.get_pull(pull_number)
+    base_repo = ((pull.get("base") or {}).get("repo") or {}).get("full_name") or ""
+    if base_repo.lower() != repo.lower():
+        raise ValueError(f"Relayed PR #{pull_number} targets {base_repo!r}, not {repo!r}")
+
+    if event_name == "pull_request_review":
+        review = api.get_review(pull_number, activity_id)
+        return event_name, {"pull_request": pull, "review": review}
+
+    comment = api.get_review_comment(activity_id)
+    expected_url = f"https://api.github.com/repos/{repo}/pulls/{pull_number}"
+    if comment.get("pull_request_url") != expected_url:
+        raise ValueError(f"Review comment {activity_id} does not belong to PR #{pull_number}")
+    return event_name, {"pull_request": pull, "comment": comment}
+
+
 def run(
     event_name: str,
     payload: dict[str, Any],
@@ -495,8 +546,7 @@ def run(
     apply_waiting_on_maintainer_activity(event_name, payload, api)
 
 
-def load_event_payload() -> dict[str, Any]:
-    path = os.environ.get("GITHUB_EVENT_PATH")
+def load_json(path: str | None) -> dict[str, Any]:
     if not path:
         return {}
     with open(path, encoding="utf-8") as handle:
@@ -509,8 +559,15 @@ def main() -> int:
     if not token:
         print("GITHUB_TOKEN is required", file=sys.stderr)
         return 1
-    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    run(event_name, load_event_payload(), GitHubAPI(token, repo), repo)
+    api = GitHubAPI(token, repo)
+    relay_path = os.environ.get("WAITING_ON_AUTHOR_RELAY_PATH")
+    if relay_path:
+        expected_event = os.environ.get("WAITING_ON_AUTHOR_RELAY_EVENT", "")
+        event_name, payload = hydrate_relay_event(load_json(relay_path), api, repo, expected_event)
+    else:
+        event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        payload = load_json(os.environ.get("GITHUB_EVENT_PATH"))
+    run(event_name, payload, api, repo)
     return 0
 
 
