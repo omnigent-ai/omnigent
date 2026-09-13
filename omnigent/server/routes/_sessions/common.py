@@ -94,6 +94,12 @@ _EXTERNAL_SESSION_INTERRUPTED_TYPE: str = "external_session_interrupted"
 
 
 _EXTERNAL_SESSION_SUPERSEDED_TYPE: str = "external_session_superseded"
+# Wrapper-reported native-session rotation: the vendor TUI started a NEW
+# native chat inside the same terminal (cursor-agent's in-pane /clear), so the
+# conversation's cold-resume target must follow it. This is the one sanctioned
+# overwrite of ``external_session_id``; a plain PATCH keeps its write-once,
+# loud-failure contract.
+_EXTERNAL_SESSION_ROTATED_TYPE: str = "external_session_rotated"
 # Transient /btw side-chat overlay: the claude-native forwarder scrapes a
 # settled ``/btw`` exchange from the pane and posts it here to be broadcast
 # (never persisted) so the web UI shows the ephemeral overlay.
@@ -485,6 +491,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_SESSION_ROTATED_TYPE,
     _EXTERNAL_BTW_SIDECHAT_TYPE,
     _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
@@ -972,6 +979,7 @@ __all__ = [
     "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
+    "_EXTERNAL_SESSION_ROTATED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
     "_EXTERNAL_SESSION_STATUS_VALUES",
     "_EXTERNAL_SESSION_SUPERSEDED_TYPE",

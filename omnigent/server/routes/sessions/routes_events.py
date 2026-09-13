@@ -111,6 +111,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+    _EXTERNAL_SESSION_ROTATED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_STATUS_VALUES,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
@@ -228,6 +229,7 @@ from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_REQUEST_BYTES,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import ConversationNotFoundError
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S, runner_seen_is_fresh
 from omnigent.stores.file_store import FileStore
@@ -675,6 +677,7 @@ def register_events_routes(
             _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
             _EXTERNAL_SESSION_INTERRUPTED_TYPE,
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+            _EXTERNAL_SESSION_ROTATED_TYPE,
             _EXTERNAL_BTW_SIDECHAT_TYPE,
             _EXTERNAL_BTW_DISMISS_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
@@ -1332,6 +1335,30 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             _publish_session_superseded(session_id, target_conversation_id.strip())
+            return {"queued": False}
+        if body.type == _EXTERNAL_SESSION_ROTATED_TYPE:
+            # A wrapper bridge detected that the vendor TUI started a NEW
+            # native chat inside the same terminal (cursor-agent's in-pane
+            # /clear), so the cold-resume target must follow the pane's
+            # current chat. This is the one sanctioned overwrite of
+            # ``external_session_id``; the PATCH endpoint keeps its
+            # write-once, loud-failure contract for every other caller.
+            rotated_external_id = body.data.get("external_session_id")
+            if not isinstance(rotated_external_id, str) or not rotated_external_id.strip():
+                raise OmnigentError(
+                    "external_session_rotated requires a non-empty string "
+                    "data.external_session_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            try:
+                await asyncio.to_thread(
+                    conversation_store.set_external_session_id,
+                    session_id,
+                    rotated_external_id.strip(),
+                    allow_rotation=True,
+                )
+            except ConversationNotFoundError as exc:
+                raise _session_not_found() from exc
             return {"queued": False}
         if body.type == _EXTERNAL_BTW_SIDECHAT_TYPE:
             question = body.data.get("question")

@@ -3620,24 +3620,29 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         conversation_id: str,
         value: str,
+        *,
+        allow_rotation: bool = False,
     ) -> Conversation:
         """
         Persist the runtime-native session id this conversation wraps.
 
         Idempotent on same-value writes; raises ``ValueError`` on
-        attempted overwrite of an existing different value. See
-        :meth:`ConversationStore.set_external_session_id` for the
-        full contract.
+        attempted overwrite of an existing different value unless
+        ``allow_rotation`` marks a deliberate wrapper-reported
+        rotation. See :meth:`ConversationStore.set_external_session_id`
+        for the full contract.
 
         :param conversation_id: Conversation to update, e.g.
             ``"conv_abc123"``.
         :param value: Runtime-native session id, e.g.
             ``"a1b2c3d4-..."``.
+        :param allow_rotation: Permit overwriting a different existing
+            value (the native TUI started a new vendor chat in place).
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         :raises ValueError: If the row already has a different
-            ``external_session_id``.
+            ``external_session_id`` and ``allow_rotation`` is false.
         """
         updated_at = now_epoch()
 
@@ -3654,7 +3659,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             existing = meta.external_session_id
-            if existing is not None and existing != value:
+            if existing is not None and existing != value and not allow_rotation:
                 raise ValueError(
                     f"conversation {conversation_id!r} already has "
                     f"external_session_id={existing!r}; refusing to "

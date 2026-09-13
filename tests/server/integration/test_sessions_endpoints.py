@@ -1106,6 +1106,63 @@ async def test_external_session_superseded_drains_pending_inputs(
         pending_inputs.reset_for_tests()
 
 
+# ── POST /v1/sessions/{id}/events external_session_rotated ────────
+
+
+async def test_external_session_rotated_re_points_resume_target(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``external_session_rotated`` overwrites ``external_session_id``.
+
+    The cursor-native forwarder posts this when the TUI's in-pane ``/clear``
+    starts a new vendor chat, so a later cold resume targets the chat the pane
+    is actually on. The plain PATCH keeps its write-once contract — only this
+    explicit wrapper-reported rotation may re-point the value.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "chat-before-clear"},
+    )
+    assert patch.status_code == 200
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_rotated",
+            "data": {"external_session_id": "chat-after-clear"},
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    fetched = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert fetched["external_session_id"] == "chat-after-clear"
+
+    # The write-once PATCH guard is untouched: a divergent plain PATCH is
+    # still rejected loudly.
+    conflicting = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "chat-something-else"},
+    )
+    assert conflicting.status_code == 400
+
+
+async def test_external_session_rotated_requires_external_session_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A rotation event without a new external session id is rejected."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_rotated", "data": {}},
+    )
+    assert resp.status_code == 400
+
+
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
