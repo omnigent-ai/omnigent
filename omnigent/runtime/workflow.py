@@ -1612,6 +1612,7 @@ def _build_acp_cli_spawn_env(
 def _build_acp_spawn_env(
     spec: AgentSpec,
     *,
+    harness: str | None = None,
     cwd: Path | None = None,
     workdir: Path | None = None,
 ) -> dict[str, str]:
@@ -1629,14 +1630,19 @@ def _build_acp_spawn_env(
     first configured agent so a bare ``acp`` id still launches something.
 
     :param spec: The agent spec.
+    :param harness: The namespaced ``acp:<slug>`` this session runs, when the
+        spec itself doesn't carry one — a per-session ``harness_override`` on
+        a non-ACP bundle selects the agent here, not in ``executor.config``.
+        Takes precedence over the spec's value; ``None``/bare ``acp`` fall
+        back to the spec.
     :param workdir: Accepted for signature parity with the other builders; the
         ACP wrap consumes no bundle dir.
     :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
     """
     env: dict[str, str] = {}
-    raw_harness = ""
     cfg = getattr(spec.executor, "config", None)
-    if isinstance(cfg, dict):
+    raw_harness = harness if harness and harness.startswith("acp:") else ""
+    if not raw_harness and isinstance(cfg, dict):
         raw_harness = str(cfg.get("harness") or "")
     slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
 
