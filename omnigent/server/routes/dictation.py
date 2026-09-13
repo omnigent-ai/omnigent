@@ -171,8 +171,7 @@ def create_dictation_router(
             def _drain(done: asyncio.Task[str]) -> None:
                 if done.cancelled():
                     return
-                with contextlib.suppress(Exception):
-                    done.exception()
+                done.exception()
 
             work.add_done_callback(_drain)
             raise
