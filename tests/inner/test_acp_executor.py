@@ -94,9 +94,7 @@ def test_unattended_auth_method_prefers_cached_token() -> None:
 
 
 def test_unattended_auth_method_none_when_only_browser_login() -> None:
-    assert (
-        _unattended_auth_method_id({"authMethods": [{"id": "grok.com"}]}) is None
-    )
+    assert _unattended_auth_method_id({"authMethods": [{"id": "grok.com"}]}) is None
 
 
 def test_unattended_auth_method_none_when_absent() -> None:
