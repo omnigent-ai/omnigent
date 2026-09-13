@@ -1,4 +1,5 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 import { cn } from "@/lib/utils";
 
 /** Circumference of the progress ring (r=5.5). */
@@ -59,7 +60,10 @@ export function ComposerContextRing({
               />
             )}
           </svg>
-          <span className="text-sm tabular-nums" aria-hidden="true">
+          <span
+            className={cn("text-sm tabular-nums", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+            aria-hidden="true"
+          >
             {usedPct}%
           </span>
         </span>

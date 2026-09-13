@@ -9,7 +9,7 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.chat.test_claude_model_picker import _patch_session_as_claude_native
 from tests.e2e_ui.chat.test_working_indicator_background_tasks import _publish_status
-from tests.e2e_ui.conftest import fetch_with_retry
+from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -186,10 +186,16 @@ def test_status_counts_and_pr_share_workspace_bar(
     assert trailing["x"] + trailing["width"] == pytest.approx(
         bounds["x"] + bounds["width"] - 9, abs=0.5
     )
-    if pr_number == 1234567:
-        assert pr_label.evaluate("el => el.scrollWidth > el.clientWidth")
-        expect(pr_label).to_have_attribute("title", f"#{pr_number}")
-    elif viewport_width >= 390:
+    # A label that would have to truncate collapses the whole bar to icons
+    # instead — the full value stays in the title — and a bar with room shows
+    # every label untruncated. Neither state may show an ellipsis.
+    collapsed = bar.get_attribute("data-labels") == "collapsed"
+    assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_number)
+    expect(pr_label).to_have_attribute("title", f"#{pr_number}")
+    if collapsed:
+        expect(pr_label).to_be_hidden()
+        expect(context.locator("span")).to_be_hidden()
+    else:
         assert pr_label.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
     for test_id in status_ids:
         rect = control_bounds[test_id]

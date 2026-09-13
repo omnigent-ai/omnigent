@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerPrLink } from "./ComposerPrLink";
+import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 
 afterEach(cleanup);
 
@@ -27,6 +28,8 @@ describe("ComposerPrLink", () => {
     expect(screen.getByText("#42")).toHaveClass("truncate");
     expect(screen.getByText("#42")).toHaveAttribute("title", "#42");
     expect(link).toHaveAttribute("title", "View this PR in the GitHub tab");
+    expect(link).toHaveAccessibleName("#42");
+    expect(screen.getByText("#42")).toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
     fireEvent.click(link);
     expect(onOpen).toHaveBeenCalledTimes(1);
   });

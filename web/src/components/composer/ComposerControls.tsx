@@ -1,4 +1,4 @@
-import { forwardRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import {
   ChevronDownIcon,
   FolderIcon,
@@ -16,12 +16,20 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import {
+  COMPOSER_COLLAPSED_LABEL_CLASS,
+  COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+  useCollapsedWorkspaceLabels,
+} from "./ChatComposer";
 
 export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  const barRef = useRef<HTMLDivElement>(null);
+  useCollapsedWorkspaceLabels(barRef);
   return (
     <div
+      ref={barRef}
       className={cn(
-        "relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 py-1.5 md:gap-2",
+        "group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 py-1.5 md:gap-2",
         className,
       )}
       {...props}
@@ -38,6 +46,8 @@ export const ComposerWorkspaceTrigger = forwardRef<
     <button
       ref={ref}
       type="button"
+      // Icon-only while the bar is collapsed, so the label is the name.
+      aria-label={label}
       className={cn(
         "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-0.5 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11 md:px-1",
         className,
@@ -45,7 +55,12 @@ export const ComposerWorkspaceTrigger = forwardRef<
       {...props}
     >
       <Icon className="size-3.5 shrink-0" />
-      <span className="min-w-0 truncate text-left">{label}</span>
+      <span
+        data-workspace-collapse-label=""
+        className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+      >
+        {label}
+      </span>
       <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
     </button>
   );
@@ -120,7 +135,11 @@ export function ComposerPermissionPicker({
           data-testid={`${testIdPrefix}-permission-chip`}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span className="min-w-0 truncate text-ui font-normal">{value}</span>
+          <span
+            className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+          >
+            {value}
+          </span>
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
@@ -211,8 +230,14 @@ export const ComposerHarnessTrigger = forwardRef<
           data-testid={`${testIdPrefix}-model-pending`}
         />
       )}
+      {/* Without an icon the text is the only identification, so it stays put
+          when the row collapses. */}
       <span
-        className={cn("inline-flex min-w-0 flex-nowrap items-baseline gap-1", labelClassName)}
+        className={cn(
+          "inline-flex min-w-0 flex-nowrap items-baseline gap-1",
+          icon != null && COMPOSER_COLLAPSED_LABEL_CLASS,
+          labelClassName,
+        )}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
         {model && (

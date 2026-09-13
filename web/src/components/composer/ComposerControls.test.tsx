@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ComposerHostTrigger,
   ComposerWorkspaceBar,
@@ -7,6 +7,10 @@ import {
   ComposerHarnessTrigger,
   ComposerPermissionPicker,
 } from "./ComposerControls";
+import {
+  COMPOSER_COLLAPSED_LABEL_CLASS,
+  COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+} from "./ChatComposer";
 
 describe("shared composer controls", () => {
   it("uses the same workspace header and host geometry in either context", () => {
@@ -79,6 +83,16 @@ describe("shared composer controls", () => {
     );
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-agent-config-value")).toHaveClass(
+      COMPOSER_COLLAPSED_LABEL_CLASS,
+    );
+  });
+
+  it("keeps an icon-less model label visible when the action row collapses", () => {
+    render(<ComposerHarnessTrigger label="Agent" model="No agents" />);
+    expect(screen.getByTestId("composer-agent-config-value")).not.toHaveClass(
+      COMPOSER_COLLAPSED_LABEL_CLASS,
+    );
   });
 
   it("dispatches permission selections through the caller's handler", () => {
@@ -98,11 +112,88 @@ describe("shared composer controls", () => {
     for (const forbidden of ["hidden", "max-w-20"]) {
       expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
     }
+    expect(screen.getByText("Bypass permissions")).toHaveClass(COMPOSER_COLLAPSED_LABEL_CLASS);
     expect(trigger).toHaveClass("w-auto", "gap-1", "px-2");
     fireEvent.keyDown(trigger, {
       key: "ArrowDown",
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
     expect(onSelect).toHaveBeenCalledWith("plan");
+  });
+});
+
+describe("workspace bar label collapse", () => {
+  class StubResizeObserver {
+    static callbacks: ResizeObserverCallback[] = [];
+    constructor(callback: ResizeObserverCallback) {
+      StubResizeObserver.callbacks.push(callback);
+    }
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  const fireResize = () => {
+    for (const callback of StubResizeObserver.callbacks) callback([], {} as ResizeObserver);
+  };
+
+  afterEach(() => {
+    StubResizeObserver.callbacks = [];
+    vi.unstubAllGlobals();
+  });
+
+  // jsdom does no layout, so stand in for it with fixed scroll/client widths.
+  const defineWidth = (element: HTMLElement, clientWidth: number, scrollWidth: number) => {
+    Object.defineProperty(element, "clientWidth", { configurable: true, get: () => clientWidth });
+    Object.defineProperty(element, "scrollWidth", { configurable: true, get: () => scrollWidth });
+  };
+
+  it("marks each chip label to collapse to its icon and keeps the label as the name", () => {
+    render(
+      <ComposerWorkspaceBar>
+        <ComposerWorkspaceTrigger kind="directory" label="repo" />
+        <ComposerWorkspaceTrigger kind="worktree" label="main" aria-label="Branch: main" />
+      </ComposerWorkspaceBar>,
+    );
+    const label = screen.getByText("repo");
+    expect(label).toHaveAttribute("data-workspace-collapse-label");
+    expect(label).toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
+    // The name survives the text hiding; a caller's explicit name still wins.
+    expect(screen.getByRole("button", { name: "repo" })).toHaveAttribute("aria-label", "repo");
+    expect(screen.getByRole("button", { name: "Branch: main" })).toBeInTheDocument();
+  });
+
+  it("collapses the labels to icons once a chip can no longer show its full text", () => {
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    render(
+      <ComposerWorkspaceBar data-testid="bar">
+        <ComposerWorkspaceTrigger kind="worktree" label="feature/really-long-branch-name" />
+      </ComposerWorkspaceBar>,
+    );
+    const bar = screen.getByTestId("bar");
+    const label = bar.querySelector<HTMLElement>("[data-workspace-collapse-label]")!;
+    defineWidth(bar, 200, 200);
+    // The label's text is wider than the box it was given: it is truncating.
+    defineWidth(label, 40, 120);
+    fireResize();
+    expect(bar).toHaveAttribute("data-labels", "collapsed");
+    // Given room for the full text again, the labels come back.
+    defineWidth(label, 120, 120);
+    fireResize();
+    expect(bar).not.toHaveAttribute("data-labels");
+  });
+
+  it("collapses when the row overflows even if no single label is truncating", () => {
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    render(
+      <ComposerWorkspaceBar data-testid="bar">
+        <ComposerWorkspaceTrigger kind="directory" label="repo" />
+      </ComposerWorkspaceBar>,
+    );
+    const bar = screen.getByTestId("bar");
+    const label = bar.querySelector<HTMLElement>("[data-workspace-collapse-label]")!;
+    defineWidth(label, 40, 40);
+    defineWidth(bar, 150, 300);
+    fireResize();
+    expect(bar).toHaveAttribute("data-labels", "collapsed");
   });
 });

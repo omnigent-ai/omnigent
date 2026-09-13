@@ -1726,7 +1726,11 @@ describe("Composer shared visible controls", () => {
     const actions = screen.getByTestId("composer-action-row");
     expect(textarea().parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
-    expect(actions.children).toHaveLength(2);
+    const [widthProbe, leading, trailing] = Array.from(actions.children);
+    expect(widthProbe).toHaveClass("h-0");
+    expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
+    expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
+    expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
     // The branch text now flows through the shared ComposerWorkspaceStatus +
     // useComposerGitStatus (covered by their own tests); here assert the shared

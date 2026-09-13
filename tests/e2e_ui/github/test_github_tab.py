@@ -30,7 +30,11 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
+from tests.e2e_ui.conftest import (
+    fetch_with_retry,
+    open_right_rail,
+    workspace_bar_needs_collapse,
+)
 
 _PR_NUMBER = 4242
 
@@ -256,6 +260,10 @@ def test_composer_pr_link_opens_github_tab(
     expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
     bar_bounds = bar.bounding_box()
     assert bar_bounds is not None
+    # When the labels cannot all show in full, the bar collapses to icons (never
+    # ellipses); the collapse must be justified by the expanded layout not fitting.
+    collapsed = bar.get_attribute("data-labels") == "collapsed"
+    assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_count)
     font_sizes = {}
     centers = {}
     bounds = {}
@@ -267,9 +275,14 @@ def test_composer_pr_link_opens_github_tab(
     ):
         indicator = page.get_by_test_id(test_id)
         label = indicator.locator("span").last
-        expect(label).to_be_visible()
-        font_sizes[test_id] = label.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
-        for part, element in (("label", label), ("icon", indicator.locator("svg").first)):
+        parts = [("icon", indicator.locator("svg").first)]
+        if collapsed:
+            expect(label).to_be_hidden()
+        else:
+            expect(label).to_be_visible()
+            font_sizes[test_id] = label.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
+            parts.insert(0, ("label", label))
+        for part, element in parts:
             rect = element.bounding_box()
             assert rect is not None
             bounds[f"{test_id}.{part}"] = rect
@@ -278,7 +291,7 @@ def test_composer_pr_link_opens_github_tab(
     assert pr_bounds is not None and context_bounds is not None
     group_gap = context_bounds["x"] - pr_bounds["x"] - pr_bounds["width"]
     pair_gaps = {}
-    for test_id in ("composer-pr-link", "composer-context-ring"):
+    for test_id in () if collapsed else ("composer-pr-link", "composer-context-ring"):
         icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
         pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
     painted_right_edges = {
@@ -293,6 +306,7 @@ def test_composer_pr_link_opens_github_tab(
     painted_gaps = {
         test_id: bounds[f"{test_id}.label"]["x"] - right
         for test_id, right in painted_right_edges.items()
+        if not collapsed
     }
     print(f"Composer fonts ({viewport_width}px, {font_size}px preference): {font_sizes}")
     print(f"Composer centers: {centers}; group gap: {group_gap}; pair gaps: {pair_gaps}")

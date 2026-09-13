@@ -1635,8 +1635,9 @@ describe("NewChatLandingScreen", () => {
     } as unknown as ReturnType<typeof useHostWorktrees>);
     renderLanding();
 
+    // The empty composer rests at one row: no minimum taller than the draft.
+    expect(screen.getByTestId("new-chat-landing-input")).not.toHaveClass("min-h-[42px]");
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
-      "min-h-[42px]",
       "max-h-[180px]",
       "overflow-y-auto",
       "p-0",
@@ -1690,7 +1691,7 @@ describe("NewChatLandingScreen", () => {
       "text-xs",
       "leading-4",
     );
-    expect(composer).toHaveClass("min-h-[105px]");
+    expect(composer).not.toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
     expect(actions).toHaveClass("justify-between", "gap-2", "px-2", "pt-1", "pb-2");
     expect(actions).not.toHaveClass("mt-2");
@@ -1770,11 +1771,13 @@ describe("NewChatLandingScreen", () => {
     const card = screen.getByTestId("new-chat-landing-composer");
     expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
-    expect(Array.from(actions.children)).toEqual([leftControls, rightControls]);
+    const [widthProbe, ...groups] = Array.from(actions.children);
+    expect(widthProbe).toHaveClass("h-0");
+    expect(groups).toEqual([leftControls, rightControls]);
     expect(actions).toHaveClass("flex-nowrap");
-    expect(leftControls).toHaveClass("min-w-0", "flex-[0_1_auto]", "gap-1", "overflow-visible");
+    expect(leftControls).toHaveClass("min-w-0", "flex-none", "gap-1", "overflow-visible");
     expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
-    expect(rightControls).toHaveClass("flex", "flex-[0_1_auto]", "items-center", "gap-1");
+    expect(rightControls).toHaveClass("flex", "shrink-0", "items-center", "gap-1");
     expect(rightControls).toHaveClass("ml-auto", "max-w-full");
     expect(rightControls).not.toHaveClass("flex-1");
     for (const control of [attach, hostChip, permission]) {
