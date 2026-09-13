@@ -478,6 +478,82 @@ export function wheelReportPayload(
 }
 
 /**
+ * Decide how one step of a one-finger vertical drag over the terminal
+ * becomes scrollback movement or SGR mouse-wheel reports, carrying the
+ * fractional-line remainder across steps.
+ *
+ * xterm has no built-in touch handling, so without this a finger drag on a
+ * phone leaves the view pinned to the live bottom — the scrollback is
+ * unreachable by touch even though wheel scrolling works. Dragging the
+ * finger *down* reveals older content (the native scroll gesture), which
+ * maps to negative lines: xterm's ``scrollLines`` scrolls up for negative
+ * amounts, and {@link sgrWheelReports} emits wheel-up (button 64) reports.
+ *
+ * When the pane program is tracking the mouse with SGR encoding (for
+ * example Claude Code on the control transport), the drag synthesizes
+ * wheel reports at the touched cell — mirroring {@link wheelReportPayload}
+ * — capped at {@link WHEEL_REPORTS_MAX_PER_EVENT} per step. Otherwise the
+ * drag moves xterm's own scrollback via ``lines``.
+ *
+ * Pure helper — exported for direct unit testing; production code calls it
+ * from the session's touch listeners.
+ *
+ * :param move: Finger positions — previous and current Y, and the X used
+ *     to place a report column.
+ * :param mouse: Current mouse tracking mode + SGR-encoding flag.
+ * :param screen: Character-grid geometry, or ``null`` when layout isn't
+ *     measurable yet (the drag is left to the browser).
+ * :param partial: Fractional lines carried over from previous steps.
+ * :returns: ``consume`` — whether the caller owns the gesture step
+ *     (prevent default so the browser doesn't pan); ``lines`` — whole
+ *     lines to feed ``term.scrollLines`` (0 when reports are emitted
+ *     instead); ``data`` — SGR reports to feed to the terminal ("" on the
+ *     scrollback path); ``partial`` — the new carry.
+ */
+/**
+ * Finger travel (CSS px) before a one-finger touch is treated as a scroll
+ * drag. Below this the gesture is left to the browser, so taps and the
+ * start of a long-press (text selection) aren't swallowed by jitter; at or
+ * beyond it the dominant axis decides — vertical locks into scrolling,
+ * horizontal abandons the gesture to the browser.
+ */
+export const TOUCH_SCROLL_SLOP_PX = 8;
+
+export function touchScrollPayload(
+  move: { previousY: number; currentY: number; clientX: number },
+  mouse: WheelMouseState,
+  screen: WheelScreenMetrics | null,
+  partial: number,
+): { consume: boolean; lines: number; data: string; partial: number } {
+  if (screen === null || screen.cellHeight <= 0) {
+    return { consume: false, lines: 0, data: "", partial };
+  }
+  const total = partial + (move.previousY - move.currentY) / screen.cellHeight;
+  const whole = Math.trunc(total);
+  if (mouse.mouseTrackingMode === "none" || !mouse.sgrEncoding) {
+    // Unlike the wheel path (which defers non-SGR tracking to xterm's
+    // native handler), touch has no native fallback — scroll the buffer,
+    // a harmless no-op on an alt-screen TUI with empty scrollback.
+    return { consume: true, lines: whole, data: "", partial: total - whole };
+  }
+  const capped = Math.max(
+    -WHEEL_REPORTS_MAX_PER_EVENT,
+    Math.min(WHEEL_REPORTS_MAX_PER_EVENT, whole),
+  );
+  const clamp = (v: number, max: number) => Math.min(Math.max(v, 1), max);
+  const col = clamp(Math.floor((move.clientX - screen.left) / screen.cellWidth) + 1, screen.cols);
+  const row = clamp(Math.floor((move.currentY - screen.top) / screen.cellHeight) + 1, screen.rows);
+  return {
+    consume: true,
+    lines: 0,
+    data: sgrWheelReports(capped, col, row),
+    // Discard the over-cap excess (like the wheel path) so a giant drag
+    // step can't keep scrolling long after the gesture.
+    partial: capped === whole ? total - whole : 0,
+  };
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -522,6 +598,14 @@ export class TerminalSession {
   private lastSentSize: { cols: number; rows: number } | null = null;
   /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
   private wheelPartialLines = 0;
+  /** Start of the tracked one-finger touch, or ``null`` when none is active. */
+  private touchStart: { x: number; y: number } | null = null;
+  /** Whether the tracked touch passed the slop gate and owns scrolling. */
+  private touchScrolling = false;
+  /** Y of the last processed drag step (valid while {@link touchScrolling}). */
+  private touchLastY = 0;
+  /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
+  private touchPartialLines = 0;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -718,6 +802,77 @@ export class TerminalSession {
       e.preventDefault();
       return false;
     });
+
+    // xterm has no touch support, so on a phone a finger drag would
+    // otherwise leave the view pinned to the live bottom with the
+    // scrollback unreachable. Translate one-finger vertical drags into
+    // scrollback movement (or SGR wheel reports when the pane program is
+    // tracking the mouse), mirroring the wheel path above. Multi-touch
+    // (pinch) is left to the browser.
+    container.addEventListener(
+      "touchstart",
+      (e) => {
+        if (e.touches.length !== 1) {
+          this.touchStart = null;
+          this.touchScrolling = false;
+          return;
+        }
+        this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        this.touchScrolling = false;
+        this.touchPartialLines = 0;
+      },
+      { signal },
+    );
+    container.addEventListener(
+      "touchmove",
+      (e) => {
+        if (this.touchStart === null || e.touches.length !== 1) return;
+        const touch = e.touches[0];
+        if (!this.touchScrolling) {
+          // Slop gate: taps and long-press jitter stay with the browser.
+          // Past the slop, the dominant axis decides — a mostly-horizontal
+          // drag is abandoned so browser gestures/selection still work.
+          const dx = Math.abs(touch.clientX - this.touchStart.x);
+          const dy = Math.abs(touch.clientY - this.touchStart.y);
+          if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) return;
+          if (dx > dy) {
+            this.touchStart = null;
+            return;
+          }
+          // Lock in: the pre-slop travel feeds the first step so the view
+          // doesn't visibly "jump the gate".
+          this.touchScrolling = true;
+          this.touchLastY = this.touchStart.y;
+        }
+        const result = touchScrollPayload(
+          { previousY: this.touchLastY, currentY: touch.clientY, clientX: touch.clientX },
+          {
+            mouseTrackingMode: this.term.modes.mouseTrackingMode,
+            sgrEncoding: this.sgrMouseEncodingActive(),
+          },
+          this.screenMetrics(),
+          this.touchPartialLines,
+        );
+        // Advance even on an unmeasurable (non-consumed) step so the next
+        // measurable one resumes from the current finger position.
+        this.touchLastY = touch.clientY;
+        this.touchPartialLines = result.partial;
+        if (!result.consume) return;
+        // The drag is ours — stop the browser from panning ancestors.
+        if (e.cancelable) e.preventDefault();
+        if (result.data) this.term.input(result.data, true);
+        if (result.lines !== 0) this.term.scrollLines(result.lines);
+      },
+      // Explicitly non-passive so preventDefault() above is honored.
+      { passive: false, signal },
+    );
+    const endTouch = () => {
+      this.touchStart = null;
+      this.touchScrolling = false;
+      this.touchPartialLines = 0;
+    };
+    container.addEventListener("touchend", endTouch, { signal });
+    container.addEventListener("touchcancel", endTouch, { signal });
 
     // ResizeObserver fires on any layout-affecting change (window
     // resize, font load, CSS class change). tmux deduplicates same-

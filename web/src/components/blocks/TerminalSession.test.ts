@@ -22,6 +22,7 @@ import {
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
+  touchScrollPayload,
   type ConnectionState,
   wheelReportPayload,
   type WheelMouseState,
@@ -438,6 +439,82 @@ describe("wheelReportPayload", () => {
   });
 });
 
+describe("touchScrollPayload", () => {
+  const noTracking: WheelMouseState = { mouseTrackingMode: "none", sgrEncoding: false };
+  const sgrModes: WheelMouseState = { mouseTrackingMode: "vt200", sgrEncoding: true };
+  const screen: WheelScreenMetrics = {
+    left: 0,
+    top: 0,
+    cellWidth: 8,
+    cellHeight: 16,
+    cols: 80,
+    rows: 24,
+  };
+
+  function drag(previousY: number, currentY: number, clientX = 100) {
+    return { previousY, currentY, clientX };
+  }
+
+  it("leaves the gesture to the browser when layout is unmeasurable, keeping the carry", () => {
+    // WHY: pre-mount (or jsdom) there is no grid to convert pixels to lines;
+    // consuming the event would swallow the gesture with no effect at all.
+    expect(touchScrollPayload(drag(100, 50), noTracking, null, 0.4)).toEqual({
+      consume: false,
+      lines: 0,
+      data: "",
+      partial: 0.4,
+    });
+  });
+
+  it("scrolls xterm's scrollback when no app is tracking the mouse", () => {
+    // WHY: this is the reported bug's exact shape — a plain shell on a phone.
+    // Dragging the finger DOWN 64px over 16px cells reveals 4 older lines:
+    // negative lines (scrollLines scrolls up for negative amounts), no reports.
+    const result = touchScrollPayload(drag(100, 164), noTracking, screen, 0);
+    expect(result).toEqual({ consume: true, lines: -4, data: "", partial: 0 });
+  });
+
+  it("accumulates small drag steps across moves into whole lines", () => {
+    // WHY: touchmove fires with tiny deltas; without a carry a slow drag
+    // would floor every step to zero lines and never move at all.
+    let partial = 0;
+    let lines = 0;
+    for (let i = 0; i < 10; i++) {
+      const result = touchScrollPayload(
+        drag(100 + i * 4, 100 + (i + 1) * 4),
+        noTracking,
+        screen,
+        partial,
+      );
+      expect(result.consume).toBe(true);
+      partial = result.partial;
+      lines += result.lines;
+    }
+    // 40px total / 16px cells = 2.5 lines: 2 whole lines back, 0.5 carried.
+    expect(lines).toBe(-2);
+    expect(partial).toBeCloseTo(-0.5);
+  });
+
+  it("synthesizes SGR wheel reports at the touched cell when the app tracks the mouse", () => {
+    // WHY: a mouse-tracking TUI (e.g. Claude Code) owns scrolling; the drag
+    // must reach it as wheel reports, exactly like the wheel path. A downward
+    // 32px drag is 2 lines of "older" — wheel-up, button 64 — placed at the
+    // finger's cell (x 100/8 = col 13, y 164/16 = row 11, 1-based).
+    const result = touchScrollPayload(drag(132, 164), sgrModes, screen, 0);
+    expect(result.lines).toBe(0);
+    expect(result.data).toBe("\x1b[<64;13;11M".repeat(2));
+    expect(result.partial).toBe(0);
+  });
+
+  it("caps per-step reports and discards the excess on the tracking path", () => {
+    // WHY: same flood guard as the wheel path — a giant drag step must not
+    // bank hundreds of lines that keep scrolling after the finger stops.
+    const result = touchScrollPayload(drag(16 * 1000, 0), sgrModes, screen, 0);
+    expect(result.data.split("\x1b[<65").length - 1).toBe(WHEEL_REPORTS_MAX_PER_EVENT);
+    expect(result.partial).toBe(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // TerminalSession class — wired up against a fake WebSocket + ResizeObserver.
 // The real xterm Terminal runs (it already does in jsdom for loadWebglRenderer
@@ -610,6 +687,65 @@ describe("TerminalSession", () => {
 
     socket.emit("error", {});
     expect(states.at(-1)).toEqual({ kind: "error" });
+    session.dispose();
+  });
+
+  it("scrolls the scrollback when a finger drags down over the terminal", () => {
+    // WHY: xterm has no touch handling of its own, so on a phone the
+    // scrollback used to be unreachable by touch — the view stayed pinned to
+    // the live bottom. The session must translate a one-finger downward drag
+    // into scrollLines and claim the gesture from the browser.
+    const { session, container } = makeSession();
+    // jsdom has no layout, so feed the grid geometry the handler measures.
+    (session as unknown as { screenMetrics: () => WheelScreenMetrics }).screenMetrics = () => ({
+      left: 0,
+      top: 0,
+      cellWidth: 8,
+      cellHeight: 16,
+      cols: 80,
+      rows: 24,
+    });
+    const term = (session as unknown as { term: Terminal }).term;
+    const scrollSpy = vi.spyOn(term, "scrollLines");
+
+    const touchEvent = (type: string, points: { clientX: number; clientY: number }[]) => {
+      // jsdom lacks a TouchEvent constructor; a plain Event with a touches
+      // list exercises the same listener path.
+      const ev = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "touches", { value: points });
+      container.dispatchEvent(ev);
+      return ev;
+    };
+
+    touchEvent("touchstart", [{ clientX: 100, clientY: 100 }]);
+    // Finger moves down 64px (past the slop gate) over 16px cells = 4 lines
+    // of older content, including the pre-slop travel.
+    const move = touchEvent("touchmove", [{ clientX: 100, clientY: 164 }]);
+
+    expect(scrollSpy).toHaveBeenCalledWith(-4);
+    expect(move.defaultPrevented).toBe(true);
+
+    // Lifting the finger resets the drag: a later move without a start is
+    // ignored rather than jumping the view.
+    touchEvent("touchend", []);
+    scrollSpy.mockClear();
+    touchEvent("touchmove", [{ clientX: 100, clientY: 300 }]);
+    expect(scrollSpy).not.toHaveBeenCalled();
+
+    // Sub-slop jitter (a tap or the start of a long-press) stays with the
+    // browser: nothing scrolls and the default isn't prevented.
+    touchEvent("touchstart", [{ clientX: 100, clientY: 100 }]);
+    const jitter = touchEvent("touchmove", [{ clientX: 102, clientY: 103 }]);
+    expect(scrollSpy).not.toHaveBeenCalled();
+    expect(jitter.defaultPrevented).toBe(false);
+    touchEvent("touchend", []);
+
+    // A dominantly horizontal drag is abandoned to the browser — even when
+    // the finger later moves vertically in the same gesture.
+    touchEvent("touchstart", [{ clientX: 100, clientY: 100 }]);
+    touchEvent("touchmove", [{ clientX: 160, clientY: 110 }]);
+    touchEvent("touchmove", [{ clientX: 160, clientY: 200 }]);
+    expect(scrollSpy).not.toHaveBeenCalled();
     session.dispose();
   });
 
