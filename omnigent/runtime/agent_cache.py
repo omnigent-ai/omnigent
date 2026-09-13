@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
@@ -11,6 +12,8 @@ from omnigent.entities import LoadedAgent
 from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore
+
+_logger = logging.getLogger(__name__)
 
 
 class AgentCache:
@@ -109,11 +112,25 @@ class AgentCache:
         if agent_id in self._specs:
             return LoadedAgent(spec=self._specs[agent_id], workdir=workdir)
 
-        # Tier 2: disk cache (directory already extracted)
+        # Tier 2: disk cache (directory already extracted). An entry
+        # that fails to load (e.g. a tmp cleaner pruned its config.yaml)
+        # is a miss, not an error: discard it and re-extract from the
+        # ArtifactStore, which still holds the bundle.
         if workdir.is_dir():
-            spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
-            self._specs[agent_id] = spec
-            return LoadedAgent(spec=spec, workdir=workdir)
+            try:
+                spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
+            except Exception:
+                _logger.warning(
+                    "Agent cache entry for %s at %s is unreadable; "
+                    "re-extracting from the artifact store",
+                    agent_id,
+                    workdir,
+                    exc_info=True,
+                )
+                shutil.rmtree(workdir, ignore_errors=True)
+            else:
+                self._specs[agent_id] = spec
+                return LoadedAgent(spec=spec, workdir=workdir)
 
         # Cache miss — download bundle, write to temp file, extract
         bundle_bytes = self._artifact_store.get(bundle_location)
