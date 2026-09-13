@@ -2962,6 +2962,27 @@ class HostProcess:
                 models=with_source(pi_models),
             )
 
+        if harness == "antigravity-native":
+            try:
+                from omnigent.harnesses.antigravity_native.models import (
+                    list_agy_cli_model_options,
+                )
+
+                models = await asyncio.to_thread(list_agy_cli_model_options)
+            except Exception:  # A missing CLI/login is a failed host probe.
+                _logger.exception("Failed to resolve pre-launch Antigravity model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="the antigravity model probe failed — see the host log",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(models),
+                routable_models=[model["id"] for model in models],
+            )
+
         if is_claude_sdk_harness_name(harness):
             # SDK-mode Claude is a pass-through client with no model catalog
             # of its own, so the endpoint listing IS the harness truth — the

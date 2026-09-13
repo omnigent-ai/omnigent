@@ -184,6 +184,55 @@ async def test_explicit_dispatch_model_wins_over_parent_selection(
     assert bodies[0]["model_override"] == "databricks-claude-haiku-4-5"
 
 
+@pytest.mark.parametrize(
+    "model",
+    (
+        pytest.param("gemini-3.1-pro-high", id="gemini"),
+        pytest.param("claude-sonnet-4-6", id="claude"),
+        pytest.param("gpt-oss-120b-medium", id="gpt-oss"),
+        pytest.param("databricks-claude-sonnet-4-6", id="opaque-cli-id"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_antigravity_native_child_dispatch_preserves_catalog_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    """An explicit Antigravity child model persists without vendor rewriting."""
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id=f"conv_antigravity_child_{model}",
+        parent_snapshot={
+            "id": f"conv_antigravity_child_{model}",
+            "agent_id": "ag_parent",
+            "model_override": "gemini-3.1-pro-high",
+            "llm_model": None,
+        },
+        explicit_model=model,
+    )
+    assert bodies[0]["model_override"] == model
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_child_without_model_keeps_agy_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No child model leaves the native CLI free to choose its own default."""
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_child_default",
+        parent_snapshot={
+            "id": "conv_antigravity_child_default",
+            "agent_id": "ag_parent",
+            "model_override": None,
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
 @pytest.mark.asyncio
 async def test_worker_spec_model_pin_blocks_inheritance(
     monkeypatch: pytest.MonkeyPatch,

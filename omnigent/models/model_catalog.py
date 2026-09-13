@@ -149,12 +149,6 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # Native Kimi TUI harness shares the multi-provider kimi resolution path.
     "kimi-native": "kimi",
     "qwen": "qwen",
-    # The native agy TUI bridge resolves its provider via the SDK sibling,
-    # mirroring the claude-native -> claude-sdk rule above.
-    "antigravity-native": "antigravity",
-    "native-antigravity": "antigravity",
-    "agy-native": "antigravity",
-    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -162,6 +156,9 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
 # short-circuits to a subscription-style readout instead of reporting the
 # harness as having "no model-provider resolution".
 _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
+_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"antigravity-native", "native-antigravity", "agy-native", "native-agy"}
+)
 
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
@@ -604,6 +601,10 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     if (harness or "") in _CURSOR_HARNESSES:
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
+        )
+    if (harness or "") in _ANTIGRAVITY_NATIVE_HARNESSES:
+        return ResolvedModelProvider(
+            kind=SUBSCRIPTION_KIND, cli="agy", detail="Antigravity CLI authentication"
         )
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
@@ -1065,7 +1066,7 @@ def _listing_for_provider(
                 "this worker cannot run here"
             ),
         )
-    if provider.kind == SUBSCRIPTION_KIND and provider.cli != "cursor-agent":
+    if provider.kind == SUBSCRIPTION_KIND and provider.cli not in {"cursor-agent", "agy"}:
         return _static_subscription_listing(provider)
     if provider.kind == CLI_CONFIG_KIND:
         return _static_cli_config_listing(provider)
@@ -1077,7 +1078,11 @@ def _listing_for_provider(
         return cached
     try:
         if provider.kind == SUBSCRIPTION_KIND:
-            listing = _fetch_cursor_cli_listing(provider)
+            listing = (
+                _fetch_antigravity_cli_listing()
+                if provider.cli == "agy"
+                else _fetch_cursor_cli_listing(provider)
+            )
         elif provider.kind == DATABRICKS_KIND:
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
@@ -1137,6 +1142,22 @@ def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
             for option in options
         ),
         note=f"live models advertised by the {provider.cli or 'cursor-agent'} CLI",
+    )
+
+
+def _fetch_antigravity_cli_listing() -> ModelListing:
+    """Build a live worker listing from the installed Antigravity CLI."""
+    from omnigent.harnesses.antigravity_native.models import list_agy_cli_model_options
+
+    options = list_agy_cli_model_options()
+    return ModelListing(
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=str(option["id"]), family=model_family_token(str(option["id"])))
+            for option in options
+        ),
+        note="live Antigravity CLI models; select a model when creating a worker",
     )
 
 

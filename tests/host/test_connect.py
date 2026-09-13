@@ -249,6 +249,70 @@ async def test_handle_model_options_uses_host_pi_configuration(
     )
 
 
+async def test_handle_model_options_serves_live_antigravity_cli_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Antigravity's pre-launch picker reflects the host CLI's actual catalog."""
+    from omnigent.harnesses.antigravity_native import models as antigravity_models
+
+    monkeypatch.setattr(
+        antigravity_models,
+        "list_agy_cli_model_options",
+        lambda: [
+            {"id": "claude-sonnet-4-6", "displayName": "Claude Sonnet 4.6", "isDefault": False},
+            {
+                "id": "gpt-oss-120b-medium",
+                "displayName": "GPT-OSS 120B Medium",
+                "isDefault": False,
+            },
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_agy_models", harness="antigravity-native"),
+    )
+
+    assert result.request_id == "req_agy_models"
+    assert result.status == "ok"
+    assert result.routable_models == ["claude-sonnet-4-6", "gpt-oss-120b-medium"]
+    assert [
+        {key: row[key] for key in ("id", "displayName", "isDefault")} for row in result.models
+    ] == [
+        {"id": "claude-sonnet-4-6", "displayName": "Claude Sonnet 4.6", "isDefault": False},
+        {
+            "id": "gpt-oss-120b-medium",
+            "displayName": "GPT-OSS 120B Medium",
+            "isDefault": False,
+        },
+    ]
+    _cleanup_host(host)
+
+
+async def test_handle_model_options_reports_antigravity_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing or failing agy CLI returns a failed, rather than invented, catalog."""
+    from omnigent.harnesses.antigravity_native import models as antigravity_models
+
+    def _raise() -> list[antigravity_models.AntigravityModelOption]:
+        raise RuntimeError("agy is unavailable")
+
+    monkeypatch.setattr(antigravity_models, "list_agy_cli_model_options", _raise)
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_agy_failed", harness="antigravity-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_agy_failed",
+        status="failed",
+        error="the antigravity model probe failed — see the host log",
+    )
+    _cleanup_host(host)
+
+
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
 async def test_handle_model_options_codex_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch, failure: str

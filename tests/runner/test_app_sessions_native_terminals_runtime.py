@@ -2125,6 +2125,31 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     assert call["headless"] is False
 
 
+@pytest.mark.parametrize(
+    "model",
+    ("gemini-3.1-pro-high", "claude-sonnet-4-6", "gpt-oss-120b-medium"),
+    ids=("gemini", "claude", "gpt-oss"),
+)
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_forwards_catalog_model_to_agy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    """The runner passes each selected native-catalog model to agy's launcher."""
+    launch_calls: list[dict[str, Any]] = []
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=f"82b5f9222c7ac0f45ba2736b57b51f{model[-2:]}",
+        snapshot={"model_override": model},
+        candidate_ports=[52549],
+        build_agy_launch_calls=launch_calls,
+    )
+    assert len(launch_calls) == 1
+    assert launch_calls[0]["model"] == model
+
+
 @pytest.mark.asyncio
 async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     tmp_path: Path,
