@@ -24,6 +24,7 @@ from omnigent.entities import (
     NewConversationItem,
     ReasoningData,
 )
+from omnigent.errors import StaleCursorError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
@@ -1381,12 +1382,13 @@ def test_list_items_before_cursor(
 def test_list_items_cursor_scoped_to_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A cursor id from another conversation resolves to no position.
+    """A cursor id from another conversation never supplies a position.
 
-    The cursor subquery is scoped to conversation_id so it stays a
-    primary-key point lookup. A foreign cursor id therefore matches no
-    row, the scalar subquery is NULL, and the position comparison yields
-    an empty page rather than silently using the other conversation's
+    The cursor lookup is scoped to conversation_id so it stays a
+    primary-key point lookup. A foreign cursor id therefore resolves to
+    no row and raises: an unresolvable cursor must be distinguishable
+    from a completed enumeration (an empty page would read as "no more
+    items"), and must never silently use the other conversation's
     position as a cutoff.
     """
     conv = conversation_store.create_conversation()
@@ -1394,10 +1396,10 @@ def test_list_items_cursor_scoped_to_conversation(
     _make_5_items(conversation_store, conv.id)
     other_items = _make_5_items(conversation_store, other.id)
 
-    after_page = conversation_store.list_items(conv.id, after=other_items[1].id)
-    assert after_page.data == []
-    before_page = conversation_store.list_items(conv.id, before=other_items[1].id)
-    assert before_page.data == []
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_items(conv.id, after=other_items[1].id)
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_items(conv.id, before=other_items[1].id)
 
 
 def _captured_item_statement_limits(store: SqlAlchemyConversationStore, run) -> list[int]:
@@ -2109,6 +2111,74 @@ def test_list_conversations_pagination(
     page2 = conversation_store.list_conversations(limit=2, after=page1.last_id)
     assert len(page2.data) == 2
     assert page2.has_more is False
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_deleted_after_cursor_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An ``after`` cursor whose row was deleted between pages raises.
+
+    The deleted row's sort position is unknowable, so an empty page here
+    would be indistinguishable from a completed enumeration — every
+    ``while has_more: after = last_id`` loop would stop early and report
+    success on a partial result.
+    """
+    for _ in range(5):
+        conversation_store.create_conversation()
+    page1 = conversation_store.list_conversations(limit=2, order="asc")
+    assert page1.has_more is True
+    assert page1.last_id is not None
+    assert await conversation_store.delete_conversation(page1.last_id)
+
+    with pytest.raises(StaleCursorError) as exc_info:
+        conversation_store.list_conversations(limit=2, order="asc", after=page1.last_id)
+    assert exc_info.value.cursor_id == page1.last_id
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_deleted_before_cursor_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A ``before`` cursor whose row was deleted raises the same signal."""
+    for _ in range(5):
+        conversation_store.create_conversation()
+    page = conversation_store.list_conversations(limit=2, order="desc")
+    assert page.first_id is not None
+    assert await conversation_store.delete_conversation(page.first_id)
+
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_conversations(limit=2, order="desc", before=page.first_id)
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_delete_of_non_cursor_row_keeps_paging(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a row that is not the cursor must not disturb enumeration.
+
+    Only the cursor row's disappearance is unrecoverable; any other
+    concurrent delete just shrinks the result set, and the next page
+    still returns every surviving row after the cursor.
+    """
+    created = [conversation_store.create_conversation().id for _ in range(6)]
+    page1 = conversation_store.list_conversations(limit=2, order="asc")
+    assert page1.has_more is True
+    assert page1.last_id is not None
+    # Delete the non-cursor row of page 1 (the cursor is last_id).
+    assert page1.first_id is not None and page1.first_id != page1.last_id
+    assert await conversation_store.delete_conversation(page1.first_id)
+
+    enumerated = [c.id for c in page1.data]
+    after = page1.last_id
+    while True:
+        page = conversation_store.list_conversations(limit=2, order="asc", after=after)
+        enumerated.extend(c.id for c in page.data)
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    survivors = [cid for cid in created if cid != page1.first_id]
+    assert [cid for cid in enumerated if cid != page1.first_id] == survivors
 
 
 def test_list_conversations_order_asc(

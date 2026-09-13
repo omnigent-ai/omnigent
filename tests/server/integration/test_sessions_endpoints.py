@@ -716,6 +716,38 @@ async def test_list_sessions_pagination(
     assert page2["data"][0]["id"] != page1["data"][0]["id"]
 
 
+async def test_list_sessions_deleted_cursor_returns_stale_cursor_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """Paging past a deleted cursor is a distinguishable 400, not an end.
+
+    Deleting the session whose id is the ``after`` cursor makes its sort
+    position unknowable; an empty 200 page here would read as "fully
+    enumerated" and the client would silently drop every remaining
+    session. The ``stale_cursor`` code tells the client to restart.
+    """
+    agent = await create_test_agent(client)
+    for i in range(3):
+        await _create_session(client, agent["id"], title=f"sc-{i}")
+
+    resp = await client.get("/v1/sessions", params={"limit": 1, "order": "asc"})
+    assert resp.status_code == 200
+    page1 = resp.json()
+    assert page1["has_more"] is True
+    cursor = page1["data"][0]["id"]
+    del_resp = await client.delete(f"/v1/sessions/{cursor}")
+    assert del_resp.status_code == 200
+
+    resp = await client.get(
+        "/v1/sessions",
+        params={"limit": 1, "order": "asc", "after": cursor},
+    )
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "stale_cursor"
+    assert cursor in body["error"]["message"]
+
+
 async def test_list_sessions_kind_filter(
     client: httpx.AsyncClient,
     db_uri: str,
