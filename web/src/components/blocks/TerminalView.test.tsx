@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import type { ConnectionState } from "./TerminalSession";
+import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
 import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
@@ -38,6 +39,8 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    sendInput: ReturnType<typeof vi.fn>;
+    setInputTransform: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -50,6 +53,9 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    sendInput = vi.fn();
+    setInputTransform = vi.fn();
+    applicationCursorKeys = () => false;
 
     constructor(
       container: HTMLDivElement,
@@ -71,6 +77,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        sendInput: this.sendInput,
+        setInputTransform: this.setInputTransform,
       });
     }
   },
@@ -86,7 +94,128 @@ beforeEach(() => {
 afterEach(() => {
   act(() => toast.dismiss());
   cleanup();
+  delete (window as unknown as Record<string, unknown>).omnigentNative;
+  localStorage.clear();
   vi.restoreAllMocks();
+});
+
+/** Per-query matchMedia stub: only `(pointer: coarse)` reads `coarse`, live-changeable. */
+function stubCoarsePointer(initial: boolean) {
+  const listeners = new Set<(ev: { matches: boolean }) => void>();
+  let coarse = initial;
+  vi.spyOn(window, "matchMedia").mockImplementation(
+    (query: string) =>
+      ({
+        get matches() {
+          return query.includes("pointer: coarse") ? coarse : false;
+        },
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: (_t: string, fn: (ev: { matches: boolean }) => void) => {
+          if (query.includes("pointer: coarse")) listeners.add(fn);
+        },
+        removeEventListener: (_t: string, fn: (ev: { matches: boolean }) => void) => {
+          listeners.delete(fn);
+        },
+        dispatchEvent: () => false,
+      }) as unknown as MediaQueryList,
+  );
+  return (next: boolean) => {
+    coarse = next;
+    for (const fn of listeners) fn({ matches: next });
+  };
+}
+
+describe("extra-keys row", () => {
+  it("renders the row on a coarse pointer, wired to the live session's sendInput", async () => {
+    stubCoarsePointer(true);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const row = screen.getByTestId("terminal-extra-keys");
+    expect(within(row).getAllByRole("button")).toHaveLength(14);
+
+    // A tapped key goes out through sendInput (one frame), never term.input.
+    const esc = within(row).getByRole("button", { name: "Escape" });
+    fireEvent.pointerDown(esc, { pointerId: 1, button: 0, isPrimary: true });
+    fireEvent.pointerUp(esc, { pointerId: 1, button: 0, isPrimary: true });
+    expect(terminalSessionMock.instances[0].sendInput).toHaveBeenCalledWith("\x1b");
+  });
+
+  it("does not render the row on a fine pointer (desktop DOM unchanged)", async () => {
+    stubCoarsePointer(false);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
+  });
+
+  it("renders the row on a fine pointer inside a native shell", async () => {
+    stubCoarsePointer(false);
+    (window as unknown as Record<string, unknown>).omnigentNative = { kind: "ios" };
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(screen.getByTestId("terminal-extra-keys")).toBeInTheDocument();
+  });
+
+  it("hides the row for a read-only attach even on touch, so nothing can be sent", async () => {
+    stubCoarsePointer(true);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
+  });
+
+  it("removes the row live when the pointer turns fine", async () => {
+    const setCoarse = stubCoarsePointer(true);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(screen.getByTestId("terminal-extra-keys")).toBeInTheDocument();
+    act(() => setCoarse(false));
+    expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
+  });
+
+  it("installs the locked modifier transform on the session and re-applies it on re-dial", async () => {
+    // WHY: a locked Ctrl must survive an automatic reconnect — the fresh
+    // session is handed the row's current transform at attach time.
+    stubCoarsePointer(true);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const first = terminalSessionMock.instances[0];
+    expect(first.setInputTransform).toHaveBeenLastCalledWith(null);
+
+    // Hold Ctrl past the long-press threshold (real timers: the reconnect
+    // backoff below runs on them too) so it locks rather than arms.
+    const ctrl = screen.getByRole("button", { name: "Control" });
+    fireEvent.pointerDown(ctrl, { pointerId: 1, button: 0, isPrimary: true });
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, LONG_PRESS_MS + 50);
+      });
+    });
+    fireEvent.pointerUp(ctrl, { pointerId: 1, button: 0, isPrimary: true });
+    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
+    const installed = first.setInputTransform.mock.calls.at(-1)?.[0];
+    expect(installed).toBeTypeOf("function");
+    expect(first.focus).toHaveBeenCalled();
+
+    // Transport drop → automatic re-dial creates a second session, which
+    // must start with the same transform installed.
+    act(() => {
+      first.onState({ kind: "connected" });
+    });
+    act(() => {
+      first.onState({ kind: "closed", reason: "", code: 1006 });
+    });
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2), {
+      timeout: RECONNECT_BACKOFF_MS[0] + 2_000,
+    });
+    const second = terminalSessionMock.instances[1];
+    expect(second.setInputTransform).toHaveBeenCalledWith(installed);
+    expect(screen.getByRole("button", { name: "Control" })).toHaveAttribute(
+      "data-modifier-state",
+      "locked",
+    );
+  });
 });
 
 describe("buildAttachPath", () => {
