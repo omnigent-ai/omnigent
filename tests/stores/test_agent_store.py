@@ -503,3 +503,222 @@ def test_session_scoped_agent_resolves_to_root_split_db(tmp_path: Path) -> None:
     fetched = agent_store.get(created.agent.id)
     assert fetched is not None
     assert fetched.session_id == mint_id
+
+
+# ── repoint_session_agents tests ────────────────────────────────────────────
+
+
+def _mint_session_clone(
+    conversation_store: SqlAlchemyConversationStore,
+    *,
+    agent_id: str,
+    name: str,
+    bundle_location: str,
+) -> str:
+    """Create a session bound to a session-scoped agent row (a fork/switch
+    clone shape: kind='session', bundle key copied verbatim).
+
+    :returns: The clone agent's id.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id=agent_id,
+        agent_name=name,
+        agent_bundle_location=bundle_location,
+        agent_description=None,
+        title="clone session",
+    )
+    return created.agent.id
+
+
+def test_repoint_session_agents_updates_stale_uncustomized_clones(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A session clone keyed under the template's id but pointing at old
+    content is repointed to the template's current bundle (and its version
+    bumps, so the runner's version-keyed cache re-fetches)."""
+    template = agent_store.create(
+        agent_id="7a100000000000000000000000000001",
+        name="pin-template",
+        bundle_location="7a100000000000000000000000000001/oldsha",
+    )
+    clone_id = _mint_session_clone(
+        conversation_store,
+        agent_id="7a100000000000000000000000000002",
+        name="pin-template (switch 7a1000000000)",
+        bundle_location="7a100000000000000000000000000001/oldsha",
+    )
+
+    new_loc = f"{template.id}/newsha"
+    agent_store.update(template.id, new_loc)
+    repointed = agent_store.repoint_session_agents(
+        template.id, new_loc, previous_bundle_location=template.bundle_location
+    )
+
+    assert repointed == [clone_id]
+    clone = agent_store.get(clone_id)
+    assert clone is not None
+    assert clone.bundle_location == new_loc, "stale clone must follow the template's bundle"
+    assert clone.version == 2, "repoint must bump version so runner caches re-fetch"
+
+
+def test_repoint_session_agents_leaves_customized_clones_pinned(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A clone whose bundle was customized after cloning is re-keyed under
+    its OWN id and must not be repointed — per-session edits stay intact."""
+    template = agent_store.create(
+        agent_id="7a200000000000000000000000000001",
+        name="custom-template",
+        bundle_location="7a200000000000000000000000000001/oldsha",
+    )
+    clone_id = _mint_session_clone(
+        conversation_store,
+        agent_id="7a200000000000000000000000000002",
+        name="custom-template (switch 7a2000000000)",
+        bundle_location="7a200000000000000000000000000001/oldsha",
+    )
+    # Per-session customization re-keys the bundle under the clone's own id.
+    customized_loc = f"{clone_id}/customsha"
+    agent_store.update(clone_id, customized_loc)
+
+    new_loc = f"{template.id}/newsha"
+    agent_store.update(template.id, new_loc)
+    repointed = agent_store.repoint_session_agents(
+        template.id, new_loc, previous_bundle_location=template.bundle_location
+    )
+
+    assert repointed == []
+    clone = agent_store.get(clone_id)
+    assert clone is not None
+    assert clone.bundle_location == customized_loc, "customized clone must stay pinned"
+
+
+def test_repoint_session_agents_ignores_current_and_foreign_rows(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A clone already on the current bundle is returned for cache eviction
+    but never mutated (another replica may have repointed it while this
+    process's cache is stale); a clone of a DIFFERENT template is invisible
+    (no cross-template bleed)."""
+    template = agent_store.create(
+        agent_id="7a300000000000000000000000000001",
+        name="noop-template",
+        bundle_location="7a300000000000000000000000000001/sha1",
+    )
+    current_clone = _mint_session_clone(
+        conversation_store,
+        agent_id="7a300000000000000000000000000002",
+        name="noop-template (switch 7a3000000000)",
+        bundle_location="7a300000000000000000000000000001/sha1",
+    )
+    foreign_clone = _mint_session_clone(
+        conversation_store,
+        agent_id="7a300000000000000000000000000003",
+        name="other-agent (switch 7a3000000000)",
+        bundle_location="7a399999999999999999999999999999/sha1",
+    )
+
+    stale_cached = agent_store.repoint_session_agents(
+        template.id, template.bundle_location, previous_bundle_location=template.bundle_location
+    )
+
+    assert stale_cached == [current_clone], (
+        "an already-current clone is returned for cache eviction, a foreign one is not"
+    )
+    for clone_id, expected in (
+        (current_clone, "7a300000000000000000000000000001/sha1"),
+        (foreign_clone, "7a399999999999999999999999999999/sha1"),
+    ):
+        clone = agent_store.get(clone_id)
+        assert clone is not None
+        assert clone.bundle_location == expected
+        assert clone.version == 1, "untouched rows must not version-churn"
+
+
+def test_repoint_session_agents_matches_legacy_prefixed_keys(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A clone of a legacy template (``ag_``-prefixed physical artifact key,
+    left segment differs from the row id) is caught via the template's
+    previous bundle-location prefix."""
+    template = agent_store.create(
+        agent_id="7a400000000000000000000000000001",
+        name="legacy-template",
+        bundle_location="ag_legacy_physical/oldsha",
+    )
+    clone_id = _mint_session_clone(
+        conversation_store,
+        agent_id="7a400000000000000000000000000002",
+        name="legacy-template (switch 7a4000000000)",
+        bundle_location="ag_legacy_physical/oldsha",
+    )
+
+    new_loc = f"{template.id}/newsha"
+    agent_store.update(template.id, new_loc)
+    repointed = agent_store.repoint_session_agents(
+        template.id, new_loc, previous_bundle_location="ag_legacy_physical/oldsha"
+    )
+
+    assert repointed == [clone_id]
+    clone = agent_store.get(clone_id)
+    assert clone is not None
+    assert clone.bundle_location == new_loc
+
+
+def test_repoint_session_agents_heals_clone_stranded_by_id_migration(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A clone minted before the uuid id migration keeps an ``ag_``-prefixed
+    physical key. If the template already re-keyed to its bare-id form in an
+    earlier (pre-repointing) deploy, the template's previous location no
+    longer carries the legacy prefix — the clone must still be found via the
+    template id's ``ag_``-prefixed spelling."""
+    template = agent_store.create(
+        agent_id="7a600000000000000000000000000001",
+        name="migrated-template",
+        # The template already moved to the bare-id key in a prior deploy.
+        bundle_location="7a600000000000000000000000000001/midsha",
+    )
+    clone_id = _mint_session_clone(
+        conversation_store,
+        agent_id="7a600000000000000000000000000002",
+        name="migrated-template (switch 7a6000000000)",
+        # The clone still carries the pre-migration physical key.
+        bundle_location="ag_7a600000000000000000000000000001/oldsha",
+    )
+
+    new_loc = f"{template.id}/newsha"
+    agent_store.update(template.id, new_loc)
+    repointed = agent_store.repoint_session_agents(
+        template.id, new_loc, previous_bundle_location=template.bundle_location
+    )
+
+    assert repointed == [clone_id]
+    clone = agent_store.get(clone_id)
+    assert clone is not None
+    assert clone.bundle_location == new_loc
+
+
+def test_repoint_session_agents_never_touches_template_rows(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """Only kind='session' rows are candidates — a template row that happens
+    to share the key prefix (impossible today, defensive) is untouched."""
+    template = agent_store.create(
+        agent_id="7a500000000000000000000000000001",
+        name="only-template",
+        bundle_location="7a500000000000000000000000000001/oldsha",
+    )
+    new_loc = f"{template.id}/newsha"
+    repointed = agent_store.repoint_session_agents(
+        template.id, new_loc, previous_bundle_location=template.bundle_location
+    )
+    assert repointed == []
+    fetched = agent_store.get(template.id)
+    assert fetched is not None
+    assert fetched.bundle_location == template.bundle_location
