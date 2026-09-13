@@ -65,7 +65,6 @@ describe("useWebUpdateNotifications", () => {
     await poll("new");
     expect(result.current.availableBuildId).toBe("new");
     expect(fetchMock).toHaveBeenCalledWith("/api/version", {
-      cache: "no-store",
       signal: expect.any(AbortSignal),
     });
     expect(nativeNotify).not.toHaveBeenCalled();

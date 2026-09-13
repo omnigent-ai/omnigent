@@ -47,7 +47,6 @@ export function useWebUpdateNotifications() {
       const timeout = window.setTimeout(() => controller.abort(), 30_000);
       try {
         const response = await authenticatedFetch("/api/version", {
-          cache: "no-store",
           signal: controller.signal,
         });
         if (!response.ok) throw new Error("Version unavailable");
