@@ -1288,6 +1288,64 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
+  it("shows a read-only child snapshot model and effort even without picker controls", () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          subAgentLabel: "worker",
+          sessionModel: "gpt-5-6-luna",
+          sessionReasoningEffort: "high",
+          showModels: false,
+          showEffort: false,
+          modelPickerKind: "codex",
+          readOnlyReason: "Sub-agent sessions are read-only",
+        })}
+      />,
+    );
+
+    expect(label()).toHaveTextContent("gpt-5.6-lunaHigh");
+    expect(within(label()).getByText("gpt-5.6-luna")).toHaveClass("text-foreground");
+    expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("shows the child snapshot model in the open harness modal", () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          subAgentLabel: "worker",
+          sessionModel: "gpt-5-6-luna",
+          sessionReasoningEffort: "high",
+          showModels: true,
+          showEffort: false,
+          modelPickerKind: "codex",
+        })}
+      />,
+    );
+
+    openSessionConfig();
+
+    expect(
+      within(screen.getByTestId("composer-agent-edit")).getByText("gpt-5.6-luna · High"),
+    ).toBeVisible();
+  });
+
+  it("shows Default reasoning for a child with no persisted override", () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          subAgentLabel: "worker",
+          sessionModel: "gpt-5-6-luna",
+          sessionReasoningEffort: null,
+          showModels: false,
+          showEffort: true,
+          modelPickerKind: "codex",
+          readOnlyReason: "Sub-agent sessions are read-only",
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("gpt-5.6-lunaDefault");
+    expect(within(label()).getByText("Default")).toHaveClass("text-muted-foreground");
+  });
   it("shows no effort for a seeded null, never borrowing the cross-session sticky (#7039)", () => {
     // Same sticky "high" as the test above, but the optimistic create seeded an
     // intentional "no effort" (sessionEffortSeeded) — the authoritative seed

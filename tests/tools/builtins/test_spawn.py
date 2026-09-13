@@ -128,3 +128,20 @@ def test_empty_file_id_rejected() -> None:
 def test_file_ids_non_string_item_rejected() -> None:
     with pytest.raises(jsonschema.ValidationError):
         _validate({"input": "go", "file_ids": [123]})
+
+
+def test_reasoning_effort_is_optional_and_validated() -> None:
+    branch = _object_branch()
+    assert branch["properties"]["reasoning_effort"]["enum"] == [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert "reasoning_effort" not in branch["required"]
+    _validate({"input": "go", "reasoning_effort": "high"})
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({"input": "go", "reasoning_effort": "bogus"})

@@ -39,7 +39,14 @@ export function formatStatusModelLabel(
   const option =
     codexModelOptions.find((candidate) => candidate.id === raw) ??
     codexModelOptions.find((candidate) => candidate.model === raw);
-  return option ? nativeModelLabel(option) : raw;
+  // Codex/router wire ids use dashed version components while the UI uses
+  // the dotted form (for example ``gpt-5-6-luna`` → ``gpt-5.6-luna``).
+  // Restrict the rewrite to a model token at the start or after a common
+  // separator so catalog-qualified ids such as ``system.ai.gpt-5-5`` remain
+  // verbatim when they are not backed by metadata.
+  return option
+    ? nativeModelLabel(option)
+    : raw.replace(/(^|[-/])(gpt)-(\d+)-(\d+)(?=-|$)/gi, "$1$2-$3.$4");
 }
 
 /** Normalize a reasoning-effort value to its display label — the single place

@@ -3699,6 +3699,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
@@ -3768,6 +3769,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             title=title,
             labels=labels,
             reasoning_effort=reasoning_effort,
+            model_override=model_override,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
@@ -3787,6 +3789,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
@@ -3800,7 +3803,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         from omnigent.stores.conversation_store import ConversationNotFoundError
 
         now = now_epoch()
-        encoded_overrides = _encode_session_overrides({"reasoning_effort": reasoning_effort})
+        encoded_overrides = _encode_session_overrides(
+            {
+                "reasoning_effort": reasoning_effort,
+                "model_override": model_override,
+            }
+        )
         prepared_labels = dict(labels) if labels else {}
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.

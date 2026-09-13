@@ -23,6 +23,8 @@ from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
         ("openai-agents-sdk", "openai-agents"),
         # Canonical names pass through unchanged.
         ("openai-agents", "openai-agents"),
+        ("opencode", "opencode"),
+        ("native-opencode", "opencode-native"),
         ("pi", "pi"),
         # Canonical cursor id passes through unchanged (no alias).
         ("cursor", "cursor"),
@@ -81,6 +83,8 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("claude", False),
         # cursor is a headless ACP harness, not a native CLI bridge.
         ("cursor", False),
+        ("opencode", False),
+        ("opencode-native", True),
         ("some-unknown-harness", False),
         (None, False),
     ],
@@ -119,7 +123,8 @@ def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
         ("agy-native", "antigravity"),
         ("native-agy", "antigravity"),
         ("opencode-native", "opencode"),
-        ("opencode", "opencode"),  # alias folds to opencode-native
+        ("native-opencode", "opencode"),
+        ("opencode", None),  # headless CLI subprocess, not the TUI bridge
         # Non-native harnesses (and the SDK shorthands) have no native pane.
         ("claude-sdk", None),
         ("claude", None),

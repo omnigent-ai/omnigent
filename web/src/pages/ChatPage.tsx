@@ -1115,6 +1115,8 @@ export function ChatPage() {
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
+      sessionModel={activeSession?.modelOverride ?? activeSession?.llmModel ?? null}
+      sessionReasoningEffort={activeSession?.reasoningEffort ?? null}
       wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
     />
   );
@@ -1374,6 +1376,10 @@ interface MainAgentSurfaceProps {
    * ``subAgentComposerLabel``.
    */
   subAgentLabel: string | null;
+  /** Effective model from the active session snapshot, including read-only children. */
+  sessionModel: string | null;
+  /** Persisted reasoning effort from the active session snapshot. */
+  sessionReasoningEffort: string | null;
   /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
   wrapperLabel: string | null;
 }
@@ -1507,6 +1513,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   costRoutingEligible,
   subagentRoutingEligible,
   subAgentLabel,
+  sessionModel,
+  sessionReasoningEffort,
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
@@ -1810,6 +1818,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
+            sessionModel={sessionModel}
+            sessionReasoningEffort={sessionReasoningEffort}
             wrapperLabel={wrapperLabel}
             onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
           />
@@ -1962,6 +1972,10 @@ interface ComposerProps {
    * tray above the card. See ``subAgentComposerLabel``.
    */
   subAgentLabel?: string | null;
+  /** Effective model from the active session snapshot, used for child status. */
+  sessionModel?: string | null;
+  /** Persisted reasoning effort from the active session snapshot, used for child status. */
+  sessionReasoningEffort?: string | null;
   /**
    * The session's ``omnigent.wrapper`` label, or ``null`` when it carries
    * none. Only the identity label reads it — to name the vendor running a
@@ -2264,6 +2278,8 @@ function ComposerImpl(
     costRoutingEligible = false,
     subagentRoutingEligible = false,
     subAgentLabel = null,
+    sessionModel = null,
+    sessionReasoningEffort = null,
     wrapperLabel = null,
     onViewportShrinkPinScroll,
   }: ComposerProps,
@@ -3666,6 +3682,9 @@ function ComposerImpl(
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
+                  subAgentLabel={subAgentLabel}
+                  sessionModel={sessionModel}
+                  sessionReasoningEffort={sessionReasoningEffort}
                   subagentRoutingEligible={subagentRoutingEligible}
                   // Config changes persist server-side and apply on the next
                   // wake/turn (the runner forward is best-effort), so the gear
@@ -4211,6 +4230,9 @@ function SessionHarnessPicker({
   codexModelOptions,
   costRoutingEligible,
   subagentRoutingEligible,
+  subAgentLabel = null,
+  sessionModel = null,
+  sessionReasoningEffort = null,
   disabled,
   openNonce = 0,
 }: {
@@ -4228,6 +4250,9 @@ function SessionHarnessPicker({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
+  subAgentLabel?: string | null;
+  sessionModel?: string | null;
+  sessionReasoningEffort?: string | null;
   disabled: boolean;
   openNonce?: number;
 }) {
@@ -4244,6 +4269,17 @@ function SessionHarnessPicker({
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  const isSubAgentSession = subAgentLabel !== null;
+  const childModelLabel = isSubAgentSession
+    ? formatStatusModelLabel(sessionModel, codexModelOptions)
+    : null;
+  const childEffortLabel = isSubAgentSession
+    ? sessionReasoningEffort
+      ? formatStatusEffortLabel(sessionReasoningEffort)
+      : showEffort
+        ? "Default"
+        : null
+    : null;
   const { effectiveModel, modelLabel, modelOptions, pickerSelectedModel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const nativeAgent =
@@ -4269,10 +4305,22 @@ function SessionHarnessPicker({
     showClaudePermissionMode,
     showCodexApprovalMode,
   });
-  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
-  const label = routingOn
+  const effortLabel =
+    childEffortLabel ?? (showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null);
+  const label = isSubAgentSession
+    ? (childModelLabel ?? nativeAgent?.displayName ?? harnessLabel ?? "Session")
+    : routingOn
+      ? SMART_ROUTING_LABEL
+      : (modelLabel ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
+  // On narrow layouts the trigger may collapse to the harness icon, leaving
+  // this row in the open picker as the only model/effort read-out. Child sessions
+  // carry their effective model in the persisted snapshot rather than the
+  // live root-session model store, so prefer that value for this modal only.
+  const modalModelLabel = routingOn
     ? SMART_ROUTING_LABEL
-    : (modelLabel ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
+    : (childModelLabel ?? modelLabel ?? "Default");
+  const modalModelSummary =
+    routingOn || !effortLabel ? modalModelLabel : `${modalModelLabel} · ${effortLabel}`;
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
@@ -4468,7 +4516,7 @@ function SessionHarnessPicker({
               onOpenChange={setConfigMenuOpen}
               icon={<ComposerAgentIcon agent={iconAgent} />}
               label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-              summary={routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default")}
+              summary={modalModelSummary}
               active={!routingOn}
               isMobile={isMobile}
               disabled={busy || pendingModelChange !== null}
