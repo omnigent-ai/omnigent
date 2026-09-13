@@ -9,10 +9,11 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseGithubModule from "@/hooks/useGithub";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
@@ -56,7 +57,13 @@ vi.mock("@/hooks/useAgents", () => ({
   useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
-vi.mock("./Sidebar", () => ({ Sidebar: () => <div data-testid="sidebar" /> }));
+vi.mock("./Sidebar", () => ({
+  Sidebar: () => <div data-testid="sidebar" />,
+  isMobileViewport: vi.fn(() => false),
+}));
+vi.mock("./GithubPanel", () => ({
+  GithubPanel: () => <div data-testid="github-panel">Pull request details</div>,
+}));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
 }));
@@ -74,6 +81,8 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { AppShell } from "./AppShell";
+import { useOpenGithubTab } from "./FileViewerContext";
+import { isMobileViewport } from "./Sidebar";
 import { useGithubInfo } from "@/hooks/useGithub";
 import { useConversations } from "@/hooks/useConversations";
 
@@ -86,6 +95,7 @@ beforeEach(() => {
   // localStorage; clear it so one test's writes can't leak into another.
   localStorage.clear();
   sessionStorage.clear();
+  vi.mocked(isMobileViewport).mockReturnValue(false);
   useGithubInfoMock.mockReset();
   useGithubInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
     typeof useGithubInfo
@@ -118,6 +128,18 @@ beforeEach(() => {
   } as never);
 });
 
+function GithubLinkProbe() {
+  const openGithubTab = useOpenGithubTab();
+  return (
+    <>
+      <button type="button" onClick={() => openGithubTab?.()}>
+        Open PR
+      </button>
+      <Link to="/c/conv_other">Another session</Link>
+    </>
+  );
+}
+
 function renderShell() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -126,7 +148,7 @@ function renderShell() {
         <MemoryRouter initialEntries={["/c/conv_ws"]}>
           <Routes>
             <Route element={<AppShell />}>
-              <Route path="c/:conversationId" element={<div>chat</div>} />
+              <Route path="c/:conversationId" element={<GithubLinkProbe />} />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -182,5 +204,58 @@ describe("GitHub rail tab visibility", () => {
     renderShell();
 
     expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+  });
+});
+
+describe("opening GitHub from the composer", () => {
+  beforeEach(() => {
+    writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "files" });
+  });
+
+  it("opens and dismisses the mobile drawer without opening the hidden desktop rail", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+    const drawer = screen.getByTestId("github-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("github-panel")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(false);
+    expect(screen.getAllByTestId("github-panel")).toHaveLength(1);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).queryByTestId("github-panel")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
+  });
+
+  it("opens the desktop GitHub tab without mounting the mobile panel", () => {
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+    const workspace = screen.getByRole("complementary", { name: "Workspace" });
+    expect(within(workspace).getByRole("tab", { name: "GitHub" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(workspace).getByTestId("github-panel")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(true);
+    const drawer = screen.getByTestId("github-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).queryByTestId("github-panel")).not.toBeInTheDocument();
+  });
+
+  it("closes the mobile GitHub drawer when navigating to another session", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "open");
+
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+
+    expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "closed");
   });
 });
