@@ -147,15 +147,19 @@ describe("workspace bar label collapse", () => {
     Object.defineProperty(element, "scrollWidth", { configurable: true, get: () => scrollWidth });
   };
 
-  it("marks each chip label to collapse to its icon", () => {
+  it("marks each chip label to collapse to its icon and keeps the label as the name", () => {
     render(
       <ComposerWorkspaceBar>
         <ComposerWorkspaceTrigger kind="directory" label="repo" />
+        <ComposerWorkspaceTrigger kind="worktree" label="main" aria-label="Branch: main" />
       </ComposerWorkspaceBar>,
     );
     const label = screen.getByText("repo");
     expect(label).toHaveAttribute("data-workspace-collapse-label");
     expect(label).toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
+    // The name survives the text hiding; a caller's explicit name still wins.
+    expect(screen.getByRole("button", { name: "repo" })).toHaveAttribute("aria-label", "repo");
+    expect(screen.getByRole("button", { name: "Branch: main" })).toBeInTheDocument();
   });
 
   it("collapses the labels to icons once a chip can no longer show its full text", () => {

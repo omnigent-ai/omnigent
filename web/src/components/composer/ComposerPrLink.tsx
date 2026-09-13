@@ -32,6 +32,7 @@ export function ComposerPrLink({
       type="button"
       data-testid="composer-pr-link"
       onClick={() => onOpen()}
+      aria-label={label}
       title={prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"}
       className={cn(
         "flex min-w-0 items-center gap-1 rounded text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
