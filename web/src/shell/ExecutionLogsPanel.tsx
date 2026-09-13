@@ -133,104 +133,106 @@ export function ExecutionLogsPanel({
   const [view, setView] = useState<"items" | "sse">("items");
 
   return (
-    <aside
-      ref={ref}
-      data-testid="execution-logs-panel"
-      data-state={open ? "open" : "closed"}
-      style={{ width: panelWidth }}
-      className={cn(
-        "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
-        "fixed inset-0 z-50 shadow-lg",
-        open ? "translate-x-0" : "translate-x-full",
-        "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
-        open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
-      )}
-      aria-hidden={!open}
-      data-collapsed={!open || undefined}
-    >
-      {isDesktop && (
+    <>
+      {isDesktop && open && (
         <div
           {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          className="relative z-10 w-1 shrink-0 self-stretch cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
         />
       )}
-      <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-3">
-        <h2 className="font-medium text-ui">Execution logs</h2>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
-          <XIcon className="size-4" />
-        </Button>
-      </header>
+      <aside
+        ref={ref}
+        data-testid="execution-logs-panel"
+        data-state={open ? "open" : "closed"}
+        style={{ width: panelWidth }}
+        className={cn(
+          "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
+          "fixed inset-0 z-50 shadow-lg",
+          open ? "translate-x-0" : "translate-x-full",
+          "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
+          open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
+        )}
+        aria-hidden={!open}
+        data-collapsed={!open || undefined}
+      >
+        <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-3">
+          <h2 className="font-medium text-ui">Execution logs</h2>
+          <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
+            <XIcon className="size-4" />
+          </Button>
+        </header>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
-        {!open || !activeEntry ? (
-          <div className="flex-1" />
-        ) : (
-          <>
-            <div className="flex items-center gap-2">
-              <Select value={activeEntry.key} onValueChange={setActiveKey}>
-                {/* The trigger already has `w-fit` by default. We add
+        <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
+          {!open || !activeEntry ? (
+            <div className="flex-1" />
+          ) : (
+            <>
+              <div className="flex items-center gap-2">
+                <Select value={activeEntry.key} onValueChange={setActiveKey}>
+                  {/* The trigger already has `w-fit` by default. We add
                     `self-start` so the flex column doesn't stretch it
                     across the panel's cross-axis — without this, the
                     trigger fills the full panel width regardless of
                     content. */}
-                <SelectTrigger className="self-start">
-                  <SelectValue>
-                    <span className="inline-flex items-center gap-2">
-                      <activeEntry.icon className="size-3.5 shrink-0 text-muted-foreground" />
-                      {activeEntry.label}
-                    </span>
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {entries.map((e) => (
-                    <SelectItem key={e.key} value={e.key}>
+                  <SelectTrigger className="self-start">
+                    <SelectValue>
                       <span className="inline-flex items-center gap-2">
-                        <e.icon className="size-3.5 shrink-0 text-muted-foreground" />
-                        {e.label}
+                        <activeEntry.icon className="size-3.5 shrink-0 text-muted-foreground" />
+                        {activeEntry.label}
                       </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {/* View toggle: conv items vs raw SSE events */}
-              <div className="ml-auto flex rounded-md border border-border text-sm">
-                <button
-                  type="button"
-                  className={cn(
-                    "px-2 py-1 rounded-l-md",
-                    view === "items"
-                      ? "bg-muted font-medium"
-                      : "text-muted-foreground hover:bg-muted/50",
-                  )}
-                  onClick={() => setView("items")}
-                >
-                  Items
-                </button>
-                <button
-                  type="button"
-                  className={cn(
-                    "px-2 py-1 rounded-r-md border-l border-border",
-                    view === "sse"
-                      ? "bg-muted font-medium"
-                      : "text-muted-foreground hover:bg-muted/50",
-                  )}
-                  onClick={() => setView("sse")}
-                >
-                  SSE
-                </button>
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {entries.map((e) => (
+                      <SelectItem key={e.key} value={e.key}>
+                        <span className="inline-flex items-center gap-2">
+                          <e.icon className="size-3.5 shrink-0 text-muted-foreground" />
+                          {e.label}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {/* View toggle: conv items vs raw SSE events */}
+                <div className="ml-auto flex rounded-md border border-border text-sm">
+                  <button
+                    type="button"
+                    className={cn(
+                      "px-2 py-1 rounded-l-md",
+                      view === "items"
+                        ? "bg-muted font-medium"
+                        : "text-muted-foreground hover:bg-muted/50",
+                    )}
+                    onClick={() => setView("items")}
+                  >
+                    Items
+                  </button>
+                  <button
+                    type="button"
+                    className={cn(
+                      "px-2 py-1 rounded-r-md border-l border-border",
+                      view === "sse"
+                        ? "bg-muted font-medium"
+                        : "text-muted-foreground hover:bg-muted/50",
+                    )}
+                    onClick={() => setView("sse")}
+                  >
+                    SSE
+                  </button>
+                </div>
               </div>
-            </div>
-            {view === "items" ? (
-              /* Remount the items list when the session changes so the
+              {view === "items" ? (
+                /* Remount the items list when the session changes so the
                  expand/collapse state resets between selections. */
-              <SessionItemsList key={activeEntry.sessionId} sessionId={activeEntry.sessionId} />
-            ) : (
-              <SseEventsList key={activeEntry.sessionId} sessionId={activeEntry.sessionId} />
-            )}
-          </>
-        )}
-      </div>
-    </aside>
+                <SessionItemsList key={activeEntry.sessionId} sessionId={activeEntry.sessionId} />
+              ) : (
+                <SseEventsList key={activeEntry.sessionId} sessionId={activeEntry.sessionId} />
+              )}
+            </>
+          )}
+        </div>
+      </aside>
+    </>
   );
 }
 

@@ -19,7 +19,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -256,6 +256,7 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -511,6 +512,10 @@ function withWindowOrigin(origin: string, run: () => void) {
 }
 
 beforeEach(() => {
+  // Default to a mobile width: these suites were written against a sidebar
+  // that starts closed. Tests that need desktop semantics (hover peek)
+  // re-pin a desktop width themselves.
+  stubMatchMedia({ width: 375 });
   runnerHealthState.runnerOnline = undefined;
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
@@ -565,7 +570,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -583,6 +591,7 @@ describe("AppShell header", () => {
   });
 
   it("shows only disabled conversation actions for a provisional temp row", () => {
+    stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
     renderShell("/c/temp:12345678");
 
@@ -592,6 +601,7 @@ describe("AppShell header", () => {
   });
 
   it("shows the optimistic title when the temp row is absent from the shell list cache", () => {
+    stubMatchMedia({ width: 1280 });
     recordOptimisticTitle("temp:12345678", "Inspect the workspace");
     mockConversations([]);
 
@@ -1135,6 +1145,7 @@ describe("TerminalFirstContext", () => {
   });
 
   it("targets the agent terminal while a user shell remains open in the workspace rail", async () => {
+    stubMatchMedia({ width: 1280 });
     writeSessionWorkspaceState("conv_native", {
       open: true,
       selectedTerminalKey: "terminal:terminal_bash_s1",
@@ -1175,6 +1186,7 @@ describe("TerminalFirstContext", () => {
   });
 
   it("allows Terminal view when only a user shell is cached", () => {
+    stubMatchMedia({ width: 1280 });
     mockConversations([
       {
         id: "conv_native",
@@ -1292,6 +1304,7 @@ describe("TerminalFirstContext", () => {
   });
 
   it("flips to an empty Terminal view when a terminal-first session has no terminal resource", () => {
+    stubMatchMedia({ width: 1280 });
     // The terminal-first pill is still a useful navigation affordance when a
     // stopped/killed session has no resource rows. `setView("terminal")`
     // must persist an open-but-empty terminal view instead of refusing to
@@ -1892,8 +1905,13 @@ describe("Workspace rail maximize", () => {
     // armed from INSIDE it. Armed from the title-bar trigger (outside), a pointer
     // that never crosses the card leaves it with no pointerenter and therefore no
     // pointerleave, so the card used to sit open indefinitely.
+    // Hover peek is a desktop affordance; at a desktop width the sidebar
+    // starts open, so collapse it first to expose the peek trigger.
+    stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
@@ -1908,8 +1926,13 @@ describe("Workspace rail maximize", () => {
   it("keeps peeking while the pointer is over the card itself", async () => {
     // The other half: dismissal must not be so eager that moving onto the card —
     // the entire point of peeking — closes it.
+    // Same desktop setup as above: collapse the open-by-default sidebar to
+    // expose the peek trigger.
+    stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
@@ -1926,8 +1949,11 @@ describe("Workspace rail maximize", () => {
     // During the card's click-through entry window the pointer still hit-tests
     // to the chat-header toggle beneath it, so a wobble there must count as
     // "inside the peek surface" — not arm the outside-dismiss timer.
+    stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     const toggle = screen.getByRole("button", { name: /open sidebar/i });
     fireEvent.pointerEnter(toggle);
@@ -2674,6 +2700,68 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+  });
+
+  it("aborts an active resize when the workspace panel closes", () => {
+    stubMatchMedia({ width: 1440 });
+    vi.stubGlobal("innerWidth", 1440);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_drag_close", permission_level: null }]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_drag_close",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_drag_close");
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    Object.assign(separator, {
+      setPointerCapture: vi.fn(),
+      hasPointerCapture: () => true,
+      releasePointerCapture: vi.fn(),
+    });
+
+    fireEvent.pointerDown(separator, { pointerId: 9, pointerType: "touch", button: 0 });
+    fireEvent.pointerMove(separator, { pointerId: 9, pointerType: "touch", clientX: 1200 });
+
+    expect(document.body.style.cursor).toBe("col-resize");
+    expect(document.body.style.userSelect).toBe("none");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(false);
+    expect(readSessionWorkspaceState("conv_drag_close").widthPx).toBeUndefined();
   });
 
   it("reserves the visible pane width plus its two desktop margins from the header", () => {
@@ -3910,13 +3998,9 @@ describe("AppShell share action", () => {
 });
 
 describe("Mobile header actions menu", () => {
-  // On mobile (`< md`) the Share / Fork / Agent-info buttons collapse
-  // into a single three-dot "Session actions" menu, gated by the same
-  // permission booleans as the desktop buttons. jsdom doesn't apply the
-  // responsive CSS, so both the desktop buttons and the mobile trigger are in
-  // the DOM here — we assert on the menu's testid'd trigger and its menuitems
-  // (which carry distinct `mobile-*` testids so they never collide with the
-  // desktop buttons' `*-header` testids).
+  // On mobile (`< md`) header actions live in a three-dot menu. Top-level
+  // owner actions share the breadcrumb's conversation menu; sessions without
+  // that row use the standalone "Session actions" trigger.
 
   /** An agent with one MCP server and one policy → agent-info affordance shown. */
   const agentWithInfo: Agent = {
@@ -3929,7 +4013,9 @@ describe("Mobile header actions menu", () => {
 
   /** Open the three-dot menu (Radix opens on pointerdown, not click). */
   function openActionsMenu() {
-    const trigger = screen.getByTestId("session-actions-menu");
+    const trigger =
+      screen.queryByTestId("session-actions-menu") ??
+      screen.getByTestId("header-conversation-actions");
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     return trigger;
   }

@@ -53,6 +53,7 @@ vi.mock("./NewTerminalButton", () => ({
 }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
+const originalMatchMedia = window.matchMedia;
 
 function makeTerminal(id: string, name: string, session: string): TerminalInfo {
   return {
@@ -98,12 +99,32 @@ function renderPanel({
 beforeEach(() => {
   vi.useFakeTimers();
   useTerminalsMock.mockReset();
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query === "(min-width: 768px)",
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  })) as unknown as typeof window.matchMedia;
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.useRealTimers();
+  window.matchMedia = originalMatchMedia;
+});
+
+describe("TerminalsPanel resize handle geometry", () => {
+  it("renders the handle as the panel's unclipped boundary sibling", () => {
+    renderPanel();
+    const handle = screen.getByRole("separator", { name: "Resize panel" });
+    const panel = screen.getByTestId("terminals-panel");
+
+    expect(handle.nextElementSibling).toBe(panel);
+    expect(panel.contains(handle)).toBe(false);
+    expect(handle.closest(".overflow-hidden, .overflow-auto, .overflow-y-auto")).toBeNull();
+    expect(handle.className).toMatch(/\bz-10\b/);
+  });
 });
 
 describe("TerminalsPanel navigation", () => {
@@ -239,5 +260,93 @@ describe("TerminalsPanel navigation", () => {
       "data-terminal-id",
       "terminal_main",
     );
+  });
+});
+
+describe("TerminalsPanel column resize handle", () => {
+  // jsdom has no layout engine, so these tests assert the structural
+  // invariants that produce the desired geometry in a real browser: the
+  // handle must live OUTSIDE the vertically scrolling list panel (a pad
+  // inside it gets clipped and makes the list pannable horizontally) and
+  // sit on the column boundary via `left: <list width>`.
+  function getHandle() {
+    return screen.getByRole("separator", { name: /resize terminal list/i });
+  }
+
+  function getListPanel() {
+    // The list panel is the scrollable element containing the row buttons.
+    const row = screen.getByRole("button", { name: /main/i });
+    const panel = row.parentElement as HTMLElement;
+    expect(panel.className).toContain("overflow-y-auto");
+    return panel;
+  }
+
+  it("renders the handle at the boundary, outside the scrollable list panel", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+
+    const handle = getHandle();
+    const listPanel = getListPanel();
+
+    // Sibling of the list panel inside the overflow-hidden split row — never
+    // a descendant of the scroll container that would clip its hit pad.
+    expect(listPanel.contains(handle)).toBe(false);
+    expect(handle.parentElement).toBe(listPanel.parentElement);
+
+    // Anchored on the column boundary with the drag/touch affordances live.
+    expect(handle.style.left).toBe("176px");
+    expect(handle.style.touchAction).toBe("none");
+    expect(handle.style.paddingLeft).not.toBe("");
+  });
+
+  it("keeps terminal rows selectable outside the handle pad", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+
+    // Tapping the body of another row (well clear of the boundary pad) must
+    // still switch the active terminal.
+    fireEvent.click(screen.getByRole("button", { name: /worker/i }));
+    act(() => {
+      vi.advanceTimersByTime(200); // past the layout-settle mount deferral
+    });
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_worker",
+    );
+  });
+
+  it("removes the handle when the panel closes (no focusable separator in aria-hidden)", () => {
+    const { rerender } = renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+    expect(getHandle()).toBeInTheDocument();
+
+    rerender(
+      <TerminalsPanel
+        open={false}
+        conversationId="conv_terminal"
+        initialTerminalKey={null}
+        readOnly={false}
+        onClose={vi.fn()}
+      />,
+    );
+
+    // The closed aside is aria-hidden; a tabbable separator inside it would
+    // be an ARIA violation and would let keyboard users resize the
+    // off-screen column.
+    expect(
+      screen.queryByRole("separator", { name: /resize terminal list/i, hidden: true }),
+    ).toBeNull();
+    const panel = screen.getByTestId("terminals-panel");
+    expect(panel).toHaveAttribute("aria-hidden", "true");
+    expect(panel.querySelector('[tabindex="0"][role="separator"]')).toBeNull();
+  });
+
+  it("adds no horizontally overflowing content to the list panel", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+
+    // The only element wider than the column (the invisible hit pad) must not
+    // be inside the list panel; everything the panel contains is w-full rows.
+    const listPanel = getListPanel();
+    for (const child of Array.from(listPanel.children)) {
+      expect((child as HTMLElement).style.paddingLeft).toBe("");
+      expect(child.getAttribute("role")).not.toBe("separator");
+    }
   });
 });
