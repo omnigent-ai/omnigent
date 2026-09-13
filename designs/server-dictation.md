@@ -109,7 +109,7 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 `scripts/fetch-dictation-models.sh` downloads a known-good trio (streaming
 Nemotron 0.6 B int8, English online punctuation, and bilingual final
 punctuation; all Apache-2.0 upstream) into the default locations. ASR and final
-punctuation advertise independent capability bits and load lazily.
+punctuation have independent availability checks and load lazily.
 
 `OMNIGENT_DICTATION_MODEL_ROOT` only controls where the fetch script installs
 the three model directories. If it is overridden, configure the corresponding
