@@ -1916,9 +1916,12 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     :param value: The raw override from the request body, e.g. ``"pi"``
         or the ``"openai-agents-sdk"`` alias. ``None`` means no override.
     :param agent: The bound agent row (already fetched by the caller).
-    :returns: The canonical harness id, or ``None`` when *value* is.
-    :raises OmnigentError: ``invalid_input`` for an unknown harness, a
-        non-omnigent executor type, or an unloadable agent bundle.
+    :returns: The canonical harness id — except for a namespaced generic-ACP
+        override (``acp:<slug>``), which is returned verbatim so the runner
+        can select the named agent at spawn — or ``None`` when *value* is.
+    :raises OmnigentError: ``invalid_input`` for an unknown harness, an
+        unknown acp agent slug, a non-omnigent executor type, or an
+        unloadable agent bundle.
     """
     if value is None:
         return None
@@ -1936,6 +1939,31 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
             f"{sorted(OMNIGENT_HARNESSES)}, got {value!r}",
             code=ErrorCode.INVALID_INPUT,
         )
+    # A namespaced generic-ACP override (``acp:<slug>``) must persist the
+    # slug: the runner reads it back for spawn selection (the spec of a
+    # non-ACP bundle carries no executor.config harness, so a persisted bare
+    # ``acp`` falls back to the FIRST configured agent — the wrong one).
+    # Validate the slug against the configured agents here, then fall through
+    # to the shared loadable-spec / executor-type gates below.
+    namespaced_acp = value.startswith("acp:")
+    if namespaced_acp:
+        slug = value.split(":", 1)[1]
+        from omnigent.onboarding.acp_auth import acp_agents
+
+        try:
+            configured = list(acp_agents())
+        except Exception as exc:  # unreadable acp config is a create-time error here
+            raise OmnigentError(
+                f"invalid harness_override: the acp: configuration could not be read "
+                f"while validating {value!r}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not any(entry.slug == slug for entry in configured):
+            raise OmnigentError(
+                f"invalid harness_override: unknown acp agent slug {slug!r}; "
+                f"configured slugs: {[e.slug for e in configured]}",
+                code=ErrorCode.INVALID_INPUT,
+            )
     try:
         loaded = get_agent_cache().load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
@@ -1954,7 +1982,9 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
             f"declares executor.type {executor_type!r}",
             code=ErrorCode.INVALID_INPUT,
         )
-    return canonical
+    # Identity consumers canonicalize on their own, so preserving the
+    # namespaced value is safe — and it is the only carrier of the slug.
+    return value if namespaced_acp else canonical
 
 
 def _validated_harness_override_executor_type(agent: Agent) -> None:
