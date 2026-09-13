@@ -881,12 +881,21 @@ async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
 # ── native hook spawn (no server involved) ───────────────────
 
 # Claude Code blocks its TUI on command hooks, so one hook subprocess's whole
-# lifetime is user-visible latency: the MessageDisplay hook runs once per
-# streamed text chunk, and the same interpreter+import cost fronts every
-# statusline refresh and per-tool-call policy hook. Spawn the per-chunk hook
-# exactly as Claude Code does — isolated interpreter, module entrypoint, JSON
-# payload on stdin — and time the full process lifetime. The import-graph side
-# of this guarantee is pinned by tests/test_claude_native_message_display_hook.
+# lifetime is user-visible latency. This journey times that lifetime for a
+# Python hook — isolated interpreter, module entrypoint, JSON payload on stdin —
+# which is the cost of ANY hook the bridge installs as a `python -m` command.
+#
+# It is NOT the per-chunk streaming path. The hooks that fire per chunk
+# (MessageDisplay) and per tool call (evaluate-policy) were deliberately moved
+# off the interpreter — a /bin/sh appender and a curl to the runner's relay
+# respectively — and tests pin that (`test_message_display_shell_command_round_trips`
+# asserts "python" is absent from the installed command). What still pays this
+# is the per-turn set (SessionStart / Stop / UserPromptSubmit / PreCompact /
+# Task*), the PostToolUse TodoWrite+TaskUpdate matchers, and the policy hook's
+# Python fallback when the relay is not yet up. So read this number as
+# "what a hook costs if it is Python", and as the standing argument for keeping
+# the hot paths off it — not as a per-chunk cost. The import-graph side is
+# pinned by tests/test_claude_native_message_display_hook.py.
 _HOOK_SPAWN_PAYLOAD = json.dumps(
     {
         "hook_event_name": "MessageDisplay",
@@ -905,7 +914,7 @@ async def _setup_hook_spawn(env: BenchEnvironment) -> JourneyContext:
 
 
 async def _measure_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> None:
-    """Spawn the MessageDisplay hook once, as Claude Code does, and wait."""
+    """Spawn one Python hook subprocess and wait, as Claude Code would."""
     del env
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -1082,7 +1091,12 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_hook_spawn,
             setup=_setup_hook_spawn,
             teardown=_teardown_hook_spawn,
-            description="Spawn the per-chunk MessageDisplay hook exactly as Claude Code does.",
+            description=(
+                "Spawn one Python command hook (isolated interpreter, module "
+                "entrypoint) and time its whole lifetime — what any `python -m` "
+                "hook costs Claude's blocked TUI. Not the per-chunk path: that "
+                "one is a /bin/sh appender."
+            ),
         ),
         Journey(
             name="cli_startup",
