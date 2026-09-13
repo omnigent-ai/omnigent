@@ -26,11 +26,11 @@ demand counts GitHub `+1` reactions only, not all reaction types.
 
 ## New-issue grading
 
-When `ISSUE_PRIORITIZATION_V2_ENABLED=true`, the existing Issue Triage workflow
-runs v2 after intake for each new non-bot issue, including maintainer-authored
-issues. It calls the configured model serving endpoint, applies component and
-priority labels, posts one bot-owned triage comment with its assessment of impact,
-and uploads a 30-day decision artifact.
+When `ISSUE_PRIORITIZATION_V2_ENABLED=true`, the Issue Triage workflow sends each
+new non-bot issue, including maintainer-authored issues, through V2 only. V2
+classifies and prioritizes the issue, completes one-time intake, and uploads a
+30-day decision artifact. Setting the switch to `false` restores the untouched
+legacy intake as a rollback path.
 Legacy `severity:S*` labels are removed instead of replaced with another label.
 The periodic Databricks job remains responsible for
 the complete ranking and dashboard; the issue-open path does not wait for it.
@@ -69,8 +69,10 @@ uv run --frozen --project .github/triage_v2 issue-priority-event \
   --model-endpoint databricks-gpt-5-6-luna \
   --areas .github/areas.json \
   --label-manifest .github/issue-prioritization-labels.json \
+  --maintainers .github/MAINTAINER \
   --output-dir /tmp/issue-priority-v2 \
   --run-id local-2125 \
+  --intake \
   --mode dry_run
 ```
 
@@ -83,8 +85,7 @@ type label. Its artifacts expose both values and a `type_label_mismatch` flag.
 For bugs they also record `evidence_kind`, `information_status`, and the
 structured `missing_information` categories. A report can be sufficient without
 a reproduction heading when it contains an intermittent observation, controlled
-test, diagnostics, or concrete code-path analysis. These fields are diagnostic;
-by themselves they do not add `needs-info` or close an issue.
+test, diagnostics, or concrete code-path analysis.
 
 On the event path, V2 uses the assessment to keep the Bug, Feature, or Docs
 label aligned with the classified content. An incomplete bug receives
@@ -92,13 +93,19 @@ label aligned with the classified content. An incomplete bug receives
 missing categories with a seven-day deadline. Author comments and issue-body
 edits run the classifier again; sufficient evidence removes `needs-info` and
 restores the normal assessment comment. Security issues are excluded from this
-lifecycle. V2 does not close issues; expiry is a separate rollout gate.
+lifecycle. Incomplete-issue expiry and high-confidence duplicate closure remain
+separate repository-variable gates.
 
 The same reusable V2 workflow handles new issues, body edits, and author
-comments. Legacy intake still owns duplicate detection, contributor routing,
-and initial assignment, but no longer writes type or `needs-info` when V2 is
-enabled. Author comments are evaluated with the label still attached, so a V2
-failure cannot strand an issue by removing `needs-info` too early.
+comments. Only a new issue runs intake: it adds `triaged`, removes
+`needs-triage`, preserves contributor routing through `help wanted`, assigns an
+unassigned report to its maintainer author or the least-loaded classified-area
+owner, and checks the prefetched issue corpus for duplicates. Duplicate closure
+still requires both high model confidence and the lexical similarity floor, and
+assignment happens first. Edits and author comments only reclassify, so they do
+not rerun duplicate detection or reshuffle ownership. Author comments are
+evaluated with `needs-info` still attached, so a V2 failure cannot strand an
+issue by removing it too early.
 
 A daily expiry workflow previews bot-managed `needs-info` deadlines. Set
 `ISSUE_TRIAGE_CLOSE_NEEDS_INFO=true` only after reviewing those previews to let

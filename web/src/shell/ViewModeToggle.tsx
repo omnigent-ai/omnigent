@@ -1,7 +1,8 @@
-import { Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
+import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { isIOSShell } from "@/lib/nativeBridge";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "./TerminalFirstContext";
 
@@ -14,13 +15,22 @@ import { useTerminalFirst } from "./TerminalFirstContext";
  *
  * Self-gates to null when there's nothing to toggle:
  *   - non-terminal-first sessions,
- *   - the iOS shell (the switcher is the native Liquid Glass bar there),
  *   - a rail-opened shell owning the main view (isShellView) — its own
  *     close affordance is the way back to chat.
+ *
+ * On a desktop-width viewport it renders in the header on every shell — the
+ * native iOS bottom pill is retired (AppShell pushes it hidden at boot), so the
+ * header is the one placement. On a mobile-width viewport the segmented track
+ * is dropped and the switch folds into the header kebab instead (see
+ * {@link ViewModeMenuItems}), so the narrow header pill isn't split between a
+ * view switch and the "…" menu.
  */
 export function ViewModeToggle() {
   const ctx = useTerminalFirst();
-  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
+  const isMobile = useIsMobileViewport();
+  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
+  // Mobile folds the switch into the header kebab (ViewModeMenuItems).
+  if (isMobile) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
@@ -30,11 +40,10 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
-      // Lets the mobile header pill inset itself only when this segmented
-      // track is present — see MOBILE_GLASS_PILL.
-      data-slot="view-mode-toggle"
       // Inset track: p-0.5 around two size-6 segments lands the control at
-      // 32px tall, matching the header's other controls.
+      // 32px tall, matching the header's other controls. Desktop-only — on a
+      // mobile viewport the component returns null and the switch folds into
+      // the header kebab instead (ViewModeMenuItems).
       className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
     >
       <ViewModeSegment
@@ -112,5 +121,50 @@ function ViewModeSegment({
           would render above the viewport edge and get clipped. */}
       <TooltipContent side="bottom">{label}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/**
+ * Chat/Terminal switch as dropdown-menu items — the mobile counterpart of the
+ * {@link ViewModeToggle} segmented track, folded into the header kebab so the
+ * narrow header pill carries one trigger instead of a switch beside the "…"
+ * menu. Self-gates to null on the same conditions as the toggle (non
+ * terminal-first sessions, and a shell owning the main view). The active view
+ * carries a trailing check; a trailing separator sets the switch off from the
+ * menu items that follow.
+ */
+export function ViewModeMenuItems() {
+  const ctx = useTerminalFirst();
+  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
+
+  const { view, setView, terminalStartingUp } = ctx;
+  const terminalLabel = terminalStartingUp ? "Terminal (starting up…)" : "Terminal";
+
+  return (
+    <>
+      <DropdownMenuItem
+        className="gap-2.5 px-2.5 py-2 text-ui"
+        onSelect={() => setView("chat")}
+        data-testid="view-mode-menu-chat"
+      >
+        <MessagesSquareIcon className="size-4" />
+        Chat
+        {view === "chat" && <CheckIcon className="ml-auto size-4" />}
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        className="gap-2.5 px-2.5 py-2 text-ui"
+        onSelect={() => setView("terminal")}
+        data-testid="view-mode-menu-terminal"
+      >
+        {terminalStartingUp ? (
+          <Loader2Icon className="size-4 animate-spin" aria-hidden />
+        ) : (
+          <TerminalIcon className="size-4" />
+        )}
+        {terminalLabel}
+        {view === "terminal" && <CheckIcon className="ml-auto size-4" />}
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+    </>
   );
 }

@@ -5,6 +5,7 @@ const {
   SETTINGS_ACCELERATOR,
   SETTINGS_PATH,
   focusedConnectedWindow,
+  aboutMenuItem,
   macApplicationMenu,
   settingsMenuItem,
 } = require("../src/settingsNavigation");
@@ -32,16 +33,24 @@ describe("Settings native menu item", () => {
     assert.equal(opened, 1);
   });
 
-  it("keeps Settings in the conventional macOS application menu", () => {
-    const item = settingsMenuItem(() => {});
-    const menu = macApplicationMenu("Omnigent", item);
+  it("opens the custom About window and keeps Settings in the macOS app menu", () => {
+    let opened = 0;
+    const about = aboutMenuItem("Omnigent", () => {
+      opened += 1;
+    });
+    const settings = settingsMenuItem(() => {});
+    const menu = macApplicationMenu("Electron", about, settings);
 
-    assert.equal(menu.label, "Omnigent");
-    assert.equal(menu.submenu[0].role, "about");
-    assert.equal(menu.submenu[2], item);
+    assert.equal(menu.label, "Electron");
+    assert.equal(menu.submenu[0], about);
+    assert.equal(about.id, "open_about");
+    assert.equal(about.label, "About Omnigent");
+    about.click();
+    assert.equal(opened, 1);
+    assert.equal(menu.submenu[2], settings);
     assert.deepEqual(
       menu.submenu.filter((entry) => entry.role).map((entry) => entry.role),
-      ["about", "services", "hide", "hideOthers", "unhide", "quit"],
+      ["services", "hide", "hideOthers", "unhide", "quit"],
     );
   });
 });

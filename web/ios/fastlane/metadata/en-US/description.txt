@@ -1,6 +1,6 @@
 Omnigent is the mobile companion for your Omnigent server: an open-source workspace for supervising AI agents across coding, research, automation, and other technical workflows.
 
-Connect to a server you run, sign in, and continue the same sessions you use from desktop or browser. Follow agent work from your phone, send messages, review outputs, and switch between sessions without losing context.
+Connect to a server you run, sign in, and continue the same sessions you use from desktop or browser. Follow agent work from your iPhone or iPad, send messages, review outputs, and switch between sessions without losing context.
 
 Use Omnigent to:
 

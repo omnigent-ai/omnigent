@@ -26,8 +26,10 @@ from omnigent.entities.conversation import (
     parse_item_data,
     synthesize_conversation_title,
 )
+from omnigent.entities.databricks_connection import DatabricksConnection
 from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
+from omnigent.entities.github_connection import GithubConnection
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
@@ -54,10 +56,12 @@ __all__ = [
     "CompactionData",
     "Conversation",
     "ConversationItem",
+    "DatabricksConnection",
     "DeviceGrant",
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
+    "GithubConnection",
     "ItemData",
     "LoadedAgent",
     "MessageData",

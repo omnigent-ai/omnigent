@@ -32,8 +32,8 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
 from omnigent.cli_invocation import cli_invocation
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native_dispatch import resolve_hook_for_key
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_dispatch import resolve_hook_for_key
 
 _logger = logging.getLogger(__name__)
 

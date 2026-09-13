@@ -239,6 +239,81 @@ describe("mobile sidebar drawer", () => {
     // hiding its title and state badge and blocking the tap target.
     renderSidebar();
 
-    expect(screen.getByRole("navigation")).toHaveClass("max-md:pb-14");
+    expect(screen.getByRole("navigation")).toHaveClass("max-md:pb-16");
+  });
+});
+
+/**
+ * Simulate the iOS native shell and its live visual viewport. The keyboard
+ * "opens" by shrinking the visual viewport below the layout viewport
+ * (window.innerHeight); useIOSNativeKeyboardInset reads the delta. Pass
+ * visibleHeight === layoutHeight to model a closed keyboard (inset 0).
+ */
+function setIOSViewport(layoutHeight: number, visibleHeight: number): void {
+  (window as unknown as Record<string, unknown>).omnigentNative = { kind: "ios" };
+  vi.stubGlobal("innerHeight", layoutHeight);
+  vi.stubGlobal("visualViewport", {
+    offsetTop: 0,
+    height: visibleHeight,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  });
+}
+
+// The mobile drawer is a `fixed inset-0` overlay that the iOS shell-lock (which
+// only resizes flow content inside .app-shell) can't lift above the soft
+// keyboard. It pads its own bottom by the keyboard inset so the session list
+// stays fully scrollable while an inline rename holds the keyboard up —
+// without it the last rows sit behind the keyboard and can never be reached.
+describe("mobile sidebar drawer keyboard inset", () => {
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentNative;
+    vi.unstubAllGlobals();
+  });
+
+  it("pads the drawer bottom by the keyboard inset when the iOS keyboard is open", () => {
+    setIOSViewport(844, 508); // keyboard covers 336px of the 844px layout
+    renderSidebar();
+
+    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveStyle({
+      paddingBottom: "336px",
+    });
+  });
+
+  it("applies no bottom padding when the keyboard is closed", () => {
+    setIOSViewport(844, 844); // visible viewport fills the layout — no keyboard
+    renderSidebar();
+
+    expect(screen.getByRole("complementary", { name: "Conversations" }).style.paddingBottom).toBe(
+      "",
+    );
+  });
+
+  it("applies no bottom padding for a sub-threshold viewport delta", () => {
+    // A small visual-viewport shrink (browser chrome shifting, not a
+    // keyboard) sits below the hook's inset threshold and must not pad.
+    setIOSViewport(844, 804); // 40px delta — below the 80px threshold
+    renderSidebar();
+
+    expect(screen.getByRole("complementary", { name: "Conversations" }).style.paddingBottom).toBe(
+      "",
+    );
+  });
+
+  it("applies no bottom padding off the iOS shell even when the viewport shrinks", () => {
+    // A shrunk visual viewport but no iOS shell marker: the browser/Electron
+    // keyboard is handled by normal layout, so the drawer must not pad itself.
+    vi.stubGlobal("innerHeight", 844);
+    vi.stubGlobal("visualViewport", {
+      offsetTop: 0,
+      height: 508,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    renderSidebar();
+
+    expect(screen.getByRole("complementary", { name: "Conversations" }).style.paddingBottom).toBe(
+      "",
+    );
   });
 });

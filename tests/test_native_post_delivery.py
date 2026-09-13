@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent._native_post_delivery import (
+from omnigent.native._native_post_delivery import (
     _DEAD_LETTER_BACKUP_FILE,
     _DEAD_LETTER_FILE,
     _DEAD_LETTER_MAX_BYTES,
@@ -245,8 +245,16 @@ def test_append_dead_letter_classification_defaults(tmp_path: Path) -> None:
         (_dead_letter_record(), True),
         # Retryable status exhausted after the forwarder's bounded retries.
         (_dead_letter_record(http_status=503), True),
-        # Ambiguous: the server may have committed it — never replay.
+        # Legacy ambiguous item: no idempotency key, so never replay.
         (_dead_letter_record(delivered_ambiguous=True), False),
+        # Idempotent ambiguous item: source_id makes a replay duplicate-safe.
+        (
+            _dead_letter_record(
+                delivered_ambiguous=True,
+                payload={"item_type": "message", "source_id": "thread:turn:item"},
+            ),
+            True,
+        ),
         # Permanent 4xx: the server rejected it; a replay just re-rejects.
         (_dead_letter_record(http_status=400), False),
         # Non-retryable 5xx that is not in the retry set is also not recoverable.
@@ -271,7 +279,7 @@ def test_append_dead_letter_classification_defaults(tmp_path: Path) -> None:
 )
 def test_dead_letter_record_replayable_classification(record: object, replayable: bool) -> None:
     """
-    Only proven-undelivered records are replayable; everything else is forensic.
+    Proven-undelivered records and source-idempotent ambiguous items are replayable.
 
     A wrong classification either duplicates a committed item (ambiguous or
     permanent record wrongly replayed) or re-rejects forever.
@@ -560,8 +568,8 @@ async def test_retry_loop_records_exhausted_connectivity_failure_for_watchdog() 
     can name the real cause. Fails before the recording call was added (the
     health slot stays empty); passes after.
     """
-    from omnigent import _native_forwarder_health as health
-    from omnigent._native_post_delivery import post_session_event_with_retry
+    from omnigent.native import _native_forwarder_health as health
+    from omnigent.native._native_post_delivery import post_session_event_with_retry
 
     class _AlwaysConnectError:
         """Stub client whose every POST fails to connect."""
@@ -603,8 +611,8 @@ async def test_retry_loop_success_clears_a_prior_connectivity_failure() -> None:
     the retry loop must empty the failure slot so the idle watchdog can't blame
     a long-resolved outage for a later, unrelated stall.
     """
-    from omnigent import _native_forwarder_health as health
-    from omnigent._native_post_delivery import post_session_event_with_retry
+    from omnigent.native import _native_forwarder_health as health
+    from omnigent.native._native_post_delivery import post_session_event_with_retry
 
     class _Ok:
         """Stub client whose POST always succeeds with 200."""

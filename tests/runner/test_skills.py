@@ -28,6 +28,17 @@ from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import SkillSpec
 
 
+@pytest.fixture(autouse=True)
+def _isolate_claude_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the ambient Claude config dir the runner resolution reads.
+
+    These tests pin ``Path.home()``; an ambient ``CLAUDE_CONFIG_DIR`` would
+    redirect the claude user scope away from that pinned home and flip the
+    expected menus on machines that set it.
+    """
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
 def _skill_md(name: str, description: str) -> str:
     """
     Build minimal SKILL.md text with valid frontmatter.

@@ -21,7 +21,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent import codex_native_forwarder
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 
 _OWNER_EMAIL = "usage-owner@e2e.test"
 _AGENT_NAME = "e2e-usage-test"

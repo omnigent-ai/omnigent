@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-import omnigent.antigravity_native_rpc as rpc
+import omnigent.harnesses.antigravity_native.rpc as rpc
 
 # Realistic two-port agy ``lsof`` output: the LOWER (52548) is the TLS
 # connect-RPC port; the higher (52549) is plain HTTP. Mirrors the verified

@@ -7,8 +7,10 @@ if the section does not exist.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,6 +185,78 @@ def load_or_create_host_identity(
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
     return identity
+
+
+def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
+    """Replace this machine's persisted ``host_id`` with a fresh one.
+
+    The recovery path for a host registration owned by another identity:
+    the server keys hosts by ``host_id``, so once that id is claimed by a
+    different account (e.g. a service principal), re-registering under the
+    signed-in user is refused with HTTP 409. Minting a fresh id lets the
+    machine register as a brand-new host under the current identity.
+
+    The host ``name`` (and every other config key) is preserved; only
+    ``host_id`` changes. A missing config or host section is created, same
+    as :func:`load_or_create_host_identity`.
+
+    :param path: Path to the config YAML file. Defaults to :data:`CONFIG_PATH`.
+    :returns: ``(old_host_id, new_host_id)`` — ``old_host_id`` is ``None``
+        when no identity was persisted before.
+    """
+    cfg: dict[str, object] = {}
+    if path.exists():
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+
+    host_section = cfg.get("host")
+    if not isinstance(host_section, dict):
+        host_section = {}
+
+    old_host_id = host_section.get("host_id")
+    new_host_id = uuid.uuid4().hex
+    host_section["host_id"] = new_host_id
+    host_section.setdefault("name", socket.gethostname())
+    cfg["host"] = host_section
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write: reset-id is a recovery command run when things are already
+    # broken, so a crash mid-write must not truncate the whole config. Write a
+    # sibling temp file and rename it over the target (rename is atomic on the
+    # same filesystem). The rename adopts mkstemp's 0600 mode intentionally —
+    # config.yaml holds only host identity, and 0600 is the right posture for a
+    # per-user file; do not "restore" a wider umask mode here.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+    return (old_host_id if isinstance(old_host_id, str) else None), new_host_id
+
+
+def host_identity_env_override_active() -> bool:
+    """Whether either identity env var (``OMNIGENT_HOST_ID`` / ``_NAME``) is set.
+
+    These pin the host identity from the environment:
+    :func:`load_or_create_host_identity` returns the env identity *without
+    reading config.yaml* when both are set, and raises when exactly one is
+    set (they must be set together). Either way a :func:`reset_host_id`
+    write to the file does not fix the machine's identity, so callers refuse
+    the reset and tell the user to unset the env vars.
+
+    Uses ``is not None`` (not truthiness) to match the loader, which treats a
+    present-but-empty var as set.
+
+    :returns: ``True`` when at least one of the identity env vars is set.
+    """
+    return (
+        os.environ.get(HOST_ID_ENV_VAR) is not None
+        or os.environ.get(HOST_NAME_ENV_VAR) is not None
+    )
 
 
 def load_host_identity_if_present(

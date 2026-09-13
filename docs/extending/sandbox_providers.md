@@ -1,8 +1,8 @@
 # Sandbox providers
 
 Omnigent supports running agent hosts in remote sandboxes. Built-in providers
-(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Islo, OpenShell, Boxlite,
-Kubernetes)
+(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
+Boxlite, Kubernetes, microsandbox)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
 
@@ -13,9 +13,9 @@ Each sandbox provider implements the
 Providers that exec into a running sandbox (Modal, Daytona, …) inherit
 `ExecModelHostLauncher`, which provides a default `start_host` that probes
 `$HOME`, creates a workspace, clones a repo, and backgrounds `omnigent host`.
-Providers whose sandbox boots running the host directly (Kubernetes) inherit
-`SandboxHostLauncher` and override `start_host` to build the infrastructure
-manifest instead.
+Providers whose sandbox boots running the host directly (Kubernetes), or whose
+control plane owns host startup (Gensee), inherit `SandboxHostLauncher` and
+override `start_host` without exposing a general-purpose exec transport.
 
 ## Creating a community sandbox provider
 
@@ -131,11 +131,31 @@ server's `sandbox:` config:
 sandbox:
   provider: acme
   server_url: https://your-host
+  reaper:
+    enabled: true
+    terminate_after_offline_days: 30  # optional; defaults to 30 days
+    sweep_interval_s: 86400           # optional; defaults to 1 day
 ```
 
 The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
+
+`sandbox.reaper` is deployment-wide: configure it next to `provider` or
+`providers`, never inside one provider entry. One configurable loop covers every
+configured provider and dispatches termination through the provider recorded on
+each managed host. Reaping keeps the session and durable host binding so the
+next message can launch a fresh sandbox generation.
+
+The loop discovers workspaces with active or pending managed sandboxes, then
+queries stale managed hosts within each workspace. Before calling the provider,
+it atomically detaches the stale sandbox id from the active host generation.
+Failed terminations stay pending and are retried by later sweeps; providers must
+therefore make `terminate()` succeed when the sandbox is already absent.
+
+The reaper reuses one launcher per workspace and provider. Override
+`reaper_identity(workspace_id)` when background termination needs a scoped
+credential context; the default context is a no-op.
 
 ## Provider capabilities
 
@@ -152,3 +172,35 @@ Providers declare their feature set via a `capabilities` property returning
 | `file_copy` | Supports copying files into the sandbox |
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
+
+## Network policy for harness bridge servers
+
+Native harnesses (e.g. `claude-native`) run small HTTP servers on the sandbox
+host — a tool relay and an MCP control ingress — that the harness's hook and
+helper subprocesses call back into. **By default these bind loopback only
+(`127.0.0.1`)**, so an ordinary host keeps them off every other interface.
+
+A sandbox whose SSRF hardening denies loopback destinations unconditionally
+(e.g. OpenShell) cannot reach a loopback-advertised relay, which fail-closes
+every prompt. Such an integrator opts into an all-interfaces bind by setting
+`OMNIGENT_BRIDGE_BIND_HOST=0.0.0.0`: the servers then listen on all interfaces
+(loopback consumers keep working) and advertise the host's routable address so
+the in-sandbox hooks can reach them. Their ports come from a small stable pool
+a network policy can allowlist by exact host+port:
+
+- **`OMNIGENT_BRIDGE_BIND_HOST`** selects the posture. Unset (default) is
+  loopback-only. `0.0.0.0` binds all interfaces and advertises the detected
+  routable address (falling back to loopback when the host has none). Any
+  other value pins that exact host for both bind and advertisement.
+- **Default port pool:** `28700`–`28715`
+  (`omnigent.harnesses.claude_native.bridge.DEFAULT_BRIDGE_PORT_POOL`).
+  Several servers coexist per host (the MCP ingress plus one tool relay per
+  session), so allowlist the whole pool, not a single port. When the pool is
+  exhausted the servers fall back to an OS-assigned ephemeral port, which an
+  exact-port policy cannot cover.
+- **`OMNIGENT_BRIDGE_PORT_POOL`** overrides the pool: comma-separated ports
+  and inclusive ranges, e.g. `28700-28703,29000`.
+
+Every endpoint on these servers (other than `GET /health`) requires a
+per-relay bearer token, so allowlisting their coordinates does not expose
+unauthenticated functionality.

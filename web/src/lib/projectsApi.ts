@@ -42,6 +42,14 @@ export interface ProjectConfig {
    * is never stored (treated the same as unset).
    */
   base_branch?: string;
+  /**
+   * Default model for new sessions when the default agent is a native coding
+   * harness with a model choice (e.g. Claude Code's version-agnostic "opus"
+   * alias, or a Codex model id resolved on the host). Only meaningful
+   * alongside an `agent_id` whose harness takes a model override; unset =
+   * the harness's own configured default.
+   */
+  model?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

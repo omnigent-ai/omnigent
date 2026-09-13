@@ -18,12 +18,29 @@ which clip `kind` it produces and where it goes; this file is the how.
 ## What is expected to yield a recording
 
 A `web` / `mobile` / `terminal` / `cli` / `desktop` facet is expected to yield a recording:
-drive it on that surface and film it. Only an `api` facet — a failure no user
-observes on any surface (a wrong value in a response, an internal state a pytest
-asserts) — legitimately has no recording; `recordings: []` is correct there and is
-not a gap. Tests may drive and verify the journey, but the clip itself must show
-the product surface and user-visible outcome, never the test process, pytest
-output, assertions, logs, or a synthetic evidence-summary slide.
+drive it on that surface and film it. A facet legitimately has no recording when
+its outcome is not something a user *watches* — an `api` failure no user observes
+on any surface (a wrong value in a response, an internal state a pytest asserts),
+or a facet whose whole user-visible outcome is a static piece of text (an error
+string, a value, a log line) with nothing that moves on screen. For those,
+`recordings: []` is correct and not a gap: state the observed text and how you
+confirmed it in your prose/evidence instead. Tests may drive and verify the
+journey, but the clip itself must show the product surface and user-visible
+outcome, never the test process, pytest output, assertions, logs, or a synthetic
+evidence-summary slide.
+
+**A valid clip shows a live action producing the outcome — not static text
+asserting it.** A recording earns its place only when there is something to
+*watch*: a user action drives the surface and the product visibly responds — a
+terminal command executing and printing its result, a screen changing, a value
+updating, an error appearing in response to input. That is why filming a
+`terminal`/`cli` command is legitimate: the pane is live, the command runs, the
+output is the product's own behavior. What is **never** a recording is a clip
+whose content is just text sitting on screen — a summary slide, a narrated page,
+the reproduction test's own console output, or a hand-typed sentence "claiming"
+the bug reproduces. Those film your *assertion*, not the product, and a viewer
+learns nothing a written line wouldn't tell them better; describe the outcome in
+prose instead of manufacturing a video of it.
 
 **One verdict-appropriate clip per facet — nothing else.** Every recording must
 correspond to a facet, and its `kind` must match that facet's verdict. Do **not**

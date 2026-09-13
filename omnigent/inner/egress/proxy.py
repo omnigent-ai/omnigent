@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import email.policy
 import functools
 import hmac
@@ -55,6 +56,7 @@ from omnigent.inner.egress.rules import (
 logger = logging.getLogger(__name__)
 
 _CONNECT_RESPONSE = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+_HTTP2_PREFACE_FIRST_LINE = b"PRI * HTTP/2.0\r\n"
 _BUF_SIZE = 65536
 _HEADER_MAX = 65536
 # S6 (security): the smallest printable ASCII byte (SP). Any byte below
@@ -235,8 +237,11 @@ class EgressProxy:
         # agent-controlled trust store entirely.
         if upstream_ca_bundle is not None:
             self._upstream_ssl_ctx = ssl.create_default_context(cafile=str(upstream_ca_bundle))
+            self._upstream_h2_ssl_ctx = ssl.create_default_context(cafile=str(upstream_ca_bundle))
         else:
             self._upstream_ssl_ctx = ssl.create_default_context()
+            self._upstream_h2_ssl_ctx = ssl.create_default_context()
+        self._upstream_h2_ssl_ctx.set_alpn_protocols(["h2"])
         self._block_private_destinations = block_private_destinations
         self._auth_token = auth_token
         # Two indexes over the rewrite rules:
@@ -246,16 +251,15 @@ class EgressProxy:
         #   injects the real credential. Exactly one rule per host — the
         #   parser rejects duplicate-host bindings, so this map never
         #   silently drops a rule.
-        # - ``_cred_by_synthetic``: the opt-in placeholder path. Only
-        #   entries that injected an ``oa_cred_*`` env var register here;
-        #   the synthetic is globally unique so it alone identifies the
-        #   rule (and thus the bound host) for the swap + leak guard.
+        # - ``_cred_by_synthetic``: the opt-in placeholder path. One
+        #   placeholder may intentionally serve several configured hosts.
         self._cred_by_host: dict[str, CredentialRewriteRule] = {}
-        self._cred_by_synthetic: dict[str, CredentialRewriteRule] = {}
+        self._cred_by_synthetic: dict[str, dict[str, CredentialRewriteRule]] = {}
         for rule in credential_rewrites or []:
-            self._cred_by_host[rule.host.lower()] = rule
+            host = rule.host.lower()
+            self._cred_by_host[host] = rule
             if rule.synthetic is not None:
-                self._cred_by_synthetic[rule.synthetic] = rule
+                self._cred_by_synthetic.setdefault(rule.synthetic, {})[host] = rule
         # Precompute the expected header bytes ONCE so the per-request
         # comparison is a constant-time memcmp instead of repeating
         # the base64 round-trip on every connection. Stored as bytes
@@ -509,6 +513,10 @@ class EgressProxy:
         await writer.drain()
 
         ssl_ctx = self._cert_cache.get_ssl_context(host)
+        if self._allows_http2_passthrough(host):
+            ssl_ctx.set_alpn_protocols(["h2", "http/1.1"])
+        else:
+            ssl_ctx.set_alpn_protocols(["http/1.1"])
 
         # Wire the post-handshake reader / protocol *before* calling
         # ``start_tls`` and pass them in directly, rather than calling
@@ -568,6 +576,30 @@ class EgressProxy:
         try:
             inner_first = await asyncio.wait_for(tls_reader.readline(), timeout=30)
             if not inner_first:
+                return
+
+            if inner_first == _HTTP2_PREFACE_FIRST_LINE:
+                if not self._allows_unrestricted_host(host):
+                    logger.warning(
+                        "BLOCKED-H2 https://%s — HTTP/2 requires an unrestricted host rule",
+                        host,
+                    )
+                    await self._send_forbidden(
+                        tls_writer, "HTTP/2 requires an unrestricted host rule"
+                    )
+                    return
+                if host.lower() in self._cred_by_host:
+                    logger.warning(
+                        "BLOCKED-H2-CREDENTIAL https://%s — opaque HTTP/2 "
+                        "cannot rewrite credentials",
+                        host,
+                    )
+                    await self._send_forbidden(
+                        tls_writer, "HTTP/2 cannot use a credential rewrite rule"
+                    )
+                    return
+                logger.info("ALLOW-H2 https://%s/**", host)
+                await self._forward_http2(tls_reader, tls_writer, host, port, inner_first)
                 return
 
             inner_line = inner_first.decode("latin-1", errors="replace").strip()
@@ -679,6 +711,65 @@ class EgressProxy:
                 await asyncio.wait_for(tls_writer.wait_closed(), timeout=2)
             except Exception:  # noqa: BLE001 — TLS close is best-effort
                 pass
+
+    def _allows_unrestricted_host(self, host: str) -> bool:
+        """Return whether one rule allows every method and path for *host*."""
+        return any(rule.allows_all_requests_to(host) for rule in self._rules)
+
+    def _allows_http2_passthrough(self, host: str) -> bool:
+        """Return whether opaque HTTP/2 relay is safe for *host*."""
+        return self._allows_unrestricted_host(host) and host.lower() not in self._cred_by_host
+
+    async def _forward_http2(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+        initial_data: bytes,
+    ) -> None:
+        """Relay an opaque HTTP/2 connection for an unrestricted host."""
+        try:
+            pinned_ip = await self._assert_destination_allowed(host, port)
+        except PermissionError as exc:
+            logger.warning("BLOCKED-DEST h2://%s:%d - %s", host, port, exc)
+            return
+
+        connect_host = pinned_ip or host
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    connect_host,
+                    port,
+                    ssl=self._upstream_h2_ssl_ctx,
+                    server_hostname=host,
+                ),
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001 — closing the h2 stream signals failure
+            logger.warning("Cannot connect HTTP/2 upstream %s:%d - %s", host, port, exc)
+            return
+
+        async def relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            while data := await reader.read(_BUF_SIZE):
+                writer.write(data)
+                await writer.drain()
+
+        try:
+            upstream_writer.write(initial_data)
+            await upstream_writer.drain()
+            tasks = {
+                asyncio.create_task(relay(client_reader, upstream_writer)),
+                asyncio.create_task(relay(upstream_reader, client_writer)),
+            }
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
+        finally:
+            upstream_writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(upstream_writer.wait_closed(), timeout=2)
 
     async def _forward_https(
         self,
@@ -1225,8 +1316,9 @@ class EgressProxy:
                     # leave it alone (and don't also inject over it).
                     rewritten.append(value)
                     continue
-                rule = self._cred_by_synthetic.get(synthetic)
-                if rule is None or rule.host != host_key:
+                rules = self._cred_by_synthetic.get(synthetic)
+                rule = rules.get(host_key) if rules is not None else None
+                if rule is None:
                     # A value carrying our placeholder prefix that we don't
                     # recognise for this host. Refuse rather than forward —
                     # this is the leak guard for a compromised sandbox that

@@ -1,6 +1,5 @@
-# resolve-agent (local) — take a reproduced bug to resolution and prove it with a
-# fail→pass test transition: review an existing fix PR if one exists, else author
-# the fix and open a PR.
+# resolve-agent (local) — take a reproduced bug to resolution, or remediate
+# requested changes on an existing Resolve-managed PR.
 #
 # This is the step AFTER repro-agent. It consumes repro-agent's handoff (the
 # live-confirmed reproduction and its e2e test). It first checks whether an open
@@ -55,7 +54,9 @@ description: >-
   live facet goes fail→pass, re-records the repro drivers on the fixed tree so
   the before/after footage pair lands in the PR's Demo section (and on the
   Linear ticket when a key is available), then commits, pushes, and opens a
-  ready-for-review pull request. It does not merge.
+  ready-for-review pull request. It can also remediate trusted human change
+  requests on an existing Resolve-managed PR, including its CI and automated
+  review failures. It does not merge.
 
 # Runs on the Claude Agent SDK. No model is pinned, so the configured provider's
 # default model is used. The large context window holds the repro session
@@ -66,6 +67,7 @@ executor:
   reasoning_effort: xhigh
   config:
     harness: claude-sdk
+    permission_mode: bypassPermissions
 
 # The full operating procedure lives in AGENTS.md, read at startup.
 instructions: AGENTS.md
@@ -80,14 +82,9 @@ agent_session_sharing: public
 async: true
 cancellable: true
 
-# spawn: true registers sys_session_create so the agent can launch a child
-# session it defines. Before opening the PR (author path), it spawns ONE
-# cross-vendor reviewer child — a different-model bundle (examples/polly/agents/
-# codex, codex-native) given the same diff-review prompt polly-review.yml uses —
-# to double-check its own fix, the way polly has an independent reviewer vet the
-# work. This reuses the server + runner it already runs on; no new infra. The
-# reviewer only reads and comments — it authors no code.
-spawn: true
+# Independent review runs through Polly after publication; the implementation
+# agent does not need child-session creation tools.
+spawn: false
 
 # Declaring os_env registers sys_os_read / sys_os_write / sys_os_edit /
 # sys_os_shell. The agent uses the shell for `git` (branch/commit/push), `gh`
@@ -126,27 +123,3 @@ guardrails:
         path: omnigent.inner.nessie.policies.blast_radius
         arguments:
           gate_pushes: false
-    # Bound the fan-out: this agent spawns at most one reviewer child, so a
-    # low per-turn cap is plenty and stops a runaway create loop. sys_session_create
-    # is counted (like polly) so a self-defined child can't bypass the cap.
-    spawn_bounds:
-      type: function
-      on: [tool_call]
-      function:
-        path: omnigent.inner.nessie.policies.spawn_bounds
-        arguments:
-          max_dispatches_per_turn: 2
-          dispatch_tools: [sys_session_send, sys_session_create]
-    # Require `review` on any sys_session_SEND dispatch. Note this guard only
-    # inspects sys_session_send, NOT the sys_session_create that launches the
-    # reviewer child (create carries no purpose arg) — so it does not itself
-    # constrain that child. spawn_bounds (which counts sys_session_create) caps
-    # the fan-out; the reviewer being read-only rests on its prompt and the codex
-    # bundle's own guardrails. This guard is a backstop for any follow-up sends.
-    headless_subagent_purpose_guard:
-      type: function
-      on: [tool_call]
-      function:
-        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
-        arguments:
-          allowed_purposes: [review]

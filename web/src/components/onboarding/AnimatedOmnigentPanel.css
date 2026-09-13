@@ -64,6 +64,36 @@
   transform: translateX(-50%);
 }
 
+/* Auth-card variant: content-sized, translucent surface, logo centered (no
+   between-step shrink animation to clip it out the top). */
+.omnigent-panel-logo--centered {
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.omnigent-card--auto {
+  height: auto;
+  background: var(--card);
+}
+
+/* transparent, not var(--card): that token is translucent, so layering it over
+   the translucent card doubles the fill and the band reads brighter. */
+.dark .omnigent-card--auto .omnigent-animated-panel {
+  background: transparent;
+}
+
+/* On a short viewport the card clamps (max-height); let the band shrink and the
+   body scroll instead of overflowing. */
+.omnigent-card--auto .omnigent-animated-panel {
+  flex-shrink: 1;
+  min-height: 120px;
+}
+
+.omnigent-card--auto .omnigent-card-body {
+  min-height: 140px;
+  overflow-y: auto;
+}
+
 /* Card body (the current onboarding step) sits below the animated panel and
    fills the remaining card height. */
 .omnigent-card-body {

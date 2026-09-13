@@ -32,6 +32,7 @@ function loadMainHarness({
     sent: [],
     showMessageBox: [],
     setApplicationMenu: [],
+    aboutOpens: [],
   };
 
   const sender = {
@@ -130,6 +131,12 @@ function loadMainHarness({
   };
 
   const localRequires = {
+    "./about_window": {
+      createAboutWindow: () => ({
+        open: (parent) => calls.aboutOpens.push(parent),
+        registerIpc: () => {},
+      }),
+    },
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
       normalizeUrl: (url) => url,
@@ -276,6 +283,44 @@ describe("in-app navigation menu actions", () => {
       channel: "omnigent:open-path",
       payload: "/",
     });
+  });
+});
+
+describe("About menu wiring", () => {
+  it("opens the shell-owned About window from About and Check for Updates", async (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      settings: { update_mode: "manual" },
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const aboutItem = findMenuItem(menu, "open_about");
+    const checkItem = findMenuItem(menu, "check_for_updates");
+    aboutItem.click();
+
+    assert.equal(aboutItem.label, "About Omnigent");
+    assert.equal(harness.calls.aboutOpens.length, 1);
+
+    checkItem.click();
+    await flushPromises();
+    assert.equal(harness.calls.aboutOpens.length, 2);
+    assert.equal(harness.calls.checkForUpdates, 1);
+  });
+
+  it("exposes About under Help on Windows and Linux", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const aboutItem = findMenuItem(menu, "open_about");
+    aboutItem.click();
+
+    assert.equal(aboutItem.label, "About Omnigent");
+    assert.equal(harness.calls.aboutOpens.length, 1);
   });
 });
 
@@ -648,9 +693,10 @@ describe("auto-update main-process wiring", () => {
     restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
     assert.equal(restartItem.visible, true);
 
+    // A late/redundant check result must not discard an already-downloaded artifact.
     harness.autoUpdater.emit("update-not-available");
     restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
-    assert.equal(restartItem.visible, false);
+    assert.equal(restartItem.visible, true);
   });
 
   it("does not start the install path when no update is downloaded", async (t) => {
@@ -736,7 +782,7 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.api.updater.installPending, false);
   });
 
-  it("allows only development builds to override the effective desktop version", async (t) => {
+  it("allows only development builds to override the effective desktop version", (t) => {
     const development = loadMainHarness({
       settings: { update_mode: "manual" },
       desktopVersionOverride: " 0.2.0 ",
@@ -750,13 +796,6 @@ describe("auto-update main-process wiring", () => {
     assert.equal(development.api.updater.getStatus().currentVersion, "0.2.0");
 
     development.autoUpdater.emit("update-not-available");
-    development.api.buildMenu();
-    await findMenuItem(development.calls.setApplicationMenu.at(-1), "check_for_updates").click();
-    assert.equal(development.calls.showMessageBox.at(-1).options.title, "Omnigent Desktop");
-    assert.equal(
-      development.calls.showMessageBox.at(-1).options.detail,
-      "Omnigent Desktop 0.2.0 is the latest version.",
-    );
 
     const packaged = loadMainHarness({
       isPackaged: true,

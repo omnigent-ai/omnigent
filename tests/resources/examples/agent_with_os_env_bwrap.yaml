@@ -132,6 +132,8 @@ os_env:
     # ``git status`` / ``git log``; add ".gitignore" if it needs to
     # respect ignore rules. Entries must be plain names — no ``/``,
     # no ``..``, no absolute paths (validated at spec parse time).
+    # Use ["*"] only for a trusted root that must preserve arbitrary
+    # agent-created dotpaths across helper invocations.
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
 
     # Optional: recurse into subdirectories when masking dotfiles /

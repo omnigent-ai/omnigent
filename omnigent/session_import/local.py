@@ -7,27 +7,31 @@ import os
 import re
 import sqlite3
 import subprocess
+from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
 from typing import get_args
 
-from omnigent.claude_native_bridge import read_transcript_items_from_offset
-from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
 from omnigent.entities import NewConversationItem, parse_item_data
-from omnigent.kimi_native_credentials import resolve_user_kimi_home
-from omnigent.kimi_native_forwarder import (
+from omnigent.harnesses.claude_native.bridge import (
+    ClaudeTranscriptItem,
+    read_transcript_items_from_offset,
+)
+from omnigent.harnesses.codex_native.main import _CODEX_THREAD_ID_RE, _find_codex_rollout
+from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
+from omnigent.harnesses.kimi_native.forwarder import (
     read_kimi_wire_items,
     workdirs_for_kimi_sessions,
 )
-from omnigent.kiro_native_session_forwarder import (
+from omnigent.harnesses.kiro_native.session_forwarder import (
     kiro_cli_sessions_dir,
     parse_kiro_jsonl_line,
 )
-from omnigent.opencode_native_app_server import (
+from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
     find_opencode_cli,
 )
-from omnigent.opencode_native_forwarder import opencode_tool_output_text
+from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
@@ -39,6 +43,27 @@ _OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
 _MAX_RESPONSE_ID_LENGTH = 64
 _OPENCODE_COMMAND_TIMEOUT_SECONDS = 120
+
+# Transcript byte size past which an import is trimmed to the last compaction
+# boundary instead of the full history. Below it the whole transcript imports
+# (cheap, and the full record is useful to browse); above it the file has almost
+# certainly been compacted at least once, so importing every pre-compaction
+# record replays megabytes the live agent no longer sees. Shared by the Claude
+# (``isCompactSummary``) and Codex (``compacted`` record) paths — see
+# docs/session-compaction.md.
+_IMPORT_COMPACT_TRIM_BYTES = 2 * 1024 * 1024
+
+
+def _exceeds_compaction_trim_size(path: Path) -> bool:
+    """Whether a transcript is large enough to trim to its last compaction.
+
+    An unreadable size falls back to ``False`` — import the whole transcript
+    rather than drop history on a failed ``stat``.
+    """
+    try:
+        return path.stat().st_size > _IMPORT_COMPACT_TRIM_BYTES
+    except OSError:
+        return False
 
 
 def _bounded_response_id(response_id: str) -> str:
@@ -371,6 +396,25 @@ def _claude_native_title(transcript_path: Path) -> str | None:
     return custom or ai
 
 
+def _items_from_last_compaction(
+    items: Sequence[ClaudeTranscriptItem],
+) -> Sequence[ClaudeTranscriptItem]:
+    """Slice ``items`` from the last compaction summary onward.
+
+    Claude flags the continuation summary it writes after compacting its own
+    context with ``is_compact_summary`` — the durable compaction boundary (see
+    :mod:`omnigent.harnesses.claude_native.bridge`). The live agent resumes from
+    that summary, not the full transcript, so keeping the summary and everything
+    after it mirrors the agent's working context. Returns ``items`` unchanged
+    when the transcript was never compacted.
+    """
+    last = None
+    for index, item in enumerate(items):
+        if item.is_compact_summary:
+            last = index
+    return items if last is None else items[last:]
+
+
 def load_claude_session(
     session_id: str,
     *,
@@ -390,13 +434,19 @@ def load_claude_session(
         start_line=0,
         agent_name="claude-native-ui",
     )
+    # A large transcript has almost certainly compacted; import only what the
+    # agent would still see (from the last compaction boundary). See
+    # docs/session-compaction.md.
+    source_items: Sequence[ClaudeTranscriptItem] = parsed.items
+    if _exceeds_compaction_trim_size(transcript_path):
+        source_items = _items_from_last_compaction(parsed.items)
     items = tuple(
         NewConversationItem(
             type=item.item_type,
             response_id=item.response_id,
             data=parse_item_data(item.item_type, item.data),
         )
-        for item in parsed.items
+        for item in source_items
     )
     if not items:
         raise SessionImportNotFoundError(
@@ -593,6 +643,28 @@ def _codex_native_title(home: Path, session_id: str) -> str | None:
     return None
 
 
+def _codex_compacted_baseline_items(payload: dict[str, object]) -> list[NewConversationItem]:
+    """Convert a Codex ``compacted`` record's replacement_history into items.
+
+    Codex appends ``{type: "compacted", payload: {replacement_history: [...]}}``
+    after compacting; ``replacement_history`` is the post-compaction context
+    baseline it resumes from (the summary plus any retained messages), each entry
+    response-item shaped. Unsupported entries (e.g. reasoning) parse to ``None``
+    and are skipped, mirroring the ordinary response-item path.
+    """
+    history = payload.get("replacement_history")
+    if not isinstance(history, list):
+        return []
+    baseline: list[NewConversationItem] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        item = _codex_response_item(entry, response_id="codex:compaction")
+        if item is not None:
+            baseline.append(item)
+    return baseline
+
+
 def load_codex_session(
     session_id: str,
     *,
@@ -607,6 +679,11 @@ def load_codex_session(
     )
     if rollout_path is None:
         raise SessionImportNotFoundError(f"Codex session {session_id!r} was not found")
+
+    # Past the size threshold, restart from each compaction boundary so the
+    # import matches what the agent resumes with, dropping the pre-compaction
+    # records it no longer sees. See docs/session-compaction.md.
+    trim_at_compaction = _exceeds_compaction_trim_size(rollout_path)
 
     workspace: str | None = None
     turn_id = "history"
@@ -629,6 +706,17 @@ def load_codex_session(
                 candidate = payload.get("turn_id")
                 if isinstance(candidate, str) and candidate:
                     turn_id = candidate
+                continue
+            if record.get("type") == "compacted":
+                # replacement_history is the new context baseline; resetting to it
+                # discards prior items so only the last compaction's baseline and
+                # what follows survive (mirrors the terminal agent on resume). A
+                # boundary with no usable baseline is ignored rather than wiping
+                # history to nothing (matches _read_compacted_history's guard).
+                if trim_at_compaction:
+                    baseline = _codex_compacted_baseline_items(payload)
+                    if baseline:
+                        items = baseline
                 continue
             if record.get("type") != "response_item":
                 continue

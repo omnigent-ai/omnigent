@@ -28,6 +28,7 @@ interface OmnigentSetup {
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
   getCliStatus: () => Promise<{ installed?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
+  onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
 }
 
 function setupBridge(): OmnigentSetup | undefined {
@@ -39,6 +40,9 @@ function SetupApp() {
   const failedUrl = params.get("url");
   const error = params.get("error") ?? undefined;
   const isEphemeral = params.get("ephemeral") === "1";
+  // "Connect to new server…" opens straight on the server list (?step=server),
+  // skipping the first-run landing/mode intro.
+  const initialStep = params.get("step") === "server" ? ("server" as const) : undefined;
 
   // Prefill: the URL that just failed (retry is the common next step), else the
   // saved server, else the default — except in ephemeral mode, where the whole
@@ -68,6 +72,7 @@ function SetupApp() {
 
   const setup: ServerSelectorV2Setup = {
     initialUrl,
+    initialStep,
     error,
     recentServers,
     managedServers,
@@ -107,6 +112,11 @@ function SetupApp() {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
     },
+    // Live startup-log stream from the shell, if this shell exposes it (older
+    // shells / browser preview omit it → the terminal step shows phases only).
+    onSetupLog: setupBridge()?.onLocalServerSetupLog
+      ? (cb) => setupBridge()?.onLocalServerSetupLog?.(cb) ?? (() => {})
+      : undefined,
     // Only offered when the shell exposes the forget method (newer shells).
     onRemoveServer: setupBridge()?.forgetRecentServer
       ? (url) => {

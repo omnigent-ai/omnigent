@@ -61,7 +61,8 @@ Default view inside the sandbox:
   ``~/.ssh/id_rsa``, ``~/.gnupg``, etc. all return EPERM.
 - Top-level dotfiles / dotdirs anywhere under cwd are denied unless
   their basename is in :data:`_DEFAULT_CWD_ALLOW_HIDDEN` or the
-  spec's ``cwd_allow_hidden``. ``.venv`` is allowed by default.
+  spec's ``cwd_allow_hidden``. ``.venv`` is allowed by default; the
+  explicit ``"*"`` entry allows every dotpath in trusted roots.
 - The default network policy depends on egress and ``allow_network``:
 
   - egress active → ``network*`` denied except loopback to the

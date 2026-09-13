@@ -72,6 +72,8 @@ export interface Usage {
 export interface ErrorInfo {
   code: string;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
   /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
   title?: string;
   /** One/two-sentence explanation of why it failed. Paired with `title`. */
@@ -120,11 +122,10 @@ export interface Response {
 // ── Content blocks ───────────────────────────────────────
 
 /**
- * A typed content block for user messages.
- *
- * Used when sending messages via `POST /v1/sessions/{id}/events`.
- * Mirrors the `content` array that `content_resolver.py` and the
- * sessions schema accept on the server side.
+ * The content blocks the composer sends via
+ * `POST /v1/sessions/{id}/events` — a send-path subset, not the full
+ * server schema. Blocks read back from a session are wider (e.g.
+ * `input_image` without `file_id`); parse those with `blocks.ts`.
  */
 export type ContentBlock =
   | { type: "input_text"; text: string }
@@ -287,6 +288,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Whether the session is archived. Carried on the snapshot because it is
+   * the only carrier for a session opened directly by URL — the default
+   * sidebar list excludes archived rows. `false`/absent for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -366,6 +373,15 @@ export interface Session {
    * `"on"` at create, so `null` means Default rather than "inherit".
    */
   subagentRoutingOverride?: "on" | "off" | null;
+  /**
+   * Whether the owner opted into letting people with *view* (read-only)
+   * access browse this session's workspace files (the Files/Changes/GitHub
+   * surfaces and the file contents behind them). `false` by default — a
+   * read grant shares the conversation, not the raw filesystem. Owner-set
+   * from the share dialog; the rail reads it to decide whether to mount the
+   * file surfaces for a view-only viewer.
+   */
+  shareWorkspaceFiles?: boolean;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
   /**
@@ -555,6 +571,18 @@ export interface NativeReasoningEffortOption {
   description?: string;
 }
 
+/** Non-secret provenance for the configuration serving a model. */
+export interface ModelConfigurationSource {
+  /** Stable provider category, e.g. `subscription`, `databricks`, or `gateway`. */
+  kind: string;
+  /** Compact composer label, e.g. `Subscription` or `Workspace`. */
+  label: string;
+  /** Specific configured source, e.g. a provider name or Databricks profile. */
+  name?: string;
+  /** Non-secret endpoint host, when the provider has one. */
+  host?: string;
+}
+
 /** One runner-owned native model-picker row. */
 export interface NativeModelOption {
   /** Native picker id (a Claude alias or Codex model id). */
@@ -569,4 +597,6 @@ export interface NativeModelOption {
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
   /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
+  /** Configuration that supplies this model; never includes credentials. */
+  source?: ModelConfigurationSource;
 }

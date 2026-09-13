@@ -44,43 +44,6 @@ export function useIOSNativeKeyboardInset(enabled = true): number {
   return inset;
 }
 
-export function useIOSNativeKeyboardVisible(enabled = true, includeEditableFocus = true): boolean {
-  const [visible, setVisible] = useState(false);
-
-  useEffect(() => {
-    if (!enabled || !isIOSShell()) {
-      setVisible(false);
-      return;
-    }
-
-    const sync = () => {
-      setVisible(
-        getIOSNativeKeyboardInset() > KEYBOARD_INSET_THRESHOLD_PX ||
-          (includeEditableFocus && isEditableElementFocused()),
-      );
-    };
-
-    sync();
-    window.visualViewport?.addEventListener("resize", sync);
-    window.visualViewport?.addEventListener("scroll", sync);
-    window.addEventListener("resize", sync);
-    window.addEventListener("orientationchange", sync);
-    window.addEventListener("focusin", sync, true);
-    window.addEventListener("focusout", sync, true);
-
-    return () => {
-      window.visualViewport?.removeEventListener("resize", sync);
-      window.visualViewport?.removeEventListener("scroll", sync);
-      window.removeEventListener("resize", sync);
-      window.removeEventListener("orientationchange", sync);
-      window.removeEventListener("focusin", sync, true);
-      window.removeEventListener("focusout", sync, true);
-    };
-  }, [enabled, includeEditableFocus]);
-
-  return visible;
-}
-
 function getIOSNativeKeyboardInset(): number {
   const viewport = window.visualViewport;
   if (!viewport) return 0;
@@ -96,15 +59,4 @@ function getIOSNativeKeyboardInset(): number {
   const layoutBottom = window.innerHeight;
   const visibleBottom = viewport.offsetTop + viewport.height;
   return Math.max(0, Math.round(layoutBottom - visibleBottom));
-}
-
-function isEditableElementFocused(): boolean {
-  const active = document.activeElement;
-  if (!(active instanceof HTMLElement)) return false;
-  // The transient textarea `copyText`'s execCommand fallback focuses is not a
-  // real editing surface — treating it as one would hide the native bar for
-  // the rest of the session, since WebKit doesn't reliably fire `focusout`
-  // when a focused element is removed. Exclude it via its marker attribute.
-  if (active.hasAttribute("data-clipboard-helper")) return false;
-  return active.matches('input, textarea, select, [contenteditable="true"]');
 }

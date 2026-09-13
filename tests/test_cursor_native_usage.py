@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import cursor_native_usage as usage
+from omnigent.harnesses.cursor_native import usage
 
 # A representative cursor ``stop``-hook payload (live-captured field set).
 _TURN1 = {
@@ -127,7 +127,7 @@ class TestRecordUsageCli:
             [
                 sys.executable,
                 "-m",
-                "omnigent.cursor_native_usage",
+                "omnigent.harnesses.cursor_native.usage",
                 "record-usage",
                 "--bridge-dir",
                 str(tmp_path),
@@ -288,17 +288,8 @@ async def _run_loop_until(
 
 
 def _usage_posts(client: _CtxRecordingClient) -> list[tuple[str, dict]]:
-    """Only the ``external_session_usage`` POSTs (excludes the idle wake edges)."""
+    """Return the ``external_session_usage`` POSTs."""
     return [(u, b) for (u, b) in client.posts if b.get("type") == "external_session_usage"]
-
-
-def _idle_posts(client: _CtxRecordingClient) -> list[tuple[str, dict]]:
-    """Only the ``external_session_status: idle`` turn-end wake POSTs."""
-    return [
-        (u, b)
-        for (u, b) in client.posts
-        if b.get("type") == "external_session_status" and b.get("data", {}).get("status") == "idle"
-    ]
 
 
 @pytest.mark.asyncio
@@ -330,15 +321,15 @@ class TestForwardLoop:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         usage.record_usage_payload(tmp_path, _TURN1)
-        # Gate on the idle POST: it is the LAST side effect of processing turn 1
-        # (usage POST, then the state write, then idle), so once it lands both
-        # assertions below read fully-settled state instead of racing the write.
-        client = await _run_loop_until(monkeypatch, tmp_path, _idle_posts)
+        client = await _run_loop_until(
+            monkeypatch,
+            tmp_path,
+            lambda c: _usage_posts(c) and usage._read_usage_state(tmp_path).seen == {"g1"},
+        )
         # Let several more polls run; with no new turns there must be no 2nd
-        # usage POST and no further idle edge.
+        # usage POST.
         await asyncio.sleep(0.1)
         assert len(_usage_posts(client)) == 1
-        assert len(_idle_posts(client)) == 1
 
     async def test_new_turn_triggers_followup_post(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -355,61 +346,14 @@ class TestForwardLoop:
         _, body = _usage_posts(client)[-1]
         assert body["data"]["cumulative_output_tokens"] == 5 + 120
 
-    async def test_completed_turn_posts_idle_wake_edge(
+    async def test_never_posts_completion_status(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A completed cursor turn posts external_session_status: idle.
-
-        This is the edge the runner turns into a parent-inbox wake for a cursor
-        sub-agent. Without it, a cursor child finishes with its review only in
-        its own transcript and the parent orchestrator is never woken.
-        """
+        """Usage cannot wake a parent before transcript delivery catches up."""
         usage.record_usage_payload(tmp_path, _TURN1)
-        client = await _run_loop_until(monkeypatch, tmp_path, _idle_posts)
-        url, body = _idle_posts(client)[0]
-        assert url == "/v1/sessions/conv_1/events"
-        assert body == {"type": "external_session_status", "data": {"status": "idle"}}
-
-    async def test_idle_posted_once_per_turn(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Each completed turn wakes the parent exactly once within a run."""
-        usage.record_usage_payload(tmp_path, _TURN1)
-        client = _CtxRecordingClient()
-        await _run_loop_until(monkeypatch, tmp_path, _idle_posts, client=client)
-        await asyncio.sleep(0.1)  # extra polls: turn 1 must not re-wake
-        assert len(_idle_posts(client)) == 1
-        # A second turn yields exactly one more idle edge.
-        usage.record_usage_payload(tmp_path, _TURN2)
-        await _run_loop_until(
-            monkeypatch, tmp_path, lambda c: len(_idle_posts(c)) >= 2, client=client
-        )
+        client = await _run_loop_until(monkeypatch, tmp_path, _usage_posts)
         await asyncio.sleep(0.1)
-        assert len(_idle_posts(client)) == 2
-
-    async def test_restart_reposts_idle_for_dedup_not_skip(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A restart re-posts idle (server dedupes) rather than risk skipping a wake.
-
-        The idle counter is NOT seeded from persisted usage: if it were, a wake
-        whose idle POST crashed after the usage flush persisted would be skipped
-        forever. Seeding at 0 makes a restart re-post at most one idle, which the
-        server treats as an already-delivered no-op.
-        """
-        # First run: turn 1 usage persisted.
-        usage.record_usage_payload(tmp_path, _TURN1)
-        first = _CtxRecordingClient()
-        await _run_loop_until(monkeypatch, tmp_path, _idle_posts, client=first)
-        assert usage._read_usage_state(tmp_path).seen == {"g1"}
-
-        # Fresh loop (simulated restart) over the SAME bridge dir, no new turns:
-        # idle is re-posted so a lost pre-crash wake still lands.
-        second = _CtxRecordingClient()
-        await _run_loop_until(monkeypatch, tmp_path, _idle_posts, client=second)
-        await asyncio.sleep(0.1)
-        # Exactly one re-post — the single already-seen turn, not a loop.
-        assert len(_idle_posts(second)) == 1
+        assert [body["type"] for _, body in client.posts] == ["external_session_usage"]
 
     async def test_failed_post_is_not_persisted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

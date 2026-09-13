@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import qwen_native_bridge as qnb
+from omnigent.harnesses.qwen_native import bridge as qnb
 from omnigent.runner.app import _build_qwen_fork_recording, _persist_qwen_external_session_id
 
 

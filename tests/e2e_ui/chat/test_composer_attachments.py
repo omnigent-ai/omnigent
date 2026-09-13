@@ -23,6 +23,12 @@ network: the chips are local component state.
 The assertion pins to the chip's per-file remove control
 (``aria-label="Remove {filename}"``, ChatPage.tsx) appearing after attach and
 disappearing after the remove click.
+
+Drag-drop covers the whole chat column (``hooks/useFileDropTarget.ts``, bound to
+``[data-chat-surface]``), not just the composer box, and nothing outside it. It
+needs a real browser: the drag is claimed only when ``dataTransfer.types`` carries
+``"Files"``, and ``preventDefault`` on ``dragover`` is what makes a ``drop`` fire
+at all — both of which jsdom approximates rather than implements.
 """
 
 from __future__ import annotations
@@ -250,3 +256,87 @@ def test_failed_upload_restores_the_message(
     expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible()
     # And the message is back in the composer, ready to retry.
     expect(composer).to_have_value("look at this file", timeout=10_000)
+
+
+# Synthesises an OS file drag: Playwright can't drive a real desktop-to-browser
+# drag, but a page-built ``DataTransfer`` fires the same events.
+_DISPATCH_FILE_DRAG = """
+([selector, types, name, body]) => {
+  const target = document.querySelector(selector);
+  if (!target) throw new Error(`no drop target for ${selector}`);
+  const transfer = new DataTransfer();
+  transfer.items.add(new File([body], name, { type: "text/plain" }));
+  const fire = (type) =>
+    target.dispatchEvent(
+      new DragEvent(type, { dataTransfer: transfer, bubbles: true, cancelable: true }),
+    );
+  let handled = null;
+  for (const type of types) handled = fire(type);
+  return handled;
+}
+"""
+
+
+def test_file_dropped_on_the_transcript_attaches(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A file dropped on the transcript attaches to the composer.
+
+    The target used to be the composer box alone, so a screenshot dropped on the
+    transcript fell through to the browser, which navigated away from the session
+    to render the file — losing the page.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    # Guards the premise: the drop lands outside the composer box.
+    assert page.evaluate(
+        "() => !document.querySelector('[role=log]').closest('[data-composer-card]')"
+    ), "the transcript resolved inside the composer box — the test proves nothing"
+
+    page.evaluate(_DISPATCH_FILE_DRAG, ["[role=log]", ["dragenter"], "hover.txt", "x"])
+    expect(page.get_by_test_id("file-drop-overlay")).to_be_visible(timeout=10_000)
+
+    handled = page.evaluate(
+        _DISPATCH_FILE_DRAG,
+        ["[role=log]", ["dragover", "drop"], _ATTACH_NAME, _ATTACH_BODY],
+    )
+    # False = preventDefault, i.e. the app claimed the drop instead of letting
+    # the browser open the file.
+    assert handled is False, "the chat column did not claim the file drop"
+
+    expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible(timeout=10_000)
+    expect(page.get_by_test_id("file-drop-overlay")).to_have_count(0)
+
+
+def test_file_dropped_outside_the_chat_column_is_ignored(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A file dropped on the sidebar is not a composer attachment.
+
+    The target is the chat column, not the window, so the shell around it keeps
+    whatever drag behavior it has.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    sidebar = "[data-testid=sidebar], nav, aside"
+    assert page.evaluate(
+        "([selector]) => {"
+        "  const el = document.querySelector(selector);"
+        "  return !!el && !el.closest('[data-chat-surface]');"
+        "}",
+        [sidebar],
+    ), "no element outside the chat column to drop on"
+
+    handled = page.evaluate(
+        _DISPATCH_FILE_DRAG,
+        [sidebar, ["dragenter", "dragover", "drop"], _ATTACH_NAME, _ATTACH_BODY],
+    )
+    assert handled is True, "a drop outside the chat column was claimed"
+    expect(page.get_by_test_id("file-drop-overlay")).to_have_count(0)
+    expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_have_count(0)

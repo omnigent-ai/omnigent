@@ -13,11 +13,11 @@
 
 import { useSyncExternalStore } from "react";
 
-// How long each label stays on screen before rotating. Deliberately slow: at
-// this cadence the label is effectively stable within a single turn and only
-// varies across turns (the bucket is wall-clock aligned), so the indicator
-// reads as a calm "still working" cue rather than a ticker.
-export const ROTATE_MS = 60 * 1000; // 1 minute
+// How long each label stays on screen before rotating. Snappy on purpose: the
+// label visibly cycles within a single turn so the indicator reads as active
+// motion ("still moving") rather than a frozen status. The bucket is wall-clock
+// aligned, so every subscriber lands on the same label with zero drift.
+export const ROTATE_MS = 5 * 1000; // 5 seconds
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
 const listeners = new Set<() => void>();
@@ -45,8 +45,8 @@ function getSnapshot(): number {
 }
 
 /**
- * Monotonic wall-clock bucket that advances once every `ROTATE_MS`. Feed it
- * into `workingIndicatorLabel(tick)` to rotate the label. SSR-safe
+ * Monotonic wall-clock bucket that advances once every `ROTATE_MS` (5s). Feed
+ * it into `workingIndicatorLabel(tick)` to rotate the label. SSR-safe
  * (returns 0 on the server, matching `useIsMobileViewport`).
  */
 export function useWorkingLabelTick(): number {

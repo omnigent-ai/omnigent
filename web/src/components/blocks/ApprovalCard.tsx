@@ -35,6 +35,7 @@
 import {
   CheckIcon,
   ClipboardListIcon,
+  ClockIcon,
   ExternalLinkIcon,
   InfoIcon,
   MessageCircleQuestionMark,
@@ -55,6 +56,11 @@ import type { RenderItem } from "@/lib/renderItems";
 import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
+import {
+  type ElicitationAnswers,
+  ElicitationSchemaForm,
+  schemaFields,
+} from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
 /**
@@ -69,6 +75,10 @@ import { ExitPlanModeReview } from "./ExitPlanModeReview";
 function extractOptionLabels(schema: Record<string, unknown>): string[] {
   const properties = schema.properties;
   if (!properties || typeof properties !== "object") return [];
+  // Only when ``answer`` is the whole question. A schema pairing it with, say,
+  // a required ``reason`` renders as buttons that submit the answer and drop
+  // the reason the server said it needed; that shape belongs to the form.
+  if (Object.keys(properties as Record<string, unknown>).length !== 1) return [];
   const answer = (properties as Record<string, unknown>).answer;
   if (!answer || typeof answer !== "object") return [];
   const enumValues = (answer as Record<string, unknown>).enum;
@@ -104,6 +114,8 @@ interface ApprovalCardProps {
   status: "pending" | "responded";
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /** Why an `auto_resolved` card has no verdict; see `ElicitationBlock`. */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;
@@ -134,7 +146,7 @@ interface ApprovalCardProps {
   } | null;
   /**
    * Claude-native edit-tool prompts only: when true, the binary
-   * approve/reject card grows a third "Accept & allow all edits"
+   * approve/reject card also offers an "Accept & allow all edits"
    * button. Accepting through it asks the server to switch the
    * session into Claude Code's ``acceptEdits`` mode (the web
    * equivalent of the native shift+tab toggle). Absent/false for
@@ -143,8 +155,15 @@ interface ApprovalCardProps {
    */
   allowAllEdits?: boolean;
   /**
+   * Eligible Claude-native tool prompts: when true, the card offers an
+   * "Approve & switch to auto mode" button — accept plus a session-scoped
+   * ``setMode(auto)``, so Claude reviews this session's later permissions
+   * automatically. Absent/false where the switch was never offered.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: when set, the binary
-   * approve/reject card grows a third "Approve & don't ask again for
+   * approve/reject card also offers an "Approve & don't ask again for
    * <host|tool>" button. Accepting through it asks the server to
    * install a session-scoped allow rule for the tool (scoped to
    * ``host`` for WebFetch, tool-wide otherwise) — the web equivalent
@@ -180,6 +199,7 @@ export function ApprovalCard({
   exitPlanMode,
   codexCommand,
   allowAllEdits,
+  allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
@@ -200,6 +220,9 @@ export function ApprovalCard({
   const submitOption = (label: string) => {
     submit(elicitationId, "accept", { answer: label });
   };
+  const submitSchemaAnswers = (content: ElicitationAnswers) => {
+    submit(elicitationId, "accept", content);
+  };
   const submitAnswers = (answers: AskUserQuestionAnswers) => {
     // ``content`` is MCP's ``ElicitResult.content``: a flat
     // ``{[field]: scalar | string[]}`` map, where each AskUserQuestion
@@ -210,6 +233,9 @@ export function ApprovalCard({
   };
   const submitExecPolicyAmendment = (amendment: string[]) => {
     submit(elicitationId, "accept", { execpolicy_amendment: amendment });
+  };
+  const submitAutoMode = () => {
+    submit(elicitationId, "accept", { allow_auto_mode: true });
   };
   const submitAllowAllEdits = () => {
     // Accept AND ask the server to switch the session's permission
@@ -254,6 +280,12 @@ export function ApprovalCard({
   const optionLabels = askPayload === null ? extractOptionLabels(requestedSchema) : [];
   const isAskUserQuestion = askPayload !== null;
   const isMultiChoice = optionLabels.length > 0;
+  // Any other schema that names fields: a free-form string, several
+  // properties, an enum under a name other than ``answer``. These used to
+  // fall through to Approve / Reject, which cannot answer them.
+  const schemaFormFields =
+    askPayload === null && !isMultiChoice ? schemaFields(requestedSchema) : [];
+  const isSchemaForm = schemaFormFields.length > 0;
   const isCodexCommandApproval = codexCommand !== null && codexCommand !== undefined;
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
@@ -286,7 +318,7 @@ export function ApprovalCard({
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
+    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -297,6 +329,8 @@ export function ApprovalCard({
     Array.isArray(response?.content?.execpolicy_amendment) &&
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
+  const acceptedAutoMode =
+    response?.action === "accept" && response.content?.allow_auto_mode === true;
   const acceptedRemember = response?.content?.remember === true;
   const acceptedCodexPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
@@ -337,6 +371,18 @@ export function ApprovalCard({
         >
           <CheckIcon className="mr-1 size-3.5" />
           Always allow
+        </Button>
+      )}
+      {allowAutoMode && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitAutoMode}
+          title="Approve this request and let Claude review future tool permissions automatically for this session"
+          componentId="approval.approve_auto_mode"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve &amp; switch to auto mode
         </Button>
       )}
       {allowAllEdits && (
@@ -404,6 +450,7 @@ export function ApprovalCard({
 
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
+    const promptExpired = autoResolved && response.reason === "unanswered";
     const accepted = response.action === "accept";
 
     // Distinguish three responded sub-states:
@@ -435,7 +482,14 @@ export function ApprovalCard({
 
     let icon = <XIcon className="size-4 text-destructive" />;
     let label = isExitPlanMode ? "Plan rejected" : "Rejected";
-    if (autoResolved) {
+    if (promptExpired) {
+      // The server cleared the prompt because the hook stopped waiting
+      // before anyone answered (a severed poll never re-parked, the ask
+      // timed out). Nothing was decided, so say so and tell the user how
+      // to get the agent moving again instead of implying an answer.
+      icon = <ClockIcon className="size-4 text-muted-foreground" />;
+      label = "Prompt expired";
+    } else if (autoResolved) {
       // Card was cleared by the chat store when the gated tool's
       // function_call_output arrived without a UI verdict —
       // typically because the user approved (or denied) via Claude
@@ -444,6 +498,10 @@ export function ApprovalCard({
       // accept/reject decision the UI never witnessed.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
       label = "Resolved elsewhere";
+    } else if (response.action === "cancel") {
+      // Dismissed without deciding — neither approved nor rejected.
+      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      label = "Cancelled";
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Submitted";
@@ -453,6 +511,9 @@ export function ApprovalCard({
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved and remembered";
+    } else if (acceptedAutoMode) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved · auto mode";
     } else if (acceptedAllEdits) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
@@ -483,7 +544,8 @@ export function ApprovalCard({
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
-      planRejectionFeedback !== null;
+      planRejectionFeedback !== null ||
+      promptExpired;
 
     return (
       <Alert
@@ -531,6 +593,11 @@ export function ApprovalCard({
             {planRejectionFeedback !== null && (
               <span className="italic" data-testid="plan-rejection-feedback">
                 “{planRejectionFeedback}”
+              </span>
+            )}
+            {promptExpired && (
+              <span className="text-muted-foreground" data-testid="prompt-expired-hint">
+                Nobody answered before the agent stopped waiting. Send a message to continue.
               </span>
             )}
           </AlertDescription>
@@ -619,6 +686,12 @@ export function ApprovalCard({
                   </a>
                 </Button>
               </div>
+            ) : isSchemaForm ? (
+              <ElicitationSchemaForm
+                fields={schemaFormFields}
+                onSubmit={submitSchemaAnswers}
+                onReject={() => submitBinary("decline")}
+              />
             ) : isMultiChoice ? (
               <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
                 {optionLabels.map((optLabel) => (
@@ -671,6 +744,7 @@ export function ElicitationCard({
       exitPlanMode={item.exitPlanMode}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
+      allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
       onSubmit={onSubmit}

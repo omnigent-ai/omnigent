@@ -751,6 +751,30 @@ def user_daily_cost_budget(
 _SUBAGENT_ASK_APPROVED_KEY = "subagent_cost_ask_approved_usd"
 
 
+# session_state key recording that the user explicitly approved exceeding a
+# subagent cost budget's hard cap (a USD float — the cap value approved; 0.0
+# when none). Set when the first-over-cap warning ASK is approved. Local to the
+# child conversation (like _SUBAGENT_ASK_APPROVED_KEY), so the override is
+# scoped to the one subagent whose budget the user lifted.
+_SUBAGENT_OVER_BUDGET_APPROVED_KEY = "subagent_cost_over_budget_approved_usd"
+
+
+def _state_usd(state: Mapping[str, object], key: str) -> float:
+    """Read a USD float from persisted session state, defensively.
+
+    :param state: The event's ``session_state`` mapping.
+    :param key: State key to read, e.g. ``_SUBAGENT_ASK_APPROVED_KEY``.
+    :returns: The value as a float, or ``0.0`` when absent / malformed.
+    """
+    raw = state.get(key, 0.0)
+    if not isinstance(raw, int | float | str):
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _subtree_cost_usd(event: PolicyEvent) -> float:
     """Read cumulative subtree cost (USD) from a policy event.
 
@@ -784,16 +808,34 @@ def subagent_cost_budget(
     ``sys_session_send``'s ``cost_budget`` argument. The parent sets the
     budget; the child gates against its own subtree spend.
 
+    One deliberate difference from :func:`cost_budget`: because this
+    budget is typically chosen by the ORCHESTRATING MODEL rather than
+    the user (the spawn path attaches it without any user action, and a
+    max-only shape has no soft checkpoints), a no-escape hard cap
+    (``expensive_models`` omitted/empty → all models blocked) must not
+    hard-DENY a user who was never warned the budget exists. The first
+    over-cap gate therefore ASKs ("lift the cap and continue?") instead
+    of DENYing; approving records the acknowledged cap in
+    ``session_state`` so the gate ALLOWs from then on, while a decline
+    records nothing (the block stands and the next gate re-asks). A
+    budget with an explicit non-empty ``expensive_models`` list keeps
+    the designed downgrade-gate DENY — that block is escapable by
+    switching to a cheaper model, so it needs no approval valve.
+
     The soft-checkpoint approval key (``subagent_cost_ask_approved_usd``)
-    stays local to the child's ``session_state`` — it is NOT routed to
-    the root conversation, so approvals are scoped to the subagent.
+    and the over-cap acknowledgement key
+    (``subagent_cost_over_budget_approved_usd``) stay local to the
+    child's ``session_state`` — they are NOT routed to the root
+    conversation, so approvals are scoped to the subagent.
 
     :param max_cost_usd: Optional hard limit in USD for the subtree. Must be
         ``> 0`` if provided. Either this or ask_thresholds_usd must be set.
     :param ask_thresholds_usd: Optional soft warning checkpoints in USD.
         Same semantics as :func:`cost_budget`.
     :param expensive_models: Optional case-insensitive substring tokens.
-        Same semantics as :func:`cost_budget`.
+        Same matching semantics as :func:`cost_budget`; when omitted or
+        empty (all models gated), the over-cap verdict is the ASK valve
+        described above rather than a hard DENY.
     :returns: A policy callable implementing the subtree budget gate.
     :raises ValueError: If neither max_cost_usd nor ask_thresholds_usd is set,
         or if validation fails.
@@ -816,11 +858,16 @@ def subagent_cost_budget(
         """Evaluate the subagent subtree cost budget for a request or tool call.
 
         Same gating logic as :func:`cost_budget`'s ``evaluate``, reading
-        the subtree cost and using a local approval key.
+        the subtree cost and using local approval keys, with one
+        difference: a block-all hard cap ASKs on the first over-cap gate
+        (approve lifts the cap; decline keeps blocking and re-asks)
+        instead of hard-DENYing a user who was never warned the budget
+        exists.
 
         :param event: Policy event dict.
-        :returns: DENY when over budget on an expensive model; ASK when
-            a new soft checkpoint is newly crossed; ALLOW otherwise.
+        :returns: DENY when over budget on an expensive model (downgrade
+            gate); ASK when a block-all cap is newly reached or a soft
+            checkpoint is newly crossed; ALLOW otherwise.
         """
         phase = event.get("type")
         if not isinstance(phase, str) or phase not in _GATED_PHASES:
@@ -839,6 +886,35 @@ def subagent_cost_budget(
                 cfg.exclude_tokens,
                 block_all=cfg.block_all_models,
             ):
+                if cfg.block_all_models:
+                    # A no-escape cap on a budget the user typically never
+                    # set (the spawn path attaches it model-chosen, with no
+                    # soft checkpoints). Never hard-stop an un-warned user:
+                    # the first over-cap gate ASKs, and only an explicit
+                    # approval (recorded below, applied on accept) lifts
+                    # the cap. A decline records nothing, so the block
+                    # stands and the next gate re-asks.
+                    state = event.get("session_state") or {}
+                    approved_cap = _state_usd(state, _SUBAGENT_OVER_BUDGET_APPROVED_KEY)
+                    if approved_cap >= max_cost_usd:
+                        return _ALLOW
+                    return {
+                        "result": "ASK",
+                        "reason": (
+                            f"Subagent cost budget reached: subtree spend "
+                            f"${cost:.2f} hit the ${max_cost_usd:.2f} cap attached "
+                            f"when this sub-agent was spawned. Approve to lift "
+                            f"the cap and continue, or decline to keep model and "
+                            f"tool calls blocked."
+                        ),
+                        "state_updates": [
+                            {
+                                "key": _SUBAGENT_OVER_BUDGET_APPROVED_KEY,
+                                "action": "set",
+                                "value": max_cost_usd,
+                            },
+                        ],
+                    }
                 return {
                     "result": "DENY",
                     "reason": _over_budget_deny_reason(
@@ -858,10 +934,7 @@ def subagent_cost_budget(
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
                 state = event.get("session_state") or {}
-                approved_value = state.get(_SUBAGENT_ASK_APPROVED_KEY, 0.0)
-                approved_up_to = (
-                    float(approved_value) if isinstance(approved_value, int | float | str) else 0.0
-                )
+                approved_up_to = _state_usd(state, _SUBAGENT_ASK_APPROVED_KEY)
                 if crossed > approved_up_to:
                     limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd else ""
                     return {
@@ -963,10 +1036,13 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
         "kind": "factory",
         "name": "Subagent Cost Budget",
-        "description": "Gates a sub-agent on its own subtree LLM spend (USD): once a hard limit "
-        "is reached DENY (the whole turn at the request phase, or each tool call) while still on "
-        "an expensive model (prompting a /model downgrade), and ASK for approval at each soft "
-        "warning checkpoint (request + tool-call phases). Reads "
+        "description": "Gates a sub-agent on its own subtree LLM spend (USD). With a non-empty "
+        "expensive_models list, once the hard limit is reached DENY (the whole turn at the "
+        "request phase, or each tool call) while still on an expensive model (prompting a "
+        "/model downgrade). With expensive_models omitted or empty (all models blocked), the "
+        "first over-cap gate ASKs for approval to lift the cap instead of hard-DENYing "
+        "(the budget is usually attached by the orchestrating model, not the user). Also ASKs "
+        "at each soft warning checkpoint (request + tool-call phases). Reads "
         "event.context.subtree_usage.total_cost_usd and event.context.model. Intended to be "
         "attached to a child session via sys_session_send's cost_budget argument.",
         "params_schema": {
@@ -988,9 +1064,10 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional case-insensitive substring tokens for the model "
-                    "tiers blocked once over budget (default: Fable + Opus + GPT-5, excluding "
-                    "the cheap -mini/-nano variants). An empty list disables the hard limit, "
-                    "leaving only the soft thresholds.",
+                    "tiers blocked once over budget. Omit (or pass []) to gate all models: the "
+                    "first over-cap gate then asks for approval to lift the cap rather than "
+                    "hard-blocking. Pass a non-empty list for a downgrade gate that only blocks "
+                    "the named tiers, letting cheaper models continue over budget.",
                 },
             },
             "required": [],

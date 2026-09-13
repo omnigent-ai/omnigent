@@ -35,6 +35,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from omnigent.errors import ErrorPhase, OmnigentError, classify_exception
+from omnigent.process_logging import redact_log_text
 from omnigent.version import VERSION
 
 # ── environment contract ────────────────────────────────────────────────────
@@ -57,6 +59,31 @@ PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 # because a ContextVar set at startup is invisible to run_in_executor threads).
 USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
 _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
+
+# Request-scoped session attribution on the server. The HTTP middleware binds
+# this for the duration of a request whose matched route carries a
+# ``{session_id}`` path param, so records emitted while handling it inherit the
+# session even when the callsite did not thread it explicitly. Unset on the
+# runner/host (they use the ``OMNIGENT_RUNNER_PRIMARY_SESSION_ID`` env instead),
+# so this never changes runner attribution. An explicit ``extra`` session id
+# always wins over this ambient value.
+_session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id", default=None)
+
+# Ambient lifecycle phase for the code currently executing. Set with
+# ``phase_scope`` around each region (runner launch, harness setup/startup, turn)
+# so any error logged inside inherits where it failed. Propagates into awaited
+# coroutines and is copied into asyncio tasks at creation, so wrap the entry of a
+# background task, not the scheduler. Unset outside a scoped region.
+_phase_var: ContextVar[ErrorPhase | None] = ContextVar("omnigent_error_phase", default=None)
+
+# Request-scoped bag of extra audit attributes a handler can attach so they ride
+# the request's audit envelope end-event (e.g. POST /events' event type, a newly
+# created session id) rather than emitting a separate row. Reset per request by
+# the middleware; mutated in place so a handler running in a child context is
+# still visible to the middleware. Unset outside a request.
+_audit_attrs_var: ContextVar[dict[str, str] | None] = ContextVar(
+    "omnigent_audit_attrs", default=None
+)
 
 # Origin deployment identity for the workspace_id/app_name columns. The
 # multi-tenant managed service stamps a per-request ``record.workspace_id`` (via
@@ -234,6 +261,98 @@ def current_user_id() -> str | None:
     return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
 
 
+def set_current_session_id(session_id: str | None) -> None:
+    """Bind the current request's session (server middleware, session-scoped routes only)."""
+    _session_id_var.set(session_id or None)
+
+
+@contextlib.contextmanager
+def current_session_id_scope(session_id: str | None) -> Iterator[None]:
+    """Bind ``session_id`` for the duration of the block, restoring the prior value on exit."""
+    token = _session_id_var.set(session_id or None)
+    try:
+        yield
+    finally:
+        _session_id_var.reset(token)
+
+
+def current_session_id() -> str | None:
+    """Best-available request-scoped session attribution (server only).
+
+    Bound by the HTTP middleware only for a request whose matched route carries a
+    ``{session_id}`` path param, so it never mis-attributes a non-session route.
+    Unset on the runner/host. An explicit ``extra`` session id always wins over
+    this (see :func:`record_to_row`).
+    """
+    return _session_id_var.get() or None
+
+
+@contextlib.contextmanager
+def phase_scope(phase: ErrorPhase) -> Iterator[None]:
+    """Mark *phase* as active for the block, restoring the prior value on exit.
+
+    Wrap each lifecycle region (runner launch, harness setup/startup, turn) so an
+    error logged inside is located even when it carries no error code. For a
+    background task, wrap the task body, not the scheduler (the context is copied
+    at task creation).
+    """
+    token = _phase_var.set(phase)
+    try:
+        yield
+    finally:
+        _phase_var.reset(token)
+
+
+def current_phase() -> ErrorPhase | None:
+    """The ambient lifecycle phase, or ``None`` outside any ``phase_scope``."""
+    return _phase_var.get()
+
+
+def reset_request_audit_attrs() -> None:
+    """Start a fresh per-request audit-attribute bag (server middleware).
+
+    Called at the top of the request so a handler can attach attributes that
+    ride the request's audit envelope ``ok``/``error`` row instead of emitting
+    a separate row (see :func:`add_audit_attrs`).
+    """
+    _audit_attrs_var.set({})
+
+
+def add_audit_attrs(**attrs: object) -> None:
+    """Merge attributes onto the current request's audit envelope end-event.
+
+    A no-op outside a request (bag unset -> e.g. on the runner). Mutates the
+    bag in place so the value is visible to the middleware even though it runs
+    the downstream app in a child context. Values are coerced to ``str`` and
+    ``None`` dropped, matching the ``MAP<STRING,STRING>`` attributes column.
+    """
+    bag = _audit_attrs_var.get()
+    if bag is None:
+        return
+    for key, value in attrs.items():
+        if value is not None:
+            bag[str(key)] = str(value)
+
+
+def current_request_audit_attrs() -> dict[str, str]:
+    """Return a copy of the current request's accumulated audit attributes."""
+    return dict(_audit_attrs_var.get() or {})
+
+
+def mark_request_audit_suppressed() -> None:
+    """Suppress this request's audit envelope end-event (high-frequency echoes).
+
+    For endpoints hit per streamed chunk (``POST /events`` with a transient
+    ``external_*_delta`` / usage type) whose per-call row is pure noise — the
+    content is already on the SSE-event logger. Recorded in the shared attribute
+    bag (a reserved key the middleware reads), so it survives the middleware's
+    child-context boundary like any other bag entry.
+    """
+    bag = _audit_attrs_var.get()
+    if bag is not None:
+        bag["_suppress"] = "1"
+
+
 def _clean(value: object) -> str | None:
     """Coerce a missing/blank record attribute to ``None`` so a fallback engages.
 
@@ -330,10 +449,58 @@ def _stack_trace(record: logging.LogRecord) -> str | None:
 
 def _attributes(record: logging.LogRecord) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
-    if not isinstance(raw, dict):
-        return {}
-    # The target column is MAP<STRING,STRING>; coerce values and drop nulls.
-    return {str(k): str(v) for k, v in raw.items() if v is not None}
+    attrs: dict[str, str] = {}
+    if isinstance(raw, dict):
+        # The target column is MAP<STRING,STRING>; coerce values, redact them,
+        # and drop nulls. Event attributes share the same privacy boundary as
+        # messages.
+        attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    _stamp_error_dimensions(attrs, record)
+    return attrs
+
+
+def _stamp_error_dimensions(attrs: dict[str, str], record: logging.LogRecord) -> None:
+    """Auto-attribute a logged exception the callsite did not classify itself.
+
+    Any record carrying ``exc_info`` gains ``error_category`` / ``error_impact``
+    derived from the exception (see :func:`omnigent.errors.classify_exception`),
+    so every ``_logger.exception`` / ``exc_info=…`` site across the codebase is
+    covered without per-site edits. Explicit callsite values always win.
+    """
+    exc = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+    if isinstance(exc, BaseException) and not (
+        "error_category" in attrs and "error_impact" in attrs
+    ):
+        category, impact = classify_exception(exc)
+        attrs.setdefault("error_category", category.value)
+        attrs.setdefault("error_impact", impact.value)
+    # Locate only rows that are actually errors: an exception to place, or a row
+    # already declaring itself an error via category/impact. Otherwise a benign
+    # INFO/DEBUG line emitted inside a phase_scope (the whole turn loop is one)
+    # would inherit a spurious error_phase from the ambient scope.
+    is_error_row = exc is not None or "error_category" in attrs or "error_impact" in attrs
+    if is_error_row and "error_phase" not in attrs:
+        phase = _resolve_error_phase(exc)
+        if phase is not None:
+            attrs["error_phase"] = phase.value
+
+
+def _resolve_error_phase(exc: BaseException | None) -> ErrorPhase | None:
+    """Locate a logged error's lifecycle phase.
+
+    Precedence: a coded ``OmnigentError``'s own (concrete) phase, then the ambient
+    ``phase_scope`` for the region that was executing (covers uncoded exceptions
+    and non-exception error logs), then a coded error's UNKNOWN fallback. Returns
+    ``None`` when there is nothing to attribute (no code, no active scope), so the
+    column stays empty rather than guessing.
+    """
+    coded = exc.phase if isinstance(exc, OmnigentError) else None
+    if coded is not None and coded is not ErrorPhase.UNKNOWN:
+        return coded
+    ambient = current_phase()
+    if ambient is not None:
+        return ambient
+    return coded
 
 
 def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
@@ -343,13 +510,16 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
 
-    ``session_id`` is taken from what the callsite threaded via ``extra`` and,
-    failing that, falls back to the runner's primary (parent) conversation id
-    (:func:`runner_primary_session_id`). That fallback reads a runner-only env
-    that is absent on the multi-tenant server, so a server record with no
-    explicit id stays null rather than risk cross-request mis-attribution --
-    this is deliberate; do NOT add an ambient request-scoped fallback here. On a
-    runner, a co-located subagent turn whose log is not threaded can be
+    ``session_id`` is taken from what the callsite threaded via ``extra`` first,
+    then the server's request-scoped :func:`current_session_id` (bound by the
+    HTTP middleware only for a request whose matched route carries a
+    ``{session_id}`` path param -- so it never mis-attributes a non-session
+    route, and an explicit id always wins), and finally the runner's primary
+    (parent) conversation id (:func:`runner_primary_session_id`). The
+    request-scoped var is unset on the runner (which uses the primary-session
+    env), and the primary-session env is absent on the server, so the two
+    fallbacks never collide. A server record on a non-session route stays null.
+    On a runner, a co-located subagent turn whose log is not threaded can be
     attributed to the parent conversation, an accepted trade-off.
 
     ``workspace_id``/``app_name`` describe the record's origin deployment: the
@@ -359,19 +529,24 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     null on the managed service.
     """
     workspace_id, app_name = _process_identity()
+    stack_trace = _stack_trace(record)
     return {
-        "session_id": getattr(record, "session_id", None) or runner_primary_session_id(),
+        "session_id": (
+            getattr(record, "session_id", None)
+            or current_session_id()
+            or runner_primary_session_id()
+        ),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
         "event_name": getattr(record, "event_name", None),
         "level": record.levelname,
-        "message": record.getMessage(),
+        "message": redact_log_text(record.getMessage()),
         "client_time": int(record.created * 1_000_000),
         "hostname": _HOSTNAME,
         "logger_name": record.name,
         "func_name": record.funcName,
         "app_version": VERSION,
-        "stack_trace": _stack_trace(record),
+        "stack_trace": redact_log_text(stack_trace) if stack_trace is not None else None,
         "attributes": _attributes(record),
         "log_id": uuid.uuid4().hex,
         "user_id": getattr(record, "user_id", None) or current_user_id(),
@@ -693,6 +868,13 @@ _sink_lock = threading.Lock()
 # ids, never content — never reach the on-disk/stderr logs.
 SSE_LOGGER_NAME = "omnigent.sse_events"
 
+# Dedicated logger for server request audit events (the per-method
+# start/ok/error envelope, WS lifecycle, and in-handler checkpoints). Like the
+# SSE logger it gets the sink as its sole handler with ``propagate=False``, so
+# audit rows populate the table without flooding the on-disk/stderr logs, and
+# they disappear entirely when the sink is off (no env vars -> no handler).
+AUDIT_LOGGER_NAME = "omnigent.audit_events"
+
 
 def debug_sink_enabled() -> bool:
     """Whether the debug-log sink is active in this process.
@@ -715,6 +897,16 @@ def sse_event_logger() -> logging.Logger:
     handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
     """
     return logging.getLogger(SSE_LOGGER_NAME)
+
+
+def audit_event_logger() -> logging.Logger:
+    """Return the table-only logger for server request audit events.
+
+    Records go only to the debug sink (attached with ``propagate=False`` in
+    :func:`attach_debug_log_sink`); when the sink is disabled the logger has no
+    handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
+    """
+    return logging.getLogger(AUDIT_LOGGER_NAME)
 
 
 def attach_debug_log_sink(
@@ -770,3 +962,10 @@ def attach_debug_log_sink(
         sse_logger.setLevel(level)
         sse_logger.propagate = False
         sse_logger.addHandler(_active_sink)
+        # Table-only server audit-event logger (same rationale as the SSE
+        # logger): sink-only, non-propagating, so request audit rows reach the
+        # table but never the on-disk/stderr logs.
+        audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
+        audit_logger.setLevel(level)
+        audit_logger.propagate = False
+        audit_logger.addHandler(_active_sink)

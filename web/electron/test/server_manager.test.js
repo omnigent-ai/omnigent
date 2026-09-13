@@ -70,6 +70,24 @@ describe("ensureServerAuth", () => {
     assert.deepEqual(login.mock.calls[0].arguments, [CLI_PATH, SERVER]);
   });
 
+  it("passes an isaac omni descriptor through login and names it in the safe error", async () => {
+    mock.method(cli, "isLoopbackServer", () => false);
+    mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: true }));
+    const login = mock.method(cli, "loginServer", async () => ({ ok: false, output: "SECRET" }));
+    const command = {
+      executable: "/usr/local/bin/isaac",
+      prefixArgs: ["omni"],
+      displayName: "isaac omni",
+    };
+
+    const res = await ensureServerAuth(command, SERVER);
+
+    assert.deepEqual(login.mock.calls[0].arguments, [command, SERVER]);
+    assert.equal(res.authError, true);
+    assert.match(res.error, /isaac omni login https:\/\/app\.example\.com/);
+    assert.doesNotMatch(res.error, /SECRET/);
+  });
+
   it("returns an authError with a generic message and does NOT surface raw login output", async () => {
     mock.method(cli, "isLoopbackServer", () => false);
     mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: true }));

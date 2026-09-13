@@ -460,7 +460,7 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if _is_codex_family_harness(canonical):
-        from omnigent.codex_native import _codex_auth_unavailable_reason
+        from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
     install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)

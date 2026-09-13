@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.cursor_native_bridge import (
+from omnigent.harnesses.cursor_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     FORK_HISTORY_CLOSE_TAG,
     FORK_HISTORY_OPEN_TAG,
@@ -221,6 +221,18 @@ class TestPastePayload:
 
 
 class TestBridge:
+    @pytest.fixture
+    def bridge_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A bridge dir under a production-shaped cursor root.
+
+        ``write_mcp_bridge_config`` hardens the token tree via
+        ``_ensure_secure_dir``, which only accepts dirs below a known bridge root,
+        so mirror the real ``<uid-scoped temp>/cursor-native/<digest>`` layout.
+        """
+        root = tmp_path / "omnigent-test" / "cursor-native"
+        monkeypatch.setattr("omnigent.harnesses.cursor_native.bridge._BRIDGE_ROOT", root)
+        return root / "sess"
+
     def test_bridge_dir_is_deterministic_and_session_scoped(self) -> None:
         a1 = bridge_dir_for_session_id("conv_a")
         a2 = bridge_dir_for_session_id("conv_a")
@@ -252,7 +264,7 @@ class TestBridge:
         assert server["args"] == [
             "-I",
             "-m",
-            "omnigent.claude_native_bridge",
+            "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
             "--bridge-dir",
             str(tmp_path),
@@ -262,11 +274,12 @@ class TestBridge:
         assert server["autoApprove"] == sorted(server["autoApprove"])
         assert server["env"]["TMPDIR"]
 
-    def test_write_mcp_config_is_workspace_scoped(self, tmp_path: Path, monkeypatch) -> None:
+    def test_write_mcp_config_is_workspace_scoped(
+        self, tmp_path: Path, bridge_dir: Path, monkeypatch
+    ) -> None:
         workspace = tmp_path / "workspace"
-        bridge_dir = tmp_path / "bridge"
         monkeypatch.setattr(
-            "omnigent.cursor_native_bridge.approve_mcp_server_for_workspace",
+            "omnigent.harnesses.cursor_native.bridge.approve_mcp_server_for_workspace",
             lambda _workspace: pytest.fail("approval must happen after tool relay starts"),
         )
         path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
@@ -276,7 +289,9 @@ class TestBridge:
         assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
         assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
 
-    def test_write_mcp_config_preserves_user_servers(self, tmp_path: Path) -> None:
+    def test_write_mcp_config_preserves_user_servers(
+        self, tmp_path: Path, bridge_dir: Path
+    ) -> None:
         workspace = tmp_path / "workspace"
         cursor_dir = workspace / ".cursor"
         cursor_dir.mkdir(parents=True)
@@ -290,7 +305,7 @@ class TestBridge:
             encoding="utf-8",
         )
 
-        path = write_mcp_config(workspace, tmp_path / "bridge", python_executable="python-test")
+        path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
 
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["mcpServers"]["atlassian"] == {"command": "atlassian-mcp"}
@@ -298,22 +313,24 @@ class TestBridge:
         assert payload["someOtherKey"] == {"keep": True}
 
     @pytest.mark.parametrize("body", ["[]", "null", '"text"', '{"mcpServers": null}', "not json"])
-    def test_write_mcp_config_survives_malformed_config(self, tmp_path: Path, body: str) -> None:
+    def test_write_mcp_config_survives_malformed_config(
+        self, tmp_path: Path, bridge_dir: Path, body: str
+    ) -> None:
         workspace = tmp_path / "workspace"
         cursor_dir = workspace / ".cursor"
         cursor_dir.mkdir(parents=True)
         (cursor_dir / "mcp.json").write_text(body, encoding="utf-8")
 
-        path = write_mcp_config(workspace, tmp_path / "bridge", python_executable="python-test")
+        path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
 
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
 
-    def test_write_mcp_bridge_config_is_idempotent(self, tmp_path: Path) -> None:
-        write_mcp_bridge_config(tmp_path)
-        first = (tmp_path / "bridge.json").read_text(encoding="utf-8")
-        write_mcp_bridge_config(tmp_path)
-        assert (tmp_path / "bridge.json").read_text(encoding="utf-8") == first
+    def test_write_mcp_bridge_config_is_idempotent(self, bridge_dir: Path) -> None:
+        write_mcp_bridge_config(bridge_dir)
+        first = (bridge_dir / "bridge.json").read_text(encoding="utf-8")
+        write_mcp_bridge_config(bridge_dir)
+        assert (bridge_dir / "bridge.json").read_text(encoding="utf-8") == first
 
     def test_cursor_project_key_matches_cursor_workspace_state(self) -> None:
         assert cursor_project_key(Path("/Users/corey.zumar")) == "Users-corey.zumar"
@@ -356,7 +373,7 @@ class TestBridge:
         calls: list[dict[str, object]] = []
 
         monkeypatch.setattr(
-            "omnigent.cursor_native.resolve_cursor_executable",
+            "omnigent.harnesses.cursor_native.main.resolve_cursor_executable",
             lambda: "/bin/cursor-agent-test",
         )
 
@@ -404,7 +421,7 @@ class TestRegistration:
         assert is_native_harness("native-cursor") is True
 
     def test_native_coding_agent_record(self) -> None:
-        from omnigent.native_coding_agents import native_coding_agent_for_harness
+        from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
         agent = native_coding_agent_for_harness("cursor-native")
         assert agent is not None

@@ -32,6 +32,10 @@ _ALPHA_TWO = "alpha_two.py"
 _BETA = "beta_three.txt"
 _ALL_FILES = (_ALPHA_ONE, _ALPHA_TWO, _BETA)
 
+# A file under a subdirectory so the walk yields a matchable directory entry.
+_DIR_NAME = "widgets"
+_DIR_FILE = f"{_DIR_NAME}/gadget.py"
+
 
 def _put_file(base_url: str, session_id: str, path: str) -> None:
     resp = httpx.put(
@@ -48,6 +52,17 @@ def all_search_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, s
     base_url, session_id = seeded_session
     for path in _ALL_FILES:
         _put_file(base_url, session_id, path)
+    try:
+        yield (base_url, session_id)
+    finally:
+        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+
+
+@pytest.fixture
+def dir_search_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
+    """A file under a subdirectory so the tree has a matchable folder."""
+    base_url, session_id = seeded_session
+    _put_file(base_url, session_id, _DIR_FILE)
     try:
         yield (base_url, session_id)
     finally:
@@ -106,3 +121,52 @@ def test_search_filters_all_files(
     expect(_row(rail, _ALPHA_ONE)).to_be_visible(timeout=15_000)
     expect(_row(rail, _ALPHA_TWO)).to_be_visible()
     expect(_row(rail, _BETA)).to_have_count(0)
+
+
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
+def test_search_matches_and_reveals_a_directory(
+    page: Page,
+    dir_search_session: tuple[str, str],
+) -> None:
+    """Searching a folder name lists it and clicking it reveals it in the tree.
+
+    Directory search is the feature under test: the server ``/search`` now
+    emits directory entries, the results render them as folder rows, and
+    clicking one exits search and expands the folder in the tree (rather than
+    opening a file). Covers the reveal + exit-search interaction end to end.
+    """
+    base_url, session_id = dir_search_session
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+
+    rail = page.get_by_role("complementary", name="Workspace")
+    search = rail.get_by_role("searchbox", name="Search all files")
+    expect(search).to_be_visible(timeout=30_000)
+    # Match rows by exact accessible name — a slash inside a Playwright
+    # name-regex is invalid, and the trailing-slash folder label collides with
+    # the file path otherwise. The folder row's name is the path + "/"; the
+    # flat file result's name is the full file path.
+    folder_row = rail.get_by_role("button", name=f"{_DIR_NAME}/", exact=True)
+    # Match the file result by its slash-free basename: _row builds a name-regex
+    # and a slash inside a Playwright regex is invalid, but the substring match
+    # still resolves the full-path button ("widgets/gadget.py").
+    file_result = _row(rail, "gadget.py")
+    # The seeded folder must be listed before searching so the panel has
+    # settled out of its mount-time re-render (see _search_for).
+    expect(folder_row).to_be_visible(timeout=30_000)
+
+    # The query matches both the directory (folder row) and the file under it.
+    _search_for(search, _DIR_NAME)
+    # Wait until search-RESULTS mode is actually active before clicking: the
+    # flat file result only exists in search mode (in the tree it's hidden
+    # inside the collapsed folder), and while it's showing the tree is
+    # unmounted, so the only "widgets/" button left is the search folder row.
+    # Without this gate the ~300ms debounce lets the click land on the tree's
+    # folder toggle instead, which expands in place rather than revealing.
+    expect(file_result).to_be_visible(timeout=15_000)
+
+    # Clicking the folder result reveals it in the tree: search clears and the
+    # folder is shown as an (expandable) tree row, not opened as a file.
+    folder_row.click()
+    expect(search).to_have_value("")
+    # Back in tree mode the folder row is still present as a tree node.
+    expect(folder_row).to_be_visible(timeout=15_000)

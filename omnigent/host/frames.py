@@ -22,9 +22,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
+from os import PathLike
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -37,6 +38,50 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # does not exist on the host (e.g. the worktree was deleted). Shared by the
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
+
+def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
+    """Build the canonical text of a workspace-missing launch refusal.
+
+    Single source for both the host that emits the refusal and the server
+    that rebuilds the client-facing message from its own authorized
+    workspace, so the two spellings cannot drift apart.
+
+    :param workspace: Session workspace path, e.g. ``"/home/me/proj"``.
+    :returns: The refusal reason, e.g.
+        ``"workspace path does not exist: /home/me/proj"``.
+    """
+    return f"workspace path does not exist: {workspace}"
+
+
+def classify_launch_refusal(
+    error_code: str | None,
+    error: str | None,
+    workspace: str | PathLike[str] | None,
+) -> str | None:
+    """Categorize a launch failure as one of the safe refusal codes.
+
+    A refusal is safe to surface when no runner can ever connect and the
+    server can describe the cause from its own state. Callers must treat
+    every other failure as generic and must not echo the host's text.
+
+    :param error_code: ``HostLaunchRunnerResultFrame.error_code``; ``None``
+        for uncategorized failures and from hosts too old to send it.
+    :param error: The host's human-readable failure text.
+    :param workspace: The server's authorized workspace for the session.
+    :returns: :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE`,
+        :data:`WORKSPACE_MISSING_ERROR_CODE`, or ``None`` when the failure
+        is not a safe categorical refusal.
+    """
+    if error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+        return HARNESS_NOT_CONFIGURED_ERROR_CODE
+    if error_code == WORKSPACE_MISSING_ERROR_CODE:
+        return WORKSPACE_MISSING_ERROR_CODE
+    # Rolling upgrade: an older host sends this exact categorical reason
+    # with no error_code.
+    if error_code is None and error == workspace_missing_message(workspace):
+        return WORKSPACE_MISSING_ERROR_CODE
+    return None
 
 
 class HostFrameKind(str, Enum):
@@ -72,9 +117,11 @@ class HostFrameKind(str, Enum):
     DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    FS_WRITE_REQUEST = "host.fs_write_request"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
     IMPORT_LOCAL = "host.import_local"
+    IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_DONE = "host.import_local_done"
 
@@ -108,6 +155,9 @@ class HostHelloFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host, or a startup probe
         that failed) — never treat it as "nothing is gateway-backed".
+    :param interactive_shells: Ordered interactive shells installed on this
+        machine, with its login shell first. ``None`` means an older host did
+        not report an inventory.
     """
 
     version: str
@@ -116,6 +166,7 @@ class HostHelloFrame:
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     gateway_inference: dict[str, bool] | None = None
+    interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
 
@@ -197,9 +248,10 @@ class HostLaunchRunnerResultFrame:
         success.
     :param error_code: Machine-readable failure category when
         ``status`` is ``"failed"``, e.g.
-        :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE`. ``None`` for
-        uncategorized failures and on success (and always from
-        older hosts that don't send it).
+        :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` or
+        :data:`WORKSPACE_MISSING_ERROR_CODE`. ``None`` for uncategorized
+        failures and on success (and always from older hosts that don't
+        send it).
     """
 
     request_id: str
@@ -821,10 +873,37 @@ class HostFsRequestFrame:
 
 
 @dataclass
-class HostFsResultFrame:
-    """Host → server: outcome of a workspace filesystem request.
+class HostFsWriteFrame:
+    """Server → host: a workspace-mutating operation, served host-side.
 
-    :param request_id: Correlates to the :class:`HostFsRequestFrame`.
+    The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
+    this carries the small set of writes the host can serve when the session's
+    runner is offline — currently the GitHub account/base preference
+    (``op="github_set_preference"``). The host runs the mutation against
+    ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
+    would, so the result transport and correlation are shared.
+
+    :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
+    :param op: Write op name — currently ``"github_set_preference"``.
+    :param workspace: Absolute path to the session's workspace on the host.
+    :param session_id: Session id, for parity with the read frame.
+    :param params: Operation-specific arguments, e.g.
+        ``{"account": "octocat", "remote": "origin"}``.
+    """
+
+    request_id: str
+    op: str
+    workspace: str
+    session_id: str
+    params: _JsonObject = field(default_factory=dict)
+
+
+@dataclass
+class HostFsResultFrame:
+    """Host → server: outcome of a workspace filesystem request (read or write).
+
+    :param request_id: Correlates to the :class:`HostFsRequestFrame` or
+        :class:`HostFsWriteFrame`.
     :param status: ``"ok"`` when ``payload`` carries the runner-shaped
         result, or ``"error"`` when the read failed.
     :param payload: The runner-shaped JSON result on success, ``None`` on
@@ -911,6 +990,20 @@ class HostImportLocalFrame:
 
 
 @dataclass
+class HostImportLocalByIdFrame:
+    """Server → host: read one known local transcript without listing.
+
+    :param request_id: Unique id for correlating the result.
+    :param source: Harness namespace containing the session.
+    :param session_id: Exact harness-native session id to load.
+    """
+
+    request_id: str
+    source: str
+    session_id: str
+
+
+@dataclass
 class HostImportLocalSessionFrame:
     """Host → server: one normalized local session, streamed as it's read.
 
@@ -977,9 +1070,11 @@ HostFrame = (
     | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostFsWriteFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
     | HostImportLocalFrame
+    | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
     | HostImportLocalDoneFrame
 )
@@ -1031,6 +1126,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
+                "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
             }
@@ -1313,6 +1409,17 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "params": frame.params,
             }
         )
+    if isinstance(frame, HostFsWriteFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FS_WRITE_REQUEST.value,
+                "request_id": frame.request_id,
+                "op": frame.op,
+                "workspace": frame.workspace,
+                "session_id": frame.session_id,
+                "params": frame.params,
+            }
+        )
     if isinstance(frame, HostFsResultFrame):
         return _encode_payload(
             {
@@ -1351,6 +1458,15 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "source": frame.source,
                 "limit": frame.limit,
+            }
+        )
+    if isinstance(frame, HostImportLocalByIdFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_BY_ID.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "session_id": frame.session_id,
             }
         )
     if isinstance(frame, HostImportLocalSessionFrame):
@@ -1503,12 +1619,16 @@ def _decode_known_host_frame(
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.FS_WRITE_REQUEST:
+            return _decode_fs_write_request(msg)
         case HostFrameKind.MODEL_OPTIONS:
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
+        case HostFrameKind.IMPORT_LOCAL_BY_ID:
+            return _decode_import_local_by_id(msg)
         case HostFrameKind.IMPORT_LOCAL_SESSION:
             return _decode_import_local_session(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
@@ -1529,6 +1649,11 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        interactive_shells=(
+            _optional_str_list(msg, "interactive_shells")
+            if msg.get("interactive_shells") is not None
+            else None
+        ),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
@@ -1984,6 +2109,24 @@ def _decode_fs_request(msg: _JsonObject) -> HostFsRequestFrame:
     )
 
 
+def _decode_fs_write_request(msg: _JsonObject) -> HostFsWriteFrame:
+    """Decode a host.fs_write_request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.fs_write_request frame.
+    """
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError("frame field must be a JSON object: 'params'")
+    return HostFsWriteFrame(
+        request_id=_required_str(msg, "request_id"),
+        op=_required_str(msg, "op"),
+        workspace=_required_str(msg, "workspace"),
+        session_id=_required_str(msg, "session_id"),
+        params=params,
+    )
+
+
 def _decode_fs_result(msg: _JsonObject) -> HostFsResultFrame:
     """Decode a host.fs_result frame.
 
@@ -2041,6 +2184,15 @@ def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
         request_id=_required_str(msg, "request_id"),
         source=_required_str(msg, "source"),
         limit=_required_int(msg, "limit"),
+    )
+
+
+def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
+    """Decode a host.import_local_by_id frame."""
+    return HostImportLocalByIdFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        session_id=_required_str(msg, "session_id"),
     )
 
 

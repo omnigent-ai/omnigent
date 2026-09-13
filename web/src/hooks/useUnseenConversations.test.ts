@@ -225,6 +225,44 @@ describe("useUnseenTick", () => {
   });
 });
 
+describe("useConversationReadState", () => {
+  it("does not re-render a row whose read state did not change", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 1_000 },
+      { id: "conv-2", viewer_last_seen: 1_000 },
+    ]);
+    let conv1Renders = 0;
+    let conv2Renders = 0;
+    const conv1 = renderHook(() => {
+      conv1Renders += 1;
+      return mod.useConversationReadState("conv-1", 2_000, "idle");
+    });
+    const conv2 = renderHook(() => {
+      conv2Renders += 1;
+      return mod.useConversationReadState("conv-2", 2_000, "idle");
+    });
+    const conv2Before = conv2Renders;
+
+    act(() => mod.markConversationSeen("conv-1", 2_000));
+
+    expect(conv1.result.current.unseen).toBe(false);
+    expect(conv1Renders).toBeGreaterThan(1);
+    expect(conv2.result.current.unseen).toBe(true);
+    expect(conv2Renders).toBe(conv2Before);
+  });
+
+  it("reports the explicit-unread bit independently of automatic unseen state", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    const { result } = renderHook(() => mod.useConversationReadState("conv-1", 2_000, "running"));
+
+    act(() => mod.markConversationUnread("conv-1", 2_000));
+
+    expect(result.current).toEqual({ unseen: false, explicitlyUnread: true });
+  });
+});
+
 describe("useMarkConversationSeen", () => {
   it("marks the active thread seen on mount when focused (after seed)", async () => {
     const mod = await loadFresh();

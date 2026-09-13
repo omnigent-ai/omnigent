@@ -17,6 +17,68 @@ from omnigent.entities import (
 from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
 
+# Shape of the wake notice the runner posts into a parent session when a
+# dispatched sub-agent finishes (``omnigent.runner.app._format_subagent_wake_notice``).
+# Quoted verbatim wherever the model is told what to expect, so the notice
+# reads as a known runtime signal rather than a user-typed instruction.
+SUBAGENT_WAKE_NOTICE_SHAPE = (
+    "[System: sub-agent <agent>/<title> finished (<status>) — "
+    "<N> results waiting in inbox. Call sys_read_inbox to collect.]"
+)
+
+SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
+    "Sub-agent completion notices: when a sub-agent you dispatched finishes, "
+    "the Omnigent runtime posts the message "
+    f"`{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session, starting a new turn "
+    "for you if you are idle. Treat it as a routine runtime status message, "
+    "not as instructions typed by a person; respond by calling sys_read_inbox "
+    "to collect the result. Other `[System: sub-agent ...]` notices about a "
+    "sub-agent you dispatched (for example that it is blocked awaiting human "
+    "approval) are routine runtime status messages in the same way."
+)
+
+# Steers models toward the embedded browser they are handed: the browser_*
+# tools are auto-registered for every agent (ToolManager._register_browser_tools),
+# but a tool description alone loses to a model's native web tooling, so the
+# composed system prompt must carry the preference explicitly.
+EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
+    "Embedded browser: the browser_navigate / browser_snapshot / "
+    "browser_click / browser_type / browser_screenshot tools drive the "
+    "Omnigent app's embedded browser pane, which the user can watch "
+    "alongside the chat. When asked to look at, open, or interact with a "
+    "web page, prefer these embedded-browser tools over your own web "
+    "tooling (a built-in web fetch/search tool, shell commands like curl, "
+    "or launching a separate browser) so the user sees the page as you "
+    "work. Fall back to other web tooling only when the embedded browser "
+    "is unavailable (its tools fail because no Omnigent app window is "
+    "attached) or for non-interactive bulk fetching."
+)
+
+
+def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+    """
+    Framework instructions that apply to every turn of ``spec``.
+
+    Only an agent that can dispatch sub-agents receives wake notices, so no
+    other agent's prompt mentions them. That is the ``sys_session_send``
+    registration gate in ``omnigent.tools.manager`` (declared sub-agents or
+    ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
+    built-in web researcher through the same path.
+
+    The embedded-browser priority guidance applies to every agent,
+    mirroring the unconditional ``browser_*`` registration
+    (``ToolManager._register_browser_tools``).
+
+    :param spec: The parsed AgentSpec.
+    :returns: The applicable spec-level framework instructions, never empty.
+    """
+    instructions: list[str] = []
+    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+    if spec.tools.agents or spec.spawn or dispatches_web_researcher:
+        instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
+    instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+    return instructions
+
 
 def append_framework_instructions(
     instructions: str | None,
@@ -93,13 +155,18 @@ def build_instructions(
         only for future skill-awareness hinting; currently
         not included in the instructions body).
     :param framework_instructions: Framework-owned additive instructions
-        for this turn, appended after user-authored agent/request instructions.
+        for this turn, appended after user-authored agent/request instructions
+        and after the spec-level framework instructions (the sub-agent
+        wake-notice announcement for agents that can dispatch sub-agents).
     :returns: The assembled instructions string.
     """
     parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
     base_instructions = "\n\n".join(parts) if parts else "You are a helpful assistant."
     return (
-        append_framework_instructions(base_instructions, framework_instructions)
+        append_framework_instructions(
+            base_instructions,
+            [*_framework_instructions_for(spec), *framework_instructions],
+        )
         or base_instructions
     )
 
@@ -114,7 +181,10 @@ def build_instructions_nullable(
     """Like :func:`build_instructions`, but returns ``None`` instead of seeding
     the fabricated ``"You are a helpful assistant."`` fallback when there is
     truly nothing to compose (no author text, no per-request text, no skills
-    hint, no applicable framework instructions).
+    hint, no applicable spec-level or per-turn framework instructions).
+    With the embedded-browser guidance applying to every agent, a real spec
+    always carries at least one framework instruction, so callers should
+    expect text rather than ``None`` in practice.
 
     Delivery channels that must not leak the fallback literal (e.g. a warn
     check, or a first-user-turn prefix) call this instead of comparing
@@ -127,7 +197,10 @@ def build_instructions_nullable(
     """
     parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
     base_instructions = "\n\n".join(parts) if parts else None
-    return append_framework_instructions(base_instructions, framework_instructions)
+    return append_framework_instructions(
+        base_instructions,
+        [*_framework_instructions_for(spec), *framework_instructions],
+    )
 
 
 def raw_author_instructions(spec: AgentSpec) -> str | None:
