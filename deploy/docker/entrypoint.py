@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
     from omnigent.stores.artifact_store import ArtifactStore
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
@@ -94,19 +95,23 @@ class _BuiltApp:
 
 
 def run_migrations(database_url: str) -> None:
-    """Run the Alembic upgrade against ``database_url``.
+    """Initialize or upgrade the schema at ``database_url``.
 
     The SQLAlchemy stores refuse to start on a stale schema, so this
-    runs before any store boots. Creates a throwaway engine, upgrades,
-    and disposes it.
+    runs before any store boots. The central initializer preserves the
+    normal Alembic path for existing backends and uses the safe fresh-schema
+    bootstrap for CockroachDB.
     """
-    import sqlalchemy
+    from omnigent.db.utils import (
+        _create_engine,
+        _initialize_or_verify_schema,
+        normalize_database_url,
+    )
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
-
-    migration_engine = sqlalchemy.create_engine(database_url)
+    database_url = normalize_database_url(database_url)
+    migration_engine = _create_engine(database_url)
     try:
-        _run_alembic_upgrade(migration_engine, database_url)
+        _initialize_or_verify_schema(migration_engine, database_url)
     finally:
         migration_engine.dispose()
 
@@ -309,6 +314,35 @@ def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
     return int(cfg.get("execution_timeout") or 7200)
 
 
+def log_capabilities(
+    sandbox_config: ManagedSandboxDeployment | None,
+    github_config: object | None,
+    github_store: object | None,
+) -> None:
+    """
+    Log the same flags ``/v1/info`` exposes, so a missing ``sandbox:``
+    block or GitHub App env shows up in pod logs without curling.
+
+    Reads ``sandbox_config.default.provider``, not ``.provider``:
+    :class:`ManagedSandboxDeployment` wraps one config PER PROVIDER and has
+    no ``provider`` of its own, so the bare attribute raises
+    ``AttributeError`` and kills the server at boot. Split out of
+    :func:`build_app` so the expression is reachable from a test without
+    standing up a database.
+
+    :param sandbox_config: The resolved sandbox deployment, or ``None``.
+    :param github_config: The GitHub App config, or ``None``.
+    :param github_store: The GitHub connection store, or ``None``.
+    """
+    managed = sandbox_config is not None and sandbox_config.managed_launch_supported
+    logger.info(
+        "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
+        managed,
+        sandbox_config.default.provider if managed and sandbox_config else None,
+        github_config is not None and github_store is not None,
+    )
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -413,6 +447,46 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
         account_store = SqlAlchemyAccountStore(database_url)
 
+    # GitHub App: same env-driven wiring as `omnigent server`
+    # (omnigent/cli.py). Without these kwargs the Docker image silently
+    # leaves Connect GitHub disabled even when the OMNIGENT_GITHUB_APP_*
+    # env vars are set.
+    from omnigent.server.github_app import GitHubAppConfig
+
+    github_config = GitHubAppConfig.from_env()
+    github_store = None
+    if github_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        cipher = build_secret_cipher()
+        if cipher is None:
+            logger.error(
+                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
+                "(the credential store's encryption key) to enable it."
+            )
+        else:
+            from omnigent.connections.github import GithubConnectionStore
+
+            github_store = GithubConnectionStore(database_url, cipher)
+
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logger.error(
+                "Databricks Connect is configured but disabled: set the credential "
+                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -434,7 +508,13 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
         server_config=cfg,
+        github_config=github_config,
+        github_store=github_store,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
     )
+
+    log_capabilities(sandbox_config, github_config, github_store)
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
 
@@ -459,16 +539,17 @@ def main() -> None:
 
         import uvicorn
 
-        from omnigent.runner.transports.ws_tunnel.limits import (
-            RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        )
+        from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
         uvicorn.run(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # This image serves external runners only, so every session rides a
+            # tunnel: without the keepalive budget uvicorn's 20 s default closes
+            # a busy-but-healthy one with 1011 after a client-path stall.
+            **uvicorn_tunnel_kwargs(),
         )
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())

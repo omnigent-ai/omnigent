@@ -36,6 +36,10 @@ class AuthFailure(click.ClickException):
     sending users to chase process cleanup for an access problem.
     """
 
+    # cli_diagnostics.SUPPRESS_RECOVERY_HINT_ATTR: re-authenticating, not
+    # `omnigent stop`, is the recovery for a sign-in/access failure.
+    omnigent_suppress_recovery_hint = True
+
 
 def reject_native_on_windows(harness: str) -> None:
     """Fail a native (tmux/PTY) harness command with an actionable message.

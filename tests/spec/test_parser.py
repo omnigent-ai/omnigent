@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import discover_host_skills, parse
+from omnigent.spec.parser import _parse_skill, discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
@@ -462,6 +462,74 @@ def test_parse_instructions_overrides_agents_md(agent_dir: Path) -> None:
     assert spec.instructions == "Inline wins."
 
 
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt", None])
+@pytest.mark.parametrize("filename", ["AGENTS.md", "CLAUDE.md", ".cursorrules"])
+def test_parse_instructions_rejects_symlink_escape(
+    tmp_path: Path, instruction_key: str | None, filename: str
+) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / filename).symlink_to(secret)
+    config = {"spec_version": 1, "name": "test-agent"}
+    if instruction_key is not None:
+        config[instruction_key] = filename
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(bundle)
+
+    assert spec.instructions == (filename if instruction_key is not None else None)
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_rejects_sibling_prefix(tmp_path: Path, instruction_key: str) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sibling = tmp_path / "bundle-other"
+    sibling.mkdir()
+    secret = sibling / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    config = {"spec_version": 1, instruction_key: str(secret)}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    assert parse(bundle).instructions == str(secret)
+
+
+@pytest.mark.parametrize("root_kind", ["direct", "relative", "symlink"])
+@pytest.mark.parametrize("reference_kind", ["nested", "absolute", "symlink"])
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_reads_contained_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_kind: str,
+    reference_kind: str,
+    instruction_key: str,
+) -> None:
+    bundle = tmp_path / "bundle"
+    prompt_dir = bundle / "prompts"
+    prompt_dir.mkdir(parents=True)
+    prompt_file = prompt_dir / "system.md"
+    prompt_file.write_text("Contained instructions.")
+    reference = "prompts/system.md"
+    if reference_kind == "absolute":
+        reference = str(prompt_file)
+    elif reference_kind == "symlink":
+        (bundle / "linked.md").symlink_to(prompt_file)
+        reference = "linked.md"
+    config = {"spec_version": 1, instruction_key: reference}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+    root = bundle
+    if root_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        root = Path("bundle")
+    elif root_kind == "symlink":
+        root = tmp_path / "bundle-alias"
+        root.symlink_to(bundle, target_is_directory=True)
+
+    assert parse(root).instructions == "Contained instructions."
+
+
 def test_parse_instructions_file_overrides_agents_md(agent_dir: Path) -> None:
     """instructions pointing to a file takes precedence over AGENTS.md."""
     (agent_dir / "AGENTS.md").write_text("Fallback instructions.")
@@ -554,6 +622,25 @@ def test_auto_detect_none_when_no_context_files(agent_dir: Path) -> None:
     """No context files present → instructions is None."""
     spec = parse(agent_dir)
     assert spec.instructions is None
+
+
+def test_auto_detect_skips_escaping_context_file(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_text(yaml.dump({"spec_version": 1}))
+    (bundle / "AGENTS.md").symlink_to(secret)
+    (bundle / "CLAUDE.md").write_text("Safe fallback.")
+
+    assert parse(bundle).instructions == "Safe fallback."
+
+
+def test_auto_detect_empty_context_file_keeps_priority(agent_dir: Path) -> None:
+    (agent_dir / "AGENTS.md").write_text("")
+    (agent_dir / "CLAUDE.md").write_text("Lower priority.")
+
+    assert parse(agent_dir).instructions == ""
 
 
 def test_parse_skill(agent_dir: Path) -> None:
@@ -677,6 +764,133 @@ def test_parse_skill_non_utf8_raises_omnigent_error(agent_dir: Path) -> None:
 _UPSTREAM_BAD_ARGUMENT_HINT = (
     "argument-hint: [industry] [--rows N] [--catalog NAME] [--schema NAME]"
 )
+
+
+# The literal ``description:`` line from the ``dev-productivity`` plugin's
+# ``simplify`` skill. Claude Code loads it; strict YAML rejects it because a
+# plain scalar may not contain ``": "`` — so every user with that plugin
+# installed silently lost the skill from Omnigent's menus.
+_UPSTREAM_COLON_IN_DESCRIPTION = (
+    "description: Refines already-working code for clarity, consistency, and "
+    "maintainability while preserving behavior. Targets code the user wants "
+    "cleaned up, not code that was just written: finishing an implementation, "
+    "bug fix, or refactor does not call for this skill."
+)
+
+
+def test_parse_skill_accepts_unquoted_colon_in_description(
+    tmp_path: Path,
+) -> None:
+    """
+    A description carrying an unquoted ``": "`` still yields a skill.
+
+    Authors write prose in ``description:`` without quoting it, and prose
+    contains colons. Claude Code accepts that; if Omnigent insists on strict
+    YAML the skill vanishes from its menus with only a log line to say why.
+    """
+    skill_dir = tmp_path / "simplify"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(f"---\nname: simplify\n{_UPSTREAM_COLON_IN_DESCRIPTION}\n---\nContent.")
+
+    skill = _parse_skill(skill_md)
+
+    assert skill.name == "simplify"
+    # The whole line survives verbatim — the text after the colon is part of
+    # the description, not a nested mapping.
+    assert skill.description == _UPSTREAM_COLON_IN_DESCRIPTION.removeprefix("description: ")
+    assert skill.content == "Content."
+
+
+def test_parse_skill_colon_recovery_keeps_other_yaml_errors_loud(
+    tmp_path: Path,
+) -> None:
+    """
+    Recovery is scoped to the colon case; other malformed YAML still raises.
+
+    ``argument-hint: [industry] [--rows N]`` breaks on the flow sequence, not
+    on a colon. Quoting must not paper over it, or a genuinely broken
+    frontmatter would be read as prose and its fields silently misparsed.
+    """
+    skill_dir = tmp_path / "bad-yaml"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        f"---\nname: bad-yaml\ndescription: x\n{_UPSTREAM_BAD_ARGUMENT_HINT}\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_leaves_other_keys_alone(
+    tmp_path: Path,
+) -> None:
+    """
+    A colon in a non-description key still raises, keeping the skill hidden.
+
+    ``user-invocable: false: internal only`` is invalid YAML. Quoting it would
+    make the value the truthy string ``"false: internal only"``, so a skill its
+    author marked internal would appear in the user's ``/`` menu. Recovery is
+    scoped to ``description`` precisely so that cannot happen.
+    """
+    skill_dir = tmp_path / "internal-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: internal-skill\ndescription: orchestrates\n"
+        "user-invocable: false: internal only\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_does_not_absorb_indented_keys(
+    tmp_path: Path,
+) -> None:
+    """
+    A mis-indented setting is not folded into a recovered description.
+
+    Continuation lines fold into a plain scalar, but an indented
+    ``user-invocable: false`` is a mis-indented setting, not prose. Absorbing
+    it would drop the flag and publish an internal skill, so the run stops
+    there and the file is rejected instead.
+    """
+    skill_dir = tmp_path / "indented-key"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: indented-key\ndescription: orchestrates things: internally\n"
+        "  user-invocable: false\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_folds_wrapped_prose(
+    tmp_path: Path,
+) -> None:
+    """
+    A wrapped description recovers, and later keys keep their own meaning.
+
+    The continuation line is prose, so it folds with a single space the way a
+    YAML plain scalar would; ``user-invocable`` is a sibling key rather than
+    part of the description and still parses as a boolean.
+    """
+    skill_dir = tmp_path / "wrapped"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: wrapped\ndescription: Use when foo: bar\n"
+        "  and also when baz qux\nuser-invocable: false\n---\nContent."
+    )
+
+    skill = _parse_skill(skill_md)
+
+    assert skill.description == "Use when foo: bar and also when baz qux"
+    assert skill.user_invocable is False
 
 
 def test_parse_skill_invalid_yaml_frontmatter_in_bundle_raises(
@@ -1036,8 +1250,13 @@ def test_discover_host_skills_skips_yaml_syntax_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """
-    Host skills whose frontmatter contains invalid YAML (e.g.
-    unquoted colons) are skipped gracefully.
+    Host skills whose frontmatter contains invalid YAML are skipped
+    gracefully.
+
+    Uses the flow-sequence case rather than an unquoted colon: prose colons
+    are recovered now (see
+    ``test_parse_skill_accepts_unquoted_colon_in_description``), so they no
+    longer exercise the skip path.
 
     :param tmp_path: Temporary directory for test fixtures.
     :param monkeypatch: Pytest monkeypatch for isolating ``Path.home()``.
@@ -1052,9 +1271,8 @@ def test_discover_host_skills_skips_yaml_syntax_error(
     skills_dir = fake_home / ".claude" / "skills"
     broken = skills_dir / "broken-yaml"
     broken.mkdir(parents=True)
-    # Unquoted colon in description triggers yaml.scanner.ScannerError.
     (broken / "SKILL.md").write_text(
-        "---\nname: broken-yaml\ndescription: TRIGGER when: code imports foo\n---\nContent."
+        f"---\nname: broken-yaml\ndescription: x\n{_UPSTREAM_BAD_ARGUMENT_HINT}\n---\nContent."
     )
 
     agent_root = tmp_path / "project"
@@ -1910,6 +2128,25 @@ def test_parse_os_env_sandbox_with_cwd_allow_hidden(tmp_path: Path) -> None:
     assert spec.os_env is not None
     assert spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.cwd_allow_hidden == [".venv", ".cache"]
+
+
+def test_parse_os_env_sandbox_cwd_allow_hidden_wildcard(tmp_path: Path) -> None:
+    """The explicit wildcard survives parsing for trusted workspaces."""
+    config = {
+        "spec_version": 1,
+        "name": "allow-all-hidden",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap", "cwd_allow_hidden": ["*"]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_allow_hidden == ["*"]
 
 
 def test_parse_os_env_sandbox_cwd_allow_hidden_empty_list_preserved(

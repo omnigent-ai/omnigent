@@ -681,7 +681,7 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
     Fail-safe: any resolution error omits the labels rather than guessing, so
     the session falls back to Chat-only rather than breaking the fire.
     """
-    from omnigent.native_coding_agents import native_coding_agent_for_agent_name
+    from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
     from omnigent.server.routes.sessions import _repl_terminal_ui_labels
 
     try:

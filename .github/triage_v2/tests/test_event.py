@@ -10,11 +10,13 @@ from issue_prioritization.classification import Classification
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.domain import Impact, IssueType
 from issue_prioritization.event import (
+    _apply_intake,
     prioritize_issue,
     target_for_labels,
     write_event_artifacts,
     write_event_status,
 )
+from issue_prioritization.intake import IntakePlan
 from issue_prioritization.labels import LabelDefinition, LabelManifest
 from issue_prioritization.pipeline import PipelineMode
 from issue_prioritization.scoring import ScoreEngine
@@ -175,3 +177,39 @@ def test_event_ignores_a_retired_severity_label_when_recomputing() -> None:
     )
 
     assert target.priority == "P1-high"
+
+
+def test_intake_assigns_before_duplicate_closure() -> None:
+    events = []
+
+    class Client:
+        def apply_labels(self, issue_number, labels_add, labels_remove):
+            events.append("labels")
+
+        def comment_on_issue_once(self, issue_number, marker, body):
+            events.append("comment")
+
+        def issue_data(self, issue_number):
+            return {"state": "open", "assignees": []}
+
+        def assign_issue(self, issue_number, assignee):
+            events.append("assign")
+
+        def close_as_duplicate(self, issue_number, duplicate_of):
+            events.append("close")
+
+    plan = IntakePlan(
+        ("triaged", "duplicate"),
+        ("needs-triage",),
+        "owner",
+        "duplicate",
+        3,
+        (),
+        0.99,
+        "<!-- omnigent-duplicate-check -->\nClosing",
+        True,
+    )
+
+    _apply_intake(Client(), 7, plan)
+
+    assert events == ["labels", "comment", "assign", "close"]

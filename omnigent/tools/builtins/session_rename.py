@@ -23,7 +23,8 @@ class SysSessionRenameTool(Tool):
             "Rename the current top-level session with a short summary-style title "
             "(3-6 words, action-first). Strip filler and keep the noun plus verb. "
             "Never copy a conversational question or greeting verbatim. "
-            "The rename is ignored if the session title changed concurrently."
+            "The rename is silent and can be updated again as the work evolves. "
+            "Sub-agent sessions cannot rename themselves (returns not_top_level)."
         )
 
     def get_schema(self) -> dict[str, Any]:

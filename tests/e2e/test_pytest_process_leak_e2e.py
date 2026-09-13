@@ -73,7 +73,7 @@ def test_claude_command_spawns_detached_host_daemon(monkeypatch) -> None:
     captured = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native",
+        "omnigent.harnesses.claude_native.main.run_claude_native",
         lambda **kwargs: captured.update(kwargs),
     )
 

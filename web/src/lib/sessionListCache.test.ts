@@ -456,7 +456,7 @@ describe("insertNewRowsIntoPages", () => {
     );
     expect(after!.pages[0].data.map((c) => c.id)).toEqual(["new", "a", "b"]);
     expect(after!.pages[0].first_id).toBe("new");
-    expect(inserted).toEqual(new Set(["new"]));
+    expect(inserted.map((c) => c.id)).toEqual(["new"]);
   });
 
   it("skips a row already present (idempotent)", () => {
@@ -467,7 +467,7 @@ describe("insertNewRowsIntoPages", () => {
       DEFAULT_FILTERS,
     );
     expect(after).toBe(before);
-    expect(inserted.size).toBe(0);
+    expect(inserted).toHaveLength(0);
   });
 
   it("skips search-filtered lists (membership unknown)", () => {
@@ -476,7 +476,7 @@ describe("insertNewRowsIntoPages", () => {
       searchQuery: "hi",
       includeArchived: false,
     });
-    expect(inserted.size).toBe(0);
+    expect(inserted).toHaveLength(0);
   });
 
   it("skips an archived row in a non-archived list", () => {
@@ -485,7 +485,7 @@ describe("insertNewRowsIntoPages", () => {
       searchQuery: "",
       includeArchived: false,
     });
-    expect(inserted.size).toBe(0);
+    expect(inserted).toHaveLength(0);
   });
 
   it("never inserts a sub-agent/child session (parent_session_id set)", () => {
@@ -495,7 +495,7 @@ describe("insertNewRowsIntoPages", () => {
       candidate("child", { parent_session_id: "parent" }),
       DEFAULT_FILTERS,
     );
-    expect(inserted.size).toBe(0);
+    expect(inserted).toHaveLength(0);
   });
 
   it("skips ids the caller excludes (e.g. a session being deleted)", () => {
@@ -506,6 +506,6 @@ describe("insertNewRowsIntoPages", () => {
       DEFAULT_FILTERS,
       (id) => id === "gone",
     );
-    expect(inserted.size).toBe(0);
+    expect(inserted).toHaveLength(0);
   });
 });

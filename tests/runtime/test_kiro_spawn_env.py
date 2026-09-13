@@ -2,7 +2,7 @@
 
 The kiro-native harness is terminal-first: the runner spawns ``kiro-cli`` in a
 tmux pane and the executor reads ``HARNESS_KIRO_NATIVE_BRIDGE_DIR`` to find the
-per-session bridge directory. Two builders in ``omnigent.kiro_native_bridge``
+per-session bridge directory. Two builders in ``omnigent.harnesses.kiro_native.bridge``
 produce that env:
 
 * :func:`build_kiro_native_spawn_env` — the minimal env handed to the harness
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import stat
 
-from omnigent.kiro_native_bridge import (
+from omnigent.harnesses.kiro_native.bridge import (
     KIRO_ACP_RECORD_PATH_ENV_VAR,
     KIRO_NATIVE_BRIDGE_DIR_ENV_VAR,
     acp_record_path,

@@ -15,6 +15,7 @@ const {
   parseLocalServerPidfile,
   candidatePaths,
   resolveCliPath,
+  cliCommandParts,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
@@ -23,6 +24,34 @@ const {
   probeServerAuth,
   localHostId,
 } = require("../src/omnigent_cli");
+
+describe("cliCommandParts", () => {
+  it("keeps public CLI paths bare and adds fixed isaac argv without a shell", () => {
+    assert.deepEqual(cliCommandParts("/bin/omnigent"), {
+      executable: "/bin/omnigent",
+      prefixArgs: [],
+      displayName: "omnigent",
+    });
+    assert.deepEqual(
+      cliCommandParts({
+        executable: "/usr/local/bin/isaac",
+        prefixArgs: ["omni"],
+        displayName: "isaac omni",
+      }),
+      {
+        executable: "/usr/local/bin/isaac",
+        prefixArgs: ["omni"],
+        displayName: "isaac omni",
+      },
+    );
+  });
+
+  it("rejects malformed descriptors", () => {
+    assert.throws(() => cliCommandParts(null));
+    assert.throws(() => cliCommandParts({ executable: "", prefixArgs: ["omni"] }));
+    assert.throws(() => cliCommandParts({ executable: "/bin/isaac", prefixArgs: "omni" }));
+  });
+});
 
 describe("normalizeServerUrl", () => {
   it("strips trailing slashes and trims", () => {

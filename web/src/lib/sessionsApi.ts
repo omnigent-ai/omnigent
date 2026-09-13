@@ -16,6 +16,7 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -124,6 +125,12 @@ interface SessionResponseWire {
    * Absent/`false` for non-managed/non-resumable hosts.
    */
   host_resumable?: boolean;
+  /**
+   * Whether the session is archived. The snapshot is the only carrier for a
+   * session opened directly by URL — the default list request excludes
+   * archived rows. Absent/`false` for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -168,6 +175,8 @@ interface SessionResponseWire {
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
   subagent_routing_override?: "on" | "off" | null;
+  /** Owner opt-in: view-level collaborators may browse workspace files. */
+  share_workspace_files?: boolean;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -313,6 +322,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
     hostResumable: wire.host_resumable ?? false,
+    archived: wire.archived ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
@@ -330,6 +340,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
+    shareWorkspaceFiles: wire.share_workspace_files ?? false,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -393,6 +404,10 @@ export class ApiError extends Error {
  * instead, so that shape is read too — otherwise those failures reach the
  * user as a bare status line ("415 ", with statusText empty over HTTP/2)
  * rather than the reason the server actually gave.
+ *
+ * Databricks-backed stores propagate rejections as a top-level
+ * `{"error_code": "…", "message": "…"}` envelope (e.g. a title the
+ * workspace storage refuses), so that shape is read as well.
  */
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
@@ -401,12 +416,16 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
     const body = (await res.json()) as {
       error?: { code?: string; message?: string };
       detail?: unknown;
+      message?: unknown;
+      error_code?: unknown;
     };
     // FastAPI's validation errors put a list in `detail`; only a plain
     // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
+    else if (typeof body.message === "string" && body.message) message = body.message;
     if (body.error?.code) code = body.error.code;
+    else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
@@ -488,7 +507,11 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -516,15 +539,116 @@ export interface LocalImportResult {
 }
 
 /**
- * Import the caller's most recent local transcripts via `POST /v1/imports/local`.
- * The chosen host reads + normalizes its own transcripts over the tunnel (the
- * transcripts live on that machine, not the server); already-imported sessions
- * are skipped. `source` is a specific harness or "all" for every harness at once.
+ * Import local transcripts from a chosen host. The
+ * host reads + normalizes its own transcripts over the tunnel (they live on
+ * that machine, not the server); already-imported sessions are skipped.
+ * Passing `sessionId` loads that exact session from `source` without listing
+ * local history. Otherwise, `source` may be "all" for every harness at once.
+ *
+ * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
+ * `onSession` fires for each newly imported session as its frame lands, so
+ * callers list sessions live instead of waiting out the whole batch. A
+ * mid-stream host failure throws after the sessions read so far have been
+ * delivered through `onSession`. Against a server too old to have the streaming
+ * endpoint (404), it falls back to the buffered `POST /v1/imports/local`, which
+ * returns the whole tally at once (`onSession` then fires for every session
+ * together). Either way the resolved {@link LocalImportResult} carries the
+ * final tally.
  */
 export async function importLocalSessions(
   hostId: string,
   source: ImportSourceSelector,
   limit: number,
+  onSession?: (session: ImportedSessionRef) => void,
+  sessionId?: string,
+): Promise<LocalImportResult> {
+  const body = { host_id: hostId, source, limit, session_id: sessionId };
+  const res = await authenticatedFetch("/v1/imports/local/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify(body),
+  });
+  // Older server without the streaming endpoint: fall back to the buffered
+  // import so a newer client still works against it.
+  if (res.status === 404) {
+    if (sessionId !== undefined) {
+      throw new Error("Direct session import is not supported by this server.");
+    }
+    return importLocalSessionsBuffered(hostId, source, limit, onSession);
+  }
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  if (res.body === null) throw new Error("Import failed: no response stream.");
+
+  const sessions: ImportedSessionRef[] = [];
+  let imported = 0;
+  let alreadyImported = 0;
+  let failed = 0;
+  let errorMessage: string | null = null;
+
+  const handleLine = (line: string): void => {
+    let evt: Record<string, unknown>;
+    try {
+      evt = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (evt.event === "session") {
+      const id = typeof evt.session_id === "string" ? evt.session_id : "";
+      if (!id) return;
+      const ref: ImportedSessionRef = {
+        id,
+        title: typeof evt.title === "string" ? evt.title : null,
+      };
+      sessions.push(ref);
+      onSession?.(ref);
+    } else if (evt.event === "done") {
+      imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
+      alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
+      failed = typeof evt.failed === "number" ? evt.failed : 0;
+    } else if (evt.event === "error") {
+      errorMessage = typeof evt.message === "string" ? evt.message : "Import failed. Try again.";
+    }
+  };
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+  try {
+    for (;;) {
+      // Sequential by design: each read waits for the next NDJSON chunk.
+      // eslint-disable-next-line no-await-in-loop
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx = buf.indexOf("\n");
+      while (idx !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line) handleLine(line);
+        idx = buf.indexOf("\n");
+      }
+    }
+    const tail = buf.trim();
+    if (tail) handleLine(tail);
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+
+  if (errorMessage !== null) throw new Error(errorMessage);
+  return { imported, alreadyImported, failed, sessions };
+}
+
+/**
+ * Buffered local import via `POST /v1/imports/local` — the pre-streaming shape,
+ * kept as the fallback for a server without the streaming endpoint. Delivers
+ * every imported session through `onSession` at once (no live list) so callers
+ * behave the same as the streaming path, just without the incremental fill.
+ */
+async function importLocalSessionsBuffered(
+  hostId: string,
+  source: ImportSourceSelector,
+  limit: number,
+  onSession?: (session: ImportedSessionRef) => void,
 ): Promise<LocalImportResult> {
   const res = await authenticatedFetch("/v1/imports/local", {
     method: "POST",
@@ -537,11 +661,13 @@ export async function importLocalSessions(
     failed: number;
     sessions: { session_id: string; title: string | null }[];
   }>(res);
+  const sessions = wire.sessions.map((s) => ({ id: s.session_id, title: s.title }));
+  for (const s of sessions) onSession?.(s);
   return {
     imported: wire.imported,
     alreadyImported: wire.already_imported,
     failed: wire.failed,
-    sessions: wire.sessions.map((s) => ({ id: s.session_id, title: s.title })),
+    sessions,
   };
 }
 
@@ -557,7 +683,10 @@ export async function importLocalSessions(
  *
  * @param bundle - The agent bundle as a `File` (`.tar.gz`).
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
- * @returns The created session's id.
+ *   A `project_id` files the session into that project atomically at create
+ *   and lets the server default-fill absent fields from the project config.
+ * @returns The created session's id, plus any non-fatal project-consistency
+ *   `warnings` the server attached to a `project_id` create.
  */
 export async function createBundledSession(
   bundle: File,
@@ -565,17 +694,21 @@ export async function createBundledSession(
     host_id?: string;
     host_type?: string;
     workspace?: string;
+    project_id?: string;
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
   } = {},
-): Promise<{ id: string }> {
+): Promise<{ id: string; warnings?: { code?: string; message?: string }[] }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: form,
   });
   if (!res.ok) {
@@ -585,8 +718,11 @@ export async function createBundledSession(
   // The multipart response uses `session_id` (CreatedSessionResponse),
   // while the JSON path uses `id` (SessionResponse). Normalize to `id`
   // so callers don't need to care which path was taken.
-  const body = (await res.json()) as { session_id: string };
-  return { id: body.session_id };
+  const body = (await res.json()) as {
+    session_id: string;
+    warnings?: { code?: string; message?: string }[];
+  };
+  return { id: body.session_id, warnings: body.warnings };
 }
 
 /**
@@ -594,42 +730,57 @@ export async function createBundledSession(
  * POST /v1/sessions/{source_id}/fork.
  *
  * The server deep-copies the source's transcript and clones its agent
- * into a fresh, unbound session owned by the caller (read access on the
- * source is required). Comments and permissions are NOT copied, and the
- * fork starts `idle` with no runner — the caller binds their own via
- * `PATCH /v1/sessions/{id}`. `title` is only sent when provided; omitted,
- * the server derives `"Fork of <source title>"`.
+ * into a fresh session owned by the caller (read access on the source is
+ * required). Comments and permissions are NOT copied. Unless
+ * `options.sandbox` is given, the fork starts `idle` and unbound — the
+ * caller binds their own runner via `PATCH /v1/sessions/{id}`.
+ * `options.title` is only sent when provided; omitted, the server derives
+ * `"Fork of <source title>"`.
  *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
- * @param title - Optional title for the new fork.
- * @param agentId - Optional built-in agent to switch the fork to (e.g.
- *   fork a Claude-SDK session into Claude Code). Omitted → keep the
+ * @param options.title - Optional title for the new fork.
+ * @param options.agentId - Optional built-in agent to switch the fork to
+ *   (e.g. fork a Claude-SDK session into Claude Code). Omitted → keep the
  *   source's agent. The server carries model settings (and native
  *   history) across only within the same provider family.
- * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
- *   set, the fork copies history only up to and including that response
- *   ("fork from here"); omitted, the full history is copied.
- * @param config - Optional run-config overrides from the fork dialog's
- *   model / effort / permission-mode pickers. Each field is opt-in: a field
- *   left `undefined` inherits the source (model settings carry within the
- *   same provider family), while a sent field overrides it. The
- *   permission-/approval-mode selector rides `terminalLaunchArgs` (e.g.
- *   `["--permission-mode", "auto"]`); `[]` clears the source's launch args.
- *   `codexBypassSandbox: true` (Codex only) arms the dangerous full-bypass on
- *   the fork — sent only on an explicit, banner-gated pick.
+ * @param options.upToResponseId - Optional truncation point, e.g.
+ *   "resp_abc". When set, the fork copies history only up to and including
+ *   that response ("fork from here"); omitted, the full history is copied.
+ * @param options.config - Optional run-config overrides from the fork
+ *   dialog's model / effort / permission-mode pickers. Each field is
+ *   opt-in: a field left `undefined` inherits the source (model settings
+ *   carry within the same provider family), while a sent field overrides
+ *   it. The permission-/approval-mode selector rides `terminalLaunchArgs`
+ *   (e.g. `["--permission-mode", "auto"]`); `[]` clears the source's launch
+ *   args. `codexBypassSandbox: true` (Codex only) arms the dangerous
+ *   full-bypass on the fork — sent only on an explicit, banner-gated pick.
+ * @param options.sandbox - Present when the fork should run on a
+ *   server-provisioned sandbox instead of a host the caller binds. It asks
+ *   for the same background launch a `host_type: "managed"` create
+ *   schedules, so the call still returns as soon as the fork row exists —
+ *   `host_id` / `workspace` stay null until the sandbox registers.
+ *   `provider` names one of the server's configured sandbox providers
+ *   (`null` takes its first). `workspace` is a `<url>[#<branch>]`
+ *   repository the server clones into the sandbox; `null` gives the fork an
+ *   empty sandbox, and leaving the key off inherits the repository the
+ *   source session recorded.
  */
 export async function forkSession(
   sourceId: string,
-  title?: string,
-  agentId?: string,
-  upToResponseId?: string,
-  config?: {
-    modelOverride?: string;
-    reasoningEffort?: string;
-    terminalLaunchArgs?: string[];
-    codexBypassSandbox?: boolean;
-  },
+  options: {
+    title?: string;
+    agentId?: string;
+    upToResponseId?: string;
+    config?: {
+      modelOverride?: string;
+      reasoningEffort?: string;
+      terminalLaunchArgs?: string[];
+      codexBypassSandbox?: boolean;
+    };
+    sandbox?: { provider?: string | null; workspace?: string | null };
+  } = {},
 ): Promise<Session> {
+  const { title, agentId, upToResponseId, config, sandbox } = options;
   const body: {
     title?: string;
     agent_id?: string;
@@ -638,6 +789,9 @@ export async function forkSession(
     reasoning_effort?: string;
     terminal_launch_args?: string[];
     codex_bypass_sandbox?: boolean;
+    host_type?: "managed";
+    sandbox_provider?: string;
+    workspace?: string | null;
   } = {};
   if (title !== undefined) {
     body.title = title;
@@ -661,6 +815,18 @@ export async function forkSession(
   // otherwise keeps the request minimal and the server default (no bypass).
   if (config?.codexBypassSandbox) {
     body.codex_bypass_sandbox = true;
+  }
+  if (sandbox !== undefined) {
+    body.host_type = "managed";
+    // A provider the server didn't name is omitted so it picks its first.
+    if (sandbox.provider != null) {
+      body.sandbox_provider = sandbox.provider;
+    }
+    // Key presence is the signal here: an explicit null means "empty
+    // sandbox", while omitting it inherits the source's repository.
+    if (sandbox.workspace !== undefined) {
+      body.workspace = sandbox.workspace;
+    }
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
@@ -808,8 +974,22 @@ export async function updateSession(
      * promise means the mode really changed.
      */
     claudePermissionMode?: string;
+    /**
+     * Codex-native approval mode to switch a RUNNING session to, one of
+     * `"ask-for-approval"`, `"approve-for-me"`, `"full-access"`, `"read-only"`
+     * (Codex's `/permissions` presets; the set is codex-version-dependent).
+     * Rejected by the server unless the session is codex-native, and the PATCH
+     * fails unless the runner confirms Codex applied it via its `/permissions`
+     * popup — so a resolved promise means the mode really changed.
+     */
+    codexApprovalMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
+    /**
+     * Owner opt-in that lets people with view (read-only) access browse the
+     * workspace files. Owner-only server-side. `true`/`false` set or clear it.
+     */
+    shareWorkspaceFiles?: boolean;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -828,11 +1008,17 @@ export async function updateSession(
   if (updates.claudePermissionMode !== undefined) {
     body.permission_mode = updates.claudePermissionMode;
   }
+  if (updates.codexApprovalMode !== undefined) {
+    body.approval_mode = updates.codexApprovalMode;
+  }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
   }
   if ("subagentRoutingOverride" in updates) {
     body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
+  }
+  if (updates.shareWorkspaceFiles !== undefined) {
+    body.share_workspace_files = updates.shareWorkspaceFiles;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
@@ -930,6 +1116,8 @@ export interface GetSessionSlimOptions {
    * refresh pierces stale server-side capability caches.
    */
   refreshState?: boolean;
+  /** Cancel this request when the owning operation ends or times out. */
+  signal?: AbortSignal;
 }
 
 export async function getSessionSlim(
@@ -943,6 +1131,7 @@ export async function getSessionSlim(
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
+    { signal: options.signal },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
@@ -970,13 +1159,18 @@ export interface SessionItemsPage {
  */
 export async function fetchSessionItemsPage(
   sessionId: string,
-  { olderThan, limit = SESSION_HISTORY_PAGE_SIZE }: { olderThan?: string; limit?: number } = {},
+  {
+    olderThan,
+    limit = SESSION_HISTORY_PAGE_SIZE,
+    signal,
+  }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
 ): Promise<SessionItemsPage> {
   const params = new URLSearchParams({ limit: String(limit), order: "desc" });
   // "Older than the cursor" within a descending scan = items after it.
   if (olderThan) params.set("after", olderThan);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    { signal },
   );
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
@@ -1036,7 +1230,10 @@ export async function postEvent(
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(event),
   });
   // Throw a typed ApiError (not the bare status line) so callers can branch
@@ -1106,6 +1303,37 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
 /** Reconnect or relaunch the existing runner without replaying user input. */
 export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });
+}
+
+// Multiple error cards can describe the same failed turn.
+const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+
+/** Continue a rate-limited turn without replaying the original prompt or tools. */
+export function retryRateLimitedTurn(sessionId: string): Promise<void> {
+  const pending = rateLimitedTurnRetries.get(sessionId);
+  if (pending) return pending;
+
+  const retry = postEvent(sessionId, {
+    type: "message",
+    data: {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: "Please continue from where you left off before the rate limit error.",
+        },
+      ],
+    },
+  })
+    .then((result) => {
+      if (result.denied) throw new Error("The retry was blocked by a policy");
+      if (!result.queued) throw new Error("The retry was not accepted");
+    })
+    .finally(() => {
+      rateLimitedTurnRetries.delete(sessionId);
+    });
+  rateLimitedTurnRetries.set(sessionId, retry);
+  return retry;
 }
 
 /**

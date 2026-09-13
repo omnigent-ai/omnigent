@@ -1,10 +1,38 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+
+// Drive lazy-directory listings from a fixture so the tree's central
+// `useWorkspaceDirectories` controller resolves nested lazy dirs without a
+// network. `lazyChildren` maps a dir path to the entries the "runner" would
+// return; the hook returns a Map only for the paths the tree currently asks
+// for, so descending into a deeper level requires the shallower level's data
+// to already be present — exactly the incremental-widening path.
+const { lazyChildren, lazyErrors } = vi.hoisted(() => ({
+  lazyChildren: new Map<string, unknown[]>(),
+  lazyErrors: new Set<string>(),
+}));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
+  useWorkspaceDirectories: (_c: string | undefined, dirPaths: string[]) => {
+    const map = new Map();
+    for (const p of dirPaths) {
+      const errored = lazyErrors.has(p);
+      map.set(p, {
+        data: lazyChildren.get(p),
+        isLoading: !errored && !lazyChildren.has(p),
+        isError: errored,
+      });
+    }
+    return map;
+  },
+}));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import {
   ROW_ACTION_SIZE_CLASS,
   ROW_META_SLOT_CLASS,
@@ -192,6 +220,14 @@ describe("FolderTree file size / download alignment", () => {
 });
 
 describe("FolderTree trailing column", () => {
+  it("suppresses browser list markers on virtualized file rows", () => {
+    // Virtualized tree rows are no longer direct children of a <ul>, so the
+    // file row's <li> must neutralize the browser's default bullet marker.
+    renderTree({ files: [file("README.md")] });
+
+    expect(screen.getByText("README.md").closest("li")).toHaveClass("list-none");
+  });
+
   it("gives folders and files alike the same fixed-width trailing slot", () => {
     // The size label is variable width ("985 B" vs "463 KB"). Letting it size
     // the column dragged the copy button, the download button and the status
@@ -267,5 +303,231 @@ describe("FolderTree double-click to open a folder", () => {
     fireEvent.doubleClick(folder);
 
     expect(folder).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree directory search results", () => {
+  it("renders a matched directory as a folder row above matched files", () => {
+    // The server-side search returns files AND directories; directories sort
+    // first so a folder to open reads above the files sharing its name.
+    renderTree({
+      searchQuery: "src",
+      searchResults: [file("src/main.py"), dir("src")],
+    });
+
+    const rows = screen.getAllByRole("listitem");
+    // Folder row first (label carries the trailing slash), then the file.
+    expect(rows[0]).toHaveTextContent("src/");
+    expect(rows[1]).toHaveTextContent("src/main.py");
+  });
+
+  it("reveals the directory and exits search when a folder result is clicked", () => {
+    // Clicking a folder in search behaves like clicking one in the tree: the
+    // panel drops back to the tree (search cleared) with that folder expanded.
+    const onExitSearch = vi.fn();
+    const onFileSelect = vi.fn();
+    renderTree({
+      searchQuery: "src",
+      searchResults: [dir("src/components")],
+      onExitSearch,
+      onFileSelect,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /src\/components\// }));
+
+    expect(onExitSearch).toHaveBeenCalledTimes(1);
+    // A folder is not a file — it must not be opened in the viewer.
+    expect(onFileSelect).not.toHaveBeenCalled();
+  });
+
+  it("scrolls to and flashes the revealed folder, expanding only its ancestors", async () => {
+    // Search-mode is parent-controlled, so drive the whole flow through a
+    // wrapper that clears searchQuery on exit — the way FilesPanel does. The
+    // tree's own files show src/ containing sub/, so revealing "src/sub"
+    // expands the ancestor (src) but leaves the target (sub) collapsed, then
+    // scrolls it into view and flashes it.
+    // jsdom leaves scrollTo undefined; the virtualizer's scrollToIndex calls
+    // it, so define a no-op to keep the reveal effect from throwing.
+    Object.defineProperty(Element.prototype, "scrollTo", {
+      value: vi.fn(),
+      configurable: true,
+      writable: true,
+    });
+    lazyChildren.set("src", [dir("src/sub")]);
+
+    function Harness() {
+      const [query, setQuery] = useState("sub");
+      return (
+        <FolderTree
+          files={[dir("src")]}
+          isLoading={false}
+          isError={false}
+          error={null}
+          onFileSelect={vi.fn()}
+          conversationId="conv_reveal"
+          showHidden={false}
+          changedFiles={undefined}
+          sort="alpha"
+          searchQuery={query}
+          searchResults={[dir("src/sub")]}
+          onExitSearch={() => setQuery("")}
+        />
+      );
+    }
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+
+    // Click the folder result → exit search, expand ancestors, reveal the row.
+    fireEvent.click(screen.getByRole("button", { name: /src\/sub\// }));
+
+    // The tree is back: the target row appears (ancestor src auto-expanded so
+    // its lazy child sub/ renders) and carries the flash class while active.
+    const subRow = await screen.findByRole("button", { name: "sub/" });
+    const rowContainer = subRow.closest("div.group");
+    expect(rowContainer).toHaveClass("animate-user-msg-flash");
+    // The ancestor was auto-expanded (its lazy child rendered); the target
+    // itself stays collapsed, like clicking a folder in the tree.
+    expect(subRow).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("flashes a deep revealed folder once its ancestors' lazy levels resolve", async () => {
+    // Reveal a deep target (a/b/target) whose ancestors' listings arrive in
+    // separate lazy steps, so `flatRows` changes several times before the row
+    // materializes. The scroll/flash effect re-runs on each change but is gated
+    // (pendingRevealRef) to act once the row first appears — the highlight
+    // lands on exactly the target and no other row.
+    Object.defineProperty(Element.prototype, "scrollTo", {
+      value: vi.fn(),
+      configurable: true,
+      writable: true,
+    });
+    lazyChildren.set("a", [dir("a/b")]);
+    lazyChildren.set("a/b", [dir("a/b/target")]);
+
+    function Harness() {
+      const [query, setQuery] = useState("target");
+      return (
+        <FolderTree
+          files={[dir("a")]}
+          isLoading={false}
+          isError={false}
+          error={null}
+          onFileSelect={vi.fn()}
+          conversationId="conv_reveal_deep"
+          showHidden={false}
+          changedFiles={undefined}
+          sort="alpha"
+          searchQuery={query}
+          searchResults={[dir("a/b/target")]}
+          onExitSearch={() => setQuery("")}
+        />
+      );
+    }
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /a\/b\/target\// }));
+
+    // Wait for the deep row to materialize after both lazy levels resolve.
+    const targetRow = await screen.findByRole("button", { name: "target/" });
+    expect(targetRow.closest("div.group")).toHaveClass("animate-user-msg-flash");
+    // Exactly one row flashes — the reveal doesn't smear the highlight across
+    // ancestors as their levels land.
+    expect(container.querySelectorAll(".animate-user-msg-flash")).toHaveLength(1);
+  });
+});
+
+describe("FolderTree nested lazy loading", () => {
+  beforeEach(() => {
+    lazyChildren.clear();
+    lazyErrors.clear();
+  });
+
+  it("shows an error row when a lazy directory's listing fails", async () => {
+    lazyErrors.add("src");
+    renderTree({ files: [dir("src")], conversationId: "conv_lazy_error" });
+
+    fireEvent.click(screen.getByRole("button", { name: "src/" }));
+
+    expect(await screen.findByText("Failed to load this folder.")).toBeInTheDocument();
+  });
+
+  it("loads a deep lazy level on a restored multi-level expansion (no per-level clicks)", async () => {
+    // Regression guard for B1. The bug only shows on RESTORE/RE-ROOT, where a
+    // multi-level expansion is seeded at once rather than clicked open level by
+    // level — interactive expansion masks it, because each click mutates
+    // expandedPaths and re-runs the fetch-set computation anyway. Here we build
+    // the expansion with clicks (which caches src + src/deep as expanded), then
+    // REMOUNT: the fresh tree seeds both expanded paths from the cache in one
+    // shot, and its fetch set starts from nothing. The controller must widen
+    // past the first level on its own as src's listing lands, or src/deep never
+    // fetches and renders as an empty folder. A fetch-set computation that
+    // ignores freshly-arrived data resolves only src and leaves leaf.ts missing.
+    const conversationId = "conv_restore_deep";
+    lazyChildren.set("src", [dir("src/deep")]);
+    lazyChildren.set("src/deep", [file("src/deep/leaf.ts", 42)]);
+
+    const { unmount } = renderTree({ files: [dir("src")], conversationId });
+    fireEvent.click(screen.getByRole("button", { name: "src/" }));
+    fireEvent.click(await screen.findByRole("button", { name: "deep/" }));
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+
+    // Restore: remount the same conversation. Expansion comes back from the
+    // cache with no clicks; the deep level must fetch and render on its own.
+    unmount();
+    renderTree({ files: [dir("src")], conversationId });
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree default expansion on conversation switch", () => {
+  const baseProps = {
+    isLoading: false,
+    isError: false,
+    error: null,
+    onFileSelect: vi.fn(),
+    showHidden: false,
+    changedFiles: undefined,
+    sort: "alpha" as const,
+  };
+
+  it("seeds a switched-to conversation's expansion from its own files, not the previous one's", () => {
+    // Regression guard: FolderTree isn't keyed by conversation, so a switch
+    // re-renders the same instance and a layout effect seeds the new
+    // conversation's default-expansion cache. The All-files query intentionally
+    // drops cross-key placeholderData, so on a real switch `files` goes
+    // undefined before the new conversation's list arrives — the effect must
+    // early-return on that undefined frame and then seed defaults from the NEW
+    // conversation's files. (A cross-key placeholder would instead leave the
+    // previous conversation's files on screen under the new key, seeding it
+    // with the wrong auto-expanded folders for the rest of the session.)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = (conversationId: string, files: WorkspaceFile[] | undefined) => (
+      <QueryClientProvider client={client}>
+        <FolderTree {...baseProps} conversationId={conversationId} files={files} />
+      </QueryClientProvider>
+    );
+
+    // Conversation A: a nested file makes its intermediate dir auto-expand.
+    const { rerender } = render(view("conv_A", [file("alpha/a.ts")]));
+    expect(screen.getByText("a.ts")).toBeInTheDocument();
+
+    // Switch to B: with no cross-key placeholder the files blank to undefined
+    // first, then B's real files arrive.
+    rerender(view("conv_B", undefined));
+    rerender(view("conv_B", [file("beta/b.ts")]));
+
+    // B auto-expands its OWN nested dir; A's folder is gone entirely.
+    expect(screen.getByText("b.ts")).toBeInTheDocument();
+    expect(screen.queryByText("a.ts")).toBeNull();
+    expect(screen.getByRole("button", { name: "beta/" })).toHaveAttribute("aria-expanded", "true");
   });
 });

@@ -38,19 +38,35 @@ function settingsMenuItem(openSettings) {
 }
 
 /**
- * Add Settings to the conventional macOS application menu.
+ * Build the custom About item that opens the shell-owned About window.
  *
- * @param {string} appName
- * @param {Electron.MenuItemConstructorOptions} item
+ * @param {string} productName
+ * @param {() => void} openAbout
  * @returns {Electron.MenuItemConstructorOptions}
  */
-function macApplicationMenu(appName, item) {
+function aboutMenuItem(productName, openAbout) {
+  return {
+    id: "open_about",
+    label: `About ${productName}`,
+    click: openAbout,
+  };
+}
+
+/**
+ * Add About and Settings to the conventional macOS application menu.
+ *
+ * @param {string} appName
+ * @param {Electron.MenuItemConstructorOptions} aboutItem
+ * @param {Electron.MenuItemConstructorOptions} settingsItem
+ * @returns {Electron.MenuItemConstructorOptions}
+ */
+function macApplicationMenu(appName, aboutItem, settingsItem) {
   return {
     label: appName,
     submenu: [
-      { role: "about" },
+      aboutItem,
       { type: "separator" },
-      item,
+      settingsItem,
       { type: "separator" },
       { role: "services" },
       { type: "separator" },
@@ -67,6 +83,7 @@ module.exports = {
   SETTINGS_ACCELERATOR,
   SETTINGS_PATH,
   focusedConnectedWindow,
+  aboutMenuItem,
   macApplicationMenu,
   settingsMenuItem,
 };
