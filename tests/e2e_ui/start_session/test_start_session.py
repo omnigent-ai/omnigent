@@ -1426,10 +1426,12 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
             # NewChat mounts with cached Mac-only data and completes another
             # Mac-only request. Neither snapshot may silently replace the saved
             # VM with the local default.
-            requests_before_open = route_state["requests"]
-            await page.get_by_test_id("new-chat-button").click()
+            async with page.expect_response(
+                lambda response: response.url.endswith("/v1/hosts")
+            ) as landing_hosts:
+                await page.get_by_test_id("new-chat-button").click()
+            await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await _wait_until(lambda: route_state["requests"] > requests_before_open)
             await expect(chip).to_have_attribute("aria-label", re.compile("Choose host"))
 
             # A later host refresh reports the continuously preferred VM again.
