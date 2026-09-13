@@ -53,7 +53,8 @@ llm:
                               #   anthropic/claude-opus-4-6,
                               #   google/gemini-2.5-pro
   max_completion_tokens: 4096 # optional; caps total output including reasoning tokens
-  reasoning_effort: medium    # optional; low | medium | high
+  reasoning_effort: medium    # optional; low | medium | high | xhigh
+                              # back-compat alias — prefer executor.reasoning_effort
 
 interaction:
   conversational: true        # maintain history across turns (default: true)

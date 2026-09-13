@@ -76,7 +76,7 @@ def main() -> None:
     }
 
     try:
-        from omnigent.native_policy_hook import (
+        from omnigent.native.native_policy_hook import (
             _RELAY_TOKEN_ENV,
             _RELAY_URL_ENV,
             policy_hook_reauth,

@@ -174,6 +174,27 @@ def test_allowlisted_dotdir_is_not_masked(tmp_path: Path) -> None:
     assert _entry_for(entries, venv) is None
 
 
+def test_wildcard_allows_created_dotpaths_but_still_masks_escape(
+    tmp_path: Path,
+) -> None:
+    """Trusted roots can preserve arbitrary dotpaths across helper calls."""
+    tools = tmp_path / ".otto-tools"
+    tools.mkdir()
+    nested = tools / "npm-global"
+    nested.mkdir()
+    secret = tmp_path / ".future-agent-cache"
+    secret.write_text("created during a prior helper invocation")
+    escaping = tmp_path / ".outward-link"
+    escaping.symlink_to("/etc/shadow")
+
+    entries = _scan(tmp_path, allow_hidden=["*"])
+
+    assert _entry_for(entries, tools) is None
+    assert _entry_for(entries, nested) is None
+    assert _entry_for(entries, secret) is None
+    assert _entry_for(entries, escaping) is not None
+
+
 def test_regular_file_is_not_masked(tmp_path: Path) -> None:
     """
     Non-dotfile content is never returned by the walker — the

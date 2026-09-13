@@ -9,10 +9,10 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    ("skip_web_ui", "expected_pnpm_calls", "expected_build_hook_setting"),
+    ("skip_web_ui", "expected_pnpm_calls", "expected_uv_calls", "expected_build_hook_setting"),
     [
-        (False, 2, "<unset>"),
-        (True, 0, "true"),
+        (False, 2, 3, "<unset>"),
+        (True, 0, 3, "true"),
     ],
 )
 def test_build_script_propagates_api_only_mode_to_wheel_builds(
@@ -20,6 +20,7 @@ def test_build_script_propagates_api_only_mode_to_wheel_builds(
     *,
     skip_web_ui: bool,
     expected_pnpm_calls: int,
+    expected_uv_calls: int,
     expected_build_hook_setting: str,
 ) -> None:
     repo = tmp_path / "repo"
@@ -64,7 +65,7 @@ def test_build_script_propagates_api_only_mode_to_wheel_builds(
     commands = command_log.read_text().splitlines()
     assert sum(command.startswith("pnpm|") for command in commands) == expected_pnpm_calls
     uv_commands = [command for command in commands if command.startswith("uv|")]
-    assert len(uv_commands) == 3
+    assert len(uv_commands) == expected_uv_calls
     assert all(command.split("|", 2)[1] == expected_build_hook_setting for command in uv_commands)
 
 

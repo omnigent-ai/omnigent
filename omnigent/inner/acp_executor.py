@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
@@ -423,6 +424,9 @@ class AcpExecutor(Executor):
             env=env,
             cwd=self._cwd,
             limit=_STREAM_LIMIT,
+            # Own session/group: the sandbox launcher forks the real agent,
+            # and without a group boundary teardown reaches only the wrapper.
+            **_proc.spawn_kwargs(),
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -727,6 +731,12 @@ class AcpExecutor(Executor):
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = session_id
+        # Capture the agent's advertised model from session/new's config options, so a
+        # turn's usage can name it. Agents that report the model here (e.g. jcode) would
+        # otherwise leave it unknown until a later config_option_update, leaving the
+        # server unable to attribute per-model token usage for the turn.
+        if isinstance(result, dict):
+            self._note_config_options(result.get("configOptions"))
         return self._session_id
 
     def _session_mcp_servers(self) -> list[_AcpJsonObject]:
@@ -1183,14 +1193,15 @@ class AcpExecutor(Executor):
         return self._context_window
 
     @staticmethod
-    def _usage_from_result(result: _AcpJsonObject) -> dict[str, int] | None:
+    def _usage_from_result(result: _AcpJsonObject) -> dict[str, Any] | None:
         """Map an agent's final ``result.usage`` to Omnigent's usage keys.
 
-        ACP does not standardize usage, but agents that report it (Goose, Devin)
-        use ``{totalTokens, inputTokens, outputTokens}`` plus an optional
-        ``cachedReadTokens``; Omnigent's ``TurnComplete.usage`` uses
-        ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens}``.
-        Absent → ``None`` (usage simply isn't shown for agents that don't report).
+        ACP does not standardize usage, but agents that report it (Goose, Devin,
+        jcode) use ``{totalTokens, inputTokens, outputTokens}`` plus optional
+        ``cachedReadTokens`` / ``cachedWriteTokens``; Omnigent's ``TurnComplete.usage``
+        uses ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens,
+        cache_creation_input_tokens}``. Absent → ``None`` (usage simply isn't shown for
+        agents that don't report).
 
         ``cachedReadTokens`` is kept as its own key rather than folded into
         ``input_tokens``: cache reads are real consumption but billed at a
@@ -1202,17 +1213,37 @@ class AcpExecutor(Executor):
         usage = result.get("usage")
         if not isinstance(usage, dict):
             return None
-        out: dict[str, int] = {}
+        out: dict[str, Any] = {}
         for acp_key, omni_key in (
             ("inputTokens", "input_tokens"),
             ("outputTokens", "output_tokens"),
             ("totalTokens", "total_tokens"),
             ("cachedReadTokens", "cache_read_input_tokens"),
+            ("cachedWriteTokens", "cache_creation_input_tokens"),
         ):
             value = usage.get(acp_key)
             if isinstance(value, int) and not isinstance(value, bool):
                 out[omni_key] = value
         return out or None
+
+    def _usage_with_active_model(self, result: _AcpJsonObject) -> dict[str, Any] | None:
+        """Usage from the result, tagged with the active model for cost attribution.
+
+        ACP ``result.usage`` carries token counts but no model id, so the server
+        cannot attribute a turn's tokens to a model — leaving its per-model usage
+        view (``usage_by_model``) empty and the counts unrendered in the UI. Stamp
+        the agent's active model (its ``model`` config option, captured at
+        ``session/new``) so the tokens are attributed, mirroring how codex stamps
+        ``usage["model"]``. The stamp is skipped when the model is unknown or the
+        agent already reported one on the result.
+
+        :param result: The ACP ``session/prompt`` result object.
+        :returns: The usage dict (with ``model`` when known), or ``None``.
+        """
+        usage = self._usage_from_result(result)
+        if usage is not None and self._active_model and "model" not in usage:
+            usage["model"] = self._active_model
+        return usage
 
     def _is_bridge_tool_call(self, name: str, update: _AcpJsonObject) -> bool:
         """True when this tool call reaches Omnigent through the MCP bridge.
@@ -1589,9 +1620,7 @@ class AcpExecutor(Executor):
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_from_result(result) if isinstance(result, dict) else None
-                if self._active_model:
-                    usage = {**(usage or {}), "model": self._active_model}
+                usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
@@ -1668,10 +1697,12 @@ class AcpExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]
             try:
-                self._proc.terminate()
+                # Tree-aware: the handle is the sandbox launcher, not the
+                # agent it forked. A bare terminate() orphans the agent.
+                _proc.terminate_tree(self._proc)
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(Exception):
-                    self._proc.kill()
+                    _proc.kill_tree(self._proc)
             finally:
                 self._proc = None

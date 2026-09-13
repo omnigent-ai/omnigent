@@ -18,11 +18,13 @@ import asyncio
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
@@ -389,6 +391,71 @@ def test_usage_omits_absent_and_non_integer_fields() -> None:
     assert AcpExecutor._usage_from_result({"usage": {"inputTokens": True}}) is None
     assert AcpExecutor._usage_from_result({"usage": {"totalTokens": "nope"}}) is None
     assert AcpExecutor._usage_from_result({}) is None
+
+
+def test_usage_maps_cached_writes_to_the_canonical_key() -> None:
+    """``cachedWriteTokens`` surfaces as ``cache_creation_input_tokens``.
+
+    Agents that report cache-creation tokens (e.g. jcode against a Databricks
+    gateway) had them silently dropped before, understating cost — cache writes
+    bill at ~1.25x the input rate.
+    """
+    usage = AcpExecutor._usage_from_result(
+        {
+            "usage": {
+                "inputTokens": 6216,
+                "outputTokens": 5,
+                "totalTokens": 6221,
+                "cachedReadTokens": 0,
+                "cachedWriteTokens": 128,
+            }
+        }
+    )
+    assert usage == {
+        "input_tokens": 6216,
+        "output_tokens": 5,
+        "total_tokens": 6221,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 128,
+    }
+
+
+def test_usage_with_active_model_tags_the_model() -> None:
+    """A turn's usage is stamped with the agent's active model.
+
+    ACP ``result.usage`` carries token counts but no model id, so the server
+    cannot attribute the tokens to a model — leaving its per-model usage view
+    (``usage_by_model``) empty and the UI showing no token counts for the ACP
+    (jcode / Devin / Grok) session. The active model comes from the agent's
+    ``model`` config option, captured at ``session/new``.
+
+    **What breaks if this fails**: token counts never render for any ACP harness.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._active_model = "system.ai.claude-haiku-4-5"
+    usage = ex._usage_with_active_model(
+        {"usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}}
+    )
+    assert usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "model": "system.ai.claude-haiku-4-5",
+    }
+
+
+def test_usage_with_active_model_skips_stamp_when_model_unknown() -> None:
+    """No active model → no ``model`` key (attribution simply stays absent)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._active_model is None
+    assert ex._usage_with_active_model({"usage": {"totalTokens": 15}}) == {"total_tokens": 15}
+
+
+def test_usage_with_active_model_is_none_when_no_usage_reported() -> None:
+    """No usage on the result → ``None`` (never a model-only dict)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._active_model = "system.ai.claude-haiku-4-5"
+    assert ex._usage_with_active_model({}) is None
 
 
 def test_in_progress_tool_update_emits_nothing() -> None:
@@ -1133,6 +1200,38 @@ def test_config_option_update_records_options_and_active_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_new_captures_advertised_model() -> None:
+    """A model advertised in ``session/new``'s config options sets ``_active_model``.
+
+    jcode (and others) report their model in the ``session/new`` result rather than
+    a later ``config_option_update``; capturing it at session creation is what lets
+    a turn's usage name the model, so the server can attribute per-model tokens.
+
+    **What breaks if this fails**: an ACP agent that only advertises its model in
+    ``session/new`` records no model → token counts don't render for the session.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+
+    async def fake_rpc(method: str, params: dict, timeout: float | None = None) -> dict:
+        return {
+            "result": {
+                "sessionId": "s1",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "system.ai.claude-haiku-4-5",
+                        "options": [{"value": "system.ai.claude-haiku-4-5"}],
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    assert await ex._ensure_session() == "s1"
+    assert ex._active_model == "system.ai.claude-haiku-4-5"
+
+
+@pytest.mark.asyncio
 async def test_model_override_switches_warm_via_set_config_option() -> None:
     """
     A new model is applied with ``session/set_config_option`` using ``configId``.
@@ -1545,7 +1644,7 @@ async def test_mcp_relay_starts_and_builds_serve_mcp_entry() -> None:
         entry = servers[0]
         assert entry["name"] == "omnigent"
         assert "serve-mcp" in entry["args"]
-        assert "omnigent.claude_native_bridge" in entry["args"]
+        assert "omnigent.harnesses.claude_native.bridge" in entry["args"]
         assert all("name" in e and "value" in e for e in entry["env"])
         # Idempotent: a second call returns the cached relay, not a new one.
         assert m.session_new_servers(tools=[], tool_executor=fake_exec, loop=loop) is servers
@@ -1919,3 +2018,69 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+# ---------------------------------------------------------------------------
+# Process lifecycle: a torn-down executor must not strand the agent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_spawned_agent_leads_its_own_process_group(tmp_path: Path) -> None:
+    """The spawned agent is a session/group leader, not in the harness's group.
+
+    Without the boundary ``_proc._killpg`` resolves the target group to the one
+    we share with the harness and daemon, refuses to signal it, and tree-aware
+    teardown silently degrades to a per-descendant walk.
+    """
+    agent_path = tmp_path / "sleepy_agent.py"
+    agent_path.write_text("import time\ntime.sleep(300)\n")
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Sleepy")
+    )
+
+    await ex._start_process()
+    try:
+        pid = ex._proc.pid  # type: ignore[union-attr]
+        assert os.getpgid(pid) == pid, "agent must lead its own process group"
+        assert os.getpgid(pid) != os.getpgid(0), "agent must not share our group"
+    finally:
+        await ex.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
+    """``close()`` stops the agent's descendants, not just the handle it holds.
+
+    Under a sandbox the handle is the seatbelt ``run_launcher`` wrapper, which
+    forks the real agent; a single-pid ``terminate()`` reached the wrapper and
+    left the agent running for the daemon's whole lifetime.
+    """
+    pid_file = tmp_path / "grandchild.pid"
+    agent_path = tmp_path / "forking_agent.py"
+    agent_path.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(kid.pid))\n"
+        "time.sleep(300)\n"
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Forking")
+    )
+
+    await ex._start_process()
+    deadline = time.monotonic() + 10.0
+    while not pid_file.exists():
+        assert time.monotonic() < deadline, "the fake agent never forked its child"
+        await asyncio.sleep(0.05)
+    grandchild = int(pid_file.read_text())
+    assert _proc.process_alive(grandchild)
+
+    await ex.close()
+
+    deadline = time.monotonic() + 10.0
+    while _proc.process_alive(grandchild):
+        assert time.monotonic() < deadline, f"agent child {grandchild} survived close()"
+        await asyncio.sleep(0.05)
