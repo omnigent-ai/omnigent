@@ -99,7 +99,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, shouldQueueSend } from "./ChatPage";
+import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
 import type { QueuedMessage } from "@/store/chatStore";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -2246,6 +2246,28 @@ describe("Composer pending elicitation", () => {
     // the lock test above left a per-session draft behind for "conv_test".
     useChatStore.setState({ conversationId: "conv_interrupt", blocks: [elicitationBlock()] });
     render(<Composer {...composerProps({ isWorking: true, status: "streaming" })} />);
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+  });
+
+  it("keeps Interrupt available and preserves a draft typed during a pending elicitation", () => {
+    useChatStore.setState({ conversationId: "conv_interrupt_draft", blocks: [elicitationBlock()] });
+    const onStop = vi.fn();
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ isWorking: true, onStop, onSend })} />);
+
+    fireEvent.change(textarea(), { target: { value: "keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+
+    expect(onStop).toHaveBeenCalledTimes(1);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("keep this draft");
+  });
+
+  it("keeps ChatPage's waiting elicitation interruptible", () => {
+    // A pending request blocks sending but keeps the waiting turn interruptible.
+    useChatStore.setState({ conversationId: "conv_wiring", blocks: [elicitationBlock()] });
+    const isWorking = computeIsWorking("waiting");
+    render(<Composer {...composerProps({ isWorking, status: "streaming" })} />);
     expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
   });
 
