@@ -3012,6 +3012,15 @@ export function NewChatLandingScreen() {
         ...(selectedNativeHarness === "pi-native"
           ? [{ label: "Thinking level", value: thinkingLevelValue }]
           : []),
+        ...(supportsAgySkipPermissions
+          ? [
+              {
+                label: "Permissions",
+                value:
+                  AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode,
+              },
+            ]
+          : []),
         ...sourceRows(modelOptions),
       ];
     }
@@ -3086,11 +3095,6 @@ export function NewChatLandingScreen() {
       const modeValue =
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
       return [{ label: "Mode", value: modeValue }, ...routingRow];
-    }
-    if (supportsAgySkipPermissions) {
-      const skipValue =
-        AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
-      return [{ label: "Permissions", value: skipValue }, ...routingRow];
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;

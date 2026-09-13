@@ -59,7 +59,7 @@ import {
   onHostStatusChanged,
 } from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
-import { readHarnessOptions } from "@/lib/modePreferences";
+import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -3272,6 +3272,45 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("claude-sonnet-4-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "antigravity-native", true);
+  });
+
+  it("restores Antigravity permissions alongside models and clears remembered skip", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockAgents([
+      {
+        id: "a_agy",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
+        skills: [],
+      },
+    ]);
+    writeHarnessOption("antigravity-native", { mode: "skip" });
+    renderLanding();
+
+    const permissions = screen.getByTestId("new-chat-landing-permission-chip");
+    expect(permissions).toBeVisible();
+    expect(permissions).toHaveAccessibleName("Permissions: Skip permissions");
+    openAgentModels("a_agy");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    pickPrimaryOption("model", "Claude Sonnet 4.6");
+    closePrimaryPicker();
+    expect(permissions).toHaveAccessibleName("Permissions: Skip permissions");
+
+    pickPermissionOption("default");
+    expect(permissions).toHaveAccessibleName("Permissions: Ask every time");
+    expect(readHarnessOptions("antigravity-native").mode).toBe("default");
+    remountLanding();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permissions: Ask every time",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("claude-sonnet-4-6");
+    expect(body.terminal_launch_args).toBeUndefined();
   });
 
   it("leaves Antigravity on its harness default until the user picks a model", async () => {
