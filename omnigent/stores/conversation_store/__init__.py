@@ -643,7 +643,9 @@ class ConversationStore(ABC):
     ) -> list[ConversationItem]:
         """
         Append items to a conversation. Assigns a globally unique
-        ID and timestamp to each item.
+        ID and timestamp to each item. An item carrying its own
+        ``created_at`` (imported history) keeps that time instead of
+        the append time.
 
         An item carrying ``stable_id`` appends idempotently: its id is the
         stable id, and when an item with that id already exists the stored
@@ -1541,6 +1543,35 @@ class ConversationStore(ABC):
         :raises ValueError: If
             ``conversation.external_session_id`` is already set
             to a different value.
+        """
+        ...
+
+    @abstractmethod
+    def set_conversation_timestamps(
+        self,
+        conversation_id: str,
+        *,
+        created_at: int,
+        updated_at: int,
+    ) -> Conversation:
+        """
+        Overwrite a conversation's created/updated times.
+
+        Session import uses this to stamp the source session's own
+        activity window (first/last source item time) instead of the
+        import run time, so imported history sorts by when the work
+        actually happened. Overwrites both columns unconditionally —
+        callers own the provenance decision.
+
+        :param conversation_id: Conversation to update, e.g.
+            ``"conv_abc123"``.
+        :param created_at: Unix epoch seconds for the first source
+            activity, e.g. ``1781514000``.
+        :param updated_at: Unix epoch seconds for the last source
+            activity, e.g. ``1784635800``.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If no conversation row
+            with ``conversation_id`` exists.
         """
         ...
 

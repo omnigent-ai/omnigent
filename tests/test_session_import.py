@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -399,6 +400,96 @@ def test_load_claude_session_normalizes_parent_transcript(tmp_path: Path) -> Non
     ]
     assert imported.items[1].data.model_dump()["call_id"] == "toolu_read_1"
     assert imported.items[3].data.model_dump()["agent"] == "claude-native-ui"
+
+
+def _iso_epoch(iso_timestamp: str) -> int:
+    """Unix seconds for an ISO-8601 transcript timestamp."""
+    return int(datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00")).timestamp())
+
+
+def test_load_claude_session_preserves_record_timestamps(tmp_path: Path) -> None:
+    """Each item keeps its record's own time; an untimed record maps to None."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    first_iso, last_iso = "2026-06-15T09:00:00.000Z", "2026-06-15T09:05:00.000Z"
+    records = [
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "cwd": "/repo",
+            "timestamp": first_iso,
+            "message": {"role": "user", "content": "inspect TODO.md"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "assistant-1",
+            "timestamp": last_iso,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        },
+        {
+            # A record with no timestamp falls back to the import time later.
+            "type": "user",
+            "uuid": "user-2",
+            "message": {"role": "user", "content": "thanks"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [
+        _iso_epoch(first_iso),
+        _iso_epoch(last_iso),
+        None,
+    ]
+
+
+def test_load_codex_session_preserves_record_timestamps(tmp_path: Path) -> None:
+    """Codex rollout lines' own wall-clock times ride into the items."""
+    session_id = "11111111-2222-4333-8444-555555555555"
+    rollout = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "15"
+        / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    first_iso, last_iso = "2026-07-15T12:00:00.000Z", "2026-07-15T12:10:00.000Z"
+    records = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
+        {
+            "type": "response_item",
+            "timestamp": first_iso,
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": last_iso,
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done."}],
+            },
+        },
+    ]
+    rollout.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [
+        _iso_epoch(first_iso),
+        _iso_epoch(last_iso),
+    ]
 
 
 def _write_claude_transcript_with_titles(

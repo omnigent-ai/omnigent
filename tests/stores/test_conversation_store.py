@@ -596,6 +596,75 @@ def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) 
     assert page.data[1].data.role == "assistant"
 
 
+def test_append_keeps_caller_supplied_created_at(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An item's own created_at (imported history) survives the append."""
+    conv = conversation_store.create_conversation()
+    source_at = 1_681_514_000  # far in the past, so an accidental now() stands out
+    items = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                created_at=source_at,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Hi"}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Hello!"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+    # The timestamped item keeps its source time; the bare one gets the
+    # append time as before.
+    assert items[0].created_at == source_at
+    assert items[1].created_at > source_at
+
+
+def test_set_conversation_timestamps_overwrites_activity_window(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The setter overrides both stamps, including a later append's bump."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Hi"}]),
+            )
+        ],
+    )
+
+    updated = conversation_store.set_conversation_timestamps(
+        conv.id, created_at=1_681_514_000, updated_at=1_681_517_600
+    )
+
+    assert updated.created_at == 1_681_514_000
+    assert updated.updated_at == 1_681_517_600
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert (fetched.created_at, fetched.updated_at) == (1_681_514_000, 1_681_517_600)
+
+
+def test_set_conversation_timestamps_missing_conversation_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An unknown conversation id is a loud error, not a silent no-op."""
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    with pytest.raises(ConversationNotFoundError):
+        conversation_store.set_conversation_timestamps("0" * 32, created_at=1, updated_at=2)
+
+
 def test_append_records_human_author_attribution(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

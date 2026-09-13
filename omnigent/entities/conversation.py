@@ -809,12 +809,16 @@ class NewConversationItem(BaseModel):
         item (e.g. ``"alice@example.com"``), or ``None`` for
         agent/tool/system-generated items and single-user mode.
         Mirrors the comment ``created_by`` contract.
+    :param created_at: Source-provided creation time (Unix seconds)
+        for items replayed from an existing transcript (session
+        import). ``None`` lets the store stamp the append time.
     """
 
     type: str
     response_id: str
     data: ItemData
     created_by: str | None = None
+    created_at: int | None = None
     # Deterministic item id for idempotent appends. When set, the store uses
     # it as the item's id and treats an already-persisted item with this id
     # as the append's result instead of inserting a duplicate — the retry

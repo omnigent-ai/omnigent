@@ -46,7 +46,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPException
@@ -597,6 +597,10 @@ class ClaudeTranscriptItem:
         source=compact`` completion signal follows; the forwarder uses this
         flag to dismiss the stranded "Compacting…" spinner. Never rendered
         as a bubble. Defaults to ``False``.
+    :param created_at: Unix time parsed from the source record's
+        ISO-8601 ``timestamp``, e.g. ``1779922393.245``. Session import
+        preserves it on the imported row. ``None`` when the record
+        carried no parseable timestamp.
     """
 
     source_id: str
@@ -605,6 +609,7 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    created_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2950,6 +2955,11 @@ def read_transcript_items_from_offset(
             settled_response_id=active_settled_id,
             include_sidechains=include_sidechains,
         )
+        # Stamp the record's own wall-clock time on its items so consumers
+        # (session import) can preserve when the work actually happened.
+        recorded_at = _transcript_timestamp(entry.get("timestamp"))
+        if recorded_at is not None:
+            parsed = [replace(item, created_at=recorded_at) for item in parsed]
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
         # the compact summary AND the resumed output must not parse the

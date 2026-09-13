@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -231,6 +232,90 @@ async def test_import_session_uses_native_title_when_supplied(
     )
     assert conversation is not None
     assert conversation.title == "My renamed thread"
+
+
+async def test_import_preserves_source_timestamps(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Imported rows keep the source record times, not the import run time."""
+    _seed_claude_agent(db_uri)
+    # A historical source window, far before any test run's wall clock.
+    first_at, last_at = 1_681_514_000, 1_681_517_600
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-timed-1",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "created_at": first_at,
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                },
+            },
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "created_at": last_at,
+                "data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                },
+            },
+        ],
+    }
+
+    created = await client.post("/v1/imports", json=payload)
+
+    assert created.status_code == 201
+    session_id = created.json()["session_id"]
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation is not None
+    # The session's activity window is the source's, so imported history
+    # sorts by when the work happened rather than when it was imported.
+    assert conversation.created_at == first_at
+    assert conversation.updated_at == last_at
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200
+    assert [item["created_at"] for item in items.json()["data"]] == [first_at, last_at]
+
+
+async def test_import_without_source_times_stamps_import_time(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Sources with no per-record time data keep the import-time fallback."""
+    _seed_claude_agent(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-untimed-1",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                },
+            }
+        ],
+    }
+    before = int(time.time())
+
+    created = await client.post("/v1/imports", json=payload)
+
+    assert created.status_code == 201
+    session_id = created.json()["session_id"]
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation is not None
+    assert conversation.created_at >= before
+    assert conversation.updated_at >= before
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200
+    assert all(item["created_at"] >= before for item in items.json()["data"])
 
 
 async def test_concurrent_identical_imports_return_one_session(
