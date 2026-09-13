@@ -166,8 +166,11 @@ function useCollapsedComposerLabels(
  *
  * The bar's height is fixed, so it is safe to resize-observe directly — the
  * collapse never changes the observed box, so there is no probe element and no
- * observer loop. Every measure probes the expanded layout first (labels shown),
- * so the verdict never feeds on its own collapsed widths.
+ * observer loop. That holds only while the bar is mounted in a width-constrained
+ * parent (it is, in both composers); a shrink-to-fit parent would let the
+ * collapse change the bar's width and re-fire the observer. Every measure probes
+ * the expanded layout first (labels shown), so the verdict never feeds on its
+ * own collapsed widths.
  */
 export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null>) {
   useLayoutEffect(() => {
