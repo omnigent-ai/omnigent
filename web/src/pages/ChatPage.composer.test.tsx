@@ -1308,6 +1308,26 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
+  it("shows the child snapshot model in the open harness modal", () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          subAgentLabel: "worker",
+          sessionModel: "gpt-5-6-luna",
+          showModels: true,
+          showEffort: false,
+          modelPickerKind: "codex",
+        })}
+      />,
+    );
+
+    openSessionConfig();
+
+    expect(
+      within(screen.getByTestId("composer-agent-edit")).getByText("gpt-5.6-luna"),
+    ).toBeVisible();
+  });
+
   it("shows Default reasoning for a child with no persisted override", () => {
     renderWithTooltips(
       <Composer
