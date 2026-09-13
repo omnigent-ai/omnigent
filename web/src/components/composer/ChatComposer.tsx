@@ -82,7 +82,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       ref={ref}
       data-composer-card
       className={cn(
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
         className,
       )}
       {...props}
@@ -252,7 +252,7 @@ export const ComposerTextarea = forwardRef<
     <textarea
       ref={ref}
       className={cn(
-        "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:select-text [&::-webkit-scrollbar]:hidden",
+        "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:min-h-[42px] md:select-text [&::-webkit-scrollbar]:hidden",
         className,
       )}
       {...props}

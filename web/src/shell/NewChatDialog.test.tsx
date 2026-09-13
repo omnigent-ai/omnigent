@@ -1635,8 +1635,9 @@ describe("NewChatLandingScreen", () => {
     } as unknown as ReturnType<typeof useHostWorktrees>);
     renderLanding();
 
-    // The empty composer rests at one row: no minimum taller than the draft.
+    // Mobile rests at one row; desktop retains the prototype's taller input.
     expect(screen.getByTestId("new-chat-landing-input")).not.toHaveClass("min-h-[42px]");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveClass("md:min-h-[42px]");
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
       "max-h-[180px]",
       "overflow-y-auto",
@@ -1692,6 +1693,7 @@ describe("NewChatLandingScreen", () => {
       "leading-4",
     );
     expect(composer).not.toHaveClass("min-h-[105px]");
+    expect(composer).toHaveClass("md:min-h-[105px]");
     expect(composer).toContainElement(actions);
     expect(actions).toHaveClass("justify-between", "gap-2", "px-2", "pt-1", "pb-2");
     expect(actions).not.toHaveClass("mt-2");
