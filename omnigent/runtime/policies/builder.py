@@ -344,8 +344,10 @@ def build_policy_engine(
     before any child-specific session policies. This ensures
     guardrails set on the parent session (e.g. via
     ``sys_add_policy``) also govern spawned sub-agents.
-    Policies with the same ``name`` on both root and child
-    are deduplicated (child wins).
+    Structurally identical root and child policies evaluate once
+    at the root policy's original position. Same-named policies
+    with different handlers or parameters both run, root first,
+    so a child cannot shadow or reorder an inherited guardrail.
 
     :param spec: The parsed agent spec.
     :param conversation_id: The conversation this workflow is
@@ -554,11 +556,10 @@ def build_policy_engine(
     # suggested root inherited another tree's guardrails.
     if root_conversation_id != conversation_id:
         root_policy_specs = _load_session_policy_specs(root_conversation_id, policy_store)
-        # Deduplicate: skip root policies already present on the child
-        # (keyed by policy name) to avoid double-evaluation.
-        child_names = {p.name for p in session_policy_specs}
-        root_policy_specs = [p for p in root_policy_specs if p.name not in child_names]
-        session_policy_specs = root_policy_specs + session_policy_specs
+        # Keep the root copy of an exact duplicate so attaching the same
+        # policy to a child cannot reorder the authoritative root pipeline.
+        child_policy_specs = [p for p in session_policy_specs if p not in root_policy_specs]
+        session_policy_specs = root_policy_specs + child_policy_specs
         all_policy_specs = (
             session_policy_specs
             + agent_policy_specs

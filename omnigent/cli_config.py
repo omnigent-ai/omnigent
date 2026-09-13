@@ -37,7 +37,7 @@ from omnigent.onboarding.ucode_setup import (
     find_ucode_command,
     model_gateway_workspace_urls,
 )
-from omnigent.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
+from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
@@ -158,7 +158,7 @@ def _tmux_dependency_problem() -> str | None:
 
     The native tmux-backed harnesses (``omnigent claude`` / ``codex`` and
     every managed terminal) need a tmux at or above
-    :data:`omnigent.tmux_compat.MIN_TMUX_VERSION`. Managed terminals enable
+    :data:`omnigent.util.tmux_compat.MIN_TMUX_VERSION`. Managed terminals enable
     ``allow-passthrough``, which tmux added in 3.3. Parses ``tmux -V`` (e.g.
     ``"tmux 3.3a"`` — suffix letters are ignored) and compares the
     ``(major, minor)`` pair against the floor.

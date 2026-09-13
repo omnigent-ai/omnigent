@@ -40,7 +40,7 @@ from omnigent.entities.session_resources import (
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
-    from omnigent.claude_native_status_file import SessionStatusPoller
+    from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
@@ -1382,11 +1382,11 @@ class SessionResourceRegistry:
             *blocked_on* names the dialog the agent is parked on, if any.
         :returns: A ``SessionStatusPoller`` the watcher drives per tick.
         """
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
         )
-        from omnigent.claude_native_status_file import SessionStatusPoller
+        from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
 

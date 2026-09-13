@@ -31,7 +31,7 @@ from omnigent.harness_plugins import (
     valid_harnesses,
 )
 from omnigent.inner.devin import DEVIN_ACP_EXTENSION
-from omnigent.model_override import (
+from omnigent.models.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
 )
@@ -115,7 +115,7 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
 
 def test_pi_harnesses_declare_the_pi_effort_family() -> None:
     """Both pi harnesses advertise pi's 7-level ladder, not "no effort knob"."""
-    from omnigent.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
+    from omnigent.util.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
 
     caps = harness_capabilities()
     for harness in ("pi", "pi-native"):
@@ -225,7 +225,7 @@ def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
     (via ``_SDK_MODEL_OVERRIDE_HARNESSES``) makes the server accept the override
     instead of rejecting it up front."""
     from omnigent.harness_plugins import model_env_keys
-    from omnigent.model_override import harness_supports_model_override
+    from omnigent.models.model_override import harness_supports_model_override
 
     assert model_env_keys()["hermes"] == "HARNESS_HERMES_MODEL"
     assert harness_supports_model_override("hermes")

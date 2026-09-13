@@ -562,6 +562,52 @@ describe("buildTree", () => {
     expect(tree.children[3].label).toBe("c4");
   });
 
+  it("prefers the server-resolved tool label over session_name for native sub-agent children", () => {
+    const map = new Map<string, ChildSessionInfo[]>();
+    map.set("root", [
+      // Claude Task child: session_name is the opaque correlation id; the
+      // server resolves the Task description into `tool`, which must win.
+      childInfo({
+        id: "c1",
+        title: "rpw-published:debug-lead:a09d1dd1d8dbc0151",
+        session_name: "a09d1dd1d8dbc0151",
+        tool: "Investigate flaky auth test",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+      // Same wrapper without a resolved `tool`: falls back to title, not
+      // the opaque session_name.
+      childInfo({
+        id: "c2",
+        title: "general-purpose:b7c2e9f4a1d3c5e60",
+        session_name: "b7c2e9f4a1d3c5e60",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+      // Codex native sub-agent children take the same path.
+      childInfo({
+        id: "c3",
+        title: "worker:thread-4",
+        session_name: "thread-4",
+        tool: "Summarize release notes",
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+      }),
+      // User-added rows keep the generic label path.
+      childInfo({
+        id: "c4",
+        title: "ui:claude:my-agent",
+        session_name: "my-agent",
+        tool: "should-not-win",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+    ]);
+
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+
+    expect(tree.children[0].label).toBe("Investigate flaky auth test");
+    expect(tree.children[1].label).toBe("general-purpose:b7c2e9f4a1d3c5e60");
+    expect(tree.children[2].label).toBe("Summarize release notes");
+    expect(tree.children[3].label).toBe("my-agent");
+  });
+
   it("passes through last_message_preview", () => {
     const map = new Map<string, ChildSessionInfo[]>();
     map.set("root", [

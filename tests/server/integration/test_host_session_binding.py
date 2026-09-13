@@ -667,7 +667,7 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     # The list-of-errors shape with a human-readable msg is what
     # describeCreateError picks the message from.
     assert isinstance(detail, list) and len(detail) == 1
-    assert "takes a git repository URL" in detail[0]["msg"]
+    assert "git repository URL" in detail[0]["msg"]
 
 
 async def test_managed_session_create_rejects_unconfigured_provider(
@@ -1730,7 +1730,7 @@ async def test_delete_reaped_managed_session_removes_durable_host(
         sandbox_id="sb-reaped-delete",
         expected_updated_at=host.updated_at,
     )
-    assert env.host_store.mark_terminating_sandbox_terminated(
+    assert env.host_store.mark_sandbox_terminated(
         host.host_id,
         sandbox_id="sb-reaped-delete",
     )

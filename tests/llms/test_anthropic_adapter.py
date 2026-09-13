@@ -19,7 +19,11 @@ from omnigent.llms.adapters.anthropic import (
     _translate_part_to_anthropic,
 )
 from omnigent.llms.errors import ContextWindowExceededError, PermanentLLMError
-from omnigent.model_metadata import ModelMetadata, ModelReasoningMetadata, ModelReasoningMode
+from omnigent.models.model_metadata import (
+    ModelMetadata,
+    ModelReasoningMetadata,
+    ModelReasoningMode,
+)
 from omnigent.runtime.llm_retry import classify_llm_error
 
 

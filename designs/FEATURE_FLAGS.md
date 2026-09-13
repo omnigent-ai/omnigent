@@ -27,6 +27,7 @@ lifecycle metadata.
 | --- | --- | --- | --- | --- |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
+| `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
 
 At the review release, each flag must be removed by making the feature
 unconditional, removing the feature, or moving a genuinely permanent operator

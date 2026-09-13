@@ -13,6 +13,7 @@ import {
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
+import { isTempConvId } from "@/lib/tempConversationId";
 import { useConversations } from "./useConversations";
 import { useSession } from "./useSession";
 
@@ -25,7 +26,9 @@ function sessionOwnerKey(sessionId: string) {
 }
 
 /** Fetch all permission grants for a session. */
-export function usePermissions(sessionId: string | null) {
+export function usePermissions(rawSessionId: string | null) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session.
+  const sessionId = isTempConvId(rawSessionId) ? null : rawSessionId;
   return useQuery({
     queryKey: permissionsKey(sessionId ?? ""),
     queryFn: () => listPermissions(sessionId!),

@@ -757,6 +757,24 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(ev.targetSessionId).toBe("conv_child_123");
   });
 
+  it.each([true, false, undefined, "true", 1])(
+    "requires an explicit boolean auto-mode capability, received %s",
+    (hint) => {
+      const out = parse("response.elicitation_request", {
+        type: "response.elicitation_request",
+        elicitation_id: "elicit_auto",
+        params: {
+          mode: "form",
+          message: "Claude wants to call **Bash**",
+          requestedSchema: {},
+          allow_auto_mode: hint,
+        },
+      });
+      expect(out).toHaveLength(1);
+      expect((out[0] as ElicitationRequest).allowAutoMode).toBe(hint === true);
+    },
+  );
+
   it("lifts the allow_all_edits hint for claude-native edit-tool prompts", () => {
     // The server stamps ``allow_all_edits`` on edit-tool
     // PermissionRequests so the card can offer "Accept & allow all

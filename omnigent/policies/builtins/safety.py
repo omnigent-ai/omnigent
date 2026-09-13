@@ -33,7 +33,7 @@ _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os
 NATIVE_WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 
 # Claude Code and Codex native tool names surfaced via the PreToolUse /
-# PostToolUse hook contract (see ``omnigent.native_policy_hook``).
+# PostToolUse hook contract (see ``omnigent.native.native_policy_hook``).
 # These bypass Omnigent' ``sys_os_*`` MCP tools and execute directly
 # inside the CLI subprocess.
 _NATIVE_OS_TOOLS = NATIVE_WRITE_TOOLS | {"Bash", "Read", "Glob", "Grep"}

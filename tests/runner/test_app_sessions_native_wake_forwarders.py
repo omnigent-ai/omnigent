@@ -11,11 +11,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-    codex_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
@@ -664,7 +662,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             raise
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _parking_forwarder,
     )
 
@@ -757,7 +755,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
@@ -855,6 +853,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         No-op thread preload.
@@ -1047,7 +1046,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "b7d2c1e0aa114b52b7c2f1d3e4a5b6c7"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
@@ -1137,6 +1136,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1210,7 +1210,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Log capture for the fallback warning.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "c8e3d2f1bb225c63c8d3a2e4f5b6c7d8"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
@@ -1319,6 +1319,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Refuse the resume the way codex's thread-store does for a bad rollout.

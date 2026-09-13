@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
+from omnigent.runner.identity import RUNNER_WORKSPACE_ENV_VAR
 
 # Env var the daemon sets to the inherited control-socket fd number.
 ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
@@ -335,6 +336,23 @@ def _run_harness_child(request: dict[str, Any]) -> None:
 
     _wire_child_stdio(os.environ.get(PROCESS_LOG_FILE_ENV_VAR))
 
+    # Match direct exec by running the harness in its session workspace.
+    workspace = os.environ.get(RUNNER_WORKSPACE_ENV_VAR)
+    if workspace:
+        try:
+            os.chdir(workspace)
+        except OSError as exc:
+            # The workspace may disappear after launch; keep the stable zygote cwd.
+            sys.stderr.write(
+                f"zygote harness fork: cannot chdir to workspace {workspace!r}: {exc}\n"
+            )
+            sys.stderr.flush()
+    else:
+        sys.stderr.write(
+            "zygote harness fork: no workspace in payload env; staying in zygote cwd\n"
+        )
+        sys.stderr.flush()
+
     # Test seam: a sleep seam keeps the harness genuinely alive (crash-recovery
     # tests); the exit seam echoes argv so a test can assert the payload
     # round-tripped. Never set in production.
@@ -347,6 +365,7 @@ def _run_harness_child(request: dict[str, Any]) -> None:
     test_exit = os.environ.get(_ZYGOTE_TEST_CHILD_EXIT_ENV_VAR)
     if test_exit is not None:
         sys.stdout.write(f"harness_argv={' '.join(request.get('argv') or [])}\n")
+        sys.stdout.write(f"harness_cwd={os.getcwd()}\n")
         sys.stdout.flush()
         os._exit(int(test_exit))
 

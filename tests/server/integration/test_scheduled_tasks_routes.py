@@ -16,7 +16,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
@@ -431,7 +431,7 @@ async def test_update_switches_the_bound_agent(
     An existing automation must be switchable in place — the alternative is
     recreating it, which loses the task id and its run history.
     """
-    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
     created = (
@@ -464,7 +464,7 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
     so carrying them onto a codex task would break the fire with an unknown
     ``--permission-mode`` / a model its CLI has never heard of.
     """
-    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
     created = (
@@ -506,7 +506,7 @@ async def test_update_agent_switch_revalidates_workspace_against_the_new_agent(
     boundary check runs against — asserting a 200 alone would pass even if the
     route kept checking the old agent.
     """
-    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
     created = (
@@ -541,7 +541,7 @@ async def test_update_agent_switch_keeps_settings_resent_in_the_same_patch(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     """Settings sent alongside a switch are kept and gated on the NEW agent."""
-    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
     created = (
@@ -568,7 +568,7 @@ async def test_update_agent_switch_gates_permission_mode_on_the_new_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     """A Claude-only mode sent with a switch to codex is rejected, not persisted."""
-    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
     created = (
@@ -631,7 +631,7 @@ async def test_create_rejects_permission_mode_for_non_claude_agent(
     itself is a valid Claude mode — the rejection is purely about the agent's
     harness.
     """
-    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
     resp = await auth_client.post(

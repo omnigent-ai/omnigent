@@ -42,6 +42,7 @@ from omnigent.onboarding.sandboxes.registry import (
 )
 from omnigent.onboarding.sandboxes.types import (
     HostContext,
+    RepoWorkspace,
     SandboxCapabilities,
     SandboxCommandError,
     SandboxConfigError,
@@ -57,6 +58,7 @@ __all__ = [
     "HostContext",
     "RemoteCommandResult",
     "RemoteProcess",
+    "RepoWorkspace",
     "SandboxCapabilities",
     "SandboxCapabilityError",
     "SandboxCommandError",

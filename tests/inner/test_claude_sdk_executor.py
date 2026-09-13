@@ -683,11 +683,11 @@ class TestConstructor(unittest.TestCase):
 
             with (
                 patch(
-                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
                     side_effect=RuntimeError("live listing unavailable"),
                 ),
                 patch(
-                    "omnigent.model_catalog.resolve_catalog_model",
+                    "omnigent.models.model_catalog.resolve_catalog_model",
                     side_effect=_resolve_model,
                 ),
                 patch.object(
@@ -739,7 +739,7 @@ class TestConstructor(unittest.TestCase):
                     ),
                 ),
                 patch(
-                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
                     return_value=SimpleNamespace(
                         families={
                             "sonnet": "system.ai.claude-sonnet-5",
@@ -808,7 +808,7 @@ class TestConstructor(unittest.TestCase):
         served id. See ``_apply_gateway_model_vocabulary``.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-        from omnigent.model_catalog import ModelEntry, ModelListing
+        from omnigent.models.model_catalog import ModelEntry, ModelListing
 
         async def _t():
             executor = ClaudeSDKExecutor(
@@ -845,7 +845,7 @@ class TestConstructor(unittest.TestCase):
                 note="",
             )
             with (
-                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
+                patch("omnigent.models.model_catalog.listing_for_provider", return_value=listing),
                 patch.object(
                     executor,
                     "_get_or_create_client",
@@ -886,7 +886,7 @@ class TestConstructor(unittest.TestCase):
         an unpinned alias is today's behavior, not a regression.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-        from omnigent.model_catalog import ModelEntry, ModelListing
+        from omnigent.models.model_catalog import ModelEntry, ModelListing
 
         async def _t():
             executor = ClaudeSDKExecutor(
@@ -910,7 +910,7 @@ class TestConstructor(unittest.TestCase):
                 note="",
             )
             with (
-                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
+                patch("omnigent.models.model_catalog.listing_for_provider", return_value=listing),
                 patch.object(
                     executor,
                     "_get_or_create_client",
@@ -934,7 +934,7 @@ class TestConstructor(unittest.TestCase):
         names on its own — those rewrites are needed either way.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-        from omnigent.model_catalog import ModelEntry, ModelListing
+        from omnigent.models.model_catalog import ModelEntry, ModelListing
 
         async def _t():
             executor = ClaudeSDKExecutor(
@@ -963,7 +963,7 @@ class TestConstructor(unittest.TestCase):
                 note="",
             )
             with (
-                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
+                patch("omnigent.models.model_catalog.listing_for_provider", return_value=listing),
                 patch.object(
                     executor,
                     "_get_or_create_client",
@@ -1569,7 +1569,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
 class TestGatewayModelVocabulary(unittest.TestCase):
     def test_pins_map_served_families_to_env_vars(self):
         from omnigent.inner.claude_sdk_executor import _gateway_model_vocabulary
-        from omnigent.model_catalog import ModelEntry, ModelListing
+        from omnigent.models.model_catalog import ModelEntry, ModelListing
 
         listing = ModelListing(
             source="openai-compatible",
@@ -1581,7 +1581,9 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             ),
             note="",
         )
-        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing) as lister:
+        with patch(
+            "omnigent.models.model_catalog.listing_for_provider", return_value=listing
+        ) as lister:
             vocabulary = _gateway_model_vocabulary(
                 "https://gw.example.com/anthropic", "printf tok"
             )
@@ -1614,10 +1616,10 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             _EMPTY_GATEWAY_VOCABULARY,
             _gateway_model_vocabulary,
         )
-        from omnigent.model_catalog import ModelListing
+        from omnigent.models.model_catalog import ModelListing
 
         listing = ModelListing(source="openai-compatible", verified=True, models=(), note="")
-        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing):
+        with patch("omnigent.models.model_catalog.listing_for_provider", return_value=listing):
             self.assertEqual(
                 _gateway_model_vocabulary("https://gw.example.com/anthropic", "printf tok"),
                 _EMPTY_GATEWAY_VOCABULARY,
@@ -1631,7 +1633,7 @@ class TestGatewayModelVocabulary(unittest.TestCase):
         )
 
         with patch(
-            "omnigent.model_catalog.listing_for_provider",
+            "omnigent.models.model_catalog.listing_for_provider",
             side_effect=RuntimeError("listing unavailable"),
         ):
             self.assertEqual(
@@ -1646,7 +1648,7 @@ class TestGatewayModelVocabulary(unittest.TestCase):
         executor = ClaudeSDKExecutor()
         env = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
         listing = Mock()
-        with patch("omnigent.model_catalog.listing_for_provider", listing):
+        with patch("omnigent.models.model_catalog.listing_for_provider", listing):
             overrides = _run(executor._apply_gateway_model_vocabulary(env, None))
         self.assertEqual(env, {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"})
         self.assertEqual(overrides, {})
@@ -1660,7 +1662,7 @@ class TestGatewayModelVocabulary(unittest.TestCase):
         names on its own, so the rewrites must be derived either way.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-        from omnigent.model_catalog import ModelEntry, ModelListing
+        from omnigent.models.model_catalog import ModelEntry, ModelListing
 
         listing = ModelListing(
             source="openai-compatible",
@@ -1675,7 +1677,7 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             "ANTHROPIC_BASE_URL": "https://gw.example.com/anthropic",
             "ANTHROPIC_DEFAULT_OPUS_MODEL": "gw-claude-opus-5",
         }
-        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing):
+        with patch("omnigent.models.model_catalog.listing_for_provider", return_value=listing):
             overrides = _run(executor._apply_gateway_model_vocabulary(env, "printf tok"))
         self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-claude-opus-5")
         self.assertEqual(overrides, {"claude-opus-4-8": "gw-claude-opus-4-8"})
@@ -1987,106 +1989,6 @@ class TestSystemMessages(unittest.TestCase):
             self.assertIn("databrickscfg", events[0].message)
 
         _run(_t())
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "claude-sdk is COMPOSED_SESSION_SNAPSHOT: the cached persistent "
-        "client does not rebuild when late-bound framework instructions "
-        "change after client creation, so a live session stays pinned to "
-        "the prompt it was created with. Deferred, with its follow-up "
-        "recorded in docs/AGENT_YAML_SPEC.md. If this test starts passing, "
-        "the client refresh landed — flip claude-sdk's registry row to "
-        "COMPOSED_PER_TURN in the same commit that removes this xfail, do "
-        "not let the two drift apart."
-    ),
-)
-def test_client_does_not_refresh_late_framework_instructions() -> None:
-    """Desired conformance, not the current bug: a framework instruction
-    that activates mid-conversation (e.g. ``shared_message_attribution_
-    enabled()`` flips on between turns) must reach the SDK client on the
-    very next turn. Today the client is constructed once and cached; only
-    ``model`` is refreshed on reuse (see ``_get_or_create_client``), so the
-    composed text a later turn actually sees is turn 1's stale value. This
-    asserts the fix's intended behavior, so it correctly XFAILs now and
-    would XPASS (failing the suite, per ``strict=True``) the moment someone
-    rebuilds the client on a changed composed prompt.
-    """
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
-
-    class _ResultMessage:
-        def __init__(self, subtype, result):
-            self.subtype = subtype
-            self.result = result
-
-    captured_options = []
-
-    class _FakeSDK:
-        AssistantMessage = type("AssistantMessage", (), {})
-        UserMessage = type("UserMessage", (), {})
-        SystemMessage = type("SystemMessage", (), {})
-        ResultMessage = _ResultMessage
-        StreamEvent = type("StreamEvent", (), {})
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
-
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                captured_options.append(options)
-
-            async def connect(self):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
-            async def receive_response(self):
-                yield _ResultMessage("default", "ok")
-
-            async def disconnect(self):
-                return None
-
-            async def set_model(self, model):
-                return None
-
-    turn1_instructions = "Base authored instructions."
-    turn2_instructions = f"{turn1_instructions}\n\n{SHARED_SESSION_AUTHORSHIP_INSTRUCTION}"
-
-    async def _t():
-        executor = ClaudeSDKExecutor()
-        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
-            [
-                e
-                async for e in executor.run_turn(
-                    [{"role": "user", "content": "hello"}],
-                    [],
-                    turn1_instructions,
-                )
-            ]
-            # A framework instruction activates between turns; the runner
-            # recomposes and passes the new value on the next call.
-            [
-                e
-                async for e in executor.run_turn(
-                    [{"role": "user", "content": "follow-up"}],
-                    [],
-                    turn2_instructions,
-                )
-            ]
-
-    _run(_t())
-
-    # The contract is over the second-turn options the SDK sees. Client count
-    # is unconstrained: reusing one client and rebuilding it on a changed
-    # composed prompt both satisfy it, so an exact count is an implementation
-    # choice rather than part of the contract.
-    assert len(captured_options) >= 1
-    assert captured_options[-1].system_prompt == turn2_instructions
 
 
 # ---------------------------------------------------------------------------

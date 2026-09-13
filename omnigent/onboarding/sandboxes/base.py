@@ -34,8 +34,10 @@ from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKE
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
+
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
 DEFAULT_HOST_IMAGE: str = "ghcr.io/omnigent-ai/omnigent-host:latest"
@@ -806,8 +808,9 @@ class SandboxHostLauncher(SandboxLifecycle):
     Every managed-host provider — exec-model or entrypoint-as-host — implements
     this. :meth:`start_host` is abstract here; the exec-model default lives on
     :class:`ExecModelHostLauncher`. Entrypoint-as-host providers (e.g.
-    Kubernetes) inherit this class directly and override :meth:`start_host`
-    without needing any exec transport.
+    Kubernetes) and provider-native host launchers (e.g. Gensee) inherit this
+    class directly and override :meth:`start_host` without needing any exec
+    transport.
     """
 
     def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
@@ -823,9 +826,7 @@ class SandboxHostLauncher(SandboxLifecycle):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
@@ -838,16 +839,16 @@ class SandboxHostLauncher(SandboxLifecycle):
         :param host_name: Server-chosen host display name, e.g.
             ``"managed-a1b2c3d4"``.
         :param server_url: URL of this server the host dials back to.
-        :param repo_url: Repository clone URL, or ``None`` for an empty
-            workspace.
-        :param repo_branch: Branch to clone, or ``None`` for the default branch.
-        :param repo_name: Directory the clone lands in under the workspace, or
-            ``None`` when *repo_url* is ``None``.
+        :param repos: Repositories to clone into ``<workspace>/<repo_name>``
+            (empty for an empty workspace). The returned path is the single
+            clone directory when exactly one repo is cloned, else the
+            workspace root that parents them all.
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content installed into the sandbox's config BEFORE the host starts.
         :param on_stage: Progress observer invoked with ``"cloning"`` and
             ``"starting"``.
-        :returns: The absolute in-sandbox workspace path.
+        :returns: The absolute in-sandbox workspace path — the working
+            directory the host starts the agent in.
         """
 
 
@@ -861,7 +862,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     managed-host bootstrap. A provider that only needs to change how the
     repository is obtained overrides :meth:`materialize_workspace` alone.
 
-    Entrypoint-as-host providers (e.g. Kubernetes) inherit
+    Entrypoint-as-host and provider-native host launchers inherit
     :class:`SandboxHostLauncher` directly and do NOT need ``run()`` or any
     exec transport.
     """
@@ -874,9 +875,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
@@ -884,11 +883,16 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         Start ``omnigent host`` in the sandbox and return the workspace path.
 
         The default is the EXEC model: probe ``$HOME``, create
-        ``<HOME>/workspace``, optionally materialize the repository into it (via
-        :meth:`materialize_workspace`, which clones by default), merge any
-        *host_config* into ``~/.omnigent/config.yaml``, and start the host
-        detached (``setsid``-backgrounded, identity + token in the process
+        ``<HOME>/workspace``, clone each requested repo into it (via
+        :meth:`materialize_workspace`), merge any *host_config* into
+        ``~/.omnigent/config.yaml``, and start the host detached
+        (``setsid``-backgrounded, identity + token in the process
         environment) — all driven through :meth:`run` / :meth:`run_background`.
+
+        The working directory is the single clone directory when exactly one
+        repo is cloned, else the workspace root parenting them all (or an empty
+        workspace when none are requested). Clones run sequentially here; the
+        entrypoint-as-host launchers (Kubernetes) clone in parallel.
 
         :returns: The absolute in-sandbox workspace path.
         """
@@ -900,15 +904,24 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             )
         workspace = f"{home}/workspace"
         self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
-        if repo_url is not None:
-            workspace = self.materialize_workspace(
-                sandbox_id,
-                workspace=workspace,
-                repo_url=repo_url,
-                repo_branch=repo_branch,
-                repo_name=repo_name,
-                on_stage=on_stage,
-            )
+        if repos:
+            if on_stage is not None:
+                on_stage("cloning")
+            # Distinct URLs can derive the same repo_name (e.g. two orgs' "api");
+            # disambiguate so they don't clone into one colliding directory.
+            clone_dirs = [
+                self.materialize_workspace(
+                    sandbox_id,
+                    workspace=workspace,
+                    repo_url=repo.url,
+                    repo_branch=repo.branch,
+                    repo_name=dirname,
+                )
+                for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True)
+            ]
+            # One repo → drop the agent straight into it; several → the
+            # workspace root that parents them all.
+            workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
         if on_stage is not None:
             on_stage("starting")
         if host_config is not None or self.capabilities.resume_stopped:

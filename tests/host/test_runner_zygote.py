@@ -478,6 +478,62 @@ def test_fork_harness_argv_round_trips_to_child(manager: ZygoteManager, tmp_path
     assert f"harness_argv={' '.join(argv)}" in log.read_text()
 
 
+def test_forked_harness_runs_in_the_session_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """A harness fork chdirs to the session workspace, not the zygote's cwd.
+
+    The zygote inherits the daemon's start cwd — possibly a since-deleted
+    transient worktree — so a harness child that kept it would root every
+    ``os.getcwd()`` fallback in its executors at the FIRST dispatch's
+    directory. The payload env carries the session workspace; the child must
+    chdir there, matching what a directly-exec'd harness inherits from its
+    runner.
+
+    :param manager: The started manager fixture (cwd = the pytest process's).
+    :param tmp_path: Temp dir for the workspace and the harness child's log.
+    """
+    workspace = tmp_path / "session-workspace"
+    workspace.mkdir()
+    log = tmp_path / "harness.log"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(log),
+        "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    assert f"harness_cwd={workspace.resolve()}\n" in log.read_text()
+
+
+def test_forked_harness_survives_a_missing_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """A workspace that vanished between launch and fork must not kill the fork.
+
+    The chdir is best-effort, matching direct exec (which never validates the
+    workspace either): a deleted workspace leaves the child in the zygote's
+    cwd rather than crashing the harness, and the failure is surfaced in the
+    harness log so a wrong-cwd session is diagnosable.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    log = tmp_path / "harness.log"
+    gone = tmp_path / "gone"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(log),
+        "OMNIGENT_RUNNER_WORKSPACE": str(gone),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    text = log.read_text()
+    # The child stayed alive in the zygote's cwd — never the vanished one —
+    # and logged why.
+    assert "harness_cwd=" in text
+    assert f"harness_cwd={gone}\n" not in text
+    assert "cannot chdir to workspace" in text
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [

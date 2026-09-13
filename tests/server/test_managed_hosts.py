@@ -8,6 +8,7 @@ import re
 import sys
 import types
 import uuid
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
+    KUBERNETES_HOME_SIZE_LIMIT_DEFAULT,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MICROSANDBOX_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
@@ -50,8 +52,10 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     launch_managed_host,
+    managed_repo_labels,
     parse_repo_workspace,
     parse_sandbox_config,
+    read_managed_repo_workspaces,
     relaunch_managed_host,
     resolve_managed_agent_label,
     resume_managed_host,
@@ -763,8 +767,12 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                 "node_selector": {"omnigent.ai/runner-ready": "true"},
                 "runtime_class": "kata",
                 "in_cluster": True,
-                "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
+                "resources": {
+                    "requests": {"cpu": "500m", "ephemeral-storage": "2Gi"},
+                    "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
+                },
                 "pod_ready_timeout_s": 300,
+                "home_size_limit": "20Gi",
             },
         }
     )
@@ -785,8 +793,12 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert fake.node_selector == {"omnigent.ai/runner-ready": "true"}
     assert fake.runtime_class == "kata"
     assert fake.in_cluster is True
-    assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
+    assert fake.resources == {
+        "requests": {"cpu": "500m", "ephemeral-storage": "2Gi"},
+        "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
+    }
     assert fake.pod_ready_timeout_s == 300
+    assert fake.home_size_limit == "20Gi"
 
 
 def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -808,6 +820,34 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.resources is None
     assert fake.pvc_mounts is None
     assert fake.pod_ready_timeout_s is None
+    # Absent, not None: a stock deployment gets a bounded HOME emptyDir.
+    assert fake.home_size_limit == KUBERNETES_HOME_SIZE_LIMIT_DEFAULT == "8Gi"
+
+
+def test_parse_kubernetes_home_size_limit_default_mirrors_launcher() -> None:
+    """The parse-time default and the launcher's manifest default stay in step."""
+    import omnigent.onboarding.sandboxes.kubernetes as k8s
+
+    assert KUBERNETES_HOME_SIZE_LIMIT_DEFAULT == k8s._HOME_SIZE_LIMIT_DEFAULT
+
+
+def test_parse_kubernetes_home_size_limit_null_is_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit `home_size_limit: null` reaches the launcher as None (no sizeLimit)."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"home_size_limit": None},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.home_size_limit is None
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -940,7 +980,17 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"runtime_class": "Not_A_DNS_Name"}, "sandbox.kubernetes.runtime_class"),
         ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
         ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
+        (
+            {"resources": {"limits": {"ephemeral-storage": "eight gigs"}}},
+            "valid Kubernetes quantity",
+        ),
         ({"in_cluster": "yes"}, "must be a boolean"),
+        # The HOME sizeLimit must be a real quantity string (or an explicit
+        # null): a number or a typo would either fail the Pod's admission or
+        # silently leave the emptyDir unbounded.
+        ({"home_size_limit": 8}, "quantity string"),
+        ({"home_size_limit": ""}, "quantity string"),
+        ({"home_size_limit": "lots"}, "valid Kubernetes quantity"),
         # A misspelled section key would silently no-op (e.g. no PVCs mounted)
         # without the allowlist check.
         ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
@@ -1007,6 +1057,111 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
     assert fake.pvc_mounts is None
+
+
+def test_parse_kubernetes_tolerations_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tolerations parse into normalized entries (operator defaults 'Equal') on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "tolerations": [
+                    {
+                        "key": "sei.io/node-role",
+                        "value": "omnigent-sandbox",
+                        "effect": "NoSchedule",
+                    },
+                    {"operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.tolerations == [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        },
+        {"operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+    ]
+
+
+def test_parse_kubernetes_without_tolerations_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) tolerations reach the launcher as None — no tolerations added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"tolerations": []},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.tolerations is None
+
+
+@pytest.mark.parametrize(
+    ("tolerations", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("sei.io/node-role", "must be a list"),
+        ([["sei.io/node-role"]], "must be a mapping"),
+        ([{"bogus": "x"}], "unknown key"),
+        # key/value field shape.
+        ([{"key": "", "operator": "Equal"}], "key.*must be a non-empty string"),
+        ([{"key": "k", "value": 123}], "value.*must be a string"),
+        # key/value Kubernetes label format.
+        ([{"key": "sei.io/node role", "operator": "Exists"}], "not a valid Kubernetes label key"),
+        (
+            [{"key": "k", "operator": "Equal", "value": "x" * 64}],
+            "not a valid Kubernetes label value",
+        ),
+        # operator/effect given the wrong Python type outright (a config typo
+        # nesting a mapping/list under a scalar field) must still fail as
+        # ValueError, not escape as an unhandled TypeError from the `in`
+        # membership test against an unhashable value.
+        ([{"operator": {"nested": "mapping"}}], "operator.*must be one of"),
+        ([{"key": "k", "effect": ["NoSchedule"]}], "effect.*must be one of"),
+        # key/operator combinations Kubernetes itself would reject.
+        ([{"operator": "Equal"}], "only pairs with 'Exists'"),
+        ([{"key": "sei.io/x", "operator": "Maybe"}], "operator.*must be one of"),
+        ([{"operator": "Exists", "value": "x"}], "not allowed with operator 'Exists'"),
+        # effect / tolerationSeconds combinations.
+        ([{"key": "sei.io/x", "effect": "Sometimes"}], "effect.*must be one of"),
+        (
+            [{"key": "sei.io/x", "effect": "NoSchedule", "tolerationSeconds": 60}],
+            "only applies with effect 'NoExecute'",
+        ),
+        (
+            [{"key": "sei.io/x", "tolerationSeconds": "60"}],
+            "tolerationSeconds.*must be an integer",
+        ),
+    ],
+)
+def test_parse_kubernetes_tolerations_invalid_fails_loud(
+    tolerations: object, expected_fragment: str
+) -> None:
+    """An operator typo in tolerations fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"tolerations": tolerations},
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -1901,6 +2056,10 @@ def test_parse_repo_workspace_accepts_url_forms(workspace: str, expected: RepoWo
         # unsupported in the fragment form.
         ("https://github.com/org/repo#a#b", "not a valid git branch name"),
         ("https://github.com/org/repo#a b", "must not contain whitespace"),
+        # Embedded credentials would be persisted verbatim in a label + Pod spec —
+        # rejected in the https AND the ssh (scp-form) branch.
+        ("https://user:token@github.com/org/repo", "must not embed credentials"),
+        ("git@x-access-token:tok@github.com:org/repo.git", "must not embed credentials"),
     ],
 )
 def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragment: str) -> None:
@@ -1912,6 +2071,98 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
     with pytest.raises(ValueError, match="") as exc:
         parse_repo_workspace(workspace)
     assert expected_fragment in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "https://x-access-token:s3cr3t@github.com/org/repo",
+        # No path → trips the shape guard; the secret must still not be echoed
+        # (the credential check runs before any URL-echoing error).
+        "https://user:s3cr3t@github.com",
+        "git@x-access-token:s3cr3t@github.com:org/repo.git",
+    ],
+)
+def test_credential_rejection_does_not_echo_the_token(workspace: str) -> None:
+    """The credential-URL error must not include the URL — that carries the secret."""
+    with pytest.raises(ValueError) as exc:
+        parse_repo_workspace(workspace)
+    assert "s3cr3t" not in str(exc.value)
+
+
+def test_managed_repo_labels_round_trip() -> None:
+    """Per-repo labels avoid the 256-char single-label cap and read back in order.
+
+    A bare space-joined key rides along as a rollback compat shim (it fits here),
+    but the indexed labels are what the current reader uses.
+    """
+    workspaces = ["https://github.com/org/api#main", "https://github.com/org/web"]
+    labels = managed_repo_labels(workspaces)
+    assert labels == {
+        "omnigent.sandbox.repo.0": "https://github.com/org/api#main",
+        "omnigent.sandbox.repo.1": "https://github.com/org/web",
+        # Legacy bare key for a rolled-back/older reader (written only when it fits).
+        "omnigent.sandbox.repo": "https://github.com/org/api#main https://github.com/org/web",
+    }
+    assert read_managed_repo_workspaces(labels) == workspaces
+    assert managed_repo_labels([]) == {}
+
+
+def test_managed_repo_labels_omit_bare_key_when_over_cap() -> None:
+    """The compat bare key is skipped (never truncated) when the joined value
+    would exceed the label-value cap; the indexed labels still carry every repo."""
+    # Enough long URLs that the space-joined value exceeds 256 chars.
+    workspaces = [f"https://github.com/some-long-org-name/repository-number-{i}" for i in range(6)]
+    labels = managed_repo_labels(workspaces)
+    assert "omnigent.sandbox.repo" not in labels  # no truncated bare value stored
+    assert read_managed_repo_workspaces(labels) == workspaces  # indexed labels intact
+
+
+def test_read_managed_repo_workspaces_orders_numerically_and_falls_back() -> None:
+    """Indices order numerically (not lexically), and the legacy single label still reads."""
+    # .10 must sort after .2, not before it (lexical order would break past 9).
+    many = {f"omnigent.sandbox.repo.{i}": f"https://github.com/o/r{i}" for i in range(11)}
+    assert read_managed_repo_workspaces(many)[-1] == "https://github.com/o/r10"
+    # Legacy single space-joined label (pre-per-repo storage) still round-trips.
+    legacy = {"omnigent.sandbox.repo": "https://github.com/o/a https://github.com/o/b"}
+    assert read_managed_repo_workspaces(legacy) == [
+        "https://github.com/o/a",
+        "https://github.com/o/b",
+    ]
+    assert read_managed_repo_workspaces({}) == []
+
+
+def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
+    """The /v1/info map reflects each launchable provider's declared multi_repo,
+    keyed by provider name; a provider declaring nothing stays off."""
+
+    class _MultiRepoFake(FakeSandboxLauncher):
+        @property
+        def capabilities(self) -> Any:
+            return replace(super().capabilities, multi_repo=True)
+
+    single = FakeSandboxLauncher()  # exec-model default → multi_repo False
+    multi = _MultiRepoFake()
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="single",
+                token_ttl_s=3600,
+                launcher_factory=lambda: single,
+            ),
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="multi",
+                token_ttl_s=3600,
+                launcher_factory=lambda: multi,
+            ),
+        )
+    )
+    assert deployment.provider_ui_capabilities() == {
+        "single": {"multi_repo": False},
+        "multi": {"multi_repo": True},
+    }
 
 
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
@@ -2305,9 +2556,7 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
             host_id: str,
             host_name: str,
             server_url: str,
-            repo_url: str | None = None,
-            repo_branch: str | None = None,
-            repo_name: str | None = None,
+            repos: Sequence[RepoWorkspace] = (),
         ) -> str:
             return super().start_host(
                 sandbox_id,
@@ -2315,9 +2564,7 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
                 host_id=host_id,
                 host_name=host_name,
                 server_url=server_url,
-                repo_url=repo_url,
-                repo_branch=repo_branch,
-                repo_name=repo_name,
+                repos=repos,
             )
 
     fake = _LegacySignatureLauncher(on_host_start=_register, can_resume=True)
@@ -2516,7 +2763,7 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
         config=_injected_config(fake),
         owner=_OWNER,
         host_store=host_store,
-        repo=parse_repo_workspace("https://github.com/org/myrepo.git#release-1.2"),
+        repos=[parse_repo_workspace("https://github.com/org/myrepo.git#release-1.2")],
     )
 
     # The session workspace is the clone directory, named after the repo.
@@ -2552,7 +2799,7 @@ async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> 
             config=_injected_config(fake),
             owner=_OWNER,
             host_store=host_store,
-            repo=parse_repo_workspace("https://github.com/org/private#main"),
+            repos=[parse_repo_workspace("https://github.com/org/private#main")],
         )
     assert exc.value.status_code == 502
     assert "failed to clone repository 'https://github.com/org/private'" in exc.value.detail
@@ -2599,9 +2846,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage=None,
     ) -> str:
@@ -2612,8 +2857,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
                 "token": token,
                 "host_id": host_id,
                 "server_url": server_url,
-                "repo_url": repo_url,
-                "repo_name": repo_name,
+                "repos": list(repos),
             }
         )
         # The token was registered before start_host, so it resolves now.
@@ -2622,7 +2866,12 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         )
         # Simulate the host's entrypoint dialing back over the tunnel.
         self._host_store.upsert_on_connect(host_id=host_id, name=host_name, user_id=_OWNER)
-        return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
+        # One repo → its clone dir; none or several → the workspace parent.
+        return (
+            f"/home/omnigent/workspace/{repos[0].repo_name}"
+            if len(repos) == 1
+            else "/home/omnigent/workspace"
+        )
 
 
 async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: str) -> None:
@@ -2638,7 +2887,7 @@ async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: 
         config=_injected_config(fake),
         owner=_OWNER,
         host_store=host_store,
-        repo=parse_repo_workspace("https://github.com/org/repo.git#main"),
+        repos=[parse_repo_workspace("https://github.com/org/repo.git#main")],
     )
 
     # start_host ran once, with the reserved id and repo info.
@@ -2646,8 +2895,8 @@ async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: 
     call = fake.start_calls[0]
     assert call["sandbox_id"] == "omnigent-pod-1"
     assert call["server_url"] == "https://srv.example.com"
-    assert call["repo_url"] == "https://github.com/org/repo.git"
-    assert call["repo_name"] == "repo"
+    assert [r.url for r in call["repos"]] == ["https://github.com/org/repo.git"]
+    assert [r.repo_name for r in call["repos"]] == ["repo"]
     # The token was already resolvable when start_host ran (no dial-back race).
     assert fake.token_resolved_at_start is True
     # The workspace (cloned dir) is returned and the host is online + bound.
@@ -2721,7 +2970,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
         await relaunch_managed_host(config=config, host=pending, host_store=host_store)
 
     assert exc.value.status_code == 409
-    assert "pending cleanup" in exc.value.detail
+    assert "host lifecycle" in exc.value.detail
     assert len(fake.host_starts) == 1
     assert fake.terminated == []
     still_pending = host_store.get_host(active.host_id)
@@ -2838,6 +3087,34 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
         host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
         is None
     )
+
+
+async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
+    """A relaunch that loses to full teardown cleans up its new sandbox."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="c73ad22fd7be4fe2a62a36b7e0fbcaa8",
+        name="managed-deleted-relaunch",
+        user_id=_OWNER,
+        token="deleted-relaunch-token",
+        provider="modal",
+        sandbox_id="sb-deleted-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.delete_host(host.host_id)
+    fake = FakeSandboxLauncher()
+
+    with pytest.raises(HTTPException) as exc:
+        await relaunch_managed_host(
+            config=_injected_config(fake),
+            host=host,
+            host_store=host_store,
+        )
+
+    assert exc.value.status_code == 409
+    assert "no longer exists" in exc.value.detail
+    assert fake.terminated == ["sb-deleted-old", "sb-fake-1"]
+    assert host_store.get_host(host.host_id) is None
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -3137,8 +3414,8 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     )
 
 
-async def test_resume_managed_host_failure_preserves_existing_row(db_uri: str) -> None:
-    """A failed wake leaves the dormant host generation retryable."""
+async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_uri: str) -> None:
+    """A failed provider resume leaves the dormant generation unchanged."""
     host_store = HostStore(db_uri)
     host_store.register_managed_host(
         host_id="efbef7dede7be6577770cbb1287992f2",
@@ -3165,7 +3442,7 @@ async def test_resume_managed_host_failure_preserves_existing_row(db_uri: str) -
     assert host.sandbox_id == "sb-resume-fail"
     assert (
         host_store.resolve_launch_token("efbef7dede7be6577770cbb1287992f2", "tok-resume-fail")
-        is None
+        is not None
     )
 
 
@@ -3173,7 +3450,7 @@ async def test_resume_managed_host_does_not_resume_detached_generation(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reaper detach that wins the CAS prevents the provider resume call."""
+    """A reaper detach that wins the CAS cleans up the resumed stale generation."""
     host_store = HostStore(db_uri)
     host_id = "ade43acaaaf44af59388dc2109a8557f"
     host_store.register_managed_host(
@@ -3213,11 +3490,46 @@ async def test_resume_managed_host_does_not_resume_detached_generation(
 
     await resume_managed_host(host_id, host_store, _injected_config(fake))
 
-    assert fake.resumed == []
+    assert fake.resumed == ["sb-resume-race"]
+    assert fake.terminated == ["sb-resume-race"]
     detached = host_store.get_host(host_id)
     assert detached is not None
     assert detached.sandbox_id is None
-    assert detached.terminating_sandbox_id == "sb-resume-race"
+    assert detached.terminating_sandbox_id is None
+
+
+async def test_resume_managed_host_does_not_recreate_deleted_host(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake that loses to full teardown cleans up the resumed sandbox."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="463013d3d38d4096b2404962c48479b1",
+        name="managed-deleted-resume",
+        user_id=_OWNER,
+        token="deleted-resume-token",
+        provider="islo",
+        sandbox_id="sb-deleted-resume",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.set_offline(host.host_id)
+    fake = _IsloFakeLauncher(can_resume=True)
+
+    def _resume(sandbox_id: str) -> None:
+        fake.resumed.append(sandbox_id)
+        host_store.delete_host(host.host_id)
+
+    monkeypatch.setattr(fake, "resume", _resume)
+
+    with pytest.raises(HTTPException) as exc:
+        await resume_managed_host(host.host_id, host_store, _injected_config(fake))
+
+    assert exc.value.status_code == 502
+    assert "no longer exists" in exc.value.detail
+    assert fake.terminated == ["sb-deleted-resume"]
+    assert fake.host_starts == []
+    assert host_store.get_host(host.host_id) is None
 
 
 # ── terminate_managed_host ──────────────────────────────────
@@ -3269,15 +3581,15 @@ async def test_terminate_managed_host_cleans_active_and_pending_generations(db_u
         sandbox_id="sb-term-old",
         expected_updated_at=original.updated_at,
     )
-    host_store.register_managed_host(
+    replaced = host_store.replace_managed_host_sandbox(
         host_id=host_id,
-        name="managed-term-both",
         user_id=_OWNER,
         token="tok-term-new",
         provider="modal",
         sandbox_id="sb-term-new",
         token_expires_at=now_epoch() + 3600,
     )
+    assert replaced is not None
     host = host_store.get_host(host_id)
     assert host is not None
 
@@ -3287,15 +3599,72 @@ async def test_terminate_managed_host_cleans_active_and_pending_generations(db_u
     assert host_store.get_host(host_id) is None
 
 
-async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
+async def test_terminate_managed_host_targets_latest_registered_generation(db_uri: str) -> None:
+    """A stale teardown snapshot removes and terminates the current generation."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    stale = host_store.register_managed_host(
+        host_id="5233b41530ed474f9860ecf3acfc9131",
+        name="managed-term-current",
+        user_id=_OWNER,
+        token="tok-term-old",
+        provider="modal",
+        sandbox_id="sb-term-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    updated = host_store.replace_managed_host_sandbox(
+        host_id=stale.host_id,
+        user_id=stale.user_id,
+        token="tok-term-new",
+        provider="modal",
+        sandbox_id="sb-term-new",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert updated is not None
+
+    await terminate_managed_host(stale, host_store, _injected_config(fake))
+
+    assert fake.terminated == ["sb-term-new"]
+    assert host_store.get_host(stale.host_id) is None
+
+
+async def test_terminate_managed_host_deletes_row_before_provider_call(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider teardown runs only after the host can no longer be relaunched."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="af48b60a7afb4c0696709403116c30c6",
+        name="managed-delete-first",
+        user_id=_OWNER,
+        token="tok-delete-first",
+        provider="modal",
+        sandbox_id="sb-delete-first",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    def _terminate(sandbox_id: str) -> None:
+        assert host_store.get_host(host.host_id) is None
+        fake.terminated.append(sandbox_id)
+
+    monkeypatch.setattr(fake, "terminate", _terminate)
+
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert fake.terminated == ["sb-delete-first"]
+
+
+async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Best-effort contract: a provider termination failure neither
-    propagates nor blocks the row deletion (the provider's lifetime
-    cap reaps the sandbox; the credential must die now).
+    A provider failure does not block logical deletion, and the persisted
+    sandbox id is retried by the existing reaper.
     """
     fake = FakeSandboxLauncher()
+    original_terminate = fake.terminate
 
     def _explode(sandbox_id: str) -> None:
         """Simulate a provider API failure during termination."""
@@ -3319,15 +3688,97 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
+    tombstones = [
+        host
+        for _, host in host_store.list_current_managed_sandbox_hosts_page(
+            after=None,
+            limit=10,
+        )
+    ]
+    assert len(tombstones) == 1
+    assert tombstones[0].deleted_at is not None
+    assert tombstones[0].sandbox_id == "sb-term-2"
+
+    monkeypatch.setattr(fake, "terminate", original_terminate)
+    reaper = ManagedSandboxReaper(
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    assert await reaper.sweep_once() == 1
+    assert fake.terminated == ["sb-term-2"]
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
+
+
+async def test_terminate_managed_host_retains_only_failed_generation(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSandboxLauncher()
+    original_terminate = fake.terminate
+    host_store = HostStore(db_uri)
+    host_id = "9e50e018919e494886b984df0bbec12b"
+    original = host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-term-partial",
+        user_id=_OWNER,
+        token="tok-term-old-partial",
+        provider="modal",
+        sandbox_id="sb-term-old-partial",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host_store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="sb-term-old-partial",
+        expected_updated_at=original.updated_at,
+    )
+    host = host_store.replace_managed_host_sandbox(
+        host_id=host_id,
+        user_id=_OWNER,
+        token="tok-term-new-partial",
+        provider="modal",
+        sandbox_id="sb-term-new-partial",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host is not None
+    attempts: list[str] = []
+
+    def _terminate(sandbox_id: str) -> None:
+        attempts.append(sandbox_id)
+        if sandbox_id == "sb-term-new-partial":
+            raise click.ClickException("provider unavailable")
+        original_terminate(sandbox_id)
+
+    monkeypatch.setattr(fake, "terminate", _terminate)
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert attempts == ["sb-term-new-partial", "sb-term-old-partial"]
+    tombstones = [
+        host
+        for _, host in host_store.list_current_managed_sandbox_hosts_page(
+            after=None,
+            limit=10,
+        )
+    ]
+    assert len(tombstones) == 1
+    assert tombstones[0].sandbox_id == "sb-term-new-partial"
+    assert tombstones[0].terminating_sandbox_id is None
+
+    monkeypatch.setattr(fake, "terminate", original_terminate)
+    reaper = ManagedSandboxReaper(
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    assert await reaper.sweep_once() == 1
+    assert fake.terminated == ["sb-term-old-partial", "sb-term-new-partial"]
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
     """
-    A config change between launch and teardown (current launcher's
-    provider ≠ the provider recorded on the row) must NOT aim the new
-    provider's terminate at a stale sandbox id — the sandbox is left
-    to its lifetime cap, but the row still dies (token revoked, no
-    picker ghost). Also covers config=None (section removed).
+    A config change between launch and teardown must not aim the new provider's
+    terminate at a stale sandbox id. The host becomes invisible and its cleanup
+    tombstone remains available if that provider is configured again later.
     """
     fake = FakeSandboxLauncher()  # provider "modal"
     host_store = HostStore(db_uri)
@@ -3350,7 +3801,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
         host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
     )
 
-    # config=None behaves the same: row deleted, nothing terminated.
+    # config=None behaves the same: host hidden, cleanup retained.
     host2 = host_store.register_managed_host(
         host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",
@@ -4008,7 +4459,7 @@ async def test_run_managed_launch_leaves_the_runner_unclassified(
         session_id="conv_1",
         owner=_OWNER,
         sandbox_config=SimpleNamespace(),
-        repo=None,
+        repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4051,7 +4502,7 @@ async def test_run_managed_launch_resolves_the_classifier_on_its_own_task(
         session_id="conv_1",
         owner=_OWNER,
         sandbox_config=SimpleNamespace(),
-        repo=None,
+        repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4090,7 +4541,7 @@ async def test_run_managed_launch_omits_the_classifier_for_a_session_scoped_impo
         session_id="conv_1",
         owner=_OWNER,
         sandbox_config=SimpleNamespace(),
-        repo=None,
+        repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4328,6 +4779,96 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     assert engaged == [True, True]
     assert len(calls) == 1
     assert calls[0]["agent_id"] == builtin.id
+
+
+# ── Gensee sandbox provider ─────────────────────────────────
+
+
+def test_parse_gensee_builds_core_launcher() -> None:
+    """The built-in Gensee provider receives its validated server config."""
+    from omnigent.onboarding.sandboxes.gensee import GenseeSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "gensee",
+            "server_url": "https://omnigent.example.com",
+            "gensee": {
+                "endpoint": "https://sandbox.example.com/control/",
+                "api_token_env": "CUSTOM_GENSEE_TOKEN",
+                "workspace_root": "/srv/gensee/workspaces",
+                "operation_timeout_s": 600,
+                "poll_interval_s": 1,
+                "request_timeout_s": 30,
+                "retry_timeout_s": 0,
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+            },
+        }
+    )
+
+    assert deployment is not None
+    config = deployment.default
+    assert config.provider == "gensee"
+    assert config.managed_launch_supported is True
+    assert config.token_ttl_s == 7 * 24 * 3600
+    launcher = config.launcher_factory()
+    assert isinstance(launcher, GenseeSandboxLauncher)
+    assert launcher.endpoint == "https://sandbox.example.com/control"
+    assert launcher.api_token_env == "CUSTOM_GENSEE_TOKEN"
+    assert str(launcher.workspace_root) == "/srv/gensee/workspaces"
+    assert launcher.retry_timeout_s == 0
+    assert launcher.env == ("OPENAI_API_KEY", "GIT_TOKEN")
+
+
+def test_parse_gensee_uses_safe_defaults() -> None:
+    """A minimal Gensee block targets the production control endpoint."""
+    from omnigent.onboarding.sandboxes.gensee import GenseeSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "gensee",
+            "server_url": "https://omnigent.example.com",
+        }
+    )
+
+    assert deployment is not None
+    launcher = deployment.default.launcher_factory()
+    assert isinstance(launcher, GenseeSandboxLauncher)
+    assert launcher.endpoint == "https://sandbox.gensee.ai"
+    assert launcher.api_token_env == "GENSEE_CONTROLLER_API_TOKEN"
+
+
+def test_parse_gensee_rejects_unknown_config_key() -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.gensee.*unknown"):
+        parse_sandbox_config(
+            {
+                "provider": "gensee",
+                "server_url": "https://omnigent.example.com",
+                "gensee": {"project": "not-a-public-provider-setting"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "gensee",
+    [
+        {"endpoint": "http://sandbox.example.com"},
+        {"api_token_env": "NOT-AN-ENV"},
+        {"workspace_root": "relative"},
+        {"operation_timeout_s": 0},
+        {"retry_timeout_s": -1},
+        {"env": ["NOT-AN-ENV"]},
+        {"env": ["DUPLICATE", "DUPLICATE"]},
+    ],
+)
+def test_parse_gensee_rejects_invalid_config(gensee: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.gensee"):
+        parse_sandbox_config(
+            {
+                "provider": "gensee",
+                "server_url": "https://omnigent.example.com",
+                "gensee": gensee,
+            }
+        )
 
 
 # ── contributed sandbox providers ───────────────────────────

@@ -39,6 +39,7 @@ from omnigent.debug_logging import (
     debug_sink_enabled,
     sse_event_logger,
 )
+from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -102,6 +103,16 @@ _TURN_OUTCOME_BY_EVENT_TYPE = {
     "response.failed": "failed",
     "response.cancelled": "cancelled",
     "response.incomplete": "incomplete",
+}
+# The authoritative progress-impact per turn outcome: this is where "the task
+# actually stopped" is known, so it overrides any per-error code default (a
+# nominally-transient retry that ultimately failed the turn lands here as
+# blocking). ``completed`` carries no impact; ``cancelled`` is a user-initiated
+# stop, not lost progress.
+_TURN_OUTCOME_IMPACT = {
+    "failed": ErrorImpact.BLOCKING,
+    "incomplete": ErrorImpact.BLOCKING,
+    "cancelled": ErrorImpact.BENIGN,
 }
 # Top-level event fields safe to log — stable identifiers, closed enums, and
 # pure numerics only. Deliberately excludes human/LLM-authored free text
@@ -200,6 +211,11 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
         error = event.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
+        impact = _TURN_OUTCOME_IMPACT.get(outcome)
+        if impact is not None:
+            attributes["error_impact"] = impact.value
+            # A terminal turn outcome is, by definition, in the turn phase.
+            attributes["error_phase"] = ErrorPhase.TURN.value
     level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
     audit_event_logger().log(level, "turn %s", outcome, extra=extra)
 

@@ -181,6 +181,13 @@ def _launcher() -> AgentSandboxLauncher:
     )
 
 
+def test_agent_sandbox_inherits_multi_repo_capability() -> None:
+    """agent-sandbox declares multi_repo via KubernetesSandboxLauncher, so the
+    picker offers the multi-repo menu for it and the launch accepts N repos.
+    Managed Databricks launchers are on the exec-model branch and stay off."""
+    assert _launcher().capabilities.multi_repo is True
+
+
 # ── manifest conversion ────────────────────────────────
 
 
@@ -237,7 +244,14 @@ def test_workspace_claim_is_named_to_replace_the_home_emptydir() -> None:
 
     pod_spec = sandbox["spec"]["podTemplate"]["spec"]  # type: ignore[index]
     home = [v for v in pod_spec["volumes"] if v["name"] == WORKSPACE_VOLUME_NAME]
-    assert home == [{"name": WORKSPACE_VOLUME_NAME, "emptyDir": {}}]
+    # The (bounded) emptyDir stays in the Pod template; the controller's
+    # by-name merge is what replaces it with the claim.
+    assert home == [
+        {
+            "name": WORKSPACE_VOLUME_NAME,
+            "emptyDir": {"sizeLimit": k8s._HOME_SIZE_LIMIT_DEFAULT},
+        }
+    ]
     mounts = pod_spec["containers"][0]["volumeMounts"]
     assert any(m["name"] == WORKSPACE_VOLUME_NAME for m in mounts)
     init_mounts = pod_spec["initContainers"][0]["volumeMounts"]

@@ -1,0 +1,249 @@
+"""The Canvas page shows top-level sessions as cards, one canvas per project."""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import httpx
+from playwright.sync_api import Page, Route, expect
+
+from tests.e2e_ui.conftest import _build_hello_world_bundle
+
+
+def _stub_server_info(page: Page, *, canvas: bool) -> None:
+    """Advertise one deterministic ``canvas`` release-feature value."""
+    body = json.dumps(
+        {
+            "accounts_enabled": False,
+            "single_user": True,
+            "login_url": None,
+            "needs_setup": False,
+            "features": {"canvas": canvas, "usage_page": False, "harness_install": False},
+            "harness_install_enabled": False,
+            "installable_harnesses": [],
+        }
+    )
+    page.route(
+        "**/v1/info",
+        lambda route: route.fulfill(status=200, content_type="application/json", body=body),
+    )
+
+
+def _session(
+    session_id: str, title: str, updated_at: int, **overrides: object
+) -> dict[str, object]:
+    return {
+        "id": session_id,
+        "object": "conversation",
+        "title": title,
+        "status": "idle",
+        "created_at": 1,
+        "updated_at": updated_at,
+        "labels": {},
+        "permission_level": None,
+        "workspace": "/workspace/canvas",
+        "git_branch": None,
+        "project_id": None,
+        "archived": False,
+        "parent_session_id": None,
+        **overrides,
+    }
+
+
+def _serve_list(sessions: list[dict[str, object]]):
+    def serve(route: Route) -> None:
+        route.fulfill(
+            json={
+                "object": "list",
+                "data": sessions,
+                "first_id": sessions[0]["id"] if sessions else None,
+                "last_id": None,
+                "has_more": False,
+            }
+        )
+
+    return serve
+
+
+def test_canvas_page_is_absent_while_the_feature_is_off(page: Page, live_server: str) -> None:
+    """A direct deep link cannot bypass the default-off navigation gate."""
+    _stub_server_info(page, canvas=False)
+
+    page.goto(f"{live_server}/canvas")
+
+    expect(page.get_by_role("heading", name="Page not found")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("canvas-nav")).to_have_count(0)
+
+
+def test_canvas_page_groups_sessions_by_project_and_opens_them(
+    page: Page,
+    live_server: str,
+    tmp_path: Path,
+) -> None:
+    """Main holds unfiled sessions; a project tab holds its own; a card opens its session."""
+    projects = [{"id": "project-release", "name": "Release", "icon": None}]
+    sessions = [
+        _session(f"main-{index}", f"Main session {index}", 20 - index) for index in range(3)
+    ]
+    sessions.append(
+        _session("project-session", "Review the release", 1, project_id="project-release")
+    )
+    _stub_server_info(page, canvas=True)
+    page.route("**/v1/sessions?*", _serve_list(sessions))
+    page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=projects))
+
+    page.goto(live_server)
+    expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
+    page.get_by_test_id("canvas-nav").click()
+
+    expect(page).to_have_url(re.compile(r"/canvas$"))
+    expect(page.get_by_role("heading", name="Canvas", exact=True)).to_be_visible()
+    expect(page.get_by_text("3 sessions", exact=True)).to_be_visible()
+    expect(page.get_by_role("status", name="Loading sessions")).to_have_count(0)
+    cards = page.get_by_test_id("session-card")
+    expect(cards).to_have_count(3)
+    expect(page.get_by_test_id("canvas-flow")).to_contain_text("Main session 2")
+    expect(page.get_by_test_id("canvas-flow")).not_to_contain_text("Review the release")
+    page.screenshot(path=str(tmp_path / "canvas-main.png"))
+
+    page.get_by_role("tab", name="Release", exact=True).click()
+    expect(page.get_by_text("1 session", exact=True)).to_be_visible()
+    expect(cards).to_have_count(1)
+    expect(cards).to_contain_text("Review the release")
+    page.screenshot(path=str(tmp_path / "canvas-project.png"))
+
+    # The selected canvas lives in the URL, so a reload lands on the same tab.
+    expect(page).to_have_url(re.compile(r"/canvas\?canvas=project-release$"))
+    page.reload()
+    expect(page.get_by_role("tab", name="Release", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(page.get_by_text("1 session", exact=True)).to_be_visible()
+    expect(cards).to_have_count(1)
+
+    # Leaving and coming back through the sidebar reopens the last selected canvas.
+    page.goto(live_server)
+    expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
+    page.get_by_test_id("canvas-nav").click()
+    expect(page).to_have_url(re.compile(r"/canvas\?canvas=project-release$"))
+    expect(page.get_by_role("tab", name="Release", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(cards).to_have_count(1)
+
+    cards.dblclick()
+    expect(page).to_have_url(re.compile(r"/c/project-session$"))
+
+
+def test_canvas_page_remembers_a_dragged_card_across_reloads(
+    page: Page,
+    live_server: str,
+) -> None:
+    """A dropped card snaps to the grid and keeps its spot after a reload, while the card
+    left alone stays in its slot; Reset layout regrids the canvas."""
+    sessions = [_session("only", "Only session", 2), _session("other", "Other session", 1)]
+    _stub_server_info(page, canvas=True)
+    page.route("**/v1/sessions?*", _serve_list(sessions))
+    page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
+
+    page.goto(f"{live_server}/canvas")
+    card = page.get_by_test_id("session-card").filter(has_text="Only session")
+    other = page.locator(".react-flow__node").filter(has_text="Other session")
+    expect(card).to_be_visible()
+    expect(other).to_be_visible()
+    # Both grid slots are saved as soon as the list is complete.
+    read_layout = (
+        "() => { const key = Object.keys(localStorage)"
+        ".find(k => k.startsWith('omnigent:canvas-layout:')); "
+        "return key ? JSON.parse(localStorage.getItem(key)) : null; }"
+    )
+    page.wait_for_function(
+        f"() => Object.keys((({read_layout})() ?? {{}}).positions ?? {{}}).length === 2"
+    )
+    other_slot = other.evaluate("el => el.style.transform")
+    assert other_slot == "translate(320px, 0px)"
+    before = card.bounding_box()
+    assert before is not None
+
+    page.mouse.move(before["x"] + 20, before["y"] + 20)
+    page.mouse.down()
+    page.mouse.move(before["x"] + 140, before["y"] + 300, steps=8)
+    page.mouse.up()
+    page.wait_for_function(
+        f"() => JSON.stringify((({read_layout})() ?? {{}}).positions?.only) !== '[0,0]'"
+    )
+    moved = card.bounding_box()
+    assert moved is not None
+    assert abs(moved["y"] - before["y"]) > 60
+
+    # The view is fitted on every load, so compare the card's canvas coordinates
+    # (the node's translate) rather than where it sits on screen. The drop snapped
+    # to the 32px lattice.
+    node = page.locator(".react-flow__node").filter(has_text="Only session")
+    dropped_at = node.evaluate("el => el.style.transform")
+    match = re.fullmatch(r"translate\((-?\d+)px, (-?\d+)px\)", dropped_at)
+    assert match is not None, dropped_at
+    assert int(match.group(1)) % 32 == 0 and int(match.group(2)) % 32 == 0
+    assert dropped_at != "translate(0px, 0px)"
+
+    page.reload()
+    expect(page.get_by_test_id("session-card")).to_have_count(2)
+    node = page.locator(".react-flow__node").filter(has_text="Only session")
+    expect(node).to_have_css("transform", re.compile(".+"))
+    assert node.evaluate("el => el.style.transform") == dropped_at
+    # The card that was never moved did not slide into the vacated slot.
+    other = page.locator(".react-flow__node").filter(has_text="Other session")
+    assert other.evaluate("el => el.style.transform") == other_slot
+
+    page.get_by_role("button", name="Reset layout").click()
+    expect(node).to_have_attribute("style", re.compile(r"translate\(0px, 0px\)"))
+    page.wait_for_function(
+        f"() => JSON.stringify((({read_layout})() ?? {{}}).positions?.only) === '[0,0]'"
+    )
+
+
+def test_canvas_cards_follow_live_session_updates(page: Page, live_server: str) -> None:
+    """A change pushed over the sessions stream reaches the card without a list re-fetch."""
+    create = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = create.json()["session_id"]
+    httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"title": "Canvas live before"},
+        timeout=10.0,
+    ).raise_for_status()
+
+    _stub_server_info(page, canvas=True)
+    canvas_list_requests: list[str] = []
+    page.on(
+        "request",
+        lambda request: (
+            canvas_list_requests.append(request.url)
+            if "/v1/sessions?" in request.url and "limit=1000" in request.url
+            else None
+        ),
+    )
+    page.goto(f"{live_server}/canvas")
+    expect(
+        page.get_by_test_id("session-card").filter(has_text="Canvas live before")
+    ).to_be_visible(timeout=30_000)
+    requests_after_load = len(canvas_list_requests)
+
+    httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"title": "Canvas live after"},
+        timeout=10.0,
+    ).raise_for_status()
+
+    # Well inside the 30 s poll, so this came over the stream via the sidebar cache.
+    expect(page.get_by_test_id("session-card").filter(has_text="Canvas live after")).to_be_visible(
+        timeout=10_000
+    )
+    assert len(canvas_list_requests) == requests_after_load

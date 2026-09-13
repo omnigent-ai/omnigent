@@ -23,6 +23,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     false,
+    func,
     text,
     true,
 )
@@ -902,6 +903,15 @@ class SqlConversation(ConversationBase):
             text("created_at DESC"),
             text("id DESC"),
         ),
+        # Session title search uses lower(title) LIKE '%query%'. Alembic owns
+        # the PostgreSQL index because its migration first enables pg_trgm;
+        # CRDB bootstrap creates its index directly from model metadata.
+        Index(
+            "ix_conversations_title_trgm",
+            func.lower(title).label("title_lower"),
+            postgresql_using="gin",
+            postgresql_ops={"title_lower": "gin_trgm_ops"},
+        ).ddl_if(dialect="cockroachdb"),
     )
 
 
@@ -1320,6 +1330,9 @@ class SqlHost(OmnigentBase):
         active host generation and awaiting successful provider termination.
         A fresh generation may be registered in ``sandbox_id`` while this
         cleanup remains pending.
+    :param deleted_at: Logical deletion timestamp for a managed host whose
+        provider sandbox cleanup is still pending. The row is physically
+        removed after every recorded sandbox id terminates successfully.
     :param configured_harnesses: JSON-encoded per-harness readiness map
         reported in the host's last ``host.hello`` frame, e.g.
         ``'{"claude-sdk": true, "codex": false}'``. ``NULL`` when the
@@ -1354,6 +1367,7 @@ class SqlHost(OmnigentBase):
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
@@ -1367,6 +1381,13 @@ class SqlHost(OmnigentBase):
         # rotation) stays consistent.
         UniqueConstraint(
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
+        Index("ix_hosts_sandbox_scan", "sandbox_id", "workspace_id", "host_id"),
+        Index(
+            "ix_hosts_terminating_sandbox_scan",
+            "terminating_sandbox_id",
+            "workspace_id",
+            "host_id",
         ),
     )
 

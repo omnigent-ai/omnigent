@@ -247,6 +247,8 @@ async def _drive_install(base_url: str) -> None:
             codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
             await expect(codex_option).to_be_visible(timeout=60_000)
             await codex_option.click()
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_role("menu")).to_have_count(0)
 
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
             await expect(setup).to_be_visible(timeout=60_000)

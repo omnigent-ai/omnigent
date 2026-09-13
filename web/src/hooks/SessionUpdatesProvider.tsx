@@ -20,7 +20,11 @@ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import { isSessionDeleting, markRecentlyCreated } from "@/hooks/useConversations";
+import {
+  isSessionArchiving,
+  isSessionDeleting,
+  markRecentlyCreated,
+} from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -34,6 +38,7 @@ import {
 } from "@/lib/sessionListCache";
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
 // action. 250 ms is short enough to feel live, long enough to batch the
@@ -64,7 +69,14 @@ function applyItemsToCache(
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
-  const itemsById = new Map(items.map((item) => [item.id, nullsToUndefined(item)]));
+  const itemsById = new Map<string, SessionListWireItem>();
+  for (const item of items) {
+    if (isSessionDeleting(item.id)) continue;
+    itemsById.set(
+      item.id,
+      nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+    );
+  }
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
@@ -218,7 +230,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         }
       }
     }
-    sessionUpdatesSocket.setWatched(ids);
+    sessionUpdatesSocket.setWatched(ids.filter((id) => !isTempConvId(id)));
   }, [queryClient]);
 
   // Navigating to an off-sidebar child changes the open session without
@@ -309,6 +321,14 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "hosts_changed":
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+          void queryClient.invalidateQueries({ queryKey: ["session-agent"] });
+          return;
+        case "projects_changed":
+          // Another client created/renamed/deleted a project (or changed its
+          // config/icon). Only the mutating client invalidates locally, so
+          // refresh the project-row caches here to converge without a reload.
+          void queryClient.invalidateQueries({ queryKey: ["projects"] });
+          void queryClient.invalidateQueries({ queryKey: ["project-config"] });
           return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);

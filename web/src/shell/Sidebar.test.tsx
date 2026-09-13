@@ -12,9 +12,15 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import {
+  markConversationSeen,
+  resetReadStateForTests,
+  seedReadState,
+} from "@/hooks/useUnseenConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
 import type { ExtensionCatalogItem } from "@/extensions/types";
@@ -24,6 +30,7 @@ import type { ExtensionCatalogItem } from "@/extensions/types";
 // sections; moveToProjectSpy captures kebab-menu "Change project" calls.
 const {
   projectsMock,
+  projectRowsRef,
   moveToProjectSpy,
   deleteProjectSpy,
   renameProjectSpy,
@@ -35,6 +42,7 @@ const {
   useHostsMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
+  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -114,7 +122,7 @@ vi.mock("@/hooks/useConversations", () => ({
   // Tests push project NAMES into projectsMock; expose them as first-class
   // {id, name} folders (synthetic id per name) to match useProjects' shape.
   useProjects: () => ({
-    data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
+    data: projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
   }),
   // Each project folder fetches its own sessions (server-side ?project=). Derive
   // them from the global-list fixture by label so existing tests keep seeding
@@ -169,6 +177,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import * as identity from "@/lib/identity";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -279,9 +288,11 @@ beforeEach(() => {
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
+  resetReadStateForTests();
   clearSessionDrafts();
   clearOptimisticTitles();
   projectsMock.length = 0;
+  projectRowsRef.current = undefined;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
   fetchProjectSessionIdsMock.mockReset();
@@ -338,6 +349,72 @@ const TEST_EXTENSION: ExtensionCatalogItem = {
 };
 
 describe("Sidebar session list", () => {
+  it.each([null, 1, 2, 3, 4])(
+    "marks shared sessions regardless of permission level %s",
+    (level) => {
+      mockConversations([
+        conv("shared_session", "Claude Code", {
+          owner: "other@example.com",
+          permission_level: level,
+        }),
+        conv("private_session", "Claude Code"),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("shared_session").closest("li")!;
+      const indicator = within(sharedRow).getByRole("img", { name: "Shared session" });
+      expect(indicator).toHaveAttribute("title", "Shared with you");
+      expect(indicator).toHaveClass("w-6", "justify-center");
+      expect(indicator).toHaveClass("absolute", "right-1");
+      expect(
+        within(screen.getByText("private_session").closest("li")!).queryByRole("img"),
+      ).toBeNull();
+    },
+  );
+
+  it("keeps the session state rightmost when a shared icon is also present", () => {
+    mockConversations([
+      conv("shared_running", "Claude Code", {
+        owner: "other@example.com",
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+    selectSessionFilter("all");
+
+    const row = screen.getByText("shared_running").closest("li")!;
+    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-8");
+    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
+  });
+
+  it("does not mark the viewer's own sessions or sessions without ownership metadata", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_session", "Claude Code", { owner: "viewer@example.com" }),
+        conv("null_owner", "Claude Code", { owner: null }),
+        conv("missing_owner", "Claude Code"),
+      ]);
+      renderSidebar();
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  it("keeps the shared indicator on pinned sessions across filters", () => {
+    mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
+    seedPins(["shared_pin"]);
+    renderSidebar();
+
+    for (const filter of ["mine", "shared", "all", "archived"] as const) {
+      selectSessionFilter(filter);
+      const pinned = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinned).getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+    }
+  });
+
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
     renderSidebar();
@@ -364,6 +441,22 @@ describe("Sidebar session list", () => {
     const label = screen.getByText("debug the login redirect");
     expect(label).toHaveClass("italic", "text-muted-foreground");
     expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
+  });
+
+  it("renders a provisional (temp:) row as a bare navigable link with no mutating actions", () => {
+    // A client-only temp row has no server session, so its per-row mutations
+    // (kebab: rename/delete/archive/move/share) must be suppressed — invoking
+    // them would POST to /v1/sessions/temp:* (Polly B-3).
+    mockConversations([
+      conv("temp:0a1b2c3d", "Claude Code", { title: "new chat", provisional: true }),
+    ]);
+    renderSidebar();
+
+    // Navigable: the row is still a link into the (soon-to-exist) conversation.
+    const link = screen.getByRole("link", { name: /new chat/ });
+    expect(link).toHaveAttribute("href", expect.stringContaining("/c/temp:0a1b2c3d"));
+    // But no action affordances until it's rekeyed to the real id.
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).not.toBeInTheDocument();
   });
 
   it("uses the interface text token for session-list errors", () => {
@@ -782,6 +875,27 @@ describe("Sidebar session list", () => {
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("hides Canvas navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas");
+
+    expect(screen.queryByTestId("canvas-nav")).toBeNull();
+  });
+
+  it("renders and highlights the Canvas nav row without lighting New session", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { canvas: true },
+    });
+
+    const canvas = screen.getByTestId("canvas-nav");
+    expect(canvas).toHaveAttribute("href", "/canvas");
+    expect(canvas).toHaveAttribute("aria-current", "page");
+    expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -1140,6 +1254,253 @@ describe("Sidebar session list", () => {
     await waitFor(() => {
       expect(screen.getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(expected);
     });
+  });
+});
+
+describe("Sidebar failed session indicator", () => {
+  function renderSessionSidebar(initialEntry = "/") {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => {
+      const sidebar = <Sidebar open onClose={vi.fn()} />;
+      return (
+        <QueryClientProvider client={qc}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={sidebar} />
+                <Route path="*" element={sidebar} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>
+      );
+    };
+    const result = render(tree());
+    return { ...result, refresh: () => result.rerender(tree()) };
+  }
+
+  it("replaces an unread dot with the error icon and keeps it after marking read", () => {
+    const session = conv("conv_error", "Codex", {
+      status: "failed",
+      updated_at: 200,
+    });
+    seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+    mockConversations([session]);
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_error/ }).closest("li")!;
+    const badge = within(row).getByRole("img", { name: "Latest message is an error" });
+    expect(badge).toHaveAttribute("data-state", "error");
+    expect(badge.parentElement).toHaveClass("right-1", "w-6", "justify-center");
+    expect(within(row).getByText("(unread)")).toBeInTheDocument();
+    expect(within(row).queryByRole("img", { name: "New messages" })).toBeNull();
+
+    act(() => markConversationSeen(session.id, session.updated_at));
+
+    expect(within(row).queryByText("(unread)")).toBeNull();
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
+  });
+
+  it("keeps the error icon on the active, already-read session", () => {
+    const session = conv("conv_error", "Codex", {
+      status: "failed",
+      updated_at: 200,
+    });
+    seedReadState([{ id: session.id, viewer_last_seen: session.updated_at }]);
+    mockConversations([session]);
+    renderSessionSidebar(`/c/${session.id}`);
+
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).queryByText("(unread)")).toBeNull();
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  it("updates a mounted row when only the session status changes", () => {
+    // Stable project contexts keep unrelated context updates from bypassing
+    // the row's render-field comparator.
+    projectRowsRef.current = [];
+    const session = conv("conv_error", "Codex", {
+      status: "failed",
+      updated_at: 200,
+    });
+    mockConversations([session]);
+    const { refresh } = renderSessionSidebar();
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
+
+    mockConversations([{ ...session, status: "idle" }]);
+    refresh();
+
+    expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
+    expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+
+    mockConversations([{ ...session, status: "failed" }]);
+    refresh();
+
+    expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
+  });
+
+  it.each([
+    { status: "running" as const, pending: 0, expected: "running" },
+    { status: "failed" as const, pending: 2, expected: "awaiting" },
+  ])("lets $expected take precedence over a previous error", ({ status, pending, expected }) => {
+    const session = conv("conv_error", "Codex", { status: "failed" });
+    mockConversations([session]);
+    const { refresh } = renderSessionSidebar();
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
+
+    mockConversations([{ ...session, status, pending_elicitations_count: pending }]);
+    refresh();
+
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", expected);
+    expect(within(row).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+  });
+
+  it.each([
+    { status: "streaming" as const, terminalPending: false },
+    { status: "idle" as const, terminalPending: true },
+  ])("shows startup over a previous error for $status/$terminalPending", (startup) => {
+    const wakingId = `conv_error_retry_${startup.status}_${startup.terminalPending}`;
+    mockConversations([
+      conv(wakingId, "Codex", {
+        status: "failed",
+        updated_at: 200,
+      }),
+      conv("conv_other", "Codex", { status: "failed" }),
+    ]);
+    seedReadState([{ id: wakingId, viewer_last_seen: 199 }]);
+    useChatStore.setState({ conversationId: wakingId, ...startup });
+    renderSidebar();
+
+    const wakingRow = screen.getByRole("link", { name: new RegExp(wakingId) }).closest("li")!;
+    expect(within(wakingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+    const otherRow = screen.getByRole("link", { name: "conv_other" }).closest("li")!;
+    expect(within(otherRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  it("shows the error icon on a pinned session", () => {
+    seedPins(["conv_error"]);
+    mockConversations([conv("conv_error", "Codex", { status: "failed" })]);
+    renderSidebar();
+
+    const pinnedSection = screen.getByRole("button", { name: /^Pinned/ }).closest("section")!;
+    const row = within(pinnedSection).getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  describe.each(["regular", "pinned"] as const)("%s session error explanation", (surface) => {
+    async function openExplanation(state: "error" | "running" | "awaiting" | "starting") {
+      const id = `conv_hint_${surface}_${state}`;
+      const pinned = surface === "pinned";
+      if (pinned) {
+        projectsMock.push("Customer X");
+        seedPins([id]);
+      }
+      mockConversations([
+        conv(id, "Codex", {
+          status: state === "running" ? "running" : "failed",
+          pending_elicitations_count: state === "awaiting" ? 1 : 0,
+          labels: pinned ? { omni_project: "Customer X" } : {},
+        }),
+      ]);
+      if (state === "starting") {
+        useChatStore.setState({ conversationId: id, status: "streaming" });
+      }
+      renderSidebar();
+
+      const row = screen.getByRole("link", { name: id });
+      expect(within(row.closest("li")!).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        state,
+      );
+      if (pinned) fireEvent.focus(row);
+      else fireEvent.pointerMove(row, { pointerType: "mouse" });
+      return screen.findByTestId(pinned ? "pinned-project-flyout" : "session-tooltip-content");
+    }
+
+    it("explains the error through the row's existing hover surface", async () => {
+      const content = await openExplanation("error");
+      expect(content).toHaveTextContent("Latest message is an error");
+      const hint = content.querySelector("p.text-destructive");
+      expect(hint).toHaveTextContent("Latest message is an error");
+      expect(hint?.querySelector("svg.lucide-circle-alert")).toHaveAttribute("aria-hidden", "true");
+    });
+
+    it.each(["running", "awaiting", "starting"] as const)(
+      "omits an old error explanation while the session is %s",
+      async (state) => {
+        const content = await openExplanation(state);
+        expect(content).not.toHaveTextContent("Latest message is an error");
+      },
+    );
+  });
+});
+
+describe("Sidebar idle latest-message error", () => {
+  beforeEach(() => {
+    vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
+      items: [
+        {
+          id: "native_error",
+          response_id: "response1",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: "API Error: Request rejected (429)" }],
+        },
+      ],
+      hasMore: true,
+    });
+  });
+  afterEach(() => vi.mocked(sessionsApi.fetchSessionItemsPage).mockRestore());
+
+  it("shows the icon for an unopened idle session and keeps it after marking read", async () => {
+    const session = conv("conv_idle_error", "Claude Code", { status: "idle", updated_at: 200 });
+    seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+    mockConversations([session]);
+    renderSidebar();
+    const row = screen.getByRole("link", { name: /conv_idle_error/ }).closest("li")!;
+    const badge = await within(row).findByRole("img", { name: "Latest message is an error" });
+    expect(badge).toHaveAttribute("data-state", "error");
+    expect(badge.querySelector("svg")).toHaveClass("text-destructive", "size-3.5");
+    expect(within(row).getByText("(unread)")).toBeInTheDocument();
+    act(() => markConversationSeen(session.id, session.updated_at));
+    expect(within(row).queryByText("(unread)")).toBeNull();
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
+    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an idle message error on a collapsed project's marker", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_idle_error", "Claude Code", {
+        status: "idle",
+        labels: { omni_project: "Customer X" },
+      }),
+    ]);
+    renderSidebar();
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    await within(header).findByRole("img", { name: "Latest message is an error" });
+    fireEvent.click(header);
+    const row = screen.getByRole("link", { name: "conv_idle_error" }).closest("li")!;
+    expect(
+      within(row).getByRole("img", { name: "Latest message is an error" }),
+    ).toBeInTheDocument();
+    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2028,6 +2389,126 @@ describe("Sidebar project sections", () => {
 // A collapsed project bubbles up its hidden rows' marker, using the same
 // SessionStateBadge a row shows. Only while collapsed.
 describe("Sidebar collapsed project marker", () => {
+  it("surfaces an error ahead of unread messages and moves it to the expanded row", () => {
+    projectsMock.push("Customer X");
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([
+      conv("conv_error", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "failed",
+      }),
+      conv("conv_unread", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "idle",
+        updated_at: 200,
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(within(header).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+
+    fireEvent.click(header);
+
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(within(header).queryByTestId("session-state-badge")).toBeNull();
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(
+      within(row).getByRole("img", { name: "Latest message is an error" }),
+    ).toBeInTheDocument();
+  });
+
+  it.each(["failed", "idle"] as const)(
+    "prioritizes a running session over an unread $0 sibling",
+    (status) => {
+      projectsMock.push("Customer X");
+      seedReadState([
+        { id: "conv_other", viewer_last_seen: 199 },
+        { id: "conv_running", viewer_last_seen: 199 },
+      ]);
+      mockConversations([
+        conv("conv_other", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status,
+          updated_at: 200,
+        }),
+        conv("conv_running", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status: "running",
+          updated_at: 200,
+        }),
+      ]);
+      renderSidebar();
+
+      const header = screen.getByRole("button", { name: /^Customer X/ });
+      expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "running",
+      );
+      expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+    },
+  );
+
+  it.each([
+    { status: "streaming" as const, terminalPending: false },
+    { status: "idle" as const, terminalPending: true },
+  ])("prioritizes startup over a previous error for $status/$terminalPending", (startup) => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_error", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "failed",
+      }),
+    ]);
+    useChatStore.setState({ conversationId: "conv_error", ...startup });
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+
+    act(() => useChatStore.setState({ status: "idle", terminalPending: false }));
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  it("prioritizes a pending approval over running and errored sessions", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_error", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "failed",
+      }),
+      conv("conv_awaiting", "Codex", {
+        labels: { omni_project: "Customer X" },
+        pending_elicitations_count: 2,
+      }),
+      conv("conv_running", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "awaiting",
+    );
+    expect(
+      within(header).getByRole("img", { name: "2 approval prompts waiting" }),
+    ).toBeInTheDocument();
+    expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+  });
+
   it("shows the row's session-state badge on a collapsed project", () => {
     projectsMock.push("Customer X");
     mockConversations([

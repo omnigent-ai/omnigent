@@ -115,6 +115,8 @@ interface BlockRendererProps {
   lastActivityAtS?: number;
   /** Whether this final bubble is still part of a visible active turn. */
   showsWorking?: boolean;
+  /** Start a fold containing a mid-turn user interjection open. */
+  defaultExpanded?: boolean;
 }
 
 /** The subset of {@link BlockRendererProps} the fold decision reads. */
@@ -127,6 +129,7 @@ type FoldInputs = Pick<
   | "isLastAssistant"
   | "hasPendingElicitation"
   | "showsWorking"
+  | "defaultExpanded"
 >;
 
 /**
@@ -206,6 +209,7 @@ function hasFoldableShape(
  * answer to anchor them to, that costs nothing visible.
  */
 export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
+  if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
   const partition = partitionTurn(inputs.items);
@@ -235,6 +239,7 @@ export function BlockRenderer({
   hasPendingElicitation = false,
   lastActivityAtS,
   showsWorking = false,
+  defaultExpanded = false,
   onRetryError,
 }: BlockRendererProps) {
   const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
@@ -318,7 +323,11 @@ export function BlockRenderer({
   if (showFold) {
     return (
       <>
-        <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
+        <TurnWorkedFold
+          workedForS={workedForS}
+          animateCollapse={animateCollapse}
+          defaultOpen={defaultExpanded}
+        >
           {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
         {exempt.map(({ item, index }) =>
@@ -534,19 +543,27 @@ function isProvisionalTrace(items: RenderItem[]): boolean {
 function TurnWorkedFold({
   workedForS,
   animateCollapse,
+  defaultOpen,
   children,
 }: {
   workedForS?: number;
   animateCollapse: boolean;
+  defaultOpen: boolean;
   children: ReactNode;
 }) {
   const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
-  const [open, setOpen] = useState(animateCollapse);
+  const [open, setOpen] = useState(animateCollapse || defaultOpen);
+  const userChangedOpenRef = useRef(false);
+  useLayoutEffect(() => {
+    // History hydration can identify an interjection after this fold mounted.
+    // Honor that late default unless the user has already made their own choice.
+    if (defaultOpen && !userChangedOpenRef.current) setOpen(true);
+  }, [defaultOpen]);
   useEffect(() => {
-    if (!animateCollapse) return;
+    if (!animateCollapse || defaultOpen) return;
     const frame = requestAnimationFrame(() => setOpen(false));
     return () => cancelAnimationFrame(frame);
-  }, [animateCollapse]);
+  }, [animateCollapse, defaultOpen]);
 
   // A USER-initiated expand (never the animateCollapse mount-close)
   // opens INSTANTLY — no height animation — and snaps the fold row to
@@ -564,6 +581,7 @@ function TurnWorkedFold({
   const scrollOnOpenRef = useRef(false);
   const scrollLock = useContext(ConversationScrollLockContext);
   const handleOpenChange = (next: boolean) => {
+    userChangedOpenRef.current = true;
     scrollOnOpenRef.current = next;
     setUserOpened(next);
     setOpen(next);

@@ -41,11 +41,10 @@
 #   qwen      → npm @qwen-code/qwen-code
 #   goose     → vendor installer (aaif-goose/goose download_cli.sh), default
 #               pin 1.38.0 (mirroring _GOOSE_MIN_VERSION)
-#   jcode     → vendor installer (1jehuang/jcode install.sh) — jcode runs as a
-#               user-configured ACP agent (acp.agents in config.yaml), not a
-#               builtin harness; a deployment that runs jcode that way still
-#               needs the binary on the managed host's PATH, since the sandbox
-#               cannot run the installer at session start
+#   jcode     → vendor installer (1jehuang/jcode install.sh) — jcode is a
+#               builtin harness (omnigent/acp_cli_harnesses.py); a managed
+#               deployment still needs the binary on the host's PATH, since
+#               the sandbox cannot run the installer at session start
 #   cursor    → vendor installer (cursor.com/install) — always fetches the
 #               latest agent build, so VERSION pins are rejected
 #   kimi      → vendor installer (code.kimi.com/kimi-code/install.sh)
@@ -60,8 +59,9 @@
 #
 # Supply-chain note: only agy here (and kiro-cli baked in the Dockerfile) is
 # pinned to an immutable asset + sha256. The vendor-installer rows (goose,
-# jcode, cursor, kimi) run the harness's own `curl | bash` off mutable refs and
-# are checked only with `--version`; cursor cannot be pinned at all.
+# jcode, cursor, kimi) run the harness's own curl-piped install script off
+# mutable refs and are checked only with `--version`; cursor cannot be
+# pinned at all.
 # Off-by-default bounds this, but a deployment needing kiro-cli-grade integrity
 # should pin + verify in its own image rather than rely on a name here.
 #

@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -23,16 +24,19 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
+  CircleAlertIcon,
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
+  GitForkIcon,
   InboxIcon,
   ListChecksIcon,
   ListFilterIcon,
   LaptopIcon,
+  LayoutDashboardIcon,
   Loader2Icon,
   MailIcon,
   MessageCircleDashedIcon,
@@ -51,6 +55,7 @@ import {
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
+  UsersIcon,
   WalletIcon,
   XIcon,
 } from "lucide-react";
@@ -139,6 +144,7 @@ import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
+import { showArchiveUndoToast } from "./archiveUndoToast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -149,21 +155,21 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
-import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { useSessionErrors } from "@/hooks/useSessionErrors";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
-  isExplicitlyUnread,
   markConversationUnread,
-  useUnseenTick,
+  useConversationReadState,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
@@ -174,6 +180,8 @@ import {
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
+import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
 import { NewProjectButton } from "./NewProjectButton";
@@ -192,17 +200,21 @@ import {
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
+  isOwnedByViewer,
+  sessionBelongsToProject,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
+import { getEmbedRoot } from "../lib/host";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
-// right-1 edge in every viewport: on desktop it fades on hover so the pin +
-// kebab take its place; on mobile those controls are gone, so the badge simply
-// holds the right edge.
+// trailing icon edge in every viewport: on desktop it fades on hover so the pin
+// + kebab take its place; on mobile those controls are gone, so the badge holds
+// that edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -235,6 +247,10 @@ const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
+// Maps a first-class project id → its chosen emoji icon (only projects that
+// have one), sharing the same list-level lookup as the names map so a row can
+// surface the real project glyph in the pinned flyout without its own query.
+const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
@@ -242,6 +258,9 @@ const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 const IsMobileContext = createContext<boolean>(false);
 const ViewerIdContext = createContext<string | null>(null);
 const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
+const RowActivationContext = createContext<
+  (id: string, event: MouseEvent<HTMLAnchorElement>) => void
+>(() => {});
 // Rows report an in-progress inline-rename edit here so ConversationList can
 // hold the sort order for the edit's whole duration — the pointer often
 // leaves the list while typing, and a reorder then would shuffle rows around
@@ -259,28 +278,38 @@ function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...a
 
 function SidebarRowDataProvider({
   projectNamesById,
+  projectIconsById,
   hostsById,
   isMobile,
   viewerId,
   serverInfo,
+  onActivate,
   children,
 }: {
   projectNamesById: Map<string, string>;
+  projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
+  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
   children: ReactNode;
 }) {
   return (
     <ProjectNamesContext.Provider value={projectNamesById}>
-      <HostsByIdContext.Provider value={hostsById}>
-        <IsMobileContext.Provider value={isMobile}>
-          <ViewerIdContext.Provider value={viewerId}>
-            <ServerInfoContext.Provider value={serverInfo}>{children}</ServerInfoContext.Provider>
-          </ViewerIdContext.Provider>
-        </IsMobileContext.Provider>
-      </HostsByIdContext.Provider>
+      <ProjectIconsContext.Provider value={projectIconsById}>
+        <HostsByIdContext.Provider value={hostsById}>
+          <IsMobileContext.Provider value={isMobile}>
+            <ViewerIdContext.Provider value={viewerId}>
+              <ServerInfoContext.Provider value={serverInfo}>
+                <RowActivationContext.Provider value={onActivate}>
+                  {children}
+                </RowActivationContext.Provider>
+              </ServerInfoContext.Provider>
+            </ViewerIdContext.Provider>
+          </IsMobileContext.Provider>
+        </HostsByIdContext.Provider>
+      </ProjectIconsContext.Provider>
     </ProjectNamesContext.Provider>
   );
 }
@@ -357,6 +386,7 @@ interface SidebarProps {
 function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
+  isCanvasPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
@@ -368,6 +398,7 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
+  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
@@ -375,6 +406,7 @@ function useActiveNavItem(): {
   const isNewSessionRoute =
     activeConversationId == null &&
     !isInboxPage &&
+    !isCanvasPage &&
     !isTasksPage &&
     !isUsagePage &&
     !isExtensionRoute;
@@ -389,6 +421,7 @@ function useActiveNavItem(): {
   return {
     isNewChatPage,
     isInboxPage,
+    isCanvasPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -412,18 +445,6 @@ function useActiveNavItem(): {
  *     scrollback is fine; users typically want the conversations list
  *     to stay visible while they switch around.
  */
-/** Toast body shown after archiving a session — links to its new home. */
-function ArchivedToast() {
-  return (
-    <span>
-      View archived sessions in{" "}
-      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
-        Settings
-      </Link>
-    </span>
-  );
-}
-
 /**
  * Compute the set of IDs to add for a shift-click range selection.
  * Returns null when the range can't be computed (missing anchor or id).
@@ -438,11 +459,6 @@ export function computeShiftSelectRange(
   if (anchorIdx === -1 || targetIdx === -1) return null;
   const [start, end] = anchorIdx < targetIdx ? [anchorIdx, targetIdx] : [targetIdx, anchorIdx];
   return visibleIds.slice(start, end + 1);
-}
-
-/** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
-function showArchivedToast() {
-  showToast(<ArchivedToast />);
 }
 
 /** Stable empty array for the pinned-conversations fallback (referential
@@ -554,6 +570,7 @@ function SidebarImpl({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -737,6 +754,7 @@ function SidebarImpl({
   const {
     isNewChatPage,
     isInboxPage,
+    isCanvasPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -820,6 +838,33 @@ function SidebarImpl({
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
 
+  // The mobile drawer is a `fixed inset-0` overlay, so the iOS shell-lock
+  // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
+  // doesn't lift it above the soft keyboard. Pad the drawer's bottom by the
+  // keyboard inset so every session row can still scroll into view while an
+  // inline rename holds the keyboard up. No-op off iOS / keyboard closed.
+  const keyboardInset = useIOSNativeKeyboardInset(effectiveOpen);
+
+  // While the peek card's entry animation is still fading it in, the card is
+  // (nearly) invisible yet already covers the toggle whose hover armed it —
+  // taking pointer events then would swallow a click aimed at that toggle,
+  // landing it on whatever sidebar content sits under the pointer instead.
+  // Stay click-through until the composed entry animation completes.
+  // Children's animations bubble too, so only the card's own end unlocks it.
+  const [peekInteractive, setPeekInteractive] = useState(false);
+  useEffect(() => {
+    if (!peek) {
+      setPeekInteractive(false);
+      return;
+    }
+    // Do not leave the card click-through if animationend is suppressed or missed.
+    const fallback = setTimeout(() => setPeekInteractive(true), 200);
+    return () => clearTimeout(fallback);
+  }, [peek]);
+  const prefersReducedMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
   // While peeking, leaving the card closes it after a short grace period;
   // re-entering before that fires cancels the close so a wobble doesn't
   // dismiss it.
@@ -869,6 +914,9 @@ function SidebarImpl({
       )}
       <aside
         aria-label="Conversations"
+        onAnimationEnd={(event) => {
+          if (event.target === event.currentTarget) setPeekInteractive(true);
+        }}
         onPointerEnter={cancelPeekClose}
         onPointerLeave={() => {
           if (!peek) return;
@@ -931,10 +979,15 @@ function SidebarImpl({
           // overlay rather than a push.
           peek &&
             "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+          // Click-through while fading in (see peekInteractive above): the
+          // click falls through to the header toggle underneath, which pins
+          // the sidebar open — what the user aimed for.
+          peek && !prefersReducedMotion && !peekInteractive && "pointer-events-none",
         )}
         style={
           {
             "--sidebar-width": `${sidebarWidth}px`,
+            ...(keyboardInset > 0 ? { paddingBottom: keyboardInset } : null),
             // Track the finger: map the 0→1 open fraction to translateX
             // -100%→0% and kill the transition so it follows the drag exactly.
             ...(dragging
@@ -1122,6 +1175,17 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              {canvasEnabled && (
+                <PrimaryNavLink
+                  to="/canvas"
+                  label="Canvas"
+                  icon={LayoutDashboardIcon}
+                  active={isCanvasPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.canvas"
+                  testId="canvas-nav"
+                />
+              )}
               <ExtensionPrimaryNavigation
                 activePageId={activeExtensionPageId}
                 onNavigate={onNavClick}
@@ -1291,7 +1355,6 @@ function ProjectFolder({
   activeConversationId,
   expanded,
   active,
-  marker,
   onToggleCollapsed,
   pinnedConversationIds,
   activeOverride,
@@ -1321,7 +1384,6 @@ function ProjectFolder({
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
-  marker: SessionState | null;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
   activeOverride: ActiveChatOverride | null;
@@ -1359,6 +1421,11 @@ function ProjectFolder({
       frozenSortKeys,
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
+  const errors = useSessionErrors(conversations);
+  const startingConversationId = useChatStore((s) =>
+    s.status === "streaming" || s.terminalPending ? s.conversationId : null,
+  );
+  const marker = projectMarkerState(conversations, errors, startingConversationId);
 
   // Publish the folder's rendered rows upward so projects-scope bulk selection
   // resolves them (the parent sources its action set from these, not the global
@@ -1510,50 +1577,6 @@ interface ConversationListProps {
   getVisibleIdsRef: RefObject<() => string[]>;
 }
 
-// Ownership drives the My-vs-Shared split and every owner-only row action.
-// It is derived purely from the session's `owner` (the creator's user id),
-// NOT from `permission_level` — the sidebar carries no effective-level info,
-// so the server can list rows without resolving the caller's grant per
-// session. A `null`/absent owner (permissions disabled — the server emits
-// `owner` only when a permission store is wired) reads as owned, matching the
-// prior permissive-on-null stance; otherwise the viewer owns it iff they are
-// the owner. In single-user mode the owner grant is the reserved `"local"`
-// id, and `viewerId` is `"local"` too (see `useViewerId`), so it matches via
-// the equality branch. `viewerId` is `null` until identity resolves — treated
-// as "not the owner" for shared rows so they don't briefly flash into "My
-// sessions" before the id lands.
-function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
-  const owner = conversation.owner ?? null;
-  if (owner === null) return true;
-  return owner === viewerId;
-}
-
-// The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
-// (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
-// grant, which in single-user mode is the reserved `"local"` id — and
-// `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
-// would make the viewer's own sessions read as shared and vanish from the
-// default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
-// identical real email in multi-user mode. It is synchronous (populated once
-// `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
-// cold mount it can still be null for a tick, so we also await
-// `resolveIdentity()` and re-render when it lands. Keeping this reactive
-// (rather than a bare module read) means the My/Shared split settles correctly
-// the moment identity is known, without a manual refresh.
-function useViewerId(): string | null {
-  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
-  useEffect(() => {
-    let cancelled = false;
-    void resolveIdentity().then(() => {
-      if (!cancelled) setViewerId(getCurrentUserId());
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return viewerId;
-}
-
 function ConversationList({
   conversationsQuery,
   scrollContainerRef,
@@ -1608,6 +1631,16 @@ function ConversationList({
     return map;
   }, [projects]);
 
+  // id → emoji icon for rows that want to show the real project glyph (e.g. the
+  // pinned flyout); built alongside the names map and shared the same way.
+  const projectIconsById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of projects) {
+      if (p.id !== null && p.icon) map.set(p.id, p.icon);
+    }
+    return map;
+  }, [projects]);
+
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
   // out from under you. Snapshot is dropped on navigate-away so the
@@ -1618,6 +1651,14 @@ function ConversationList({
   // parent walk loads — a top-level session resolves to itself.
   const activeRootSessionId = useActiveRootSessionId(activeId ?? null);
   const resolvedActiveId = activeRootSessionId ?? activeId ?? null;
+  const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
+  useEffect(() => setOptimisticActiveId(null), [activeId]);
+  const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    setOptimisticActiveId(id);
+  }, []);
+  const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
   useEffect(() => {
     setActiveOverride((prev) => computeNextActiveOverride(activeId, allConversations, prev));
@@ -1705,10 +1746,7 @@ function ConversationList({
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
       const inProject = notArchived.filter(
-        (c) =>
-          isOwnedByViewer(c, viewerId) &&
-          ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-          !pinnedIdSet.has(c.id),
+        (c) => sessionBelongsToProject(c, { id, name }, viewerId) && !pinnedIdSet.has(c.id),
       );
       inProject.forEach((c) => filedIds.add(c.id));
       return {
@@ -2090,10 +2128,12 @@ function ConversationList({
   return (
     <SidebarRowDataProvider
       projectNamesById={projectNamesById}
+      projectIconsById={projectIconsById}
       hostsById={hostsById}
       isMobile={isMobile}
       viewerId={viewerId}
       serverInfo={serverInfo}
+      onActivate={activateRow}
     >
       <DndContext
         sensors={sensors}
@@ -2150,7 +2190,7 @@ function ConversationList({
                     <ConversationSection
                       title="Pinned"
                       conversations={sections.pinned}
-                      activeConversationId={resolvedActiveId}
+                      activeConversationId={displayedActiveId}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Pinned")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
@@ -2209,12 +2249,9 @@ function ConversationList({
                       projectId={group.id}
                       icon={group.icon}
                       windowConversations={group.conversations}
-                      activeConversationId={resolvedActiveId}
+                      activeConversationId={displayedActiveId}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
-                      // Best-effort marker from the globally-loaded window: a
-                      // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
                       onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                       pinnedConversationIds={pinnedConversationIds}
                       activeOverride={activeOverride}
@@ -2250,7 +2287,7 @@ function ConversationList({
                     <ConversationSection
                       title="Sessions"
                       conversations={sections.sessions}
-                      activeConversationId={resolvedActiveId}
+                      activeConversationId={displayedActiveId}
                       emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
@@ -2328,15 +2365,22 @@ function ConversationList({
             )}
           </div>
         </RowEditHoldContext.Provider>
-        {/* The dragged row's preview follows the pointer (rendered in a portal),
-          a compact card showing the session's title. */}
-        <DragOverlay dropAnimation={null}>
-          {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
-              {activeDrag.label}
-            </div>
-          ) : null}
-        </DragOverlay>
+        {/* The dragged row's preview follows the pointer: a compact card showing
+          the session's title. Portaled to <body>: the aside always carries a CSS
+          translate (the mobile slide-in), which makes it the containing block for
+          fixed descendants, so an inline overlay would resolve its viewport
+          coordinates against the aside's box and drift off the cursor whenever
+          the aside sits away from (0,0) — e.g. the floating peek card. */}
+        {createPortal(
+          <DragOverlay dropAnimation={null}>
+            {activeDrag ? (
+              <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
+                {activeDrag.label}
+              </div>
+            ) : null}
+          </DragOverlay>,
+          getEmbedRoot() ?? document.body,
+        )}
       </DndContext>
     </SidebarRowDataProvider>
   );
@@ -2417,29 +2461,36 @@ function UngroupDropZone() {
   );
 }
 
-/**
- * Aggregate the sidebar marker for a project from its conversations, using
- * the same precedence a row uses (awaiting > unseen > running). Returned as a
- * {@link SessionState} so a collapsed project header can render the exact
- * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
- */
-function projectMarkerState(conversations: Conversation[]): SessionState | null {
+/** Surface the most actionable state across a collapsed project's loaded rows. */
+function projectMarkerState(
+  conversations: Conversation[],
+  errors: readonly boolean[],
+  startingConversationId: string | null,
+): SessionState | null {
   let awaiting = 0;
-  let unseen = false;
   let running = false;
-  for (const c of conversations) {
-    const pending = c.pending_elicitations_count ?? 0;
-    if (pending > 0) {
-      awaiting += pending;
+  let starting = false;
+  let error = false;
+  let unseen = false;
+  for (const [i, c] of conversations.entries()) {
+    const state = getSessionState(c, errors[i]);
+    if (state?.kind === "awaiting") {
+      awaiting += state.count;
+    } else if (state?.kind === "running") {
+      running = true;
+    } else if (c.id === startingConversationId) {
+      starting = true;
+    } else if (state?.kind === "error") {
+      error = true;
     } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
       unseen = true;
-    } else if (c.status === "running") {
-      running = true;
     }
   }
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
-  if (unseen) return { kind: "unseen" };
   if (running) return { kind: "running" };
+  if (starting) return { kind: "starting" };
+  if (error) return { kind: "error" };
+  if (unseen) return { kind: "unseen" };
   return null;
 }
 
@@ -3075,6 +3126,7 @@ function ConversationMenuItems({
   moveToProject,
   stopSession,
   setShareOpen,
+  setForkOpen,
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
@@ -3104,6 +3156,7 @@ function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
+  setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
@@ -3211,6 +3264,10 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
+      <C.Item data-testid="fork-conversation" onSelect={() => setForkOpen(true)}>
+        <GitForkIcon className="size-3.5" />
+        Fork
+      </C.Item>
       {isOwner ? (
         <C.Item
           data-testid="rename-conversation"
@@ -3386,12 +3443,23 @@ function ConversationMenuItems({
   );
 }
 
+function SessionErrorHint() {
+  return (
+    <p className="mt-1 flex items-center gap-1.5 text-sm text-destructive">
+      <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
+      <span>Latest message is an error</span>
+    </p>
+  );
+}
+
 function SessionTooltipContent({
   conversation,
   hostsById,
+  hasError,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
+  hasError: boolean;
 }) {
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
@@ -3433,6 +3501,7 @@ function SessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
 }
@@ -3467,6 +3536,10 @@ function ConversationRowImpl({
 }) {
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
+  // A client-only `temp:` row (navigate-first create window): no server session
+  // yet, so per-row mutations are disabled until it's rekeyed to the real id —
+  // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
+  const isProvisionalRow = conversation.provisional === true;
   // Mobile has no real hover, so a tap that navigates would also trip the
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
@@ -3479,6 +3552,7 @@ function ConversationRowImpl({
     if (!isActive) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isActive]);
+  const queryClient = useQueryClient();
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
@@ -3498,6 +3572,7 @@ function ConversationRowImpl({
   // portal), and a passive effect would leave a post-paint frame where churn
   // could reorder — and blur — the just-mounted input before the hold lands.
   const reportRowEditing = useContext(RowEditHoldContext);
+  const activateRow = useContext(RowActivationContext);
   useLayoutEffect(() => {
     if (!isEditing) return;
     reportRowEditing(conversation.id, true);
@@ -3511,6 +3586,7 @@ function ConversationRowImpl({
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
@@ -3560,6 +3636,13 @@ function ConversationRowImpl({
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
+  // First-class projects can carry a chosen emoji; label-only projects have
+  // none, so the flyout falls back to the folder glyph for those.
+  const projectIconsById = useContext(ProjectIconsContext);
+  const projectFlyoutIcon =
+    conversation.project_id != null
+      ? (projectIconsById.get(conversation.project_id) ?? null)
+      : null;
 
   // The title the user just committed. The rename's cache write reaches this
   // row as a prop from the list above, which re-renders a tick after the row's
@@ -3582,10 +3665,13 @@ function ConversationRowImpl({
   const isProvisionalLabel =
     pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
   const hasDraft = useHasSessionDraft(conversation.id);
-  // Recompute unseen state the moment the last-seen map changes (e.g. the
-  // user picks "Mark as unread" on this row) rather than waiting for the
-  // next conversations poll.
-  useUnseenTick();
+  // A write for another conversation leaves this primitive snapshot unchanged,
+  // so useSyncExternalStore skips the heavy row render.
+  const readState = useConversationReadState(
+    conversation.id,
+    conversation.updated_at,
+    conversation.status,
+  );
   // The dot shows when the conversation is content-unseen AND either the
   // row isn't the one you're viewing OR you explicitly marked it unread.
   // `isConversationUnseen` still gates on status, so a *running* turn never
@@ -3593,16 +3679,13 @@ function ConversationRowImpl({
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages =
-    isConversationUnseen(conversation.id, conversation.updated_at, conversation.status) &&
-    (!isActive || isExplicitlyUnread(conversation.id));
+  const hasUnseenMessages = readState.unseen && (!isActive || readState.explicitlyUnread);
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
-  // Badge precedence: a pending approval ("Needs response") outranks the
-  // unread dot — a session that's both unread and awaiting input should
-  // surface the actionable approval tag. The row still renders bold (the
-  // unread signal) via `hasUnseenMessages` below.
-  const derivedState = getSessionState(conversation);
+  // Approvals and failures outrank the unread dot without clearing read state.
+  const errorConversations = useMemo(() => [conversation], [conversation]);
+  const [latestMessageIsError] = useSessionErrors(errorConversations);
+  const derivedState = getSessionState(conversation, latestMessageIsError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -3614,16 +3697,18 @@ function ConversationRowImpl({
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
   const sessionState =
-    derivedState?.kind === "awaiting"
+    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
       ? derivedState
-      : hasUnseenMessages
-        ? { kind: "unseen" as const }
-        : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
+      : isStartingUp
+        ? { kind: "starting" as const }
+        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
-  const hasTrailingIndicator = sessionState !== null || showDraftIndicator;
+  const showSharedIndicator = !isOwner;
+  const hasSessionIndicator = sessionState !== null || showDraftIndicator;
+  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3638,7 +3723,7 @@ function ConversationRowImpl({
   } = useDraggable({
     id: conversation.id,
     data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing,
+    disabled: !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -3725,11 +3810,13 @@ function ConversationRowImpl({
     // session they'd switched to meanwhile. Mirrors confirmDelete.
     if (nextArchived && isActive) navigate("/", { replace: true });
     archive.mutate({ id: conversation.id, archived: nextArchived });
-    // Point the user at where the session went — fire NOW, not in a mutate
-    // onSuccess: the optimistic overlay unmounts this row on the next frame,
-    // and per-call mutate callbacks don't fire once their observer unmounts.
-    // A failed archive reconciles the row back with its own error toast.
-    if (nextArchived) showArchivedToast();
+    // Offer an Undo (and point at where the session went) — fire NOW, not in a
+    // mutate onSuccess: the optimistic overlay unmounts this row on the next
+    // frame, and per-call mutate callbacks don't fire once their observer
+    // unmounts. A failed archive reconciles the row back with its own error
+    // toast. The toast is driven imperatively (module state + app-level
+    // Toaster), so it survives this row unmounting.
+    if (nextArchived) showArchiveUndoToast(queryClient, [conversation]);
   }
 
   function runUnarchive() {
@@ -3782,6 +3869,7 @@ function ConversationRowImpl({
     moveToProject,
     stopSession,
     setShareOpen,
+    setForkOpen,
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
@@ -3806,7 +3894,15 @@ function ConversationRowImpl({
         // reserves only what the badge needs — the same width desktop uses at
         // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting" ? "pr-29" : hasTrailingIndicator ? "pr-8" : "pr-2"),
+          (sessionState?.kind === "awaiting"
+            ? showSharedIndicator
+              ? "pr-36"
+              : "pr-29"
+            : hasSessionIndicator && showSharedIndicator
+              ? "pr-14"
+              : hasTrailingIndicator
+                ? "pr-8"
+                : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3831,11 +3927,13 @@ function ConversationRowImpl({
           onToggleSelected(conversation.id, e.shiftKey);
           return;
         }
+        activateRow(conversation.id, e);
         onClick(e);
       }}
       onDoubleClick={(e) => {
         if (selectionMode) return;
         if (!isOwner) return;
+        if (isProvisionalRow) return; // no rename before the real session exists
         e.preventDefault();
         // The dblclick's own second click was already recorded above, so
         // exactly ONE recent click means the first click landed on a different
@@ -3853,7 +3951,7 @@ function ConversationRowImpl({
     >
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
-      <div className="flex w-full items-center gap-1.5">
+      <div className="flex w-full items-center">
         <span
           className={cn(
             "relative min-w-0 truncate",
@@ -3868,6 +3966,18 @@ function ConversationRowImpl({
       </div>
     </Link>
   );
+
+  // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
+  // context menu, pin, archive, drag) until the real session exists — those
+  // would POST to `/v1/sessions/temp:*`. Rekey to the real id (`hydrateLocal-
+  // Conversation`) drops `provisional` and the full row renders.
+  if (isProvisionalRow) {
+    return (
+      <li ref={rowRef} className="group relative">
+        {rowLink}
+      </li>
+    );
+  }
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
@@ -3893,7 +4003,9 @@ function ConversationRowImpl({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
+              projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
+              hasError={sessionState?.kind === "error"}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -3901,7 +4013,11 @@ function ConversationRowImpl({
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+            <SessionTooltipContent
+              conversation={conversation}
+              hostsById={hostsById}
+              hasError={sessionState?.kind === "error"}
+            />
           </Tooltip>
         )
       ) : projectFlyoutName ? (
@@ -3921,7 +4037,9 @@ function ConversationRowImpl({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
+            projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
+            hasError={sessionState?.kind === "error"}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -3951,7 +4069,11 @@ function ConversationRowImpl({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+          <SessionTooltipContent
+            conversation={conversation}
+            hostsById={hostsById}
+            hasError={sessionState?.kind === "error"}
+          />
         </Tooltip>
       )}
       {selectionMode ? (
@@ -3962,10 +4084,11 @@ function ConversationRowImpl({
             <SquareIcon className="size-4 text-muted-foreground" />
           )}
         </span>
-      ) : hasTrailingIndicator ? (
+      ) : hasSessionIndicator ? (
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
+            "right-1",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
             // the fixed centered box so it lines up under the kebab.
@@ -3986,6 +4109,19 @@ function ConversationRowImpl({
           )}
         </span>
       ) : null}
+      {!selectionMode && showSharedIndicator && (
+        <span
+          role="img"
+          aria-label="Shared session"
+          title="Shared with you"
+          className={cn(
+            "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            hasSessionIndicator ? "right-8" : "right-1",
+          )}
+        >
+          <UsersIcon className="size-3.5" aria-hidden="true" />
+        </span>
+      )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.
@@ -4124,6 +4260,17 @@ function ConversationRowImpl({
           sessionId={conversation.id}
           open={shareOpen}
           onOpenChange={setShareOpen}
+        />
+      )}
+      {forkOpen && (
+        <ForkSessionDialog
+          sourceSessionId={conversation.id}
+          sourceTitle={conversation.title}
+          sourceWorkspace={conversation.workspace}
+          sourceHostId={conversation.host_id}
+          sourceGitBranch={conversation.git_branch}
+          open
+          onOpenChange={setForkOpen}
         />
       )}
       <Dialog
@@ -4306,6 +4453,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "project_id",
   "owner",
   "pending_elicitations_count",
+  "provisional",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
@@ -4346,11 +4494,15 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
 function PinnedProjectFlyoutContent({
   title,
   projectName,
+  projectIcon,
   gitBranch,
+  hasError,
 }: {
   title: string;
   projectName: string;
+  projectIcon: string | null;
   gitBranch: string | null;
+  hasError: boolean;
 }) {
   return (
     <HoverCardContent
@@ -4365,7 +4517,7 @@ function PinnedProjectFlyoutContent({
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <FolderIcon className="size-3.5 shrink-0" />
+        <ProjectRowIcon icon={projectIcon} />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (
@@ -4377,6 +4529,7 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
+      {hasError && <SessionErrorHint />}
     </HoverCardContent>
   );
 }
@@ -5051,6 +5204,7 @@ function BulkActionBar({
   onProjectAssigned?: (projectName: string) => void;
 }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
@@ -5157,6 +5311,10 @@ function BulkActionBar({
       navigate("/", { replace: true });
     onDeselectAll();
     bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
+    // Offer Undo for the whole batch. Fire now, before this bar unmounts with
+    // the cleared selection; the toast is driven by module state + the
+    // app-level Toaster, so it outlives this component.
+    showArchiveUndoToast(queryClient, nonArchivedSelected);
   }
 
   function handleUnarchive() {

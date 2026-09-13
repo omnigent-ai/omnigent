@@ -1,7 +1,7 @@
 """Tests for native-Codex provider routing (configure harnesses parity).
 
 Covers :func:`omnigent.inner.codex_executor._provider_codex_config_overrides`
-and :func:`omnigent.codex_native_app_server.resolve_native_codex_launch` —
+and :func:`omnigent.harnesses.codex_native.app_server.resolve_native_codex_launch` —
 the path that makes a native Codex terminal route through a ``configure
 harness`` provider just like the in-process codex harness, instead of only
 the Databricks ucode profile. Providers are constructed via the real config
@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.codex_native_app_server import resolve_native_codex_launch
 from omnigent.errors import OmnigentError
+from omnigent.harnesses.codex_native.app_server import resolve_native_codex_launch
 from omnigent.inner.codex_executor import _provider_codex_config_overrides
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 

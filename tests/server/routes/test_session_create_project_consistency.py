@@ -152,9 +152,11 @@ async def test_unknown_and_unowned_project_are_404(
         assert "Project not found" in response.text
 
 
-async def test_workspace_mismatch_warns_and_strict_mode_escalates(
+async def test_workspace_outside_configured_root_is_allowed_silently(
     project_create_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A per-session working directory outside the project root is a deliberate
+    choice, not a mismatch — no warning, and strict mode does not reject it."""
     project_id = await _project(
         project_create_client,
         {"agent_id": CUSTOM_AGENT_ID, "workspace": "/work/project"},
@@ -166,11 +168,14 @@ async def test_workspace_mismatch_warns_and_strict_mode_escalates(
     }
     response = await project_create_client.post("/v1/sessions", json=payload, headers=_headers())
     assert response.status_code == 201, response.text
-    assert response.json()["warnings"][0]["code"] == "project_workspace_mismatch"
+    assert "warnings" not in response.json()
 
+    # Strict mode still gates other mismatches (e.g. agent), but a differing
+    # workspace no longer produces a warning to escalate.
     monkeypatch.setenv("OMNIGENT_STRICT_PROJECT_SESSION_CREATE", "1")
     response = await project_create_client.post("/v1/sessions", json=payload, headers=_headers())
-    assert response.status_code == 400
+    assert response.status_code == 201, response.text
+    assert "warnings" not in response.json()
 
 
 async def test_builtin_agent_mismatch_warning_surfaces(
@@ -430,7 +435,7 @@ async def test_explicit_null_workspace_is_not_defaulted(
     assert response.json()["workspace"] is None
 
 
-async def test_git_default_fill_and_workspace_parent_traversal_warning(db_uri: str) -> None:
+async def test_git_default_fill_with_differing_workspace_emits_no_warning(db_uri: str) -> None:
     project_store = SqlAlchemyProjectStore(db_uri)
     project = project_store.create(
         "487b7cb7ac30abf4debfaa578d052ec6",
@@ -446,14 +451,16 @@ async def test_git_default_fill_and_workspace_parent_traversal_warning(db_uri: s
         body=ProjectSessionCreateRequest(
             project_id=project.id,
             host_id="host_abc",
-            workspace="/work/project/../other",
+            workspace="/work/other",
         ),
         user_id=ALICE,
         project_store=project_store,
     )
+    # The omitted git block is default-filled from config; an explicit workspace
+    # outside the project root is a deliberate choice and emits no warning.
     assert resolved.body.git is not None
     assert resolved.body.git.branch_name == "feature/project"
-    assert resolved.warnings[0]["code"] == "project_workspace_mismatch"
+    assert resolved.warnings == ()
 
 
 async def test_multipart_create_defaults_workspace_and_files_atomically(

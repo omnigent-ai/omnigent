@@ -147,7 +147,7 @@ def _print_ready_banner(provider: str, sandbox_id: str, server_url: str) -> None
     ui.console.print()
     ui.success("Sandbox ready.")
     ui.console.print()
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     ui.kv("Sandbox", f"{sandbox_id}  (provider: {provider})")
     # Display form (workspace /omnigent URL); the suggested command below

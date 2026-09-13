@@ -32,6 +32,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     build_job_manifest,
     build_token_secret_manifest,
 )
+from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 _TOKEN = "launch-token-xyz"
 _MANIFEST_KW = {
@@ -51,6 +52,9 @@ _MANIFEST_KW = {
 
 # Minimal valid host_config exercised by the injection tests below.
 _HOST_CONFIG: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+
+# The writable-HOME emptyDir as rendered with the default sizeLimit.
+_BOUNDED_HOME_VOLUME = {"name": "home", "emptyDir": {"sizeLimit": k8s._HOME_SIZE_LIMIT_DEFAULT}}
 
 
 def _pod_spec(manifest: dict) -> dict:
@@ -101,9 +105,10 @@ def test_build_job_manifest_has_no_liveness_probe() -> None:
 def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> None:
     """The init container makes the workspace and clones the repo before the host."""
     manifest = build_job_manifest(
-        **{**_MANIFEST_KW, "clone_dir": "/home/omnigent/workspace/repo"},
-        repo_url="https://github.com/org/repo.git",
-        repo_branch="main",
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/repo.git", branch="main", repo_name="repo")
+        ],
     )
     init = _pod_spec(manifest)["initContainers"]
     assert len(init) == 1
@@ -123,6 +128,44 @@ def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> No
     )
 
 
+def test_build_job_manifest_clones_multiple_repos_as_parallel_siblings() -> None:
+    """Several repos → each clones into its own sibling dir, backgrounded (parallel)."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/a.git", branch=None, repo_name="a"),
+            RepoWorkspace(url="https://github.com/org/b.git", branch="main", repo_name="b"),
+        ],
+    )
+    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    assert "https://github.com/org/a.git /home/omnigent/workspace/a" in script
+    assert (
+        "--branch main --single-branch -- https://github.com/org/b.git "
+        "/home/omnigent/workspace/b" in script
+    )
+    # Both clones are backgrounded and joined, and the broker is wired ONCE
+    # (a single `python3 -c` line configures the helper for every clone).
+    assert script.count(" & pids=") == 2
+    assert 'for p in $pids; do wait "$p" || rc=1; done' in script
+    assert script.count("python3 -c") == 1
+
+
+def test_build_job_manifest_disambiguates_same_named_repos() -> None:
+    """Two repos with the same last-segment name clone into owner-qualified dirs,
+    not one colliding directory that would fail the concurrent clone."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org-a/api", branch=None, repo_name="api"),
+            RepoWorkspace(url="https://github.com/org-b/api", branch=None, repo_name="api"),
+        ],
+    )
+    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    assert "https://github.com/org-a/api /home/omnigent/workspace/org-a__api" in script
+    assert "https://github.com/org-b/api /home/omnigent/workspace/org-b__api" in script
+    assert "workspace/api " not in script  # no plain colliding dir
+
+
 def test_build_job_manifest_without_repo_has_no_clone() -> None:
     """No repo → the init container only makes the workspace, no git clone."""
     manifest = build_job_manifest(**_MANIFEST_KW)
@@ -139,8 +182,10 @@ def test_build_job_manifest_without_repo_has_no_clone() -> None:
 def test_build_job_manifest_host_config_is_written_by_init_container() -> None:
     """host_config rides the init container script, after mkdir/clone, before the host."""
     manifest = build_job_manifest(
-        **{**_MANIFEST_KW, "clone_dir": "/home/omnigent/workspace/repo"},
-        repo_url="https://github.com/org/repo.git",
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")
+        ],
         host_config=_HOST_CONFIG,
     )
     spec = _pod_spec(manifest)
@@ -287,6 +332,27 @@ def test_build_job_manifest_node_selector_can_override_arch() -> None:
     assert selector["disktype"] == "ssd"
 
 
+def test_build_job_manifest_omits_tolerations_by_default() -> None:
+    """No tolerations → no tolerations key: byte-compatible with pre-tolerations manifests."""
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    assert "tolerations" not in _pod_spec(manifest)
+
+
+def test_build_job_manifest_tolerations_land_on_the_pod_spec_verbatim() -> None:
+    """Normalized toleration entries reach spec.tolerations verbatim."""
+    tolerations = [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        },
+        {"operator": "Exists"},
+    ]
+    manifest = build_job_manifest(**{**_MANIFEST_KW, "tolerations": tolerations})
+    assert _pod_spec(manifest)["tolerations"] == tolerations
+
+
 def test_build_job_manifest_omits_runtime_class_by_default() -> None:
     """No runtime_class → no runtimeClassName key: the cluster default runtime."""
     manifest = build_job_manifest(**_MANIFEST_KW)
@@ -297,6 +363,66 @@ def test_build_job_manifest_runtime_class_sets_runtime_class_name() -> None:
     """An operator runtime_class lands verbatim as spec.runtimeClassName."""
     manifest = build_job_manifest(**{**_MANIFEST_KW, "runtime_class": "kata"})
     assert _pod_spec(manifest)["runtimeClassName"] == "kata"
+
+
+def test_build_job_manifest_home_emptydir_is_bounded_by_default() -> None:
+    """
+    The writable-HOME emptyDir carries a sizeLimit (8Gi) out of the box: an
+    unbounded emptyDir lets one sandbox push its node into disk pressure, and
+    the kubelet then evicts by node-wide ranking — innocent Pods first.
+    """
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    volumes = {v["name"]: v for v in _pod_spec(manifest)["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {"sizeLimit": "8Gi"}}
+    assert k8s._HOME_SIZE_LIMIT_DEFAULT == "8Gi"
+
+
+def test_build_job_manifest_home_size_limit_override_lands_on_the_emptydir() -> None:
+    """An operator home_size_limit replaces the default sizeLimit verbatim."""
+    manifest = build_job_manifest(**_MANIFEST_KW, home_size_limit="20Gi")
+    volumes = {v["name"]: v for v in _pod_spec(manifest)["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {"sizeLimit": "20Gi"}}
+
+
+def test_build_job_manifest_home_size_limit_none_renders_unbounded_emptydir() -> None:
+    """An explicit None (config `home_size_limit: null`) restores the unbounded emptyDir."""
+    manifest = build_job_manifest(**_MANIFEST_KW, home_size_limit=None)
+    volumes = {v["name"]: v for v in _pod_spec(manifest)["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+
+
+def test_resolve_pod_resources_defaults_leave_ephemeral_storage_unset() -> None:
+    """No built-in ephemeral-storage: an omitted field stays out of the manifest
+    so a namespace LimitRange can default it."""
+    resources = k8s._resolve_pod_resources(None)
+    assert resources == {
+        "requests": {"cpu": k8s._SANDBOX_CPU_REQUEST, "memory": k8s._SANDBOX_MEMORY_REQUEST},
+        "limits": {"cpu": k8s._SANDBOX_CPU_LIMIT, "memory": k8s._SANDBOX_MEMORY_LIMIT},
+    }
+    assert "ephemeral-storage" not in resources["requests"]
+    assert "ephemeral-storage" not in resources["limits"]
+
+
+def test_resolve_pod_resources_forwards_ephemeral_storage_in_both_tiers() -> None:
+    """A configured ephemeral-storage request / limit reaches the container resources."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        resources={
+            "requests": {"ephemeral-storage": "2Gi"},
+            "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
+        },
+    )
+    host = _pod_spec(manifest)["containers"][0]
+    assert host["resources"]["requests"] == {
+        "cpu": k8s._SANDBOX_CPU_REQUEST,
+        "memory": k8s._SANDBOX_MEMORY_REQUEST,
+        "ephemeral-storage": "2Gi",
+    }
+    assert host["resources"]["limits"] == {
+        "cpu": k8s._SANDBOX_CPU_LIMIT,
+        "memory": "8Gi",
+        "ephemeral-storage": "8Gi",
+    }
 
 
 def test_build_job_manifest_pvc_mounts_land_on_host_container_only() -> None:
@@ -310,7 +436,7 @@ def test_build_job_manifest_pvc_mounts_land_on_host_container_only() -> None:
     )
     spec = _pod_spec(manifest)
     volumes = {v["name"]: v for v in spec["volumes"]}
-    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["home"] == _BOUNDED_HOME_VOLUME
     assert volumes["pvc-0"]["persistentVolumeClaim"] == {
         "claimName": "omnigent-datasets",
         "readOnly": True,
@@ -332,7 +458,7 @@ def test_build_job_manifest_without_pvc_mounts_is_unchanged() -> None:
     """No pvc_mounts → the single home emptyDir, exactly as before."""
     manifest = build_job_manifest(**_MANIFEST_KW)
     spec = _pod_spec(manifest)
-    assert spec["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert spec["volumes"] == [_BOUNDED_HOME_VOLUME]
     assert spec["containers"][0]["volumeMounts"] == [
         {"name": "home", "mountPath": "/home/omnigent"}
     ]
@@ -349,7 +475,7 @@ def test_build_job_manifest_secret_mounts_land_on_host_container_only() -> None:
     )
     spec = _pod_spec(manifest)
     volumes = {v["name"]: v for v in spec["volumes"]}
-    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["home"] == _BOUNDED_HOME_VOLUME
     assert volumes["secret-0"]["secret"] == {
         "secretName": "git-token",
         "optional": False,
@@ -394,7 +520,7 @@ def test_build_job_manifest_without_secret_mounts_is_unchanged() -> None:
     """No secret_mounts → the single home emptyDir, exactly as before."""
     manifest = build_job_manifest(**_MANIFEST_KW)
     spec = _pod_spec(manifest)
-    assert spec["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert spec["volumes"] == [_BOUNDED_HOME_VOLUME]
     assert spec["containers"][0]["volumeMounts"] == [
         {"name": "home", "mountPath": "/home/omnigent"}
     ]
@@ -469,23 +595,21 @@ def test_build_job_manifest_is_restricted_and_least_privilege() -> None:
 
 
 @pytest.mark.parametrize(
-    ("clone_dir", "repo_url", "repo_branch", "expect_clone", "expect_branch"),
+    ("repos", "expect_clone", "expect_branch"),
     [
-        (None, None, None, False, False),
-        ("/ws/repo", "https://x/y.git", None, True, False),
-        ("/ws/repo", "https://x/y.git", "release-1.2", True, True),
+        ([], False, False),
+        ([RepoWorkspace(url="https://x/y.git", branch=None, repo_name="y")], True, False),
+        ([RepoWorkspace(url="https://x/y.git", branch="release-1.2", repo_name="y")], True, True),
     ],
 )
 def test_render_workspace_prep_command(
-    clone_dir: str | None,
-    repo_url: str | None,
-    repo_branch: str | None,
+    repos: list[RepoWorkspace],
     expect_clone: bool,
     expect_branch: bool,
 ) -> None:
     """The init command always mkdir's the workspace and clones only when asked."""
     command = k8s._render_workspace_prep_command(
-        "/ws", clone_dir, repo_url, repo_branch, "http://srv.example.com", "host_abc"
+        "/ws", repos, "http://srv.example.com", "host_abc"
     )
     script = command[2]
     assert "mkdir -p /ws" in script
@@ -795,6 +919,68 @@ def test_launch_host_threads_pvc_mounts_into_the_job(
     } in pod_spec["volumes"]
 
 
+def test_launch_host_threads_tolerations_into_the_job(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """A launcher built with tolerations creates Jobs whose Pod spec carries them."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    tolerations = [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        }
+    ]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        tolerations=tolerations,
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert pod_spec["tolerations"] == tolerations
+
+
+@pytest.mark.parametrize(
+    ("home_size_limit", "expected_empty_dir"),
+    [("20Gi", {"sizeLimit": "20Gi"}), (None, {})],
+)
+def test_launch_host_threads_home_size_limit_into_the_job(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    home_size_limit: str | None,
+    expected_empty_dir: dict[str, str],
+) -> None:
+    """A launcher built with home_size_limit creates Jobs whose HOME emptyDir carries it."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        home_size_limit=home_size_limit,
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert {"name": "home", "emptyDir": expected_empty_dir} in pod_spec["volumes"]
+
+
 def test_launch_host_threads_secret_mounts_into_the_job(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
@@ -860,7 +1046,7 @@ def test_launch_host_without_agent_label_keeps_reserved_labels(
 def test_launch_host_with_repo_returns_clone_dir(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
-    """With a repo, the returned workspace is the cloned directory under the workspace."""
+    """With one repo, the returned workspace is the cloned directory under the workspace."""
     core, _batch = fake_clients
     _setup_pod_discovery(core)
     workspace = _launcher().start_host(
@@ -869,10 +1055,31 @@ def test_launch_host_with_repo_returns_clone_dir(
         host_id="host_2",
         host_name="managed-2",
         server_url="http://srv.example.com",
-        repo_url="https://github.com/org/repo.git",
-        repo_name="repo",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")
+        ],
     )
     assert workspace == "/home/omnigent/workspace/repo"
+
+
+def test_launch_host_with_multiple_repos_returns_parent_workspace(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """With several repos, the returned workspace is the parent that holds them all."""
+    core, _batch = fake_clients
+    _setup_pod_discovery(core)
+    workspace = _launcher().start_host(
+        "omnigent-job-2b",
+        token=_TOKEN,
+        host_id="host_2b",
+        host_name="managed-2b",
+        server_url="http://srv.example.com",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/a.git", branch=None, repo_name="a"),
+            RepoWorkspace(url="https://github.com/org/b.git", branch=None, repo_name="b"),
+        ],
+    )
+    assert workspace == "/home/omnigent/workspace"
 
 
 def test_launch_host_cleans_up_on_create_failure(
@@ -941,8 +1148,7 @@ def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
             host_id="host_4",
             host_name="managed-4",
             server_url="http://srv.example.com",
-            repo_url="https://x/y.git",
-            repo_name="y",
+            repos=[RepoWorkspace(url="https://x/y.git", branch=None, repo_name="y")],
         )
     assert "workspace prep failed (exit 128" in exc.value.message
     assert "repository 'https://x/y.git' not found" in exc.value.message

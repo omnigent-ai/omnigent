@@ -11,10 +11,15 @@ class FakeWebContents extends EventEmitter {
     this.sent = [];
     this.url = "";
     this.windowOpenHandler = null;
+    this.destroyed = false;
   }
 
   getURL() {
     return this.url;
+  }
+
+  isDestroyed() {
+    return this.destroyed;
   }
 
   setWindowOpenHandler(handler) {
@@ -22,6 +27,7 @@ class FakeWebContents extends EventEmitter {
   }
 
   send(channel, payload) {
+    if (this.destroyed) throw new TypeError("Object has been destroyed");
     this.sent.push({ channel, payload });
   }
 }
@@ -67,8 +73,18 @@ class FakeWindow extends EventEmitter {
   }
 
   destroy() {
+    this.webContents.destroyed = true;
     this.destroyed = true;
     this.emit("closed");
+  }
+
+  close() {
+    // Electron destroys a window's renderer before all BrowserWindow "closed"
+    // listeners finish. Model the interval where isDestroyed() is still false
+    // but webContents.send() can no longer be called.
+    this.webContents.destroyed = true;
+    this.emit("closed");
+    this.destroyed = true;
   }
 }
 
@@ -174,6 +190,16 @@ describe("update overlay", () => {
       channel: "omnigent:update-overlay-height",
       payload: 0,
     });
+  });
+
+  it("does not notify a parent whose web contents were destroyed during close", () => {
+    const { controller } = makeOverlay();
+    const parent = new FakeWindow();
+    const overlay = controller.ensureOverlay(parent);
+
+    assert.doesNotThrow(() => parent.close());
+    assert.equal(overlay.isDestroyed(), true);
+    assert.deepEqual(parent.webContents.sent, []);
   });
 
   it("reports zero and keeps an empty overlay as a click-through sliver", () => {
