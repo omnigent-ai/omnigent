@@ -414,7 +414,13 @@ and printing, a screen changing — never static text on screen asserting the bu
 When a facet's whole user-visible outcome is a static piece of text (an error
 line, a value) with nothing to watch, do **not** manufacture a video of it: keep
 `recordings: []` and state the observed text in your evidence, per
-`dev/recording-lanes.md`.
+`dev/recording-lanes.md`. Judge that exemption by the **ticket's symptom**,
+never by how you verified the facet: when the symptom is content missing from
+(or wrong in) a rendered view (chat, the terminal pane, a sidebar), the
+divergence is watchable — film it through the documented lane (a fixture-driven
+stand-in for the organic trigger is fine, captioned as one), and skip only
+after quoting the concrete error each documented lane produced (see
+`dev/recording-lanes.md`).
 
 ## Output — the reproduction artifacts
 
@@ -553,8 +559,10 @@ Field meanings:
   whose outcome is purely textual — an `api` facet, or a facet whose user-visible
   result is just a static error line or value with nothing to watch — say the
   evidence is textual and put the observed text in `evidence`; `recordings: []` is
-  correct and not a blocker. Never substitute a synthetic fallback or test-runner
-  video.
+  correct and not a blocker. A symptom of content missing from (or wrong in) a
+  rendered view is never "purely textual" — film the divergence per Step 4 and
+  `dev/recording-lanes.md`, or quote the concrete error each documented lane
+  produced. Never substitute a synthetic fallback or test-runner video.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +
