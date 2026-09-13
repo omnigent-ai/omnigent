@@ -274,7 +274,11 @@ def test_client_loads_a_live_open_issue() -> None:
         "reactions": {"+1": 3},
         "state": "open",
     }
-    client = GitHubClient("token", "org/repo", lambda method, path, body: payload)
+
+    def transport(method, path, body):
+        return [] if "/comments" in path else payload
+
+    client = GitHubClient("token", "org/repo", transport)
 
     issue = client.open_issue(7)
 
@@ -285,6 +289,33 @@ def test_client_loads_a_live_open_issue() -> None:
     assert issue.upvote_count == 3
 
 
+def test_client_includes_only_author_follow_up_comments() -> None:
+    payload = {
+        "number": 7,
+        "title": "Session fails",
+        "body": "Original report",
+        "html_url": "https://github.com/org/repo/issues/7",
+        "user": {"login": "community"},
+        "labels": [{"name": "Bug"}],
+        "created_at": "2026-08-06T00:00:00Z",
+        "state": "open",
+    }
+    comments = [
+        {"user": {"login": "maintainer"}, "body": "Could you share logs?"},
+        {"user": {"login": "community"}, "body": "The session ID is abc-123."},
+    ]
+
+    def transport(method, path, body):
+        return comments if "/comments" in path else payload
+
+    issue = GitHubClient("token", "org/repo", transport).open_issue(7)
+
+    assert issue is not None
+    assert "The session ID is abc-123." in issue.body
+    assert "Could you share logs?" not in issue.body
+    assert "Original report" in issue.body
+
+
 def test_client_ignores_closed_issues_and_pull_requests() -> None:
     payload = {"state": "closed"}
     client = GitHubClient("token", "org/repo", lambda method, path, body: payload)
@@ -292,6 +323,107 @@ def test_client_ignores_closed_issues_and_pull_requests() -> None:
 
     payload = {"state": "open", "pull_request": {}}
     assert client.open_issue(7) is None
+
+
+def test_client_lists_and_closes_labeled_open_issues() -> None:
+    calls = []
+    issue = {"number": 7, "state": "open", "labels": [{"name": "needs-info"}]}
+
+    def transport(method, path, body):
+        calls.append((method, path, body))
+        if path.startswith("/issues?"):
+            return [issue]
+        if method == "GET" and path == "/issues/7":
+            return issue
+        return {}
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    assert client.open_issues_with_label("needs-info") == (issue,)
+    client.comment_on_issue(7, "Closing")
+    client.close_issue(7)
+
+    assert ("POST", "/issues/7/comments", {"body": "Closing"}) in calls
+    assert (
+        "PATCH",
+        "/issues/7",
+        {"state": "closed", "state_reason": "not_planned"},
+    ) in calls
+
+
+def test_client_lists_corpus_counts_load_and_filters_pull_requests() -> None:
+    calls = []
+
+    def transport(method, path, body):
+        calls.append((method, path, body))
+        if "state=all" in path:
+            return [
+                {"number": 1, "assignees": []},
+                {"number": 2, "pull_request": {}, "assignees": []},
+            ]
+        if "state=open" in path:
+            return [
+                {"number": 1, "assignees": [{"login": "owner"}]},
+                {"number": 2, "pull_request": {}, "assignees": [{"login": "owner"}]},
+            ]
+        raise AssertionError(path)
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    assert [issue["number"] for issue in client.issue_corpus()] == [1]
+    assert client.assignee_load() == {"owner": 1}
+
+
+def test_client_posts_a_duplicate_comment_only_once() -> None:
+    comments = []
+
+    def transport(method, path, body):
+        if method == "GET":
+            return comments
+        comments.append({"id": 1, "body": body["body"]})
+        return comments[-1]
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    assert client.comment_on_issue_once(7, "<!-- marker -->", "<!-- marker -->\nFirst")
+    assert not client.comment_on_issue_once(7, "<!-- marker -->", "<!-- marker -->\nSecond")
+    assert len(comments) == 1
+
+
+def test_client_assigns_and_closes_with_github_duplicate_metadata() -> None:
+    calls = []
+
+    def transport(method, path, body):
+        calls.append((method, path, body))
+        if method == "GET" and path == "/issues/7":
+            return {"node_id": "issue-node"}
+        if method == "GET" and path == "/issues/3":
+            return {"node_id": "duplicate-node"}
+        return {}
+
+    client = GitHubClient("token", "org/repo", transport)
+    client.assign_issue(7, "owner")
+    client.close_as_duplicate(7, 3)
+
+    assert ("POST", "/issues/7/assignees", {"assignees": ["owner"]}) in calls
+    graphql = next(call for call in calls if call[1] == "/graphql")
+    assert graphql[2]["variables"]["input"] == {
+        "issueId": "issue-node",
+        "stateReason": "DUPLICATE",
+        "duplicateIssueId": "duplicate-node",
+    }
+
+
+def test_client_surfaces_graphql_duplicate_closure_errors() -> None:
+    def transport(method, path, body):
+        if method == "GET":
+            return {"node_id": f"node-{path.rsplit('/', 1)[-1]}"}
+        return {"errors": [{"message": "target is unavailable"}]}
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    with pytest.raises(RuntimeError, match="target is unavailable"):
+        client.close_as_duplicate(7, 3)
 
 
 def test_client_strips_token_whitespace() -> None:

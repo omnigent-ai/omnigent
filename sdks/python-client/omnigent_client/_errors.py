@@ -44,6 +44,10 @@ class BundleInvalidError(OmnigentError):
     """Agent bundle is invalid — corrupt tarball, bad config, etc. (HTTP 400)."""
 
 
+class RateLimitedError(OmnigentError):
+    """Request was rate-limited (HTTP 429) — transient, safe to retry."""
+
+
 class ServerError(OmnigentError):
     """Internal server error (HTTP 5xx)."""
 
@@ -98,6 +102,9 @@ def raise_for_status(status_code: int, body: dict[str, object] | str) -> None:
 
     if status_code == 400:
         raise InvalidInputError(message, status_code, code)
+
+    if status_code == 429:
+        raise RateLimitedError(message, status_code, code)
 
     if status_code >= 500:
         raise ServerError(message, status_code, code)

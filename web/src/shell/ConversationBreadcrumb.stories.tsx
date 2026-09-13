@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { MoreHorizontalIcon } from "lucide-react";
+import { expect, within } from "storybook/test";
 import { Button } from "@/components/ui/button";
 import type { Agent } from "@/hooks/useAgents";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
@@ -42,6 +43,22 @@ export const FiledConversation: Story = {
         <MoreHorizontalIcon />
       </Button>
     ),
+  },
+};
+
+export const FiledWithEmojiIcon: Story = {
+  args: {
+    conversationTitle: "Review the workspace navigation architecture",
+    projectName: "Web application",
+    projectIcon: "🚀",
+    isChildSession: false,
+    boundAgent: undefined,
+    wrapperLabel: null,
+  },
+  play: async ({ canvasElement }) => {
+    // The project's emoji renders as the leading segment instead of the
+    // default folder glyph.
+    await expect(within(canvasElement).getByTestId("project-icon")).toHaveTextContent("🚀");
   },
 };
 

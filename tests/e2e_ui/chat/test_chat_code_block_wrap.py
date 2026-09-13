@@ -27,6 +27,7 @@ column or needs horizontal scrolling.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -41,6 +42,7 @@ _TOGGLE = "Toggle word wrap"
 # low-entropy (so the secret scanner doesn't flag it) and obviously not a real
 # token.
 _LONG_WORD = "horizontalScrolling" * 14
+_SCROLL_CODE = "\n".join(f'const line{index} = "{_LONG_WORD}";' for index in range(60)) + "\n"
 
 # Fenced ``markdown`` block whose source has deliberately long lines, so it can
 # only fit the column by wrapping. Generic joke content (no real identifiers).
@@ -74,7 +76,9 @@ _FITS = (
 
 
 @pytest.fixture
-def code_block_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
+def code_block_session(
+    seeded_session: tuple[str, str], request: pytest.FixtureRequest
+) -> Iterator[tuple[str, str]]:
     """Seed a runner-bound session with a long-lined markdown code block reply.
 
     Reuses :func:`seeded_session` (a ``hello_world`` session already bound to the
@@ -89,7 +93,7 @@ def code_block_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, s
         f"{base_url}/v1/sessions/{session_id}/events",
         json={
             "type": "external_assistant_message",
-            "data": {"agent": _AGENT_NAME, "text": _MESSAGE_TEXT},
+            "data": {"agent": _AGENT_NAME, "text": getattr(request, "param", _MESSAGE_TEXT)},
         },
         timeout=10.0,
     )
@@ -126,3 +130,86 @@ def test_chat_code_block_wraps_by_default_and_toggle_switches(
     toggle.click()
     expect(toggle).to_have_attribute("aria-pressed", "true")
     page.wait_for_function(_FITS, timeout=10_000)
+
+
+@pytest.mark.parametrize(
+    "code_block_session",
+    [f"```ts\n{_SCROLL_CODE}```\n\nEnd of example."],
+    indirect=True,
+    ids=["tall-code-block"],
+)
+@pytest.mark.parametrize("viewport", [(1280, 800), (390, 844)], ids=["desktop", "mobile"])
+def test_chat_code_controls_scroll_together(
+    page: Page,
+    code_block_session: tuple[str, str],
+    viewport: tuple[int, int],
+) -> None:
+    """All controls stay aligned with the code header in both wrap modes."""
+    base_url, session_id = code_block_session
+    page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+    page.goto(f"{base_url}/c/{session_id}")
+    block = page.locator('[data-streamdown="code-block"]').first.locator("..")
+    expect(block).to_be_visible(timeout=30_000)
+    page.wait_for_function(
+        """() => document.querySelector(
+            '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
+        ) !== null"""
+    )
+
+    for wrap in (True, False):
+        block.evaluate(
+            """block => {
+                const scroller = document.querySelector('[role="log"]').firstElementChild;
+                scroller.scrollTop += block.getBoundingClientRect().top
+                    - scroller.getBoundingClientRect().top - 96;
+            }"""
+        )
+        toggle = block.get_by_role("button", name=_TOGGLE)
+        if not wrap:
+            toggle.click()
+        expect(toggle).to_have_attribute("aria-pressed", str(wrap).lower())
+        if not wrap:
+            block.locator(_CODE_BODY).evaluate("el => { el.scrollLeft = 200; }")
+        page.locator('[role="log"] > div').first.evaluate("el => { el.scrollTop += 200; }")
+
+        page.wait_for_function(
+            """() => {
+                const block = document.querySelector('[data-streamdown="code-block"]')
+                    .parentElement;
+                const scroller = document.querySelector('[role="log"]').firstElementChild;
+                const header = block.querySelector('[data-streamdown="code-block-header"]');
+                const buttons = ['Toggle word wrap', 'Copy Code', 'Download file'].map(name =>
+                    [...block.querySelectorAll('button')].find(button =>
+                        button.getAttribute('aria-label') === name || button.title === name
+                    )?.getBoundingClientRect()
+                );
+                if (buttons.some(rect => !rect)) return false;
+                const centers = buttons.map(rect => rect.top + rect.height / 2);
+                const headerRect = header.getBoundingClientRect();
+                const headerCenter = headerRect.top + headerRect.height / 2;
+                return headerRect.bottom < scroller.getBoundingClientRect().top
+                    && centers.every(center => Math.abs(center - headerCenter) < 2);
+            }""",
+            timeout=10_000,
+        )
+
+    block.evaluate(
+        """block => {
+            const scroller = document.querySelector('[role="log"]').firstElementChild;
+            scroller.scrollTop += block.getBoundingClientRect().top
+                - scroller.getBoundingClientRect().top - 96;
+        }"""
+    )
+    scroller = page.locator('[role="log"] > div').first
+    scroll_top = scroller.evaluate("el => el.scrollTop")
+    download_button = block.get_by_role("button", name="Download file").bounding_box()
+    assert download_button is not None
+    with page.expect_download() as download_info:
+        page.mouse.click(
+            download_button["x"] + download_button["width"] / 2,
+            download_button["y"] + download_button["height"] / 2,
+        )
+    download = download_info.value
+    assert download.suggested_filename.endswith(".ts")
+    assert Path(download.path()).read_text() == _SCROLL_CODE
+    assert abs(scroller.evaluate("el => el.scrollTop") - scroll_top) < 2

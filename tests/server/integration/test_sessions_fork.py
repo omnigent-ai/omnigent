@@ -18,6 +18,9 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_sessions_endpoints import (
     _create_session,
@@ -253,8 +256,43 @@ async def test_fork_coding_session_stamps_fork_source_label(
     )
 
 
+async def test_fork_recovers_runner_bound_native_session_without_workspace(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Forking a runner-bound native session with lost workspace metadata still
+    sends the clone through directory rebinding.
+
+    Older ``/clear`` replacements could retain their live runner and native
+    presentation labels while dropping ``workspace``. Treating that source as
+    chat-only produces an unbound fork that silently cannot run. The native
+    wrapper label plus runner binding is the recovery signal.
+    """
+    agent = await create_test_agent(client)
+    source = await _create_session(
+        client,
+        agent["id"],
+        title="Legacy clear replacement",
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(source["id"], "runner_legacy_clear")
+
+    resp = await _fork_session(client, source["id"])
+    assert resp.status_code == 201
+    fork = resp.json()
+
+    assert fork["labels"].get("omnigent.fork.source_id") == source["id"]
+    assert fork.get("workspace") is None
+
+
 async def test_fork_chat_session_has_no_fork_source_label(
     client: httpx.AsyncClient,
+    db_uri: str,
 ) -> None:
     """
     Forking a chat-only session (no working directory) adds no
@@ -268,6 +306,8 @@ async def test_fork_chat_session_has_no_fork_source_label(
     """
     agent = await create_test_agent(client)
     source = await _create_session(client, agent["id"], title="Chat only")
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(source["id"], "runner_chat_only")
 
     resp = await _fork_session(client, source["id"])
     assert resp.status_code == 201

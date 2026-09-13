@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_native_bridge import build_hook_settings, prepare_bridge_dir
+from omnigent.harnesses.claude_native.bridge import build_hook_settings, prepare_bridge_dir
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_MATCHER
 
 #: Claude Code's default command-hook timeout for ``UserPromptSubmit``, which is
@@ -25,8 +25,8 @@ def _trust_tmp_bridge_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
 
 
 def _bridge_dir(tmp_path: Path) -> Path:
@@ -74,7 +74,7 @@ def test_router_hook_coexists_with_policy_hooks(tmp_path: Path) -> None:
     )
     pre_tool_use = settings["hooks"]["PreToolUse"]
     matchers = [entry.get("matcher") for entry in pre_tool_use]
-    assert matchers == ["AskUserQuestion", None, AGENT_TOOL_MATCHER]
+    assert matchers == [None, AGENT_TOOL_MATCHER]
 
 
 def _commands(settings: dict[str, Any], event: str) -> list[str]:
@@ -108,7 +108,7 @@ def test_both_routing_hooks_coexist_with_the_policy_hooks(tmp_path: Path) -> Non
     # routing gate next (it may block the prompt), the request-phase policy gate
     # last — for a native session that gate is the sole request gate.
     assert len(prompt_submit) == 3
-    assert "omnigent.claude_native_hook" in prompt_submit[0]
+    assert "omnigent.harnesses.claude_native.hook" in prompt_submit[0]
     assert "route-turn" in prompt_submit[1]
     assert "evaluate-policy" in prompt_submit[2]
     # Neither routing hook leaks onto the other's event.
