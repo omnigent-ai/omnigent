@@ -21,6 +21,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
 import { useFileDiff } from "./useFileDiff";
 
+const flushMicrotasks = () =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+
 const serveableMock = vi.mocked(useWorkspaceServeable);
 const changedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
@@ -135,10 +140,10 @@ describe("useFileDiff — enable gate", () => {
     expect(result.current.data).toMatchObject({ before: "old", after: "new" });
   });
 
-  it("still fetches when runnerOnline is undefined (unknown, not offline)", async () => {
-    // The gate only blocks on an explicit `false`; an unknown (undefined)
-    // runner state must not stop the diff, or the panel would stay blank
-    // during the brief window before health resolves.
+  it("holds the fetch while liveness is unknown (undefined)", async () => {
+    // The diff endpoint is runner-proxied: firing while liveness is still
+    // unknown would 503 on a session whose runner went away (and be
+    // logged server-side). The gate holds until serveable resolves `true`.
     setHooks({ serveable: undefined, changedPaths: ["a.ts"] });
     fetchMock.mockResolvedValueOnce(
       mockResponse({
@@ -149,8 +154,9 @@ describe("useFileDiff — enable gate", () => {
       }),
     );
     const { result } = renderDiff("conv_1", "a.ts");
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.current.isSuccess).toBe(false);
   });
 });
 

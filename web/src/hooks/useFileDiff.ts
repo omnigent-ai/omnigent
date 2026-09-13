@@ -65,7 +65,7 @@ export function useFileDiff(conversationId: string | undefined, path: string | n
   return useQuery({
     queryKey: ["file-diff", conversationId, path],
     queryFn: () => fetchFileDiff(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false && isInChangedFiles,
+    enabled: !!conversationId && !!path && serveable === true && isInChangedFiles,
     staleTime: 5_000,
   });
 }

@@ -110,3 +110,47 @@ describe("useGithubInfo turn-end invalidate", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("useGithubInfo liveness gating", () => {
+  it("holds the fetch until runner liveness resolves, then fires", async () => {
+    // Opening a session before the first /health resolves must not fire the
+    // runner-proxied github fetch: on a session whose runner went away it
+    // would just 503 alongside the other resource queries.
+    stubChatStore("conv_open", "idle");
+    onlineMock.mockReturnValue(undefined);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+    const { rerender } = render(
+      <QueryClientProvider client={qc}>
+        <Probe id="conv_open" />
+      </QueryClientProvider>,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // First /health lands `true` -> the held fetch fires.
+    onlineMock.mockReturnValue(true);
+    rerender(
+      <QueryClientProvider client={qc}>
+        <Probe id="conv_open" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_open/resources/github");
+  });
+
+  it("stays held when the runner is known offline and no host can serve", async () => {
+    stubChatStore("conv_dead", "idle");
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(null); // not host-bound
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <Probe id="conv_dead" />
+      </QueryClientProvider>,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

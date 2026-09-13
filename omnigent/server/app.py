@@ -1881,6 +1881,23 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
+        elif exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH:
+            # Also an expected 503: the bound runner can't serve the requested
+            # capability. A configuration state the client surfaces, not an
+            # internal fault, so keep it off the ERROR stream too.
+            _logger.warning(
+                "Runner capability mismatch: %s",
+                exc.message,
+                extra=_error_audit_extra(
+                    request,
+                    phase="capability_mismatch",
+                    code=str(exc.code),
+                    http_status="503",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
+                ),
+            )
         elif exc.http_status >= 500:
             _logger.error(
                 "Internal error: %s",
