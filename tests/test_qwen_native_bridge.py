@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import qwen_native_bridge
+from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 
 
 @pytest.fixture
@@ -35,7 +35,12 @@ def test_write_mcp_config_writes_into_bridge_dir_not_workspace(bridge_dir: Path)
     data = json.loads(path.read_text(encoding="utf-8"))
     server = data["mcpServers"]["omnigent"]
     # Points at the shared stdio relay implemented in claude_native_bridge.
-    assert server["args"][:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
+    assert server["args"][:4] == [
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.bridge",
+        "serve-mcp",
+    ]
     assert str(bridge_dir) in server["args"]
     # trust:true auto-approves qwen's own MCP gate (Omnigent gates separately).
     assert server["trust"] is True

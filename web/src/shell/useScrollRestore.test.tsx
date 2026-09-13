@@ -11,7 +11,7 @@
 //   6. Saving resumes once the restore settles.
 //   7. A null key disables persistence entirely.
 
-import { useRef } from "react";
+import { StrictMode, useRef } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -113,16 +113,27 @@ describe("useScrollRestore", () => {
     expect(getSavedScrollTop("view:slow")).toBe(140);
   });
 
-  it("settles as soon as the target is reachable", async () => {
+  it("suppresses programmatic scroll saves through the budget even when reachable", async () => {
+    // The offset fits immediately, but the restore intentionally does NOT
+    // settle on first reach: a virtualized tree measures its rows after mount
+    // and shifts scrollTop, and that programmatic adjustment must not overwrite
+    // the saved offset. So a non-user scroll within the budget is ignored;
+    // only the budget expiring (or a user gesture) re-enables saving.
     saveScrollTop("view:reachable", 50);
     const { el } = mount("view:reachable");
-    // Tall content: the offset fits, so no budget needs to be spent.
     Object.defineProperty(el, "scrollHeight", { configurable: true, value: 1000 });
     await nextFrame();
 
+    // A measurement-driven (non-user) scroll mid-restore is not persisted.
     el.scrollTop = 60;
     fireEvent.scroll(el);
-    expect(getSavedScrollTop("view:reachable")).toBe(60);
+    expect(getSavedScrollTop("view:reachable")).toBe(50);
+
+    // Once the budget expires, saving resumes.
+    await settleRestore();
+    el.scrollTop = 75;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:reachable")).toBe(75);
   });
 
   it("stops fighting the user when they scroll during a pending restore", async () => {
@@ -134,6 +145,20 @@ describe("useScrollRestore", () => {
     fireEvent.scroll(el);
 
     expect(getSavedScrollTop("view:wheel")).toBe(12);
+  });
+
+  it("stops fighting a keyboard / assistive-tech scroll during a pending restore", async () => {
+    // Keyboard scrolling (PageDown/arrows/Space) and AT scroll-into-view fire
+    // keydown, not wheel/pointer — the restore must yield to them too, or it
+    // snaps the reader back for the whole budget.
+    saveScrollTop("view:keydown", 300);
+    const { el } = mount("view:keydown");
+
+    fireEvent.keyDown(el, { key: "PageDown" });
+    el.scrollTop = 42;
+    fireEvent.scroll(el);
+
+    expect(getSavedScrollTop("view:keydown")).toBe(42);
   });
 
   it("saves again once the restore has settled", async () => {
@@ -160,5 +185,25 @@ describe("useScrollRestore", () => {
     fireEvent.scroll(el);
 
     expect(getSavedScrollTop("null")).toBeUndefined();
+  });
+
+  it("keeps the restore armed under StrictMode's mount/cleanup/mount replay", () => {
+    // StrictMode replays setup → cleanup → setup on one commit. The effect's
+    // cleanup must NOT settle the pending restore, or the replay would leave it
+    // disarmed and a clamp-induced scroll event (scrollTop forced to 0 before
+    // content is tall) would overwrite the saved offset.
+    saveScrollTop("view:strict", 200);
+    const view = render(
+      <StrictMode>
+        <Scroller scrollKey="view:strict" ready />
+      </StrictMode>,
+    );
+    const el = view.getByTestId("scroller");
+
+    // A clamp to 0 (short content) fires a scroll during the still-pending
+    // restore; it must be ignored, not saved.
+    el.scrollTop = 0;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:strict")).toBe(200);
   });
 });

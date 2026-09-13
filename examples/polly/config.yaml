@@ -71,21 +71,34 @@ prompt: |
   Extra vendors widen cross-vendor review (any implementer's diff can be judged
   by a DIFFERENT vendor). Route to whichever workers the preflight finds.
 
-  Roster preflight (FIRST turn, before any dispatch). Each worker needs its own
-  CLI on PATH — `claude` for `claude_code`, `codex` for `codex`, `opencode` for
-  `opencode`, `cursor-agent` for `cursor`, `hermes` for `hermes`, `pi` for `pi`,
-  `agy` for `agy`.
-  Before delegating anything, run exactly ONE
-  `sys_os_shell("command -v claude codex opencode cursor-agent hermes pi agy || true")`. A worker is AVAILABLE
-  only if its binary resolved in that output; record the available set and route
+  Roster preflight (FIRST turn, before any dispatch). Before delegating
+  anything, run exactly ONE `sys_session_get_info({})` and read its
+  `configured_harnesses` map — the bound host's authoritative readiness report.
+  Map workers to readiness keys as follows:
+  `claude_code` -> `claude-native`, `codex` -> `codex-native`, `opencode` ->
+  `opencode-native`, `cursor` -> `cursor-native`, `hermes` -> `hermes-native`,
+  `agy` -> `antigravity-native`, and `pi` -> `pi`. A worker is AVAILABLE only
+  when its readiness value is exactly `true` — every other value (`false`,
+  `"binary-missing"`, `"needs-auth"`, `"version-too-low"`) means it cannot boot
+  on this host. If `configured_harnesses` is absent or `null` (the session has
+  no bound host, or the readiness lookup failed), readiness is UNKNOWN — fall
+  back to exactly ONE
+  `sys_os_shell("command -v claude codex opencode cursor-agent hermes pi agy || true")`
+  and treat a worker as available only if its binary resolved there. The
+  fallback is weaker (a shell PATH probe cannot see auth state), so a
+  fallback-approved worker may still fail loud at dispatch — read that error,
+  drop the worker, and do not retry it. Readiness is the HOST's view, not each
+  dispatch's guarantee: a `true` worker can still fail at dispatch; the same
+  fail-loud rule applies. Record the available set and route
   work ONLY to available workers for the entire run. Do this in the same first
-  turn you start planning (the preflight `sys_os_shell` call counts as acting —
+  turn you start planning (the preflight tool call counts as acting —
   don't end the turn on the preflight alone). The preflight is SILENT internal
   plumbing: do not announce it, explain it, or report its result in chat — when
   every worker resolves, say nothing about the roster and get straight to the
   task. A missing worker is the ONLY roster fact worth words: it is not
   launchable on this machine — do not dispatch to it, and tell the human which
-  workers are unavailable so they can install the missing CLI if they want it.
+  workers are unavailable and why (e.g. `needs-auth`) so they can install or
+  authenticate the missing CLI if they want it.
 
   Every dispatch may carry an explicit `args.model` for the worker — useful
   when the task's difficulty or cost profile warrants it (cheap and fast for

@@ -620,6 +620,109 @@ describe("HistoryAutoLoader", () => {
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
+
+  it("bounds the prepend-fed chain from a single touch drag", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    // Folded tool-heavy transcript: one short screen, no scroll range, parked
+    // under the load threshold. Height-neutral prepends keep it that way.
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // One small downward finger drag — "peek at what's above".
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // Each settled page moves the cursor without adding height. The chain may
+    // follow for a bounded number of pages, then must wait for a new gesture
+    // instead of paging in the entire transcript.
+    let settled = 49;
+    while (loadMoreHistory.mock.calls.length < 8 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) break;
+    }
+
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("holds the bound when pages settle mid-drag between touchmoves", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+
+    // A sustained drag on a fast connection: pages settle while the finger is
+    // still moving, so every settle is followed by another touchmove from the
+    // SAME gesture. Those mid-drag touchmoves must not refill the budget.
+    let settled = 49;
+    let fingerY = 320;
+    let stalled = 0;
+    while (stalled < 2 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      fireEvent.touchMove(scrollRoot, { touches: [{ clientY: fingerY }] });
+      fingerY += 10;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
+      else stalled = 0;
+    }
+
+    expect(loadMoreHistory.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("re-grants the chain budget on the reader's next gesture", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+
+    // Exhaust the first gesture's budget with height-neutral prepends.
+    let settled = 49;
+    let stalled = 0;
+    while (stalled < 1 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
+    }
+    const afterFirstGesture = loadMoreHistory.mock.calls.length;
+
+    // The chain stopped, but older history is not stranded: the next drag
+    // asks again and pages resume.
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+
+    expect(loadMoreHistory.mock.calls.length).toBe(afterFirstGesture + 1);
+  });
 });
 
 describe("LatestTurnSpacer", () => {
@@ -634,11 +737,11 @@ describe("LatestTurnSpacer", () => {
     vi.unstubAllGlobals();
   });
 
-  function rect(top: number): DOMRect {
+  function rect(top: number, bottom = top): DOMRect {
     return {
       top,
-      bottom: top,
-      height: 0,
+      bottom,
+      height: bottom - top,
       left: 0,
       right: 0,
       width: 0,
@@ -662,6 +765,8 @@ describe("LatestTurnSpacer", () => {
     anchorTop: number;
     spacerTop: number;
     anchor: "user" | "text" | "none";
+    /** Bottom edge of the content column, when its trailing padding matters. */
+    contentBottom?: number;
   }): number {
     const holder: { cb: (() => void) | null } = { cb: null };
     class StubResizeObserver {
@@ -682,22 +787,34 @@ describe("LatestTurnSpacer", () => {
     });
     stickContext.scrollRef.current = scrollRoot;
 
-    if (opts.anchor !== "none") {
+    if (opts.anchor === "user") {
       const anchor = document.createElement("div");
-      if (opts.anchor === "user") {
-        anchor.dataset.role = "user";
-        anchor.dataset.userMessageId = "initial-user";
-        useChatStore.setState({ blocks: [userBlock("initial-user")] });
-      } else {
-        anchor.dataset.testid = "assistant-text-section";
-      }
+      anchor.dataset.role = "user";
+      anchor.dataset.userMessageId = "initial-user";
+      useChatStore.setState({ blocks: [userBlock("initial-user")] });
       vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
       scrollRoot.append(anchor);
+    } else if (opts.anchor === "text") {
+      // The assistant text section is nested inside its bubble, which carries
+      // the stable id the spacer captures and re-resolves by.
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = "resp-1";
+      const anchor = document.createElement("div");
+      anchor.dataset.testid = "assistant-text-section";
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
+      bubble.append(anchor);
+      scrollRoot.append(bubble);
     }
 
     const { container } = render(<LatestTurnSpacer />);
     const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
     vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(opts.spacerTop));
+    if (opts.contentBottom !== undefined) {
+      vi.spyOn(spacer.parentElement!, "getBoundingClientRect").mockReturnValue(
+        rect(0, opts.contentBottom),
+      );
+    }
     // Re-measure now that the rects are pinned (mount ran against jsdom's 0s).
     act(() => holder.cb?.());
 
@@ -745,6 +862,36 @@ describe("LatestTurnSpacer", () => {
     expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 400, anchor: "user" })).toBe(
       104,
     );
+  });
+
+  it("leaves the column's trailing padding out of the reservation", () => {
+    // The padding below the spacer scrolls with the content: reserving it
+    // again would leave the document 24px taller than the viewport — a
+    // phantom scroll range that paints a scrollbar thumb over a transcript
+    // that fully fits. 600 − 400 − 96 − 24 = 80, not 104.
+    expect(
+      measureSpacer({
+        clientHeight: 600,
+        anchorTop: 0,
+        spacerTop: 400,
+        anchor: "user",
+        contentBottom: 424,
+      }),
+    ).toBe(80);
+  });
+
+  it("clamps to zero when the trailing padding alone would overdraw the viewport", () => {
+    // Reply nearly fills the viewport: 600 − 490 − 96 = 14 raw, minus 24px of
+    // trailing padding goes negative — the spacer must not go below 0.
+    expect(
+      measureSpacer({
+        clientHeight: 600,
+        anchorTop: 0,
+        spacerTop: 490,
+        anchor: "user",
+        contentBottom: 514,
+      }),
+    ).toBe(0);
   });
 
   it("caps the reserved space so a short turn does not blank most of the viewport", () => {
@@ -853,6 +1000,203 @@ describe("LatestTurnSpacer", () => {
     });
     expect(spacer.style.display).toBe("none");
     expect(spacer.style.height || "0px").toBe("0px");
+  });
+
+  it("holds its height while the anchor is windowed out, then re-resolves the remounted node", () => {
+    // WHY: the transcript is virtualized, so the anchor's DOM node is destroyed
+    // when it scrolls out of the window and a *fresh* node with the same id
+    // mounts when it returns. The spacer must resolve the anchor by id, not by a
+    // captured node reference — a held reference would stay detached forever and
+    // freeze the reservation.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAnchor = (top: number) => {
+      const el = document.createElement("div");
+      el.dataset.role = "user";
+      el.dataset.userMessageId = "initial-user";
+      vi.spyOn(el, "getBoundingClientRect").mockReturnValue(rect(top));
+      return el;
+    };
+    const first = makeAnchor(0);
+    scrollRoot.append(first);
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+
+    // Windowed out: the row unmounts. The captured height must hold.
+    first.remove();
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px");
+
+    // Windowed back in as a *new* node with the same id, at a different offset
+    // (anchor at 50 → 600 − (400 − 50) − 96 = 154). A stale node reference would
+    // still read the removed node; id re-resolution picks up the fresh node.
+    const remounted = makeAnchor(50);
+    scrollRoot.append(remounted);
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
+
+  it("does not retarget the assistant-text anchor to a different mounted turn", () => {
+    // WHY: with no committed user anchor the spacer pins the LAST assistant
+    // response by its stable id. Once that response is windowed out while an
+    // EARLIER assistant text is still mounted, a "last mounted text" resolution
+    // would silently re-anchor to the wrong turn and change the reservation.
+    // Binding to the stable id holds the last good height instead.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAssistant = (stableId: string, top: number) => {
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = stableId;
+      const text = document.createElement("div");
+      text.dataset.testid = "assistant-text-section";
+      vi.spyOn(text, "getBoundingClientRect").mockReturnValue(rect(top));
+      bubble.append(text);
+      return bubble;
+    };
+    // Two assistant turns mounted; the LAST (resp-2, at 150) is the anchor.
+    const earlier = makeAssistant("resp-1", 50);
+    const last = makeAssistant("resp-2", 150);
+    scrollRoot.append(earlier, last);
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(500));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px"); // 600 − (500 − 150) − 96, anchored to resp-2
+
+    // resp-2 windows out; only the earlier turn (resp-1) stays mounted. A
+    // "last mounted text" resolution would retarget to resp-1 (→ 600 − (500 −
+    // 50) − 96 = 4); binding to the stable id holds the last good height.
+    last.remove();
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
+
+  it("retries capture across frames until the windowed anchor row mounts", () => {
+    // WHY: the anchor row can be absent for the first frame(s) on a cold load of
+    // a windowed transcript (the scroll element is published before the
+    // virtualizer fills its window). Capture must retry rather than depend on a
+    // resize that need not fire — the wrapper height is estimate-fixed.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    // Drive requestAnimationFrame callbacks manually.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // Committed anchor exists in the store, but its row hasn't mounted yet.
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    // Mount + manual measure both find no anchor node → a retry is scheduled and
+    // no height is set yet.
+    act(() => holder.cb?.());
+    expect(spacer.style.height || "0px").toBe("0px");
+    expect(frames.length).toBeGreaterThan(0);
+
+    // Synchronous layout/observer measurements can fire repeatedly before the
+    // browser advances a frame. They must not consume the frame retry budget.
+    for (let i = 0; i < 12; i += 1) {
+      act(() => holder.cb?.());
+    }
+
+    // The row mounts; the next scheduled frame fires and capture succeeds.
+    const anchor = document.createElement("div");
+    anchor.dataset.role = "user";
+    anchor.dataset.userMessageId = "initial-user";
+    vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(0));
+    scrollRoot.append(anchor);
+    act(() => frames.shift()?.(0));
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+  });
+
+  it("settles a never-anchoring turn to display:none after the retry budget", () => {
+    // WHY: a tool-only trailing turn (committed non-user block, no user anchor
+    // and no assistant-text section) must not retry forever — capture settles to
+    // no-anchor (display:none) once the budget is spent, matching the pre-
+    // windowing behaviour.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // A committed block that is NOT a user message and never renders an anchor.
+    useChatStore.setState({
+      blocks: [{ type: "reasoning", ctx: { itemId: "r1" }, text: "…" }] as never,
+    });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+
+    // Drain the retry budget; the anchor never mounts. Bounded, so it stops.
+    act(() => holder.cb?.());
+    let guard = 0;
+    while (frames.length > 0 && guard < 50) {
+      guard += 1;
+      act(() => frames.shift()?.(0));
+    }
+    expect(guard).toBeLessThan(50); // did not retry forever
+    expect(spacer.style.display).toBe("none");
   });
 });
 
@@ -972,6 +1316,26 @@ describe("JumpToTopButton", () => {
     // Scrolling down (scrollTop increases) must not surface the pill.
     act(() => {
       metrics.scrollTop = 600;
+      fireEvent.scroll(scroll);
+    });
+    expect(pill().className).toContain("pointer-events-none");
+  });
+
+  it("does not mistake bottom re-anchoring for an upward scroll", () => {
+    const metrics = {
+      scrollTop: 600,
+      scrollHeight: 1000,
+      clientHeight: 400,
+    };
+    const { container, scroll, scroller } = makeScroller(metrics);
+
+    render(<JumpToTopButton containerEl={container} scroller={scroller} hasMoreHistory={true} />);
+
+    // Removing transient content can reduce both scrollHeight and scrollTop
+    // while the viewport remains pinned to the bottom.
+    act(() => {
+      metrics.scrollHeight = 800;
+      metrics.scrollTop = 400;
       fireEvent.scroll(scroll);
     });
     expect(pill().className).toContain("pointer-events-none");

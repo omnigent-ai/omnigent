@@ -36,6 +36,8 @@ export interface MessageItem extends BaseItem {
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */
   interrupted?: boolean;
+  /** Native live-preview stream finalized by this persisted assistant message. */
+  stream_message_id?: string;
 }
 
 export interface FunctionCallItem extends BaseItem {
@@ -62,6 +64,8 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
   /** Friendly headline for a classified failure. Present when the runner classified it. */
   title?: string;
   /** One/two-sentence explanation of why it failed. Paired with `title`. */

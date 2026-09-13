@@ -51,9 +51,10 @@ def test_polly_codex_goal_sends_native_command(
     page.route(f"**/v1/sessions/{session_id}/events", _ack_event)
     page.goto(f"{base_url}/c/{session_id}")
 
-    goal_toggle = page.get_by_test_id("goal-toggle")
+    page.get_by_test_id("composer-attach").click()
+    goal_toggle = page.get_by_test_id("composer-goal-action")
     expect(goal_toggle).to_be_visible(timeout=15_000)
-    expect(goal_toggle).to_have_attribute("aria-label", "Start Codex goal")
+    expect(goal_toggle).to_contain_text("Goal")
     goal_toggle.click()
 
     condition = "Finish the implementation and pass all tests"
