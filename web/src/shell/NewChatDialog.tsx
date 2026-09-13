@@ -2179,6 +2179,13 @@ function readSavedLandingDraft(scope: string): LandingDraft | null {
 let landingDraftScope = landingStorageKey(LANDING_COMPOSER_KEY);
 let landingDraft: LandingDraft | null = readSavedLandingDraft(landingDraftScope);
 let landingDraftRevision = 0;
+const landingDraftClearListeners = new Set<(scope: string) => void>();
+
+function sameLandingDraft(left: LandingDraft | null, right: LandingDraft): boolean {
+  if (left === null || left.files.length !== right.files.length) return false;
+  if (left.files.some((file, index) => file !== right.files[index])) return false;
+  return JSON.stringify({ ...left, files: [] }) === JSON.stringify({ ...right, files: [] });
+}
 
 function writeLandingDraft(
   draft: LandingDraft | null,
@@ -2194,6 +2201,7 @@ function writeLandingDraft(
   } catch {
     /* Storage is optional. */
   }
+  if (draft === null) landingDraftClearListeners.forEach((listener) => listener(scope));
 }
 
 // Test-only: clears the preserved landing draft so each case starts from a
@@ -2730,10 +2738,8 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
   // Harness-config modal, opened from the composer's gear icon.
   const [configOpen, setConfigOpen] = useState(false);
 
-  // Mirror the current draft fields into a ref every render so the unmount
-  // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped once the draft is sent to a create, so the
-  // snapshot is dropped instead of resurrected.
+  // Keep the latest draft available across a detour while Start is pending.
+  // A successful create clears it; a failed create leaves it for retry.
   const submittedRef = useRef(false);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
@@ -2768,11 +2774,8 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
   };
   useEffect(() => {
     if (!submittedRef.current) {
-      try {
-        localStorage.setItem(draftScope, JSON.stringify({ ...draftRef.current, files: [] }));
-      } catch {
-        /* Storage is optional. */
-      }
+      if (draftScope === landingDraftScope && !sameLandingDraft(landingDraft, draftRef.current))
+        writeLandingDraft(draftRef.current, draftScope);
     }
   });
   useEffect(() => {
@@ -2784,8 +2787,20 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
       if (!submittedRef.current) {
         writeLandingDraft(draftRef.current, draftScope);
       } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null, draftScope);
+        writeLandingDraft(draftRef.current, draftScope);
+        submittedDraftRevisionRef.current = landingDraftRevision;
       }
+    };
+  }, [draftScope]);
+  useEffect(() => {
+    const clearSubmittedDraft = (scope: string) => {
+      if (scope !== draftScope || submittedRef.current) return;
+      setMessage("");
+      setFiles([]);
+    };
+    landingDraftClearListeners.add(clearSubmittedDraft);
+    return () => {
+      landingDraftClearListeners.delete(clearSubmittedDraft);
     };
   }, [draftScope]);
 
@@ -4701,9 +4716,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
     }
   }
 
-  // No session was created after all, so the draft is the user's again —
-  // including when they navigated away and the unmount cleanup already
-  // dropped it on the strength of the submit.
+  // A failed create leaves the prompt available for another attempt.
   function returnDraftToUser() {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
@@ -4764,11 +4777,8 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
       if (wasViewing && stillOnTempRoute) navigate("/");
     };
-    // The draft is spent from the moment it is submitted: it belongs to the
-    // session now being created, so a detour back to this screen must not
-    // hand it back pre-filled. Flipped here rather than on the response
-    // because the create outlives an unmount; a create that fails hands the
-    // draft back via returnDraftToUser.
+    // Keep the submitted draft until creation succeeds, including when the
+    // user leaves and returns while the request is pending.
     submittedDraftRevisionRef.current = landingDraftRevision;
     submittedRef.current = true;
     try {
@@ -5624,6 +5634,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
                 value: message,
                 onChange: (e) => {
                   setMessage(e.target.value);
+                  landingDraftRevision += 1;
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
 import re
 import shutil
 from collections.abc import Awaitable, Callable
@@ -22,6 +21,7 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.workspace_contexts import LEASE_SECONDS, WorkspaceContextManager
+from omnigent.inner._proc import process_alive
 
 _HAS_TMUX = shutil.which("tmux") is not None
 
@@ -100,14 +100,10 @@ async def _wait_for_stream(sink: _StreamSink, needle: bytes, timeout: float = 8.
 
 
 async def _wait_for_process_exit(pid: int, timeout: float = 5.0) -> None:
-    """Wait until a tmux pane PID is gone."""
+    """Wait until the pane stops, including zombies adopted by a Linux test worker."""
 
     async def exited() -> None:
-        while True:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return
+        while process_alive(pid):
             await asyncio.sleep(0.05)
 
     await asyncio.wait_for(exited(), timeout=timeout)
@@ -501,7 +497,7 @@ async def test_terminal_survives_reconnect_and_obeys_lease(
         assert (channel_limited.status, channel_limited.error_status) == ("error", 429)
         command = (
             b'printf \'CTX_PID=%s\\nCTX_CWD=%s\\n\' "$$" "$PWD"; '
-            b"printf persisted > reconnect-marker.txt; printf 'CTX_DONE\\n'\r"
+            b"printf persisted > reconnect-marker.txt; printf 'CTX_%s\\n' DONE\r"
         )
         manager.receive(
             HostWorkspaceContextStreamFrame(
@@ -610,7 +606,7 @@ async def test_multiple_viewers_preserve_lazy_shell_across_handoff(tmp_path: Pat
         manager.receive(
             HostWorkspaceContextStreamFrame(
                 channel_id="viewer-0",
-                data=base64.b64encode(b"printf 'SHARED_VIEW_READY\\n'\r").decode("ascii"),
+                data=base64.b64encode(b"printf 'SHARED_VIEW_%s\\n' READY\r").decode("ascii"),
                 binary=True,
             ),
             tunnel=tunnels[0],

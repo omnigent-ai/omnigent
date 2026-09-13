@@ -955,6 +955,90 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("restore this draft");
   });
 
+  it("clears a pending draft on the remounted landing when its create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("start this session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("start this session");
+
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(""));
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+  });
+
+  it("keeps a newly attached file when an older create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+    const file = new File(["diagram"], "new-diagram.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    expect(screen.getByText("new-diagram.png")).toBeTruthy();
+
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+    });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+    expect(screen.getByText("new-diagram.png")).toBeTruthy();
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+    expect(screen.getByText("new-diagram.png")).toBeTruthy();
+  });
+
+  it("keeps a newer prompt when an older create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+    cleanup();
+    renderLanding();
+    typeMessage("newer draft");
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+    });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("newer draft");
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("newer draft");
+  });
+
   it("records the launched workspace under its host without corrupting other recents", async () => {
     // Write-back hygiene for omnigent:recent-workspaces: the launched path
     // moves to the front of ITS host's list (deduplicated, not appended

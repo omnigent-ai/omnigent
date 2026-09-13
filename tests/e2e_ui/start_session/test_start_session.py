@@ -649,12 +649,11 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_navigates_while_create_is_pending(seeded_session: tuple[str, str]) -> None:
-    """Send immediately opens a temporary chat, then hydrates its real id.
+    """Start keeps the draft on New Chat until it has a real session id.
 
-    The create response is held so the test can verify the navigate-first
-    window: the landing composer is already gone, the URL uses a client-only
-    ``temp:`` id, and the optimistic prompt is visible in a read-only chat.
-    Releasing the response must replace that temporary URL with the real id.
+    The create response is held so the test can verify the pending window:
+    the draft and its tools remain on New Chat while the request is
+    pending. Releasing the response opens the real chat.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_send_busy_spinner(base_url, session_id))
@@ -738,62 +737,28 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            # The create is still in flight, but the landing screen is gone and
-            # the optimistic prompt is already visible under a temporary URL.
+            # The create is still in flight; the draft stays on New Chat until
+            # the real id is known.
             await _wait_until(lambda: len(create_bodies) == 1)
-            await expect(page).to_have_url(
-                re.compile(rf"{re.escape(base_url)}/c/temp:[0-9a-f]{{32}}")
-            )
+            await expect(page).to_have_url(f"{base_url}/")
             assert "id" not in create_bodies[0]
             assert re.fullmatch(
                 r"[0-9a-f]{32}",
                 create_bodies[0]["labels"]["omnigent.client_create_token"],
             )
-            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(0)
-            composer = page.get_by_role("textbox", name="Message the agent")
-            await expect(composer).to_be_disabled()
-            await expect(composer).to_have_attribute("placeholder", "Starting the session…")
-            await expect(
-                page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
-            ).to_be_visible()
-            await expect(
-                page.get_by_role("navigation", name="Conversation").get_by_text(
-                    "set up the project", exact=True
-                )
-            ).to_be_visible()
-            header = page.locator("header.chat-header")
-            for action_name in (
-                "Add to project",
-                "Agent tools and policies",
-                "Chat view",
-                "Terminal view",
-                "Conversation actions",
-                "Share session",
-            ):
-                await expect(
-                    header.get_by_role("button", name=action_name, exact=True)
-                ).to_be_disabled()
-            await expect(
-                header.get_by_role("button", name="Collapse right panel", exact=True)
-            ).to_be_enabled()
-            workspace = page.get_by_role("complementary", name="Workspace")
-            await expect(workspace).to_be_visible()
-            for tab_name in ("Files", "Changes", "GitHub", "Agents"):
-                await expect(
-                    workspace.get_by_role("tab", name=re.compile(tab_name))
-                ).to_be_disabled()
-            await expect(workspace.get_by_role("button", name="Full screen")).to_be_disabled()
-            await expect(
-                workspace.get_by_role("separator", name="Resize panel")
-            ).to_have_attribute("aria-disabled", "true")
-            await expect(workspace.get_by_text("Starting workspace…", exact=True)).to_be_visible()
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_value(
+                "set up the project"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+            await expect(page.get_by_test_id("new-chat-landing-submit")).to_have_attribute(
+                "aria-label", "Starting session"
+            )
             assert temp_scoped_requests == []
 
-            # Release the create: the same chat hydrates onto the real id.
+            # Release the create: the real chat opens and the draft goes away.
             release_create.set()
             await expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
-            await expect(workspace.get_by_text("Starting workspace…", exact=True)).to_have_count(0)
-            await expect(workspace.get_by_role("tab", name=re.compile("Agents"))).to_be_enabled()
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(0)
         finally:
             await browser.close()
 
@@ -801,10 +766,10 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
 def test_start_session_ignores_uncorrelated_announcement_while_create_pending(
     seeded_session: tuple[str, str],
 ) -> None:
-    """Only the exact create-token announcement resolves the temporary chat.
+    """Only the exact create-token announcement opens the created chat.
 
-    An uncorrelated top-level row leaves the temporary route in place. A row
-    carrying the POST's token resolves it while the HTTP response is pending.
+    An uncorrelated top-level row leaves the draft on New Chat. A row carrying
+    the POST's token resolves it while the HTTP response is pending.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_ignore_uncorrelated_announcement(base_url, session_id))
@@ -912,12 +877,12 @@ async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str
                 )
             )
 
-            # Stay on the already-open temp chat; never guess that the pushed
-            # row belongs to this request.
-            await expect(page).to_have_url(
-                re.compile(rf"{re.escape(base_url)}/c/temp:[0-9a-f]{{32}}")
+            # Keep the pending draft and its tools on New Chat; never guess
+            # that the pushed row belongs to this request.
+            await expect(page).to_have_url(f"{base_url}/")
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_value(
+                "set up the project"
             )
-            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(0)
             assert not release_create.is_set(), "the create must still be unanswered here"
 
             sockets[0].send(
@@ -1091,14 +1056,11 @@ async def _drive_no_redirect_after_navigating_away(
 def test_start_session_landing_clears_after_navigating_away(
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Coming back to the landing screen mid-create must not restore the draft.
+    """A pending draft survives a detour, then clears when creation succeeds.
 
-    The composer stashes its half-composed draft on unmount so a detour
-    into another session doesn't lose a half-typed thought. But a draft
-    that has already been *submitted* is spent: it belongs to the session
-    now being created. Restoring it hands the user a composer pre-filled
-    with the message they just sent — and a second Send would create a
-    duplicate session.
+    The pending prompt stays available if the user comes back while the
+    create is running. Once the server confirms the session, that prompt
+    belongs to the created chat and New Chat must be empty again.
     """
     base_url, session_a, session_b = seeded_session_pair
     _run_in_fresh_loop(_drive_landing_clears_after_navigating_away(base_url, session_a, session_b))
@@ -1196,11 +1158,10 @@ async def _drive_landing_clears_after_navigating_away(
             await page.get_by_test_id("new-chat-button").click()
             await landing_input.wait_for(state="visible", timeout=30_000)
 
-            # A spent draft must not come back — not while the create is
-            # still running, nor once it lands.
-            await expect(landing_input).to_have_value("")
+            await expect(landing_input).to_have_value(message)
             release_create.set()
             await asyncio.wait_for(create_answered.wait(), timeout=30.0)
+            await expect(landing_input).to_have_value("")
             for _ in range(20):
                 assert await landing_input.input_value() == "", "submitted draft was restored"
                 await asyncio.sleep(0.05)

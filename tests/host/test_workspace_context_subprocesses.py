@@ -97,14 +97,12 @@ async def test_host_reaper_preserves_workspace_async_child_exit_status() -> None
         assert process.pid in host._workspace_contexts.subprocess_ownership.pids
 
         sweeps = 0
-        reaped = 0
         while process.returncode is None:
-            reaped += host._reap_orphans_once()  # pyright: ignore[reportPrivateUsage]
+            host._reap_orphans_once()  # pyright: ignore[reportPrivateUsage]
             sweeps += 1
             await asyncio.sleep(0.005)
 
         assert sweeps > 1
-        assert reaped == 0
         assert await process.wait() == 37
         await _wait_until(
             lambda: process.pid not in host._workspace_contexts.subprocess_ownership.pids
@@ -140,11 +138,13 @@ async def test_host_reaper_reaps_orphan_while_workspace_child_is_alive() -> None
         reaped = 0
         for _ in range(500):
             reaped += host._reap_orphans_once()  # pyright: ignore[reportPrivateUsage]
-            if reaped:
+            try:
+                os.kill(orphan_pid, 0)
+            except ProcessLookupError:
                 break
             await asyncio.sleep(0.01)
 
-        assert reaped == 1
+        assert reaped >= 1
         with pytest.raises(OSError) as exc_info:
             os.waitpid(orphan_pid, os.WNOHANG)
         assert exc_info.value.errno == errno.ECHILD
