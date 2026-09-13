@@ -253,7 +253,9 @@ async def test_turn_with_file_attachment_reaches_agent() -> None:
         events.append(ev)
 
     prompt_msg = next(m for m in sent if m.get("method") == "session/prompt")
-    prompt_text = prompt_msg["params"]["prompt"][0]["text"]
+    prompt = prompt_msg["params"]["prompt"]
+    assert [block["type"] for block in prompt] == ["text", "text", "text"]
+    prompt_text = "\n".join(block["text"] for block in prompt)
     assert "review this file" in prompt_text
     assert "[attached file: foo.py]" in prompt_text
     assert any(isinstance(e, TurnComplete) for e in events)
