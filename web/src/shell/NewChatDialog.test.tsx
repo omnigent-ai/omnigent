@@ -59,6 +59,8 @@ import {
   onHostStatusChanged,
 } from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
+import { readHarnessOptions } from "@/lib/modePreferences";
+import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -1175,6 +1177,15 @@ function selectAgent(agentId: string): void {
   closeMenu();
 }
 
+function openPermissions(): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
+}
+
+function pickPermissionOption(value: string): void {
+  openPermissions();
+  fireEvent.click(screen.getByTestId(`new-chat-landing-permission-option-${value}`));
+}
+
 /**
  * Select a harness that may live under the picker's "More" submenu. Fully
  * supported harnesses list inline even when they need setup; everything else
@@ -1660,16 +1671,25 @@ describe("NewChatLandingScreen", () => {
       "-mb-px",
       "h-[37px]",
       "min-w-0",
-      "items-start",
-      "gap-2",
+      "items-center",
+      "gap-0.5",
+      "md:gap-2",
       "rounded-t-2xl",
       "border",
       "border-b-0",
       "bg-muted/70",
       "px-2",
-      "pt-1.5",
+      "py-1.5",
     );
-    expect(workspace).toHaveClass("h-6", "gap-1", "rounded-md", "px-1", "text-xs", "leading-4");
+    expect(workspace).toHaveClass(
+      "h-6",
+      "gap-1",
+      "rounded-md",
+      "px-0.5",
+      "md:px-1",
+      "text-xs",
+      "leading-4",
+    );
     expect(composer).toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
     expect(actions).toHaveClass("justify-between", "gap-2", "px-2", "pt-1", "pb-2");
@@ -1714,7 +1734,8 @@ describe("NewChatLandingScreen", () => {
       "gap-1",
       "rounded-md",
       "bg-transparent",
-      "px-1",
+      "px-0.5",
+      "md:px-1",
       "text-xs",
       "leading-4",
     );
@@ -1918,12 +1939,119 @@ describe("NewChatLandingScreen", () => {
     expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort High");
   });
 
-  it("does not duplicate model or effort controls in landing Advanced settings", () => {
-    renderLanding();
-    openAgentConfig("a2");
-    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
+  it.each([
+    ["Claude Code", "a1", false],
+    ["Claude Code", "a1", true],
+    ["Codex", "a2", false],
+    ["Codex", "a2", true],
+  ] as const)(
+    "omits %s Advanced settings and its separator for %s with smart routing enabled=%s",
+    (_label, agentId, smartRoutingEnabled) => {
+      renderLanding({ smart_routing_enabled: smartRoutingEnabled });
+      openAgentModels(agentId);
+      expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+      expect(screen.queryByText("Advanced settings")).toBeNull();
+      const models = screen.getByTestId("new-chat-landing-agent-models");
+      const efforts = screen.getByTestId("new-chat-landing-agent-efforts");
+      expect(models).toBeVisible();
+      expect(efforts).toBeVisible();
+      expect(models.closest('[role="menu"]')?.lastElementChild).toBe(efforts);
+    },
+  );
+
+  it.each(NATIVE_CODING_AGENTS)(
+    "$displayName has no redundant Advanced settings or empty Edit menu",
+    (native) => {
+      const agentId = `a_${native.key}`;
+      mockAgents([
+        {
+          id: agentId,
+          name: native.agentName,
+          display_name: native.displayName,
+          description: null,
+          harness: native.harness,
+          skills: [],
+        },
+      ]);
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+        fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      }
+
+      if (["claude", "codex", "pi"].includes(native.key)) {
+        fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+        expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+        expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+        expect(screen.queryByText("Advanced settings")).toBeNull();
+      } else {
+        expect(screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`)).toBeNull();
+        fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+        expect(screen.queryByRole("menu")).toBeNull();
+        expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
+      }
+    },
+  );
+
+  it.each(["cursor", "antigravity", "opencode"])(
+    "keeps model settings editable after selecting %s",
+    (key) => {
+      mockAgents(
+        NATIVE_CODING_AGENTS.filter((native) => native.key === "claude" || native.key === key).map(
+          (native) => ({
+            id: `a_${native.key}`,
+            name: native.agentName,
+            display_name: native.displayName,
+            description: null,
+            harness: native.harness,
+            skills: [],
+          }),
+        ),
+      );
+      renderLanding();
+      selectUnconfiguredAgent(`a_${key}`);
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-a_claude"));
+      expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+      expect(screen.queryByText("Advanced settings")).toBeNull();
+    },
+  );
+
+  it.each([
+    ["Devin", "devin"],
+    ["Grok Build", "grok"],
+    ["Jcode", "jcode"],
+    ["Kilocode", "acp:kilocode"],
+  ])("preserves %s's Agent Harness setting under Other", async (label, harness) => {
+    const agentLabels = await import("@/lib/agentLabels");
+    const catalog = vi.spyOn(agentLabels, "useBrainHarnessLabels").mockReturnValue({
+      ...agentLabels.BRAIN_HARNESS_LABELS,
+      [harness]: label,
+    });
+    try {
+      mockAgents([
+        {
+          id: "a_acp",
+          name: "acp-agent",
+          display_name: label,
+          description: null,
+          harness,
+          acpHarness: true,
+          skills: [],
+        },
+      ]);
+      renderLanding();
+      openAgentConfig("a_acp");
+      expect(screen.getByTestId("new-chat-landing-config-harness")).toHaveTextContent(label);
+      expect(screen.queryByTestId("new-chat-landing-permission-chip")).toBeNull();
+      pickSelectOption("new-chat-landing-config-harness", "Codex");
+      saveConfig();
+      openAgentConfig("a_acp");
+      expect(screen.getByTestId("new-chat-landing-config-harness")).toHaveTextContent("Codex");
+    } finally {
+      cleanup();
+      catalog.mockRestore();
+    }
   });
 
   it("offers model-specific Codex effort in the adjacent selector and sends the selection", async () => {
@@ -2056,6 +2184,7 @@ describe("NewChatLandingScreen", () => {
     const permissionMenu = screen.getByTestId("new-chat-landing-permission-menu");
     expect(permissionMenu).toHaveClass("w-max", "min-w-[13.75rem]", "max-w-[calc(100vw-2rem)]");
     expect(permissionMenu).toHaveTextContent("Bypass permissions");
+    expect(screen.queryByTestId("new-chat-landing-permission-option-bypass")).toBeNull();
 
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-option-acceptEdits"));
     expect(permission).toHaveTextContent("Accept edits");
@@ -2917,7 +3046,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("keeps model and effort in the primary picker and permissions in Advanced", () => {
+  it("keeps model and effort in the primary picker and permissions in the hand menu", () => {
     renderLanding();
     openAgentModels("a1");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
@@ -2926,10 +3055,11 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 4.6" })).toBeVisible();
     expect(screen.queryByText("Fable")).toBeNull();
     expect(screen.queryByText("Sonnet 5")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.queryByText("Advanced settings")).toBeNull();
+    closePrimaryPicker();
     expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
-    openSelect("new-chat-landing-config-permission");
+    openPermissions();
     expect(screen.getByText("Plan")).toBeTruthy();
     expect(screen.getByText("Bypass permissions")).toBeTruthy();
   });
@@ -2973,15 +3103,17 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBeUndefined();
   });
 
-  it("shows the Codex approval-mode knob in the gear modal", () => {
+  it("offers every Codex approval mode in the hand dropdown", () => {
     renderLanding();
-    // Open Codex's (a2) config modal — it carries the approval-mode select.
-    openAgentConfig("a2");
-    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
-    openSelect("new-chat-landing-config-approval");
-    expect(screen.getByText("Full access")).toBeTruthy();
-    expect(screen.getByText("Read only")).toBeTruthy();
+    selectAgent("a2");
+    openPermissions();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const menu = screen.getByTestId("new-chat-landing-permission-menu");
+    expect(
+      within(menu)
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Default", "Full access", "Read only", "Bypass approvals & sandbox"]);
   });
 
   it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {
@@ -3177,42 +3309,42 @@ describe("NewChatLandingScreen", () => {
     },
   );
 
-  it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
+  it("arms Codex bypass directly from the hand dropdown", () => {
     renderLanding();
-    // Open Codex's (a2) config modal; bypass is the most-permissive Approval
-    // option. It reads back exactly like Claude's "Bypass permissions" — the
-    // dropdown footer blurb carries the stance, with no danger banner.
-    openAgentConfig("a2");
-    openSelect("new-chat-landing-config-approval");
-    fireEvent.pointerEnter(screen.getByRole("option", { name: "Bypass approvals & sandbox" }));
-    expect(screen.getByTestId("new-chat-landing-config-approval-detail").textContent).toContain(
-      "no approval prompts and no command sandbox",
+    selectAgent("a2");
+    pickPermissionOption("bypass");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Approval: Bypass approvals & sandbox",
     );
-    fireEvent.click(screen.getByRole("option", { name: "Bypass approvals & sandbox" }));
-    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain(
-      "Bypass approvals & sandbox",
-    );
-    expect(
-      within(screen.getByTestId("new-chat-landing-config-modal")).queryByRole("alert"),
-    ).toBeNull();
+    expect(readHarnessOptions("codex-native").mode).toBe("bypass");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("disarms the dangerous bypass when the agent changes (re-arm per context)", () => {
     renderLanding();
-    // Arm bypass on Codex (a2): open its config modal, pick Bypass, Save.
-    openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
-    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain(
-      "Bypass approvals & sandbox",
+    selectAgent("a2");
+    pickPermissionOption("bypass");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Approval: Bypass approvals & sandbox",
     );
-    saveConfig();
 
-    // Switch away to Claude (a1) — which has no bypass option at all — then
-    // back to Codex: Approval is back at Default, so bypass must be re-armed
-    // for this fresh context rather than carrying across the agent change.
+    // A different agent starts a fresh context, so returning to Codex disarms bypass.
     selectAgent("a1");
-    openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain("Default");
+    selectAgent("a2");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Approval: Default",
+    );
+  });
+
+  it("restores the hand dropdown's bypass selection on a fresh visit", () => {
+    renderLanding();
+    selectAgent("a2");
+    pickPermissionOption("bypass");
+    remountLanding();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Approval: Bypass approvals & sandbox",
+    );
   });
 
   it("seeds the bypass-sandbox label in the create body when armed", async () => {
@@ -3221,10 +3353,8 @@ describe("NewChatLandingScreen", () => {
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     renderLanding();
-    openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
-    // Save to commit, then submit a real task.
-    saveConfig();
+    selectAgent("a2");
+    pickPermissionOption("bypass");
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
     });
@@ -3237,6 +3367,35 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.codex_native.bypass_sandbox"]).toBe("1");
     // The native wrapper labels still ride alongside it.
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
+  });
+
+  it.each([
+    ["default", "Default", undefined],
+    [
+      "full-access",
+      "Full access",
+      ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+    ],
+    ["read-only", "Read only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
+  ] as const)("clears bypass when the hand dropdown selects %s", async (mode, label, args) => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    pickPermissionOption("bypass");
+    pickPermissionOption(mode);
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      `Approval: ${label}`,
+    );
+    expect(readHarnessOptions("codex-native").mode).toBe(mode);
+
+    const { body } = await submitAndReadBody();
+    expect(
+      (body.labels as Record<string, string>)["omnigent.codex_native.bypass_sandbox"],
+    ).toBeUndefined();
+    expect(body.terminal_launch_args).toEqual(args);
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
@@ -3273,7 +3432,8 @@ describe("NewChatLandingScreen", () => {
       "h-6",
       "max-w-[calc(50%-0.25rem)]",
       "gap-1",
-      "px-1",
+      "px-0.5",
+      "md:px-1",
       "text-xs",
       "leading-4",
     );
@@ -5104,22 +5264,17 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     );
   });
 
-  it("opens the selected agent's config modal from the gear icon", () => {
+  it("edits Claude models without opening a permissions modal", () => {
     renderLanding();
-    // a1 (Claude Code) is selected by default; the gear opens its config modal.
-    expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-modal")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
+    openAgentModels("a1");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("summarizes the current settings across the integrated controls", () => {
     renderLanding();
-    // Set a non-default permission mode via the modal so the tooltip has
-    // something specific to show, then Save.
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-permission", "Plan");
-    saveConfig();
+    pickPermissionOption("plan");
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
       "Models unavailable",
     );
@@ -5153,49 +5308,34 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
 
   it("reflects an armed Codex bypass in the anchored Approval control", () => {
     renderLanding();
-    // Arm bypass on Codex (a2) via the Approval dropdown, Save.
-    openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
-    saveConfig();
+    selectAgent("a2");
+    pickPermissionOption("bypass");
     const approval = screen.getByTestId("new-chat-landing-permission-chip");
     expect(approval).toHaveAccessibleName("Approval: Bypass approvals & sandbox");
   });
 
-  it("shows the permission mode description in the dropdown footer, tracking hover", () => {
+  it("does not change permissions when the hand menu is dismissed without a selection", () => {
     renderLanding();
-    openAgentConfig("a1");
-    openSelect("new-chat-landing-config-permission");
-    // The footer starts on the selected (Default) mode's blurb...
-    const detail = screen.getByTestId("new-chat-landing-config-permission-detail");
-    expect(detail.textContent).toContain("Prompts before edits and commands");
-    // ...then follows the hovered option.
-    fireEvent.pointerEnter(screen.getByRole("option", { name: "Plan" }));
-    expect(detail.textContent).toContain("Plans only; makes no edits");
-  });
-
-  it("discards config changes on Cancel", () => {
-    renderLanding();
-    openAgentConfig("a1");
-    // Change the permission mode to Plan, then Cancel — nothing commits, and
-    // reopening shows the default again (the trigger reflects the value).
-    pickSelectOption("new-chat-landing-config-permission", "Plan");
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain("Plan");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
-    expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
-    openAgentConfig("a1");
-    // Reopened: Plan was discarded, the permission select is back at Manual
-    // (Claude's label for the prompting `default` mode).
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Manual",
+    openPermissions();
+    fireEvent.pointerMove(screen.getByRole("menuitem", { name: "Plan" }));
+    closeMenu();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permissions: Manual",
     );
   });
 
-  it("keeps the gear visible for routing-eligible agents even with no other knob (guard)", () => {
-    // Defensive: if a routable harness ever has no permission/approval/cursor
-    // knob and isn't a brain agent, Smart Routing (modal-only) still needs the
-    // gear. Simulate by extending the routable set is not possible here, so we
-    // assert the inverse contract: a NON-routable knob-less native agent hides
-    // the gear (so the routing-eligible branch is what keeps it shown).
+  it("commits Claude permissions immediately and remembers them on a fresh visit", () => {
+    renderLanding();
+    pickPermissionOption("plan");
+    expect(readHarnessOptions("claude-native").mode).toBe("plan");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    remountLanding();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permissions: Plan",
+    );
+  });
+
+  it("hides Edit for a harness with no configurable settings", () => {
     mockAgents([
       {
         id: "a_bare",
@@ -5207,7 +5347,9 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
       },
     ]);
     renderLanding({ smart_routing_enabled: true });
-    // opencode-native has no knobs and isn't routable → no gear.
+    openPicker();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    expect(screen.queryByTestId("new-chat-landing-agent-config-a_bare")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
   });
 });
@@ -5365,10 +5507,42 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     expect(screen.getAllByRole("menu")).toEqual([menu]);
     expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
+    expect(screen.queryByText("Advanced settings")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-agent-a2")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeVisible();
+    closeMenu();
+    pickPermissionOption("bypass");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Approval: Bypass approvals & sandbox",
+    );
   });
+
+  it.each(["cursor", "antigravity", "opencode"])(
+    "selects %s without an empty mobile config page and can return to Claude models",
+    (key) => {
+      mockAgents(
+        NATIVE_CODING_AGENTS.filter((native) => native.key === "claude" || native.key === key).map(
+          (native) => ({
+            id: `a_${native.key}`,
+            name: native.agentName,
+            display_name: native.displayName,
+            description: null,
+            harness: native.harness,
+            skills: [],
+          }),
+        ),
+      );
+      renderLanding();
+      selectUnconfiguredAgent(`a_${key}`);
+      expect(screen.queryByRole("menu")).toBeNull();
+      openPicker();
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-a_claude"));
+      expect(screen.getAllByRole("menu")).toHaveLength(1);
+      expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+      expect(screen.queryByText("Advanced settings")).toBeNull();
+    },
+  );
 
   it("drills into the Custom agents page in place and returns via Back", () => {
     // A custom (non-builtin) agent lands in the Custom agents group.
@@ -5477,14 +5651,8 @@ describe("NewChatLandingScreen smart routing", () => {
     },
   );
 
-  // No Model row at all: a non-routable harness has nothing to offer even with
-  // the flag on, and its own knob row is untouched. (Codex always has a row —
-  // the host resolves its launch catalog — see the dropdown cases above.)
-  it.each([
-    [
-      "a non-routable harness with the flag on",
-      "a_cursor",
-      true,
+  it("keeps non-routable Cursor modes in the hand menu", () => {
+    mockAgents([
       {
         id: "a_cursor",
         name: "cursor-native-ui",
@@ -5492,15 +5660,13 @@ describe("NewChatLandingScreen smart routing", () => {
         description: null,
         harness: "cursor-native",
         skills: [],
-      } as AvailableAgent,
-      "new-chat-landing-config-cursor-mode",
-    ],
-  ] as const)("gives %s no Model row", (_case, agentId, flag, agent, siblingTestId) => {
-    if (agent) mockAgents([agent]);
-    renderLanding({ smart_routing_enabled: flag });
-    openAgentConfig(agentId);
-    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-    expect(screen.getByTestId(siblingTestId)).toBeTruthy();
+      },
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    openPermissions();
+    expect(screen.queryByTestId("new-chat-landing-agent-models")).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Plan" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Smart Routing" })).toBeNull();
   });
 
   // Per-family gateway gating: the apply layer rewrites the model through the
@@ -6237,20 +6403,17 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
       JSON.stringify({ "claude-native": { mode: "plan" } }),
     );
     renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain("Plan");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permissions: Plan",
+    );
 
     selectSmartRoutingHarness();
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
       "Permissions: Default",
     );
-    // Reads the state behind the locked control: the wrapper's full modal is
-    // back and shows the reset value.
     selectAgent("a1");
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Manual",
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permissions: Manual",
     );
   });
 

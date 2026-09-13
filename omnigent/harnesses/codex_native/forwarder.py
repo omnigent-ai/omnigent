@@ -6158,7 +6158,7 @@ _CODEX_SANDBOX_BYPASS_GUIDANCE = (
     "Omnigent: Codex's command sandbox could not start because this container "
     "disallows unprivileged user namespaces, so the command did not run. To run "
     'shell commands here, start a new Codex session with the "Full access" '
-    "approval preset (New chat → Advanced settings), or set "
+    "approval preset (New chat → permissions dropdown), or set "
     'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
 )
 
