@@ -60,7 +60,6 @@ from omnigent.inner.codex_executor import (
     codex_router_session_id,
     codex_routing_hook_skip_reason,
     materialize_codex_provider_config,
-    read_codex_model_catalog,
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import (
@@ -469,21 +468,16 @@ def _sync_codex_developer_instructions(
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
-def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
-    """Return Codex's replacement for *model*, when the catalog declares one."""
-    if not isinstance(catalog, dict):
-        return None
-    models = catalog.get("models")
-    if not isinstance(models, list):
-        return None
+def _codex_model_upgrade_target(models: Sequence[_JsonObject], model: str) -> str | None:
+    """Read the migration target from the running app-server's model/list rows."""
     for entry in models:
-        if not isinstance(entry, dict) or entry.get("slug") != model:
+        if entry.get("model") != model:
             continue
-        upgrade = entry.get("upgrade")
-        if not isinstance(upgrade, dict):
-            return None
-        target = upgrade.get("model") or upgrade.get("id")
-        if isinstance(target, str) and target and target != model:
+        target = entry.get("upgrade")
+        if not isinstance(target, str):
+            upgrade_info = entry.get("upgradeInfo")
+            target = upgrade_info.get("model") if isinstance(upgrade_info, dict) else None
+        if isinstance(target, str) and target.strip() and target != model:
             return target
         return None
     return None
@@ -810,17 +804,20 @@ class CodexAppServerClient:
             await self._events.put(message)
 
 
-async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
-    """Read every visible model from an initialized Codex app-server client.
+async def list_codex_model_options(
+    client: CodexAppServerClient, *, include_hidden: bool = False
+) -> list[_JsonObject]:
+    """Read models from an initialized Codex app-server client.
 
     :param client: Connected Codex app-server client.
+    :param include_hidden: Include retired models when checking migration targets.
     :returns: Raw ``model/list`` rows in Codex preference order.
     :raises ValueError: When Codex returns a malformed response.
     """
     options: list[_JsonObject] = []
     cursor: str | None = None
     while True:
-        params: CodexParams = {"includeHidden": False}
+        params: CodexParams = {"includeHidden": include_hidden}
         if cursor is not None:
             params["cursor"] = cursor
         response = await client.request("model/list", params)
@@ -1417,15 +1414,6 @@ class CodexNativeAppServer:
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
         config_source = _codex_home_config_source_from_env()
-        model_migration_target: str | None = None
-        if self.trust_project and self.pinned_model:
-            catalog = await asyncio.to_thread(
-                read_codex_model_catalog,
-                self.codex_path,
-                config_source,
-                timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
-            )
-            model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
         # Off the loop: this copies/symlinks a home AND (on a Smart Routing
         # session) shells out to ``codex debug models`` with a 10s timeout. Run
         # inline it stalled every other session sharing this event loop for that
@@ -1450,12 +1438,6 @@ class CodexNativeAppServer:
         )
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
-            if model_migration_target is not None:
-                _acknowledge_codex_model_migration(
-                    self.codex_home,
-                    self.pinned_model,
-                    model_migration_target,
-                )
         if self.pinned_effort:
             _pin_codex_config_effort(self.codex_home, self.pinned_effort, self.pinned_model)
         _sync_codex_developer_instructions(
@@ -1728,6 +1710,19 @@ class CodexNativeAppServer:
         self.process_registry_tag = None
         self.process_owner_lock = None
 
+    async def _acknowledge_model_migration(self, client: CodexAppServerClient) -> None:
+        """Suppress migration prompts before the TUI attaches, using the active catalog."""
+        if not self.trust_project or not self.pinned_model:
+            return
+        try:
+            async with asyncio.timeout(_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS):
+                models = await list_codex_model_options(client, include_hidden=True)
+                target = _codex_model_upgrade_target(models, self.pinned_model)
+                if target is not None:
+                    _acknowledge_codex_model_migration(self.codex_home, self.pinned_model, target)
+        except Exception:  # noqa: BLE001 - migration lookup must not block startup
+            _logger.warning("Could not acknowledge native Codex model migration", exc_info=True)
+
     async def _wait_until_ready(self) -> None:
         """
         Wait until the app-server socket accepts an initialized
@@ -1754,8 +1749,13 @@ class CodexNativeAppServer:
                         self.socket_path,
                         client_name="omnigent-probe",
                     )
-                await client.connect()
-                await client.close()
+                try:
+                    await client.connect()
+                    # Reuse the initialized connection and the session's effective
+                    # catalog. A separate debug-models process repeats config/auth.
+                    await self._acknowledge_model_migration(client)
+                finally:
+                    await client.close()
                 return
             except Exception as exc:  # noqa: BLE001 - readiness retry boundary
                 last_error = exc
