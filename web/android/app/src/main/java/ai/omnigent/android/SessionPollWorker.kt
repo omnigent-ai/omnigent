@@ -382,7 +382,7 @@ class SessionPollWorker(
             // Cheap size cap: the endpoint is limit=20 so a well-behaved body is
             // small, but readText() is otherwise unbounded. Read in fixed chunks
             // into a StringBuilder that grows to the actual body size, capped at
-            // MAX_RESPONSE_BYTES; a larger body is treated as a no-op (null)
+            // MAX_RESPONSE_CHARS; a larger body is treated as a no-op (null)
             // rather than buffered whole. Sizing the buffer to the response (a
             // sane page is a few KB) avoids allocating the full cap every poll.
             conn.inputStream.bufferedReader().use { reader ->
@@ -392,7 +392,7 @@ class SessionPollWorker(
                     val n = reader.read(chunk)
                     if (n < 0) break
                     // Appending this chunk would exceed the cap → oversized, bail.
-                    if (out.length + n > MAX_RESPONSE_BYTES) return null
+                    if (out.length + n > MAX_RESPONSE_CHARS) return null
                     out.append(chunk, 0, n)
                 }
                 out.toString()
@@ -411,10 +411,11 @@ class SessionPollWorker(
         private const val IDLE_SETTLE_MS = 10_000L
         private const val HTTP_TIMEOUT_MS = 15_000
 
-        // Upper bound on the list-response body we buffer. The endpoint is
-        // limit=20, so a sane page is well under this; a larger body is treated
-        // as a no-op rather than read whole. ~1M chars.
-        private const val MAX_RESPONSE_BYTES = 1_048_576
+        // Upper bound on the list-response body we buffer, in CHARS (the
+        // StringBuilder length we compare against, so multi-byte bodies may
+        // occupy more bytes). The endpoint is limit=20, so a sane page is well
+        // under this; a larger body is treated as a no-op rather than read whole.
+        private const val MAX_RESPONSE_CHARS = 1_048_576
 
         // Per-read chunk size. Small and fixed so the buffer footprint tracks
         // the actual (tiny) response rather than the cap above.
