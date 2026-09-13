@@ -1979,7 +1979,7 @@ describe("NewChatLandingScreen", () => {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
 
-      if (["claude", "codex", "pi"].includes(native.key)) {
+      if (["claude", "codex", "pi", "devin"].includes(native.key)) {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
         expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
@@ -2115,6 +2115,56 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
     const { body } = await submitAndReadBody();
     expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("renders Devin's own model families and effort ladder from the devinMode capability", () => {
+    // Devin declares only `devinMode` (not modelPicker/permissionMode). Both the
+    // config-content gate and the models-section gate must honour that flag, or a
+    // Devin chat opens with no way to pick a model or effort at launch.
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a3",
+        name: "devin-native-ui",
+        display_name: "Devin",
+        description: null,
+        harness: "devin-native",
+        skills: [],
+      },
+    ]);
+    mockHosts([{ ...host("online"), configured_harnesses: { "devin-native": true } } as Host]);
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "devin-native"
+          ? {
+              data: [
+                { id: "swe-2", displayName: "SWE-2", isDefault: true },
+                { id: "claude-opus-5", displayName: "Claude Opus 5" },
+              ],
+              isLoading: false,
+              isError: false,
+            }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    renderLanding();
+    openAgentModels("a3");
+
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(models).toHaveTextContent("SWE-2");
+    expect(screen.getByTestId("new-chat-landing-agent-model-claude-opus-5")).toBeTruthy();
+
+    // No --effort flag: the runner recombines (model, effort) at launch, so the
+    // picker offers the fixed Anthropic ladder regardless of the drafted model.
+    for (const rung of ["low", "medium", "high", "xhigh", "max"]) {
+      expect(screen.getByTestId(`new-chat-landing-agent-effort-${rung}`)).toBeTruthy();
+    }
   });
 
   it("hides adjacent Codex effort options when the model has no effort metadata", () => {

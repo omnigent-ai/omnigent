@@ -1399,6 +1399,76 @@ async def test_external_acp_subagent_start_is_idempotent_on_subagent_id(
     assert len([c for c in children if c["labels"].get("omnigent.acp.subagent_id") == "dup1"]) == 1
 
 
+async def test_external_devin_subagent_start_mints_child(
+    client: httpx.AsyncClient,
+) -> None:
+    """A devin-native run_subagent spawn mints a child carrying Devin's identity."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_devin_subagent_start",
+            "data": {
+                "agent_id": "690d786b",
+                "title": "Write alpha.txt",
+                "tool_use_id": "run_subagent_0",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), f"unexpected status {resp.status_code}: {resp.text}"
+    child_id = resp.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    matching = [c for c in children if c["id"] == child_id]
+    assert len(matching) == 1, f"child {child_id} not in {children!r}"
+    child = matching[0]
+    assert child["parent_session_id"] == parent["id"]
+    assert child["kind"] == "sub_agent"
+    # The run_subagent title is the rail label; the agent_id is the correlation id.
+    assert child["tool"] == "Write alpha.txt"
+    assert child["session_name"] == "690d786b"
+    assert child["labels"]["omnigent.wrapper"] == "devin-native-ui-subagent"
+    assert child["labels"]["omnigent.devin_native.subagent_agent_id"] == "690d786b"
+    assert child["labels"]["omnigent.devin_native.run_subagent_tool_use_id"] == "run_subagent_0"
+
+
+async def test_external_devin_subagent_start_is_idempotent_on_agent_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A redelivery with the same agent_id returns the same child, not a duplicate.
+
+    The forwarder re-mirrors on each turn-end until it marks a sub-agent done, so a
+    retry must resolve to the existing child row.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    payload = {
+        "type": "external_devin_subagent_start",
+        "data": {"agent_id": "dupdevin", "title": "worker"},
+    }
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    second = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert first.json()["child_session_id"] == second.json()["child_session_id"]
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    label = "omnigent.devin_native.subagent_agent_id"
+    assert len([c for c in children if c["labels"].get(label) == "dupdevin"]) == 1
+
+
+async def test_external_devin_subagent_start_needs_an_agent_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A spawn with no agent_id is rejected rather than minting an unkeyed child."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={"type": "external_devin_subagent_start", "data": {"title": "worker"}},
+    )
+    assert resp.status_code == 400, f"unexpected status {resp.status_code}: {resp.text}"
+
+
 async def test_external_acp_subagent_start_allows_duplicate_titles(
     client: httpx.AsyncClient,
 ) -> None:

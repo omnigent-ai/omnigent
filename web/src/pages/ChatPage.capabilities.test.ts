@@ -21,6 +21,18 @@ describe("effortLevelsForConv", () => {
     ]);
   });
 
+  it("returns the extended ladder for devin-native-ui (effort is a model suffix)", () => {
+    // WHY: Devin has no --effort flag; its rung set is the Anthropic ladder,
+    // which the executor recombines onto the model id.
+    expect(effortLevelsForConv({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
   it("returns the base three levels for a non-native wrapper", () => {
     // WHY: other wrappers only support low/medium/high; offering xhigh/max
     // would send an effort the harness can't honor.
@@ -60,6 +72,9 @@ describe("shouldShowModelPicker", () => {
     // pi injects a live model switch into the running Pi process (via the bridge
     // inbox → setModel) and mirrors in-TUI /model picks back to model_override.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "pi-native-ui" } })).toBe(true);
+    // devin mirrors its live model into model_override (the executor types
+    // /model when a routed model changes), like opencode/pi.
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(true);
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
@@ -77,6 +92,14 @@ describe("shouldShowEffortPicker", () => {
     // WHY: delegates to supportsEffortControl — only claude-native exposes a
     // Web UI effort dial.
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": NATIVE } })).toBe(true);
+  });
+
+  it("shows effort controls for devin-native (effort is a model-variant suffix)", () => {
+    // WHY: Devin has no --effort flag; effort is a model-variant suffix the
+    // executor recombines and re-applies via /model, so the in-chat dial is live.
+    expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(
+      true,
+    );
   });
 
   it("hides effort controls for other wrappers and missing labels", () => {

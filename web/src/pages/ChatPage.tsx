@@ -874,7 +874,9 @@ export function ChatPage() {
       ? "codex-native"
       : fallbackPickerKind === "claude"
         ? "claude-native"
-        : null;
+        : fallbackPickerKind === "devin"
+          ? "devin-native"
+          : null;
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
@@ -2089,6 +2091,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "cursor") return "Cursor";
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
+  if (modelPickerKind === "devin") return "Devin";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -3974,7 +3977,7 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4031,6 +4034,10 @@ export function effortLevelsForConv(
   switch (conv?.labels?.["omnigent.wrapper"]) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
+    case "devin-native-ui":
+      // Devin encodes effort as a model-variant suffix; its rung set is the
+      // Anthropic ladder (low/medium/high/xhigh/max).
+      return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "pi-native-ui":
@@ -4070,6 +4077,10 @@ export function modelPickerKindForConv(
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "devin-native-ui":
+      // Like opencode/pi: Devin mirrors its live model into ``model_override``
+      // (the executor types ``/model`` when a routed model changes).
+      return "devin";
     case "pi-native-ui":
       // Like cursor: the runner types a model switch into the live Pi process
       // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
@@ -4586,7 +4597,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
-    modelPickerKind === "opencode";
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "devin";
   const modelOptions: readonly {
     id: string;
     model?: string;
@@ -4636,7 +4648,7 @@ function useResolvedComposerModel(
     : nativeVendorOwnsModel
       ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
         ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi"
+        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker

@@ -327,6 +327,13 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Kiro (``omni kiro``) — gates on the kiro-cli binary.
         "kiro-native",
         "native-kiro",
+        # Native Devin (``omni devin``) — gates on the devin binary. The bare
+        # ``devin`` spelling canonicalizes onto ``devin-native``, so it is
+        # covered too; Devin's ACP row is keyed ``devin-acp`` and gates on the
+        # same binary through the catalog.
+        "devin",
+        "devin-native",
+        "native-devin",
         # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
         # on the goose CLI.
         "goose",

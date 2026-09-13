@@ -30,6 +30,7 @@ from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    DEVIN_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
@@ -349,6 +350,31 @@ _ANTIGRAVITY_NATIVE_HARNESS = ANTIGRAVITY_NATIVE_CODING_AGENT.harness
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 
 
+_DEVIN_NATIVE_WRAPPER_LABEL_VALUE = DEVIN_NATIVE_CODING_AGENT.wrapper_label
+
+
+_EXTERNAL_DEVIN_SUBAGENT_START_TYPE: str = "external_devin_subagent_start"
+
+
+_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "devin-native-ui-subagent"
+
+
+# Devin's ``run_subagent`` spawns a background sub-agent whose ``agent_id`` (the
+# idempotency key for the child row) rides only free text in the tool result; a
+# child mirrors that sub-agent's transcript, reconstructed from the parent's
+# ``message_nodes`` forest.
+_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY = "omnigent.devin_native.subagent_agent_id"
+
+
+_DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY = "omnigent.devin_native.run_subagent_tool_use_id"
+
+
+_DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY = "omnigent.devin_native.subagent_title"
+
+
+_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Devin"
+
+
 _PI_NATIVE_WRAPPER_LABEL_VALUE = PI_NATIVE_CODING_AGENT.wrapper_label
 
 
@@ -502,6 +528,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
+    _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
 }
@@ -812,6 +839,7 @@ _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
+    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE: "devin-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
@@ -951,6 +979,12 @@ __all__ = [
     "_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_CURSOR_NATIVE_WRAPPER_LABEL_VALUE",
     "_DENY_SENTINEL_PREFIX",
+    "_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK",
+    "_DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
+    "_DEVIN_NATIVE_WRAPPER_LABEL_VALUE",
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
@@ -962,6 +996,7 @@ __all__ = [
     "_EXTERNAL_COMPACTION_STATUS_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_VALUES",
     "_EXTERNAL_CONVERSATION_ITEM_TYPE",
+    "_EXTERNAL_DEVIN_SUBAGENT_START_TYPE",
     "_EXTERNAL_ELICITATION_RESOLVED_TYPE",
     "_EXTERNAL_MCP_STARTUP_STATUS_VALUES",
     "_EXTERNAL_MCP_STARTUP_TYPE",

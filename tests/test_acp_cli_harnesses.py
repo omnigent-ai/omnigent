@@ -231,7 +231,7 @@ def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> 
 # AcpExtension into the same shared ACP executor (see omnigent.inner.devin).
 # Listing one here is deliberate: it declares that the row no longer runs the
 # shared wrap and may declare capabilities the generic profile does not.
-_VENDOR_WRAPS = {"devin": "omnigent.inner.devin.harness"}
+_VENDOR_WRAPS = {"devin-acp": "omnigent.inner.devin.harness"}
 
 
 @pytest.mark.parametrize("name", sorted(ACP_CLI_HARNESSES))
@@ -334,7 +334,7 @@ def test_spawn_env_forwards_permission_mode(monkeypatch: pytest.MonkeyPatch) -> 
 
     Devin and Grok Build are builtin rows, so they take this builder rather than
     ``_build_acp_spawn_env``. Missing it here would leave the option working for
-    a self-registered ``acp:devin`` but silently inert for the builtin ``devin``
+    a self-registered ``acp:devin`` but silently inert for the builtin ``devin-acp``
     the picker offers.
     """
     monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
