@@ -23,7 +23,7 @@ Two behaviors are pinned:
 1. The auto-login inside ``omnigent host --server <ws>/omnigent?o=<id>``
    completes unattended: the token verify inherits the CLI-recorded
    workspace selector, so the login does NOT die with the misleading
-   "rejected the token (HTTP 403)" the ticket transcript shows.
+   "rejected the token (HTTP 403)" the reported transcript shows.
 2. When the mount genuinely rejects the token (the user lacks app
    access), the login error is NOT followed by the irrelevant
    "runner tunnel rejection (HTTP 401) ... run `omnigent stop`" hint —
@@ -39,6 +39,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import shutil
 import ssl
 import subprocess
 import sys
@@ -81,7 +82,9 @@ class _FakeDatabricksEdge(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:  # noqa: A002
         pass  # keep pexpect transcripts clean
 
-    def _json(self, code: int, body: dict[str, object], headers: dict[str, str] | None = None) -> None:
+    def _json(
+        self, code: int, body: dict[str, object], headers: dict[str, str] | None = None
+    ) -> None:
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -130,7 +133,7 @@ class _FakeDatabricksEdge(http.server.BaseHTTPRequestHandler):
 @pytest.fixture(scope="module")
 def edge_cert(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Self-signed localhost cert the fake edge serves TLS with."""
-    if not (Path("/usr/bin/openssl").exists() or os.environ.get("PATH")):
+    if shutil.which("openssl") is None:
         pytest.skip("openssl not available")
     cert_dir = tmp_path_factory.mktemp("edge_cert")
     result = subprocess.run(
@@ -180,7 +183,7 @@ def edge_always_403(edge_cert: Path) -> Iterator[str]:
 
 _STUB_DATABRICKS_CLI = """#!/usr/bin/env bash
 # Stub Databricks CLI: `auth login --host H --profile P` simulates the real
-# browser flow — auto-selects the single accessible workspace, records its id
+# browser flow -- auto-selects the single accessible workspace, records its id
 # in the profile, and caches a grant (a PAT-style token the SDK resolves).
 set -u
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "login" ]; then
@@ -245,6 +248,11 @@ def host_env(edge_cert: Path, tmp_path: Path) -> dict[str, str]:
         "DATABRICKS_BEARER",
     ):
         env.pop(ambient, None)
+    # Runner/host vars from a server-spawned agent shell would make the
+    # spawned CLI take the zygote-fork path; the user's machine has none.
+    for key in list(env):
+        if key.startswith(("OMNIGENT_RUNNER", "OMNIGENT_HOST")):
+            env.pop(key, None)
     env.update(
         {
             "HOME": str(fake_home),
@@ -276,9 +284,7 @@ def _omnigent_cli() -> str:
     venv_omnigent = Path(sys.executable).parent / "omnigent"
     if venv_omnigent.exists():
         return str(venv_omnigent)
-    import shutil as _shutil
-
-    path = _shutil.which("omnigent")
+    path = shutil.which("omnigent")
     if path is None:
         pytest.skip("omnigent CLI not on PATH")
     return path
@@ -290,10 +296,10 @@ def test_host_autologin_inherits_workspace_selector(
 ) -> None:
     """`omnigent host --server <ws>/omnigent?o=<id>` logs in unattended.
 
-    The ticket transcript's failure: the auto-login's token verify reached
-    the account host without the ``?o=`` workspace selector, was rejected
-    with HTTP 403, and the CLI told the user to check app access — even
-    though a manual ``omnigent login`` (which routes the selector) then
+    The reported transcript's first failure: the auto-login's token verify
+    reached the account host without the ``?o=`` workspace selector, was
+    rejected with HTTP 403, and the CLI told the user to check app access —
+    even though a manual ``omnigent login`` (which routes the selector) then
     succeeded. The fixed flow inherits the workspace id the Databricks CLI
     recorded during the browser login, so the verify routes to the
     workspace and the whole `host` bring-up completes without a manual
@@ -314,7 +320,9 @@ def test_host_autologin_inherits_workspace_selector(
                 pexpect.EOF,
             ]
         )
-        transcript = (child.before or "") + (child.after if isinstance(child.after, str) else "")
+        transcript = (child.before or "") + (
+            child.after if isinstance(child.after, str) else ""
+        )
         assert idx == 0, (
             "host auto-login did not complete: the token verify was rejected "
             "(the ?o= workspace selector was dropped) or the CLI "
