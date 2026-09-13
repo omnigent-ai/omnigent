@@ -3404,6 +3404,7 @@ def _read_discovery_registry_entries(registry_path: Path) -> list[dict[str, obje
     return [item for item in payload if isinstance(item, dict)]
 
 
+@pytest.mark.posix_only
 async def test_model_discovery_spawn_registers_crash_safe_entry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3482,6 +3483,7 @@ async def test_model_discovery_spawn_registers_crash_safe_entry(
         await codex_native_app_server._stop_codex_model_discovery_process(discovery)
 
 
+@pytest.mark.posix_only
 async def test_model_discovery_stop_removes_entry_and_releases_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3535,6 +3537,7 @@ async def test_model_discovery_stop_removes_entry_and_releases_lock(
     assert not lock_path.exists()
 
 
+@pytest.mark.posix_only
 async def test_model_discovery_stop_keeps_entry_when_terminate_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3586,6 +3589,7 @@ async def test_model_discovery_stop_keeps_entry_when_terminate_raises(
     assert not Path(owner_lock.path).exists()
 
 
+@pytest.mark.posix_only
 async def test_model_discovery_spawn_failure_releases_owner_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
