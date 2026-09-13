@@ -70,6 +70,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
 )
+from omnigent.onboarding.provider_config import harness_owns_its_credential
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -10120,6 +10121,7 @@ async def _get_session_snapshot(
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
+    harness_owns_model = False
     if agent_store is not None and agent_cache is not None and conv.agent_id is not None:
         try:
             agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
@@ -10152,6 +10154,13 @@ async def _get_session_snapshot(
                         else:
                             resolved_spec = _sub_spec
                     if resolved_spec is not None:
+                        # A self-authenticated harness (own-auth ACP) picks its
+                        # own model; the spec's pin is not what the session
+                        # runs, so don't present it as the model. The observed
+                        # context-window label below still repopulates
+                        # ``context_window`` once the harness reports usage.
+                        effective_harness = conv.harness_override or _spec_harness(resolved_spec)
+                        harness_owns_model = harness_owns_its_credential(effective_harness)
                         # Prefer the spec's name over the agent row's: a
                         # switch-created session-scoped clone is named
                         # "<builtin> (switch ag_…)" for row disambiguation,
@@ -10159,12 +10168,12 @@ async def _get_session_snapshot(
                         # carries the clean identity (e.g. "claude-native-ui").
                         if resolved_spec.name:
                             agent_name = resolved_spec.name
-                        llm_model = resolved_spec.executor.model
+                        llm_model = None if harness_owns_model else resolved_spec.executor.model
 
                         # Offload: may fetch a provider catalog (blocking IO).
                         context_window = await asyncio.to_thread(
                             resolve_effective_context_window,
-                            resolved_spec.executor.context_window,
+                            None if harness_owns_model else resolved_spec.executor.context_window,
                             llm_model,
                             model_override=conv.model_override,
                         )
