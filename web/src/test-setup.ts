@@ -1,6 +1,48 @@
 import "@testing-library/jest-dom/vitest";
 import { vi } from "vitest";
 
+// Node 22+ exposes an experimental file-backed ``localStorage`` global whose
+// methods are not dispatched through ``Storage.prototype``; on Node 25+ it
+// shadows jsdom's and reads as ``undefined`` without ``--localstorage-file``.
+// Tests that simulate quota/private-mode failures spy on that prototype, so
+// give jsdom a small in-memory implementation instead.
+class TestStorage implements Storage {
+  private values = new Map<string, string>();
+
+  get length(): number {
+    return this.values.size;
+  }
+
+  clear(): void {
+    this.values.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.values.get(String(key)) ?? null;
+  }
+
+  key(index: number): string | null {
+    return [...this.values.keys()][index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    this.values.delete(String(key));
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(String(key), String(value));
+  }
+}
+
+Object.defineProperty(globalThis, "Storage", {
+  configurable: true,
+  value: TestStorage,
+});
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: new TestStorage(),
+});
+
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
 // import them can still load in tests. (The Antigravity glyph additionally
