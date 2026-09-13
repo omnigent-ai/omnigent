@@ -550,10 +550,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="exec",
         shell_tool_prompt=_SHELL_PROMPT,
-        # The wrap launches the vendor TUI and mirrors it; AgentSpec.instructions
-        # are not threaded into Devin (no --prompt-file / rules injection yet),
-        # matching the other native TUI wraps.
-        instruction_delivery=_ID.NOT_DELIVERED,
+        # A custom agent's instructions are delivered at launch as an always-on
+        # Windsurf rule in the workspace (Devin's only per-turn system-prompt
+        # channel; it has no --append-system-prompt). See write_devin_agent_rule.
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,

@@ -3347,6 +3347,7 @@ async def _auto_create_devin_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """Auto-create the Devin TUI terminal for a devin-native session.
 
@@ -3354,6 +3355,10 @@ async def _auto_create_devin_terminal(
     lifecycle hooks and so is what makes policy, elicitation and the transcript
     mirror work), launches the TUI in a runner-owned tmux pane, then starts the
     hook forwarder.
+
+    :param agent_spec: The session's resolved agent spec. A custom agent's
+        ``instructions`` are delivered to Devin as an always-on Windsurf rule in
+        the workspace (Devin's only per-turn system-prompt channel).
     """
     from omnigent.harnesses.devin_native.bridge import (
         DEVIN_NATIVE_ENV_UNSET,
@@ -3361,6 +3366,7 @@ async def _auto_create_devin_terminal(
         export_path,
         prepare_bridge_dir,
         session_config_path,
+        write_devin_agent_rule,
         write_hook_wrapper,
         write_tmux_target,
     )
@@ -3379,6 +3385,13 @@ async def _auto_create_devin_terminal(
         raise RuntimeError(f"Devin workspace does not exist for session {session_id!r}.")
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
+
+    # Deliver a custom agent's instructions as an always-on Windsurf rule (the
+    # only channel Devin applies to every turn); a plain agent clears any stale
+    # rule a prior custom-agent launch left in this workspace.
+    write_devin_agent_rule(
+        workspace_path, _native_startup_raw_instructions_from_spec(agent_spec)
+    )
 
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
@@ -8149,6 +8162,7 @@ async def _launch_devin(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 

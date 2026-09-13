@@ -318,6 +318,42 @@ def write_devin_session_config(
     return path
 
 
+#: Workspace-relative always-on rule file carrying a custom Devin agent's
+#: ``AgentSpec.instructions``. Devin has no ``--append-system-prompt`` and
+#: ignores config-level instructions (verified), so a Windsurf always-on rule is
+#: the only channel that reaches every turn's system prompt. Stable name so each
+#: launch overwrites rather than accumulating.
+_AGENT_RULE_RELPATH = (".windsurf", "rules", "omnigent-agent-instructions.md")
+
+
+def write_devin_agent_rule(workspace: Path, instructions: str | None) -> None:
+    """Deliver a custom agent's instructions to Devin as an always-on rule.
+
+    Writes ``<workspace>/.windsurf/rules/omnigent-agent-instructions.md`` with the
+    ``trigger: always_on`` frontmatter Devin requires to load a rule into every
+    turn's system prompt. Idempotent: called with ``None`` (a plain Devin agent,
+    no instructions) it removes any rule a prior custom-agent launch left, so the
+    workspace never carries stale instructions.
+
+    :param workspace: The session's workspace directory (Devin reads rules
+        relative to its CWD, which is this workspace).
+    :param instructions: The verbatim ``AgentSpec.instructions``, or ``None``.
+    """
+    # ponytail: this writes into the user's workspace — the only always-on
+    # channel Devin exposes (rules are CWD-relative; there is no out-of-tree
+    # rules dir and config-level instructions are ignored). Stable name keeps it
+    # to one overwritten file, removed when the agent carries no instructions.
+    rule_path = workspace.joinpath(*_AGENT_RULE_RELPATH)
+    if instructions and instructions.strip():
+        rule_path.parent.mkdir(parents=True, exist_ok=True)
+        rule_path.write_text(
+            f"---\ntrigger: always_on\n---\n{instructions.strip()}\n", encoding="utf-8"
+        )
+    else:
+        with contextlib.suppress(OSError):
+            rule_path.unlink(missing_ok=True)
+
+
 def write_hook_wrapper(
     bridge_dir: Path,
     *,

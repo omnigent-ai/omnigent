@@ -17,6 +17,7 @@ from omnigent.harnesses.devin_native.bridge import (
     iter_hook_events,
     record_hook_event,
     session_config_path,
+    write_devin_agent_rule,
     write_devin_session_config,
 )
 from omnigent.harnesses.devin_native.hook import _normalize_tool_result
@@ -168,6 +169,32 @@ class TestSessionConfig:
         assert set(written["hooks"]) == set(DEVIN_HOOK_EVENTS)
         assert written["agent"]["model"] == "claude-opus-5-xhigh"
         assert path == session_config_path(bridge)
+
+
+class TestAgentRule:
+    """A custom agent's instructions reach Devin as an always-on Windsurf rule."""
+
+    def test_writes_always_on_frontmatter(self, tmp_path: Path) -> None:
+        write_devin_agent_rule(tmp_path, "Always write TypeScript, never JavaScript.")
+        rule = tmp_path / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+        text = rule.read_text(encoding="utf-8")
+        # The frontmatter is what makes Devin load the rule into every turn;
+        # without `trigger: always_on` Devin treats the file as manual (unloaded).
+        assert text.startswith("---\ntrigger: always_on\n---\n")
+        assert "Always write TypeScript, never JavaScript." in text
+
+    def test_none_removes_a_stale_rule(self, tmp_path: Path) -> None:
+        write_devin_agent_rule(tmp_path, "old instructions")
+        rule = tmp_path / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+        assert rule.exists()
+        # A later plain-Devin launch (no instructions) must not leave the previous
+        # agent's rule behind in the workspace.
+        write_devin_agent_rule(tmp_path, None)
+        assert not rule.exists()
+
+    def test_blank_instructions_write_nothing(self, tmp_path: Path) -> None:
+        write_devin_agent_rule(tmp_path, "   ")
+        assert not (tmp_path / ".windsurf" / "rules" / "omnigent-agent-instructions.md").exists()
 
     def test_absent_user_config_still_yields_hooks(self, tmp_path: Path) -> None:
         bridge = tmp_path / "bridge"
