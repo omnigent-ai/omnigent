@@ -60,6 +60,7 @@ class FullServerDriver:
     """Drive turns through a live Omnigent server and runner."""
 
     transport = "full-server"
+    applied_model_override = True
 
     def __init__(
         self,
