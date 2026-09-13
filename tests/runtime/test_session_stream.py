@@ -258,6 +258,26 @@ async def test_subscriber_slot_cleaned_up_on_exit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_has_subscribers_tracks_live_subscription() -> None:
+    """
+    ``has_subscribers`` is False with no subscriber, True while one is
+    registered, and False again after it exits.
+
+    Production breakage that causes this test to fail: the helper reads
+    the wrong registry (or a stale snapshot), so fail-fast callers (the
+    browser action bridge) either always fail fast — breaking the desktop
+    flow — or never do, restoring the 30 s headless stall.
+    """
+    assert session_stream.has_subscribers("conv_probe") is False
+    task = asyncio.create_task(_collect("conv_probe", expected=1))
+    await asyncio.sleep(0)
+    assert session_stream.has_subscribers("conv_probe") is True
+    session_stream.publish("conv_probe", {"type": "a"})
+    await asyncio.wait_for(task, timeout=2.0)
+    assert session_stream.has_subscribers("conv_probe") is False
+
+
+@pytest.mark.asyncio
 async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -906,4 +926,11 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
     assert completed.attributes == {"outcome": "completed", "response_id": "resp_1"}
     failed = records[1]
     assert failed.levelno == logging.WARNING
-    assert failed.attributes == {"outcome": "failed", "error_code": "timeout"}  # no message text
+    # A failed turn is the authoritative blocking signal; error_impact rides the
+    # same row so "sessions actually blocked" is a direct query. No message text.
+    assert failed.attributes == {
+        "outcome": "failed",
+        "error_code": "timeout",
+        "error_impact": "blocking",
+        "error_phase": "turn",
+    }

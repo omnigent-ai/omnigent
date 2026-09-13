@@ -274,6 +274,79 @@ def test_search_exclude_glob_prunes_results(tmp_path: Path) -> None:
     assert paths == {"keep.py"}
 
 
+def test_search_returns_matching_directories(tmp_path: Path) -> None:
+    """A query matching a directory name surfaces it as a directory entry.
+
+    Mirrors the runner's ``/search`` so a folder can be revealed from the
+    Explore tab whether the runner or the host answers.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("src")
+
+    by_path = {e["path"]: e for e in result["data"]}
+    assert by_path["src"]["type"] == "directory"
+    # A directory has no byte size.
+    assert by_path["src"]["bytes"] is None
+
+
+def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep dependency subtree must not starve a later-sorted real directory.
+
+    ``aaa/node_modules/<many>`` sorts before ``zzz/target``; without globally
+    deferring the noise subtree, a tight budget is exhausted inside
+    node_modules before the walk reaches the real match. Mirrors the runner.
+    """
+    noise = tmp_path / "aaa" / "node_modules"
+    noise.mkdir(parents=True)
+    for i in range(40):
+        (noise / f"dep{i}.js").write_text("x")
+    target = tmp_path / "zzz" / "target"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("y")
+
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 20)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target")
+
+    paths = {e["path"] for e in result["data"]}
+    assert "zzz/target" in paths, (
+        f"the real 'zzz/target' directory must be reached despite the earlier "
+        f"aaa/node_modules subtree, got {paths}"
+    )
+
+
+def test_search_does_not_follow_symlinked_deprioritized_dir(tmp_path: Path) -> None:
+    """A symlinked noise dir must not let the walk escape the workspace root.
+
+    Mirrors the runner: the deferred second pass walks each noise root directly,
+    and ``os.walk`` follows a top-level symlink, so a committed ``node_modules``
+    symlink pointing outside the workspace would disclose the target's contents.
+    Deferring only real directories preserves the ``followlinks=False`` boundary.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leaked")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "node_modules").symlink_to(outside, target_is_directory=True)
+    reader = WorkspaceReader(ws)
+
+    result = reader.search("secret")
+
+    paths = {e["path"] for e in result["data"]}
+    assert not any("secret" in p for p in paths), (
+        f"search must not descend a symlinked node_modules and leak the target's "
+        f"contents, got {paths}"
+    )
+
+
 # ── changes / diff (git mode) ─────────────────────────────────────────
 
 
@@ -372,11 +445,10 @@ def _git_branch_repo(path: Path) -> None:
     )
 
 
-def test_github_info_without_gh_reports_git_state(tmp_path: Path, monkeypatch) -> None:
-    """The host serves branch + base from git even when ``gh`` is absent.
+def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> None:
+    """Without ``gh`` the host reports the git repo/branch but no PR or base.
 
-    This is what keeps the branch-vs-base diff viewable when the runner is
-    offline and the host machine has no ``gh``.
+    The tab is a pure PR view, so ``base_ref`` stays null until a PR resolves it.
     """
     from omnigent import workspace_fs
 
@@ -389,22 +461,37 @@ def test_github_info_without_gh_reports_git_state(tmp_path: Path, monkeypatch) -
     assert info["available"] is True
     assert info["gh_available"] is False
     assert info["branch"] == "feature"
-    assert info["base_ref"] == "main"
+    assert info["base_ref"] is None
 
 
-def test_github_changes_lists_branch_diff(tmp_path: Path) -> None:
-    """``github_changes`` derives the base and lists the branch's changes."""
+def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
+    """``github_changes`` delegates to the gh-backed PR file list."""
+    from omnigent import workspace_fs
+
     _git_branch_repo(tmp_path)
+
+    def fake_gh(argv, *, cwd, token=None):
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (0, '{"number": 3}', "")
+        if tuple(argv[:1]) == ("api",):
+            return (
+                0,
+                '[{"filename": "app.txt", "status": "modified", "additions": 1, "deletions": 1}]',
+                "",
+            )
+        return (1, "", "")
+
+    monkeypatch.setattr(workspace_fs.github_resource, "_gh", fake_gh)
     reader = WorkspaceReader(tmp_path)
 
-    result = reader.github_changes(None)
+    result = reader.github_changes()
 
     paths = {entry["path"]: entry["status"] for entry in result["data"]}
     assert paths.get("app.txt") == "modified"
 
 
 def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
-    """``github_file_diff`` returns base vs HEAD content for a file."""
+    """``github_file_diff`` returns base vs HEAD content for a file (git show)."""
     _git_branch_repo(tmp_path)
     reader = WorkspaceReader(tmp_path)
 
@@ -414,12 +501,23 @@ def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
     assert diff["after"] == "changed\n"
 
 
-def test_github_pr_diff_returns_whole_patch(tmp_path: Path) -> None:
-    """``github_pr_diff`` returns the whole branch-vs-base patch (base derived)."""
+def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None:
+    """``github_pr_diff`` resolves the PR number, then delegates to ``gh pr diff <n>``."""
+    from omnigent import workspace_fs
+
     _git_branch_repo(tmp_path)
+
+    def fake_gh(argv, *, cwd, token=None):
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (0, '{"number": 3}', "")
+        if tuple(argv[:2]) == ("pr", "diff"):
+            return (0, "diff --git a/app.txt b/app.txt\n+changed\n", "")
+        return (1, "", "")
+
+    monkeypatch.setattr(workspace_fs.github_resource, "_gh", fake_gh)
     reader = WorkspaceReader(tmp_path)
 
-    result = reader.github_pr_diff(None)
+    result = reader.github_pr_diff()
 
     assert "diff --git a/app.txt b/app.txt" in result["patch"]
     assert "+changed" in result["patch"]

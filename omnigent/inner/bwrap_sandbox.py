@@ -470,6 +470,19 @@ class BwrapSandboxBackend(SandboxBackend):
         if target is not None:
             bwrap_args += _ensure_executable_visible([target], cwd_resolved)
 
+        # Extra read roots beyond the default toolchain bind set. These
+        # mounts precede write grants because bwrap resolves overlaps by
+        # letting the last mount win.
+        if policy.read_roots is not None:
+            for root in policy.read_roots:
+                # Read roots only expand visibility; they never restrict an
+                # overlapping cwd or explicit write grant.
+                if _is_same_path(root, cwd_resolved) or any(
+                    _is_same_path(root, write_root) for write_root in policy.write_roots
+                ):
+                    continue
+                bwrap_args += ["--ro-bind-try", str(root), str(root)]
+
         # cwd bind: writable iff a write_root resolves to cwd.
         cwd_writable = any(_is_same_path(root, cwd_resolved) for root in policy.write_roots)
         bwrap_args += [
@@ -480,9 +493,42 @@ class BwrapSandboxBackend(SandboxBackend):
 
         # Additional write roots — typically the per-helper scratch
         # tmpdir. We skip cwd here because it was bound above.
+        #
+        # ``--bind-try`` silently skips a missing source, so a write_paths
+        # root that doesn't exist yet on the host would otherwise bind to
+        # nothing and leave the grant with no effect — the agent finds out
+        # only much later, as a bare "Read-only file system" error on its
+        # first write. Since the policy layer has already approved this
+        # root as a write grant, create it up front so the bind (and the
+        # grant) actually does what it says. If creation fails (e.g. an
+        # unwritable parent), keep the old skip-the-bind behavior but warn
+        # loudly instead of failing the whole sandbox wrap: some merged-in
+        # write roots (harness-internal dirs) are optional, and a hard
+        # error here would degrade the helper to running unsandboxed paths.
         for root in policy.write_roots:
             if _is_same_path(root, cwd_resolved):
                 continue
+            if not root.exists():
+                try:
+                    root.mkdir(parents=True, exist_ok=True)
+                    created_mode = root.stat().st_mode & 0o777
+                except OSError as exc:
+                    _LOGGER.warning(
+                        "linux_bwrap: write_paths root %s does not exist on "
+                        "the host and could not be created (%s); the write "
+                        "grant for this path will have no effect",
+                        root,
+                        exc,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "linux_bwrap: write_paths root %s did not exist on "
+                        "the host, created it (permissions %s) so the "
+                        "granted write access takes effect instead of "
+                        "silently binding to nothing",
+                        root,
+                        oct(created_mode),
+                    )
             bwrap_args += ["--bind-try", str(root), str(root)]
 
         # Per-file write grants. ``--bind-try`` with a file source
@@ -491,11 +537,6 @@ class BwrapSandboxBackend(SandboxBackend):
         # caller also added the parent to read_paths or write_paths).
         for fpath in policy.write_files:
             bwrap_args += ["--bind-try", str(fpath), str(fpath)]
-
-        # Extra read roots beyond the default toolchain bind set.
-        if policy.read_roots is not None:
-            for root in policy.read_roots:
-                bwrap_args += ["--ro-bind-try", str(root), str(root)]
 
         # Mask dotfiles anywhere under cwd OR under any ``read_paths`` /
         # ``write_paths`` root that aren't on the allowlist, plus any

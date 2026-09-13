@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
@@ -49,20 +49,14 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.model_override import (
+from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
     normalize_model_for_provider,
     validate_model_override,
 )
-from omnigent.native_coding_agents import public_agent_name
+from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
-from omnigent.session_lifecycle import (
-    CLOSED_LABEL_KEY,
-    CLOSED_LABEL_VALUE,
-    is_session_closed,
-    title_without_closed_marker,
-)
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -72,6 +66,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelTaskTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
@@ -89,8 +84,10 @@ from omnigent.tools.builtins.spawn import (
     _ACTIVITY_MAX_CHARS,
     _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
+    _HISTORY_MAX_TOTAL_CHARS,
     _bound_history_content_chars,
     _clamp_history_content_chars,
+    _clamp_history_offset_chars,
     _clamp_tail_items,
 )
 from omnigent.tools.builtins.sys_terminal import (
@@ -108,10 +105,23 @@ from omnigent.tools.builtins.timer import (
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
+    is_session_closed,
+    title_without_closed_marker,
+)
 
 _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
+
+
+class _UnsetLocalToolWorkdir:
+    """Sentinel distinguishing legacy fallback from an explicit no-bundle root."""
+
+
+_UNSET_LOCAL_TOOL_WORKDIR = _UnsetLocalToolWorkdir()
 
 
 class _DynamicCallable(Protocol):
@@ -413,15 +423,7 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # result back. Execution lives HERE (not in Tool.invoke) because the browser
 # protocol needs the runner's ``server_client`` and ``ToolContext`` carries
 # none. See omnigent/tools/builtins/browser.py for the schema-only classes.
-_BROWSER_TOOLS = frozenset(
-    {
-        "browser_navigate",
-        "browser_snapshot",
-        "browser_click",
-        "browser_type",
-        "browser_screenshot",
-    }
-)
+_BROWSER_TOOLS = BROWSER_TOOL_NAMES
 
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
@@ -469,9 +471,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
-    # feature is dead for its real target. The relay still filters
-    # ``ToolManager(spec).get_tool_schemas()``, so browser schemas appear
-    # only when the spec declares the builtins (see builtins/__init__.py).
+    # feature is dead for its real target. ToolManager auto-registers these
+    # framework-owned schemas for every spec, so the native relay surface is
+    # session-static and always includes them.
     | _BROWSER_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
@@ -481,6 +483,32 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # native session's only tool surface is this relay.
     | _SKILL_TOOLS
 )
+
+
+def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
+    """Drop the ``browser_*`` tool schemas from a tool-schema list.
+
+    Used for request-driven harnesses when the turn's dispatch says no
+    renderer is subscribed to the session stream. Native harnesses use a
+    session-scoped relay surface instead of the per-turn schema list, so they
+    retain the browser tools and rely on the server's prompt failure path.
+    Handles both the nested OpenAI shape
+    (``{"function": {"name": ...}}``) and the flat relay shape
+    (``{"name": ...}``).
+
+    :param schemas: Tool schemas in either supported shape.
+    :returns: The same list minus any ``browser_*`` entries.
+    """
+    kept: list[_JsonObject] = []
+    for schema in schemas:
+        name: object = schema.get("name")
+        if not isinstance(name, str):
+            function = _string_object_dict(schema.get("function"))
+            name = function.get("name") if function is not None else None
+        if isinstance(name, str) and name in _BROWSER_TOOLS:
+            continue
+        kept.append(schema)
+    return kept
 
 
 def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
@@ -940,19 +968,16 @@ async def _execute_local_python_tool(
     task_id: str | None,
     agent_id: str | None,
     runner_workspace: Path | None,
+    local_tool_workdir: Path | None,
 ) -> str:
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
-    manager = ToolManager(agent_spec, workdir=runner_workspace)
+    manager = ToolManager(agent_spec, workdir=local_tool_workdir)
     try:
-        workspace = None
-        if runner_workspace is not None and conversation_id is not None:
-            workspace = runner_workspace / conversation_id
-            workspace.mkdir(parents=True, exist_ok=True)
         ctx = ToolContext(
             task_id=task_id or conversation_id or "runner-local-tool",
             agent_id=agent_id or agent_spec.name or "runner-agent",
-            workspace=workspace,
+            workspace=runner_workspace,
             conversation_id=conversation_id,
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
@@ -1360,6 +1385,60 @@ async def _session_turn_actor(
     return actor if isinstance(actor, str) and actor else None
 
 
+async def _patch_subagent_label(
+    server_client: httpx.AsyncClient, child_session_id: str, key: str, value: str
+) -> str | None:
+    """
+    Write one runner-owned sub-agent label on a child session.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
+    :param key: Label key, e.g. ``"omnigent.subagent.dispatch_id"``.
+    :param value: Label value, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :returns: A short failure description, or ``None`` on success.
+    """
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{child_session_id}",
+            json={"labels": {key: value}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return f"{resp.status_code} {resp.text[:200]}"
+    return None
+
+
+async def _record_subagent_receipt(
+    server_client: httpx.AsyncClient, child_session_id: str, work_id: str
+) -> None:
+    """
+    Mark a dispatch id as one that will never be delivered as a new result.
+
+    Written when the parent drains the turn's result, and when a continued
+    turn was stamped but its send failed. Best effort: a lost receipt costs
+    one duplicate delivery after a runner restart, whereas a lost result
+    would never reach the parent.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
+    :param work_id: Dispatch id, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :returns: None.
+    """
+    from omnigent.runner import app as _runner_app
+
+    error = await _patch_subagent_label(
+        server_client, child_session_id, _runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY, work_id
+    )
+    if error is not None:
+        _logger.warning(
+            "Failed to record sub-agent delivery receipt for child=%s: %s",
+            child_session_id,
+            error,
+        )
+
+
 async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
@@ -1400,6 +1479,157 @@ async def _post_child_message_event(
         f"/v1/sessions/{session_id}/events",
         json=_payload(None),
         timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+    )
+
+
+async def _send_to_in_flight_child(
+    child_session_id: str,
+    message: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    agent: str,
+    title: str,
+    child_display_title: str,
+    wrapper_label: str | None,
+    created_by: str | None = None,
+) -> str:
+    """Steer a message into a sub-agent whose turn is already in flight.
+
+    The message is **posted first**; work tracking is decided only *after* the
+    post succeeds, from the child's post-settled work state, under a per-child
+    lock. Live completion delivery is keyed by child id (the dispatch-id label
+    is read only on restart recovery), so the classify/register step is what
+    governs delivery:
+
+    * post fails — nothing was registered or stamped, so the still-running
+      turn's tracking is untouched and there is nothing to roll back (the child
+      is never torn down);
+    * post succeeds and the child's tracked turn is **still active** — the
+      message was buffered into it, so its single existing work entry is reused
+      verbatim (no re-stamp) and that one completion delivers under it;
+    * post succeeds and no tracked turn is active — the old turn already ended
+      and the server started a new one, or the child was in-flight but untracked
+      locally (e.g. after a runner restart). Either way a fresh entry is
+      registered in ``running`` (not ``launching``, so the launch-timeout reaper
+      leaves it alone) so the new/pre-existing turn's completion is delivered
+      rather than dropped against a drained entry.
+
+    Why the post→classify order is loss-safe: the completion path
+    ``_on_proxy_stream_end`` is synchronous — it frees the turn slot and marks
+    the work entry terminal in one run, with no ``await`` between. On the single
+    event loop the runner shares with its sub-agent turns, that makes those two
+    inseparable, so a turn that had ended by the time we classify is already
+    terminal in the registry — we register fresh for the new turn and never
+    reuse a drained entry. The one residual is benign: if a *buffered* turn
+    completes during the post's response round-trip, we register a fresh
+    ``running`` entry that no turn will complete — a harmless phantom (the real
+    result already delivered under the original entry) that is cleaned up with
+    the rest of the child's work on teardown. Eliminating even that would take
+    the server surfacing its own buffered-vs-accepted disposition back through
+    the message response; delivery is already loss-safe without it.
+
+    Concurrent sends to one child are serialized by the per-child lock so they
+    can't install divergent entries; the lock is cleaned up with the child's
+    work registry (see ``in_flight_send_lock`` /
+    ``unregister_subagent_work_for_session``).
+
+    :param child_session_id: The in-flight child session id.
+    :param message: Steering message text to inject.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The parent session id.
+    :param agent: Sub-agent name, echoed in the handle.
+    :param title: Sub-agent instance title, echoed in the handle.
+    :param child_display_title: Display title for the fan-out registration.
+    :param wrapper_label: Optional child ``omnigent.wrapper`` label.
+    :param created_by: Human actor that sent the nudge, if known.
+    :returns: A JSON handle on success; a descriptive error string otherwise.
+    """
+    from omnigent.runner import app as _runner_app
+
+    # Post first — before any register/stamp — so a failure leaves the live
+    # turn's tracking untouched (nothing to roll back, never a teardown).
+    try:
+        msg_resp = await _post_child_message_event(
+            server_client,
+            child_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=created_by,
+        )
+    except httpx.HTTPError as exc:
+        return (
+            f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if msg_resp.status_code >= 400:
+        return (
+            f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
+            f"{msg_resp.status_code} {msg_resp.text[:200]}"
+        )
+
+    async with _runner_app.in_flight_send_lock(child_session_id):
+        entry = _runner_app.get_subagent_work(child_session_id)
+        if entry is not None and entry.status in ("running", "waiting"):
+            # The tracked turn is still active, so the post was buffered into it.
+            # Reuse the one entry so its single completion delivers under it;
+            # re-stamping/replacing here is what would orphan that completion.
+            work_id = entry.work_id
+        else:
+            # No active tracked turn: the old turn ended and a fresh one started,
+            # or the in-flight turn was untracked locally (post-restart). Track
+            # it freshly so the completion is delivered, directly as "running"
+            # (never "launching") to stay clear of the launch-timeout reaper.
+            work_id = _runner_app.new_subagent_work_id()
+            _runner_app.register_child_session(
+                child_session_id,
+                parent_session_id=conversation_id,
+                title=child_display_title,
+                tool=agent,
+                session_name=title,
+            )
+            fresh = _runner_app.register_subagent_work(
+                parent_session_id=conversation_id,
+                child_session_id=child_session_id,
+                agent=agent,
+                title=title,
+                wrapper_label=wrapper_label,
+                created_by=created_by,
+                work_id=work_id,
+            )
+            fresh.status = "running"
+            # Best-effort dispatch-id stamp for restart recovery only; the
+            # in-memory entry above already makes the completion deliverable, so
+            # a stamp failure degrades recovery but never live delivery.
+            stamp_error = await _patch_subagent_label(
+                server_client,
+                child_session_id,
+                _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY,
+                work_id,
+            )
+            if stamp_error is not None:
+                _logger.warning(
+                    "steered sub-agent %s: dispatch-id stamp failed (%s); live "
+                    "delivery is unaffected, restart recovery for this turn is degraded",
+                    child_session_id,
+                    stamp_error,
+                )
+
+    return json.dumps(
+        {
+            "task_id": child_session_id,
+            "handle_id": child_session_id,
+            "conversation_id": child_session_id,
+            "kind": "sub_agent",
+            "agent": agent,
+            "title": title,
+            "status": "running",
+            "message": (
+                f"Steered the in-flight turn of sub-agent {agent!r} title {title!r}: the "
+                "message was injected into the running turn, which picks it up as it yields. "
+                "The turn's single result still arrives via sys_read_inbox — don't resend to "
+                "await it."
+            ),
+        }
     )
 
 
@@ -1536,7 +1766,7 @@ def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str
     :raises ValueError: If the harness supports no effort override, or
         the value falls outside its vocabulary.
     """
-    from omnigent.reasoning_effort import efforts_for_harness, validate_effort
+    from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
 
     canonical = canonicalize_harness(harness) if harness is not None else None
     supported = efforts_for_harness(harness)
@@ -1594,17 +1824,23 @@ async def _teardown_failed_child(
     also reclaims any files copied into it before the failure — leaving an
     empty child behind would poison a retry with the same ``(agent, title)``
     (the next send would attach to the phantom instead of spawning clean)
-    and orphan the copied file rows. Used on both the copy/content failure
-    and the message-post failure paths so they tear down identically.
+    and orphan the copied file rows. A continued child keeps its session,
+    so its already-stamped dispatch id gets a delivery receipt instead;
+    otherwise a runner restart would replay the previous turn's result as
+    this turn's. Used on both the copy/content failure and the
+    message-post failure paths so they tear down identically.
 
     :returns: ``None`` when no server cleanup was needed or cleanup
         succeeded, otherwise a parent-visible warning string.
     """
     from omnigent.runner import app as _runner_app
 
+    entry = _runner_app.get_subagent_work(child_session_id)
     _runner_app.unregister_child_session(child_session_id)
     _runner_app.unregister_subagent_work(child_session_id)
     if not created_child:
+        if entry is not None:
+            await _record_subagent_receipt(server_client, child_session_id, entry.work_id)
         return None
 
     last_error = ""
@@ -1796,7 +2032,7 @@ def _subagent_harness(sub_agent_name: str, agent_spec: AgentSpec | None) -> str 
         available.
     :returns: Harness id, e.g. ``"codex-native"``, or ``None``.
     """
-    from omnigent.model_catalog import spec_harness
+    from omnigent.models.model_catalog import spec_harness
 
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     return spec_harness(sub_spec) if sub_spec is not None else None
@@ -1927,7 +2163,7 @@ def _normalize_subagent_model(
     Localize a per-dispatch model id for the child's resolved provider.
 
     Runs after the family guard (see
-    :func:`omnigent.model_override.normalize_model_for_provider` for
+    :func:`omnigent.models.model_override.normalize_model_for_provider` for
     the ordering rationale): a canonical vendor id is prefixed with
     ``databricks-`` when the child routes through the Databricks
     gateway, and the prefix is stripped for a vendor-direct child. When
@@ -1941,7 +2177,7 @@ def _normalize_subagent_model(
     :param harness: The child's declared harness, e.g. ``"claude-native"``.
     :returns: The id to persist as ``model_override``.
     """
-    from omnigent.model_catalog import resolve_model_provider
+    from omnigent.models.model_catalog import resolve_model_provider
 
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None or harness is None:
@@ -1970,7 +2206,7 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
 
     Runs the enumeration off the event loop — provider resolution reads
     config files and the listing fetches hit provider HTTP APIs (TTL-
-    cached in :mod:`omnigent.model_catalog`).
+    cached in :mod:`omnigent.models.model_catalog`).
 
     :param agent_spec: The calling session's agent spec; its
         ``sub_agents`` define the worker rows.
@@ -1979,10 +2215,32 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
     """
     if agent_spec is None:
         return "Error: sys_list_models requires an agent spec"
-    from omnigent.model_catalog import catalog_for_spec
+    from omnigent.models.model_catalog import catalog_for_spec
 
     catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
     return json.dumps(catalog)
+
+
+def _subagent_launching_message(agent: str, title: object, task_id: str) -> str:
+    """
+    Tool-result text for a sub-agent dispatch whose turn is still running.
+
+    Pre-announces the wake notice on the tool-result channel so the model
+    recognises it as runtime-originated when it later arrives as a message.
+
+    :param agent: Sub-agent name, e.g. ``"researcher"``.
+    :param title: Child instance title supplied at dispatch.
+    :param task_id: The child session id, doubling as the task handle.
+    :returns: A one-line ``[System: ...]`` status string.
+    """
+    return (
+        f"[System: sub-agent {agent} title {title!r} launching as task "
+        f"{task_id}. Result will appear in your inbox; call sys_read_inbox to "
+        "check or sys_cancel_task to interrupt it. When it finishes, the "
+        "runtime posts a `[System: sub-agent ... finished ...]` wake notice "
+        "into this session; that notice comes from the runtime, not from a "
+        "person.]"
+    )
 
 
 async def _execute_subagent_tool(
@@ -2174,6 +2432,7 @@ async def _execute_subagent_tool(
     assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
+    work_id = _runner_app.new_subagent_work_id()
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -2217,23 +2476,39 @@ async def _execute_subagent_tool(
             )
         child_wrapper_label = _session_wrapper_label(existing)
         existing_work = _runner_app.get_subagent_work(child_session_id)
-        if existing_work is not None and existing_work.status in (
-            "launching",
-            "running",
-            "waiting",
-        ):
+        if existing_work is not None and existing_work.status == "launching":
+            # The child's turn hasn't started streaming yet, so there is no
+            # active turn to inject into and a send now could race a parallel
+            # start. Ask the caller to retry once it is running (a matter of a
+            # beat) rather than post into that gap.
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a launching or running turn. Use a distinct task-based title "
-                "for independent parallel work; reuse this title only to continue the same "
-                "conversation after completion."
+                "is still starting its turn; retry the send in a moment, or use "
+                "a distinct task-based title for independent parallel work."
             )
-        if existing.get("busy") is True:
-            return (
-                f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "is already running. Use a distinct task-based title for independent "
-                "parallel work; reuse this title only to continue the same conversation "
-                "after completion."
+        # A running/waiting child, or one the server reports busy, is steered
+        # into its in-flight turn rather than refused — but on the in-flight
+        # path so its single existing work entry is reused (or, if untracked
+        # after a restart, adopted) instead of replaced. Re-stamping/replacing
+        # the entry before the post is accepted is what would orphan the running
+        # turn's completion (misattributed or lost). The fresh-continuation path
+        # below (register launching, stamp, post) is only for a genuinely idle
+        # child, where the post starts a new turn that emits its own running
+        # edge.
+        _named_in_flight = (
+            existing_work is not None and existing_work.status in ("running", "waiting")
+        ) or existing.get("busy") is True
+        if _named_in_flight:
+            return await _send_to_in_flight_child(
+                child_session_id,
+                message,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent=str(sub_agent_name),
+                title=str(session_name),
+                child_display_title=f"{sub_agent_name}:{session_name}",
+                wrapper_label=child_wrapper_label,
+                created_by=dispatch_created_by,
             )
     else:
         _auto_ordinal = False
@@ -2337,6 +2612,7 @@ async def _execute_subagent_tool(
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
+            "labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
@@ -2551,6 +2827,15 @@ async def _execute_subagent_tool(
     # title/tool/session_name are known here (we set the title above), so
     # even a cold status update carries a display name. Cleaned up when
     # the child session ends.
+    if not created_child:
+        # A new child carries this turn's id in its create body; a continued
+        # child keeps its session, so the id is written first. A missing
+        # stamp would let the previous turn's receipt mask this turn's result.
+        stamp_error = await _patch_subagent_label(
+            server_client, child_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        )
+        if stamp_error is not None:
+            return f"Error: failed to record sub-agent dispatch: {stamp_error}"
     _runner_app.register_child_session(
         child_session_id,
         parent_session_id=conversation_id,
@@ -2565,6 +2850,7 @@ async def _execute_subagent_tool(
         title=session_name,
         wrapper_label=child_wrapper_label,
         created_by=dispatch_created_by,
+        work_id=work_id,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -2643,12 +2929,7 @@ async def _execute_subagent_tool(
             "agent": sub_agent_name,
             "title": session_name,
             "status": "launching",
-            "message": (
-                f"[System: sub-agent {sub_agent_name} title {session_name!r} "
-                f"launching as task {child_session_id}. Result will appear in "
-                "your inbox; call sys_read_inbox to check or sys_cancel_task "
-                "to interrupt it.]"
-            ),
+            "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
         }
     )
 
@@ -2675,6 +2956,12 @@ async def _send_to_existing_session(
     fan-out and work mappings, posts the message, and returns a
     ``running`` handle immediately — the completion lands in the parent's
     ``sys_read_inbox`` queue, matching named-mode send.
+
+    The child's ``(agent, title)`` identity, carried by the handle, the
+    launching tool result, and the completion wake notice, comes from
+    the ``"<agent>:<title>"`` title when it has one, and otherwise from
+    the snapshot's ``sub_agent_name`` / ``agent_name`` with the verbatim
+    title, so a ``sys_session_create`` child is named like a named one.
 
     :param target_session_id: The existing child session id, e.g.
         ``"conv_abc123"``.
@@ -2716,40 +3003,74 @@ async def _send_to_existing_session(
                 "message": "target sub-agent session is closed; create a new session to continue.",
             }
         )
-    parsed = _parse_session_title(snap_data.get("title"))
-    agent_label = parsed.agent or "agent"
+    display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
+    parsed = _parse_session_title(display_title)
+    # A sys_session_create child keeps its verbatim title and has no
+    # sub_agent_name, so when the title does not parse as "<agent>:<title>"
+    # the identity comes from the snapshot's agent fields instead.
+    agent_label = (
+        parsed.agent
+        or _optional_string(snap_data.get("sub_agent_name"))
+        or _optional_string(snap_data.get("agent_name"))
+        or "agent"
+    )
+    instance_title = parsed.title if parsed.title is not None else (display_title or "")
     existing_work = _runner_app.get_subagent_work(target_session_id)
-    if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
+    if existing_work is not None and existing_work.status == "launching":
+        # No active turn to inject into yet; a send now could race a parallel
+        # start. Ask the caller to retry once it is running.
         return (
-            f"Error: session {target_session_id!r} already has a launching or running turn; "
-            "wait for completion before sending again"
+            f"Error: session {target_session_id!r} is still starting its turn; "
+            "retry the send in a moment"
         )
-    if snap_data.get("busy") is True:
-        return (
-            f"Error: session {target_session_id!r} is already running; "
-            "wait for completion before sending again"
+    # A running/waiting child, or one the server reports busy, is steered into
+    # its in-flight turn on the in-flight path — reusing (or adopting) the one
+    # work entry instead of replacing it, so the running turn's single
+    # completion is never orphaned. The fresh continuation below is only for a
+    # genuinely idle child, where the post starts a new turn.
+    _by_id_in_flight = (
+        existing_work is not None and existing_work.status in ("running", "waiting")
+    ) or snap_data.get("busy") is True
+    if _by_id_in_flight:
+        return await _send_to_in_flight_child(
+            target_session_id,
+            message,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            agent=agent_label,
+            title=instance_title,
+            child_display_title=display_title or "",
+            wrapper_label=_session_wrapper_label(snap_data),
+            created_by=created_by,
         )
+    work_id = _runner_app.new_subagent_work_id()
+    stamp_error = await _patch_subagent_label(
+        server_client, target_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+    )
+    if stamp_error is not None:
+        return f"Error: failed to record sub-agent dispatch: {stamp_error}"
     _runner_app.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
-        title=snap_data.get("title") or "",
+        title=display_title or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=instance_title,
     )
     _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
-        title=parsed.title or "",
+        title=instance_title,
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
+        work_id=work_id,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
-        title=snap_data.get("title") or "",
+        title=display_title or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=instance_title,
         publish_event=publish_event,
     )
 
@@ -2761,12 +3082,10 @@ async def _send_to_existing_session(
             created_by=created_by,
         )
     except httpx.HTTPError as exc:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
+        await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
+        await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
@@ -2778,14 +3097,9 @@ async def _send_to_existing_session(
             "conversation_id": target_session_id,
             "kind": "sub_agent",
             "agent": agent_label,
-            "title": parsed.title,
+            "title": instance_title,
             "status": "launching",
-            "message": (
-                f"[System: sub-agent {agent_label} title {parsed.title!r} "
-                f"launching as task {target_session_id}. Result will appear in "
-                "your inbox; call sys_read_inbox to check or sys_cancel_task "
-                "to interrupt it.]"
-            ),
+            "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
         }
     )
 
@@ -4161,20 +4475,24 @@ def _truncate_activity(
     text: str | None,
     *,
     max_chars: int = _ACTIVITY_MAX_CHARS,
+    offset_chars: int = 0,
 ) -> str | None:
     """
-    Truncate text to ``max_chars`` to bound peek prompt size.
+    Return a bounded window of ``text`` to bound peek prompt size.
 
     :param text: The text to truncate, or ``None``.
     :param max_chars: Maximum characters retained before the marker.
-    :returns: The (possibly truncated) text, or ``None`` when the input
-        is ``None``.
+    :param offset_chars: Characters skipped before the window.
+    :returns: ``text[offset_chars : offset_chars + max_chars]`` with a
+        ``" [truncated]"`` suffix when content remains past the window,
+        or ``None`` when the input is ``None``.
     """
     if text is None:
         return None
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + " [truncated]"
+    window = text[offset_chars : offset_chars + max_chars]
+    if offset_chars + max_chars >= len(text):
+        return window
+    return window + " [truncated]"
 
 
 def _text_from_api_content(content: object) -> str:
@@ -4199,6 +4517,7 @@ def _project_api_item(
     item: _JsonObject,
     *,
     max_chars: int = _ACTIVITY_MAX_CHARS,
+    offset_chars: int = 0,
 ) -> _JsonObject:
     """
     Project a REST API conversation item into the compact peek shape.
@@ -4211,6 +4530,8 @@ def _project_api_item(
 
     :param item: One API item dict from the items endpoint.
     :param max_chars: Maximum characters retained in each content field.
+    :param offset_chars: Characters skipped from the start of each
+        content field before the window is taken.
     :returns: A compact dict — ``{type, tool, args}`` for tool calls,
         ``{type, output}`` for tool results, ``{type, role, text}`` for
         messages.
@@ -4223,6 +4544,7 @@ def _project_api_item(
             "args": _truncate_activity(
                 _optional_string(item.get("arguments")),
                 max_chars=max_chars,
+                offset_chars=offset_chars,
             ),
         }
     if itype == "function_call_output":
@@ -4230,7 +4552,7 @@ def _project_api_item(
         rendered = output if isinstance(output, str) else json.dumps(output)
         return {
             "type": "function_call_output",
-            "output": _truncate_activity(rendered, max_chars=max_chars),
+            "output": _truncate_activity(rendered, max_chars=max_chars, offset_chars=offset_chars),
         }
     if itype == "message":
         return {
@@ -4239,6 +4561,7 @@ def _project_api_item(
             "text": _truncate_activity(
                 _text_from_api_content(item.get("content")),
                 max_chars=max_chars,
+                offset_chars=offset_chars,
             ),
         }
     return {"type": itype}
@@ -5560,7 +5883,8 @@ async def _session_get_history_via_rest(
     may read).
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items`` and ``content_max_chars``.
+        optional ``tail_items``, ``content_max_chars``, and
+        ``content_offset_chars``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
@@ -5581,6 +5905,9 @@ async def _session_get_history_via_rest(
         tail_items=tail_items,
         content_max_chars=content_max_chars,
     )
+    content_offset_chars = _clamp_history_offset_chars(args.get("content_offset_chars", 0))
+    if isinstance(content_offset_chars, str):
+        return content_offset_chars
     try:
         resp = await server_client.get(
             f"/v1/sessions/{target_id}/items",
@@ -5599,7 +5926,8 @@ async def _session_get_history_via_rest(
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
     items: list[_JsonObject] = [
-        _project_api_item(it, max_chars=content_max_chars) for it in reversed(data)
+        _project_api_item(it, max_chars=content_max_chars, offset_chars=content_offset_chars)
+        for it in reversed(data)
     ]
     meta = await _fetch_peek_meta(target_id, server_client)
     # A parked elicitation never lands in the conversation store (it
@@ -5846,6 +6174,7 @@ async def execute_tool(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
@@ -5883,7 +6212,6 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
-
     try:
         if mcp_manager is not None:
             # All MCP tool calls are routed through the AP server's
@@ -5949,6 +6277,7 @@ async def execute_tool(
                 agent_id=agent_id,
                 agent_name=agent_name,
                 runner_workspace=runner_workspace,
+                local_tool_workdir=local_tool_workdir,
                 mcp_manager=mcp_manager,
                 filesystem_registry=filesystem_registry,
             )
@@ -6100,6 +6429,11 @@ async def execute_tool(
                 task_id=task_id,
                 agent_id=agent_id,
                 runner_workspace=runner_workspace,
+                local_tool_workdir=(
+                    runner_workspace
+                    if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+                    else cast(Path | None, local_tool_workdir)
+                ),
             )
         elif _is_uc_function_tool(tool_name, agent_spec):
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
@@ -6113,6 +6447,18 @@ async def execute_tool(
         )
         output = f"Error: {type(exc).__name__}: {exc}"
 
+    if conversation_id and tool_name == "sys_os_shell":
+        from omnigent.runner.pr_observer import observe_tool_completion
+
+        await asyncio.to_thread(
+            observe_tool_completion,
+            conversation_id,
+            tool_name=tool_name,
+            arguments=args,
+            result=output,
+            successful=not output.startswith("Error:"),
+            source="runner_shell",
+        )
     return output
 
 
@@ -6187,6 +6533,7 @@ async def dispatch_tool_locally(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
@@ -6227,6 +6574,7 @@ async def dispatch_tool_locally(
         agent_id=agent_id,
         agent_name=agent_name,
         runner_workspace=runner_workspace,
+        local_tool_workdir=local_tool_workdir,
         mcp_manager=mcp_manager,
         session_inbox=session_inbox,
         session_async_tasks=session_async_tasks,
@@ -7047,6 +7395,7 @@ async def _execute_async_inbox_tool(
     agent_id: str | None,
     agent_name: str | None,
     runner_workspace: Path | None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir,
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
@@ -7093,6 +7442,7 @@ async def _execute_async_inbox_tool(
             agent_id=agent_id,
             agent_name=agent_name,
             runner_workspace=runner_workspace,
+            local_tool_workdir=local_tool_workdir,
             mcp_manager=mcp_manager,
             filesystem_registry=filesystem_registry,
         )
@@ -7138,20 +7488,35 @@ def _format_terminal_idle_item(
     return f"[System: inbox item terminal_idle — terminal {source}:{session} is idle]"
 
 
-def _truncate_inbox_output(output: object) -> str:
+def _truncate_inbox_output(output: object, *, source_session_id: str | None = None) -> str:
     """
     Convert an inbox payload output to bounded text.
 
+    Delivery stays capped to bound the wake prompt; when the payload
+    came from a session whose transcript persists the full text, the
+    truncation marker names the retrieval path so the recipient can
+    read the rest instead of losing it.
+
     :param output: Raw payload output, e.g. ``"done"`` or an error
         object converted by the caller.
+    :param source_session_id: Session whose transcript holds the full
+        text (e.g. a completed sub-agent), or ``None`` when there is
+        no session to read back.
     :returns: Text capped for LLM delivery.
     """
     text = output if isinstance(output, str) else str(output)
     if len(text) <= _INBOX_OUTPUT_MAX_CHARS:
         return text
+    hint = (
+        f" — read the full text with sys_session_get_history "
+        f"conversation_id={source_session_id} tail_items=1 "
+        f"content_max_chars={min(len(text), _HISTORY_MAX_TOTAL_CHARS)}"
+        if source_session_id
+        else ""
+    )
     return (
         text[:_INBOX_OUTPUT_MAX_CHARS].rstrip()
-        + f"\n...[truncated {len(text) - _INBOX_OUTPUT_MAX_CHARS} chars]"
+        + f"\n...[truncated {len(text) - _INBOX_OUTPUT_MAX_CHARS} chars{hint}]"
     )
 
 
@@ -7166,7 +7531,10 @@ def _format_async_task_item(payload: _JsonObject) -> str:
     handle_id = payload.get("handle_id", "unknown")
     tool = payload.get("tool_name", "unknown")
     status = payload.get("status", "unknown")
-    output = _truncate_inbox_output(payload.get("output", ""))
+    # A sub-agent's full result persists in its own session transcript,
+    # so a truncated delivery can point the parent at the retrieval path.
+    retrieval_id = _subagent_child_id(payload) if payload.get("type") == "sub_agent" else None
+    output = _truncate_inbox_output(payload.get("output", ""), source_session_id=retrieval_id)
     # An empty completion (e.g. a native child that idled with no assistant
     # text — the runner delivers "" rather than fabricating from stale
     # history) must read as "produced no output", not a dangling
@@ -7389,11 +7757,20 @@ async def _evaluate_subagent_inbox_output(
     return _apply_subagent_policy_verdict(payload, verdict)
 
 
-def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
+async def _cleanup_drained_subagent_work(
+    payload: _JsonObject, *, server_client: httpx.AsyncClient | None
+) -> None:
     """
     Remove terminal sub-agent work after its inbox item is drained.
 
+    Also writes the delivered-id receipt on the child session so a runner
+    restart does not re-queue this turn's result. The write is best effort:
+    a lost receipt costs one duplicate delivery after a restart, whereas a
+    lost result would never reach the parent.
+
     :param payload: Drained inbox payload.
+    :param server_client: HTTP client pointed at the Omnigent server, or
+        ``None`` when the drain runs without server access.
     :returns: None.
     """
     if payload.get("type") != "sub_agent":
@@ -7413,6 +7790,8 @@ def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
         work_id=work_id,
         remember_drained_delivery=True,
     )
+    if server_client is not None:
+        await _record_subagent_receipt(server_client, child_id, work_id)
 
 
 async def _drain_inbox(
@@ -7463,7 +7842,7 @@ async def _drain_inbox(
         if evaluation.retry_original:
             retry_payloads.append(payload)
         else:
-            _cleanup_drained_subagent_work(evaluation.payload)
+            await _cleanup_drained_subagent_work(evaluation.payload, server_client=server_client)
     for payload in retry_payloads:
         inbox.put_nowait(payload)
     return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
@@ -7547,6 +7926,7 @@ def _spawn_async_tool(
     runner_workspace: Path | None,
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
@@ -7631,6 +8011,7 @@ def _spawn_async_tool(
                 agent_id=agent_id,
                 agent_name=agent_name,
                 runner_workspace=runner_workspace,
+                local_tool_workdir=local_tool_workdir,
                 mcp_manager=mcp_manager,
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,

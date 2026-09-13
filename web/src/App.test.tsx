@@ -16,12 +16,49 @@ vi.mock("@/shell/AppShell", () => ({
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
     SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
   };
 });
+vi.mock("@/extensions/ExtensionPageHost", () => ({
+  ExtensionPageHost: ({ resolved }: { resolved: { page: { title: string } } }) => (
+    <h1>{resolved.page.title}</h1>
+  ),
+}));
+vi.mock("@/extensions/ExtensionProvider", () => ({
+  useExtensionsLoading: () => false,
+  useExtensions: () => [
+    {
+      object: "extension",
+      id: "acme.review",
+      display_name: "Acme Review",
+      distribution: "acme-review",
+      version: "1.0.0",
+      extension_api: 1,
+      status: "enabled",
+      permissions: [],
+      pages: [
+        {
+          id: "acme.review.dashboard",
+          title: "Review dashboard",
+          route: "dashboard",
+          view: "review-dashboard",
+        },
+      ],
+      primary_navigation: [],
+      browser: {
+        declared: true,
+        has_styles: false,
+        digest: "digest",
+        script_url: "/script",
+        style_url: null,
+      },
+    },
+  ],
+}));
 
 import App from "./App";
 
@@ -39,15 +76,78 @@ function renderUsageRoute(enabled: boolean) {
   );
 }
 
-function renderRoute(path: string) {
+function renderRoute(
+  path: string,
+  features: Record<string, boolean> = {},
+  info: typeof FALLBACK_SERVER_INFO | "loading" = { ...FALLBACK_SERVER_INFO, features },
+) {
   return render(
-    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+    <CapabilitiesProvider info={info}>
       <MemoryRouter initialEntries={[path]}>
         <App />
       </MemoryRouter>
     </CapabilitiesProvider>,
   );
 }
+
+describe("Canvas route", () => {
+  it("shows a spinner, not 'not found', while server info is still loading", () => {
+    renderRoute("/canvas", {}, "loading");
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
+    expect(screen.queryByText("canvas page")).toBeNull();
+  });
+
+  it("renders not found once server info says the canvas feature is off", async () => {
+    renderRoute("/canvas");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("canvas page")).toBeNull();
+  });
+
+  it("renders the native Canvas page inside the shell when the feature is on", async () => {
+    renderRoute("/canvas", { canvas: true });
+    expect(await screen.findByText("canvas page")).toBeInTheDocument();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
+  });
+});
+
+describe("Extension page routes", () => {
+  it("renders a catalog-owned namespaced page", async () => {
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter initialEntries={["/extensions/acme.review/dashboard"]}>
+          <App />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Review dashboard" })).toBeInTheDocument();
+  });
+
+  it("matches extension pages under an embedded basename", async () => {
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter initialEntries={["/mount/extensions/acme.review/dashboard"]}>
+          <App basename="/mount" />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Review dashboard" })).toBeInTheDocument();
+  });
+
+  it("rejects unknown extension pages", async () => {
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter initialEntries={["/extensions/acme.review/missing"]}>
+          <App />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+  });
+});
 
 describe("Usage release feature route", () => {
   it("does not register /usage while the feature is off", async () => {

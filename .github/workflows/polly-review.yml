@@ -8,7 +8,8 @@ name: Polly AI Review
 #
 # Triggers:
 #   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
-#   - `/review` comment on a PR (manual retrigger by write-access users)
+#   - `/review` comment on a PR (manual retrigger by write-access users, or
+#     any login in the REVIEW_ALLOWLIST repo variable, a JSON array of strings)
 #   - workflow_dispatch with a PR number (manual retrigger from Actions tab,
 #     also used by the maintainer-approval relay)
 #
@@ -43,10 +44,10 @@ env:
 
 jobs:
   # Security precondition gate (security-gate.yml): untrusted PRs wait for
-  # the scan; trusted authors pass through. Only runs on pull_request events
-  # — issue_comment and workflow_dispatch are already gated by write-access
-  # (author_association check + GitHub's own dispatch auth) and never check
-  # out PR code, so the scan is not applicable.
+  # the scan; trusted authors pass through. Only runs on pull_request events.
+  # issue_comment and workflow_dispatch are gated by write-access or the
+  # REVIEW_ALLOWLIST (author_association / login check, plus GitHub's dispatch
+  # auth) and never check out PR code, so the scan is not applicable.
   gate:
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/security-gate.yml
@@ -54,9 +55,10 @@ jobs:
   review:
     name: Polly AI Review
     needs: gate
-    # Fire on non-draft PRs (after gate passes), `/review` comments by
-    # write-access users, or workflow_dispatch. The `!cancelled()` ensures
-    # the job runs when gate is skipped (non-PR events) but not when it fails.
+    # Fire on non-draft PRs (after gate passes), `/review` comments by write-
+    # access users or REVIEW_ALLOWLIST logins, or workflow_dispatch. The
+    # `!cancelled()` ensures the job runs when gate is skipped (non-PR events)
+    # but not when it fails.
     if: >-
       !cancelled() && (
         (
@@ -72,7 +74,8 @@ jobs:
           (
             github.event.comment.author_association == 'OWNER' ||
             github.event.comment.author_association == 'MEMBER' ||
-            github.event.comment.author_association == 'COLLABORATOR'
+            github.event.comment.author_association == 'COLLABORATOR' ||
+            contains(fromJSON(vars.REVIEW_ALLOWLIST || '[]'), github.event.comment.user.login)
           )
         ) ||
         github.event_name == 'workflow_dispatch'
@@ -235,7 +238,7 @@ jobs:
           # this dir's node_modules empty.
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.212
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
@@ -398,13 +401,14 @@ jobs:
           """ if is_external else ""
 
           # The "Missing visual demonstration" report item + rule are only included
-          # for external contributors; otherwise the review has just the 4 standard
+          # for external contributors; otherwise the review has just the 5 standard
           # sections. Build the numbered list so the numbering stays contiguous
           # regardless of whether the visual item is present.
           standard_items = [
               "**Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
               "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
               "**Non-blocking notes** — design concerns or edge cases worth flagging (brief).",
+              "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
               "**Summary** — one-paragraph overall assessment.",
           ]
           visual_item = [

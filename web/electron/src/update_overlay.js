@@ -81,7 +81,13 @@ function createUpdateOverlay({
 
   function notifyParentHeight(parent, height) {
     if (!parent || parent.isDestroyed()) return;
-    parent.webContents.send("omnigent:update-overlay-height", height);
+    const contents = parent.webContents;
+    // During BrowserWindow's "closed" event Electron may already have
+    // destroyed the renderer while the BrowserWindow wrapper has not yet
+    // started reporting isDestroyed(). The child overlay closes from that
+    // event and must not send its final height into the dead renderer.
+    if (!contents || contents.isDestroyed()) return;
+    contents.send("omnigent:update-overlay-height", height);
   }
 
   function collapse(parent, overlay) {

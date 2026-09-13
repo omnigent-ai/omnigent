@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from omnigent import claude_native
+from omnigent.harnesses.claude_native import main as claude_native
 
 _MULTILINE = "line one\nline two\n\n  indented third"
 
@@ -42,10 +42,10 @@ def _capture_local(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return captured
 
 
-def test_prompt_rides_as_claudes_trailing_positional_argument(
+def test_prompt_rides_as_claudes_leading_positional_argument(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Claude Code takes the initial prompt positionally, after the flags."""
+    """The initial prompt is positional and precedes the pass-through flags."""
     captured = _capture_remote(monkeypatch)
 
     claude_native.run_claude_native(
@@ -56,9 +56,29 @@ def test_prompt_rides_as_claudes_trailing_positional_argument(
     )
 
     assert captured["claude_args"] == (
-        "--dangerously-skip-permissions",
         "review the last commit",
+        "--dangerously-skip-permissions",
     )
+
+
+def test_prompt_precedes_variadic_value_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A trailing variadic value flag must not be able to swallow the prompt.
+
+    Claude Code's ``--mcp-config <configs...>`` consumes every following
+    non-flag token as another config path; a prompt forwarded after it is
+    rejected as a missing config file. Leading with the prompt makes that
+    impossible regardless of which value flags the user passes through.
+    """
+    captured = _capture_remote(monkeypatch)
+
+    claude_native.run_claude_native(
+        server="https://example.com/",
+        session_id=None,
+        extra_args=("--model", "haiku", "--mcp-config", "mcp.json"),
+        prompt="hello",
+    )
+
+    assert captured["claude_args"] == ("hello", "--model", "haiku", "--mcp-config", "mcp.json")
 
 
 def test_multiline_prompt_stays_one_argv_entry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,10 +98,10 @@ def test_multiline_prompt_stays_one_argv_entry(monkeypatch: pytest.MonkeyPatch) 
     assert captured["claude_args"] == (_MULTILINE,)
 
 
-def test_prompt_is_appended_after_resume_args_are_stripped(
+def test_prompt_is_added_after_resume_args_are_stripped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stray ``--resume`` is still dropped, and the prompt stays last."""
+    """A stray ``--resume`` is still dropped, and the prompt stays first."""
     captured = _capture_remote(monkeypatch)
 
     claude_native.run_claude_native(
@@ -91,7 +111,7 @@ def test_prompt_is_appended_after_resume_args_are_stripped(
         prompt="hello",
     )
 
-    assert captured["claude_args"] == ("--verbose", "hello")
+    assert captured["claude_args"] == ("hello", "--verbose")
 
 
 def test_local_launch_path_also_receives_the_prompt(monkeypatch: pytest.MonkeyPatch) -> None:

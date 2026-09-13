@@ -39,6 +39,7 @@ from omnigent.debug_logging import (
     debug_sink_enabled,
     sse_event_logger,
 )
+from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -102,6 +103,16 @@ _TURN_OUTCOME_BY_EVENT_TYPE = {
     "response.failed": "failed",
     "response.cancelled": "cancelled",
     "response.incomplete": "incomplete",
+}
+# The authoritative progress-impact per turn outcome: this is where "the task
+# actually stopped" is known, so it overrides any per-error code default (a
+# nominally-transient retry that ultimately failed the turn lands here as
+# blocking). ``completed`` carries no impact; ``cancelled`` is a user-initiated
+# stop, not lost progress.
+_TURN_OUTCOME_IMPACT = {
+    "failed": ErrorImpact.BLOCKING,
+    "incomplete": ErrorImpact.BLOCKING,
+    "cancelled": ErrorImpact.BENIGN,
 }
 # Top-level event fields safe to log — stable identifiers, closed enums, and
 # pure numerics only. Deliberately excludes human/LLM-authored free text
@@ -200,11 +211,16 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
         error = event.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
+        impact = _TURN_OUTCOME_IMPACT.get(outcome)
+        if impact is not None:
+            attributes["error_impact"] = impact.value
+            # A terminal turn outcome is, by definition, in the turn phase.
+            attributes["error_phase"] = ErrorPhase.TURN.value
     level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
     audit_event_logger().log(level, "turn %s", outcome, extra=extra)
 
 
-def publish(conversation_id: str, event: dict[str, Any]) -> None:
+def publish(conversation_id: str, event: dict[str, Any]) -> int:
     """
     Broadcast an event to every active subscriber of the given
     conversation (called from sync workflow thread). The event
@@ -227,6 +243,13 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
         the Omnigent route layer validates each emitted dict against
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
+    :returns: The number of subscriber slots the event was dispatched
+        toward (``0`` when nothing was listening or the event was
+        suppressed). A slow subscriber's queue may still overflow after
+        dispatch, so a positive count is presence, not delivery. Callers
+        that need a live listener — e.g. the browser action bridge — use
+        this to fail fast instead of awaiting a response that can never
+        arrive; most callers ignore it.
     """
     # Mirror the emitted event to the debug-log table (best-effort, table-only,
     # no-op unless the sink is enabled). Done first so it captures every event
@@ -242,11 +265,31 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
     # always a text delta, never an elicitation, so this still runs.
     pending_elicitations.record_publish(conversation_id, event)
     if live_event is None:
-        return
+        return 0
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
         loop.call_soon_threadsafe(_enqueue_or_overflow, queue, live_event)
+    return len(subs)
+
+
+def has_subscribers(conversation_id: str) -> bool:
+    """
+    Return whether any live subscriber is currently registered for
+    the given conversation.
+
+    Because this stream has no buffer and no replay, an event
+    published while this returns ``False`` is lost — callers can use
+    that to fail fast instead of awaiting a response that can never
+    arrive (e.g. a browser action dispatched to a session no renderer
+    is watching).
+
+    :param conversation_id: The conversation to check,
+        e.g. ``"conv_abc123"``.
+    :returns: ``True`` when at least one subscriber slot is registered.
+    """
+    with _lock:
+        return bool(_subscribers.get(conversation_id))
 
 
 def close(conversation_id: str) -> None:

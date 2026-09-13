@@ -10,6 +10,7 @@ import { useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
+  BlocksIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -34,6 +35,7 @@ export type SettingsSectionId =
   | "appearance"
   | "general"
   | "git"
+  | "integrations"
   | "shortcuts"
   | "import"
   | "account"
@@ -48,6 +50,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "general",
   "git",
+  "integrations",
   "shortcuts",
   "import",
   "account",
@@ -86,6 +89,7 @@ export function settingsNavGroups(
   isDesktop: boolean,
   isAdmin = false,
   isSingleUser = false,
+  integrationsEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
@@ -94,6 +98,15 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
+  // Sandbox Integrations appears once any connection provider is wired
+  // (enabled_connections non-empty). Slots right after Git.
+  if (integrationsEnabled) {
+    general.splice(2, 0, {
+      id: "integrations",
+      label: "Sandbox Integrations",
+      icon: BlocksIcon,
+    });
+  }
   if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
     // on a deploy with sign-in.
@@ -202,12 +215,14 @@ export function SettingsSidebarBody({
   // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
+  const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,
     isElectronShell(),
     isAdmin,
     isSingleUserMode(info),
+    integrationsEnabled,
   );
 
   return (

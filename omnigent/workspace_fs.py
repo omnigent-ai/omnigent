@@ -36,6 +36,7 @@ import base64
 import mimetypes
 import os
 import re
+from collections import deque
 from pathlib import Path
 from typing import TypeAlias, cast
 
@@ -326,61 +327,107 @@ class WorkspaceReader:
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
 
         results: list[_WorkspacePayload] = []
+        # State the two-pass walk mutates via closures (rebound through the
+        # `nonlocal` in scan()). deferred is a FIFO of noise-dir roots to drain
+        # in pass 2.
+        deferred: deque[str] = deque()
         scanned = 0
         truncated = False
-        for dirpath, dirnames, filenames in os.walk(self._root):
+        stop = False
+
+        def rel(dirpath: str, name: str) -> str:
             rel_dir = os.path.relpath(dirpath, self._root)
-            # Prune excluded subtrees so a "**/node_modules" pattern
-            # avoids descending, matching the runner's search walk.
-            kept = []
-            for d in sorted(dirnames):
-                dp = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, d))
-                if any(r.match(dp) for r in exc):
-                    continue
-                kept.append(d)
-            # Spend the scan budget on the real tree first, as the runner does.
-            kept.sort(key=lambda d: d in _DEFAULT_DEPRIORITIZED_DIRS)
-            dirnames[:] = kept
-            scanned += len(kept)
-            for fname in sorted(filenames):
-                # Counted per entry: a per-directory check lets one huge
-                # directory overshoot the budget before `truncated` trips.
-                scanned += 1
-                if scanned >= _SEARCH_SCAN_BUDGET:
-                    truncated = True
-                    break
-                p = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, fname))
-                if exc and any(r.match(p) for r in exc):
-                    continue
-                if inc and not any(r.match(p) for r in inc):
-                    continue
-                if q not in fname.lower() and q not in p.lower():
-                    continue
-                try:
-                    st = (Path(dirpath) / fname).stat()
-                    size: int | None = st.st_size
-                    mtime: int | None = int(st.st_mtime)
-                except OSError:
-                    size = None
-                    mtime = None
-                results.append(
-                    {
-                        "id": p,
-                        "object": "session.environment.filesystem.entry",
-                        "name": fname,
-                        "path": p,
-                        "type": "file",
-                        "bytes": size,
-                        "modified_at": mtime,
-                    }
-                )
-                if len(results) >= limit:
-                    break
-            # A query matching little or nothing never fills the result cap,
-            # so the walk needs its own bound -- the same one the runner
-            # applies, so search behaves identically whether the agent is awake.
-            if truncated or len(results) >= limit:
-                break
+            return os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, name))
+
+        def match(dirpath: str, name: str, *, is_dir: bool) -> None:
+            # A directory carries no byte size; a file stats for size + mtime.
+            p = rel(dirpath, name)
+            if exc and any(r.match(p) for r in exc):
+                return
+            if inc and not any(r.match(p) for r in inc):
+                return
+            if q not in name.lower() and q not in p.lower():
+                return
+            try:
+                st = (Path(dirpath) / name).stat()
+                size: int | None = None if is_dir else st.st_size
+                mtime: int | None = int(st.st_mtime)
+            except OSError:
+                size = None
+                mtime = None
+            results.append(
+                {
+                    "id": p,
+                    "object": "session.environment.filesystem.entry",
+                    "name": name,
+                    "path": p,
+                    "type": "directory" if is_dir else "file",
+                    "bytes": size,
+                    "modified_at": mtime,
+                }
+            )
+
+        def scan(root: str, defer: bool) -> None:
+            # A query matching little or nothing never fills the result cap, so
+            # the walk needs its own bound. Counted per entry: a per-directory
+            # check lets one huge directory overshoot before `truncated` trips.
+            nonlocal scanned, truncated, stop
+            for dirpath, dirnames, filenames in os.walk(root):
+                kept = []
+                for d in sorted(dirnames):
+                    full = os.path.join(dirpath, d)
+                    dp = rel(dirpath, d)
+                    if any(r.match(dp) for r in exc):
+                        continue
+                    if defer and d in _DEFAULT_DEPRIORITIZED_DIRS:
+                        # Match the dir now, but walk its subtree later (pass 2)
+                        # so it can't starve the real tree of scan budget. Never
+                        # defer a symlinked dir: os.walk(root) follows a top-level
+                        # symlink, so a committed 'node_modules -> ..' would let
+                        # pass 2 escape the workspace. os.walk(followlinks=False)
+                        # never crosses symlinks mid-tree; deferring only real
+                        # dirs keeps that boundary intact.
+                        if not os.path.islink(full):
+                            deferred.append(full)
+                    kept.append(d)
+                dirnames[:] = [d for d in kept if not (defer and d in _DEFAULT_DEPRIORITIZED_DIRS)]
+                for dname in kept:
+                    # Count then check `> budget`, not `>= budget`: a tree of
+                    # exactly `budget` entries is fully enumerable and must not
+                    # report truncated.
+                    scanned += 1
+                    if scanned > _SEARCH_SCAN_BUDGET:
+                        truncated = True
+                        stop = True
+                        return
+                    match(dirpath, dname, is_dir=True)
+                    if len(results) >= limit:
+                        stop = True
+                        return
+                for fname in sorted(filenames):
+                    scanned += 1
+                    if scanned > _SEARCH_SCAN_BUDGET:
+                        truncated = True
+                        stop = True
+                        return
+                    match(dirpath, fname, is_dir=False)
+                    if len(results) >= limit:
+                        stop = True
+                        return
+
+        # Pass 1 walks the real tree and defers dependency/cache subtrees;
+        # reordering siblings isn't enough, because a deep node_modules nested
+        # under an earlier-sorted real dir would still swallow the whole budget
+        # before the walk reached a later top-level dir. Pass 2 drains the
+        # deferred roots only if budget remains. Mirrors the runner's walk.
+        scan(str(self._root), True)
+        while deferred and not stop:
+            scan(deferred.popleft(), False)
+        # When the walk stops early it is always because scan() tripped the
+        # budget (which sets truncated) or the result limit (signaled by
+        # has_more); the loop exits only once deferred is drained or stop is
+        # set, so no extra truncation flag is needed here.
+
         results.sort(key=lambda entry: cast(str, entry["path"]))
         return {
             "object": "list",
@@ -470,37 +517,73 @@ class WorkspaceReader:
         }
 
     # ── GitHub integration (read-only) ────────────────────────────
-    # Serve the same read-only PR-metadata + branch-vs-base diff the runner's
+    # Serve the same read-only PR metadata + the PR's files / diff the runner's
     # GitHub endpoints do, so the tab keeps working when the runner is offline
     # but the host still holds the workspace. Delegates to the shared
-    # ``github_resource`` helpers against this reader's confined root; the git
-    # ops are read-only and ``gh`` is the developer's own authenticated CLI.
+    # ``github_resource`` helpers against this reader's confined root; the list
+    # and patch come from ``gh`` (the developer's authenticated CLI) and only the
+    # per-file reader shells out to a read-only ``git show``.
 
-    def github_info(self) -> _WorkspacePayload:
-        """GitHub context (repo, branch, base ref, PR) for the workspace."""
-        return cast("_WorkspacePayload", github_resource.github_info(str(self._root)))
-
-    def github_changes(self, base: str | None) -> _WorkspacePayload:
-        """Files changed on HEAD vs the base branch (``base`` derived if None)."""
-        resolved = github_resource.resolve_base_ref(str(self._root), base)
-        if not resolved:
-            return {"object": "list", "data": [], "has_more": False}
-        return cast(
-            "_WorkspacePayload", github_resource.github_changed_files(str(self._root), resolved)
-        )
-
-    def github_file_diff(self, base: str | None, relative_path: str) -> _WorkspacePayload:
-        """Before/after content for one file, HEAD vs the base merge-base."""
-        resolved = github_resource.resolve_base_ref(str(self._root), base)
+    def github_info(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """GitHub context for an explicit session PR or the workspace branch."""
         return cast(
             "_WorkspacePayload",
-            github_resource.github_file_diff(str(self._root), resolved or "", relative_path),
+            github_resource.github_info(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
         )
 
-    def github_pr_diff(self, base: str | None) -> _WorkspacePayload:
-        """The whole PR as one unified diff patch (base derived if None)."""
-        resolved = github_resource.resolve_base_ref(str(self._root), base)
+    def github_changes(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The selected PR's changed files."""
         return cast(
             "_WorkspacePayload",
-            github_resource.github_pr_diff(str(self._root), resolved or ""),
+            github_resource.github_changed_files(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )
+
+    def github_file_diff(
+        self,
+        base: str | None,
+        relative_path: str,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """Before/after content for the selected PR's revisions."""
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_file_diff(
+                str(self._root),
+                base or "",
+                relative_path,
+                session_id=session_id,
+                pr_url=pr_url,
+                previous_path=previous_path,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            ),
+        )
+
+    def github_pr_diff(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The selected PR's unified diff patch."""
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_pr_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
         )
