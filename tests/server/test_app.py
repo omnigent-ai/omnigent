@@ -71,6 +71,23 @@ async def test_version_returns_source_of_truth_version(
     )
 
 
+def test_version_openapi_field_nullability(app: FastAPI) -> None:
+    """API consumers can distinguish the required package version from a missing bundle."""
+    schema = app.openapi()
+    response = schema["paths"]["/api/version"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    model = schema["components"]["schemas"][response["$ref"].rsplit("/", 1)[1]]
+    properties = model["properties"]
+    assert {"version", "webapp_build_id"} <= set(model["required"])
+    assert properties["version"]["type"] == "string"
+    assert "anyOf" not in properties["version"]
+    assert {item["type"] for item in properties["webapp_build_id"]["anyOf"]} == {
+        "string",
+        "null",
+    }
+
+
 def test_server_version_reads_version_constant() -> None:
     """The server version is the shared ``omnigent.version.VERSION`` constant."""
     from omnigent.version import VERSION

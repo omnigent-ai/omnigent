@@ -358,8 +358,33 @@ describe("useWebUpdateNotifications", () => {
   });
 
   it("survives StrictMode effect cleanup without using an aborted baseline", async () => {
+    let finishAborted!: (response: Response) => void;
+    let finishSurviving!: (response: Response) => void;
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishAborted = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishSurviving = resolve;
+          }),
+      );
     const { result } = renderHook(useWebUpdateNotifications, { wrapper: StrictMode });
-    await act(async () => {});
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    await act(async () =>
+      finishAborted(new Response(JSON.stringify({ webapp_build_id: "aborted" }))),
+    );
+    await act(async () =>
+      finishSurviving(new Response(JSON.stringify({ webapp_build_id: "loaded" }))),
+    );
+    await poll("loaded");
+    await poll("loaded");
+    expect(result.current.availableBuildId).toBeNull();
     await poll("new");
     expect(result.current.availableBuildId).toBeNull();
     await poll("new");
