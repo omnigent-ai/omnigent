@@ -2511,6 +2511,43 @@ describe("useArchiveConversation", () => {
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
+  it("updates the session snapshot after unarchiving succeeds", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_a",
+        object: "conversation",
+        title: "A",
+        created_at: 0,
+        updated_at: 10,
+        labels: {},
+        archived: false,
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_a"], {
+      id: "conv_a",
+      agentId: "ag_1",
+      agentName: null,
+      status: "idle",
+      createdAt: 0,
+      title: "A",
+      items: [],
+      permissionLevel: null,
+      parentSessionId: null,
+      subAgentName: null,
+      kind: "default",
+      archived: true,
+    } satisfies Session);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(queryClient.getQueryData<Session>(["session", "conv_a"])?.archived).toBe(false);
+  });
+
   it("rolls the flag back from the snapshot when the PATCH fails, without a list refetch", async () => {
     // The archive PATCH fails.
     fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));

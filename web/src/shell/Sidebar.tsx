@@ -24,6 +24,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
+  CircleAlertIcon,
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
@@ -158,6 +159,7 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { useSessionErrors } from "@/hooks/useSessionErrors";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -167,6 +169,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
@@ -835,6 +838,13 @@ function SidebarImpl({
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
 
+  // The mobile drawer is a `fixed inset-0` overlay, so the iOS shell-lock
+  // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
+  // doesn't lift it above the soft keyboard. Pad the drawer's bottom by the
+  // keyboard inset so every session row can still scroll into view while an
+  // inline rename holds the keyboard up. No-op off iOS / keyboard closed.
+  const keyboardInset = useIOSNativeKeyboardInset(effectiveOpen);
+
   // While the peek card's entry animation is still fading it in, the card is
   // (nearly) invisible yet already covers the toggle whose hover armed it —
   // taking pointer events then would swallow a click aimed at that toggle,
@@ -977,6 +987,7 @@ function SidebarImpl({
         style={
           {
             "--sidebar-width": `${sidebarWidth}px`,
+            ...(keyboardInset > 0 ? { paddingBottom: keyboardInset } : null),
             // Track the finger: map the 0→1 open fraction to translateX
             // -100%→0% and kill the transition so it follows the drag exactly.
             ...(dragging
@@ -1344,7 +1355,6 @@ function ProjectFolder({
   activeConversationId,
   expanded,
   active,
-  marker,
   onToggleCollapsed,
   pinnedConversationIds,
   activeOverride,
@@ -1374,7 +1384,6 @@ function ProjectFolder({
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
-  marker: SessionState | null;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
   activeOverride: ActiveChatOverride | null;
@@ -1412,6 +1421,11 @@ function ProjectFolder({
       frozenSortKeys,
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
+  const errors = useSessionErrors(conversations);
+  const startingConversationId = useChatStore((s) =>
+    s.status === "streaming" || s.terminalPending ? s.conversationId : null,
+  );
+  const marker = projectMarkerState(conversations, errors, startingConversationId);
 
   // Publish the folder's rendered rows upward so projects-scope bulk selection
   // resolves them (the parent sources its action set from these, not the global
@@ -2238,9 +2252,6 @@ function ConversationList({
                       activeConversationId={displayedActiveId}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
-                      // Best-effort marker from the globally-loaded window: a
-                      // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
                       onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                       pinnedConversationIds={pinnedConversationIds}
                       activeOverride={activeOverride}
@@ -2450,29 +2461,36 @@ function UngroupDropZone() {
   );
 }
 
-/**
- * Aggregate the sidebar marker for a project from its conversations, using
- * the same precedence a row uses (awaiting > unseen > running). Returned as a
- * {@link SessionState} so a collapsed project header can render the exact
- * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
- */
-function projectMarkerState(conversations: Conversation[]): SessionState | null {
+/** Surface the most actionable state across a collapsed project's loaded rows. */
+function projectMarkerState(
+  conversations: Conversation[],
+  errors: readonly boolean[],
+  startingConversationId: string | null,
+): SessionState | null {
   let awaiting = 0;
-  let unseen = false;
   let running = false;
-  for (const c of conversations) {
-    const pending = c.pending_elicitations_count ?? 0;
-    if (pending > 0) {
-      awaiting += pending;
+  let starting = false;
+  let error = false;
+  let unseen = false;
+  for (const [i, c] of conversations.entries()) {
+    const state = getSessionState(c, errors[i]);
+    if (state?.kind === "awaiting") {
+      awaiting += state.count;
+    } else if (state?.kind === "running") {
+      running = true;
+    } else if (c.id === startingConversationId) {
+      starting = true;
+    } else if (state?.kind === "error") {
+      error = true;
     } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
       unseen = true;
-    } else if (c.status === "running") {
-      running = true;
     }
   }
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
-  if (unseen) return { kind: "unseen" };
   if (running) return { kind: "running" };
+  if (starting) return { kind: "starting" };
+  if (error) return { kind: "error" };
+  if (unseen) return { kind: "unseen" };
   return null;
 }
 
@@ -3425,12 +3443,23 @@ function ConversationMenuItems({
   );
 }
 
+function SessionErrorHint() {
+  return (
+    <p className="mt-1 flex items-center gap-1.5 text-sm text-destructive">
+      <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
+      <span>Latest message is an error</span>
+    </p>
+  );
+}
+
 function SessionTooltipContent({
   conversation,
   hostsById,
+  hasError,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
+  hasError: boolean;
 }) {
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
@@ -3472,6 +3501,7 @@ function SessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
 }
@@ -3652,11 +3682,10 @@ function ConversationRowImpl({
   const hasUnseenMessages = readState.unseen && (!isActive || readState.explicitlyUnread);
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
-  // Badge precedence: a pending approval ("Needs response") outranks the
-  // unread dot — a session that's both unread and awaiting input should
-  // surface the actionable approval tag. The row still renders bold (the
-  // unread signal) via `hasUnseenMessages` below.
-  const derivedState = getSessionState(conversation);
+  // Approvals and failures outrank the unread dot without clearing read state.
+  const errorConversations = useMemo(() => [conversation], [conversation]);
+  const [latestMessageIsError] = useSessionErrors(errorConversations);
+  const derivedState = getSessionState(conversation, latestMessageIsError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -3668,11 +3697,11 @@ function ConversationRowImpl({
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
   const sessionState =
-    derivedState?.kind === "awaiting"
+    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
       ? derivedState
-      : hasUnseenMessages
-        ? { kind: "unseen" as const }
-        : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
+      : isStartingUp
+        ? { kind: "starting" as const }
+        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
@@ -3976,6 +4005,7 @@ function ConversationRowImpl({
               projectName={projectFlyoutName}
               projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
+              hasError={sessionState?.kind === "error"}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -3983,7 +4013,11 @@ function ConversationRowImpl({
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+            <SessionTooltipContent
+              conversation={conversation}
+              hostsById={hostsById}
+              hasError={sessionState?.kind === "error"}
+            />
           </Tooltip>
         )
       ) : projectFlyoutName ? (
@@ -4005,6 +4039,7 @@ function ConversationRowImpl({
             projectName={projectFlyoutName}
             projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
+            hasError={sessionState?.kind === "error"}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -4034,7 +4069,11 @@ function ConversationRowImpl({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+          <SessionTooltipContent
+            conversation={conversation}
+            hostsById={hostsById}
+            hasError={sessionState?.kind === "error"}
+          />
         </Tooltip>
       )}
       {selectionMode ? (
@@ -4457,11 +4496,13 @@ function PinnedProjectFlyoutContent({
   projectName,
   projectIcon,
   gitBranch,
+  hasError,
 }: {
   title: string;
   projectName: string;
   projectIcon: string | null;
   gitBranch: string | null;
+  hasError: boolean;
 }) {
   return (
     <HoverCardContent
@@ -4488,6 +4529,7 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
+      {hasError && <SessionErrorHint />}
     </HoverCardContent>
   );
 }

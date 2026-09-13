@@ -3079,11 +3079,10 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
         "omnigent.harnesses.claude_native.hook"
         in settings["hooks"]["PreCompact"][0]["hooks"][0]["command"]
     )
-    # No built-in tools are disabled anymore: ``AskUserQuestion``
-    # routes through its dedicated PreToolUse hook (answers injected
-    # via ``updatedInput.answers``) and ``ExitPlanMode`` surfaces
-    # through the standard PermissionRequest elicitation card, so the
-    # wrapper must not inject a ``--disallowedTools`` flag of its own.
+    # No built-in tools are disabled anymore: ``AskUserQuestion`` and
+    # ``ExitPlanMode`` both surface through the standard PermissionRequest
+    # elicitation card (question answers ride back via ``updatedInput``),
+    # so the wrapper must not inject a ``--disallowedTools`` flag of its own.
     assert "--disallowedTools" not in args
 
 
@@ -4995,6 +4994,44 @@ def test_set_permission_mode_raises_when_target_not_in_cycle(
 
     with pytest.raises(RuntimeError, match="not available in this session's cycle"):
         claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+
+@pytest.mark.parametrize(
+    ("target", "presses"),
+    [("auto", 1), ("acceptEdits", 3)],
+)
+def test_set_permission_mode_leaves_a_bypass_launched_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    presses: int,
+) -> None:
+    """
+    A session launched into bypass can still be switched to a cycle mode.
+
+    Bypass is launch-only, so it is not a switch target, but the pane's
+    ``bypass permissions on`` footer must still read as the current mode:
+    without that the cycler cannot tell where it is starting from and gives
+    up before pressing anything. From bypass the TUI cycles
+    bypass → auto → manual → accept edits → plan, so ``auto`` is one press
+    away and ``acceptEdits`` three.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(
+        ["bypassPermissions", "auto", "default", "acceptEdits", "plan"],
+        start="bypassPermissions",
+    )
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode=target, timeout_s=5.0)
+
+    assert got == target
+    assert fake.presses == presses, f"Expected {presses} presses, got {fake.presses}."
 
 
 @pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "", "nonsense"])
@@ -9937,6 +9974,144 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert unmarked_dir.exists()
 
 
+# ── /btw side-chat overlay parsing ─────────────────────────────────
+
+_BTW_BORDER = "▔" * 120
+
+
+def _btw_pane(*body_lines: str) -> str:
+    """
+    Build a captured-pane string with a ``/btw`` overlay at the bottom.
+
+    Prepends some inert scrollback and the ``▔`` overlay border, then the
+    supplied overlay body lines, mirroring the real capture layout.
+
+    :param body_lines: Overlay lines below the border (questions, answer,
+        footer), verbatim.
+    :returns: A synthetic pane string for the parser under test.
+    """
+    prefix = ["welcome banner line", "another line", _BTW_BORDER]
+    return "\n".join([*prefix, *body_lines])
+
+
+def test_btw_overlay_parses_completed_single_turn() -> None:
+    """A settled single-turn overlay yields its question and answer."""
+    pane = _btw_pane(
+        "",
+        "    /btw is this backward compatible?",
+        "",
+        "      Yes, the public API is unchanged.",
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.question == "/btw is this backward compatible?"
+    assert overlay.answer == "Yes, the public API is unchanged."
+    assert overlay.truncated is False
+
+
+def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
+    """
+    With stacked side turns, only the LAST question is taken, and a tall
+    overflowing overlay is flagged truncated.
+    """
+    answer_lines = [f"      {n} = word{n}" for n in range(1, 16)]
+    pane = _btw_pane(
+        "    /btw earlier question",
+        "    /btw list many numbers",
+        "",
+        *answer_lines,
+        "",
+        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.question == "/btw list many numbers"
+    assert overlay.answer.splitlines()[0] == "1 = word1"
+    assert "earlier question" not in overlay.answer
+    assert overlay.truncated is True
+
+
+def test_btw_overlay_none_while_generating() -> None:
+    """An overlay still generating (Answering… / no copy·fork) is skipped."""
+    pane = _btw_pane(
+        "    /btw write a long thing",
+        "      ✻ Answering…",
+        "    ←/→ to switch · x to clear history · Esc to close",
+    )
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+def test_btw_overlay_none_without_overlay() -> None:
+    """A plain composer pane (no overlay footer) yields None."""
+    pane = "\n".join(
+        [
+            "some transcript output",
+            "─" * 80,
+            "❯ ",
+            "─" * 80,
+            "  Opus 4.8 (1M) │ high │ 0/1M $0.00 │ git:main",
+        ]
+    )
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+def test_btw_overlay_preserves_relative_indentation() -> None:
+    """Dedent strips the fixed margin but keeps nested structure."""
+    pane = _btw_pane(
+        "    /btw show a nested list",
+        "",
+        "      - top",
+        "        - nested",
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.answer == "- top\n  - nested"
+
+
+def test_btw_overlay_present_matches_settled_multiturn_and_generating() -> None:
+    """The dismiss guard matches every /btw overlay state, settled or not."""
+    settled = _btw_pane(
+        "    /btw q",
+        "",
+        "      A",
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+    )
+    multiturn = _btw_pane(
+        "    /btw q1",
+        "    /btw q2",
+        "",
+        "      A",
+        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+    )
+    generating = _btw_pane(
+        "    /btw q",
+        "      ✻ Answering…",
+        "    ←/→ to switch · x to clear history · Esc to close",
+    )
+    assert claude_native_bridge._btw_overlay_present(settled) is True
+    assert claude_native_bridge._btw_overlay_present(multiturn) is True
+    assert claude_native_bridge._btw_overlay_present(generating) is True
+
+
+def test_btw_overlay_present_false_on_bare_composer() -> None:
+    """No /btw footer → no Escape (a blind Escape would cancel a turn)."""
+    pane = "\n".join(
+        [
+            "some transcript output",
+            "─" * 80,
+            "❯ ",
+            "─" * 80,
+            "  Opus 4.8 (1M) │ high │ 0/1M $0.00 │ git:main",
+        ]
+    )
+    assert claude_native_bridge._btw_overlay_present(pane) is False
+
+
 # ---------------------------------------------------------------------------
 # Bridge HTTP server bind/advertise behavior.
 #
@@ -10249,8 +10424,8 @@ def test_approval_wait_marker_tracks_a_parked_permission_hook(
     # One session's parked prompt must not spare another session's pane.
     assert not claude_native_bridge.approval_wait_is_fresh("conv_other")
 
-    # Each hook owns its own marker, so one finishing (an AskUserQuestion beside
-    # a permission request, or parallel tool calls) leaves the other's evidence.
+    # Each hook owns its own marker, so one finishing (parallel tool calls each
+    # raising a permission request) leaves the other's evidence.
     sibling = marker.with_name(marker.name.replace(f".{os.getpid()}.", f".{os.getpid() + 1}."))
     assert sibling != marker
     claude_native_bridge.touch_approval_wait_marker(sibling)

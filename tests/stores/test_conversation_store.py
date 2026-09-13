@@ -108,6 +108,31 @@ def test_fork_drops_sandbox_repo_label(
     assert MANAGED_REPO_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_per_repo_sandbox_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The per-repo family (``omnigent.sandbox.repo.<index>``) is dropped by
+    prefix on a fork, for the same reason as the legacy single label: the fork's
+    own launch re-stamps whatever it resolves, so inheriting the source's would
+    re-clone them even into a fork that asked for an empty sandbox."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+            "kept": "yes",
+        },
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not any(k.startswith(f"{MANAGED_REPO_LABEL_KEY}.") for k in fork.labels)
+
+
 def test_fork_drops_per_user_pin_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

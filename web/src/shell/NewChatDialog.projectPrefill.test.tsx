@@ -222,6 +222,8 @@ function selectAgent(agentId: string): void {
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+  const selectedRow = screen.queryByTestId(`new-chat-landing-agent-${agentId}`);
+  if (selectedRow) fireEvent.keyDown(selectedRow, { key: "Escape" });
 }
 
 async function submitAndReadBody(): Promise<Record<string, unknown>> {
@@ -518,27 +520,25 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/alpha-repo" },
     });
-    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
-      target: { value: "alpha-main" },
-    });
-    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain(
-      "alpha-repo#alpha-main",
-    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("alpha-repo");
 
     // Click project Beta's pencil: the param changes in place.
     searchParams = new URLSearchParams("project=Beta");
     rerender(<NewChatLandingScreen />);
 
     // The sticky host pick re-selects the sandbox, but Alpha's staged repo
-    // inputs are gone.
+    // is gone.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
     );
     const body = await submitAndReadBody();
     expect(body.host_type).toBe("managed");
-    // Blank repo inputs pin workspace to explicit null under Beta's
-    // project_id (a managed create rejects a default-filled path) — not
-    // Alpha's repo#branch.
+    // No repos carried over → an empty workspaces list; workspace stays pinned
+    // to explicit null under Beta's project_id (a managed create rejects a
+    // default-filled path) — not Alpha's repo.
+    expect(body.workspaces).toEqual([]);
     expect(body.workspace).toBeNull();
   });
 
@@ -804,13 +804,8 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
     fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
-    fireEvent.click(screen.getByRole("option", { name: "Sonnet" }));
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
 
     // The project default (Opus) lands afterwards — it must not reseed.
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
@@ -840,13 +835,8 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
     fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
-    fireEvent.click(screen.getByRole("option", { name: "Smart Routing" }));
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     unmount();
 
     // Remount for the SAME project, now with a stored model default. The

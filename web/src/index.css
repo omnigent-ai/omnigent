@@ -386,15 +386,9 @@
   line-height: 20px;
 }
 
-.composer-agent-menu [role="menuitem"].composer-agent-choice {
-  padding-right: 0;
-}
-
-.composer-agent-menu [role="menuitem"].composer-agent-edit {
-  padding: 0 12px;
-  border-radius: 0;
-  font-size: 12px;
-  line-height: 16px;
+.composer-agent-menu [role="menuitem"].composer-agent-row {
+  gap: 4px;
+  padding: 0 12px 0 0;
 }
 
 .composer-agent-menu [role="menuitemcheckbox"] {
@@ -1057,7 +1051,7 @@ aside[aria-label="Workspace"][data-maximized] {
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Opaque selection colors keep arbitrary selected text legible in every palette. */
+  /* Solid selection colors keep selected text readable across palette surfaces. */
   ::selection {
     background: var(--selection-background);
     color: var(--selection-foreground);
@@ -1107,6 +1101,13 @@ aside[aria-label="Workspace"][data-maximized] {
     --mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13));
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
+  }
+
+  /* Keep draft text and its mirrors above Safari's input-focus zoom threshold.
+   * Native inputs must also preserve larger Appearance sizes. */
+  .composer-input-text,
+  [data-ios-native] textarea.composer-input-text {
+    font-size: max(16px, var(--text-ui));
   }
 
   /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
@@ -1172,15 +1173,21 @@ aside[aria-label="Workspace"][data-maximized] {
   font-size: 1em;
 }
 
+/* Keep download aligned with our header overlay; sticky controls otherwise
+ * drift into the code body and then underneath the transcript's header fade. */
+.chat-code-block > [data-streamdown="code-block"] > .sticky {
+  position: static;
+}
+
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
  * Streamdown renders the body with `overflow-x-auto` and the <code> with
  * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`
  * is set we soft-wrap instead so everything fits the column width. */
-.chat-code-wrap [data-streamdown="code-block-body"] {
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] {
   overflow-x: hidden;
 }
-.chat-code-wrap [data-streamdown="code-block-body"] pre,
-.chat-code-wrap [data-streamdown="code-block-body"] code {
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] pre,
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] code {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1188,9 +1195,17 @@ aside[aria-label="Workspace"][data-maximized] {
  * align with the code, not under the numbers. Gutter = before:w-6 (1.5rem) +
  * before:mr-4 (1rem) = 2.5rem; the negative text-indent pulls the first line
  * (and its ::before number) back to the left edge. */
-.chat-code-wrap [data-streamdown="code-block-body"] code > span {
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] code > span {
   padding-left: 2.5rem;
   text-indent: -2.5rem;
+}
+
+/* Our own mermaid fullscreen button (see ChatMermaidBlock in message.tsx)
+ * sits in a pill at the block's top-right. Nudge Streamdown's mermaid action
+ * bar left by that pill's footprint so the two rows sit side by side rather
+ * than overlapping. */
+.chat-mermaid [data-streamdown="mermaid-block-actions"] {
+  margin-right: 2.75rem;
 }
 
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can

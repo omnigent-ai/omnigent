@@ -426,7 +426,12 @@ export function AppShell() {
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
-  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true);
+  // Restrict the observer to the fields AppShell actually reads: the 30s
+  // refetchInterval otherwise re-renders this whole shell on every background
+  // `isFetching`/`dataUpdatedAt` flap even when the list is unchanged.
+  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true, {
+    notifyOnChangeProps: ["data", "isLoading"],
+  });
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
@@ -494,7 +499,10 @@ export function AppShell() {
   // snapshot carries ``omnigent.ui``/``omnigent.wrapper`` — without
   // this merge an added claude-native agent loses its terminal-first
   // toggle. Snapshot wins on conflict; spreading undefined is a no-op.
-  const sessionLabels = { ...activeConv?.labels, ...activeSession?.labels };
+  const sessionLabels = useMemo(
+    () => ({ ...activeConv?.labels, ...activeSession?.labels }),
+    [activeConv?.labels, activeSession?.labels],
+  );
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
   // Native-CLI wrapper of either family. Keys harness behavior gates
@@ -573,6 +581,10 @@ export function AppShell() {
       created_at: activeSession.createdAt,
       updated_at: activeSession.createdAt,
       labels: activeSession.labels ?? {},
+      // The snapshot is the only archived-flag carrier here: an archived
+      // session is absent from the sidebar list, so without this the header
+      // menu would offer "Archive" on an already-archived session.
+      archived: activeSession.archived ?? false,
       permission_level: activeSession.permissionLevel,
       runner_id: activeSession.runnerId ?? null,
       host_id: activeSession.hostId ?? null,
@@ -993,6 +1005,7 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
+    setGithubPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
     // still-armed create ref would otherwise auto-focus an unrelated shell in
@@ -1181,21 +1194,6 @@ export function AppShell() {
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
   );
-
-  // Reveal the rail on the GitHub tab (from the composer's PR link). Mirrors
-  // openFileViewer's rail-reveal, but deselects any file/shell so the tab's
-  // own content (the stacked diff) shows rather than the FileViewer.
-  const openGithubTab = useCallback(() => {
-    setSelectedFilePath(null);
-    setSelectedTerminalKey(null);
-    if (!terminalFirst) setPanelInitialKey(null);
-    setExecutionLogsKey(null);
-    setFilesPanelOpen(false);
-    setSubagentsPanelOpen(false);
-    setRightRailTab("github");
-    setRightPanelOpen(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-  }, [conversationId, terminalFirst, setPanelInitialKey]);
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
@@ -1686,7 +1684,7 @@ export function AppShell() {
   // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
   // (matches the desktop rail's GitHub tab; the panel handles all states —
   // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
-  function openGithubPanel() {
+  const openGithubPanel = useCallback(() => {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
     setPanelInitialKey(null); // close terminals panel
@@ -1695,7 +1693,25 @@ export function AppShell() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(true);
-  }
+  }, [clearFileViewerUrl, setPanelInitialKey]);
+
+  // Composer links open the mobile drawer or reveal the desktop GitHub tab.
+  // Deselect files/shells so the chosen panel owns its content slot.
+  const openGithubTab = useCallback(() => {
+    if (isMobileViewport()) {
+      openGithubPanel();
+      return;
+    }
+    setSelectedFilePath(null);
+    setSelectedTerminalKey(null);
+    if (!terminalFirst) setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setRightRailTab("github");
+    setRightPanelOpen(true);
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+  }, [conversationId, terminalFirst, setPanelInitialKey, openGithubPanel]);
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.

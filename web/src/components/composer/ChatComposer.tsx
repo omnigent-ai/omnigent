@@ -11,8 +11,9 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { isComposerSendKey } from "@/lib/composerSendShortcutPreferences";
+import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
-export const COMPOSER_COLUMN_WIDTH = "w-full max-w-[720px]";
+export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
 
 export interface ComposerKeyIntent {
   shouldSubmitFromKeyboard: boolean;
@@ -32,6 +33,7 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
   };
   slots?: {
     beforeInput?: ReactNode;
+    inputPrefix?: ReactNode;
     inputBackdrop?: ReactNode;
     inputHint?: ReactNode;
     attachments?: ReactNode;
@@ -60,24 +62,12 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       {...props}
     >
       {slots?.beforeInput}
-      <ComposerInputArea>
+      <ComposerInputArea
+        className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
+      >
+        {slots?.inputPrefix}
         {slots?.inputBackdrop}
-        <ComposerTextarea
-          {...input}
-          onKeyDown={(event) => {
-            if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
-            const shouldSubmitFromKeyboard = isComposerSendKey(
-              { ...event, isComposing: event.nativeEvent.isComposing },
-              keyboard.submitWithModEnter,
-              keyboard.preventsKeyboardSubmit,
-            );
-            input.onKeyDown?.(event, {
-              shouldSubmitFromKeyboard,
-              shouldPreferSendOverCompletion:
-                keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
-            });
-          }}
-        />
+        <ComposerTextInput input={input} keyboard={keyboard} />
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
@@ -93,11 +83,34 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
   );
 });
 
+export function ComposerTextInput({
+  input,
+  keyboard,
+}: Pick<ChatComposerProps, "input" | "keyboard">) {
+  return (
+    <ComposerTextarea
+      {...input}
+      onKeyDown={(event) => {
+        if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        const shouldSubmitFromKeyboard = isComposerSendKey(
+          { ...event, isComposing: event.nativeEvent.isComposing },
+          keyboard.submitWithModEnter,
+          keyboard.preventsKeyboardSubmit,
+        );
+        input.onKeyDown?.(event, {
+          shouldSubmitFromKeyboard,
+          shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
+        });
+      }}
+    />
+  );
+}
+
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
     <div
       className={cn(
-        "relative overflow-hidden px-3 pt-3 pb-1 text-[13px] leading-[20.8px]",
+        "composer-input-text relative overflow-hidden px-3 pt-3 pb-1 text-ui",
         className,
       )}
       {...props}
@@ -117,7 +130,7 @@ export const ComposerTextarea = forwardRef<
     <textarea
       ref={ref}
       className={cn(
-        "relative min-h-[42px] max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-[13px] leading-[20.8px] text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:select-text [&::-webkit-scrollbar]:hidden",
+        "composer-input-text relative min-h-[42px] max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:select-text [&::-webkit-scrollbar]:hidden",
         className,
       )}
       {...props}
@@ -140,7 +153,7 @@ export function ComposerActionRow({ className, ...props }: ComponentPropsWithout
   return (
     <div
       className={cn(
-        "@container/composer-actions flex min-w-0 items-center justify-between gap-2 px-2 pt-1 pb-2",
+        "@container/composer-actions flex min-w-0 flex-nowrap items-center justify-between gap-2 px-2 pt-1 pb-2",
         className,
       )}
       {...props}
@@ -157,7 +170,7 @@ export function ComposerActionGroup({
     <div
       className={cn(
         "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-1 overflow-visible" : "shrink-0",
+        side === "left" ? "flex-[0_1_auto] overflow-visible" : "ml-auto max-w-full flex-[0_1_auto]",
         className,
       )}
       {...props}

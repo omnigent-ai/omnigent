@@ -18,10 +18,12 @@ import cachetools
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -92,6 +94,14 @@ _EXTERNAL_SESSION_INTERRUPTED_TYPE: str = "external_session_interrupted"
 
 
 _EXTERNAL_SESSION_SUPERSEDED_TYPE: str = "external_session_superseded"
+# Transient /btw side-chat overlay: the claude-native forwarder scrapes a
+# settled ``/btw`` exchange from the pane and posts it here to be broadcast
+# (never persisted) so the web UI shows the ephemeral overlay.
+_EXTERNAL_BTW_SIDECHAT_TYPE: str = "external_btw_sidechat"
+# Transient /btw overlay dismiss: the web UI posts this when the reader closes
+# the side-chat overlay (Escape / ✕), and the server forwards an Escape to the
+# pane so the terminal's own ``/btw`` overlay closes in lockstep.
+_EXTERNAL_BTW_DISMISS_TYPE: str = "external_btw_dismiss"
 
 
 _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
@@ -227,6 +237,12 @@ _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mo
 _CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
     {"default", "acceptEdits", "plan", "auto"}
 )
+# Modes the forwarder can read off the pane footer. A session launched into
+# ``bypassPermissions`` reports it so the label and picker show the real mode;
+# it is still not a PATCH target.
+_CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES | {
+    "bypassPermissions"
+}
 
 
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
@@ -469,6 +485,8 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_BTW_SIDECHAT_TYPE,
+    _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
@@ -838,6 +856,25 @@ def get_server_runner_router() -> RunnerRouter | None:
 _server_host_registry: HostRegistry | None = None
 
 
+def host_interactive_shells_for_request(
+    host_id: str,
+    *,
+    host_registry: HostRegistry,
+    runner_router: RunnerRouter | None,
+) -> list[str]:
+    """Return this replica's host shells or signal a misrouted request."""
+    if (
+        host_registry.get(host_id) is None
+        and runner_router is not None
+        and runner_router.host_is_on_another_replica(host_id)
+    ):
+        raise OmnigentError(
+            "host shell inventory is on another replica",
+            code=ErrorCode.WRONG_REPLICA,
+        )
+    return normalize_interactive_shells(host_registry.interactive_shells(host_id))
+
+
 def set_server_host_registry(host_registry: HostRegistry | None) -> None:
     """Stash the live host registry for asleep-session catalog refills.
 
@@ -884,6 +921,7 @@ __all__ = [
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_CLAUDE_NATIVE_PERMISSION_MODES",
     "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
+    "_CLAUDE_NATIVE_READABLE_PERMISSION_MODES",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
@@ -916,6 +954,8 @@ __all__ = [
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
+    "_EXTERNAL_BTW_DISMISS_TYPE",
+    "_EXTERNAL_BTW_SIDECHAT_TYPE",
     "_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_SUBAGENT_START_TYPE",
@@ -1037,6 +1077,7 @@ __all__ = [
     "_session_todos_cache",
     "get_server_host_registry",
     "get_server_runner_router",
+    "host_interactive_shells_for_request",
     "set_server_host_registry",
     "set_server_runner_router",
 ]

@@ -44,6 +44,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import phase_scope, runner_primary_session_id
 from omnigent.entities.session_resources import (
@@ -74,6 +75,7 @@ from omnigent.llms.summarize import (
     extract_summary_text,
 )
 from omnigent.native.native_coding_agents import (
+    native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
@@ -218,11 +220,12 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
 
-# Settle delay between keystrokes when driving Codex's /permissions popup. The
-# slash-command menu, the popup, and the Full Access confirm sub-dialog are each
-# drawn asynchronously; without a pause the next key races ahead (e.g. Enter
-# arrives before the /permissions menu commits, so the command never submits).
-_CODEX_PERMISSION_POPUP_RENDER_S = 0.7
+# Settle delay between keystrokes when driving Codex TUI popups. The
+# slash-command menu, the /permissions popup, and the Full Access confirm
+# sub-dialog are each drawn asynchronously; without a pause the next key races
+# ahead (e.g. Enter arrives before the menu commits, so the command never
+# submits).
+_CODEX_POPUP_RENDER_S = 0.7
 
 # Budget for confirming an approval switch actually landed. Codex echoes
 # "Permissions updated to <label>" once the popup applies; we poll the pane for
@@ -2317,6 +2320,9 @@ def _subagent_delivery_not_confirmed_response(
     an untracked status remains a no-op unless the runner knows this session
     was created as a sub-agent. For known sub-agents, Omnigent must not receive a
     2xx acknowledgement unless the terminal payload is confirmed in the
+    parent's inbox — except a tracked entry whose parent is itself a
+    sub-agent, which ``post_session_events`` acknowledges before calling here;
+    the entry is retained and delivered only if this runner ever creates that
     parent's inbox.
 
     :param ack: Delivery acknowledgement returned by
@@ -2890,6 +2896,15 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
+    # Conversations whose claude-sdk `/compact` published an up-front
+    # `response.compaction.in_progress`. Used to (a) swallow the executor's own
+    # later `in_progress` so the web shows a single spinner, and (b) publish a
+    # `failed` if the turn produced no compaction, so the spinner is never
+    # stranded. Discarded on `response.compaction.completed` (real compaction),
+    # else cleared by `_on_proxy_stream_end` — the single turn-end convergence
+    # point reached on every exit path (clean end, setup error, cancel).
+    _sdk_compact_inprogress: set[str] = set()
+    app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     # Detached watchers answering a /model confirm dialog that pops after
@@ -3738,6 +3753,12 @@ def create_runner_app(
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
 
+        # Captured before init's first await: the legacy (no-envelope) context
+        # load below probes the server's version over the network, so a reset
+        # landing anywhere in init — including that probe — must fence the
+        # memoizing writes at the end of init.
+        spec_cache_generation = _session_cache_generation(session_id)
+
         try:
             init_context = await _load_session_init_context(
                 body,
@@ -3845,7 +3866,11 @@ def create_runner_app(
                     server_client=server_client,
                     optional_labels=init_context.labels,
                 )
-            _session_spec_cache[session_id] = spec_entry
+            # An agent-cache reset acknowledged while init awaited retired
+            # this entry; skip the memoization so the reset wins. Init still
+            # runs on what it resolved — the next spec read re-resolves.
+            if _session_cache_generation_is_current(session_id, spec_cache_generation):
+                _session_spec_cache[session_id] = spec_entry
         else:
             if spec_resolver is not None:
                 # spec_resolver was configured but returned no spec for this
@@ -3881,7 +3906,32 @@ def create_runner_app(
             )
 
         _session_start_cache.setdefault(session_id, time.time())
-        _session_agent_ids[session_id] = agent_id
+        # The same reset that retires the spec entry also retires this
+        # binding, and later resets read it to decide which agent's shared
+        # ``_spec_cache`` entry to drop; reinstating a superseded binding
+        # would misdirect them at the old agent. Same fence as the spec-cache
+        # write above — a fenced-out reader falls back to the fresh session
+        # snapshot instead.
+        if _session_cache_generation_is_current(session_id, spec_cache_generation):
+            _session_agent_ids[session_id] = agent_id
+        else:
+            # The reset that fenced this binding ran before init registered
+            # the harness, so it could not release the subprocess spawned
+            # above with the superseded spec's environment baked in. With
+            # the binding left absent, the next turn's prior-binding teardown
+            # would skip release too, and a new agent sharing the harness and
+            # model would silently reuse the stale process. Release it now so
+            # the next turn respawns from the freshly resolved spec.
+            _logger.info(
+                "session init raced an agent-cache reset; releasing the "
+                "harness spawned from the superseded spec",
+                extra={"session_id": session_id},
+            )
+            # Conditional on idleness (the reaper's guard): a consumer that
+            # touched or is mid-turn on the shared entry after this cutoff is
+            # never torn down out from under it; the entry init itself just
+            # registered predates the cutoff and is released.
+            await process_manager.release(session_id, only_if_idle_cutoff=time.monotonic())
         if session_id not in _session_event_queues:
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
@@ -4351,7 +4401,12 @@ def create_runner_app(
                     "detail": ("Runner GET /v1/sessions/{id} needs a HarnessProcessManager."),
                 },
             )
-        if not process_manager.has_session(session_id):
+        # A live session's subprocess can be legitimately unregistered — a
+        # fence-fired release after init raced a reset, or an agent-switch
+        # teardown awaiting its next-turn respawn — so a missing entry alone
+        # is not "no such session": the start cache tracks every session this
+        # runner initialized until it is deleted.
+        if not process_manager.has_session(session_id) and session_id not in _session_start_cache:
             return JSONResponse(
                 status_code=404,
                 content={
@@ -4362,6 +4417,18 @@ def create_runner_app(
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
         status = "running" if has_turn else "idle"
         agent_id = _session_agent_ids.get(session_id)
+        if agent_id is None:
+            # An agent-cache reset retires the binding while the session
+            # stays live, so a registered session can transiently lack it.
+            # The server snapshot is the authoritative binding; serve it
+            # rather than failing the read (the next turn re-memoizes).
+            snapshot = await _session_snapshot(session_id)
+            if snapshot.ok and snapshot.agent_id is not None:
+                _logger.info(
+                    "session agent binding absent from cache; serving the server snapshot binding",
+                    extra={"session_id": session_id},
+                )
+                agent_id = snapshot.agent_id
         if agent_id is None:
             return JSONResponse(
                 status_code=500,
@@ -4961,6 +5028,48 @@ def create_runner_app(
             title=snapshot.sub_agent_name or "",
         )
 
+    async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
+        """
+        Return whether an undelivered result's parent is itself a sub-agent.
+
+        A mirrored claude-native sub-agent never runs on this runner, so its
+        inbox never exists here and retrying its children's terminal status
+        every 30 s buys nothing. The inbox record is redundant for that
+        topology: the child's result reaches the parent natively inside the
+        Claude process. The status is acknowledged and the entry kept, so a
+        sub-agent parent that does run here later still receives it when its
+        inbox is created (``_deliver_retained_subagent_results``). An unreadable
+        parent snapshot reads as a top-level parent, so the retry contract still
+        covers a parent that lives elsewhere or is re-initializing after a
+        restart.
+
+        :param entry: Terminal work entry whose parent inbox was missing.
+        :returns: ``True`` when the parent's snapshot names its own parent.
+        """
+        snapshot = await _session_snapshot(entry.parent_session_id)
+        return snapshot.ok and snapshot.parent_session_id is not None
+
+    def _deliver_retained_subagent_results(parent_id: str) -> None:
+        """
+        Hand over results acknowledged while ``parent_id`` had no inbox here.
+
+        A terminal child whose sub-agent parent had no inbox here is
+        acknowledged with its entry kept undelivered. If that parent later
+        runs on this runner, creating its inbox delivers those entries and
+        wakes it, as the forwarder's pending retry used to the moment the inbox
+        appeared. A parent that never runs here keeps the entry undelivered;
+        for a claude-native mirror the result already reached it natively.
+        Idempotent: delivered entries are skipped.
+
+        :param parent_id: Parent whose inbox now exists, e.g. ``"conv_parent123"``.
+        :returns: None.
+        """
+        for entry in list_subagent_work(parent_id):
+            if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
+                continue
+            if _deliver_subagent_completion(entry).delivered_now:
+                _schedule_subagent_wake(entry)
+
     async def _recover_undrained_subagent_results(parent_id: str) -> None:
         """
         Re-queue terminal child results lost with a runner process restart.
@@ -4971,15 +5080,17 @@ def create_runner_app(
         before the next ``sys_read_inbox`` drain. The inbox is created here
         when missing: after a reconnect the server can dispatch a pending
         message before it re-initializes the session, and that turn's drain
-        must still see the recovered results.
+        must still see the recovered results. Results acknowledged while this
+        parent had no inbox here are handed over first, on every call.
 
         :param parent_id: Parent session whose inbox was recreated, e.g.
             ``"conv_parent123"``.
         :returns: None.
         """
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        _deliver_retained_subagent_results(parent_id)
         if parent_id in _subagent_recovery_done:
             return
-        _session_inboxes.setdefault(parent_id, asyncio.Queue())
         lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
         async with lock:
             if parent_id in _subagent_recovery_done:
@@ -5383,11 +5494,11 @@ def create_runner_app(
         # session — keeping the SHAPE's stored default (a session's own pin
         # must not become the host-wide default).
         asyncio.get_running_loop().create_task(
-            _write_back_codex_catalog([dict(row) for row in rows])
+            _write_back_codex_catalog(conv_id, [dict(row) for row in rows])
         )
         return marked
 
-    async def _write_back_codex_catalog(rows: list[_JsonObject]) -> None:
+    async def _write_back_codex_catalog(session_id: str, rows: list[_JsonObject]) -> None:
         try:
             from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
@@ -5396,7 +5507,10 @@ def create_runner_app(
             )
             from omnigent.models import model_catalog_store
 
-            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+            spec = await _resolve_session_agent_spec(session_id)
+            if spec is None:
+                return
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None, spec=spec)
             fingerprint = codex_catalog_fingerprint(launch)
             stored = model_catalog_store.read_catalog("codex-native", fingerprint)
             stored_default = next(
@@ -5413,7 +5527,7 @@ def create_runner_app(
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
-                extra={"session_id": runner_primary_session_id()},
+                extra={"session_id": session_id},
             )
 
     async def _handle_pi_native_effort_change(
@@ -5558,6 +5672,34 @@ def create_runner_app(
                 },
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})
+
+    async def _handle_claude_native_btw_dismiss(conv_id: str) -> Response:
+        """
+        Close a live claude-native session's ``/btw`` overlay from the web UI.
+
+        The reader dismissed the transient side-chat overlay in the web view;
+        mirror that to the terminal by sending Escape to the pane — but only
+        when the ``/btw`` overlay is actually on screen (the bridge guards on
+        this), because a blind Escape on the bare composer would cancel an
+        in-flight turn. Best-effort: the overlay also auto-dismisses on the
+        next injected message, so a miss is harmless.
+        """
+        from omnigent.harnesses.claude_native.bridge import (
+            bridge_dir_for_bridge_id,
+            dismiss_btw_overlay,
+        )
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        try:
+            await asyncio.to_thread(dismiss_btw_overlay, bridge_dir)
+        except (RuntimeError, ValueError):
+            # Nothing to recover: the pane overlay closes on the next inject.
+            return Response(status_code=204)
+        return Response(status_code=200)
 
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
@@ -6164,10 +6306,14 @@ def create_runner_app(
         return Response(status_code=200)
 
     def _inject_codex_compact(socket_path: str, target: str) -> None:
+        # Typing "/compact" opens Codex's slash-command popup, which draws
+        # asynchronously: an Enter sent back-to-back is swallowed by the
+        # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
     def _inject_codex_permission_mode(
@@ -6191,12 +6337,12 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
-        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
-        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, menu_key)
         if needs_confirm:
-            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            time.sleep(_CODEX_POPUP_RENDER_S)
             _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
@@ -6216,7 +6362,7 @@ def create_runner_app(
                 return True
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            time.sleep(_CODEX_POPUP_RENDER_S)
 
     async def _handle_hermes_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.hermes_native.bridge import (
@@ -6257,6 +6403,115 @@ def create_runner_app(
                 },
             )
         return Response(status_code=200)
+
+    def _is_sdk_compact_body(body: dict[str, Any]) -> bool:
+        """Return whether a buffered body is the synthesized claude-sdk ``/compact``.
+
+        The compact control is dispatched as a resumed turn whose sole content is
+        the literal ``/compact`` slash command. The continuation drain uses this
+        to dispatch a buffered ``/compact`` as its OWN turn (never coalesced
+        behind a later message), so the SDK still sees it as the turn prompt and
+        runs native compaction.
+        """
+        content = body.get("content")
+        if not isinstance(content, list) or len(content) != 1:
+            return False
+        part = content[0]
+        return (
+            isinstance(part, dict)
+            and part.get("type") == "input_text"
+            and part.get("text") == "/compact"
+        )
+
+    async def _handle_claude_sdk_compact(conv_id: str) -> Response:
+        """Compact a claude-sdk session by sending it the ``/compact`` command.
+
+        The Claude SDK owns its own context window in the harness subprocess,
+        so Omnigent-side transcript compaction is ineffective for it. The
+        effective path is to send the literal ``/compact`` slash command to
+        the live client, which runs native compaction — the same PreCompact
+        path auto-compaction uses, whose ``response.compaction.completed`` the
+        executor already emits. We do that by dispatching a resumed
+        ``/compact`` turn: buffered behind an in-flight turn (the harness has a
+        single client), started immediately otherwise. Returns 200 so the
+        Omnigent server treats the control as handled and skips its own
+        (transcript-only) compaction.
+        """
+        compact_body: _JsonObject = {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "/compact"}],
+            "conversation_id": conv_id,
+        }
+        # Serialize the active-turn check + slot bind through the same ingest
+        # gate the message path uses. Without it, the idle branch's check and
+        # its `_active_turns` bind straddle an `await` (history load), so a
+        # message arriving in that window also sees the session idle and binds
+        # the slot — the two turns then clobber each other's `_active_turns`
+        # entry and race the single live SDK client. Under the gate one reaches
+        # its bind before the other's check, so the loser buffers instead.
+        _seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = _seq + 1
+        _cond = _ingest_cond.get(conv_id)
+        if _cond is None:
+            _cond = asyncio.Condition()
+            _ingest_cond[conv_id] = _cond
+        async with _cond:
+            while _ingest_now_serving.get(conv_id, 0) != _seq:
+                await _cond.wait()
+        try:
+            # A turn is already running: buffer so /compact runs as the next turn
+            # rather than racing the live one; the buffer drains via
+            # _check_and_start_next_turn once the active turn ends. The buffered
+            # compact's own in_progress comes from the executor when it later runs
+            # — publishing an up-front spinner here would show "Compacting…" while
+            # the prior turn is still working, so only the idle path does that.
+            if conv_id in _active_turns:
+                _session_message_buffers.setdefault(conv_id, []).append(compact_body)
+                return Response(status_code=200)
+
+            # Publish the compaction spinner up front so the UI shows "Compacting
+            # conversation…" immediately, like the native handlers — the executor's
+            # own in_progress fires only once the SDK PreCompact hook hits (mid-turn),
+            # by which point the generic running status has shown "Working…". The
+            # relay swallows the executor's later duplicate; `completed` (or the
+            # turn-end `failed` fallback in _on_proxy_stream_end) clears the spinner.
+            _publish_event(
+                conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id}
+            )
+            _sdk_compact_inprogress.add(conv_id)
+            try:
+                new_item: _JsonObject = {
+                    "type": "message",
+                    "role": "user",
+                    "content": compact_body["content"],
+                }
+                if conv_id in _session_histories:
+                    _session_histories[conv_id].append(new_item)
+                else:
+                    loaded = await _load_history_as_input(conv_id)
+                    loaded.append(new_item)
+                    _session_histories[conv_id] = loaded
+
+                _begin_turn_slot(conv_id)
+                _publish_turn_status(conv_id, "running")
+                _turn_task = asyncio.create_task(
+                    _run_turn_bg(compact_body, conv_id),
+                    name=f"compact-{conv_id}",
+                )
+                _active_turns[conv_id] = _turn_task
+                _turn_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_turn_task)
+            except Exception:
+                # Never strand the spinner if the turn fails to start.
+                _sdk_compact_inprogress.discard(conv_id)
+                _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+                raise
+            return Response(status_code=200)
+        finally:
+            async with _cond:
+                _ingest_now_serving[conv_id] = _seq + 1
+                _cond.notify_all()
 
     async def _handle_claude_native_cost_popup(
         conv_id: str,
@@ -6529,6 +6784,17 @@ def create_runner_app(
 
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
+        # A claude-sdk `/compact` turn that ended without emitting
+        # `response.compaction.completed` produced no compaction (nothing to
+        # compact, or the turn failed before/without streaming). Clear the
+        # up-front spinner with `failed` here — the single turn-end convergence
+        # point, reached on every exit path (clean end, setup error, cancel) — so
+        # no path strands the spinner or leaks the flag into a later turn's
+        # compaction signalling. A successful compaction already discarded the
+        # flag on `response.compaction.completed`, making this a no-op then.
+        if conv_id in _sdk_compact_inprogress:
+            _sdk_compact_inprogress.discard(conv_id)
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
@@ -6872,7 +7138,14 @@ def create_runner_app(
                 _rewake_parent_if_inbox_stranded(session_id)
                 return
 
-            if _is_native_harness(session_id):
+            # A buffered claude-sdk /compact must dispatch as its OWN turn: the
+            # SDK runs native compaction only when /compact is the turn prompt,
+            # but the default non-native drain coalesces the whole buffer and
+            # dispatches only the last body — burying a /compact behind a later
+            # message and silently no-opping it (the runner already returned 200,
+            # so the server won't fall back). Drain one at a time (like native)
+            # whenever a /compact is buffered, so each lands as its own turn.
+            if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
                 next_body = buf.pop(0)
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
@@ -6898,6 +7171,20 @@ def create_runner_app(
                     )
                 next_body = all_bodies[-1]
 
+            if _is_sdk_compact_body(next_body):
+                # This buffered /compact now dispatches as its own turn. Mirror the
+                # idle path: publish the spinner up front AND set the flag, so
+                # (a) the relay swallows the executor's own duplicate in_progress
+                # (single spinner), and (b) _on_proxy_stream_end publishes `failed`
+                # if the turn ends without a `response.compaction.completed` (a real
+                # executor path — the compaction-complete event can be None) rather
+                # than stranding the spinner. The prior turn has ended, so showing
+                # "Compacting…" now is accurate.
+                _publish_event(
+                    session_id,
+                    {"type": "response.compaction.in_progress", "task_id": session_id},
+                )
+                _sdk_compact_inprogress.add(session_id)
             _begin_turn_slot(session_id)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
@@ -6913,6 +7200,8 @@ def create_runner_app(
             async with _cond:
                 _ingest_now_serving[session_id] = _seq + 1
                 _cond.notify_all()
+
+    app.state.check_and_start_next_turn = _check_and_start_next_turn
 
     async def _post_subagent_wake_notice(
         parent_id: str,
@@ -8158,6 +8447,14 @@ def create_runner_app(
                                     raise _ContextWindowOverflow(*_overflow)
 
                                 _evt_type = event.get("type")
+                                if (
+                                    _evt_type == "response.compaction.in_progress"
+                                    and conv_id in _sdk_compact_inprogress
+                                ):
+                                    # _handle_claude_sdk_compact already published an
+                                    # up-front spinner; drop the executor's own duplicate
+                                    # so the web renders a single compaction spinner.
+                                    continue
                                 if _evt_type == "injection.consumed":
                                     _inj_id = event.get("injection_id")
                                     _buf = _session_message_buffers.get(conv_id)
@@ -8231,6 +8528,10 @@ def create_runner_app(
                                 elif _evt_type == "response.compaction.completed" and event.get(
                                     "summary"
                                 ):
+                                    # A real compaction landed; the completed event clears
+                                    # the up-front spinner, so drop the pending flag and
+                                    # skip the stream-end `failed` fallback.
+                                    _sdk_compact_inprogress.discard(conv_id)
                                     await _handle_harness_compaction(conv_id, event)
 
                                 if is_action_required(event):
@@ -8463,6 +8764,9 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
+                    # _on_proxy_stream_end clears any claude-sdk `/compact`
+                    # spinner (publishing `failed` when no compaction landed);
+                    # it is the single convergence point for every turn-end path.
                     _on_proxy_stream_end(
                         conv_id, error=_stream_failed_error, owner_response_id=_response_id
                     )
@@ -8738,6 +9042,15 @@ def create_runner_app(
                     output=output or "Error: native sub-agent turn failed",
                 )
             if delivery_ack is not None:
+                if (
+                    delivery_ack.entry is not None
+                    and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
+                    and await _parent_is_nested_subagent(delivery_ack.entry)
+                ):
+                    # Acknowledge instead of asking the forwarder to poll. The
+                    # entry stays terminal and undelivered; it is handed over
+                    # only if this runner ever creates the parent's inbox.
+                    return Response(status_code=204)
                 is_known = (
                     conversation_id in _session_sub_agent_names or recovered_entry is not None
                 )
@@ -8879,6 +9192,12 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "btw_dismiss":
+            harness = _session_harness_name(conversation_id)
+            if harness == "claude-native":
+                return await _handle_claude_native_btw_dismiss(conversation_id)
+            return Response(status_code=204)
+
         if body_type == "codex_approval_mode_change":
             harness = _session_harness_name(conversation_id)
             if harness == "codex-native":
@@ -8921,6 +9240,8 @@ def create_runner_app(
                 return await _handle_hermes_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "qwen-native":
                 return await _handle_qwen_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "claude-sdk":
+                return await _handle_claude_sdk_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "clear":
@@ -9393,9 +9714,28 @@ def create_runner_app(
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
         declared_terminal = None
+        terminals_map = {}
         if agent_spec is not None:
             terminals_map = getattr(agent_spec, "terminals", None) or {}
             declared_terminal = terminals_map.get(terminal_name)
+
+        if (
+            declared_terminal is None
+            and native_coding_agent_for_agent_name(getattr(agent_spec, "name", None)) is not None
+            and normalize_interactive_shells([terminal_name])
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": ErrorCode.INVALID_INPUT,
+                        "message": (
+                            f"Shell {terminal_name!r} is not available on this host. "
+                            f"Available shells: {list(terminals_map) or 'none'}."
+                        ),
+                    }
+                },
+            )
 
         if declared_terminal is not None:
             from omnigent.tools.builtins.sys_terminal import (

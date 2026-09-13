@@ -895,6 +895,18 @@ describe("index.css mobile sidebar glass chip opacity", () => {
   });
 });
 
+describe("index.css text selection colors", () => {
+  const selectionRule = cssSource.match(/::selection\s*\{([^}]*)\}/)?.[1];
+
+  it("uses dedicated selection tokens instead of subtle sidebar shading", () => {
+    expect(selectionRule).toContain("background: var(--selection-background)");
+    expect(selectionRule).toContain("color: var(--selection-foreground)");
+    expect(selectionRule).not.toContain("--sidebar-active");
+    expect(selectionRule).not.toContain("--brand-accent");
+    expect(cssSource).not.toContain(".dark ::selection");
+  });
+});
+
 /* On the macOS desktop shell the window's top strip carries the OS traffic
  * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
  * AppShell rather than the sidebar so it holds that spot whether the sidebar is

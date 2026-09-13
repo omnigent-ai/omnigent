@@ -71,6 +71,7 @@ from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
+from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -136,6 +137,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_HARNESS,
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODES,
+    _CLAUDE_NATIVE_READABLE_PERMISSION_MODES,
     _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
     _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -239,6 +241,7 @@ from omnigent.server.schemas import (
     ResponseObject,
     RetryErrorDetail,
     SandboxStatus,
+    SessionBtwSidechatEvent,
     SessionChildSessionUpdatedEvent,
     SessionCodexApprovalModeEvent,
     SessionCollaborationModeEvent,
@@ -2585,7 +2588,8 @@ async def _persist_external_permission_mode_change(
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row for ``session_id`` at the route boundary.
-    :param body: Event body; ``data.permission_mode`` must be a switchable mode.
+    :param body: Event body; ``data.permission_mode`` must be a mode the pane
+        footer can report (the switchable modes plus ``bypassPermissions``).
     :param conversation_store: Store used to upsert the mode label.
     :returns: None.
     :raises OmnigentError: If ``data.permission_mode`` is missing or unsupported.
@@ -2598,10 +2602,10 @@ async def _persist_external_permission_mode_change(
             code=ErrorCode.INVALID_INPUT,
         )
     mode = raw_mode.strip()
-    if mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
+    if mode not in _CLAUDE_NATIVE_READABLE_PERMISSION_MODES:
         raise OmnigentError(
             "external_permission_mode_change requires data.permission_mode in "
-            f"{sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}; got {mode!r}",
+            f"{sorted(_CLAUDE_NATIVE_READABLE_PERMISSION_MODES)}; got {mode!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     # Reflect the switch into terminal_launch_args so a relaunch reopens in this
@@ -2734,6 +2738,40 @@ def _merge_codex_permission_launch_args(
     return [*merged, *permission_args]
 
 
+def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], bool]:
+    """
+    Drop every permission-mode selector from Claude launch args.
+
+    Removes ``--permission-mode`` (space- or ``=``-joined) and the standalone
+    ``--dangerously-skip-permissions``, which Claude treats as
+    ``--permission-mode bypassPermissions``; leaving that flag next to a pinned
+    mode would resume the session in bypass under a restricted label.
+
+    :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
+    :returns: The remaining args in order, and whether a selector was present.
+    """
+    stripped: list[str] = []
+    had_flag = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-skip-permissions":
+            had_flag = True
+            index += 1
+            continue
+        if arg == "--permission-mode":
+            had_flag = True
+            index += 2  # drop the flag and its separate value token
+            continue
+        if arg.startswith("--permission-mode="):
+            had_flag = True
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return stripped, had_flag
+
+
 def _merge_claude_permission_launch_args(
     existing_args: list[str] | None,
     mode: str,
@@ -2744,7 +2782,8 @@ def _merge_claude_permission_launch_args(
     launcher restores the mode from ``terminal_launch_args`` — not the label.
     Rewrite the existing ``--permission-mode`` entry (space- or ``=``-joined) to
     the current mode, preserving other args in order, so a cold resume reopens
-    in the mode the user last chose.
+    in the mode the user last chose. A standalone ``--dangerously-skip-permissions``
+    counts as an existing ``--permission-mode bypassPermissions``.
 
     Returns ``existing_args`` unchanged when they carry no ``--permission-mode``:
     a session launched without the flag (manual, or a ``settings.json``
@@ -2754,23 +2793,33 @@ def _merge_claude_permission_launch_args(
     settings default on relaunch. Those sessions surface the live mode through
     the permission-mode label instead.
     """
-    args = list(existing_args or ())
-    if not any(a == "--permission-mode" or a.startswith("--permission-mode=") for a in args):
+    stripped, had_flag = _strip_claude_permission_launch_arg(list(existing_args or ()))
+    if not had_flag:
         return existing_args
-    merged: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--permission-mode":
-            index += 2  # drop the flag and its separate value token
-            continue
-        if arg.startswith("--permission-mode="):
-            index += 1
-            continue
-        merged.append(arg)
-        index += 1
-    merged.extend(("--permission-mode", mode))
-    return merged
+    return [*stripped, "--permission-mode", mode]
+
+
+def _pin_claude_permission_launch_args(
+    existing_args: list[str] | None,
+    mode: str,
+) -> list[str]:
+    """
+    Set ``--permission-mode`` to ``mode`` in Claude launch args, adding it when absent.
+
+    For a switch the user made deliberately (the web picker, confirmed by the
+    runner) the mode must survive a cold resume even when the session was
+    created without the flag: the launcher rebuilds Claude's args from
+    ``terminal_launch_args`` alone and never reads the mode label, so a
+    label-only record reopens the session in Claude's default (manual) mode.
+    Pinning ``"default"`` is a deliberate choice of Claude's manual mode and
+    overrides a ``permissions.defaultMode`` in the user's settings on relaunch.
+
+    :param existing_args: Current launch args, e.g. ``["--model", "opus"]`` or ``None``.
+    :param mode: Runner-confirmed mode, e.g. ``"auto"``.
+    :returns: The args with exactly one trailing ``--permission-mode <mode>``.
+    """
+    stripped, _ = _strip_claude_permission_launch_arg(list(existing_args or ()))
+    return [*stripped, "--permission-mode", mode]
 
 
 def _handle_external_session_todos(
@@ -2828,6 +2877,7 @@ def _publish_external_conversation_item(
     session_id: str,
     item: ConversationItem,
     cleared_pending_id: str | None = None,
+    message_id: str | None = None,
 ) -> None:
     """
     Broadcast a terminal-observed conversation item.
@@ -2846,6 +2896,7 @@ def _publish_external_conversation_item(
         at the persist site — see :func:`_persist_external_conversation_item`
         — because it also folds the entry's file blocks into the durable
         item before append.
+    :param message_id: Optional live-preview stream finalized by this item.
     :returns: None.
     """
     if item.type == "message" and isinstance(item.data, MessageData):
@@ -2857,7 +2908,10 @@ def _publish_external_conversation_item(
             # path that filters on the flag, so keep it off the stream.
             return
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
-    session_stream.publish(session_id, event.model_dump())
+    payload = event.model_dump()
+    if message_id is not None:
+        payload["message_id"] = message_id
+    session_stream.publish(session_id, payload)
 
 
 def _publish_external_output_text_delta(session_id: str, body: SessionEventInput) -> None:
@@ -3182,6 +3236,12 @@ def _parse_external_conversation_item(
             "external_conversation_item data.response_id must be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
+    message_id = body.data.get("message_id")
+    if message_id is not None and (not isinstance(message_id, str) or not message_id):
+        raise OmnigentError(
+            "external_conversation_item data.message_id must be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # NOTE: producers that can re-post (the native transcript forwarders
     # retry timed-out POSTs whose disposition they cannot know) send a
     # ``data.source_id`` dedup key; the persist path derives the item's
@@ -3198,6 +3258,8 @@ def _parse_external_conversation_item(
             f"Invalid data payload for external item type {item_type!r}: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if message_id is not None and isinstance(data, MessageData) and data.role == "assistant":
+        data = data.model_copy(update={"stream_message_id": message_id})
     return NewConversationItem(
         type=item_type,
         response_id=response_id.strip(),
@@ -3545,18 +3607,19 @@ async def _persist_external_subagent_start(
         return existing.id
 
     # Title format mirrors omnigent-spawned children
-    # (``"{tool}:{session_name}"``) so the rail's split-on-colon
-    # parser surfaces the same ``tool`` shape. The ``session_name``
-    # half must be unique per parent because the conversation store
-    # has a ``(parent_conversation_id, title)`` unique index — using
-    # the description here would collide whenever Claude's LLM
-    # passes the same agentType + description for parallel
-    # sub-agents (which the Task tool does routinely). The
-    # ``subagent_id`` is the only stable per-sub-agent identifier
-    # in the meta file, so it goes here. The human-readable
-    # description is stored as a label below for downstream surfaces
-    # that want it; the rail's ``SubagentsPanel`` already hides the
-    # ``session_name`` half so the user only sees ``agent_type``.
+    # (``"{tool}:{session_name}"``). The ``session_name`` half must be
+    # unique per parent because the conversation store has a
+    # ``(parent_conversation_id, title)`` unique index — using the
+    # description here would collide whenever Claude's LLM passes the
+    # same agentType + description for parallel sub-agents (which the
+    # Task tool does routinely). The ``subagent_id`` is the only stable
+    # per-sub-agent identifier in the meta file, so it goes here.
+    #
+    # The title is therefore a uniqueness key, not a display string:
+    # nothing user-facing should render it. The human-readable
+    # description goes on a label below, and
+    # ``_claude_subagent_display_tool`` turns that label into the
+    # rail's row label.
     title = f"{agent_type}:{subagent_id}"
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -3759,6 +3822,47 @@ def _codex_subagent_display_tool(labels: dict[str, str]) -> str:
     if role:
         return role
     return _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK
+
+
+def _claude_subagent_display_tool(conv: Conversation, labels: dict[str, str]) -> str | None:
+    """
+    Return the UI-facing label for a Claude Code sub-agent child.
+
+    The Task tool's free-form ``description`` ("wave-worker-696") is
+    the only part a human recognises, so it wins. Without one, fall
+    back to the agent type's trailing segment: plugin-namespaced types
+    arrive as ``"rpw-published:debug-lead"`` and only the agent name
+    carries meaning. The row's title is a uniqueness key built from the
+    opaque ``subagent_id``, so it is never a display candidate.
+
+    :param conv: Claude-native sub-agent child row; its
+        ``sub_agent_name`` holds the Claude ``agentType``.
+    :param labels: Conversation labels from that row.
+    :returns: Display label, e.g. ``"wave-worker-696"`` or
+        ``"debug-lead"``; ``None`` when the row carries neither.
+    """
+    description = " ".join((labels.get(_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY) or "").split())
+    if description:
+        return description
+    agent_type = (conv.sub_agent_name or "").strip()
+    if agent_type:
+        return agent_type.rpartition(":")[2] or agent_type
+    return None
+
+
+def _is_claude_native_subagent(conv: Conversation) -> bool:
+    """
+    Return whether a child conversation tracks a Claude Code sub-agent.
+
+    :param conv: Conversation row to inspect.
+    :returns: ``True`` when the row carries the claude-native sub-agent
+        wrapper label.
+    """
+    return (
+        conv.kind == "sub_agent"
+        and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        == _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
+    )
 
 
 def _is_codex_native_subagent(conv: Conversation) -> bool:
@@ -4623,7 +4727,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
     if raw_error_code and raw_error_message:
         error: dict[str, str] = {
-            "code": raw_error_code,
+            "code": classify_native_turn_error(raw_error_code, raw_error_message),
             "message": raw_error_message,
         }
         for key, label in (
@@ -4947,6 +5051,55 @@ def _publish_session_superseded(session_id: str, target_conversation_id: str) ->
         _logger.info(
             "Discarded %d unconsumed pending input(s) on superseded session %s",
             discarded,
+            session_id,
+            extra={"session_id": session_id},
+        )
+
+
+def _publish_btw_sidechat(
+    session_id: str,
+    *,
+    question: str,
+    answer: str,
+    truncated: bool,
+) -> None:
+    """
+    Publish a transient ``session.btw_sidechat`` overlay to the live stream.
+
+    Emitted when the claude-native forwarder scrapes a settled ``/btw``
+    side-chat from the pane (see ``_relay_btw_overlay`` in the
+    claude-native forwarder). Broadcast-only: nothing is written to the
+    conversation store, so the ephemeral exchange never lands in the main
+    transcript. Live viewers render a dismissable overlay; a client that
+    connects later never sees it (no SSE replay), matching the terminal
+    overlay's Escape-to-close, leave-no-history behavior.
+
+    The oldest pending input is also discarded so a web composer's
+    optimistic ``/btw`` bubble does not linger as a stuck "queued" message —
+    the same reconciliation ``_publish_session_superseded`` performs.
+    ``/btw`` is never committed as a user turn (no ``session.input.consumed``
+    is emitted); the overlay carries the request text instead.
+
+    :param session_id: Conversation id whose stream receives the event.
+    :param question: The ``/btw`` request line as typed.
+    :param answer: The side-chat answer text.
+    :param truncated: True when the pane clipped a longer answer.
+    """
+    event = SessionBtwSidechatEvent(
+        type="session.btw_sidechat",
+        conversation_id=session_id,
+        question=question,
+        answer=answer,
+        truncated=truncated,
+    )
+    session_stream.publish(session_id, event.model_dump())
+    # Drop the optimistic ``/btw`` bubble (the oldest unconsumed input) so it
+    # does not spin forever — ``/btw`` never round-trips through the transcript
+    # to earn a ``session.input.consumed``. Only the oldest is resolved so a
+    # follow-up the user queued after ``/btw`` is left intact.
+    if pending_inputs.resolve_oldest(session_id) is not None:
+        _logger.info(
+            "Discarded the pending /btw input on session %s",
             session_id,
             extra={"session_id": session_id},
         )
@@ -5471,7 +5624,7 @@ async def _provision_managed_sandbox(
     session_id: str,
     owner: str,
     sandbox_config: ManagedSandboxDeployment,
-    repo: RepoWorkspace | None,
+    repos: Sequence[RepoWorkspace],
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
@@ -5489,7 +5642,7 @@ async def _provision_managed_sandbox(
     :param session_id: Session/conversation identifier.
     :param owner: User the managed host acts for.
     :param sandbox_config: The deployment's sandbox config.
-    :param repo: Repository workspace to clone, or ``None``.
+    :param repos: Repository workspaces to clone (empty for none).
     :param tracker: The app's launch tracker (failed here on error).
     :param host_store: Persistent host registrations.
     :param relaunch_host: Existing host row for a relaunch, or
@@ -5523,7 +5676,7 @@ async def _provision_managed_sandbox(
                 config=sandbox_config,
                 host=relaunch_host,
                 host_store=host_store,
-                repo=repo,
+                repos=repos,
                 agent_name=agent_name,
                 on_stage=_on_stage,
             )
@@ -5531,7 +5684,7 @@ async def _provision_managed_sandbox(
             config=sandbox_config,
             owner=owner,
             host_store=host_store,
-            repo=repo,
+            repos=repos,
             provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
@@ -9710,6 +9863,10 @@ def _child_session_summary_from_conversation(
     the raw title and ``session_name`` is ``None`` — the row is still
     surfaced so debug views can investigate.
 
+    Native-harness children are the exception: their titles are
+    uniqueness keys built from opaque runtime ids, so Codex and Claude
+    rows take ``tool`` from their labels instead of the title.
+
     ``busy`` is derived from the relay-fed ``_session_status_cache``
     (the tasks table has been removed). ``agent_id`` and ``agent_name``
     are read from the conversation row directly.
@@ -9745,6 +9902,14 @@ def _child_session_summary_from_conversation(
         # ``tool`` and the raw thread id as ``session_name`` for correlation.
         tool = _codex_subagent_display_tool(labels)
         session_name = labels.get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
+    elif _is_claude_native_subagent(conv):
+        # Claude-native child: the title is "{agentType}:{subagent_id}" — an
+        # opaque uniqueness key whose halves are both unreadable once the
+        # agent type is plugin-namespaced. Surface the Task description (or
+        # the bare agent name) as ``tool`` and keep the raw Claude id as
+        # ``session_name`` for correlation.
+        tool = _claude_subagent_display_tool(conv, labels)
+        session_name = labels.get(_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY)
     elif display_title and ":" in display_title:
         head, _, tail = display_title.partition(":")
         if head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail:
@@ -10586,6 +10751,7 @@ __all__ = [
     "_child_session_current_task_status_from_cached_status",
     "_child_session_summary_from_conversation",
     "_claude_native_remember_host",
+    "_claude_subagent_display_tool",
     "_client_supplied_hook_elicitation_id",
     "_codex_plan_mode_enabled",
     "_codex_subagent_display_tool",
@@ -10625,6 +10791,7 @@ __all__ = [
     "_host_model_options_via_registry",
     "_if_none_match_matches",
     "_invalidate_runner_backed_snapshot_state",
+    "_is_claude_native_subagent",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
     "_last_task_error_from_labels",
@@ -10673,6 +10840,7 @@ __all__ = [
     "_persist_policy_deny_sentinel",
     "_persist_session_status_error_labels",
     "_persist_stored_session_bundle",
+    "_pin_claude_permission_launch_args",
     "_policy_notice_from_ensure_response",
     "_poll_request_disconnect",
     "_presentation_labels_for_agent",
@@ -10683,6 +10851,7 @@ __all__ = [
     "_prune_pre_resolved_harness_elicitations",
     "_prune_session_read_state",
     "_publish_and_persist_resource_event",
+    "_publish_btw_sidechat",
     "_publish_changed_files_invalidated",
     "_publish_codex_approval_mode",
     "_publish_collaboration_mode",

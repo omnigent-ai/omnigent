@@ -122,12 +122,12 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
-    _merge_claude_permission_launch_args,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
+    _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
     _prune_session_read_state,
     _publish_codex_approval_mode,
@@ -247,7 +247,7 @@ def register_core_routes(
         agent_id: str | None,
         user_id: str | None,
         sandbox_provider: str | None,
-        workspace: str | None,
+        workspaces: list[str],
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -276,9 +276,11 @@ def register_core_routes(
             owner).
         :param sandbox_provider: Provider to provision, or ``None`` for
             the server's first configured provider.
-        :param workspace: Managed workspace — a git repository URL
-            (optionally ``#<branch>``) cloned into the sandbox, or
-            ``None`` for an empty sandbox.
+        :param workspaces: Managed workspaces — git repository URLs
+            (each optionally ``#<branch>``) cloned into the sandbox in
+            parallel; empty for an empty sandbox. One repo becomes the
+            session's working directory; several are cloned as siblings
+            and the working directory is the parent that holds them.
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -293,7 +295,7 @@ def register_core_routes(
             )
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
-            MANAGED_REPO_LABEL_KEY,
+            managed_repo_labels,
             parse_repo_workspace,
         )
 
@@ -306,18 +308,32 @@ def register_core_routes(
                 f"on this server — available: {offered}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Reject several repos on a provider that clones only one, with a clear
+        # 4xx (the web picker already caps this per provider; this guards direct
+        # API callers). Resolve the provider the launch will actually use.
+        if len(workspaces) > 1:
+            resolved = sandbox_provider or sandbox_config.default.provider
+            caps = sandbox_config.provider_ui_capabilities().get(resolved or "", {})
+            if not caps.get("multi_repo", False):
+                raise OmnigentError(
+                    f"sandbox provider '{resolved}' clones only one repository; "
+                    "select a single repository or choose a provider that supports several",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         # A managed workspace is a repository URL (schema-validated) the
-        # launch clones inside the sandbox; parse it now so a malformed
+        # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
-        repo = parse_repo_workspace(workspace) if workspace is not None else None
-        if workspace is not None:
-            # The session row's workspace is overwritten with the CLONED
-            # path at bind time; record the raw request value so a
-            # sandbox relaunch can re-clone the same repository.
+        repos = [parse_repo_workspace(w) for w in workspaces]
+        if workspaces:
+            # The session row's workspace is overwritten with the CLONED path at
+            # bind time; record the raw request value(s) so a sandbox relaunch
+            # can re-clone the same repositories. Stored one label per repo (not
+            # a single joined value) so the 256-char label-value cap can't
+            # silently truncate the list and drop repos on relaunch.
             await asyncio.to_thread(
                 conversation_store.set_labels,
                 session_id,
-                {MANAGED_REPO_LABEL_KEY: workspace},
+                managed_repo_labels(workspaces),
             )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
@@ -332,7 +348,7 @@ def register_core_routes(
                 # host registers under the reserved local owner.
                 owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
                 sandbox_config=sandbox_config,
-                repo=repo,
+                repos=repos,
                 tracker=managed_launches,
                 conversation_store=conversation_store,
                 host_store=host_store_for_managed,
@@ -673,7 +689,7 @@ def register_core_routes(
                 agent_id=conv.agent_id if conv is not None else None,
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,
-                workspace=body.workspace,
+                workspaces=body.managed_repo_workspaces(),
             )
 
         # Host launch: if a host is targeted (caller-supplied or
@@ -846,7 +862,11 @@ def register_core_routes(
                 agent_id=result.agent_id,
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
-                workspace=parsed_metadata.workspace,
+                # Bundle metadata carries a single repo; multi-repo is a
+                # web-picker (JSON) feature. Empty list = no repo.
+                workspaces=[parsed_metadata.workspace]
+                if parsed_metadata.workspace is not None
+                else [],
             )
         # Caller-supplied external host: bind + launch a runner on it,
         # exactly like the JSON create form (same authorization, atomic
@@ -2383,12 +2403,13 @@ def register_core_routes(
             )
             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
             # The launcher restores the mode from terminal_launch_args, not the
-            # label above, so reflect the confirmed mode there too — otherwise a
-            # relaunch reverts to the launch --permission-mode. Merge against
-            # ``updated`` (the post-write row), not the pre-update snapshot, so a
-            # combined PATCH that also set terminal_launch_args keeps those. Only
-            # rewrites an existing --permission-mode; mirrors the shift+tab path.
-            _merged_permission_args = _merge_claude_permission_launch_args(
+            # label above, so pin the confirmed mode there too — otherwise a
+            # relaunch reopens in the launch mode, which is Claude's default
+            # (manual) for a session created without --permission-mode. Merge
+            # against ``updated`` (the post-write row), not the pre-update
+            # snapshot, so a combined PATCH that also set terminal_launch_args
+            # keeps those.
+            _merged_permission_args = _pin_claude_permission_launch_args(
                 updated.terminal_launch_args,
                 _confirmed_permission_mode,
             )
@@ -2916,16 +2937,21 @@ def register_core_routes(
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
 
-        from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+        from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
         # Managed host: schedule the fork's own BACKGROUND sandbox provision
         # and return immediately, exactly like a managed create. The host is
         # registered to the forking caller, so the sandbox resolves THEIR
-        # credentials, never the source owner's. An omitted workspace
-        # inherits the repository the source recorded (read off the SOURCE,
-        # since a fork never inherits the label itself), so cloning a sandbox
-        # session lands the fork in the same checkout.
+        # credentials, never the source owner's. An omitted workspace inherits
+        # ALL of the repositories the source recorded (read off the SOURCE,
+        # since a fork never inherits the labels itself), so cloning a
+        # multi-repo sandbox session lands the fork with every repo.
         if body.host_type == "managed":
+            fork_workspaces = (
+                ([body.workspace] if body.workspace is not None else [])
+                if workspace_set
+                else read_managed_repo_workspaces(source.labels)
+            )
             await _schedule_managed_launch(
                 request,
                 session_id=new_conv.id,
@@ -2935,9 +2961,7 @@ def register_core_routes(
                 agent_id=new_conv.agent_id,
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,
-                workspace=(
-                    body.workspace if workspace_set else source.labels.get(MANAGED_REPO_LABEL_KEY)
-                ),
+                workspaces=fork_workspaces,
             )
 
         # Bound the response like the GET-session snapshot: newest item page,

@@ -74,7 +74,7 @@ def test_router_hook_coexists_with_policy_hooks(tmp_path: Path) -> None:
     )
     pre_tool_use = settings["hooks"]["PreToolUse"]
     matchers = [entry.get("matcher") for entry in pre_tool_use]
-    assert matchers == ["AskUserQuestion", None, AGENT_TOOL_MATCHER]
+    assert matchers == [None, AGENT_TOOL_MATCHER]
 
 
 def _commands(settings: dict[str, Any], event: str) -> list[str]:
