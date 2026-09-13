@@ -101,8 +101,5 @@ def test_cursor_missing_cli_shows_install_and_login_guidance(
     page.get_by_test_id("new-chat-landing-agent-select").click()
     badge = page.get_by_test_id(f"new-chat-landing-agent-warning-{_AGENT_ID}")
     expect(badge).to_be_visible()
-    # Feature-OFF picker keeps the per-reason badge text; with the structured
-    # "binary-missing" reason that is now "binary missing" — the same label
-    # Codex / Claude / OpenCode show for a missing CLI, instead of the legacy
-    # bespoke "install & login".
-    expect(badge).to_have_text("binary missing")
+    expect(badge).to_have_accessible_name("binary missing")
+    expect(badge).to_have_attribute("title", "binary missing")

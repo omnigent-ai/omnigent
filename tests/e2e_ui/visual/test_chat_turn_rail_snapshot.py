@@ -197,7 +197,7 @@ def test_chat_turn_rail_matches_baseline(
     # the ticks is what proves this baseline actually captures the rail.
     expect(page.locator(_TURN_TICK)).to_have_count(len(_TURNS), timeout=30_000)
     expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
-    expect(page.locator('[data-testid="composer-model-effort-label"]')).to_be_visible()
+    expect(page.locator('[data-testid="composer-agent-config-value"]')).to_be_visible()
 
     # Hide the "Jump to top" pill for the capture: the initial layout settle
     # fires a scroll that reveals it for a ~2s window, so whether it's on screen

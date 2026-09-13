@@ -339,10 +339,18 @@ class ExecutorError(ExecutorEvent):
         failures (auth, SDK crash, protocol violation) that would recur.
         Consumed by the omnigent workflow to pick between
         :class:`RetryableLLMError` and :class:`PermanentLLMError`.
+    :param usage: Token usage the executor observed before the turn
+        failed, or ``None`` when nothing was observed. Same shape as
+        :attr:`TurnComplete.usage`. ``context_tokens`` (window fill) is
+        the meaningful field here: a turn that dies after the model
+        call started has already reported its prompt size, and
+        discarding it freezes the context-occupancy meter at the
+        previous turn's value exactly when the session is in trouble.
     """
 
     message: str
     retryable: bool = False
+    usage: ExecutorUsage | None = None
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:

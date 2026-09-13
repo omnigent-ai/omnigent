@@ -5,7 +5,7 @@ from collections.abc import Iterator
 import pytest
 
 import omnigent.harness_plugins as hp
-from omnigent import native_dispatch
+from omnigent.native import native_dispatch
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +53,7 @@ def test_resolve_hook_resolves_populated_hook() -> None:
 def test_resolve_hook_rejects_non_callable_target(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = hp.native_provider_for_key("pi")
     assert provider is not None
-    monkeypatch.setattr("omnigent.pi_native.run_pi_native", object())
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.run_pi_native", object())
 
     with pytest.raises(TypeError, match="is not callable"):
         native_dispatch.resolve_hook(provider, "run_native")

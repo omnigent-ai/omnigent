@@ -1408,6 +1408,44 @@ describe("SubagentsPanel", () => {
     expect(llmSpawned).not.toHaveTextContent("researcher");
   });
 
+  it("shows the Task description for Claude Code sub-agents, never the hex id", () => {
+    // A Claude sub-agent's title is "<agentType>:<subagentId>", a per-parent
+    // uniqueness key ending in an opaque hex id. Splitting it left the rail
+    // showing bare ids — in a 21-worker wave, 17 indistinguishable rows. The
+    // readable label rides on ``tool``: the Task description, else the agent
+    // type's trailing segment (plugin-namespaced types carry their own colon).
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_described",
+          title: "general-purpose:a09d1dd1d8dbc0151",
+          tool: "wave-worker-696",
+          session_name: "a09d1dd1d8dbc0151",
+          labels: {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "wave-worker-696",
+          },
+        }),
+        childInfo({
+          id: "conv_namespaced",
+          title: "rpw-published:debug-lead:a361e6a6aa05689cb",
+          tool: "debug-lead",
+          session_name: "a361e6a6aa05689cb",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    const described = childRow(container, "conv_described");
+    expect(described).toHaveTextContent("wave-worker-696");
+    expect(described).not.toHaveTextContent("a09d1dd1d8dbc0151");
+    const namespaced = childRow(container, "conv_namespaced");
+    expect(namespaced).toHaveTextContent("debug-lead");
+    expect(namespaced).not.toHaveTextContent("a361e6a6aa05689cb");
+  });
+
   it("renders grandchildren and deeper levels indented under their parents", () => {
     mockChildTree({
       conv_root: [childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" })],

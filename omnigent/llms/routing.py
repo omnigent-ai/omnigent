@@ -89,6 +89,43 @@ _HARNESS_FOR_MODEL_PREFIX: dict[str, str] = {
 }
 
 
+def web_search_native_passthrough_provider(
+    model: str | None,
+    harness: str | None,
+) -> str | None:
+    """
+    Return the LLM provider for ``WebSearchTool`` when the harness supports
+    the OpenAI-native ``web_search_preview`` passthrough, else ``None``.
+
+    Only OpenAI Responses-compatible harnesses (``openai-agents`` / ``codex``)
+    can execute the passthrough server-side; every other harness must get the
+    function-tool schema or the tool is silently dropped (the schema has no
+    ``name``). ``databricks-*`` models never use the passthrough (Databricks
+    rejects it with HTTP 400). Shared by session-setup advertisement
+    (``ToolManager._create_web_search``) and runner dispatch
+    (``_execute_web_search_tool``) so the two sites cannot drift.
+
+    :param model: The spec's ``executor.model``, or ``None``.
+    :param harness: The spec's harness kind (``AgentSpec.harness_kind``);
+        empty/``"omnigent"`` falls back to :func:`infer_harness_from_model`.
+    :returns: The provider name for :class:`WebSearchTool`'s
+        ``llm_provider`` (e.g. ``"openai"``), or ``None`` for
+        function-tool mode.
+    """
+    if not model or model.startswith("databricks-"):
+        return None
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.onboarding.provider_config import _EXECUTOR_TYPE_HARNESS_ALIASES
+
+    if not harness or harness == "omnigent":
+        harness = infer_harness_from_model(model) or harness
+    canonical = canonicalize_harness(harness) or harness or ""
+    canonical = _EXECUTOR_TYPE_HARNESS_ALIASES.get(canonical, canonical)
+    if canonical in ("openai-agents", "codex"):
+        return parse_model_string(model).provider
+    return None
+
+
 def infer_harness_from_model(model: str) -> str:
     """
     Return the harness name implied by a model string, or ``""``
