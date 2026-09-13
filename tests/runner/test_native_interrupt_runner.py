@@ -38,6 +38,29 @@ class _FakeTerminalRegistry:
         return []
 
 
+class _FakeLabelsResponse:
+    """Minimal ``httpx.Response`` stand-in for the session-labels endpoint."""
+
+    status_code = 200
+
+    def __init__(self, labels: dict[str, str]) -> None:
+        self._labels = labels
+
+    def json(self) -> dict[str, Any]:
+        return {"labels": self._labels}
+
+
+class _FakeLabelsClient:
+    """Server client that answers the labels lookup with a fixed mapping."""
+
+    def __init__(self, labels: dict[str, str]) -> None:
+        self._labels = labels
+
+    async def get(self, path: str, **_kw: Any) -> _FakeLabelsResponse:
+        del path
+        return _FakeLabelsResponse(self._labels)
+
+
 class _FakeResourceRegistry:
     def __init__(self) -> None:
         self.terminal_registry = _FakeTerminalRegistry()
@@ -181,18 +204,18 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A uniform stop kills the bridge, publishes idle, and wakes the parent."""
-    import omnigent.harnesses.cursor_native.bridge as cursor_bridge
+    import omnigent.harnesses.kimi_native.bridge as kimi_bridge
 
     killed: list[Any] = []
-    monkeypatch.setattr(cursor_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(kimi_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
     monkeypatch.setattr(
-        cursor_bridge,
+        kimi_bridge,
         "kill_session",
         lambda bridge_dir, *, timeout_s: killed.append((bridge_dir, timeout_s)),
     )
 
     runner, captured = _make_runner()
-    resp = await runner.stop("cursor-native", "conv_c")
+    resp = await runner.stop("kimi-native", "conv_c")
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert killed == [("dir/conv_c", 1.0)]
@@ -337,3 +360,87 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
     assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+
+
+class TestCursorBridgeIdLabel:
+    """cursor panes outlive the conversation that launched them.
+
+    A ``/clear`` rotation rebinds a fresh conversation to the same pane, so
+    interrupt/stop must address the launcher's bridge dir — named by the
+    ``omnigent.cursor_native.bridge_id`` session label — not the live one.
+    """
+
+    @staticmethod
+    def _patch_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+        import omnigent.harnesses.cursor_native.bridge as cursor_bridge
+
+        monkeypatch.setattr(cursor_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+        monkeypatch.setattr(
+            cursor_bridge,
+            "bridge_dir_for_session_id",
+            lambda conv: pytest.fail("cursor must resolve the bridge dir via the label"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_interrupt_uses_label_bridge_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import omnigent.harnesses.cursor_native.bridge as cursor_bridge
+
+        self._patch_dirs(monkeypatch)
+        injected: list[Any] = []
+        monkeypatch.setattr(
+            cursor_bridge,
+            "inject_interrupt",
+            lambda bridge_dir, *, timeout_s: injected.append((bridge_dir, timeout_s)),
+        )
+        client = _FakeLabelsClient(
+            {cursor_bridge.CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: "conv_launcher"}
+        )
+
+        runner, _ = _make_runner(server_client=client)
+        resp = await runner.interrupt("cursor-native", "conv_rotated")
+
+        assert isinstance(resp, Response) and resp.status_code == 204
+        assert injected == [("dir/conv_launcher", 1.0)]
+
+    @pytest.mark.asyncio
+    async def test_interrupt_falls_back_to_conversation_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unrotated conversation carries no label and owns its own pane."""
+        import omnigent.harnesses.cursor_native.bridge as cursor_bridge
+
+        self._patch_dirs(monkeypatch)
+        injected: list[Any] = []
+        monkeypatch.setattr(
+            cursor_bridge,
+            "inject_interrupt",
+            lambda bridge_dir, *, timeout_s: injected.append((bridge_dir, timeout_s)),
+        )
+
+        runner, _ = _make_runner(server_client=_FakeLabelsClient({}))
+        resp = await runner.interrupt("cursor-native", "conv_own")
+
+        assert isinstance(resp, Response) and resp.status_code == 204
+        assert injected == [("dir/conv_own", 1.0)]
+
+    @pytest.mark.asyncio
+    async def test_stop_uses_label_bridge_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import omnigent.harnesses.cursor_native.bridge as cursor_bridge
+
+        self._patch_dirs(monkeypatch)
+        killed: list[Any] = []
+        monkeypatch.setattr(
+            cursor_bridge,
+            "kill_session",
+            lambda bridge_dir, *, timeout_s: killed.append((bridge_dir, timeout_s)),
+        )
+        client = _FakeLabelsClient(
+            {cursor_bridge.CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: "conv_launcher"}
+        )
+
+        runner, captured = _make_runner(server_client=client)
+        resp = await runner.stop("cursor-native", "conv_rotated")
+
+        assert isinstance(resp, Response) and resp.status_code == 204
+        assert killed == [("dir/conv_launcher", 1.0)]
+        assert captured["wakes"] == [("conv_rotated", "cancelled", "[System: sub-agent stopped]")]

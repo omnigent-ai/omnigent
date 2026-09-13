@@ -48,6 +48,9 @@ from omnigent.runner.native.orchestration import (
 from omnigent.runner.resource_registry import SessionResourceRegistry
 
 if TYPE_CHECKING:
+    from pathlib import Path
+    from types import ModuleType
+
     from omnigent.harness_plugins import NativeCodingAgent
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
@@ -113,6 +116,9 @@ class _UniformInterrupt:
         (the TUI harnesses do; pi's ``enqueue_interrupt`` does not).
     :param log_on_error: Whether to log a warning before the 503 — only pi's
         original handler did; the TUI handlers returned without logging.
+    :param bridge_id_label_attr: Name of the module attribute holding the
+        bridge-id session label key, for harnesses whose pane outlives the
+        conversation that launched it. ``None`` keys the dir on *conv_id*.
     """
 
     module: str
@@ -122,6 +128,7 @@ class _UniformInterrupt:
     error_types: tuple[type[BaseException], ...]
     with_timeout: bool
     log_on_error: bool = False
+    bridge_id_label_attr: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,12 +139,15 @@ class _UniformStop:
     :param error_code: The structured error code returned on failure.
     :param context: The ``_client_safe_error_detail`` context label.
     :param display_name: Human name for the delivery-not-confirmed warning.
+    :param bridge_id_label_attr: Name of the module attribute holding the
+        bridge-id session label key. ``None`` keys the dir on *conv_id*.
     """
 
     module: str
     error_code: str
     context: str
     display_name: str
+    bridge_id_label_attr: str | None = None
 
 
 # The seven uniform interrupt harnesses (claude/codex are special-cased). pi uses
@@ -160,6 +170,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         "cursor-native interrupt",
         (RuntimeError,),
         True,
+        bridge_id_label_attr="CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY",
     ),
     "goose": _UniformInterrupt(
         "omnigent.harnesses.goose_native.bridge",
@@ -211,6 +222,7 @@ _UNIFORM_STOP: dict[str, _UniformStop] = {
         "cursor_native_stop_failed",
         "cursor-native stop",
         "Cursor",
+        bridge_id_label_attr="CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY",
     ),
     "goose": _UniformStop(
         "omnigent.harnesses.goose_native.bridge",
@@ -401,9 +413,26 @@ class NativeInterruptRunner:
                 publish_event=self._publish_event,
             )
 
+    async def _uniform_bridge_dir(
+        self, module: ModuleType, label_attr: str | None, conv_id: str
+    ) -> Path:
+        """Resolve the bridge dir for *conv_id*, honouring a bridge-id label.
+
+        A rotated conversation is bound to the pane a previous conversation
+        launched, so its control files live under the launcher's dir.
+        """
+        if label_attr is None:
+            return module.bridge_dir_for_session_id(conv_id)
+        labels = await _session_labels_for_runner_spawn(
+            server_client=self._server_client,
+            session_id=conv_id,
+        )
+        bridge_id = labels.get(getattr(module, label_attr)) or conv_id
+        return module.bridge_dir_for_bridge_id(bridge_id)
+
     async def _uniform_interrupt(self, spec: _UniformInterrupt, conv_id: str) -> Response:
         module = importlib.import_module(spec.module)
-        bridge_dir = module.bridge_dir_for_session_id(conv_id)
+        bridge_dir = await self._uniform_bridge_dir(module, spec.bridge_id_label_attr, conv_id)
         inject = getattr(module, spec.inject_fn)
         try:
             if spec.with_timeout:
@@ -427,10 +456,9 @@ class NativeInterruptRunner:
 
     async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
         module = importlib.import_module(spec.module)
+        bridge_dir = await self._uniform_bridge_dir(module, spec.bridge_id_label_attr, conv_id)
         try:
-            await asyncio.to_thread(
-                module.kill_session, module.bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
+            await asyncio.to_thread(module.kill_session, bridge_dir, timeout_s=1.0)
         except RuntimeError as exc:
             # 503 means the kill attempt failed — including a transient tmux
             # error against a still-running pane. This is not proof the pane

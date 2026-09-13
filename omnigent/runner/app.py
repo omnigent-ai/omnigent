@@ -121,6 +121,7 @@ from omnigent.runner.native import (
     _codex_native_terminal_arrives_via_transfer,
     _codex_session_needs_runner_terminal,
     _CodexNativeModelOptionsNotReady,
+    _cursor_native_bridge_id_for_session,
     _delete_native_bridge_dirs,
     _ensure_native_terminal,
     _ensure_orchestrator_skills_in_bundle,
@@ -6013,13 +6014,17 @@ def create_runner_app(
         model: str | None,
     ) -> Response:
         from omnigent.harnesses.cursor_native.bridge import (
-            bridge_dir_for_session_id,
+            bridge_dir_for_bridge_id,
             inject_model_command,
         )
 
         if model is None or not model.strip():
             return Response(status_code=204)
-        bridge_dir = bridge_dir_for_session_id(conv_id)
+        bridge_id = await _cursor_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         selected_model = model.strip()
         expected_display_name = _session_cursor_model_names.get(conv_id, {}).get(selected_model)
         try:
@@ -6257,11 +6262,15 @@ def create_runner_app(
 
     async def _handle_cursor_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.cursor_native.bridge import (
-            bridge_dir_for_session_id,
+            bridge_dir_for_bridge_id,
             inject_user_message,
         )
 
-        bridge_dir = bridge_dir_for_session_id(conv_id)
+        bridge_id = await _cursor_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
         try:
             await asyncio.to_thread(
