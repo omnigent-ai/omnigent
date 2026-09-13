@@ -29,33 +29,12 @@ export interface RoutingModelOption {
   label: string;
 }
 
-/** The native-catalog fields the Model row's copy is built from. */
-interface NativeModelLabelFields {
-  id: string;
-  displayName?: string;
-  isDefault?: boolean;
-}
-
-/** A catalog row's user-facing name: what the harness advertises, else its id. */
-export function nativeModelLabel(option: NativeModelLabelFields): string {
-  return option.displayName ?? option.id;
-}
-
-/**
- * Label for the Model row's "Default" choice, naming the model it resolves to
- * when the catalog marks one.
- *
- * Shared by the landing dialog and the in-session composer: read from one place
- * so the same session can't read "Default" in one gear and
- * "Default (GPT-5.6-Luna)" in the other.
- *
- * @param options Harness catalog rows; at most one is marked default.
- * @returns ``Default (<name>)``, or plain ``Default`` when unmarked.
- */
-export function defaultModelLabel(options: readonly NativeModelLabelFields[]): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${nativeModelLabel(dflt)})` : "Default";
-}
+// The model-label helpers are canonical in the shared leaf module so the
+// landing dialog, the chat status line, and this file all format a model the
+// same way. Re-exported here so callers that import them from
+// HarnessConfigControls keep working.
+export { defaultModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
+export type { NativeModelLabelFields } from "@/lib/composerModelLabel";
 
 /**
  * The Model row's Select: the Smart Routing sentinel (when offered), the

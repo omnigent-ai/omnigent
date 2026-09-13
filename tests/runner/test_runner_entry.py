@@ -21,6 +21,8 @@ from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
     _agent_cache_dest,
+    _apply_host_interactive_shells,
+    _host_interactive_shells_from_env,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
@@ -44,6 +46,7 @@ from omnigent.runner._entry import (
 )
 from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
@@ -54,6 +57,39 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 # here (via import_module, so there is no bound-but-unused import) resolves and
 # caches it with the real type.
 importlib.import_module("mcp.client.streamable_http")
+
+
+def test_host_interactive_shells_from_env_normalizes_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner wiring accepts only supported, ordered shell basenames."""
+    monkeypatch.setenv(
+        RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+        '["zsh", "bash", "zsh", "not-a-shell"]',
+    )
+    assert _host_interactive_shells_from_env() == ["zsh", "bash"]
+
+
+def test_apply_host_interactive_shells_only_replaces_native_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom agent terminals remain authored while native fallbacks change."""
+    from types import SimpleNamespace
+
+    from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["zsh", "bash"]')
+    native = SimpleNamespace(name=CLAUDE_NATIVE_AGENT_NAME, terminals={"bash": object()})
+    custom_terminal = object()
+    custom = SimpleNamespace(name="custom", terminals={"project": custom_terminal})
+
+    _apply_host_interactive_shells(native)
+    _apply_host_interactive_shells(custom)
+
+    assert list(native.terminals) == ["zsh", "bash"]
+    assert native.terminals["zsh"].command is not None
+    assert native.terminals["zsh"].command.endswith("zsh")
+    assert custom.terminals == {"project": custom_terminal}
 
 
 class _TrackingTerminalRegistry:

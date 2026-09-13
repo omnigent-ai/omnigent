@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
@@ -70,18 +71,23 @@ const SECOND_CONVERSATION: Conversation = {
 };
 
 function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
+  // A QueryClientProvider is required: the menu reads useQueryClient() to hand
+  // the post-archive Undo toast a client for unarchiving.
+  const queryClient = new QueryClient();
   return (
-    <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
-      <HeaderConversationMenu
-        conversation={CONVERSATION}
-        currentProject={null}
-        canShare
-        canFork
-        onShare={() => {}}
-        onFork={mocks.fork}
-        {...overrides}
-      />
-    </MemoryRouter>
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
+        <HeaderConversationMenu
+          conversation={CONVERSATION}
+          currentProject={null}
+          canShare
+          canFork
+          onShare={() => {}}
+          onFork={mocks.fork}
+          {...overrides}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
   );
 }
 
@@ -182,9 +188,9 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // Just the flag: the optimistic overlay lives in the hook, and the
-    // "view archived" toast fires synchronously (navigating away unmounts this
-    // menu, so a mutate onSuccess callback wouldn't fire).
+    // Just the flag: the optimistic overlay lives in the hook, and the Undo
+    // toast fires synchronously (navigating away unmounts this menu, so a
+    // mutate onSuccess callback wouldn't fire).
     expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
 
     view.unmount();
@@ -197,6 +203,22 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  it("offers Unarchive on an archived session and unarchives in place", () => {
+    // An archived session reopened by URL must not be re-offered the action
+    // that was already taken; the item flips like the sidebar row's menu.
+    renderMenu({ conversation: { ...CONVERSATION, archived: true } });
+
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    const item = screen.getByRole("menuitem", { name: "Unarchive" });
+    expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
+
+    fireEvent.click(item);
+    // Just the flag flip: unarchiving keeps the user on the session, so no
+    // redirect home and no Undo toast.
+    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: false });
   });
 
   it("labels project actions for filed and unfiled sessions", () => {

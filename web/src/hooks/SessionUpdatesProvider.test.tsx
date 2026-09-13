@@ -178,6 +178,20 @@ function wireItem(id: string, commentsCount: number, commentsUpdatedAt: number |
   return { ...conv(id), comments_count: commentsCount, comments_updated_at: commentsUpdatedAt };
 }
 
+describe("SessionUpdatesProvider host changes", () => {
+  it("invalidates cached session agents so shell inventories refresh", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_old"]);
+    renderProvider(client, ["/c/conv_old"]);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    act(() => frameHandler()({ type: "hosts_changed" }));
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["hosts"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-agent"] });
+  });
+});
+
 describe("SessionUpdatesProvider comments fingerprint", () => {
   it("invalidates the comments cache when a changed frame moves the fingerprint", () => {
     const client = new QueryClient();

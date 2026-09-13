@@ -295,6 +295,9 @@ class MessageData(BaseModel):
         turn, e.g. Codex ``turn/completed`` with status
         ``"interrupted"``. Defaults to ``False`` and is omitted from
         serialized payloads in that case.
+    :param stream_message_id: Native live-preview stream finalized by
+        this assistant message. Persisted so reconnect snapshots can
+        suppress delayed preview chunks after the authoritative item.
     """
 
     role: Literal["user", "assistant"]
@@ -303,6 +306,7 @@ class MessageData(BaseModel):
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
+    stream_message_id: str | None = None
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:

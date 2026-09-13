@@ -181,6 +181,13 @@ def _launcher() -> AgentSandboxLauncher:
     )
 
 
+def test_agent_sandbox_inherits_multi_repo_capability() -> None:
+    """agent-sandbox declares multi_repo via KubernetesSandboxLauncher, so the
+    picker offers the multi-repo menu for it and the launch accepts N repos.
+    Managed Databricks launchers are on the exec-model branch and stay off."""
+    assert _launcher().capabilities.multi_repo is True
+
+
 # ── manifest conversion ────────────────────────────────
 
 

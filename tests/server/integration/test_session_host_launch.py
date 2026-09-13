@@ -47,6 +47,7 @@ from omnigent.host.frames import (
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.host_registry import HostConnection
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -581,6 +582,63 @@ async def test_inline_launch_failure_still_returns_bound_session(
         "runner binding should persist even when the host reports launch failure"
     )
     assert conv.host_id == _HOST_ID
+
+
+@pytest.mark.parametrize("disconnect", [False, True], ids=["replaced", "disconnected"])
+async def test_inline_launch_connection_loss_still_returns_bound_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    disconnect: bool,
+) -> None:
+    """Replace the transport after workspace validation, before launch enqueueing."""
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    registry = app.state.host_registry
+    original_send = registry.send_text
+    old_connection = registry.get(_HOST_ID)
+    assert old_connection is not None
+    pending_launches: list[asyncio.Future[dict[str, str | None]]] = []
+
+    def send_with_connection_loss(conn: HostConnection, data: str) -> None:
+        frame = decode_host_frame(data)
+        if isinstance(frame, HostStatFrame):
+            conn.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+            return
+        if isinstance(frame, HostLaunchRunnerFrame):
+            pending_launches.append(conn.pending_launches[frame.request_id])
+            if disconnect:
+                registry.deregister(conn.host_id, workspace_id=conn.workspace_id, conn=conn)
+            else:
+                registry.register(
+                    conn.host_id,
+                    _NoopRunnerWS(),
+                    conn.hello,
+                    conn.owner,
+                    workspace_id=conn.workspace_id,
+                )
+        original_send(conn, data)
+
+    monkeypatch.setattr(registry, "send_text", send_with_connection_loss)
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["host_id"] == _HOST_ID
+    assert body["runner_id"].startswith("runner_token_")
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conversation is not None
+    assert conversation.runner_id == body["runner_id"]
+    assert old_connection.pending_launches == {}
+    assert len(pending_launches) == 1
+    assert pending_launches[0].done()
+    comm.stop()
 
 
 _HARNESS_REFUSAL = (

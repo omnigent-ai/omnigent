@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import asc, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
     SqlPolicy,
@@ -24,6 +25,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
+    run_write_transaction,
 )
 from omnigent.entities import Policy
 from omnigent.stores.policy_store import PolicyStore
@@ -76,6 +78,11 @@ class SqlAlchemyPolicyStore(PolicyStore):
             self._engine,
             query_name_prefix="omnigent.policy_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.policy_store",
+            immediate=True,
+        )
 
     # ── Session-scoped policy methods ────────────────────────────
 
@@ -97,19 +104,10 @@ class SqlAlchemyPolicyStore(PolicyStore):
         unique within a session while different sessions may reuse a
         name.
         """
-        row = SqlPolicy(
-            id=policy_id,
-            name=name,
-            session_id=session_id,
-            scope=encode_policy_scope("session"),
-            created_at=now_epoch(),
-            updated_at=None,
-            type=encode_policy_type(type),
-            handler=handler,
-            factory_params=json.dumps(factory_params) if factory_params else None,
-            enabled=enabled,
-        )
-        with self._session("insert_policy") as session:
+        created_at = now_epoch()
+        encoded_params = json.dumps(factory_params) if factory_params else None
+
+        def write(session: Session) -> Policy:
             existing = (
                 session.execute(
                     select(SqlPolicy)
@@ -126,9 +124,23 @@ class SqlAlchemyPolicyStore(PolicyStore):
                     params={"name": name},
                     orig=Exception(f"UNIQUE constraint: name={name!r}"),
                 )
+            row = SqlPolicy(
+                id=policy_id,
+                name=name,
+                session_id=session_id,
+                scope=encode_policy_scope("session"),
+                created_at=created_at,
+                updated_at=None,
+                type=encode_policy_type(type),
+                handler=handler,
+                factory_params=encoded_params,
+                enabled=enabled,
+            )
             session.add(row)
             session.flush()
             return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "insert_policy", write)
 
     def get(self, policy_id: str, session_id: str) -> Policy | None:
         """Return the policy if it belongs to the given session."""
@@ -172,7 +184,9 @@ class SqlAlchemyPolicyStore(PolicyStore):
         Update mutable fields. Returns ``None`` if not found or
         wrong session.
         """
-        with self._session("update_policy") as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> Policy | None:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
             if row is None or row.session_id != normalize_uuid(session_id):
                 return None
@@ -209,18 +223,23 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 row.enabled = enabled
                 changed = True
             if changed:
-                row.updated_at = now_epoch()
+                row.updated_at = updated_at
             session.flush()
             return _to_entity(row)
 
+        return run_write_transaction(self._session_immediate, "update_policy", write)
+
     def delete(self, policy_id: str, session_id: str) -> bool:
         """Delete a policy. Idempotent: returns ``False`` if not found."""
-        with self._session("delete_policy") as session:
+
+        def write(session: Session) -> bool:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
             if row is None or row.session_id != normalize_uuid(session_id):
                 return False
             session.delete(row)
             return True
+
+        return run_write_transaction(self._session_immediate, "delete_policy", write)
 
     # ── Default (server-wide) policy methods ─────────────────────
 
@@ -242,20 +261,10 @@ class SqlAlchemyPolicyStore(PolicyStore):
         uniqueness is enforced here explicitly (by name digest).
         """
 
-        row = SqlPolicy(
-            id=policy_id,
-            name=name,
-            session_id=None,
-            scope=encode_policy_scope("default"),
-            created_at=now_epoch(),
-            updated_at=None,
-            type=encode_policy_type(type),
-            handler=handler,
-            factory_params=json.dumps(factory_params) if factory_params else None,
-            enabled=enabled,
-            created_by=created_by,
-        )
-        with self._session("insert_default_policy") as session:
+        created_at = now_epoch()
+        encoded_params = json.dumps(factory_params) if factory_params else None
+
+        def write(session: Session) -> Policy:
             # Default-name uniqueness is enforced here (no DB constraint):
             # scan for an existing default with the same name digest.
             existing = (
@@ -274,9 +283,24 @@ class SqlAlchemyPolicyStore(PolicyStore):
                     params={"name": name},
                     orig=Exception(f"UNIQUE constraint: name={name!r}"),
                 )
+            row = SqlPolicy(
+                id=policy_id,
+                name=name,
+                session_id=None,
+                scope=encode_policy_scope("default"),
+                created_at=created_at,
+                updated_at=None,
+                type=encode_policy_type(type),
+                handler=handler,
+                factory_params=encoded_params,
+                enabled=enabled,
+                created_by=created_by,
+            )
             session.add(row)
             session.flush()
             return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "insert_default_policy", write)
 
     def get_default(self, policy_id: str) -> Policy | None:
         """Return a default policy by ID (``scope = 'default'``)."""
@@ -310,7 +334,9 @@ class SqlAlchemyPolicyStore(PolicyStore):
         Update mutable fields of a default policy. Returns ``None``
         if not found or not a default policy.
         """
-        with self._session("update_default_policy") as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> Policy | None:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
             if row is None or row.scope != encode_policy_scope("default"):
                 return None
@@ -347,15 +373,20 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 row.enabled = enabled
                 changed = True
             if changed:
-                row.updated_at = now_epoch()
+                row.updated_at = updated_at
             session.flush()
             return _to_entity(row)
 
+        return run_write_transaction(self._session_immediate, "update_default_policy", write)
+
     def delete_default(self, policy_id: str) -> bool:
         """Delete a default policy. Idempotent."""
-        with self._session("delete_default_policy") as session:
+
+        def write(session: Session) -> bool:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
             if row is None or row.scope != encode_policy_scope("default"):
                 return False
             session.delete(row)
             return True
+
+        return run_write_transaction(self._session_immediate, "delete_default_policy", write)

@@ -665,7 +665,21 @@ class SetupFlow:
     async def _handle_select_submit(
         self, ack: Any, body: dict[str, Any], view: dict[str, Any], client: Any
     ) -> None:
-        server_url = self._server_url
+        team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
+        user_id = str((body.get("user") or {}).get("id") or "")
+        # Fail closed on a missing team/user: configs key on (team, user), so a
+        # blank one would collapse keys across workspaces. No form field can fix
+        # it, so the modal dead-ends. Matches the guard in the slash-command path.
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Setup submit missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            await ack(
+                response_action="update",
+                view=setup_failed_modal("Slack didn't identify your workspace or account."),
+            )
+            return
+
         agent_option = _selected_option(view, AGENT_BLOCK, AGENT_ACTION)
         if agent_option is None:
             await ack(
@@ -713,18 +727,9 @@ class SetupFlow:
             host_type="managed" if managed else "external",
         )
 
-        team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
-        user_id = str((body.get("user") or {}).get("id") or "")
-        # Fail closed: an empty team/user would write the config under a key that
-        # collapses across workspaces (configs key on (team, user)).
-        if not team_id or not user_id:
-            self._logger.warning(
-                "Setup submit missing team/user (team=%r user=%r)", team_id, user_id
-            )
-            await ack()
-            return
         await self._store.upsert_user_config(team_id, user_id, config)
         await ack()
+        server_url = self._server_url
         self._logger.info(
             "Saved Omnigent setup team=%s user=%s server=%s agent=%s host_type=%s host=%s",
             team_id,
@@ -966,6 +971,30 @@ def login_failed_modal(server_url: str, reason: str) -> dict[str, Any]:
                     "type": "mrkdwn",
                     "text": (
                         f":warning: Login{where} didn't complete: {reason}\n"
+                        "Run `/omnigent` to try again."
+                    ),
+                },
+            }
+        ],
+    }
+
+
+def setup_failed_modal(reason: str) -> dict[str, Any]:
+    # Terminal screen when a submitted setup can't be saved for a reason no form
+    # field carries — the picker's inline errors can't express it. Distinct from
+    # the login-failure screen: the sign-in may have succeeded.
+    return {
+        "type": "modal",
+        "callback_id": CALLBACK_SETUP_INFO,
+        "title": {"type": "plain_text", "text": "Set up Omnigent"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":warning: Your setup wasn't saved: {reason}\n"
                         "Run `/omnigent` to try again."
                     ),
                 },

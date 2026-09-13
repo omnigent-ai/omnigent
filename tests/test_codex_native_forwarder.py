@@ -44,13 +44,20 @@ class _RecordingClient:
         """Initialize with an empty record of posts."""
         self.posts: list[tuple[str, dict]] = []
 
-    async def post(self, url: str, *, json: dict) -> httpx.Response:
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict,
+        timeout: float | None = None,
+    ) -> httpx.Response:
         """
         Record ``(url, json)`` and return a 200 response.
 
         :param url: Request URL, e.g. ``"/v1/sessions/conv_x/events"``.
         :param json: JSON body, e.g.
             ``{"type": "external_model_change", "data": {"model": "gpt-5.4"}}``.
+        :param timeout: Ignored request timeout used by transient delta posts.
         :returns: A real ``httpx.Response`` with status 200.
         """
         self.posts.append((url, json))
@@ -224,6 +231,69 @@ def test_refresh_launch_race_ends_on_routed_model(tmp_path: Path) -> None:
     # Later turns stay on the routed model (no reversion churn).
     fwd._refresh_model_from_config(tmp_path, state)
     assert state.model == "databricks-gpt-5-6-luna"
+
+
+def test_refresh_effort_from_config_adopts_changed_value(tmp_path: Path) -> None:
+    """``config.toml``'s effort lands on the forwarder state for mirroring.
+
+    This is the path the ``turn/started`` handler uses to learn an in-TUI
+    ``/model`` effort change (which rewrites config.toml with no
+    notification): read config.toml (via the shared ``read_codex_config_effort``)
+    → set ``forwarder_state.effort`` → ``_sync_reasoning_effort_change``
+    mirrors it so the chat composer's effort control updates.
+    """
+    _write_codex_config(tmp_path, 'model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_effort_from_config(tmp_path, state)
+    assert state.effort == "medium"
+
+    # The user picks a new effort in the TUI: /model rewrites config.toml.
+    _write_codex_config(tmp_path, 'model = "gpt-5.5"\nmodel_reasoning_effort = "high"\n')
+
+    fwd._refresh_effort_from_config(tmp_path, state)
+
+    assert state.effort == "high"
+    assert state.last_config_effort == "high"
+
+
+def test_refresh_effort_prefers_pushed_settings_effort_over_stale_config(
+    tmp_path: Path,
+) -> None:
+    """An unchanged config.toml must not roll back a live thread-settings effort.
+
+    An Omnigent-initiated effort change lands thread-level (notified as
+    ``thread/settings/updated``) without rewriting config.toml; the next
+    ``turn/started`` re-read of the unchanged file must keep the pushed
+    effort rather than reverting it one turn after it applied.
+    """
+    _write_codex_config(tmp_path, 'model_reasoning_effort = "medium"\n')
+    state = fwd._CodexForwarderState()
+    # Subscription/turn-time read adopts the pinned launch effort (baseline).
+    fwd._refresh_effort_from_config(tmp_path, state)
+    assert state.effort == "medium"
+    # Omnigent pushes a new effort thread-level; the live notification wins.
+    state.note_thread_settings_updated({"threadSettings": {"effort": "low"}})
+
+    # turn/started re-read: config.toml is UNCHANGED — the pushed effort holds.
+    fwd._refresh_effort_from_config(tmp_path, state)
+
+    assert state.effort == "low"
+
+
+def test_refresh_effort_noop_when_config_has_no_effort(tmp_path: Path) -> None:
+    """A config.toml without an effort key preserves the prior value.
+
+    Absence (or an unreadable file) is not a signal to clear or invent an
+    effort — the forwarder keeps whatever it last learned.
+    """
+    _write_codex_config(tmp_path, 'model = "gpt-5.5"\n')
+    state = fwd._CodexForwarderState()
+    state.effort = "medium"
+
+    fwd._refresh_effort_from_config(tmp_path, state)
+
+    assert state.effort == "medium"
+    assert state.last_config_effort is None
 
 
 def test_note_resume_response_records_model_without_seeding_baseline() -> None:
@@ -773,6 +843,91 @@ async def test_elicitation_post_reposts_after_transport_cut_with_same_envelope(
     # Identical (url, envelope) on the retry is the re-park contract.
     assert client.posts[0] == client.posts[1]
     assert client.posts[0][0] == "/v1/sessions/conv_x/hooks/codex-elicitation-request"
+
+
+@pytest.mark.asyncio
+async def test_elicitation_post_resets_backoff_after_a_gateway_severed_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A gateway-severed HELD poll resets the retry backoff; fast failures grow it.
+
+    The front door caps a request at 300s and answers with 504, so a parked
+    approval is severed every five minutes. A backoff that kept doubling
+    pushed the re-POST past the server's re-park grace, which cleared the
+    approval card to "Resolved elsewhere" between polls. Growth belongs to
+    fast failures (a sick or unreachable server), not to a poll the gateway
+    held for its full budget.
+    """
+    loop = asyncio.get_running_loop()
+    clock = {"t": 0.0}
+    monkeypatch.setattr(loop, "time", lambda: clock["t"])
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        """
+        Record the backoff instead of waiting it out.
+
+        :param seconds: Backoff the loop asked for.
+        :returns: None.
+        """
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(fwd, "_elicitation_retry_sleep", _record_sleep)
+    held = fwd._CODEX_ELICITATION_HELD_POLL_FLOOR_SECONDS + 290.0
+    # (held_s, outcome) per attempt: a gateway sever holds the poll for its
+    # full budget, a refused connection fails instantly.
+    script = [
+        (held, "5xx"),
+        (held, "5xx"),
+        (0.0, "cut"),
+        (0.0, "cut"),
+        (held, "5xx"),
+        (0.0, "ok"),
+    ]
+
+    class _ScriptedElicitationClient:
+        """Stub client whose POSTs follow *script*, advancing the fake clock."""
+
+        def __init__(self) -> None:
+            self.posts: list[tuple[str, dict]] = []
+
+        async def post(self, url: str, *, json: dict, timeout: httpx.Timeout) -> httpx.Response:
+            """
+            Fail or succeed per the script, charging the attempt's hold time.
+
+            :param url: Request URL.
+            :param json: Codex JSON-RPC request envelope.
+            :param timeout: Per-attempt budget (ignored by the stub).
+            :returns: 504 for a gateway sever, 200 once the script says so.
+            :raises httpx.ReadError: For an instantly refused connection.
+            """
+            del timeout
+            self.posts.append((url, json))
+            held_s, outcome = script[len(self.posts) - 1]
+            clock["t"] += held_s
+            request = httpx.Request("POST", url)
+            if outcome == "cut":
+                raise httpx.ReadError("connection refused", request=request)
+            if outcome == "5xx":
+                return httpx.Response(504, request=request)
+            return httpx.Response(200, json={"action": "accept"}, request=request)
+
+    client = _ScriptedElicitationClient()
+
+    response = await fwd._post_codex_elicitation_request(
+        client,  # type: ignore[arg-type]  # stub implements the one used method
+        "conv_x",
+        event=_ELICITATION_EVENT,
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    initial = fwd._CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
+    assert sleeps == [initial, initial, initial, initial * 2, initial * 4], (
+        "a gateway-severed held poll must reset the backoff so the re-POST lands "
+        "inside the server's re-park grace; only fast failures may back off"
+    )
 
 
 @pytest.mark.asyncio
@@ -1581,33 +1736,32 @@ async def test_reasoning_delta_opens_block_then_continues() -> None:
     """
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=1000,
+    )
 
     await fwd._handle_reasoning_delta(
-        client,
-        "conv_x",
         {"turnId": "turn_1", "itemId": "item_r", "delta": "Let me "},
+        coalescer,
         state,
     )
     await fwd._handle_reasoning_delta(
-        client,
-        "conv_x",
         {"turnId": "turn_1", "itemId": "item_r", "delta": "think."},
+        coalescer,
         state,
     )
+    await coalescer.flush()
+    await coalescer.close()
 
     assert client.posts == [
         (
             "/v1/sessions/conv_x/events",
             {
                 "type": "external_output_reasoning_delta",
-                "data": {"delta": "Let me ", "started": True},
-            },
-        ),
-        (
-            "/v1/sessions/conv_x/events",
-            {
-                "type": "external_output_reasoning_delta",
-                "data": {"delta": "think.", "started": False},
+                "data": {"delta": "Let me think.", "started": True},
             },
         ),
     ]
@@ -1624,13 +1778,17 @@ async def test_reasoning_delta_new_item_reopens_block() -> None:
     """
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=1000,
+    )
 
-    await fwd._handle_reasoning_delta(
-        client, "conv_x", {"itemId": "item_a", "delta": "first"}, state
-    )
-    await fwd._handle_reasoning_delta(
-        client, "conv_x", {"itemId": "item_b", "delta": "second"}, state
-    )
+    await fwd._handle_reasoning_delta({"itemId": "item_a", "delta": "first"}, coalescer, state)
+    await fwd._handle_reasoning_delta({"itemId": "item_b", "delta": "second"}, coalescer, state)
+    await coalescer.flush()
+    await coalescer.close()
 
     started_flags = [post[1]["data"]["started"] for post in client.posts]
     assert started_flags == [True, True]
@@ -1647,11 +1805,19 @@ async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
     """
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=1000,
+    )
 
     # Opening delta (empty) still posts to open the block.
-    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+    await fwd._handle_reasoning_delta({"itemId": "item_r", "delta": ""}, coalescer, state)
     # Empty continuation for the same item is dropped.
-    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+    await fwd._handle_reasoning_delta({"itemId": "item_r", "delta": ""}, coalescer, state)
+    await coalescer.flush()
+    await coalescer.close()
 
     assert len(client.posts) == 1
     assert client.posts[0][1]["data"] == {"delta": "", "started": True}
@@ -1852,7 +2018,7 @@ async def test_post_session_event_dead_letters_durable_event_on_permanent_failur
 
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data):
+    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
         return fwd._PostResult(
             response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
         )
@@ -1892,7 +2058,7 @@ async def test_post_session_event_does_not_dead_letter_ephemeral_event(
     """
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data):
+    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
         return fwd._PostResult(
             response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
         )
@@ -1930,7 +2096,7 @@ async def test_post_session_event_dead_letters_usage_on_permanent_failure(
 
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data):
+    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
         return fwd._PostResult(
             response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
         )
@@ -1970,6 +2136,27 @@ class _RaisingPostClient:
         raise self._exc
 
 
+class _SequencedPostClient:
+    """Return or raise configured POST outcomes in order."""
+
+    def __init__(self, outcomes: list[httpx.Response | httpx.HTTPError]) -> None:
+        self._outcomes = outcomes
+        self.calls: list[tuple[str, object, float | None]] = []
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: object,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        self.calls.append((url, json, timeout))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, httpx.HTTPError):
+            raise outcome
+        return outcome
+
+
 @pytest.mark.asyncio
 async def test_post_session_event_inner_classifies_ambiguous_skip() -> None:
     """
@@ -1992,6 +2179,511 @@ async def test_post_session_event_inner_classifies_ambiguous_skip() -> None:
     assert result.transport_error == "ReadTimeout"
     # Ambiguous items are abandoned immediately — no retries.
     assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotent_conversation_item_retries_ambiguous_failure_until_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stable source id makes response-loss retries duplicate-safe."""
+    monkeypatch.setattr(fwd, "_sleep", AsyncMock())
+    request = httpx.Request("POST", "http://test")
+    client = _SequencedPostClient(
+        [
+            httpx.ReadTimeout("response lost", request=request),
+            httpx.Response(503, request=request),
+            httpx.Response(202, request=request),
+        ]
+    )
+    data = {
+        "item_type": "message",
+        "item_data": {"role": "assistant"},
+        "source_id": "thread_1:turn_1:item_1",
+    }
+
+    result = await fwd._post_session_event_inner(
+        client,  # type: ignore[arg-type]
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data=data,
+        max_attempts=None,
+        timeout=5.0,
+    )
+
+    assert result.response is not None
+    assert result.response.status_code == 202
+    assert [call[1] for call in client.calls] == [
+        {"type": "external_conversation_item", "data": data},
+    ] * 3
+    assert [call[2] for call in client.calls] == [5.0, 5.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_idempotent_conversation_item_bounds_long_source_id() -> None:
+    """Long native ids are hashed into the server's source-id limit."""
+    client = _RecordingClient()
+
+    posted = await fwd._post_external_item(
+        client,  # type: ignore[arg-type]
+        "conv_x",
+        item_type="message",
+        item_data={"role": "assistant", "content": []},
+        response_id="codex_turn_1",
+        source_id="source:" + ("x" * 300),
+    )
+
+    assert posted is True
+    source_id = client.posts[0][1]["data"]["source_id"]
+    assert isinstance(source_id, str)
+    assert source_id.startswith("codex:")
+    assert len(source_id) <= 256
+
+
+@pytest.mark.asyncio
+async def test_idempotent_conversation_items_keep_order_while_older_post_is_slow() -> None:
+    """Concurrent resume/live delivery cannot let a newer item overtake an older one."""
+
+    class _BlockingFirstPostClient(_RecordingClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            if not self.posts:
+                self.entered.set()
+                await self.release.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    client = _BlockingFirstPostClient()
+    token = fwd._conversation_item_locks.set({})
+    try:
+        older = asyncio.create_task(
+            fwd._post_external_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                item_type="message",
+                item_data={"role": "assistant", "content": []},
+                response_id="codex_turn_1",
+                source_id="thread_1:turn_1:item_1",
+            )
+        )
+        await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+        newer = asyncio.create_task(
+            fwd._post_external_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                item_type="message",
+                item_data={"role": "assistant", "content": []},
+                response_id="codex_turn_2",
+                source_id="thread_1:turn_2:item_2",
+            )
+        )
+        await asyncio.sleep(0)
+        assert client.posts == []
+
+        client.release.set()
+        assert await asyncio.gather(older, newer) == [True, True]
+    finally:
+        fwd._conversation_item_locks.reset(token)
+
+    assert [body["data"]["source_id"] for _url, body in client.posts] == [
+        "thread_1:turn_1:item_1",
+        "thread_1:turn_2:item_2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_replay_keeps_tool_pair_ahead_of_live_completion() -> None:
+    """Replay holds one delivery scope so live items cannot split a tool pair."""
+
+    class _BlockingFirstPostClient(_RecordingClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            if not self.posts:
+                self.entered.set()
+                await self.release.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    client = _BlockingFirstPostClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        replay = asyncio.create_task(
+            fwd._replay_resume_response(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=Path(),
+                response={
+                    "result": {
+                        "thread": {
+                            "id": "thread_1",
+                            "turns": [
+                                {
+                                    "id": "turn_1",
+                                    "items": [
+                                        {
+                                            "type": "commandExecution",
+                                            "id": "call_1",
+                                            "command": "pwd",
+                                            "aggregatedOutput": "/repo\n",
+                                            "exitCode": 0,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    }
+                },
+                usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+                elicitation_tracker=tracker,
+                forwarder_state=state,
+            )
+        )
+        await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+        live = asyncio.create_task(
+            fwd._handle_completed_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_2",
+                    "item": {"type": "agentMessage", "id": "item_2", "text": "new reply"},
+                },
+                forwarder_state=state,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not live.done()
+
+        client.release.set()
+        await asyncio.gather(replay, live)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await tracker.close()
+
+    assert [body["data"]["source_id"] for _url, body in client.posts] == [
+        "thread_1:turn_1:call_1:call",
+        "thread_1:turn_1:call_1:output",
+        "thread_1:turn_2:item_2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live completion cannot overtake replay while resume metadata sync waits."""
+
+    class _ResumeClient:
+        async def request(self, _method: str, _params: dict) -> dict:
+            return {
+                "result": {
+                    "thread": {
+                        "id": "thread_1",
+                        "turns": [
+                            {
+                                "id": "turn_1",
+                                "items": [
+                                    {
+                                        "type": "agentMessage",
+                                        "id": "item_1",
+                                        "text": "replayed",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
+            }
+
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    sync_entered = asyncio.Event()
+    release_sync = asyncio.Event()
+
+    async def blocking_model_sync(*_args: object, **_kwargs: object) -> None:
+        sync_entered.set()
+        await release_sync.wait()
+
+    monkeypatch.setattr(fwd, "_sync_model_change", blocking_model_sync)
+    monkeypatch.setattr(fwd, "_sync_codex_approval_mode_change", AsyncMock())
+    monkeypatch.setattr(fwd, "_refresh_model_from_config", MagicMock())
+    monkeypatch.setattr(fwd, "_refresh_developer_instructions_from_config", MagicMock())
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        subscribe = asyncio.create_task(
+            fwd._subscribe_until_ready(
+                _ResumeClient(),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+                forwarder_state=state,
+            )
+        )
+        await asyncio.wait_for(sync_entered.wait(), timeout=5.0)
+        live = asyncio.create_task(
+            fwd._handle_completed_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_2",
+                    "item": {"type": "agentMessage", "id": "item_2", "text": "live"},
+                },
+                forwarder_state=state,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not live.done()
+        assert client.posts == []
+
+        release_sync.set()
+        await asyncio.gather(subscribe, live)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    assert [body["data"]["source_id"] for _url, body in client.posts] == [
+        "thread_1:turn_1:item_1",
+        "thread_1:turn_2:item_2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
+    tmp_path: Path,
+) -> None:
+    """A blocked replay keeps the crash journal until its item is acknowledged."""
+
+    class _BlockingFirstPostClient(_RecordingClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            if not self.posts:
+                self.entered.set()
+                await self.release.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    client = _BlockingFirstPostClient()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        replay = asyncio.create_task(
+            fwd._replay_resume_response(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                response={
+                    "result": {
+                        "thread": {
+                            "id": "thread_1",
+                            "turns": [
+                                {
+                                    "id": "turn_1",
+                                    "items": [
+                                        {
+                                            "type": "agentMessage",
+                                            "id": "item_1",
+                                            "text": "replayed",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    }
+                },
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+        )
+        await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+        terminal = asyncio.create_task(
+            fwd._handle_terminal_turn_boundary(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                method="turn/completed",
+                params={"turn": {"id": "turn_1", "status": "completed", "items": []}},
+                usage_coalescer=usage,
+                delta_coalescer=None,
+                elicitation_tracker=tracker,
+                codex_client=None,
+                forwarder_state=None,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not terminal.done()
+        assert read_bridge_state(tmp_path).active_turn_id == "turn_1"  # type: ignore[union-attr]
+
+        client.release.set()
+        await asyncio.gather(replay, terminal)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    assert read_bridge_state(tmp_path).active_turn_id is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_turn_started_waits_for_replay_before_replacing_active_turn(tmp_path: Path) -> None:
+    """A newer turn cannot overwrite the interrupted-turn crash journal."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    client = _RecordingClient()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    lock_entered = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def hold_replay_scope() -> None:
+        async with fwd._conversation_item_delivery_scope("conv_x"):
+            lock_entered.set()
+            await release_lock.wait()
+
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        replay = asyncio.create_task(hold_replay_scope())
+        await asyncio.wait_for(lock_entered.wait(), timeout=5.0)
+        turn_started = asyncio.create_task(
+            fwd._maybe_handle_turn_event(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                method="turn/started",
+                params={"turn": {"id": "turn_2"}},
+                usage_coalescer=usage,
+                delta_coalescer=None,
+                elicitation_tracker=tracker,
+                codex_client=None,
+                forwarder_state=None,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not turn_started.done()
+        assert read_bridge_state(tmp_path).active_turn_id == "turn_1"  # type: ignore[union-attr]
+
+        release_lock.set()
+        assert await turn_started is True
+        await replay
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    assert read_bridge_state(tmp_path).active_turn_id == "turn_2"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_idempotent_item_is_dead_lettered_for_safe_replay(tmp_path: Path) -> None:
+    """Shutdown during an in-flight completion keeps a replayable disk record."""
+
+    class _BlockingPostClient:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            self.entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    client = _BlockingPostClient()
+    dead_letter_token = fwd._dead_letter_dir.set(tmp_path)
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        task = asyncio.create_task(
+            fwd._post_external_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                item_type="message",
+                item_data={"role": "assistant", "content": []},
+                response_id="codex_turn_1",
+                source_id="thread_1:turn_1:item_1",
+            )
+        )
+        await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        fwd._dead_letter_dir.reset(dead_letter_token)
+
+    import json as _json
+
+    record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert record["delivered_ambiguous"] is True
+    assert record["payload"]["source_id"] == "thread_1:turn_1:item_1"
 
 
 @pytest.mark.asyncio
@@ -2032,7 +2724,7 @@ async def test_post_session_event_dead_letters_ambiguous_classification(
 
     fwd._reset_forward_health()
 
-    async def _ambiguous_inner(client, session_id, *, event_type, data):
+    async def _ambiguous_inner(client, session_id, *, event_type, data, max_attempts, timeout):
         return fwd._PostResult(
             response=None, delivered_ambiguous=True, transport_error="ReadTimeout"
         )
@@ -2070,7 +2762,7 @@ async def test_post_session_event_dead_letters_records_http_status(
 
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data):
+    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
         return fwd._PostResult(
             response=httpx.Response(503, request=httpx.Request("POST", "http://test"))
         )
@@ -2878,27 +3570,30 @@ async def test_delta_coalescer_close_gives_up_on_a_wedged_worker(
     monkeypatch.setattr(fwd, "_DELTA_MARKER_TIMEOUT_SECONDS", 0.1)
     client = _HangingClient()
     coalescer = _coalescer(client)
-    coalescer._ensure_worker()
-    coalescer._queue.put_nowait(fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="x"))
+    await coalescer.append("x", message_id="m1")
     await asyncio.wait_for(client.entered.wait(), timeout=5.0)
     worker = coalescer._worker_task
     assert worker is not None
 
-    await asyncio.wait_for(coalescer.close(), timeout=fwd._DELTA_MARKER_TIMEOUT_SECONDS + 5.0)
+    try:
+        await asyncio.wait_for(coalescer.close(), timeout=fwd._DELTA_MARKER_TIMEOUT_SECONDS + 5.0)
 
-    # close() gave up on the bound rather than waiting out a worker still stuck in its post.
-    assert coalescer._worker_task is None
-    assert not worker.done()
-    worker.cancel()
+        # Once the close deadline expires, cancel and reap the worker so it
+        # cannot outlive the HTTP client that owns its in-flight POST.
+        assert coalescer._worker_task is None
+        assert worker.cancelled()
+    finally:
+        if not worker.done():
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
 
 
 @pytest.mark.asyncio
 async def test_delta_coalescer_worker_survives_an_already_settled_marker() -> None:
     """Resolving a marker whose future is already settled must not kill the worker.
 
-    ``set_result`` on a settled future raises ``InvalidStateError``, and
-    ``_ensure_worker`` only replaces a ``None`` task, so a worker lost this way is
-    never restarted and every later delta is dropped without a word.
+    ``set_result`` on a settled future raises ``InvalidStateError`` inside the
+    worker, so every later delta would otherwise be dropped without a word.
     """
     client = _RecordingClient()
     coalescer = _coalescer(client)
@@ -2914,9 +3609,7 @@ async def test_delta_coalescer_worker_survives_an_already_settled_marker() -> No
     assert not coalescer._worker_task.done()
 
     posts_before = len(client.posts)
-    coalescer._queue.put_nowait(
-        fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="still here")
-    )
+    await coalescer.append("still here", message_id="m1")
     await asyncio.wait_for(coalescer.flush(), timeout=5.0)
     assert len(client.posts) > posts_before
 
@@ -2925,10 +3618,9 @@ async def test_delta_coalescer_worker_survives_an_already_settled_marker() -> No
 async def test_delta_coalescer_survives_a_cancelled_flush_caller() -> None:
     """A cancelled ``flush()`` caller must not kill the worker.
 
-    The caller's cancellation settles its own future. Resolving it again raises
-    ``InvalidStateError`` inside the worker, and ``_ensure_worker`` only replaces a
-    ``None`` task, so the dead worker was never restarted and every later delta was
-    silently dropped.
+    The caller's cancellation can settle its own future. Resolving it again raises
+    ``InvalidStateError`` inside the worker, so every later delta would otherwise
+    be silently dropped.
     """
     client = _RecordingClient()
     coalescer = _coalescer(client)
@@ -2945,11 +3637,307 @@ async def test_delta_coalescer_survives_a_cancelled_flush_caller() -> None:
     assert not coalescer._worker_task.done()
 
     posts_before = len(client.posts)
-    coalescer._queue.put_nowait(
-        fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="still here")
-    )
+    await coalescer.append("still here", message_id="m1")
     await asyncio.wait_for(coalescer.flush(), timeout=5.0)
     assert len(client.posts) > posts_before
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_restarts_an_unexpectedly_stopped_worker() -> None:
+    """A dead worker drops its stale queue before later streaming restarts."""
+    client = _RecordingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    worker = coalescer._worker_task
+    assert worker is not None
+
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+    stale = fwd._DeltaChunk(message_id="old", tool_call_id=None, delta="stale")
+    coalescer._queue.put_nowait(stale)
+    coalescer._queued_chars = len(stale.delta)
+    await coalescer.flush()
+    await coalescer.append("recovered", message_id="m1")
+    await coalescer.flush()
+    await coalescer.close()
+
+    assert [post[1]["data"]["delta"] for post in client.posts] == ["recovered"]
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_batches_newline_heavy_tool_output() -> None:
+    """Line-oriented command output is batched instead of POSTed per line."""
+    client = _RecordingClient()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=100_000,
+    )
+    chunks = [f"line {index}\n" for index in range(200)]
+
+    for chunk in chunks:
+        await coalescer.append_tool_output(chunk, call_id="call_1")
+    await coalescer.flush()
+    await coalescer.close()
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_tool_output_delta",
+                "data": {"call_id": "call_1", "delta": "".join(chunks)},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_preserves_mixed_stream_order() -> None:
+    """Assistant and reasoning batches retain their Codex arrival order."""
+    client = _RecordingClient()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=100_000,
+    )
+
+    await coalescer.append("answer one", message_id="message_1")
+    await coalescer.append_reasoning("think ", started=True)
+    await coalescer.append_reasoning("more", started=False)
+    await coalescer.append("answer two", message_id="message_2")
+    await coalescer.flush()
+    await coalescer.close()
+
+    assert [post[1]["type"] for post in client.posts] == [
+        "external_output_text_delta",
+        "external_output_reasoning_delta",
+        "external_output_text_delta",
+    ]
+    assert [post[1]["data"]["delta"] for post in client.posts] == [
+        "answer one",
+        "think more",
+        "answer two",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_does_not_drop_healthy_burst_at_queue_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ready worker gets a chance to drain before the queue sheds output."""
+    monkeypatch.setattr(fwd, "_DELTA_QUEUE_CHAR_LIMIT", 10)
+    client = _RecordingClient()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=100,
+    )
+
+    await coalescer.append("first!", message_id="m1")
+    await coalescer.append("second", message_id="m1")
+    await coalescer.flush()
+    await coalescer.close()
+
+    assert [post[1]["data"]["delta"] for post in client.posts] == ["first!second"]
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_overflow_drops_backlog_before_durable_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow relay sheds queued previews but preserves the completion boundary."""
+
+    class _SlowFirstClient(_RecordingClient):
+        """Hold the first delta POST while the queue crosses its byte budget."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            self.calls += 1
+            if self.calls == 1:
+                self.entered.set()
+                await self.release.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    monkeypatch.setattr(fwd, "_DELTA_QUEUE_CHAR_LIMIT", 19)
+    client = _SlowFirstClient()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=1,
+    )
+
+    await coalescer.append("stale", message_id="old")
+    await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+    await coalescer.append("queued stale", message_id="old")
+    await coalescer.append("overflow", message_id="old")
+    completed = asyncio.create_task(
+        fwd._handle_completed_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            params={
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "item": {"id": "item_1", "type": "agentMessage", "text": "final answer"},
+            },
+            delta_coalescer=coalescer,
+            forwarder_state=None,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not completed.done()
+    client.release.set()
+    await asyncio.wait_for(completed, timeout=5.0)
+
+    await coalescer.append("fresh", message_id="new")
+    await coalescer.flush()
+    await coalescer.close()
+
+    assert client.calls == 3
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_text_delta",
+                "data": {
+                    "delta": "stale",
+                    "message_id": "old",
+                    "index": 0,
+                    "final": False,
+                },
+            },
+        ),
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "codex-native-ui",
+                        "content": [{"type": "output_text", "text": "final answer"}],
+                    },
+                    "response_id": "codex_turn_1",
+                    "message_id": "codex:thread_1:turn_1:agentMessage:item_1",
+                    "source_id": "thread_1:turn_1:item_1",
+                },
+            },
+        ),
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_text_delta",
+                "data": {
+                    "delta": "fresh",
+                    "message_id": "new",
+                    "index": 0,
+                    "final": False,
+                },
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_sheds_small_slow_backlog_before_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sub-limit backlog cannot continue posting after the durable item."""
+
+    class _SlowDeltaClient(_RecordingClient):
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            if json["type"] == "external_output_text_delta":
+                await asyncio.sleep(0.04)
+            return await super().post(url, json=json, timeout=timeout)
+
+    monkeypatch.setattr(fwd, "_DELTA_FLUSH_GRACE_SECONDS", 0.02)
+    monkeypatch.setattr(fwd, "_DELTA_MARKER_TIMEOUT_SECONDS", 0.1)
+    client = _SlowDeltaClient()
+    coalescer = fwd._OutputTextDeltaCoalescer(
+        client,
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=5,
+    )
+
+    await coalescer.append("first", message_id="old")
+    await asyncio.sleep(0)
+    await coalescer.append("second", message_id="old")
+    await fwd._handle_completed_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        params={
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"id": "item_1", "type": "agentMessage", "text": "final answer"},
+        },
+        delta_coalescer=coalescer,
+        forwarder_state=None,
+    )
+    await asyncio.sleep(0.05)
+    await coalescer.close()
+
+    assert [post[1]["type"] for post in client.posts] == [
+        "external_output_text_delta",
+        "external_conversation_item",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transient_delta_post_uses_one_short_attempt() -> None:
+    """Lossy previews fail fast instead of retrying behind durable events."""
+
+    class _FailingClient:
+        def __init__(self) -> None:
+            self.timeouts: list[float | None] = []
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            self.timeouts.append(timeout)
+            return httpx.Response(503, request=httpx.Request("POST", url))
+
+    fwd._reset_forward_health()
+    try:
+        client = _FailingClient()
+
+        await fwd._post_output_text_delta(
+            client,  # type: ignore[arg-type]
+            "conv_x",
+            "preview",
+            message_id="m1",
+            index=0,
+            final=False,
+        )
+
+        assert client.timeouts == [fwd._DELTA_POST_TIMEOUT_SECONDS]
+    finally:
+        fwd._reset_forward_health()
 
 
 def test_default_collaboration_mode_refuses_when_developer_instructions_never_confirmed() -> None:

@@ -1529,6 +1529,7 @@ def _build_acp_cli_spawn_env(
     harness: str,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
 
@@ -1581,6 +1582,30 @@ def _build_acp_cli_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
+
+    # Managed-connect support for jcode: point it at a session-private JCODE_HOME
+    # (with a config.toml pinning the gateway provider) + a fresh broker bearer. A
+    # no-op when not connected (connect_jcode_gateway_env returns None), and — like the
+    # other connect harnesses — suppressed when the spec configures its own API key, so
+    # an explicit key is never silently rerouted through the owner's gateway.
+    if harness == "jcode":
+        from omnigent.host.databricks_credential import api_key_auth_precludes_broker
+        from omnigent.host.jcode_databricks import connect_jcode_gateway_env
+
+        gateway_env = (
+            None
+            if api_key_auth_precludes_broker(spec)
+            else connect_jcode_gateway_env(session_id=session_id)
+        )
+        if gateway_env is not None:
+            env.update(gateway_env)
+            # The ACP wrap forwards only passthrough-named vars to the jcode subprocess,
+            # so name every managed-connect var (JCODE_DBX_TOKEN / JCODE_HOME /
+            # JCODE_RUNTIME_DIR). Preserve any existing value, dedupe, and join.
+            existing = env.get("HARNESS_ACP_ENV_PASSTHROUGH", "").split(",")
+            names = {n.strip() for n in existing if n.strip()} | set(gateway_env)
+            env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(names))
+
     return env
 
 

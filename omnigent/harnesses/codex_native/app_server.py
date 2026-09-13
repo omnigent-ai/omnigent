@@ -63,8 +63,11 @@ from omnigent.inner.codex_executor import (
     read_codex_model_catalog,
     write_codex_hooks_file,
 )
-from omnigent.inner.databricks_executor import _databricks_gateway_host
-from omnigent.models.codex_model_vocabulary import codex_spawn_model
+from omnigent.inner.databricks_executor import (
+    _databricks_gateway_host,
+    _read_databrickscfg_host,
+)
+from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
 from omnigent.process_logging import log_info_once, log_once, redact_log_text
 
 _logger = logging.getLogger(__name__)
@@ -120,6 +123,8 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # (including a version we could not parse) the flag is omitted and the
 # interactive trust prompt may appear instead.
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
+# Codex rejects permission flags on remote resume starting with this release.
+_MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
@@ -1110,7 +1115,10 @@ async def probe_codex_model_options(
     env = _clean_codex_env()
     if launch.profile is not None:
         databricks = await asyncio.to_thread(
-            _databricks_launch_materialization, model=launch.model, profile=launch.profile
+            _databricks_launch_materialization,
+            model=launch.model,
+            profile=launch.profile,
+            codex_path=resolved_codex,
         )
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
@@ -1154,7 +1162,8 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     The Codex executable is part of the key. The catalog holds that
     binary's own answer, so an upgraded CLI must re-probe instead of
     serving model names the previous release printed. The binary is
-    resolved the same way the probe launches it.
+    resolved the same way the probe launches it. Databricks profile keys also
+    include the locally configured host, so repointing a profile is a miss.
 
     :param launch: The resolved launch (``resolve_native_codex_launch``).
     :param codex_path: Optional Codex executable override, matching the
@@ -1163,9 +1172,10 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     """
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
 
+    profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
     return fingerprint_of(
         "codex-native",
-        launch.profile,
+        (launch.profile, (profile_host or "").rstrip("/")) if launch.profile is not None else None,
         launch.model,
         tuple(launch.config_overrides),
         binary_identity(codex_path or _find_codex_cli()),
@@ -1856,13 +1866,16 @@ def _codex_policy_hooks_settings(
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
+    from omnigent.native.tool_observer_hook import hook_settings
+
+    observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
     prompt_submit: list[_JsonObject] = [hook]
     if turn_routing:
         prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
     return {
         "hooks": {
             "PreToolUse": [{"hooks": [hook]}],
-            "PostToolUse": [{"hooks": [hook]}],
+            "PostToolUse": [{"hooks": [hook, observer]}],
             "UserPromptSubmit": [{"hooks": prompt_submit}],
         }
     }
@@ -2324,7 +2337,7 @@ class _DatabricksLaunchMaterialization:
 
 
 def _databricks_launch_materialization(
-    *, model: str | None, profile: str
+    *, model: str | None, profile: str, codex_path: str | None = None
 ) -> _DatabricksLaunchMaterialization:
     """
     Resolve the Databricks-profile routing pieces of a Codex launch.
@@ -2336,6 +2349,7 @@ def _databricks_launch_materialization(
     :param model: Optional explicit model pin; ``None`` resolves the
         catalog default.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+    :param codex_path: Executable whose shared catalog may resolve the model.
     :returns: The materialized overrides, pinned model, and host.
     :raises OSError: When the profile resolves no workspace host.
     """
@@ -2347,10 +2361,7 @@ def _databricks_launch_materialization(
             "with a host visible to the runner process."
         )
     host = host.rstrip("/")
-    # Resolve against what the workspace actually serves (live UC listing →
-    # ucode state → bundled catalog), never the bundled catalog alone — its
-    # legacy ``databricks-`` spellings can 501 on today's gateway.
-    resolved_model = _resolve_databricks_codex_model(host, profile, model)
+    resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
@@ -2363,7 +2374,9 @@ def _databricks_launch_materialization(
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
-def _resolve_databricks_codex_model(host: str, profile: str, requested: str | None) -> str:
+def _resolve_databricks_codex_model(
+    host: str, profile: str, requested: str | None, *, codex_path: str | None = None
+) -> str:
     """Resolve the codex launch model against what the workspace serves.
 
     Codex used to take its model from the bundled MLflow catalog — a
@@ -2375,7 +2388,9 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     then ucode's cached copy of it, then the bundled catalog as the documented
     last resort.
 
-    An explicit model is matched against the servable ids, so a legacy
+    An explicit model first reuses its fresh shared Codex catalog row's model
+    for the same profile, workspace and executable. A miss keeps discovery.
+    The explicit model is matched against the servable ids, so a legacy
     ``model_override`` persisted before this change still launches; one the
     workspace does not serve passes through untouched, because the gateway's
     error beats a silent substitution.
@@ -2384,12 +2399,27 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     :param profile: Databricks CLI profile backing the launch.
     :param requested: Explicit model id, or ``None`` to take the newest
         servable one.
+    :param codex_path: Executable whose shared catalog may resolve the model.
     :returns: The model id to pin on the codex launch.
     """
+    from omnigent.models import model_catalog_store
     from omnigent.models.databricks_model_discovery import (
         discover_databricks_codex_models,
         select_servable_model,
     )
+
+    if requested:
+        profile_host = _read_databrickscfg_host(profile)
+        if profile_host and profile_host.rstrip("/") == host.rstrip("/"):
+            fingerprint = codex_catalog_fingerprint(
+                NativeCodexLaunch([], None, profile), codex_path=codex_path
+            )
+            rows = model_catalog_store.read_catalog("codex-native", fingerprint)
+            if rows and not model_catalog_store.catalog_is_stale("codex-native", fingerprint):
+                slug = codex_reachable_model_slug(requested, rows)
+                model = next((row.get("model") for row in rows if row.get("id") == slug), None)
+                if isinstance(model, str) and model.strip():
+                    return model.strip()
 
     servable: tuple[str, ...] = ()
     try:
@@ -2511,7 +2541,9 @@ def build_codex_native_server(
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
-        databricks = _databricks_launch_materialization(model=model, profile=profile)
+        databricks = _databricks_launch_materialization(
+            model=model, profile=profile, codex_path=resolved_codex
+        )
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
         # A launch that names no model still routes through the profile's
@@ -3165,6 +3197,47 @@ def resolve_native_codex_launch(
             summary=f"Codex config.toml provider {provider_id!r} (ambient fallback)",
         )
 
+    from omnigent.host.databricks_credential import api_key_auth_precludes_broker
+
+    if entry is None and not api_key_auth_precludes_broker(spec):
+        # Managed connect host: no spec/global/ambient provider, but the owner
+        # linked Databricks via the connect flow (host-only [omnigent] profile +
+        # broker sidecar). Route Codex through the workspace gateway, minting the
+        # bearer via the broker — the Codex counterpart to
+        # _connect_broker_claude_config. ucode configure (host boot) populated
+        # ucode state, so the model resolves to a served id. An explicit spec
+        # ApiKeyAuth resolves to None above too, but Codex threads that key
+        # itself, so it must not be rerouted through the owner's gateway.
+        from omnigent.host.databricks_credential import (
+            HOST_DATABRICKS_PROFILE,
+            broker_token_command,
+        )
+        from omnigent.inner.databricks_executor import _read_databrickscfg_host
+
+        connect_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+        if connect_host and broker_token_command(connect_host.rstrip("/")):
+            connect_host = connect_host.rstrip("/")
+            resolved_model = _resolve_databricks_codex_model(
+                connect_host, HOST_DATABRICKS_PROFILE, model
+            )
+            log_info_once(
+                _logger,
+                "native-codex routing: managed connect host — Databricks AI gateway "
+                "via the credential broker (host-only [omnigent] profile + sidecar).",
+            )
+            return NativeCodexLaunch(
+                config_overrides=_databricks_codex_config_overrides(
+                    model=resolved_model,
+                    base_url=_databricks_codex_base_url(connect_host),
+                    auth_command=_databricks_codex_auth_command(
+                        connect_host, HOST_DATABRICKS_PROFILE
+                    ),
+                ),
+                model=resolved_model,
+                profile=None,
+                summary="Databricks AI gateway (managed connect host, broker-minted)",
+            )
+
     if entry is None:
         log_info_once(
             _logger,
@@ -3357,13 +3430,16 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
     return params
 
 
+_CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {
+    "approval_policy": "approvalPolicy",
+    "approvals_reviewer": "approvalsReviewer",
+    "default_permissions": "permissions",
+    "sandbox_mode": "sandbox",
+}
+
+
 def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> None:
-    field = {
-        "approval_policy": "approvalPolicy",
-        "approvals_reviewer": "approvalsReviewer",
-        "default_permissions": "permissions",
-        "sandbox_mode": "sandbox",
-    }.get(key.strip())
+    field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key.strip())
     if field is None:
         return
     value = _codex_config_string(raw_value)
@@ -3376,7 +3452,8 @@ async def preload_codex_thread_for_resume(
     thread_id: str,
     *,
     terminal_launch_args: Sequence[str] | None = None,
-) -> None:
+    retain_client: bool = False,
+) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
 
@@ -3391,15 +3468,18 @@ async def preload_codex_thread_for_resume(
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
     :param terminal_launch_args: Persisted permission overrides for the resumed thread.
-    :returns: None.
+    :param retain_client: Keep the thread subscribed through terminal attachment.
+        The caller must pass the returned client to the forwarder and close it.
+    :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
     client = client_for_transport(
         transport,
         client_name="omnigent-codex-native-preload",
     )
-    await client.connect()
+    retained = False
     try:
+        await client.connect()
         await client.request(
             "thread/resume",
             {
@@ -3408,8 +3488,13 @@ async def preload_codex_thread_for_resume(
                 **_codex_resume_permission_params(terminal_launch_args),
             },
         )
+        if retain_client:
+            retained = True
+            return client
     finally:
-        await client.close()
+        if not retained:
+            await client.close()
+    return None
 
 
 async def apply_codex_thread_effort(
@@ -3453,13 +3538,16 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     """
     Build terminal env overrides for the native Codex TUI.
 
+    The terminal and app-server share resource attributes for telemetry attribution.
+
     :param app_server: Running app-server wrapper.
     :returns: Environment variables for the terminal process.
     """
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
-        if key in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
+        if key
+        in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 
@@ -3545,12 +3633,53 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     return cleaned
 
 
+def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str]:
+    """Omit permissions configured on the app-server at startup or thread/resume."""
+    args = _strip_approval_sandbox_flags(codex_args)
+    cleaned: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        width = 1
+        if arg in {"-c", "--config"} and index + 1 < len(args):
+            assignment = args[index + 1]
+            width = 2
+        elif arg.startswith(("-c=", "--config=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, separator, raw_value = assignment.partition("=")
+            # Leave unsupported settings for Codex to validate, rather than
+            # silently dropping a policy that preload does not apply.
+            if (
+                separator
+                and key.strip() in _CODEX_RESUME_PERMISSION_CONFIG_FIELDS
+                and _codex_config_string(raw_value)
+            ):
+                index += width
+                continue
+        cleaned.append(arg)
+        index += 1
+    return cleaned
+
+
+def codex_remote_resume_omits_permission_args(
+    codex_cli_version: tuple[int, int, int] | None,
+) -> bool:
+    """Whether remote resume needs a retained preload instead of permission flags."""
+    return (
+        codex_cli_version is None
+        or codex_cli_version >= _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION
+    )
+
+
 def build_codex_remote_args(
     *,
     codex_args: tuple[str, ...],
     thread_id: str | None,
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
+    codex_cli_version: tuple[int, int, int] | None = None,
     bypass_sandbox: bool = False,
     bypass_hook_trust: bool = False,
 ) -> list[str]:
@@ -3585,7 +3714,8 @@ def build_codex_remote_args(
         settings already cover everything.
     :param thread_id: Codex thread id to resume, e.g. ``"thread_abc123"``.
         ``None`` starts a fresh remote Codex TUI thread instead of
-        resuming an existing one.
+        resuming an existing one. On Codex 0.154+, omit terminal permission
+        args; app-server startup and preload still configure the thread.
     :param remote_url: App-server endpoint the TUI attaches to, e.g.
         ``"unix:///home/user/.omnigent/codex-native/x/app-server.sock"``
         or ``"ws://127.0.0.1:9876"``.
@@ -3594,14 +3724,19 @@ def build_codex_remote_args(
         ``('model="databricks-gpt-5-5"', 'model_provider="omnigent_databricks"')``.
         Each is emitted as a ``-c <value>`` global flag. Empty for a
         plain Codex-login launch that needs no provider routing.
-    :param bypass_sandbox: When ``True``, emit a single
+    :param codex_cli_version: Probed app-server CLI version. Before 0.154,
+        preserve permission flags because a remote TUI can reapply its own
+        defaults on attach. ``None`` uses the 0.154+ compatible arguments.
+    :param bypass_sandbox: When ``True`` for a fresh thread or a pre-0.154
+        resume, emit a single
         ``--dangerously-bypass-approvals-and-sandbox`` flag and strip any
         conflicting ``--sandbox`` / ``--ask-for-approval`` pairs from
         *codex_args* (codex aborts at startup if the bypass flag is
         combined with either). DANGEROUS: this disables both the approval
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
-        the granular flags untouched. See issue #657.
+        the granular flags untouched. On Codex 0.154+, resumed terminals
+        omit these flags and use the existing preload path. See issue #657.
     :param bypass_hook_trust: When ``True``, emit
         ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
         hooks without the interactive "Hooks need review" trust prompt.
@@ -3629,7 +3764,13 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
-    return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+    if not codex_remote_resume_omits_permission_args(codex_cli_version):
+        return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+    # Codex rejects explicit permission overrides on remote resume, even
+    # when they match the app-server policy. config_overrides went to server
+    # startup; codex_args went to preload's thread/resume call.
+    resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
+    return [*resume_args, "resume", "--remote", remote_url, thread_id]
 
 
 def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:

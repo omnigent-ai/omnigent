@@ -69,12 +69,14 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxHostLauncher,
     render_host_config_write_command,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from kubernetes import client as k8s_client
+
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
 _logger = logging.getLogger(__name__)
@@ -471,9 +473,7 @@ def _token_secret_name(job_name: str) -> str:
 
 def _render_workspace_prep_command(
     workspace: str,
-    clone_dir: str | None,
-    repo_url: str | None,
-    repo_branch: str | None,
+    repos: Sequence[RepoWorkspace],
     server_url: str,
     host_id: str,
     host_config: dict[str, object] | None = None,
@@ -481,46 +481,61 @@ def _render_workspace_prep_command(
     """
     Render the init container command that prepares the workspace.
 
-    Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
-    requested, and merges *host_config* into ``config.yaml`` under
-    ``$OMNIGENT_CONFIG_HOME`` or the default ``~/.omnigent`` when set — all
-    BEFORE the host starts. Running in an init container means a failure
-    terminates the init container non-zero — surfaced fast by the start wait
-    with the error as the container log tail — rather than silently leaving the
-    host without its workspace or provider config.
+    Creates ``<workspace>``, clones each requested repository into
+    ``<workspace>/<repo_name>`` **in parallel**, and merges *host_config* into
+    ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default
+    ``~/.omnigent`` when set — all BEFORE the host starts. Running in an init
+    container means a failure terminates the init container non-zero — surfaced
+    fast by the start wait with the error as the container log tail — rather
+    than silently leaving the host without its workspace or provider config.
 
     :param workspace: The workspace root to create, e.g. ``"/home/omnigent/workspace"``.
-    :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
-    :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
-    :param repo_branch: Branch to clone (``--branch … --single-branch``), or
-        ``None`` for the default branch.
+    :param repos: Repositories to clone into ``<workspace>/<repo_name>``; empty
+        for an empty workspace.
     :param host_config: Deployment-supplied config content to merge in (lands
         under the same config directory seen by the host container), or
         ``None``.
     :returns: The ``["bash", "-lc", script]`` command.
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
-    if repo_url is not None and clone_dir is not None:
+    if repos:
         # Prefer the owner's per-user credential for the clone: when they've
         # connected GitHub, wire the broker as the sole github.com helper so a
-        # private clone authenticates as *them*. When they haven't connected this
-        # is a no-op that leaves the image's shared ``$GIT_TOKEN`` helper in
-        # place; ``|| true`` keeps a broker hiccup from failing the clone (it
-        # then falls back to ``$GIT_TOKEN``). Needs OMNIGENT_HOST_TOKEN in-env.
+        # private clone authenticates as *them*. Wired ONCE (it configures the
+        # global github.com helper for every clone below). When they haven't
+        # connected this is a no-op that leaves the image's shared ``$GIT_TOKEN``
+        # helper in place; ``|| true`` keeps a broker hiccup from failing the
+        # clone (it then falls back to ``$GIT_TOKEN``). Needs OMNIGENT_HOST_TOKEN.
         wire = (
             "from omnigent.git_credential_github import configure_clone_credentials; "
             f"configure_clone_credentials({server_url!r}, {host_id!r})"
         )
         script += f"python3 -c {shlex.quote(wire)} || true\n"
-        # ``--`` separates options from the (already-validated) URL so it can
-        # never be parsed as a flag; --single-branch keeps branch-pinned clones
-        # fast. Auth: the broker (above, if connected) else the image's GIT_TOKEN.
-        branch = (
-            f"--branch {shlex.quote(repo_branch)} --single-branch "
-            if repo_branch is not None
-            else ""
-        )
-        script += f"git clone {branch}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}\n"
+        # Clone every repo concurrently, then wait on each and fail the init
+        # container if ANY clone failed — a half-populated workspace must abort
+        # the launch loudly, not boot the host on it. ``set -e`` stays on, but a
+        # backgrounded failure doesn't trip it; the explicit per-pid exit-code
+        # check below does. ``--`` separates options from the (already-validated)
+        # URL so it can never be parsed as a flag; --single-branch keeps
+        # branch-pinned clones fast.
+        # ponytail: unbounded fan-out; add `xargs -P <n>` if huge repo sets on a
+        # 2-vCPU pod ever thrash.
+        script += "pids=''\n"
+        # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
+        # shared clone dir would fail the concurrent clones, so disambiguate.
+        for repo, dirname in zip(repos, clone_dir_names(repos), strict=True):
+            clone_dir = f"{workspace}/{dirname}"
+            branch = (
+                f"--branch {shlex.quote(repo.branch)} --single-branch "
+                if repo.branch is not None
+                else ""
+            )
+            script += (
+                f"git clone {branch}-- {shlex.quote(repo.url)} "
+                f'{shlex.quote(clone_dir)} & pids="$pids $!"\n'
+            )
+        script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
+        script += '[ "$rc" -eq 0 ]\n'
     if host_config is not None:
         script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]
@@ -593,9 +608,7 @@ def build_job_manifest(
     env_literals: dict[str, str],
     node_selector: dict[str, str] | None,
     workspace: str,
-    clone_dir: str | None = None,
-    repo_url: str | None = None,
-    repo_branch: str | None = None,
+    repos: Sequence[RepoWorkspace] = (),
     host_config: dict[str, object] | None = None,
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
@@ -696,9 +709,8 @@ def build_job_manifest(
         a default ``kubernetes.io/arch: amd64``; an operator-supplied
         ``kubernetes.io/arch`` entry overrides the default.
     :param workspace: Absolute workspace root created by the init container.
-    :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
-    :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
-    :param repo_branch: Branch to clone, or ``None`` for the default branch.
+    :param repos: Repositories the init container clones into
+        ``<workspace>/<repo_name>`` in parallel; empty for an empty workspace.
     :param host_config: Deployment-supplied config content merged in by the
         init container under the host's resolved config directory, or ``None``.
         Non-secret by design:
@@ -787,7 +799,7 @@ def build_job_manifest(
         )
 
     init_env: list[dict[str, object]] = [{"name": "HOME", "value": _HOME_DIR}]
-    if repo_url is not None:
+    if repos:
         # The clone wires the per-user broker when the owner has connected GitHub
         # (see _render_workspace_prep_command), which reads the launch token from
         # the env — project it the same way the host container does. Only added
@@ -833,7 +845,7 @@ def build_job_manifest(
         "image": image,
         "workingDir": _HOME_DIR,
         "command": _render_workspace_prep_command(
-            workspace, clone_dir, repo_url, repo_branch, server_url, host_id, host_config
+            workspace, repos, server_url, host_id, host_config
         ),
         "env": init_env,
         "resources": pod_resources,
@@ -1138,6 +1150,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             resume_stopped=True,
             programmatic_terminate=True,
             classifies_runner_by_agent=True,
+            # The init container clones repos in parallel. agent-sandbox
+            # inherits this; managed Databricks launchers (Lakebox, Arca, …)
+            # are on the exec-model branch and stay single-repo until they
+            # opt in themselves.
+            multi_repo=True,
         )
 
     def __init__(
@@ -1409,9 +1426,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
@@ -1424,9 +1439,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param host_id: Server-chosen host identity.
         :param host_name: Server-chosen host display name.
         :param server_url: URL the host dials back to.
-        :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
-        :param repo_branch: Branch to clone, or ``None`` for the default branch.
-        :param repo_name: Directory the clone lands in, or ``None``.
+        :param repos: Repositories the init container clones into
+            ``<workspace>/<repo_name>`` in parallel; empty for an empty
+            workspace. The returned path is the single clone directory when one
+            repo is cloned, else the workspace root parenting them all.
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content the init container merges in before the host starts, or
             ``None``.
@@ -1447,7 +1463,6 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         env_literals = self._resolve_sandbox_env()
         secret_name = _token_secret_name(sandbox_id)
         workspace = f"{_HOME_DIR}/workspace"
-        clone_dir = f"{workspace}/{repo_name}" if repo_name else None
         if on_stage is not None:
             on_stage("starting")
         core = self._load_core()
@@ -1470,9 +1485,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     env_literals=env_literals,
                     node_selector=self._node_selector,
                     workspace=workspace,
-                    clone_dir=clone_dir,
-                    repo_url=repo_url,
-                    repo_branch=repo_branch,
+                    repos=repos,
                     host_config=host_config,
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
@@ -1510,7 +1523,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         finally:
             self._close_clients()
         click.echo(f"  → {self.workload_kind} '{sandbox_id}' is starting the host")
-        return clone_dir or workspace
+        # One repo → drop the agent straight into it; several (or none) → the
+        # workspace root that parents every clone.
+        return f"{workspace}/{repos[0].repo_name}" if len(repos) == 1 else workspace
 
     def _create_workload(self, namespace: str, manifest: dict[str, object]) -> None:
         """

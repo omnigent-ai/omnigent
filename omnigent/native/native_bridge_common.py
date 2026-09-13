@@ -2,14 +2,15 @@
 
 Each native coding-agent harness (claude / codex / antigravity / opencode /
 pi) keeps a per-session bridge directory under its own bridge root holding the
-``bridge.json`` token, MCP/policy config, and ``permission_hook.json``. When a
-launcher crashes or a session is abandoned, that directory is left behind and
-accumulates — each one holds bearer-token / auth material.
+``bridge.json`` token, MCP/policy config, and hook state. Some harnesses also
+co-locate persistent resume state there. When a launcher crashes or a session
+is abandoned, disposable bridge material must be reclaimed without deleting
+state the native runtime needs to resume.
 
-To reap those, every bridge dir carries an ``owner.pid`` marker naming the
-process that prepared it. The marker is refreshed on every turn's bridge prep,
-so it always names the *current* runner; a periodic startup sweep removes dirs
-whose owner is provably dead while leaving live and unmarked dirs untouched.
+Every bridge dir carries an ``owner.pid`` marker naming the process that
+prepared it. The marker is refreshed on every turn's bridge prep. The sweep
+considers dirs whose owner is provably dead while leaving live and unmarked
+dirs alone; harnesses may apply an additional retention policy.
 
 This module factors the marker write and the per-root sweep so all five
 harnesses share one implementation (the per-harness modules only supply their
@@ -26,6 +27,7 @@ import importlib
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 _logger = logging.getLogger(__name__)
@@ -49,14 +51,20 @@ def write_owner_pid_marker(bridge_dir: Path) -> None:
         (bridge_dir / OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
 
 
-def prune_orphaned_dirs(bridge_root: Path) -> int:
+def prune_orphaned_dirs(
+    bridge_root: Path,
+    *,
+    should_prune: Callable[[Path], bool] | None = None,
+) -> int:
     """
     Remove per-session bridge dirs under *bridge_root* whose owner is dead.
 
     The in-run analog of the terminal/process orphan sweeps: scans
-    *bridge_root* and rmtrees each immediate child dir whose ``owner.pid``
-    marker names a process that no longer exists. Conservative in the
-    dangerous direction — a reused/foreign pid reads as alive and is left.
+    *bridge_root* and removes each immediate child dir whose ``owner.pid``
+    marker names a process that no longer exists. A harness may provide an
+    additional eligibility predicate, such as a minimum inactivity period.
+    Conservative in the dangerous direction — a reused/foreign pid reads as
+    alive and is left.
     The check-then-rmtree race (a pid reused between the liveness read and
     the removal) is accepted: it is benign because a live session refreshes
     its marker every turn, so only genuinely orphaned dirs reach removal.
@@ -67,6 +75,9 @@ def prune_orphaned_dirs(bridge_root: Path) -> int:
 
     :param bridge_root: The harness's bridge root, e.g.
         ``~/.omnigent/codex-native``.
+    :param should_prune: Optional harness-specific eligibility predicate called
+        only after the owner is proven dead. ``None`` removes every dead-owner
+        directory.
     :returns: The number of orphaned bridge dirs removed.
     """
     if not bridge_root.exists():
@@ -84,11 +95,14 @@ def prune_orphaned_dirs(bridge_root: Path) -> int:
             continue
         if _process_alive(pid):
             continue
-        # Accepted residual race: the owner pid could in principle be reused
-        # by a new live process between this check and the rmtree below. The
-        # window is tiny and benign here — a live session refreshes its
-        # owner.pid every turn, so its dir always reads as live at check time
-        # and only a genuinely orphaned dir reaches this point.
+        if should_prune is not None:
+            try:
+                eligible = should_prune(entry)
+            except Exception:
+                _logger.exception("Error checking orphaned bridge dir %s", entry)
+                continue
+            if not eligible:
+                continue
         shutil.rmtree(entry, ignore_errors=True)
         pruned += 1
     return pruned

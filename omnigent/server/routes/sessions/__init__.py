@@ -239,6 +239,8 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_SESSION_STATUS_TYPE as _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_STATUS_VALUES as _EXTERNAL_SESSION_STATUS_VALUES,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE as _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_BTW_SIDECHAT_TYPE as _EXTERNAL_BTW_SIDECHAT_TYPE,
+    _EXTERNAL_BTW_DISMISS_TYPE as _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_SESSION_TITLE_TYPE as _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE as _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE as _EXTERNAL_SESSION_USAGE_TYPE,
@@ -369,6 +371,7 @@ from omnigent.server.routes._sessions.helpers import (
     _child_session_current_task_status_from_cached_status as _child_session_current_task_status_from_cached_status,
     _child_session_summary_from_conversation as _child_session_summary_from_conversation,
     _claude_native_remember_host as _claude_native_remember_host,
+    _claude_subagent_display_tool as _claude_subagent_display_tool,
     _client_supplied_hook_elicitation_id as _client_supplied_hook_elicitation_id,
     _codex_plan_mode_enabled as _codex_plan_mode_enabled,
     _codex_subagent_display_tool as _codex_subagent_display_tool,
@@ -404,6 +407,7 @@ from omnigent.server.routes._sessions.helpers import (
     _host_model_options_via_registry as _host_model_options_via_registry,
     _if_none_match_matches as _if_none_match_matches,
     _invalidate_runner_backed_snapshot_state as _invalidate_runner_backed_snapshot_state,
+    _is_claude_native_subagent as _is_claude_native_subagent,
     _is_codex_native_subagent as _is_codex_native_subagent,
     _is_kiro_native_session as _is_kiro_native_session,
     _last_task_error_from_labels as _last_task_error_from_labels,
@@ -478,6 +482,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_policy_denied as _publish_policy_denied,
     _publish_policy_deny as _publish_policy_deny,
     _publish_runner_skills as _publish_runner_skills,
+    _publish_btw_sidechat as _publish_btw_sidechat,
     _publish_session_created as _publish_session_created,
     _publish_session_superseded as _publish_session_superseded,
     _publish_status as _publish_status,
@@ -601,6 +606,7 @@ from omnigent.server.routes._sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
+    _context_labels_from_turn_usage as _context_labels_from_turn_usage,
     _bind_and_launch_managed_runner as _bind_and_launch_managed_runner,
     _build_native_terminal_message_event as _build_native_terminal_message_event,
     _build_session_list_item as _build_session_list_item,
@@ -980,6 +986,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         agent_cache=agent_cache,
+        host_registry=host_registry,
     )
 
     return router

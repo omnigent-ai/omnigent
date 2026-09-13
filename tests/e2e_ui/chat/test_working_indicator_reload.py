@@ -849,3 +849,133 @@ def test_settled_fold_holds_through_scheduled_wake(
     expect(fold.nth(1)).to_be_visible(timeout=15_000)
     assert fold.count() == 2
     assert page.locator(_ASSISTANT_BUBBLE).count() == 2
+
+
+_LATENCY_QUESTION = (
+    "can you help me understand the definition of this latency? "
+    "what's the start time and what's the end time"
+)
+_LATENCY_ANSWER = (
+    "It is end-to-end launch latency: wall-clock seconds from asking to launch the "
+    "job to user code running on the GPU pod.\n\n"
+    "The start clock is captured in the Makefile right before it invokes `air run`; "
+    "the end clock is the first line of the job's command block on the remote pod."
+)
+_TASK_NOTIFICATION = "\n".join(
+    [
+        "<task-notification>",
+        "<task-id>b3f9a2c1d</task-id>",
+        "<tool-use-id>toolu_bdrk_01Xy7Q2PfLm8RkVn3Ws4Tz9A</tool-use-id>",
+        "<output-file>/tmp/claude/tasks/b3f9a2c1d.output</output-file>",
+        "<status>completed</status>",
+        (
+            '<summary>Background command "air run -f cases/latency_launch_hello_world/run.yml" '
+            + "completed (exit code 0)</summary>"
+        ),
+        "</task-notification>",
+    ]
+)
+_RUNS_SUMMARY = (
+    "Both additional runs succeeded.\n\n"
+    "**df1 latency_launch_hello_world (civ4) — 3 runs total**\n\n"
+    "| # | Launch latency (s) | Run |\n|---|---|---|\n"
+    "| 1 | 40 | 864427556073297 |\n| 2 | 35 | 60354668994037 |\n| 3 | 37 | 236213654141952 |"
+)
+
+
+def _assert_answer_outside_fold(page: Page) -> None:
+    """Assert the pre-wake answer and the wake marker render, with one fold.
+
+    :param page: Playwright page fixture.
+    :returns: None.
+    """
+    fold = page.locator(_FOLD)
+    expect(fold.first).to_be_visible(timeout=15_000)
+    expect(fold).to_have_count(1)
+    # The answer Claude finished BEFORE the wake must stay readable without
+    # expanding anything; folding it behind the follow-up work is the bug.
+    expect(page.get_by_text("It is end-to-end launch latency", exact=False)).to_be_visible()
+    marker = page.get_by_test_id("system-message")
+    expect(marker).to_be_visible()
+    expect(marker).to_contain_text("Background task completed")
+    expect(page.get_by_text("Both additional runs succeeded.", exact=False)).to_be_visible()
+    expect(page.locator(_ASSISTANT_BUBBLE)).to_have_count(2)
+
+
+def test_background_task_wake_keeps_prior_answer_visible(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A finished answer stays visible when Claude resumes on a background task.
+
+    Claude Code reports a finished background shell task by injecting a
+    ``<task-notification>`` user entry and starting a NEW turn on it, with
+    no human message in between. The claude-native forwarder mirrors that
+    entry as an ``is_meta`` user item. Grouping every assistant item after
+    the real user message into one bubble folded the already-complete
+    answer behind the follow-up work's "Worked for" row, so the chat showed
+    only the wrap-up text while the terminal showed the answer.
+
+    The wake must render as a muted system marker that starts a new bubble:
+    the answer keeps its own bubble and only the follow-up work folds. The
+    wire order below is the one observed live (answer, idle edge, hidden
+    notification, running edge, tool work, wrap-up, idle edge). Asserted
+    live and again after a reload, because both views must agree.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+
+    _seed_user_message(base_url, session_id, text=_LATENCY_QUESTION, response_id="resp_q")
+    _publish_status(base_url, session_id, "running", response_id="resp_answer")
+    _seed_assistant_message(base_url, session_id, text=_LATENCY_ANSWER, response_id="resp_answer")
+    _publish_status(base_url, session_id, "idle", response_id="resp_answer")
+    expect(page.get_by_text("It is end-to-end launch latency", exact=False)).to_be_visible(
+        timeout=15_000
+    )
+
+    # Claude Code wakes on the finished background task: a hidden meta user
+    # entry, then a fresh turn's running edge and its tool work.
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="message",
+        item_data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": _TASK_NOTIFICATION}],
+        },
+        response_id="resp_wake",
+    )
+    _publish_status(base_url, session_id, "running", response_id="resp_followup")
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Both background runs finished — pulling their launch metrics.",
+        response_id="resp_followup",
+    )
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id="resp_followup",
+        call_id="call_wake_runs",
+        arguments='{"command": "air runs list --latest 2 --format json"}',
+        output=(
+            '[{"run": "864427556073297", "launch_s": 40}, '
+            '{"run": "60354668994037", "launch_s": 35}]\n'
+        ),
+    )
+    _seed_assistant_message(base_url, session_id, text=_RUNS_SUMMARY, response_id="resp_followup")
+    _publish_status(base_url, session_id, "idle", response_id="resp_followup")
+
+    _assert_answer_outside_fold(page)
+
+    page.reload()
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+    _assert_answer_outside_fold(page)

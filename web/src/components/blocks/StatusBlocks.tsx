@@ -50,7 +50,7 @@ interface ErrorBannerProps {
   remediation?: string;
   /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
   level?: "error" | "info";
-  /** Reconnect the existing session without replaying or duplicating user input. */
+  /** Recover the existing session or continue after a retryable turn failure. */
   onRetry?: () => Promise<void>;
 }
 
@@ -75,6 +75,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",
   native_turn_error: "The agent ran into an error during this turn.",
+  rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -83,6 +84,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
+  "rate_limit_exceeded",
 ]);
 
 interface ParsedErrorMessage {
@@ -224,7 +226,7 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          Reconnecting
+          {code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
         </Badge>
       </div>
     );

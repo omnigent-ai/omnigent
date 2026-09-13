@@ -634,6 +634,7 @@ def create_hosts_router(
                     # emitted as-is so a client can tell "unknown" from "not
                     # gateway-backed".
                     "gateway_inference": host_registry.gateway_inference(host.host_id),
+                    "interactive_shells": host_registry.interactive_shells(host.host_id),
                 }
             )
         return {"hosts": result}
@@ -676,6 +677,7 @@ def create_hosts_router(
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
+            "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
         }
 
