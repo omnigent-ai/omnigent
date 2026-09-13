@@ -1867,7 +1867,10 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
             )
             await expect(model).to_contain_text("Harness default")
-            await expect(effort).to_contain_text("Default")
+            await expect(effort).to_have_count(0)
+            await expect(
+                page.get_by_role("menuitemcheckbox", name="Default", exact=True)
+            ).to_have_count(0)
 
             # Model and effort picks commit immediately using the live host catalog.
             await page.get_by_role("menuitemcheckbox", name="Opus 4.8", exact=True).click()
