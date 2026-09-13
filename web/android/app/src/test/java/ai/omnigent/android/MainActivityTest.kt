@@ -1,5 +1,6 @@
 package ai.omnigent.android
 
+import android.app.NotificationManager
 import android.content.Context
 import android.content.RestrictionsManager
 import android.content.res.Configuration
@@ -8,6 +9,7 @@ import android.os.Looper
 import android.text.TextUtils
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.widget.TextView
@@ -16,6 +18,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -325,12 +328,79 @@ class MainActivityTest {
         assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
     }
 
+    @Test
+    fun `pinned page load binds an accounts-mode WebView login and clears prior account state`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val origin = "https://example.com"
+        val tokenB = jwt("user-b")
+        val store = seedPriorAccount(context, origin)
+        CookieManager.getInstance().setCookie(origin, "__Host-ap_session=$tokenB")
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.invokePageReady("$origin/")
+
+        assertEquals(sessionAccountIdentity(origin, tokenB), store.lastAccountIdentity())
+        assertTrue(store.load().isEmpty())
+        val systemNotifications = context.getSystemService(NotificationManager::class.java)
+        assertEquals(0, shadowOf(systemNotifications).size())
+    }
+
+    @Test
+    fun `pinned login page unbinds an accounts-mode WebView logout`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val origin = "https://example.com"
+        CookieManager.getInstance().removeAllCookies(null)
+        val store = seedPriorAccount(context, origin)
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.invokePageReady("$origin/login")
+
+        assertNull(store.lastAccountIdentity())
+        assertTrue(store.load().isEmpty())
+        val systemNotifications = context.getSystemService(NotificationManager::class.java)
+        assertEquals(0, shadowOf(systemNotifications).size())
+    }
+
+    /**
+     * Seed the store + notifications with a prior account "user-a" (bound,
+     * a persisted snapshot, and a leftover per-session notification), returning
+     * the store the account-transition tests then assert against.
+     */
+    private fun seedPriorAccount(
+        context: Context,
+        origin: String,
+    ): SessionSnapshotStore {
+        ServerStore(context).connect(origin)
+        val store = SessionSnapshotStore(context)
+        val accountA = sessionAccountIdentity(origin, jwt("user-a"))
+        store.bindAccount(accountA) {}
+        assertTrue(
+            store.saveIfCurrentAccount(
+                mapOf("conv_a" to SessionSnapshot("running", 0)),
+                store.generation(),
+                accountA,
+            ),
+        )
+        NativeNotificationManager(context).notify("A", "finished", "/c/conv_a", tag = "conv_a")
+        return store
+    }
+
     private fun MainActivity.webView(): WebView =
         MainActivity::class
             .java
             .getDeclaredField("webView")
             .apply { isAccessible = true }
             .get(this) as WebView
+
+    private fun MainActivity.invokePageReady(url: String) {
+        MainActivity::class
+            .java
+            .getDeclaredMethod("onPageReady", String::class.java)
+            .apply { isAccessible = true }
+            .invoke(this, url)
+    }
+
+    private fun jwt(subject: String): String = TestJwt.forSubject(subject)
 
     private fun launch(): MainActivity {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")

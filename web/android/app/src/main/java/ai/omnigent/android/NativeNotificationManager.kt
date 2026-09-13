@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import java.util.concurrent.atomic.AtomicInteger
@@ -44,6 +45,18 @@ class NativeNotificationManager(
     private var lastBadge: BadgeState? = null
 
     init {
+        ensureChannel()
+    }
+
+    /**
+     * Create the notification channel, idempotently. `createNotificationChannel`
+     * is a no-op when the channel already exists, so this is cheap to call
+     * repeatedly. Exposed (and re-run from the constructor) so a WorkManager-only
+     * process — one that spawned in the background with no Activity ever
+     * on-screen — still has the channel before it posts; otherwise an O+ post to
+     * a missing channel is silently dropped. A no-op on pre-O.
+     */
+    fun ensureChannel() {
         val channel =
             NotificationChannel(
                 CHANNEL_ID,
@@ -57,8 +70,20 @@ class NativeNotificationManager(
         title: String,
         body: String?,
         navigatePath: String?,
+        // A caller-supplied STABLE id (e.g. per-session, via notificationIdFor)
+        // so a re-fire updates the same notification instead of stacking, and
+        // distinct subjects never collide. When null, an incrementing per-
+        // instance id is used — fine for one-off in-app toasts, but NOT for the
+        // background worker, which builds a fresh manager each run (the counter
+        // would restart and collide across runs).
+        notificationId: Int? = null,
+        // Optional notification TAG (e.g. the session id). Distinct session ids
+        // can share a String.hashCode-derived numeric id ("Aa"/"BB"), so tagging
+        // with the full session id is what actually guarantees distinctness —
+        // the numeric id stays stable so a re-fire still updates in place.
+        tag: String? = null,
     ) {
-        val id = nextId.getAndIncrement()
+        val id = notificationId ?: nextId.getAndIncrement()
         val builder =
             NotificationCompat
                 .Builder(context, CHANNEL_ID)
@@ -72,7 +97,7 @@ class NativeNotificationManager(
             builder.setContentIntent(activationIntent(navigatePath, id))
         }
 
-        post(id, builder.build())
+        post(id, builder.build(), tag)
     }
 
     /**
@@ -132,6 +157,17 @@ class NativeNotificationManager(
     }
 
     /**
+     * Cancel every notification this app has posted. Called on a fresh login so
+     * per-session notifications (id >= 2) left over from the PRIOR account don't
+     * linger — they'd expose the old account's titles and deep-link into its
+     * session ids. The badge (id 1) is withdrawn too; the web layer re-pushes
+     * the current count on its next tick, so it self-heals for the new account.
+     */
+    fun cancelAll() {
+        manager.cancelAll()
+    }
+
+    /**
      * Post a notification, tolerating a missing notification grant. The
      * `POST_NOTIFICATIONS` permission is revocable on API 33+, so `notify` can
      * throw `SecurityException` even after `areNotificationsEnabled()` — we drop
@@ -140,18 +176,27 @@ class NativeNotificationManager(
     private fun post(
         id: Int,
         notification: Notification,
+        tag: String? = null,
     ) {
         if (!manager.areNotificationsEnabled()) return
         try {
-            manager.notify(id, notification)
+            // Tag-qualified post: (tag, id) is the notification key, so two
+            // sessions whose hash-derived numeric ids collide still coexist.
+            // cancelAll() (the only cancel path for tagged posts) cancels
+            // tagged and untagged notifications alike.
+            manager.notify(tag, id, notification)
         } catch (_: SecurityException) {
             // POST_NOTIFICATIONS not granted — drop; web falls back.
         }
     }
 
-    // requestCode is the notification's own id, so each notification gets a
-    // distinct PendingIntent — otherwise FLAG_UPDATE_CURRENT would let two paths
-    // with colliding hashes overwrite each other's extras and mis-route a tap.
+    // requestCode is the notification's own id AND the intent carries a unique
+    // data Uri derived from navigatePath: PendingIntents are keyed by
+    // (requestCode, Intent.filterEquals), and filterEquals ignores extras — so
+    // two paths whose hash-derived ids collide would otherwise share one
+    // PendingIntent, FLAG_UPDATE_CURRENT would overwrite its extras, and both
+    // taps would mis-route to the later path. The data Uri makes the intents
+    // non-filterEqual even on an id collision.
     private fun activationIntent(
         navigatePath: String,
         requestCode: Int,
@@ -159,6 +204,7 @@ class NativeNotificationManager(
         val intent =
             Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                data = Uri.parse("omnigent://notification$navigatePath")
                 putExtra(EXTRA_NAVIGATE_PATH, navigatePath)
             }
         return PendingIntent.getActivity(
