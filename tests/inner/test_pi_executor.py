@@ -677,6 +677,49 @@ class TestBuildModelsJson(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def test_anthropic_only_family_routes_non_claude_model_to_anthropic_surface():
+    # A provider configuring only an anthropic family (a vendor whose
+    # anthropic-wire endpoint also fronts non-Claude-named models, e.g.
+    # moonshot serving kimi at /anthropic) must route a non-claude model to
+    # that configured surface. Routing by name token instead sent the model
+    # to the completions provider against a fabricated /serving-endpoints
+    # path that only exists on a Databricks workspace, so the vendor
+    # answered 404 url.not_found.
+    result = _build_models_json(
+        "https://api.moonshot.ai",
+        "tok",
+        {"claude": "https://api.moonshot.ai/anthropic"},
+        model="kimi-k2.7-code",
+    )
+    p = result["providers"]
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "kimi-k2.7-code" in anthropic_ids
+    assert p["databricks-anthropic"]["baseUrl"] == "https://api.moonshot.ai/anthropic"
+    for name, provider in p.items():
+        if name != "databricks-anthropic":
+            ids = [e.get("id") for e in provider.get("models", [])]
+            assert "kimi-k2.7-code" not in ids, name
+
+
+def test_openai_only_family_routes_claude_named_model_to_openai_surface():
+    # Symmetric: a provider configuring only an openai family that serves a
+    # Claude-named id (a LiteLLM-style passthrough) must keep that model on
+    # the configured openai surface. The name heuristic sent it to the
+    # anthropic provider against a fabricated /serving-endpoints/anthropic
+    # path. Configured families win over name tokens in both directions.
+    result = _build_models_json(
+        "https://gw.example.com",
+        "tok",
+        {"openai": "https://gw.example.com/v1"},
+        model="claude-k2.7",
+    )
+    p = result["providers"]
+    completions_ids = [e.get("id") for e in p["databricks-completions"]["models"]]
+    assert "claude-k2.7" in completions_ids
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "claude-k2.7" not in anthropic_ids
+
+
 class TestGenerateExtensionJs(unittest.TestCase):
     def test_contains_tool_names(self):
         schemas = [

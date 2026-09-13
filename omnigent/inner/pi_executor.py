@@ -863,6 +863,7 @@ def _build_models_json(
                 model,
                 wire_catalog.get(model.lower()),
                 generic_openai_wire_api=generic_openai_wire_api,
+                only_family=_only_configured_family(base_urls),
             )
         ]
         if not any(entry.get("id") == model for entry in provider["models"]):
@@ -910,15 +911,50 @@ def _pi_needs_responses_api(
     return "gpt" in lower
 
 
+def _only_configured_family(base_urls: Mapping[str, str] | None) -> str | None:
+    """Return the lone family key when a provider configures exactly one.
+
+    An empty URL counts as unconfigured — the reading
+    :func:`_build_models_json` itself gives the dict — so a lone family with
+    an empty URL is not "configured" and never pins routing.
+
+    :param base_urls: Provider base URLs keyed by family (``"claude"`` /
+        ``"openai"``), from ucode state or a provider entry.
+    :returns: The single configured family, or ``None`` when both families
+        (or neither) carry a URL.
+    """
+    families = [family for family, url in (base_urls or {}).items() if url]
+    if len(families) == 1:
+        return families[0]
+    return None
+
+
 def _pi_provider_for_model(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
     *,
     generic_openai_wire_api: str | None = None,
+    only_family: str | None = None,
 ) -> str:
-    """Return the Pi provider name to use for a given Databricks model."""
+    """Return the Pi provider name to use for a given Databricks model.
+
+    :param model: Model id to route.
+    :param wire_apis: Catalog-reported wire surfaces, when known.
+    :param generic_openai_wire_api: Configured wire for a generic
+        (non-Databricks) OpenAI-compatible provider.
+    :param only_family: The lone family a provider entry configures, from
+        :func:`_only_configured_family`. A one-family provider has no other
+        real endpoint, so every dynamically-registered model routes to that
+        family's surface regardless of name tokens; name heuristics would
+        otherwise pick a provider whose base URL was fabricated for the
+        Databricks workspace host and 404 at the vendor.
+    """
     lower = model.lower()
-    if "claude" in lower:
+    if "claude" in lower and only_family != "openai":
+        return "databricks-anthropic"
+    # A claude-only provider fronts non-Claude-named ids (e.g. moonshot
+    # serving kimi) on its anthropic wire, so they route there too.
+    if only_family == "claude":
         return "databricks-anthropic"
     if generic_openai_wire_api is not None:
         if generic_openai_wire_api == RESPONSES_WIRE_API:
@@ -2374,6 +2410,7 @@ class PiExecutor(Executor):
                 effective_model,
                 wire_catalog.get(effective_model.lower()),
                 generic_openai_wire_api=self._generic_openai_wire_api(),
+                only_family=_only_configured_family(self._base_urls_override),
             )
             pi_model = f"{provider}/{effective_model}"
         else:
