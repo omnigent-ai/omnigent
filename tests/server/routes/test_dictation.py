@@ -135,6 +135,46 @@ async def test_punctuation_route_rejects_concurrent_inference() -> None:
     assert first_response.status_code == 200
 
 
+async def test_punctuation_route_holds_slot_after_client_disconnect() -> None:
+    """A cancelled request keeps the slot until its inference finishes."""
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingRestorer:
+        def restore(self, text: str) -> str:
+            entered.set()
+            assert release.wait(timeout=2)
+            finished.set()
+            return f"{text}。"
+
+    restorer = BlockingRestorer()
+    app = _fake_app(punctuation_provider=lambda: restorer)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = asyncio.create_task(
+            client.post("/v1/dictation/punctuation", json={"text": "第一句"})
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = await client.post("/v1/dictation/punctuation", json={"text": "第二句"})
+        assert second.status_code == 429
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        deadline = time.monotonic() + 2
+        while True:
+            third = await client.post("/v1/dictation/punctuation", json={"text": "第三句"})
+            if third.status_code == 200:
+                break
+            assert third.status_code == 429
+            assert time.monotonic() < deadline, "punctuation slot never released"
+            await asyncio.sleep(0.01)
+
+    assert third.json() == {"text": "第三句。"}
+
+
 def test_punctuation_route_requires_identity() -> None:
     app = _fake_app(
         auth_provider=_NoIdentityAuthProvider(),

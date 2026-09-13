@@ -151,18 +151,39 @@ def create_dictation_router(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="dictation punctuation busy",
             )
-        async with punctuation_slots:
+        await punctuation_slots.acquire()
+
+        async def _load_and_restore() -> str:
             try:
                 restorer = await asyncio.to_thread(resolve_punctuation)
-                restored = await asyncio.to_thread(restorer.restore, body.text)
-            except Exception as exc:
-                # Model exceptions are not trusted to omit their input. Keep
-                # transcript text out of logs while retaining the error class.
-                _logger.error("dictation punctuation failed (%s)", type(exc).__name__)
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="dictation punctuation unavailable",
-                ) from exc
+                return await asyncio.to_thread(restorer.restore, body.text)
+            finally:
+                punctuation_slots.release()
+
+        work = asyncio.create_task(_load_and_restore())
+        try:
+            restored = await asyncio.shield(work)
+        except asyncio.CancelledError:
+            # The handler is going away (client disconnect) while the
+            # inference thread keeps running. Keep the slot held until
+            # the worker finishes, and drain its exception so a later
+            # failure does not warn about an unretrieved exception.
+            def _drain(done: asyncio.Task[str]) -> None:
+                if done.cancelled():
+                    return
+                with contextlib.suppress(Exception):
+                    done.exception()
+
+            work.add_done_callback(_drain)
+            raise
+        except Exception as exc:
+            # Model exceptions are not trusted to omit their input. Keep
+            # transcript text out of logs while retaining the error class.
+            _logger.error("dictation punctuation failed (%s)", type(exc).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="dictation punctuation unavailable",
+            ) from exc
         return DictationPunctuationResponse(text=restored)
 
     if include_punctuation:
