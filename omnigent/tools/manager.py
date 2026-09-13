@@ -371,25 +371,21 @@ class ToolManager:
         """
         Build a :class:`WebSearchTool` for the parent's LLM.
 
-        Uses ``parse_model_string`` to infer the provider, except for
-        ``databricks-*`` models which don't support the native
-        ``web_search_preview`` schema and fall back to function-tool mode.
+        The OpenAI-native ``web_search_preview`` passthrough is only used
+        on OpenAI Responses-compatible harnesses; everywhere else the tool
+        gets a function schema — see
+        :func:`~omnigent.llms.routing.web_search_native_passthrough_provider`.
 
         :param config: Spec-level tool config dict, e.g.
             ``{"api_key": "...", "engine_id": "..."}``.
         :returns: A configured :class:`WebSearchTool`.
         """
+        from omnigent.llms.routing import web_search_native_passthrough_provider
         from omnigent.tools.builtins.web_search import WebSearchTool
 
-        llm_provider = None
-        if self._spec.executor.model:
-            model = self._spec.executor.model
-            # Databricks doesn't support web_search_preview; skip
-            # OpenAI provider inference for all databricks-* models.
-            if not model.startswith("databricks-"):
-                from omnigent.llms.routing import parse_model_string
-
-                llm_provider = parse_model_string(model).provider
+        llm_provider = web_search_native_passthrough_provider(
+            self._spec.executor.model, self._spec.executor.harness_kind
+        )
         return WebSearchTool(config=config, llm_provider=llm_provider)
 
     def _create_web_fetch(self) -> Tool:

@@ -10,14 +10,13 @@
 // geometry, materials, renderer, the animation frame, and the WebGL context are
 // all released so repeatedly opening model files can't leak GPU memory.
 
-import { useTheme } from "next-themes";
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
-import { normalizeResolvedTheme } from "@/components/theme/themeMode";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { type FileContentResponse, fileContentToBlob } from "@/hooks/useFileContent";
 import {
   type ModelFormat,
@@ -228,8 +227,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
   // effect below re-runs only on an actual toggle.
-  const { resolvedTheme } = useTheme();
-  const mode = normalizeResolvedTheme(resolvedTheme);
+  const mode = useResolvedThemeMode();
 
   // The live scene, so the theme effect can recolor it without a rebuild, and
   // the latest theme, so the build effect can seed it without depending on the

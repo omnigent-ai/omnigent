@@ -33,6 +33,12 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 
+# Wall-clock ceiling for polling the recording dispatch. The notifier
+# hops through ``run_coroutine_threadsafe`` and an escalation sleep, so
+# on a loaded 8-worker xdist runner a 1s budget times out spuriously; a
+# passing test returns as soon as the dispatch lands regardless.
+_WAIT_TIMEOUT_S = 10.0
+
 
 async def _instant_sleep(_seconds: float) -> None:
     """
@@ -227,7 +233,7 @@ def _resolved_event(elicitation_id: str, action: str | None = None) -> dict[str,
 
 
 async def _wait_for_calls(
-    dispatch: _RecordingDispatch, expected: int, timeout_s: float = 1.0
+    dispatch: _RecordingDispatch, expected: int, timeout_s: float = _WAIT_TIMEOUT_S
 ) -> None:
     """
     Spin until ``dispatch.calls`` has at least ``expected`` entries.
@@ -240,7 +246,7 @@ async def _wait_for_calls(
     :param dispatch: Recording dispatch to poll.
     :param expected: Minimum number of calls to wait for.
     :param timeout_s: Hard ceiling so a stuck test fails loudly rather
-        than hanging forever, e.g. ``1.0``.
+        than hanging forever; defaults to ``_WAIT_TIMEOUT_S``.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
     while len(dispatch.calls) < expected:
@@ -447,7 +453,7 @@ async def test_resolve_during_escalation_grace_suppresses_wake(
 
     notifier.observe(child.id, _request_event("elicit_attended"))
     # Wait until the handler is parked in the grace, then resolve.
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while gate.entered < 1:
         assert asyncio.get_event_loop().time() < deadline, "handler never reached the grace"
         await asyncio.sleep(0)
@@ -490,7 +496,7 @@ async def test_wake_fires_only_after_escalation_grace(
     )
 
     notifier.observe(child.id, _request_event("elicit_idle", message="Run rm -rf?"))
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while gate.entered < 1:
         assert asyncio.get_event_loop().time() < deadline, "handler never reached the grace"
         await asyncio.sleep(0)
@@ -711,7 +717,7 @@ async def test_resolve_racing_inflight_wake_still_sends_resolution_notice(
     dispatch.elicitation_id = "elicit_midflight"
 
     notifier.observe(child.id, _request_event("elicit_midflight"))
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while len(dispatch.calls) < 2:
         assert asyncio.get_event_loop().time() < deadline, (
             f"expected the resolution notice to follow the raced block wake; "
@@ -753,7 +759,7 @@ async def test_no_resolution_notice_after_failed_wake(
     notifier.observe(child.id, _request_event("elicit_fail"))
     # 3 = 1 attempt + 2 retries, all raising; then the arm is released.
     await _wait_for_calls(dispatch, expected=3)
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while elicitation_armed(notifier, "elicit_fail"):
         assert asyncio.get_event_loop().time() < deadline, "arm never released after failure"
         await asyncio.sleep(0)

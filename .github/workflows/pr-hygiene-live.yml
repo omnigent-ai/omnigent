@@ -1,14 +1,9 @@
 name: PR Hygiene (live)
 
-# Runs the issue-reference nudge and the ready-for-review gate against a single PR
-# the moment something changes on it, so a contributor is not waiting on the hourly
-# sweep. GitHub's cron is best-effort and in practice fires every 1.5 to 2.5 hours.
+# Runs demo, issue-reference, and ready-for-review checks against a single PR the
+# moment something changes on it.
 #
-# The sweep in demo-check.yml stays as the safety net: it catches PRs this misses
-# (a run that failed, a link added from the sidebar, which fires no webhook) and it
-# is the only path that reaches PRs opened before this workflow existed. Both routes
-# call the same scripts with the same decision logic; only the fetch differs, so
-# they cannot disagree.
+# The demo sweep in demo-check.yml is manual-only recovery for missed events.
 #
 # `pull_request_target` because the scripts need write access to comment and label on
 # fork PRs. Safe here: it checks out only the trusted default branch's .github and
@@ -16,21 +11,22 @@ name: PR Hygiene (live)
 
 on:
   pull_request_target:
-    # `edited` matters: adding "Closes #123" to the description is how a nudged
-    # contributor satisfies the rule, and it should clear immediately.
-    types: [opened, reopened, ready_for_review, edited, synchronize]
+    # Description edits can satisfy either content rule. Draft conversion and
+    # closure clear a stale demo label.
+    types: [opened, reopened, ready_for_review, converted_to_draft, edited, synchronize, closed]
 
 permissions:
   contents: read
 
 concurrency:
-  # Per PR, cancelling superseded runs: rapid edits should not queue up duplicates.
+  # Serialize each PR so a run cannot be cancelled between commenting and labeling.
+  # Label and comment writes are not subscribed event types, so there is no loop.
   group: pr-hygiene-live-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   hygiene:
-    if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.draft
+    if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -46,7 +42,20 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github
+      - name: Demo check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          retries: 3
+          script: |
+            const script = require(".github/workflows/demo-check.js");
+            await script({ context, github, core });
       - name: Issue-link check
+        if: >-
+          always() &&
+          github.event.action != 'closed' &&
+          !github.event.pull_request.draft
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ENFORCE: "true"
@@ -61,7 +70,10 @@ jobs:
             const script = require(".github/workflows/pr-issue-link.js");
             await script({ context, github, core });
       - name: Ready-for-review gate
-        if: always()
+        if: >-
+          always() &&
+          github.event.action != 'closed' &&
+          !github.event.pull_request.draft
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ENFORCE: "true"

@@ -10,11 +10,12 @@ The preference domain is the desktop bundle identifier:
 ai.omnigent.desktop
 ```
 
-## Key
+## Keys
 
-| Key          | Type             | Required | Default | Description                                                                       |
-| ------------ | ---------------- | -------- | ------- | --------------------------------------------------------------------------------- |
-| `serverUrls` | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10. |
+| Key                                 | Type             | Required | Default | Description                                                                                                                                                                                     |
+| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                                                                               |
+| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Enables Databricks-internal features (e.g. the Arca host option) on windows connected to a Databricks-managed server. Fails closed — anything but an explicit boolean `true` reads as disabled. |
 
 A schemeless host is accepted and interpreted as `https://`. Paths are
 preserved, so an administrator can provide a workspace mount directly:
@@ -40,6 +41,26 @@ screen and in the in-app server switcher. They are offered, not enforced:
 
 Applying or removing a profile is reflected the next time the server switcher
 is opened or the connect screen is loaded.
+
+## Databricks-internal features
+
+When `databricksInternalFeaturesEnabled` is `true` **and** the window is
+connected to a Databricks-managed server (a workspace mount on
+`*.databricks.com` / `*.azuredatabricks.net`, or a Databricks App on
+`*.databricksapps.com`, https only), the new-session host picker offers
+**Run on Arca**: connecting the user's Arca dev instance to the current
+server as a host. On any other server the flag reads as disabled. Selecting it
+opens a shell-owned connect console that shows the exact command — `arca ssh`
+with a remote `isaac omni host --background --non-interactive` — and, after
+confirmation, streams the command's live output into an embedded terminal
+pane; the instance authenticates with its own Databricks credentials. A
+connect already in flight is re-surfaced (console focused, outcome shared)
+rather than refused, and the run has a hard timeout so a wedged connection
+always settles. No local process outlives the connect — the enrolled host
+keeps its own outbound tunnel from the Arca box. Once connected, the option
+disappears and the box's host row is tagged **Arca instance** (recognized by
+the host id remembered at connect time). Like the server list, the flag is read from
+macOS on demand, so profile changes apply without a restart.
 
 ## MDM profile example
 
@@ -70,6 +91,8 @@ this as a custom settings or managed preferences payload.
                   <string>https://omnigent.corp.example.com</string>
                   <string>https://my-workspace.cloud.databricks.com/ml/omnigents</string>
                 </array>
+                <key>databricksInternalFeaturesEnabled</key>
+                <false/>
               </dict>
             </dict>
           </array>
@@ -116,12 +139,14 @@ identifier, not `ai.omnigent.desktop`, so it will not see this value:
 defaults write ai.omnigent.desktop serverUrls -array \
   "https://omnigent.corp.example.com" \
   "https://my-workspace.cloud.databricks.com/ml/omnigents"
+defaults write ai.omnigent.desktop databricksInternalFeaturesEnabled -bool true
 ```
 
-Remove the test value with:
+Remove the test values with:
 
 ```bash
 defaults delete ai.omnigent.desktop serverUrls
+defaults delete ai.omnigent.desktop databricksInternalFeaturesEnabled
 ```
 
 Production deployment should use an MDM-forced preference rather than a local

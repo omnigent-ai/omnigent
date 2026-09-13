@@ -43,6 +43,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.test_start_session import _open_entry_config as open_entry_config
+
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
 _HOST_ID = "host_e2e"
@@ -198,9 +200,7 @@ async def _open_entry_config(page, agent_id: str) -> None:
     :param page: The Playwright page (the landing picker is already mounted).
     :param agent_id: The stubbed agent id to configure, e.g. ``"ag_polly_e2e"``.
     """
-    await page.get_by_test_id("new-chat-landing-agent-select").click()
-    await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
-    await page.get_by_test_id("new-chat-landing-config-gear").click()
+    await open_entry_config(page, agent_id)
     await page.get_by_test_id("new-chat-landing-config-harness").click()
 
 
