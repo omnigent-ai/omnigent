@@ -113,7 +113,10 @@ def test_session_row_swipe_has_affordance(
         session_writes: list[str] = []
 
         def _on_request(request) -> None:
-            if request.method in ("PATCH", "DELETE") and f"/v1/sessions/{session_id}" in request.url:
+            if (
+                request.method in ("PATCH", "DELETE")
+                and f"/v1/sessions/{session_id}" in request.url
+            ):
                 session_writes.append(f"{request.method} {request.post_data or ''}".strip())
 
         page.on("request", _on_request)
@@ -157,9 +160,7 @@ def test_session_row_swipe_has_affordance(
         # finger, an archive/delete affordance appeared inside the row, the
         # swipe committed a session write, or the row left the sidebar
         # (action committed and the list updated).
-        affordance = row_li.get_by_role(
-            "button", name=re.compile(r"archive|delete", re.I)
-        )
+        affordance = row_li.get_by_role("button", name=re.compile(r"archive|delete", re.I))
         affordance_visible = affordance.count() > 0 and affordance.first.is_visible()
         row_gone = row_link.count() == 0
         tracked = max_track >= _MIN_TRACK_PX
