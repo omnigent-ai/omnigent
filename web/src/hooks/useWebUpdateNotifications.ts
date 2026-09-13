@@ -58,6 +58,8 @@ export function useWebUpdateNotifications() {
           candidate.current = null;
           return;
         }
+        // During rollouts, this baseline can come from a different replica than the
+        // loaded HTML; two-read confirmation limits flapping but cannot prevent that mismatch.
         if (baseline.current === null) baseline.current = id;
         if (id === baseline.current || notified.current.has(id)) {
           candidate.current = null;
