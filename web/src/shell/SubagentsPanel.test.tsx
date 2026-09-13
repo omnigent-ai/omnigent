@@ -1,21 +1,11 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import {
-  BookOpenIcon,
-  Code2Icon,
-  CompassIcon,
-  FileTextIcon,
-  FlaskConicalIcon,
-  ScanSearchIcon,
-  SearchIcon,
-} from "lucide-react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
-import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
+import { SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
@@ -118,24 +108,6 @@ function mockChildTree(tree: Record<string, ChildSessionInfo[]>) {
   }));
 }
 
-/** Agent-type → category-icon expectations. Order-sensitive cases (review
- *  before code, test before code) guard the substring precedence. */
-const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
-  ["Explore", SearchIcon],
-  ["deep-researcher", BookOpenIcon],
-  ["planner", CompassIcon],
-  ["architect", CompassIcon],
-  ["code-reviewer", ScanSearchIcon],
-  ["pr-test-analyzer", FlaskConicalIcon],
-  ["frontend_engineer", Code2Icon],
-  // Both halves of the doc/writ branch, so neither sub-condition can be
-  // dropped without a test failing.
-  ["documentation", FileTextIcon],
-  ["technical-writer", FileTextIcon],
-  ["general-purpose", OttoIcon],
-  [null, OttoIcon],
-];
-
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
@@ -236,6 +208,7 @@ describe("SubagentsPanel", () => {
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveTextContent("Claude Code");
     expect(main).not.toHaveTextContent("claude-native-ui");
+    expect(main.querySelector('[data-icon="claude"]')).toHaveAttribute("aria-hidden", "true");
   });
 
   it("labels Pi native-wrapper main rows with the product name", () => {
@@ -601,7 +574,7 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const codexRow = childRow(container, "conv_codex");
-    expect(codexRow.querySelector('[data-icon="codex"]')).not.toBeNull();
+    expect(codexRow.querySelector('[data-icon="codex"]')).toHaveAttribute("aria-hidden", "true");
     expect(codexRow.querySelector(".lucide-code-2")).toBeNull();
 
     const opencodeRow = childRow(container, "conv_opencode");
@@ -1363,12 +1336,6 @@ describe("SubagentsPanel", () => {
 
     const child = screen.getByTestId("subagent-row");
     expect(child.getAttribute("href")).toBe("/c/conv_child_a?debug=1");
-  });
-
-  it.each(ICON_CASES)("maps agent type %s to its category icon", (tool, expected) => {
-    // Substring precedence matters: "code-reviewer" must hit review before
-    // code, "pr-test-analyzer" must hit test — a wrong branch order regresses.
-    expect(iconForAgentType(tool)).toBe(expected);
   });
 
   it("shows instance names for user-added and normal spawned sub-agents", () => {
