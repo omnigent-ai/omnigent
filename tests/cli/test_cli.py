@@ -761,6 +761,9 @@ def test_codex_command_resume_binds_session_and_passes_unknown_args(
     ``omnigent codex --resume <conv_id>`` binds the Omnigent
     session and preserves Codex CLI passthrough args after ``--``.
     """
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend", lambda server: server or "http://localhost:0"
+    )
     captured: dict[str, object] = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr(
@@ -5776,6 +5779,9 @@ def test_codex_applies_auto_open_conversation_config(
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
     _save_global_config({"auto_open_conversation": True})
 
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend", lambda server: server or "http://localhost:0"
+    )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.main.run_codex_native",

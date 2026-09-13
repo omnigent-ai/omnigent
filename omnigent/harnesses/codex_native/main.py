@@ -24,6 +24,7 @@ import httpx
 import yaml
 
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
+from omnigent._startup_events import record_startup_event
 from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
 )
@@ -858,6 +859,7 @@ def _run_with_remote_server(
                     prompt=prompt,
                     auth=attach_auth,
                 )
+                record_startup_event("initial_prompt_submitted")
             await _attach_terminal_resource(
                 base_url=base_url,
                 headers=headers,
@@ -943,6 +945,7 @@ async def _prepare_codex_terminal_via_daemon(
         else:
             _update_startup_progress(startup_progress, "Loading Codex session...")
             payload = await _fetch_codex_session(client, session_id)
+            record_startup_event("session_resolved", session_id=session_id)
             labels = payload.get("labels") if isinstance(payload, dict) else None
             if (
                 not isinstance(labels, dict)
@@ -961,6 +964,7 @@ async def _prepare_codex_terminal_via_daemon(
                         "terminal; restart the session terminal to apply them.",
                         err=True,
                     )
+                record_startup_event("terminal_available", session_id=session_id)
                 _update_startup_progress(startup_progress, "Codex terminal ready.")
                 return PreparedCodexTerminal(
                     session_id=session_id,
@@ -994,6 +998,7 @@ async def _prepare_codex_terminal_via_daemon(
         if not fresh_session:
             await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
+        record_startup_event("runner_requested", session_id=session_id)
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
@@ -1003,11 +1008,13 @@ async def _prepare_codex_terminal_via_daemon(
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
+        record_startup_event("runner_connected")
         # Must run AFTER wait_for_runner_online — unregistered runners
         # 400 on replace_runner_id. The daemon bind paths don't route
         # through replace_runner_id, so without this re-bind a stopped
         # session stays stopped.
         await _bind_session_runner(client, session_id, runner_id)
+        record_startup_event("session_runner_bound")
         _update_startup_progress(startup_progress, "Starting Codex terminal...")
         await _ensure_codex_terminal_on_runner(client, session_id)
         terminal = await _wait_for_codex_terminal_ready(
@@ -1015,6 +1022,7 @@ async def _prepare_codex_terminal_via_daemon(
             session_id,
             timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S,
         )
+        record_startup_event("terminal_available", session_id=session_id)
         _update_startup_progress(startup_progress, "Codex terminal ready.")
     return PreparedCodexTerminal(
         session_id=session_id,
@@ -1632,7 +1640,9 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
         tmux_target,
         env=env,
     )
-    await process.wait()
+    record_startup_event("terminal_attach_started")
+    exit_code = await process.wait()
+    record_startup_event("terminal_attach_exited", exit_code=exit_code)
 
 
 async def _create_codex_session(
@@ -1677,6 +1687,7 @@ async def _create_codex_session(
     new_session_id = body.get("session_id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise click.ClickException("Codex session creation response did not include session_id.")
+    record_startup_event("session_resolved", session_id=new_session_id)
     return new_session_id
 
 

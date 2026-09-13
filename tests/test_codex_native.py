@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import Callable
@@ -8467,8 +8468,11 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ensure_status", [200, 503])
 async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    ensure_status: int,
 ) -> None:
     """
     Daemon preparation owns session create, runner launch, and terminal ensure.
@@ -8482,6 +8486,9 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    from omnigent import _startup_events as startup
+
+    caplog.set_level("INFO", logger="omnigent.startup")
     original_async_client = httpx.AsyncClient
     calls: list[tuple[str, str, object]] = []
 
@@ -8515,7 +8522,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         if request.method == "GET" and path == "/v1/runners/runner_new/status":
             return httpx.Response(200, json={"online": True})
         if request.method == "POST" and path.endswith("/resources/terminals"):
-            return httpx.Response(200, json={"id": "terminal_codex_main"})
+            return httpx.Response(ensure_status, json={"id": "terminal_codex_main"})
         if request.method == "GET" and path.endswith("/resources/terminals/terminal_codex_main"):
             return httpx.Response(
                 200,
@@ -8545,17 +8552,27 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     monkeypatch.setattr(codex_native.httpx, "AsyncClient", client_factory)
     progress_updates: list[str] = []
 
-    prepared = await codex_native._prepare_codex_terminal_via_daemon(
-        base_url="https://example.com",
-        headers={},
-        session_id=None,
-        session_bundle=b"bundle",
-        codex_args=("--config", "approval_policy=on-request"),
-        model="gpt-5.4-mini",
-        host_id="host_local",
-        workspace="/repo",
-        startup_progress=RunnerStartupProgress(update=progress_updates.append),
+    expected_error = (
+        pytest.raises(click.ClickException) if ensure_status != 200 else contextlib.nullcontext()
     )
+    with expected_error:
+        with startup.codex_startup_attempt():
+            prepared = await codex_native._prepare_codex_terminal_via_daemon(
+                base_url="https://example.com",
+                headers={},
+                session_id=None,
+                session_bundle=b"bundle",
+                codex_args=("--config", "approval_policy=on-request"),
+                model="gpt-5.4-mini",
+                host_id="host_local",
+                workspace="/repo",
+                startup_progress=RunnerStartupProgress(update=progress_updates.append),
+            )
+    if ensure_status != 200:
+        events = [r.attributes["event"] for r in caplog.records if r.name == "omnigent.startup"]
+        assert events[-1] == "launch_failed"
+        assert "terminal_available" not in events
+        return
 
     assert prepared.session_id == "conv_new"
     assert prepared.terminal_id == "terminal_codex_main"
@@ -8590,6 +8607,23 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         "Starting Codex terminal...",
         "Codex terminal ready.",
     ]
+
+    events = [r.attributes for r in caplog.records if r.name == "omnigent.startup"]
+    assert [e["event"] for e in events] == [
+        "launch_started",
+        "session_resolved",
+        "runner_requested",
+        "runner_connected",
+        "session_runner_bound",
+        "terminal_available",
+        "launch_incomplete",
+    ]
+    assert len({e["attempt_id"] for e in events}) == 1
+    assert all(
+        r.session_id == "conv_new"
+        for r in caplog.records
+        if r.name == "omnigent.startup" and r.attributes["event"] != "launch_started"
+    )
 
 
 @pytest.mark.asyncio
