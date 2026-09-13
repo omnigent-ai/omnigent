@@ -22,6 +22,7 @@ import subprocess
 import sys
 import uuid
 
+from omnigent.claude_paths import claude_config_dir
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
@@ -265,7 +266,6 @@ _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
-_CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # Test override for the managed-settings chain. ``None`` means "use the ambient
 # detector's chain" — the single canonical definition (``ambient`` owns both the
 # path list and the parser). Binding a *copy* here would create a second source
@@ -2293,7 +2293,7 @@ def _redirect_claude_transcript_to_current_project(
     if source is None:
         raise click.ClickException(
             f"Claude transcript {external_session_id!r} was not found under "
-            f"{_CLAUDE_PROJECTS_DIR}."
+            f"{_claude_projects_dir()}."
         )
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
@@ -2536,6 +2536,11 @@ def _clone_claude_transcript(
     return target
 
 
+def _claude_projects_dir() -> Path:
+    """Return the directory Claude Code writes session transcripts under."""
+    return claude_config_dir() / "projects"
+
+
 def _find_claude_transcript(
     external_session_id: str, *, exclude: Path | None = None
 ) -> Path | None:
@@ -2550,12 +2555,13 @@ def _find_claude_transcript(
     """
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return None
-    if not _CLAUDE_PROJECTS_DIR.is_dir():
+    projects_dir = _claude_projects_dir()
+    if not projects_dir.is_dir():
         return None
     matches: list[Path] = []
     filename = f"{external_session_id}.jsonl"
     excluded = exclude.resolve() if exclude is not None else None
-    for project_dir in _CLAUDE_PROJECTS_DIR.iterdir():
+    for project_dir in projects_dir.iterdir():
         if not project_dir.is_dir():
             continue
         candidate = project_dir / filename
@@ -2571,14 +2577,14 @@ def _claude_project_dir_for_cwd(cwd: Path) -> Path:
     """
     Return Claude's project transcript directory for *cwd*.
 
-    Claude Code stores transcripts under
-    ``~/.claude/projects/<sanitized-cwd>/``. The observed sanitizer
+    Claude Code stores transcripts under ``projects/<sanitized-cwd>/`` in
+    its config dir. The observed sanitizer
     replaces non-alphanumeric path characters with ``-``.
 
     :param cwd: Absolute cwd, e.g. ``Path("/home/me/repo")``.
     :returns: Claude project transcript directory.
     """
-    return _CLAUDE_PROJECTS_DIR / _sanitize_claude_project_name(str(cwd))
+    return _claude_projects_dir() / _sanitize_claude_project_name(str(cwd))
 
 
 def _sanitize_claude_project_name(path: str) -> str:
