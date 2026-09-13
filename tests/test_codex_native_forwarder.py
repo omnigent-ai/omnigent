@@ -2787,11 +2787,11 @@ async def test_post_session_event_dead_letters_records_http_status(
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
+async def test_replay_dead_letters_before_resume_reposts_proven_undelivered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    On startup, a proven-undelivered record is re-POSTed and removed (#1579).
+    Before resume, a proven-undelivered record is re-POSTed and removed (#1579).
 
     :param tmp_path: Pytest temp dir standing in for the bridge dir.
     :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
@@ -2824,7 +2824,7 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
         )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _ok_inner)
-    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+    await fwd._replay_dead_letters_before_resume(MagicMock(), tmp_path)
 
     assert len(posted) == 1
     assert posted[0]["session_id"] == "conv_codex1"
@@ -2839,11 +2839,11 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_on_startup_skips_ambiguous(
+async def test_replay_dead_letters_before_resume_skips_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    On startup, an ambiguous record is never re-POSTed and is retained (#1579).
+    Before resume, an ambiguous record is never re-POSTed and is retained (#1579).
 
     :param tmp_path: Pytest temp dir standing in for the bridge dir.
     :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
@@ -2867,7 +2867,7 @@ async def test_replay_dead_letters_on_startup_skips_ambiguous(
         )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _inner)
-    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+    await fwd._replay_dead_letters_before_resume(MagicMock(), tmp_path)
 
     assert called is False
     # Ambiguous record retained as a forensic record.
