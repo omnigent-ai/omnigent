@@ -1052,6 +1052,10 @@ class HostProcess:
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._codex_rate_limits: dict[str, Any] | None = None
+        # Serializes readiness publication across the readiness refresh and
+        # the quota publisher: under send backpressure the quota loop must
+        # not resend a stale harness map after a newer readiness frame.
+        self._readiness_publish_lock = asyncio.Lock()
         self._capabilities_initialized = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
@@ -4069,18 +4073,19 @@ class HostProcess:
             if new_configured is None:
                 continue
             if new_configured != configured or new_gateway != gateway:
-                await ws.send(
-                    encode_host_frame(
-                        HostHarnessReadinessFrame(
-                            configured_harnesses=new_configured,
-                            gateway_inference=new_gateway,
+                async with self._readiness_publish_lock:
+                    await ws.send(
+                        encode_host_frame(
+                            HostHarnessReadinessFrame(
+                                configured_harnesses=new_configured,
+                                gateway_inference=new_gateway,
+                            )
                         )
                     )
-                )
-                configured = new_configured
-                gateway = new_gateway
-                self._configured_harnesses = configured
-                self._gateway_inference = gateway
+                    configured = new_configured
+                    gateway = new_gateway
+                    self._configured_harnesses = configured
+                    self._gateway_inference = gateway
 
     async def _codex_rate_limits_loop(
         self, ws: websockets.asyncio.client.ClientConnection
@@ -4091,20 +4096,22 @@ class HostProcess:
             if any(readiness.get(name) is True for name in CODEX_CANONICAL_HARNESSES):
                 try:
                     snapshot = await read_rate_limits()
-                    readiness = self._configured_harnesses or {}
-                    if snapshot is not None and any(
-                        readiness.get(name) is True for name in CODEX_CANONICAL_HARNESSES
-                    ):
-                        self._codex_rate_limits = snapshot
-                        await ws.send(
-                            encode_host_frame(
-                                HostHarnessReadinessFrame(
-                                    configured_harnesses=readiness,
-                                    gateway_inference=self._gateway_inference,
-                                    codex_rate_limits=snapshot,
+                    async with self._readiness_publish_lock:
+                        readiness = self._configured_harnesses or {}
+                        gateway = self._gateway_inference
+                        if snapshot is not None and any(
+                            readiness.get(name) is True for name in CODEX_CANONICAL_HARNESSES
+                        ):
+                            self._codex_rate_limits = snapshot
+                            await ws.send(
+                                encode_host_frame(
+                                    HostHarnessReadinessFrame(
+                                        configured_harnesses=readiness,
+                                        gateway_inference=gateway,
+                                        codex_rate_limits=snapshot,
+                                    )
                                 )
                             )
-                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - advisory data cannot stop the Host
