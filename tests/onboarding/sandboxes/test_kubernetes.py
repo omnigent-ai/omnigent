@@ -117,9 +117,10 @@ def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> No
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone --branch main --single-branch -- " in script
     assert "https://github.com/org/repo.git /home/omnigent/workspace/repo" in script
-    # The per-user broker is wired before the clone, and the init container gets
-    # the launch token (secretKeyRef) so it can reach the broker.
+    # Per-user GIT_TOKEN skips the broker (host is not registered yet).
+    assert 'if [ -z "${GIT_TOKEN:-}" ]' in script
     assert "configure_clone_credentials" in script
+    assert script.index("${GIT_TOKEN:-}") < script.index("configure_clone_credentials")
     assert script.index("configure_clone_credentials") < script.index("git clone")
     init_env = init[0]["env"]
     assert any(
