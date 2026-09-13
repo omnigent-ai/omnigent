@@ -1203,8 +1203,10 @@ class HostProcess:
 
         * **Linux/POSIX with** ``os.waitid`` — *peek* at the next reapable
           child with ``WNOWAIT`` (does not consume). Reap it only if it is
-          not a tracked runner; if it is, stop the sweep and let the runner's
-          own Popen reaper (``_watch_runner``) consume it. Cleanest: a tracked
+          not a live tracked runner; if it is, stop the sweep and let the
+          runner's own Popen reaper (``_watch_runner``) consume it. A stale
+          entry — exit already consumed, pid since reused by an orphan — is
+          pruned so the sweep never wedges on it. Cleanest: a live tracked
           runner's status is never touched.
         * **Platforms without** ``os.waitid`` **(e.g. macOS)** — ``waitpid``
           has no peek, so reap with ``WNOHANG`` and, if the reaped pid is a
@@ -1285,11 +1287,18 @@ class HostProcess:
                 break  # children exist but none ready to reap
             pid = info.si_pid
             if pid in tracked:
-                # Leave it for _watch_runner's Popen to reap+report. Break, not
-                # continue: WNOWAIT keeps returning the same head pid, so
-                # continuing would spin. The runner is reaped within ~0.5s and
-                # the next sweep proceeds past it.
-                break
+                if not self._prune_stale_runner_entries(pid):
+                    # A live tracked runner (or the zygote): leave it for its
+                    # own Popen reaper to consume+report. Break, not continue:
+                    # WNOWAIT keeps returning the same head pid, so continuing
+                    # would spin. The owner reaps it within ~0.5s and the next
+                    # sweep proceeds past it.
+                    break
+                # Every entry claiming this pid was stale — its Popen already
+                # consumed the real runner's exit, so this reapable child is a
+                # fresh orphan on a reused pid. Reap it like any other, lest it
+                # sit at the head of the queue and starve the sweep forever.
+                tracked.discard(pid)
             try:
                 os.waitpid(pid, 0)  # consume the orphan
                 reaped += 1
@@ -1317,12 +1326,16 @@ class HostProcess:
                 break  # children exist but none ready
             handle = self._runner_handle_for_pid(pid)
             if handle is not None:
-                # A tracked runner — do NOT count it as an orphan. Re-inject
-                # the status so its Popen (and thus _watch_runner) reports the
-                # true exit code instead of ECHILD → bogus 0.
                 if handle.proc.returncode is None:
+                    # A tracked runner — do NOT count it as an orphan. Re-inject
+                    # the status so its Popen (and thus _watch_runner) reports
+                    # the true exit code instead of ECHILD → bogus 0.
                     handle.proc.returncode = os.waitstatus_to_exitcode(status)
-                continue
+                    continue
+                # Exit already consumed: a stale entry claiming a reused pid.
+                # What was just reaped is a fresh orphan — prune the leak and
+                # count it.
+                self._prune_stale_runner_entries(pid)
             reaped += 1
         if reaped:
             _logger.debug("orphan reaper reaped %d process(es)", reaped)
@@ -1339,6 +1352,31 @@ class HostProcess:
             if handle.proc.pid == pid:
                 return handle
         return None
+
+    def _prune_stale_runner_entries(self, pid: int) -> bool:
+        """Drop dead ``_runners`` entries that still claim *pid*.
+
+        An entry is stale once ``proc.returncode`` is set: its ``Popen``
+        already consumed the real runner's exit, the kernel freed the pid,
+        and a reapable child seen at that pid is an unrelated orphan that
+        reused it — not the runner.
+
+        :param pid: A pid the reaper observed as reapable.
+        :returns: ``True`` if no tracked owner claims *pid* anymore (every
+            claiming entry was stale and got pruned); ``False`` while a live
+            runner entry or the zygote still owns the pid.
+        """
+        if self._zygote is not None and self._zygote.pid == pid:
+            return False
+        stale = [
+            rid
+            for rid, handle in self._runners.items()
+            if handle.proc.pid == pid and handle.proc.returncode is not None
+        ]
+        for rid in stale:
+            self._runners.pop(rid, None)
+            _logger.info("Pruned stale runner entry %s (pid %d already exited)", rid, pid)
+        return all(handle.proc.pid != pid for handle in self._runners.values())
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -2178,6 +2216,10 @@ class HostProcess:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
             return
+        # Exit observed and its status consumed — stop tracking the entry, or
+        # _tracked_runner_pids() keeps claiming this (soon-reusable) pid and
+        # the orphan reaper skips whatever next occupies it.
+        self._runners.pop(runner_id, None)
         if handle.proc.returncode == 0:
             # A clean exit (code 0) is a graceful shutdown, not a crash — the
             # idle reaper shutting an inactive runner down, or any orderly

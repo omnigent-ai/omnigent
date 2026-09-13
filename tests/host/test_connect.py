@@ -1625,6 +1625,155 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     runner.wait()
 
 
+class _ExitedRunnerProc:
+    """Popen stand-in for a runner whose exit was already consumed.
+
+    Models a leaked ``_runners`` entry: the watcher's ``poll()`` reaped the
+    real runner (``returncode`` set), the kernel freed the pid, and the entry
+    was never popped — so it still claims whatever process reuses that pid.
+    """
+
+    def __init__(self, pid: int, returncode: int = 0) -> None:
+        self.pid = pid
+        self.returncode: int | None = returncode
+
+    def poll(self) -> int | None:
+        """Report the already-consumed exit code, like ``Popen`` on a dead proc."""
+        return self.returncode
+
+
+def test_reap_orphans_prunes_stale_entry_and_reaps_reused_pid(tmp_path: Path) -> None:
+    """A leaked entry claiming a reused pid must not starve the sweep.
+
+    A runner self-exits and its entry leaks with ``returncode`` already set;
+    the freed pid is reused by a fresh orphan that exits. The peeked head is
+    then a tracked pid no watcher will ever reap — a sweep that breaks blind
+    on it reaps nothing, forever. It must prune the stale entry and drain the
+    whole queue instead.
+    """
+    import os
+
+    host = _make_host_process()
+
+    # Forked first, so it is the oldest entry in the WNOWAIT reap queue.
+    head = os.fork()
+    if head == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+    host._runners["runner_leaked"] = _RunnerHandle(
+        proc=_ExitedRunnerProc(head),  # type: ignore[arg-type]
+        log_path=tmp_path / "runner-leaked.log",
+    )
+    time.sleep(0.1)
+    behind = os.fork()
+    if behind == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+
+    deadline = time.monotonic() + 5.0
+    reaped = 0
+    while time.monotonic() < deadline and reaped < 2:
+        reaped += host._reap_orphans_once()
+        time.sleep(0.05)
+
+    assert reaped == 2, "sweep wedged on the stale tracked head"
+    assert "runner_leaked" not in host._runners, "stale entry was not pruned"
+    for pid in (head, behind):
+        with pytest.raises(OSError) as exc_info:
+            os.waitpid(pid, 0)
+        assert exc_info.value.errno == errno.ECHILD
+
+
+def test_reap_orphans_never_reaps_live_zygote(tmp_path: Path) -> None:
+    """A reapable child at the zygote's pid is left for its manager.
+
+    The zygote is tracked without a ``_runners`` entry; the stale-entry prune
+    must not misread that as "no owner" and steal its exit status from
+    ``ZygoteManager._proc``.
+    """
+    import os
+
+    host = _make_host_process()
+
+    child = os.fork()
+    if child == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+    host._zygote = SimpleNamespace(pid=child)  # type: ignore[assignment]
+
+    # Give the child time to exit and become reapable, then sweep repeatedly.
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        host._reap_orphans_once()
+        time.sleep(0.05)
+
+    # Still reapable by its real owner — no sweep consumed the zygote's exit
+    # (a consumed exit would raise ChildProcessError here).
+    pid, _status = os.waitpid(child, 0)
+    assert pid == child
+
+
+def test_reap_orphans_waitpid_treats_stale_entry_pid_as_orphan(tmp_path: Path) -> None:
+    """The no-``waitid`` fallback prunes a stale entry and counts its orphan.
+
+    On this path the reaped pid maps to a tracked handle whose exit was
+    already consumed — what was reaped is a reused-pid orphan, so it must be
+    counted (and the leaked entry pruned), not silently attributed to the
+    long-dead runner.
+    """
+    import os
+
+    host = _make_host_process()
+
+    orphan = os.fork()
+    if orphan == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+    host._runners["runner_leaked"] = _RunnerHandle(
+        proc=_ExitedRunnerProc(orphan),  # type: ignore[arg-type]
+        log_path=tmp_path / "runner-leaked.log",
+    )
+
+    deadline = time.monotonic() + 5.0
+    reaped = 0
+    while time.monotonic() < deadline and reaped < 1:
+        reaped += host._reap_orphans_waitpid()
+        time.sleep(0.05)
+
+    assert reaped == 1, "reused-pid orphan was not counted as reaped"
+    assert "runner_leaked" not in host._runners, "stale entry was not pruned"
+
+
+async def test_watch_runner_stops_tracking_after_self_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A self-exited runner's entry is dropped once its exit is consumed.
+
+    Both self-exit paths (clean and crash) used to return with the entry
+    still in ``_runners``, so ``_tracked_runner_pids()`` claimed the dead —
+    and eventually reused — pid forever, and the orphan reaper skipped
+    whatever process next occupied it. Once the watcher consumes the exit it
+    must stop tracking the entry. (An intentional stop is unaffected:
+    ``_handle_stop`` pops the handle before terminating.)
+    """
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._ws = _FakeTunnel()  # type: ignore[assignment] — duck-typed send
+
+    for exit_code, runner_id in ((0, "runner_clean"), (3, "runner_crash")):
+        log_path = tmp_path / f"{runner_id}.log"
+        log_path.write_text("crash cause\n")
+        proc = subprocess.Popen(
+            ["sh", "-c", f"exit {exit_code}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        host._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
+
+        await asyncio.wait_for(host._watch_runner(runner_id), timeout=5.0)
+
+        assert runner_id not in host._runners, f"{runner_id} entry leaked after exit"
+        assert proc.pid not in host._tracked_runner_pids()
+
+
 def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:
     """The reaper must not reap a host-owned subprocess's child (#1782).
 
