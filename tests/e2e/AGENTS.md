@@ -2,6 +2,14 @@
 
 These tests start a real `omnigent` server subprocess, upload real agent bundles, and call real LLM APIs. They are **excluded from the default `pytest` run** via `addopts = --ignore=tests/e2e` in `pyproject.toml`. To exercise them you must opt in with `--llm-api-key` (and optionally `--profile`).
 
+The credential-free CLI exception is `test_offline_validate_e2e.py`. It runs the
+real module entry point with network/process and runtime-import tripwires, not a
+server or LLM. Run it explicitly without credentials:
+
+```bash
+uv run --no-sync pytest -o addopts= tests/e2e/test_offline_validate_e2e.py -q
+```
+
 ## ALWAYS RUN INTEGRATION + UNIT TESTS IN THE BACKGROUND
 
 The e2e suite takes 5–10 minutes even fully parallel; the unit suite takes 5–7 minutes parallel. **Never block your terminal (or an interactive Claude Code session) on a foreground run** — kick them off backgrounded and monitor:

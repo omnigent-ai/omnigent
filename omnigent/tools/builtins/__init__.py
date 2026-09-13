@@ -21,7 +21,14 @@ Public API:
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
+from importlib import import_module
 
+from omnigent.builtin_catalog import (
+    BUILTIN_FACTORIES,
+    FRAMEWORK_TOOL_NAMES,
+    HINDSIGHT_FACTORIES,
+)
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
 from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
@@ -247,62 +254,23 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 # the spec declares a ``terminals:`` block — not via this
 # registry. One-shot shell commands now use ``sys_os_shell``
 # instead.
+def _catalog_factory(path: str, config: dict[str, str]) -> Tool:
+    """Resolve a shipped factory only when a tool is instantiated."""
+    module, name = path.split(":")
+    return getattr(import_module(module), name)(config=config)
+
+
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
-    # User-enablable tools (factory present).
-    "web_search": lambda config: WebSearchTool(config=config),
-    "nimble_research": lambda config: NimbleResearchTool(config=config),
-    "nimble_extract": lambda config: NimbleExtractTool(config=config),
-    "upload_file": _create_upload_file,
-    "list_files": _create_list_files,
-    "download_file": _create_download_file,
-    "search_conversations": _create_search_conversations,
-    "export_agent": _create_export_agent,
-    # Framework-owned: need runtime context. ``web_fetch`` is
-    # constructed by ToolManager before reaching this registry.
-    # ``list_comments`` and ``update_comment`` are auto-registered by
-    # ``ToolManager._register_comment_tools`` — they are reserved
-    # here so user specs cannot shadow them. (Policy ASKs are
-    # surfaced as MCP-shape elicitations on the SSE stream — not
-    # via the tool registry — see omnigent/runtime/policies/approval.py.)
-    "web_fetch": None,
-    "list_comments": None,
-    "update_comment": None,
-    # ``sys_list_models`` is auto-registered by
-    # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
-    # and intercepted by name in the runner's tool dispatch — reserved
-    # here so user specs cannot shadow it.
-    "sys_list_models": None,
-    # ``sys_advise_models`` is auto-registered alongside ``sys_list_models``
-    # when ``RuntimeCaps.routing_client`` is configured. Intercepted by
-    # name in the runner's tool dispatch — reserved here so user specs
-    # cannot shadow it.
-    "sys_advise_models": None,
-    # ``browser_*`` embedded-browser tools are framework-owned: always
-    # auto-registered by ``ToolManager._register_browser_tools`` (the
-    # single source of truth for registration), so any agent can drive
-    # the desktop app's browser without the spec opting in. Reserved
-    # here with ``None`` — exactly like ``list_comments`` /
-    # ``update_comment`` — so user specs cannot shadow the names and
-    # ``get_builtin_tool`` returns ``None`` for them (they are not
-    # instantiated via this registry). Execution is runner-dispatched
-    # (``_BROWSER_TOOLS`` in omnigent/runner/tool_dispatch.py).
-    "browser_navigate": None,
-    "browser_snapshot": None,
-    "browser_click": None,
-    "browser_type": None,
-    "browser_screenshot": None,
+    name: partial(_catalog_factory, path) for name, path in BUILTIN_FACTORIES.items()
 }
+_BUILTIN_REGISTRY.update(dict.fromkeys(FRAMEWORK_TOOL_NAMES))
 
 # Hindsight long-term memory (optional ``hindsight`` extra). Registered only
 # when ``hindsight-client`` is installed, so the tools are absent from the
 # builtin list on installs without the extra.
 if _hindsight_available():
     _BUILTIN_REGISTRY.update(
-        {
-            "hindsight_retain": _create_hindsight_retain,
-            "hindsight_recall": _create_hindsight_recall,
-            "hindsight_reflect": _create_hindsight_reflect,
-        }
+        {name: partial(_catalog_factory, path) for name, path in HINDSIGHT_FACTORIES.items()}
     )
 
 # Canonical set of every reserved builtin name. Derived from

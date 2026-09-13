@@ -7,15 +7,6 @@ import shutil
 from pathlib import Path
 
 from omnigent.errors import ErrorCode, OmnigentError
-
-# Omnigent compat: imported surgically from a dedicated module so
-# the integration's tech debt is removable in one shot. See
-# omnigent/spec/_omnigent_compat.py.
-from omnigent.spec._omnigent_compat import (
-    diagnose_yaml_rejection,
-    is_omnigent_yaml,
-    load_omnigent_yaml,
-)
 from omnigent.spec.parser import expand_env_vars, parse, parse_default_policies, parse_server_llm
 from omnigent.spec.tar_utils import ExtractionError, extract_safe
 from omnigent.spec.types import (
@@ -88,6 +79,36 @@ __all__ = [
     "parse_server_llm",
     "validate",
 ]
+
+
+def is_omnigent_yaml(path: Path) -> bool:
+    """Keep format detection available without importing compatibility code eagerly."""
+    from omnigent.spec._omnigent_compat import is_omnigent_yaml as detect
+
+    return detect(path)
+
+
+def diagnose_yaml_rejection(path: Path) -> str:
+    """Lazily diagnose the standalone YAML format."""
+    from omnigent.spec._omnigent_compat import diagnose_yaml_rejection as diagnose
+
+    return diagnose(path)
+
+
+def load_omnigent_yaml(
+    path: Path,
+    *,
+    enforce_handler_allowlist: bool = False,
+    prune_invalid_sub_agents: bool = False,
+) -> AgentSpec:
+    """Preserve the existing standalone loader export, loading runtime code on use."""
+    from omnigent.spec._omnigent_compat import load_omnigent_yaml as load_yaml
+
+    return load_yaml(
+        path,
+        enforce_handler_allowlist=enforce_handler_allowlist,
+        prune_invalid_sub_agents=prune_invalid_sub_agents,
+    )
 
 
 def materialize_bundle(source: Path, dest: Path) -> Path:
