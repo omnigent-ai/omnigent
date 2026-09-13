@@ -17,7 +17,7 @@ const { createBrowserViewBoundsController } = require("../src/browserViewBounds"
 
 /** Build a registry with spy-backed injected deps. Returns the registry plus
  *  the recorded renderer sends / attach / detach calls for assertions. */
-function makeRegistry() {
+function makeRegistry(registryOptions = {}) {
   const sent = []; // { channel, payload }
   const attached = [];
   const detached = [];
@@ -42,14 +42,171 @@ function makeRegistry() {
     detachFromHost: (view) => detached.push(view),
     sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
     getHostZoomFactor: () => 1,
+    ...registryOptions,
   });
   return { registry, sent, attached, detached, visibility };
+}
+
+function makeManualTimers() {
+  let nextId = 1;
+  const pending = new Map();
+  return {
+    setTimeoutFn(callback, delay) {
+      const id = nextId++;
+      pending.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeoutFn(id) {
+      pending.delete(id);
+    },
+    fire(id) {
+      const timer = pending.get(id);
+      if (!timer) return false;
+      pending.delete(id);
+      timer.callback();
+      return true;
+    },
+    entries() {
+      return [...pending.entries()];
+    },
+  };
 }
 
 describe("browserViewRegistry — first-navigate activation signal", () => {
   let ctx;
   beforeEach(() => {
     ctx = makeRegistry();
+  });
+
+  it("expires every detached view in a draft after its ten-minute lease", () => {
+    const timers = makeManualTimers();
+    ctx = makeRegistry({
+      draftLeaseMs: 10 * 60 * 1000,
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    });
+    const draft = "draft-workspace:1234";
+    const draftTab = "browser-tab:draft-workspace%3A1234:first";
+    ctx.registry.openOrNavigate(draft, "https://example.com");
+    ctx.registry.openOrNavigate(draftTab, "https://example.org");
+    ctx.registry.openOrNavigate("conv_existing", "https://session.example");
+
+    const [[timerId, timer]] = timers.entries();
+    assert.equal(timer.delay, 10 * 60 * 1000);
+    assert.equal(timers.entries().length, 1);
+    assert.equal(timers.fire(timerId), true);
+    assert.equal(ctx.registry.has(draft), false);
+    assert.equal(ctx.registry.has(draftTab), false);
+    assert.equal(ctx.registry.has("conv_existing"), true);
+    assert.deepEqual(
+      ctx.sent
+        .filter((event) => event.channel === "browser-view-closed")
+        .map((event) => event.payload),
+      [
+        { conversationId: draft, reason: "draft-lease-expired" },
+        { conversationId: draftTab, reason: "draft-lease-expired" },
+      ],
+    );
+  });
+
+  it("renews a collapsed draft lease from the renderer heartbeat", () => {
+    const timers = makeManualTimers();
+    ctx = makeRegistry({
+      draftLeaseMs: 10 * 60 * 1000,
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    });
+    const draft = "draft-workspace:1234";
+    ctx.registry.openOrNavigate(draft, "https://example.com");
+    const firstTimerId = timers.entries()[0][0];
+
+    ctx.registry.setActive(draft);
+    ctx.registry.setActive(null);
+    assert.equal(timers.entries().length, 1);
+    assert.deepEqual(ctx.registry.renewDraftLease(draft), { ok: true, renewed: true });
+    const secondTimerId = timers.entries()[0][0];
+    assert.notEqual(secondTimerId, firstTimerId);
+    assert.equal(timers.fire(firstTimerId), false);
+    assert.equal(ctx.registry.has(draft), true);
+
+    ctx.registry.setActive(draft);
+    ctx.registry.setActive(null);
+    assert.deepEqual(ctx.registry.renewDraftLease(draft), { ok: true, renewed: true });
+    const [[thirdTimerId, thirdTimer]] = timers.entries();
+    assert.notEqual(thirdTimerId, secondTimerId);
+    assert.equal(timers.fire(secondTimerId), false);
+    assert.equal(thirdTimer.delay, 10 * 60 * 1000);
+    assert.equal(timers.fire(thirdTimerId), true);
+    assert.equal(ctx.registry.has(draft), false);
+  });
+
+  it("removes draft expiry when detached browser views are adopted", () => {
+    const timers = makeManualTimers();
+    ctx = makeRegistry({
+      draftLeaseMs: 10 * 60 * 1000,
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    });
+    const draft = "draft-workspace:1234";
+    const draftTab = "browser-tab:draft-workspace%3A1234:first";
+    ctx.registry.openOrNavigate(draft, "https://example.com");
+    ctx.registry.openOrNavigate(draftTab, "https://example.org");
+    const leaseTimerId = timers.entries()[0][0];
+
+    assert.deepEqual(ctx.registry.adoptDraft(draft, "conv_new"), {
+      ok: true,
+      transferred: 2,
+    });
+    assert.equal(timers.entries().length, 0);
+    assert.equal(timers.fire(leaseTimerId), false);
+    assert.deepEqual(ctx.registry.renewDraftLease(draft), { ok: true, renewed: false });
+    assert.equal(timers.entries().length, 0);
+    assert.equal(ctx.registry.has("conv_new"), true);
+    assert.equal(ctx.registry.has("browser-tab:conv_new:first"), true);
+  });
+
+  it("does not create resources when an absent or invalid draft is renewed", () => {
+    assert.deepEqual(ctx.registry.renewDraftLease("draft-workspace:missing"), {
+      ok: true,
+      renewed: false,
+    });
+    assert.equal(ctx.registry.renewDraftLease("conv_existing").ok, false);
+    assert.equal(ctx.registry.size(), 0);
+  });
+
+  it("adopts draft browsers without replacing their live views or active tab", () => {
+    const draft = "draft-workspace:1234";
+    const draftTab = "browser-tab:draft-workspace%3A1234:first";
+    ctx.registry.openOrNavigate(draft, "https://example.com");
+    ctx.registry.openOrNavigate(draftTab, "https://example.org");
+    const main = ctx.registry.get(draft);
+    const tab = ctx.registry.get(draftTab);
+    ctx.registry.setActive(draftTab);
+    ctx.registry.setSuppressed(true);
+    const result = ctx.registry.adoptDraft(draft, "conv_new");
+    assert.deepEqual(result, { ok: true, transferred: 2 });
+    assert.equal(ctx.registry.get(draft), null);
+    assert.equal(ctx.registry.get(draftTab), null);
+    assert.equal(ctx.registry.get("conv_new"), main);
+    assert.equal(ctx.registry.get("browser-tab:conv_new:first"), tab);
+    assert.equal(tab.conversationId, "browser-tab:conv_new:first");
+    assert.equal(ctx.registry.activeConversationId(), "browser-tab:conv_new:first");
+    assert.equal(ctx.registry.isSuppressed(), true);
+    assert.equal(ctx.attached.length, 1);
+    assert.equal(ctx.detached.length, 0);
+    assert.deepEqual(ctx.registry.adoptDraft(draft, "conv_new"), { ok: true, transferred: 0 });
+  });
+
+  it("rejects a conflicting adoption without transferring any draft tab", () => {
+    const draft = "draft-workspace:1234";
+    ctx.registry.openOrNavigate(draft, "https://example.com");
+    ctx.registry.openOrNavigate("browser-tab:draft-workspace%3A1234:first", "https://example.org");
+    ctx.registry.openOrNavigate("browser-tab:conv_new:first", "https://existing.example");
+    assert.equal(ctx.registry.adoptDraft(draft, "conv_new").ok, false);
+    assert.equal(ctx.registry.size(), 3);
+    assert.equal(ctx.registry.has(draft), true);
+    assert.equal(ctx.registry.has("conv_new"), false);
+    assert.equal(ctx.registry.adoptDraft("conv_other", "conv_new").ok, false);
   });
 
   it("keeps the agent view and two user tabs independent through switch and close", () => {

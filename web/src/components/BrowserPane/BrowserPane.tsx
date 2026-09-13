@@ -14,7 +14,8 @@
  *  The agent relay is NOT here (it must listen before the first browser_navigate
  *  auto-selects the tab) — it's hoisted to the always-mounted AppShell. On
  *  unmount the view DETACHES, not destroys (background agent pages survive a tab
- *  switch; destroy only on explicit close). Renders nothing outside Electron. */
+ *  switch). The main-process registry owns cleanup, including draft lease
+ *  expiry. Renders nothing outside Electron. */
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -101,6 +102,7 @@ export interface BrowserPaneProps {
   /** Native view key: the session ID or a session-scoped browser tab ID. */
   conversationId: string;
   agentBrowser?: boolean;
+  allowDesignMode?: boolean;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
 }
@@ -109,7 +111,12 @@ export interface BrowserPaneProps {
  * Keeps the agent relay alive for a conversation and, once a native browser
  * view is attached, keeps that view positioned over a measuring placeholder.
  */
-export function BrowserPane({ conversationId, className, agentBrowser = true }: BrowserPaneProps) {
+export function BrowserPane({
+  conversationId,
+  className,
+  agentBrowser = true,
+  allowDesignMode = true,
+}: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
@@ -478,7 +485,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         <button
           type="button"
           onClick={handleToggleDesignMode}
-          disabled={!viewActive}
+          disabled={!allowDesignMode || !viewActive}
           aria-pressed={designMode}
           aria-label={designMode ? "Exit design mode" : "Enter design mode"}
           title={

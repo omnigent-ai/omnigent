@@ -23,7 +23,12 @@ import {
   subscribeTerminalTheme,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
-import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
+import {
+  clearHostKeyless,
+  getSessionHost,
+  isHostKeyless,
+  markHostKeyless,
+} from "@/lib/sessionHost";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -69,9 +74,7 @@ export const RECONNECT_BACKOFF_MS = [
  */
 export const RECONNECT_STABLE_MS = 30_000;
 
-interface TerminalViewProps {
-  /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
-  sessionId: string;
+interface TerminalViewBaseProps {
   /** Opaque terminal resource id, e.g. ``"terminal_bash_s1"``. */
   terminalId: string;
   /** If true, drops keyboard input and runs ``tmux attach -r``. */
@@ -111,16 +114,29 @@ interface TerminalViewProps {
    * way. It still grabs focus on the reveal edge and on an explicit open.
    */
   focusOnConnect?: boolean;
-  /**
-   * Loopback attach URL advertised by the session's runner (from the
-   * terminal resource's ``metadata.direct_attach_url``). When set, each
-   * connection attempt probes it first and uses it if the listener
-   * answers — a browser on the runner's machine then attaches with zero
-   * relay legs. Unreachable or absent falls back to the relay URL; the
-   * page URL and all HTTP traffic are unaffected either way.
-   */
-  directAttachUrl?: string;
 }
+
+type TerminalViewProps = TerminalViewBaseProps &
+  (
+    | {
+        /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
+        sessionId: string;
+        /**
+         * Loopback attach URL advertised by the session's runner. The view
+         * probes it and falls back to the session relay when it is unreachable.
+         */
+        directAttachUrl?: string;
+        attachPath?: never;
+        hostId?: never;
+      }
+    | {
+        /** Explicit non-session attach route, used by draft workspace terminals. */
+        attachPath: string;
+        hostId: string;
+        sessionId?: never;
+        directAttachUrl?: never;
+      }
+  );
 
 export function TerminalView({
   sessionId,
@@ -134,11 +150,13 @@ export function TerminalView({
   active = true,
   focusOnConnect = active,
   directAttachUrl,
+  attachPath,
+  hostId,
 }: TerminalViewProps) {
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
-  const clipboardScope = `${sessionId}\0${terminalId}\0${readOnly ? "read-only" : "writable"}`;
+  const clipboardScope = `${sessionId ?? attachPath}\0${terminalId}\0${readOnly ? "read-only" : "writable"}`;
   const [clipboardPrompt, setClipboardPrompt] = useState<{
     scope: string;
     epoch: number;
@@ -227,6 +245,8 @@ export function TerminalView({
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
   const keylessRef = useRef(false);
+  const draftAttachKeylessRef = useRef(false);
+  const draftWrongReplicaRetriedRef = useRef(false);
   // Bumped by every attach so an in-flight attach can tell it has been
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.
@@ -563,12 +583,24 @@ export function TerminalView({
         // and a hostless session yields none. The direct URL needs no key: it
         // bypasses the server entirely.
         const computedHostId = (() => {
-          if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
+          if (attachPath !== undefined || keylessRef.current || !isDatabricksWorkspace()) {
+            return undefined;
+          }
           const h = getSessionHost(sessionId);
           return h && !isHostKeyless(h) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
-        const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
+        const draftAttachKeyless = attachPath === undefined ? false : isHostKeyless(hostId);
+        if (attachPath !== undefined) draftAttachKeylessRef.current = draftAttachKeyless;
+        const relayUrl =
+          attachPath === undefined
+            ? buildAttachUrl(sessionId, terminalId, readOnly, computedHostId)
+            : resolveWebSocketUrl(
+                withAttachPathParams(attachPath, readOnly, hostId, draftAttachKeyless),
+              );
+        const directUrl =
+          attachPath === undefined && directAttachUrl
+            ? withAttachParams(directAttachUrl, readOnly)
+            : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
         // reachable; otherwise it returns the relay URL immediately.
@@ -612,6 +644,8 @@ export function TerminalView({
       terminalId,
       readOnly,
       directAttachUrl,
+      attachPath,
+      hostId,
       notifyState,
       notifyActivity,
       notifyInput,
@@ -681,19 +715,27 @@ export function TerminalView({
     // "connecting" (a re-dial in flight) keeps the pending flag;
     // "error" is transient and always followed by a close event.
     if (state.kind !== "closed") return;
-    // Wrong-replica close (4400): the keyed request reached the wrong replica.
-    // Mark the host keyless so the next dial skips the key, and re-dial
-    // immediately without backoff (the correct route is one handshake away).
-    // One-shot: if we're ALREADY keyless and still get 4400, the host is
-    // genuinely unreachable from here — stop, don't loop.
     if (state.code === WS_CLOSE_WRONG_REPLICA) {
-      if (keylessRef.current) {
-        setReconnectPending(false);
-        return;
+      if (attachPath !== undefined) {
+        if (draftWrongReplicaRetriedRef.current) {
+          setReconnectPending(false);
+          return;
+        }
+        draftWrongReplicaRetriedRef.current = true;
+        if (draftAttachKeylessRef.current) {
+          clearHostKeyless(hostId);
+        } else {
+          markHostKeyless(hostId);
+        }
+      } else {
+        if (keylessRef.current) {
+          setReconnectPending(false);
+          return;
+        }
+        keylessRef.current = true;
+        const routingHostId = getSessionHost(sessionId);
+        if (routingHostId) markHostKeyless(routingHostId);
       }
-      keylessRef.current = true;
-      const hostId = getSessionHost(sessionId);
-      if (hostId) markHostKeyless(hostId);
       setReconnectPending(true);
       disposeActiveSession();
       setConnectAttempt((attempt) => attempt + 1);
@@ -740,7 +782,7 @@ export function TerminalView({
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [state, disposeActiveSession, sessionId]);
+  }, [state, disposeActiveSession, sessionId, hostId, attachPath]);
 
   return (
     <div
@@ -831,6 +873,24 @@ function StatusOverlay({
 function resumeErrorText(error: unknown): string {
   if (error instanceof Error && error.message) return `Couldn't resume session: ${error.message}`;
   return "Couldn't resume session.";
+}
+
+function withAttachPathParams(
+  attachPath: string,
+  readOnly: boolean,
+  hostId: string,
+  keyless: boolean,
+): string {
+  const [path, query] = attachPath.split("?", 2);
+  const params = new URLSearchParams(query);
+  if (readOnly) params.set("read_only", "true");
+  if (keyless) {
+    params.delete("omnigent_slice_key");
+  } else {
+    params.set("omnigent_slice_key", hostId);
+  }
+  const suffix = params.toString();
+  return suffix ? `${path}?${suffix}` : path;
 }
 
 /**

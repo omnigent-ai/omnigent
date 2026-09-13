@@ -12,7 +12,10 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
+import type { UseDraftWorkspaceResult } from "@/hooks/useDraftWorkspace";
 import { toast } from "sonner";
+import * as sessionHost from "@/lib/sessionHost";
+import { DraftTerminalSurface } from "@/shell/LandingWorkspacePanel";
 import type { ConnectionState } from "./TerminalSession";
 import {
   TerminalView,
@@ -86,6 +89,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => toast.dismiss());
   cleanup();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -143,6 +147,144 @@ describe("buildAttachPath", () => {
     // a leading slash is required for that concatenation to be
     // correct against any page origin.
     expect(buildAttachPath("conv_abc", "terminal_bash_s1", false).startsWith("/")).toBe(true);
+  });
+});
+
+describe("explicit attach path", () => {
+  it("connects a draft terminal without consulting session routing", async () => {
+    vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+    const getSessionHost = vi.spyOn(sessionHost, "getSessionHost");
+
+    render(
+      <TerminalView
+        terminalId="terminal_bash_draft"
+        hostId="host_1"
+        attachPath="/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach"
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    expect(terminalSessionMock.instances[0].url).toBe(
+      `ws://${window.location.host}/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach?omnigent_slice_key=host_1`,
+    );
+    expect(getSessionHost).not.toHaveBeenCalled();
+  });
+
+  it("adds read_only once while preserving an existing slice key", async () => {
+    render(
+      <TerminalView
+        terminalId="terminal_bash_draft"
+        hostId="host_1"
+        attachPath="/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach?omnigent_slice_key=host_1"
+        readOnly
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const url = terminalSessionMock.instances[0].url;
+    expect(url).toContain("omnigent_slice_key=host_1&read_only=true");
+    expect(url.match(/read_only=true/g)).toHaveLength(1);
+  });
+
+  it("removes a stale routing key for a host already demoted by HTTP", async () => {
+    sessionHost.markHostKeyless("draft_keyless");
+    try {
+      render(
+        <TerminalView
+          terminalId="terminal_bash_draft"
+          hostId="draft_keyless"
+          attachPath="/v1/hosts/draft_keyless/workspace-contexts/ctx/resources/terminals/term/attach?omnigent_slice_key=draft_keyless"
+          readOnly
+        />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const url = new URL(terminalSessionMock.instances[0].url);
+      expect(url.searchParams.has("omnigent_slice_key")).toBe(false);
+      expect(url.searchParams.get("read_only")).toBe("true");
+    } finally {
+      sessionHost.clearHostKeyless("draft_keyless");
+    }
+  });
+
+  it("redials a draft attachment keyless once after a wrong-replica close", async () => {
+    try {
+      render(
+        <TerminalView
+          terminalId="terminal_bash_draft"
+          hostId="draft_retry"
+          attachPath="/v1/hosts/draft_retry/workspace-contexts/ctx/resources/terminals/term/attach?omnigent_slice_key=draft_retry&read_only=true"
+          readOnly
+        />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      expect(
+        new URL(terminalSessionMock.instances[0].url).searchParams.get("omnigent_slice_key"),
+      ).toBe("draft_retry");
+      act(() =>
+        terminalSessionMock.instances[0].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      const retryUrl = new URL(terminalSessionMock.instances[1].url);
+      expect(retryUrl.searchParams.has("omnigent_slice_key")).toBe(false);
+      expect(retryUrl.searchParams.get("read_only")).toBe("true");
+      expect(sessionHost.isHostKeyless("draft_retry")).toBe(true);
+      act(() =>
+        terminalSessionMock.instances[1].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      expect(terminalSessionMock.instances).toHaveLength(2);
+      expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
+    } finally {
+      sessionHost.clearHostKeyless("draft_retry");
+    }
+  });
+
+  it("redials a stale keyless draft attachment with a routing key once", async () => {
+    sessionHost.markHostKeyless("draft_stale");
+    try {
+      render(
+        <TerminalView
+          terminalId="terminal_bash_draft"
+          hostId="draft_stale"
+          attachPath="/v1/hosts/draft_stale/workspace-contexts/ctx/resources/terminals/term/attach"
+        />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      expect(
+        new URL(terminalSessionMock.instances[0].url).searchParams.has("omnigent_slice_key"),
+      ).toBe(false);
+
+      act(() =>
+        terminalSessionMock.instances[0].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      expect(
+        new URL(terminalSessionMock.instances[1].url).searchParams.get("omnigent_slice_key"),
+      ).toBe("draft_stale");
+      expect(sessionHost.isHostKeyless("draft_stale")).toBe(false);
+
+      act(() =>
+        terminalSessionMock.instances[1].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      expect(terminalSessionMock.instances).toHaveLength(2);
+    } finally {
+      sessionHost.clearHostKeyless("draft_stale");
+    }
   });
 });
 
@@ -665,6 +807,66 @@ describe("automatic reconnect", () => {
     expect(terminalSessionMock.instances).toHaveLength(RECONNECT_BACKOFF_MS.length + 1);
     expect(screen.getByText("Bridge closed: code 1006")).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
+  });
+
+  it("starts a fresh retry budget when the draft shell identity changes", async () => {
+    const deleteTerminal = vi.fn().mockResolvedValue(undefined);
+    const discard = vi.fn().mockResolvedValue(undefined);
+    const draft = (
+      hostId: string,
+      contextId: string,
+      terminalId: string,
+    ): UseDraftWorkspaceResult => ({
+      context: {
+        id: contextId,
+        hostId,
+        workspace: "/repo",
+        workspaceAliases: ["/repo"],
+        session_id: null,
+        lease_seconds: 600,
+      },
+      terminals: [{ id: terminalId, name: "bash", session: "draft", running: true }],
+      isLoading: false,
+      error: null,
+      ensureContext: vi.fn(),
+      refreshTerminals: vi.fn(),
+      createTerminal: vi.fn(),
+      deleteTerminal,
+      discard,
+      adopt: vi.fn(),
+    });
+    const { rerender } = render(
+      <DraftTerminalSurface
+        draft={draft("host-a", "context-a", "terminal-a")}
+        terminalKey="terminal:terminal-a"
+      />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+      closeNewest(1006);
+      // oxlint-disable-next-line no-await-in-loop
+      await elapse(delay);
+    }
+    closeNewest(1006);
+    await elapse(60_000);
+    const exhausted = terminalSessionMock.instances.length;
+
+    rerender(
+      <DraftTerminalSurface
+        draft={draft("host-b", "context-b", "terminal-b")}
+        terminalKey="terminal:terminal-b"
+      />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+
+    closeNewest(1006);
+    await elapse(RECONNECT_BACKOFF_MS[0]);
+    expect(terminalSessionMock.instances).toHaveLength(exhausted + 2);
+    expect(deleteTerminal).not.toHaveBeenCalled();
+    expect(discard).not.toHaveBeenCalled();
   });
 
   it("restores the retry budget after a connection that stayed up past the stability window", async () => {

@@ -25,6 +25,7 @@ from typing import Any, TypeAlias
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.util.subprocess_ownership import create_subprocess_exec
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
@@ -1243,7 +1244,8 @@ class TerminalInstance:
             ),
         ]
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_subprocess_exec(
+            asyncio.create_subprocess_exec,
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -1983,7 +1985,8 @@ class TerminalInstance:
         if not self.running:
             return False
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_subprocess_exec(
+                asyncio.create_subprocess_exec,
                 *self._tmux_base_cmd(),
                 "list-panes",
                 "-t",
@@ -2070,7 +2073,8 @@ class TerminalInstance:
         """Run a tmux command against this instance's server."""
         cmd = [*self._tmux_base_cmd(), *args]
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_subprocess_exec(
+                asyncio.create_subprocess_exec,
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
@@ -2088,7 +2092,8 @@ class TerminalInstance:
         """Run a tmux command and return stdout."""
         cmd = [*self._tmux_base_cmd(), *args]
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_subprocess_exec(
+                asyncio.create_subprocess_exec,
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

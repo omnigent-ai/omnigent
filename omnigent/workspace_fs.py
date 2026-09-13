@@ -94,7 +94,6 @@ class WorkspaceReader:
         # way the runner chooses it, so git workspaces get git-status
         # semantics and everything else degrades to an empty list.
         self._registry = create_filesystem_registry(self._root)
-        self._registry.start()
 
     # ── Path confinement ──────────────────────────────────────────
 
@@ -305,6 +304,7 @@ class WorkspaceReader:
         self,
         query: str,
         *,
+        path: str = "",
         include: str | None = None,
         exclude: str | None = None,
         limit: int = 500,
@@ -313,6 +313,7 @@ class WorkspaceReader:
 
         :param query: Case-insensitive substring matched against name and
             relative path.  Whitespace-only yields an empty result.
+        :param path: Optional directory below the workspace to search.
         :param include: Comma-separated include globs (VSCode/Cursor
             subset), e.g. ``"*.ts,src/**"``.
         :param exclude: Comma-separated exclude globs.
@@ -322,6 +323,8 @@ class WorkspaceReader:
         q = query.strip().lower()
         if not q:
             return {"object": "list", "data": [], "has_more": False}
+
+        search_root = self._resolve(path)
 
         inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(include)]
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
@@ -420,7 +423,7 @@ class WorkspaceReader:
         # under an earlier-sorted real dir would still swallow the whole budget
         # before the walk reached a later top-level dir. Pass 2 drains the
         # deferred roots only if budget remains. Mirrors the runner's walk.
-        scan(str(self._root), True)
+        scan(str(search_root), True)
         while deferred and not stop:
             scan(deferred.popleft(), False)
         # When the walk stops early it is always because scan() tripped the
@@ -431,6 +434,7 @@ class WorkspaceReader:
         results.sort(key=lambda entry: cast(str, entry["path"]))
         return {
             "object": "list",
+            "base": str(search_root),
             "data": results,
             "has_more": len(results) >= limit,
             "truncated": truncated,

@@ -102,6 +102,18 @@ function renderPanel() {
   });
 }
 
+function renderHostPanel() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <GithubPanel target={{ kind: "host", hostId: "host_1", workspace: "/work/repo" }} />,
+    {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    },
+  );
+}
+
 /** Render, then switch to the Changes tab — Summary is the default, so the
  *  diff view (and its toolbar) only exists after activating Changes. Radix
  *  tabs select on pointer-down, so mouseDown (not click) flips the tab. */
@@ -191,6 +203,49 @@ afterEach(() => {
 });
 
 describe("GithubPanel", () => {
+  it("keeps host workspace GitHub data read-only and target-scoped", () => {
+    state.info!.data!.tracking_available = true;
+    state.info!.data!.selected_pr_url = "https://example.com/pr/6000";
+    state.info!.data!.prs = [
+      {
+        url: "https://example.com/pr/6000",
+        host: "github.com",
+        repository: "acme/app",
+        number: 6000,
+        relationship: "attached",
+      },
+    ];
+    renderHostPanel();
+
+    const target = { kind: "host", hostId: "host_1", workspace: "/work/repo" };
+    expect(useGithubInfo).toHaveBeenCalledWith(target, { poll: true, prUrl: undefined });
+    expect(useGithubChangedFiles).toHaveBeenCalledWith(
+      target,
+      true,
+      "https://example.com/pr/6000",
+      ":",
+    );
+    expect(screen.getByText("chore: dummy PR")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "Session pull request" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("describes a host branch without implying a session exists", () => {
+    state.info!.data!.pr = null;
+    state.info!.data!.prs = [];
+    renderHostPanel();
+
+    expect(
+      screen.getByText(
+        "No open pull request was found for this branch in the upstream repository.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/created in this session/i)).not.toBeInTheDocument();
+  });
+
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
     // Title + number live in the shared header (both tabs).

@@ -18,18 +18,20 @@ interface FakeEditor {
   on: (evt: string, h: () => void) => void;
   off: (evt: string, h: () => void) => void;
   commands: { setContent: (c: string) => void };
-  setEditable: () => void;
+  setEditable: (editable: boolean) => void;
   state: { selection: { empty: boolean; from: number; to: number } };
   emit: (evt: string) => void;
   setMarkdown: (m: string) => void;
   isFocused: boolean;
   wired: boolean;
+  editable: boolean;
+  typeMarkdown: (m: string) => void;
 }
 
 function makeFakeEditor(initial: string): FakeEditor {
   const handlers: Record<string, Set<() => void>> = {};
   let markdown = initial;
-  return {
+  const editor: FakeEditor = {
     isDestroyed: false,
     getMarkdown: () => markdown,
     on: (evt, h) => {
@@ -43,7 +45,9 @@ function makeFakeEditor(initial: string): FakeEditor {
         markdown = c;
       },
     },
-    setEditable: () => {},
+    setEditable: (editable: boolean) => {
+      editor.editable = editable;
+    },
     state: { selection: { empty: true, from: 0, to: 0 } },
     emit: (evt) => {
       handlers[evt]?.forEach((h) => h());
@@ -55,19 +59,28 @@ function makeFakeEditor(initial: string): FakeEditor {
     // the editor has focus. The load-normalisation test flips this to false.
     isFocused: true,
     wired: false,
+    editable: true,
+    typeMarkdown: (m) => {
+      if (!editor.editable) return;
+      markdown = m;
+      editor.emit("update");
+    },
   };
+  return editor;
 }
 
 let fakeEditor: FakeEditor | null = null;
 
 vi.mock("@tiptap/react", () => ({
   useEditor: (config: {
+    editable?: boolean;
     onCreate?: (p: { editor: FakeEditor }) => void;
     onUpdate?: (p: { editor: FakeEditor }) => void;
   }) => {
     const f = fakeEditor;
     if (f && !f.wired) {
       f.wired = true;
+      f.editable = config.editable ?? true;
       // onCreate sets the editor's baseline; real TipTap also registers the
       // onUpdate option as an "update" listener, so mirror that.
       config.onCreate?.({ editor: f });
@@ -101,13 +114,16 @@ vi.mock("./TipTapCommentExtension", () => ({
   createCommentDecorationExtension: vi.fn().mockReturnValue({}),
   commentDecorationKey: {},
 }));
-vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null }));
+vi.mock("./MarkdownCommentPlugin", () => ({
+  MarkdownCommentPlugin: ({ canEdit }: { canEdit?: boolean }) =>
+    canEdit ? <button type="button">Add comment</button> : null,
+}));
 // Capture the onSave the viewer wires so a test can fire a "manual save" (⌘S / pill).
 const toolbar = vi.hoisted(() => ({ onSave: null as ((md: string) => void) | null }));
 vi.mock("./MarkdownEditorToolbar", () => ({
   ToolbarPlugin: (props: { onSave: (md: string) => void }) => {
     toolbar.onSave = props.onSave;
-    return null;
+    return <button type="button">Edit toolbar</button>;
   },
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
@@ -137,11 +153,15 @@ function mockWrite(): void {
 // A fresh element each call: passing the same element reference to rerender()
 // makes React bail out (identical-element optimization), which would skip
 // re-reading the runner-online mock in the reconnect test.
-function makeViewer(content: string = INITIAL) {
+function makeViewer(
+  content: string = INITIAL,
+  { readOnly = false, conversationId = "conv_int" } = {},
+) {
   return (
     <MarkdownRichTextViewer
       content={content}
-      conversationId="conv_int"
+      conversationId={conversationId}
+      readOnly={readOnly}
       path={PATH}
       isSettled={true}
       comments={[]}
@@ -169,6 +189,22 @@ afterEach(() => {
 });
 
 describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
+  it("rejects typing and hides edit and comment controls in explicit read-only mode", async () => {
+    render(makeViewer(INITIAL, { readOnly: true, conversationId: "" }));
+
+    expect(fakeEditor!.editable).toBe(false);
+    expect(screen.queryByRole("button", { name: "Edit toolbar" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
+
+    await act(async () => {
+      fakeEditor!.typeMarkdown(EDITED);
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(fakeEditor!.getMarkdown()).toBe(INITIAL);
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
   it("debounced save fires after an edit (update → schedule → write)", async () => {
     render(makeViewer());
     // Edit: content diverges from the onCreate baseline, then emit 'update'.

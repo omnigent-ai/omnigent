@@ -17,6 +17,13 @@ import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
+  isHostWorkspaceTarget,
+  normalizeWorkspaceResourceTarget,
+  workspaceTargetKey,
+  workspaceTargetSessionId,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
+import {
   PathUnreachableError,
   joinBrowseLocation,
   relativizeToWorkspace,
@@ -41,6 +48,8 @@ import { FolderTree } from "./FolderTree";
 import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
+  /** Explicit resource scope. Omit to use the route session for compatibility. */
+  target?: WorkspaceResourceTarget;
   onFileSelect: (path: string) => void;
   /**
    * Which scope this panel renders: false = full folder tree, true =
@@ -227,6 +236,7 @@ const browseLocationCache = new Map<string, string>();
  * intentionally not listed here.
  */
 export function FilesPanel({
+  target: targetProp,
   onFileSelect,
   flatView,
   showHidden,
@@ -236,7 +246,12 @@ export function FilesPanel({
   onClose,
   frameless,
 }: FilesPanelProps) {
-  const { conversationId } = useParams<{ conversationId: string }>();
+  const { conversationId: routeConversationId } = useParams<{ conversationId: string }>();
+  const resourceTarget = targetProp ?? routeConversationId;
+  const target = normalizeWorkspaceResourceTarget(resourceTarget);
+  const conversationId = workspaceTargetSessionId(target);
+  const targetIdentity = workspaceTargetKey(target).join("\u0000");
+  const hostTarget = isHostWorkspaceTarget(target) ? target : undefined;
   // The runner went offline (e.g. its host restarted): `sessionStatus`
   // is "failed", set by `_on_runner_disconnect` server-side when the
   // runner's tunnel drops (and also client-side in chatStore when the
@@ -273,10 +288,10 @@ export function FilesPanel({
   // rounded card chrome; only the standalone card caps content at max-h.
   const isDrawer = onClose !== undefined;
   const fillHeight = isDrawer || frameless === true;
-  const changedQuery = useWorkspaceChangedFiles(conversationId, {
+  const changedQuery = useWorkspaceChangedFiles(resourceTarget, {
     enabled: true,
   });
-  const envQuery = useWorkspaceEnvironment(conversationId, {
+  const envQuery = useWorkspaceEnvironment(resourceTarget, {
     enabled: true,
   });
   const workspaceRoot = envQuery.data?.root ?? null;
@@ -287,19 +302,19 @@ export function FilesPanel({
   // from the per-conversation cache so the location survives the panel
   // unmounting while a file is open in the viewer.
   const [browseLocation, setBrowseLocation] = useState<string | null>(
-    () => (conversationId && browseLocationCache.get(conversationId)) || null,
+    () => (target && browseLocationCache.get(targetIdentity)) || null,
   );
   const [browseError, setBrowseError] = useState<string | null>(null);
   // On an in-place conversation switch (no remount), land on the NEW
   // session's own cached location or its root — never the previous
   // session's directory. The ref keeps mount itself from wiping the seed.
-  const browseForRef = useRef(conversationId);
+  const browseForRef = useRef(targetIdentity);
   useEffect(() => {
-    if (browseForRef.current === conversationId) return;
-    browseForRef.current = conversationId;
-    setBrowseLocation((conversationId && browseLocationCache.get(conversationId)) || null);
+    if (browseForRef.current === targetIdentity) return;
+    browseForRef.current = targetIdentity;
+    setBrowseLocation((target && browseLocationCache.get(targetIdentity)) || null);
     setBrowseError(null);
-  }, [conversationId]);
+  }, [target, targetIdentity]);
   const workingDir = browseLocation ?? workspaceRoot;
   // The wire form: "" means the workspace root (the historical relative
   // contract). A location INSIDE the workspace is sent relative to it, and
@@ -313,13 +328,13 @@ export function FilesPanel({
     (absolutePath: string) => {
       setBrowseError(null);
       const next = absolutePath === workspaceRoot ? null : absolutePath;
-      if (conversationId) {
-        if (next === null) browseLocationCache.delete(conversationId);
-        else browseLocationCache.set(conversationId, next);
+      if (target) {
+        if (next === null) browseLocationCache.delete(targetIdentity);
+        else browseLocationCache.set(targetIdentity, next);
       }
       setBrowseLocation(next);
     },
-    [workspaceRoot, conversationId],
+    [workspaceRoot, target, targetIdentity],
   );
 
   // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.
@@ -349,7 +364,7 @@ export function FilesPanel({
     [onFileSelect, locationParam],
   );
 
-  const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
+  const allFilesQuery = useWorkspaceAllFiles(resourceTarget, { enabled: !flatView }, locationParam);
   // A refused location must say so on the bar. Rendering an empty tree instead
   // would read as "this directory is empty", which is a different fact.
   const unreachable =
@@ -401,7 +416,7 @@ export function FilesPanel({
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
   const treeSearchQuery = useWorkspaceFileSearch(
-    conversationId,
+    resourceTarget,
     debouncedTreeSearch,
     debouncedTreeInclude,
     debouncedTreeExclude,
@@ -419,9 +434,7 @@ export function FilesPanel({
   // `isLoading` — the files queries are disabled (not loading) until the
   // environment query resolves.
   const scrollRef = useRef<HTMLElement>(null);
-  const scrollKey = conversationId
-    ? `files:${conversationId}:${flatView ? "changed" : "all"}`
-    : null;
+  const scrollKey = target ? `files:${targetIdentity}:${flatView ? "changed" : "all"}` : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
   const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
 
@@ -439,8 +452,8 @@ export function FilesPanel({
           <BrowseLocationBar
             current={workingDir}
             workspace={workspaceRoot}
-            hostId={session?.hostId ?? null}
-            canBrowseOutside={isOwnerLevel(session?.permissionLevel ?? null)}
+            hostId={hostTarget?.hostId ?? session?.hostId ?? null}
+            canBrowseOutside={!hostTarget && isOwnerLevel(session?.permissionLevel ?? null)}
             reach={envQuery.data?.reachable ?? null}
             onNavigate={navigateTo}
             error={locationError}
@@ -601,7 +614,7 @@ export function FilesPanel({
             isError={allFilesQuery.isError}
             error={allFilesQuery.error}
             onFileSelect={openTreeFile}
-            conversationId={conversationId}
+            target={resourceTarget}
             showHidden={showHidden}
             onShowHidden={() => onShowHiddenChange(true)}
             changedFiles={changedQuery.data?.data}

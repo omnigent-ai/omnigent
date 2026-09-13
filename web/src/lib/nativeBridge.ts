@@ -194,6 +194,14 @@ interface ElectronDesktopApi extends NativeShellApi {
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  /** Preserve a draft's browser views when its session is created. */
+  browserAdoptDraft?: (
+    sourceId: string,
+    targetId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  browserRenewDraftLease?: (
+    workspaceId: string,
+  ) => Promise<{ ok: boolean; renewed?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -454,6 +462,19 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
  */
 export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
+}
+
+export async function renewDraftBrowserLease(
+  workspaceId: string,
+): Promise<{ ok: boolean; renewed?: boolean; error?: string }> {
+  const electron = electronApi();
+  if (!electron?.browserRenewDraftLease) return { ok: false };
+  try {
+    return await electron.browserRenewDraftLease(workspaceId);
+  } catch (err) {
+    console.warn("[nativeBridge] browser draft lease renewal failed:", err);
+    return { ok: false, error: String(err) };
+  }
 }
 
 /**

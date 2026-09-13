@@ -109,14 +109,14 @@ function nonceFromScripts(scripts) {
 /** Build a registry stub around one entry keyed by conversationId. */
 function makeRegistry(conversationId, webContents) {
   const entries = new Map();
-  if (conversationId) entries.set(conversationId, { view: { webContents } });
+  if (conversationId) entries.set(conversationId, { conversationId, view: { webContents } });
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
     openOrNavigate: (id) => {
       const wc = makeWebContents();
-      const entry = { view: { webContents: wc } };
+      const entry = { conversationId: id, view: { webContents: wc } };
       entries.set(id, entry);
       return { ok: true, created: true, entry };
     },
@@ -126,6 +126,7 @@ function makeRegistry(conversationId, webContents) {
       return { ok: true };
     },
     close: () => ({ ok: true, removed: true }),
+    renewDraftLease: () => ({ ok: true, renewed: false }),
     suppressedCalls,
   };
 }
@@ -170,6 +171,7 @@ describe("browserIpc — trust gate", () => {
     const channels = ipcMain.channels();
     for (const ch of [
       "omnigent:browser-open-or-navigate",
+      "omnigent:browser-renew-draft-lease",
       "omnigent:browser-set-active",
       "omnigent:browser-set-suppressed",
       "omnigent:browser-resize",
@@ -225,6 +227,32 @@ describe("browserIpc — overlay suppression (#3980)", () => {
   });
 });
 
+describe("browserIpc — draft lease renewal", () => {
+  it("gates renewal and forwards the owning draft namespace", async () => {
+    const blocked = setup({ pinned: false });
+    const denied = await blocked.ipcMain.invoke(
+      "omnigent:browser-renew-draft-lease",
+      blocked.event,
+      { workspaceId: "draft-workspace:1234" },
+    );
+    assert.equal(denied.ok, false);
+
+    const { ipcMain, registry, event } = setup();
+    let renewed = null;
+    registry.renewDraftLease = (workspaceId) => {
+      renewed = workspaceId;
+      return { ok: true, renewed: true };
+    };
+    assert.deepEqual(
+      await ipcMain.invoke("omnigent:browser-renew-draft-lease", event, {
+        workspaceId: "draft-workspace:1234",
+      }),
+      { ok: true, renewed: true },
+    );
+    assert.equal(renewed, "draft-workspace:1234");
+  });
+});
+
 describe("browserIpc — history navigation", () => {
   it("go-back issues goBack only when canGoBack is true", async () => {
     const wc = makeWebContents({ canBack: true });
@@ -276,6 +304,45 @@ describe("browserIpc — devtools toggle", () => {
 });
 
 describe("browserIpc — url live-tracking", () => {
+  it("reports the new owner after a draft view is adopted", async () => {
+    const { ipcMain, registry, sent, event } = setup({ conversationId: null });
+    await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
+      conversationId: "draft-workspace:1234",
+      url: "https://example.com",
+    });
+    const entry = registry.get("draft-workspace:1234");
+    entry.conversationId = "conv_new";
+    entry.view.webContents.emit("did-navigate", "https://example.com/next");
+    assert.deepEqual(sent.find((s) => s.channel === "browser-url-changed").payload, {
+      conversationId: "conv_new",
+      url: "https://example.com/next",
+    });
+  });
+
+  it("gates draft adoption and confines it to the sender's registry", async () => {
+    const blocked = setup({ pinned: false });
+    assert.equal(
+      (
+        await blocked.ipcMain.invoke("omnigent:browser-adopt-draft", blocked.event, {
+          sourceId: "draft-workspace:1234",
+          targetId: "conv_new",
+        })
+      ).ok,
+      false,
+    );
+    const { ipcMain, registry, event } = setup();
+    registry.adoptDraft = (source, target) => ({
+      ok: source === "draft-workspace:1234" && target === "conv_new",
+    });
+    assert.deepEqual(
+      await ipcMain.invoke("omnigent:browser-adopt-draft", event, {
+        sourceId: "draft-workspace:1234",
+        targetId: "conv_new",
+      }),
+      { ok: true },
+    );
+  });
+
   it("open-or-navigate wires did-navigate listeners that emit url + nav-state", async () => {
     const { ipcMain, registry, sent, event } = setup({ conversationId: null });
     await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {

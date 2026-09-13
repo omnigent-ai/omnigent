@@ -10,6 +10,11 @@ import {
   useWorkspaceDirectories,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import {
+  workspaceTargetKey,
+  workspaceTargetSessionId,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { type ChangedSort, compareChangedFiles, type SortableFile } from "./FlatFileList";
@@ -359,7 +364,8 @@ export function FolderTree({
   isError,
   error,
   onFileSelect,
-  conversationId,
+  target,
+  conversationId: legacyConversationId,
   showHidden,
   onShowHidden,
   changedFiles,
@@ -380,7 +386,9 @@ export function FolderTree({
   isError: boolean;
   error: Error | null;
   onFileSelect: (path: string) => void;
-  conversationId: string | undefined;
+  target?: WorkspaceResourceTarget;
+  /** Session-only compatibility for direct consumers. */
+  conversationId?: string;
   showHidden: boolean;
   /** Called when the user clicks "Show hidden files" in the search results. */
   onShowHidden?: () => void;
@@ -430,9 +438,12 @@ export function FolderTree({
    */
   scrollParentRef?: RefObject<HTMLElement | null>;
 }) {
+  const resourceTarget = target ?? legacyConversationId;
+  const conversationId = workspaceTargetSessionId(resourceTarget);
+  const targetIdentity = workspaceTargetKey(resourceTarget).join("\u0000");
   // Initialise from the module-level cache so expanded state survives
   // unmount/remount (e.g. opening the FileViewer and navigating back).
-  const cacheKey = conversationId ? expandedCacheKey(conversationId, browseLocation) : null;
+  const cacheKey = resourceTarget ? expandedCacheKey(targetIdentity, browseLocation) : null;
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
     if (!cacheKey) return new Set();
     const cached = expandedPathsCache.get(cacheKey);
@@ -564,7 +575,7 @@ export function FolderTree({
   // all the way down, and it converges the same whether listings arrive async
   // or are already cached.
   const [lazyPaths, setLazyPaths] = useState<string[]>([]);
-  const dirData = useWorkspaceDirectories(conversationId, lazyPaths, browseLocation);
+  const dirData = useWorkspaceDirectories(resourceTarget, lazyPaths, browseLocation);
   useEffect(() => {
     const next = visibleTree
       ? expandedLazyPaths(visibleTree, expandedPaths, showHidden, sort, dirData)

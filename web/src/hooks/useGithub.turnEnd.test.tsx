@@ -18,7 +18,12 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { useGithubInfo } from "./useGithub";
+import {
+  fetchGithubFileContents,
+  useGithubChangedFiles,
+  useGithubInfo,
+  useGithubPrDiff,
+} from "./useGithub";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -52,6 +57,18 @@ function Probe({ id }: { id: string | undefined }) {
   return null;
 }
 
+function HostProbe({ workspace }: { workspace: string }) {
+  useGithubInfo({ kind: "host", hostId: "host/a", workspace });
+  return null;
+}
+
+function RevisionProbe({ revision }: { revision: string }) {
+  const target = { kind: "host" as const, hostId: "host/a", workspace: "/repo" };
+  useGithubChangedFiles(target, true, "https://github.com/acme/repo/pull/1", revision);
+  useGithubPrDiff(target, true, "https://github.com/acme/repo/pull/1", revision);
+  return null;
+}
+
 beforeEach(() => {
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(githubInfoResponse());
@@ -67,6 +84,69 @@ afterEach(() => {
 });
 
 describe("useGithubInfo turn-end invalidate", () => {
+  it("preserves GitHub file diff parameters on the host route", async () => {
+    await fetchGithubFileContents(
+      { kind: "host", hostId: "host/a", workspace: "/repo one" },
+      "src/a b.ts",
+      "main",
+      {
+        pr_url: "https://github.com/acme/repo/pull/1",
+        previous_path: "src/old.ts",
+        head_sha: "head",
+        base_sha: "base",
+      },
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/hosts/host%2Fa/workspace/resources/github/diff/src/a%20b.ts?base=main&pr_url=https%3A%2F%2Fgithub.com%2Facme%2Frepo%2Fpull%2F1&previous_path=src%2Fold.ts&head_sha=head&base_sha=base&workspace=%2Frepo+one",
+      expect.anything(),
+    );
+  });
+
+  it("uses the host workspace route without a session liveness target", async () => {
+    stubChatStore("conv_live", "running");
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+    const { rerender } = render(
+      <QueryClientProvider client={qc}>
+        <HostProbe workspace="/repo one" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/hosts/host%2Fa/workspace/resources/github?workspace=%2Frepo+one",
+    );
+    expect(onlineMock).toHaveBeenCalledWith(undefined);
+    expect(hostOnlineMock).toHaveBeenCalledWith(undefined);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/v1/sessions/"))).toBe(false);
+
+    stubChatStore("conv_live", "idle");
+    rerender(
+      <QueryClientProvider client={qc}>
+        <HostProbe workspace="/repo two" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/v1/hosts/host%2Fa/workspace/resources/github?workspace=%2Frepo+two",
+    );
+  });
+
+  it("refetches PR files and patch when the remote revision changes", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <QueryClientProvider client={qc}>
+        <RevisionProbe revision="base:head-one" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    rerender(
+      <QueryClientProvider client={qc}>
+        <RevisionProbe revision="base:head-two" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+  });
+
   it("refetches github info when the focused session goes running → idle", async () => {
     stubChatStore("conv_live", "running");
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });

@@ -247,6 +247,51 @@ def test_manual_attach_and_exclusion(tracked: str, monkeypatch: pytest.MonkeyPat
     assert url not in {entry.url for entry in SessionPrRegistry("session").list()}
 
 
+def test_unlinked_branch_pr_stays_unselected(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "unlinked-branch"
+
+    def git(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return (0, "feature\n", "")
+        return (1, "", "no stub")
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[:2] == ["pr", "view"]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": 42,
+                        "title": "Branch PR",
+                        "state": "OPEN",
+                        "url": A,
+                        "isDraft": False,
+                        "author": {"login": "alice"},
+                        "baseRefName": "main",
+                        "headRefName": "feature",
+                        "headRefOid": "head",
+                        "baseRefOid": "base",
+                        "statusCheckRollup": [],
+                    }
+                ),
+                "",
+            )
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github, "_git", git)
+    monkeypatch.setattr(github, "_gh", gh)
+    initial = github.github_info(tracked, session_id=session_id)
+    assert initial["selected_pr_url"] == A
+
+    unlinked = github.update_session_pr(tracked, session_id, A, "remove")
+
+    assert unlinked["pr"] is None
+    assert "selected_pr_url" not in unlinked
+    assert unlinked["prs"] == []
+
+
 def test_default_selection_matches_metadata_and_all_pages(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

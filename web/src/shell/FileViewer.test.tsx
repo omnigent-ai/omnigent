@@ -31,15 +31,18 @@ vi.mock("./CodeViewer", () => ({
     viewMode,
     searchOpen,
     onDirtyChange,
+    readOnly,
   }: {
     viewMode: string;
     searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
+    readOnly?: boolean;
   }) => (
     <div
       data-testid="code-viewer"
       data-view-mode={viewMode}
       data-search-open={String(!!searchOpen)}
+      data-read-only={String(!!readOnly)}
     >
       <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
     </div>
@@ -87,16 +90,19 @@ vi.mock("./MonacoDiffViewer", () => ({
     wrapLines,
     hideWhitespace,
     searchOpen,
+    readOnly,
   }: {
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
+    readOnly?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
       data-search-open={String(!!searchOpen)}
+      data-read-only={String(!!readOnly)}
     />
   ),
 }));
@@ -166,6 +172,7 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import type { WorkspaceResourceTarget } from "@/lib/workspaceTarget";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
@@ -214,6 +221,8 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  /** Explicit host target for pre-session read-only coverage. */
+  target?: WorkspaceResourceTarget;
 }
 
 /**
@@ -231,6 +240,7 @@ function viewerTree({
   onClose = vi.fn(),
   sort,
   onNavigateTo,
+  target,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -241,6 +251,7 @@ function viewerTree({
         <FileViewer
           open={open}
           conversationId="conv_1"
+          target={target}
           path={path}
           onClose={onClose}
           sort={sort}
@@ -562,6 +573,17 @@ describe("FileViewer prev/next navigation order", () => {
 });
 
 describe("FileViewer URL sync — diff param", () => {
+  it("keeps pre-session file and diff surfaces explicitly read-only", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const target = { kind: "host", hostId: "host_1", workspace: "/repo" } as const;
+    const file = renderViewer({ open: true, path: "file1.py", target });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-read-only", "true");
+
+    file.unmount();
+    renderViewer({ open: true, path: "file1.py", target, initialSearch: "diff=1" });
+    expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-read-only", "true");
+  });
+
   it("initializes diff view when URL contains ?diff=1 and the file is in the changed list", async () => {
     // file1.py is returned by the useWorkspaceChangedFiles mock → isDiffAvailable=true.
     // Starting with ?diff=1 means diffActive is initialized to true, so viewMode="diff".
@@ -1161,6 +1183,22 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     fireEvent.click(screen.getByRole("button", { name: "View source" }));
     expect(viewModeOf()).toBe("source");
   });
+
+  it.each(["page.html", "analysis.ipynb"])(
+    "switches pre-session %s between read-only preview and source",
+    (path) => {
+      renderViewer({
+        open: true,
+        path,
+        target: { kind: "host", hostId: "host_1", workspace: "/repo" },
+      });
+      expect(viewModeOf()).toBe("preview");
+
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+      expect(screen.getByRole("button", { name: "View preview" })).toBeInTheDocument();
+    },
+  );
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
     renderViewer({ open: true, path: "notes.md" });

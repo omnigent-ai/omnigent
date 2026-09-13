@@ -3,6 +3,22 @@ import {
   HarnessPickerEntry,
   HarnessPickerConfigPage,
 } from "@/components/composer/HarnessPicker";
+import { landingStorageKey } from "@/lib/landingStorage";
+import {
+  publishLandingWorkspaceSelection,
+  confirmLandingWorkspaceChange,
+  adoptLandingWorkspace,
+  LandingWorkspaceAdoptionError,
+  discardLandingWorkspace,
+  claimLandingWorkspaceStart,
+  discardAbandonedLandingWorkspace,
+  finishLandingWorkspaceStart,
+  useLandingWorkspaceState,
+  readLandingWorkspaceState,
+  setLandingWorkspaceStarting,
+  setLandingWorkspaceBusy,
+  readLandingNavigationGeneration,
+} from "@/lib/landingWorkspaceState";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import {
@@ -93,6 +109,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { useViewerId } from "@/hooks/useViewerId";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { randomUUID } from "@/lib/randomUUID";
@@ -1943,10 +1960,8 @@ function HarnessConfigModal({
   );
 }
 
-// In-memory draft for the new-session landing screen, so a half-composed
-// message, attachments and picker selections survive the unmount that happens
-// when the user navigates into an existing session and back. Module-scoped,
-// not persisted to storage (a page refresh starts clean); cleared on create.
+// Preserve the composer across navigation; serializable fields also survive
+// reload. File attachments stay in memory. Clear the draft after creation.
 interface LandingDraft {
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
@@ -1980,12 +1995,43 @@ interface LandingDraft {
   workspaceFromConfig: boolean;
 }
 
-let landingDraft: LandingDraft | null = null;
+const LANDING_COMPOSER_KEY = "omnigent:landing-composer";
+function readSavedLandingDraft(scope: string): LandingDraft | null {
+  try {
+    const saved = JSON.parse(localStorage.getItem(scope) ?? "null");
+    return saved && typeof saved.message === "string" && typeof saved.workspace === "string"
+      ? { ...saved, files: [] }
+      : null;
+  } catch {
+    return null;
+  }
+}
+let landingDraftScope = landingStorageKey(LANDING_COMPOSER_KEY);
+let landingDraft: LandingDraft | null = readSavedLandingDraft(landingDraftScope);
 let landingDraftRevision = 0;
+const landingDraftClearListeners = new Set<(scope: string) => void>();
 
-function writeLandingDraft(draft: LandingDraft | null): void {
-  landingDraft = draft;
-  landingDraftRevision += 1;
+function sameLandingDraft(left: LandingDraft | null, right: LandingDraft): boolean {
+  if (left === null || left.files.length !== right.files.length) return false;
+  if (left.files.some((file, index) => file !== right.files[index])) return false;
+  return JSON.stringify({ ...left, files: [] }) === JSON.stringify({ ...right, files: [] });
+}
+
+function writeLandingDraft(
+  draft: LandingDraft | null,
+  scope = landingStorageKey(LANDING_COMPOSER_KEY),
+): void {
+  if (scope === landingDraftScope) {
+    landingDraft = draft;
+    landingDraftRevision += 1;
+  }
+  try {
+    if (draft) localStorage.setItem(scope, JSON.stringify({ ...draft, files: [] }));
+    else localStorage.removeItem(scope);
+  } catch {
+    /* Storage is optional. */
+  }
+  if (draft === null) landingDraftClearListeners.forEach((listener) => listener(scope));
 }
 
 // Test-only: clears the preserved landing draft so each case starts from a
@@ -1993,9 +2039,19 @@ function writeLandingDraft(draft: LandingDraft | null): void {
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
   writeLandingDraft(null);
+  setLandingWorkspaceStarting(false);
+  setLandingWorkspaceBusy(false);
 }
 
 export function NewChatLandingScreen() {
+  useViewerId();
+  useLandingWorkspaceState();
+  const draftScope = landingStorageKey(LANDING_COMPOSER_KEY);
+  return <NewChatLandingComposer key={draftScope} draftScope={draftScope} />;
+}
+
+function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
+  const landingResources = useLandingWorkspaceState();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -2114,6 +2170,11 @@ export function NewChatLandingScreen() {
   // visit (or a plain one) must not beat THIS visit's project defaults —
   // strip them so the prefill machine (fill-empty-only) can seed. Read once
   // per mount; only the lazy state initializers below consume it.
+  if (landingDraftScope !== draftScope) {
+    landingDraftScope = draftScope;
+    landingDraft = readSavedLandingDraft(draftScope);
+    landingDraftRevision += 1;
+  }
   const restoredDraft: LandingDraft | null =
     landingDraft === null || landingDraft.project === projectParam
       ? landingDraft
@@ -2138,12 +2199,19 @@ export function NewChatLandingScreen() {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const setPromptMessage = useCallback(
+    (next: string) => {
+      if (next !== message) landingDraftRevision += 1;
+      setMessage(next);
+    },
+    [message],
+  );
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(message, setMessage, textareaRef);
+  const dictation = useDictationInsert(message, setPromptMessage, textareaRef);
   // The CSS max-height keeps the reference's 180px scrolling cap while the
   // shared hook continues to grow from the one-row minimum.
   useAutoGrowTextarea(textareaRef, message, 9);
@@ -2160,10 +2228,14 @@ export function NewChatLandingScreen() {
   // 415 strands the typed message in a session the user never wanted.
   const addFiles = (incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
+    if (accepted.length > 0) {
+      landingDraftRevision += 1;
+      setFiles((prev) => [...prev, ...accepted]);
+    }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
   const removeFile = (index: number) => {
+    if (index >= 0 && index < files.length) landingDraftRevision += 1;
     setFiles((prev) => prev.filter((_, i) => i !== index));
     setAttachmentError(null);
   };
@@ -2500,10 +2572,8 @@ export function NewChatLandingScreen() {
   // Advanced settings for agents with a configurable brain harness.
   const [configOpen, setConfigOpen] = useState(false);
 
-  // Mirror the current draft fields into a ref every render so the unmount
-  // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped once the draft is sent to a create, so the
-  // snapshot is dropped instead of resurrected.
+  // Keep the latest draft available across a detour while Start is pending.
+  // A successful create clears it; a failed create leaves it for retry.
   const submittedRef = useRef(false);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
@@ -2537,18 +2607,36 @@ export function NewChatLandingScreen() {
     workspaceFromConfig: workspaceFromConfigRef.current,
   };
   useEffect(() => {
+    if (!submittedRef.current) {
+      if (draftScope === landingDraftScope && !sameLandingDraft(landingDraft, draftRef.current))
+        writeLandingDraft(draftRef.current, draftScope);
+    }
+  });
+  useEffect(() => {
     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
     // doesn't leave the screen marked gone.
     onScreenRef.current = true;
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftRef.current);
+        writeLandingDraft(draftRef.current, draftScope);
       } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+        writeLandingDraft(draftRef.current, draftScope);
+        submittedDraftRevisionRef.current = landingDraftRevision;
       }
     };
-  }, []);
+  }, [draftScope]);
+  useEffect(() => {
+    const clearSubmittedDraft = (scope: string) => {
+      if (scope !== draftScope || submittedRef.current) return;
+      setMessage("");
+      setFiles([]);
+    };
+    landingDraftClearListeners.add(clearSubmittedDraft);
+    return () => {
+      landingDraftClearListeners.delete(clearSubmittedDraft);
+    };
+  }, [draftScope]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -2646,6 +2734,13 @@ export function NewChatLandingScreen() {
       seededConfigSigRef.current !== null &&
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
+    if (!confirmLandingWorkspaceChange()) {
+      const params = new URLSearchParams(searchParams);
+      if (prefill.project) params.set("project", prefill.project);
+      else params.delete("project");
+      navigate(`/?${params.toString()}`, { replace: true });
+      return;
+    }
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
@@ -2663,7 +2758,7 @@ export function NewChatLandingScreen() {
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project, prefillConfigSig]);
+  }, [projectParam, prefill.project, prefillConfigSig, searchParams, navigate]);
 
   // Record the config the machine settled from, once it's loaded and the
   // machine is done, so the reseed effect above can spot a later change to it
@@ -3767,6 +3862,71 @@ export function NewChatLandingScreen() {
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  const landingSelectionPublishedRef = useRef(false);
+  useEffect(() => {
+    if (
+      !landingSelectionPublishedRef.current &&
+      (!prefillSettled ||
+        hostsLoading ||
+        (!sandboxSelected && (selectedHostId === null || workspaceTrimmed === "")))
+    )
+      return;
+    landingSelectionPublishedRef.current = true;
+    const available =
+      !sandboxSelected &&
+      !shouldCreateWorktree &&
+      selectedHost?.status === "online" &&
+      workspaceValid;
+    const accepted = publishLandingWorkspaceSelection({
+      hostId: selectedHostId,
+      workspace: normalizeWorkspacePath(workspaceTrimmed) ?? workspaceTrimmed,
+      available,
+      project: projectParam,
+      reason: sandboxSelected
+        ? "The sandbox workspace becomes available after Start."
+        : shouldCreateWorktree
+          ? "The new worktree becomes available after Start. Clear the branch name to use this folder now."
+          : selectedHost?.status !== "online"
+            ? "Choose a connected computer to browse its workspace."
+            : "Choose a folder to browse its workspace.",
+    });
+    if (!accepted) {
+      const retained = readLandingWorkspaceState().selection;
+      if (retained !== null) {
+        setSandboxSelected(false);
+        setSelectedHostId(retained.hostId);
+        setWorkspace(retained.workspace);
+        setBranchName("");
+        setAutoSeededBranch("");
+        setPrefilledBranch("");
+        const retainedProject = retained.project ?? "";
+        setSelectedProject(retainedProject);
+        setPrefill(initialPrefillState(retainedProject));
+        seededConfigSigRef.current = null;
+        workspaceFromConfigRef.current = false;
+        seededHostRef.current = retained.hostId;
+        worktreeSeededForRef.current = null;
+        if (retained.project !== undefined && retainedProject !== projectParam) {
+          const params = new URLSearchParams(searchParams);
+          if (retainedProject) params.set("project", retainedProject);
+          else params.delete("project");
+          navigate(`/?${params.toString()}`, { replace: true });
+        }
+      }
+    }
+  }, [
+    prefillSettled,
+    hostsLoading,
+    sandboxSelected,
+    shouldCreateWorktree,
+    selectedHost?.status,
+    selectedHostId,
+    workspaceTrimmed,
+    workspaceValid,
+    projectParam,
+    searchParams,
+    navigate,
+  ]);
   // Auto-fill the base branch when a new-worktree branch is named, but only
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
@@ -3949,7 +4109,7 @@ export function NewChatLandingScreen() {
   // argument — skills never auto-execute from the menu.
   function applySlashSelection(cmd: string) {
     setSlashMenuIndex(-1);
-    setMessage(cmd + " ");
+    setPromptMessage(cmd + " ");
     textareaRef.current?.focus();
   }
 
@@ -3960,7 +4120,7 @@ export function NewChatLandingScreen() {
 
   // Pills only render over an empty draft, so there's never args to preserve.
   function applySkillPill(name: string) {
-    setMessage(`/${name} `);
+    setPromptMessage(`/${name} `);
     textareaRef.current?.focus();
   }
 
@@ -4042,7 +4202,7 @@ export function NewChatLandingScreen() {
     setMention,
     mentionEntries,
     text: message,
-    setText: setMessage,
+    setText: setPromptMessage,
     textareaRef,
   });
 
@@ -4050,7 +4210,8 @@ export function NewChatLandingScreen() {
     message.trim().length > 0 &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
-    !creating;
+    !creating &&
+    !landingResources.busy;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
   // order a user fills the form — location first, then message — so the
@@ -4058,21 +4219,23 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : sandboxSelected && sandboxRepoOverCap
-      ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-          maxSandboxRepos === 1 ? "repository" : "repositories"
-        } — remove the extras`
-      : sandboxSelected && !sandboxRepoValid
-        ? "Please enter a valid repository URL"
-        : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-          ? "Selected host is unavailable. Reconnect it or choose another host."
-          : !sandboxSelected && (!selectedHostId || !workspaceValid)
-            ? "Please choose a host and working directory"
-            : configuredAgentUnavailable && selectedAgent == null
-              ? "This project's configured agent is unavailable — pick an agent to continue"
-              : message.trim().length === 0
-                ? "Enter a message to get started"
-                : null;
+    : landingResources.busy
+      ? "Wait for the workspace tool to finish opening"
+      : sandboxSelected && sandboxRepoOverCap
+        ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+            maxSandboxRepos === 1 ? "repository" : "repositories"
+          } — remove the extras`
+        : sandboxSelected && !sandboxRepoValid
+          ? "Please enter a valid repository URL"
+          : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+            ? "Selected host is unavailable. Reconnect it or choose another host."
+            : !sandboxSelected && (!selectedHostId || !workspaceValid)
+              ? "Please choose a host and working directory"
+              : configuredAgentUnavailable && selectedAgent == null
+                ? "This project's configured agent is unavailable — pick an agent to continue"
+                : message.trim().length === 0
+                  ? "Enter a message to get started"
+                  : null;
 
   // Chip display labels.
   const worktreeHeader = composerWorktreeHeaderState({
@@ -4229,6 +4392,7 @@ export function NewChatLandingScreen() {
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
+    if (hostId !== selectedHostId && !confirmLandingWorkspaceChange()) return;
     writeLastHostChoice(hostId);
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
@@ -4250,6 +4414,7 @@ export function NewChatLandingScreen() {
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
     // sticky default for the next visit, on the provider just picked.
+    if (!sandboxSelected && !confirmLandingWorkspaceChange()) return;
     writeLastHostChoice(SANDBOX_HOST_CHOICE);
     writeLastSandboxProvider(provider);
     // Recorded even when already selected, so re-picking a different
@@ -4363,24 +4528,27 @@ export function NewChatLandingScreen() {
     }
   }
 
-  // No session was created after all, so the draft is the user's again —
-  // including when they navigated away and the unmount cleanup already
-  // dropped it on the strength of the submit.
+  // A failed create leaves the prompt available for another attempt.
   function returnDraftToUser() {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
-    if (!onScreenRef.current) writeLandingDraft(draftRef.current);
+    if (!onScreenRef.current) writeLandingDraft(draftRef.current, draftScope);
   }
 
   async function handleCreate() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
-    if (!canSubmit) return;
+    if (!canSubmit || readLandingWorkspaceState().busy) return;
     // A create is actually happening: report it for pointer clicks (via the
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
     // don't emit, matching the disabled Start button.
     trackClick("new_chat.start_session", "button");
+    const createNavigationGeneration = readLandingNavigationGeneration();
+    const createHistoryKey = window.history.state?.key;
+    const createNavigationIsCurrent = () =>
+      readLandingNavigationGeneration() === createNavigationGeneration &&
+      window.history.state?.key === createHistoryKey;
     // BrowserRouter may defer its React update even though history already
     // changed. Remember the submit location so a late create cannot redirect
     // after the user has navigated elsewhere while this component is still
@@ -4392,6 +4560,16 @@ export function NewChatLandingScreen() {
     if (sandboxRepoSelections.length > 0) {
       writeLastSandboxRepos(sandboxRepoSelections);
     }
+    const draftWorkspaceClaim = claimLandingWorkspaceStart();
+    const draftWorkspaceSnapshot = draftWorkspaceClaim.snapshot;
+    const cleanAbandonedTools = async (preserveTerminals = false) => {
+      if (!draftWorkspaceClaim.ownsResources) return;
+      try {
+        await discardAbandonedLandingWorkspace(draftWorkspaceSnapshot, preserveTerminals);
+      } catch {
+        showToast("Some tools from the previous workspace could not be closed.");
+      }
+    };
     setCreating(true);
     setCreateError(null);
     let localConv: {
@@ -4411,11 +4589,8 @@ export function NewChatLandingScreen() {
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
       if (wasViewing && stillOnTempRoute) navigate("/");
     };
-    // The draft is spent from the moment it is submitted: it belongs to the
-    // session now being created, so a detour back to this screen must not
-    // hand it back pre-filled. Flipped here rather than on the response
-    // because the create outlives an unmount; a create that fails hands the
-    // draft back via returnDraftToUser.
+    // Keep the submitted draft until creation succeeds, including when the
+    // user leaves and returns while the request is pending.
     submittedDraftRevisionRef.current = landingDraftRevision;
     submittedRef.current = true;
     try {
@@ -4615,7 +4790,7 @@ export function NewChatLandingScreen() {
             // real host (null for a sandbox create).
             hostId: sandboxSelected ? null : selectedHostId,
           });
-          if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
+          // Keep draft tools available until Start resolves; the real session opens below.
         } catch {
           /* non-fatal: the response still opens the server session */
         }
@@ -4745,6 +4920,7 @@ export function NewChatLandingScreen() {
         // the workspace and agent, so winning on the push can't skip past an
         // error the user needed to see on this screen.
         if ("error" in created) {
+          await cleanAbandonedTools();
           returnDraftToUser();
           // On the navigate-first path the landing screen is unmounted, so tear
           // down the phantom chat, return to landing, and surface the error as a
@@ -4759,6 +4935,34 @@ export function NewChatLandingScreen() {
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
+      }
+      if (draftWorkspaceClaim.ownsResources && !sandboxSelected && !shouldCreateWorktree) {
+        try {
+          await adoptLandingWorkspace(
+            data.id,
+            selectedHostId,
+            normalizeWorkspacePath(workspaceTrimmed) ?? workspaceTrimmed,
+            draftWorkspaceSnapshot,
+          );
+        } catch (error) {
+          const terminalsTransferred =
+            error instanceof LandingWorkspaceAdoptionError && error.terminalsTransferred;
+          await cleanAbandonedTools(terminalsTransferred);
+          showToast(
+            terminalsTransferred
+              ? "The chat started. Transferred shells remain available in the chat; some browser tabs could not be transferred."
+              : "The chat started, but draft tools could not be transferred.",
+          );
+        }
+      }
+      if (draftWorkspaceClaim.ownsResources && (sandboxSelected || shouldCreateWorktree)) {
+        try {
+          await discardLandingWorkspace(draftWorkspaceSnapshot);
+        } catch {
+          showToast(
+            "The chat started, but some draft tools could not be closed. Return to New chat to close them.",
+          );
+        }
       }
       // Persist the configuration that actually launched. Modal Save updates
       // storage eagerly so an immediate Send cannot observe stale state; this
@@ -4839,7 +5043,7 @@ export function NewChatLandingScreen() {
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
       if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+        writeLandingDraft(null, draftScope);
       }
       void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
 
@@ -4857,7 +5061,10 @@ export function NewChatLandingScreen() {
           localConv.pendingMsgTempId,
           skill,
           navigate,
-          () => window.location.pathname.endsWith(tempRouteSuffix),
+          () =>
+            createNavigationIsCurrent() &&
+            (window.location.pathname.endsWith(tempRouteSuffix) ||
+              window.location.href === createLocation),
           localProject,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
@@ -4867,11 +5074,16 @@ export function NewChatLandingScreen() {
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
-        if (onScreenRef.current && window.location.href === createLocation) {
+        if (
+          createNavigationIsCurrent() &&
+          onScreenRef.current &&
+          window.location.href === createLocation
+        ) {
           navigate(`/c/${data.id}`);
         }
       }
     } catch {
+      await cleanAbandonedTools();
       const msg = "Couldn't reach the server. Check your connection and try again.";
       tearDownLocalConversation();
       returnDraftToUser();
@@ -4880,6 +5092,7 @@ export function NewChatLandingScreen() {
       else setCreateError(msg);
     } finally {
       setCreating(false);
+      finishLandingWorkspaceStart(draftWorkspaceClaim.token);
     }
   }
 
@@ -5014,6 +5227,7 @@ export function NewChatLandingScreen() {
                           type="button"
                           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
                           onClick={() => {
+                            if (path !== workspace && !confirmLandingWorkspaceChange()) return;
                             workspaceFromConfigRef.current = false;
                             setWorkspace(path);
                             setWorkspacePopoverOpen(false);
@@ -5086,7 +5300,11 @@ export function NewChatLandingScreen() {
                           id="landing-branch-name"
                           type="text"
                           value={branchName}
-                          onChange={(e) => setBranchName(e.target.value)}
+                          onChange={(e) => {
+                            if (e.target.value !== branchName && !confirmLandingWorkspaceChange())
+                              return;
+                            setBranchName(e.target.value);
+                          }}
                           onFocus={() => setBranchInputFocused(true)}
                           onBlur={() => setBranchInputFocused(false)}
                           placeholder="feature/my-branch"
@@ -5146,6 +5364,11 @@ export function NewChatLandingScreen() {
                                       // though blur is about to hide the list.
                                       onMouseDown={(e) => {
                                         e.preventDefault();
+                                        if (
+                                          w.path !== workspace &&
+                                          !confirmLandingWorkspaceChange()
+                                        )
+                                          return;
                                         workspaceFromConfigRef.current = false;
                                         setWorkspace(w.path);
                                         setBranchInputFocused(false);
@@ -5222,7 +5445,7 @@ export function NewChatLandingScreen() {
                 ref: textareaRef,
                 value: message,
                 onChange: (e) => {
-                  setMessage(e.target.value);
+                  setPromptMessage(e.target.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
@@ -5282,7 +5505,7 @@ export function NewChatLandingScreen() {
                       e.preventDefault();
                       // Dismiss the menu by clearing the draft so the user can
                       // start fresh.
-                      setMessage("");
+                      setPromptMessage("");
                       setSlashMenuIndex(-1);
                       return;
                     }
@@ -5928,7 +6151,7 @@ export function NewChatLandingScreen() {
                       onVoiceStart={() => {
                         voiceSnapshotRef.current = message;
                       }}
-                      onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                      onVoiceDiscard={() => setPromptMessage(voiceSnapshotRef.current)}
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
@@ -5975,6 +6198,7 @@ export function NewChatLandingScreen() {
                 hostId={selectedHostId}
                 initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
                 onSelect={(path) => {
+                  if (path !== workspace && !confirmLandingWorkspaceChange()) return;
                   workspaceFromConfigRef.current = false;
                   setWorkspace(path);
                   addRecent(path);

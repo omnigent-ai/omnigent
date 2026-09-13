@@ -363,9 +363,35 @@ machine as a host:
 omnigent start   # starts the local server and registers this machine as a host
 ```
 
-Open the server URL it prints, hit **New Chat**, pick your machine, and go.
+Open the server URL it prints, hit **New Chat**, and pick your machine and folder.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
+
+#### Workspace before Start
+
+The right Workspace panel starts collapsed on every New Chat entry. Expand it
+with the panel button or workspace-panel shortcut, then resize or collapse it
+as usual. It uses the composer's selected computer and folder. Before **Start**,
+Files and Changes are read-only; GitHub shows the repository's available PR,
+checks, and diffs using the host's GitHub login. Agents stays empty. New worktree
+and managed sandbox destinations are created only on Start; clear a new
+branch name to inspect the existing folder instead.
+
+Use **+ → Shell (bash)** to open a real shell on the selected host. If an older
+host reports that workspace contexts are unsupported, upgrade that host first.
+In the Electron desktop app, **+ → Browser** opens a blank manual browser; enter
+an address to navigate. These tools create no chat or agent. The shell can run
+commands normally even though Files and Changes are read-only.
+
+Collapsing the panel keeps draft tools running, and a brief page reload restores
+the saved composer and reconnects its tools while the host and desktop app stay
+running. Start in the same host and folder to transfer the tools to the new
+session; any transfer failure is reported. A failed Start leaves the draft
+available. Changing the host or folder
+asks for confirmation when shells exist and closes the old draft tools. Close
+tool tabs explicitly when finished; abandoned tools expire after ten minutes
+without active attachments or lease renewal. New Chat's saved panel layout is
+separate from session layouts.
 
 <details>
 <summary>Customize automatic session titles</summary>

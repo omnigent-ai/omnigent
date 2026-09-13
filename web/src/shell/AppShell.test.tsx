@@ -3,6 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
+import type * as UseDraftWorkspaceModule from "@/hooks/useDraftWorkspace";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -15,15 +16,37 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type ReactNode, useEffect } from "react";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { readLandingNavigationGeneration } from "@/lib/landingWorkspaceState";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
+}));
+const draftWorkspaceState = vi.hoisted(() => ({
+  context: null as {
+    id: string;
+    workspace: string;
+    session_id: string | null;
+    lease_seconds: number;
+    hostId: string;
+    workspaceAliases: string[];
+  } | null,
+  terminals: [] as { id: string; name: string; session: string; running: boolean }[],
+  isLoading: false,
+  error: null as Error | null,
+  ensureContext: vi.fn(),
+  refreshTerminals: vi.fn(),
+  createTerminal: vi.fn(),
+  deleteTerminal: vi.fn(),
+  discard: vi.fn(),
+  adopt: vi.fn(),
 }));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
@@ -32,6 +55,11 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthModule>()),
   useSessionRunnerOnline: () => runnerHealthState.runnerOnline,
   useSessionHostOnline: () => true,
+}));
+
+vi.mock("@/hooks/useDraftWorkspace", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseDraftWorkspaceModule>()),
+  useDraftWorkspace: () => draftWorkspaceState,
 }));
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
@@ -344,6 +372,30 @@ function NavProbe() {
       <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
         to-home
       </button>
+      <button
+        type="button"
+        data-testid="nav-conversation"
+        onClick={() => navigate("/c/conv_after")}
+      >
+        to-conversation
+      </button>
+      <button
+        type="button"
+        data-testid="nav-home-replace"
+        onClick={() => navigate("/", { replace: true })}
+      >
+        replace with home
+      </button>
+      <button type="button" data-testid="nav-back" onClick={() => navigate(-1)}>
+        back
+      </button>
+      <button
+        type="button"
+        data-testid="normalize-project-query"
+        onClick={() => navigate("/?project=ready", { replace: true })}
+      >
+        normalize query
+      </button>
     </div>
   );
 }
@@ -356,6 +408,11 @@ function NavProbe() {
 function PathDisplay() {
   const { pathname } = useLocation();
   return <div data-testid="url-pathname">{pathname}</div>;
+}
+
+function PassiveEffect({ run }: { run: () => void }) {
+  useEffect(run, [run]);
+  return <div>home</div>;
 }
 
 /**
@@ -396,7 +453,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
-function renderShell(path: string, info?: ServerInfo) {
+function renderShell(path: string, info?: ServerInfo, indexElement?: ReactNode) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -409,10 +466,13 @@ function renderShell(path: string, info?: ServerInfo) {
               <Route
                 index
                 element={
-                  <>
-                    <div>home</div>
-                    <LocationDisplay />
-                  </>
+                  indexElement ?? (
+                    <>
+                      <div>home</div>
+                      <NavProbe />
+                      <LocationDisplay />
+                    </>
+                  )
                 }
               />
               <Route
@@ -563,11 +623,34 @@ beforeEach(() => {
     sessionStatus: "idle",
     status: "idle",
   });
+  draftWorkspaceState.context = null;
+  draftWorkspaceState.terminals = [];
+  draftWorkspaceState.isLoading = false;
+  draftWorkspaceState.error = null;
+  draftWorkspaceState.ensureContext.mockReset();
+  draftWorkspaceState.refreshTerminals.mockReset();
+  draftWorkspaceState.createTerminal.mockReset();
+  draftWorkspaceState.deleteTerminal.mockReset();
+  draftWorkspaceState.discard.mockReset();
+  draftWorkspaceState.adopt.mockReset();
+  draftWorkspaceState.refreshTerminals.mockResolvedValue([]);
+  draftWorkspaceState.deleteTerminal.mockResolvedValue(undefined);
+  draftWorkspaceState.discard.mockResolvedValue(undefined);
 });
 
 afterEach(cleanup);
 
 describe("AppShell header", () => {
+  it("advances landing navigation identity on a same-URL New session entry", () => {
+    mockConversations([]);
+    renderShell("/");
+    const priorGeneration = readLandingNavigationGeneration();
+
+    fireEvent.click(screen.getByTestId("nav-home"));
+
+    expect(readLandingNavigationGeneration()).toBeGreaterThan(priorGeneration);
+  });
+
   it("renders the sidebar toggle on all pages", () => {
     mockConversations([]);
     renderShell("/");
@@ -1696,6 +1779,50 @@ describe("Chat-mode terminal panel layout", () => {
     expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
   });
 
+  it("shows an offline failure when closing an adopted draft shell", async () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:draft_shell",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    draftWorkspaceState.context = {
+      id: "context-abc",
+      workspace: "/workspace",
+      session_id: "conv_abc",
+      lease_seconds: 600,
+      hostId: "offline-host",
+      workspaceAliases: ["/workspace"],
+    };
+    draftWorkspaceState.terminals = [
+      { id: "draft_shell", name: "draft", session: "draft-1", running: true },
+    ];
+    const detail = "Host offline while closing draft shell";
+    draftWorkspaceState.deleteTerminal.mockRejectedValue(new Error(detail));
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "error-toast");
+    try {
+      renderShell("/c/conv_abc");
+      expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("draft_shell");
+
+      fireEvent.click(screen.getByRole("button", { name: "Close draft" }));
+      expect(screen.getByRole("dialog")).toHaveTextContent("Close shell?");
+      expect(draftWorkspaceState.deleteTerminal).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+
+      await waitFor(() => expect(errorToast).toHaveBeenCalledWith(detail));
+      expect(draftWorkspaceState.deleteTerminal).toHaveBeenCalledWith("draft_shell");
+      expect(deleteTerminalMutate).not.toHaveBeenCalled();
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+      expect(screen.getByRole("button", { name: "Close draft" })).toBeInTheDocument();
+    } finally {
+      errorToast.mockRestore();
+    }
+  });
+
   it("does not kill the terminal when the close confirmation is cancelled", () => {
     writeSessionWorkspaceState("conv_abc", {
       open: true,
@@ -1807,6 +1934,34 @@ describe("Chat-mode terminal panel layout", () => {
 });
 
 describe("Workspace rail maximize", () => {
+  it("restores the landing composer after leaving a maximized session", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell(
+      "/c/conv_abc",
+      undefined,
+      <>
+        <textarea aria-label="New chat composer" />
+        <NavProbe />
+      </>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    fireEvent.click(screen.getByTestId("nav-home"));
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByRole("textbox", { name: "New chat composer" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+    expect(rail.className).not.toContain("md:absolute");
+    expect(screen.getByRole("button", { name: "Full screen" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "New chat composer" })).toBeVisible();
+  });
+
   it("toggles the rail between docked and full-screen, collapsing the sidebar on maximize", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
@@ -4119,5 +4274,235 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
     const probe = screen.getByTestId("view-probe");
     expect(probe).toHaveAttribute("data-view", "terminal");
     expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_tui_main");
+  });
+});
+
+describe("new-chat workspace rail", () => {
+  it("registers retained shells before a remounted workspace publishes", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    landing.publishLandingWorkspaceSelection({
+      hostId: "host-a",
+      workspace: "/project-a",
+      available: true,
+      project: "Project A",
+      reason: "",
+    });
+    const beforeChange = landing.readLandingWorkspaceState();
+    draftWorkspaceState.context = {
+      id: "context-a",
+      workspace: "/project-a",
+      session_id: null,
+      lease_seconds: 600,
+      hostId: "host-a",
+      workspaceAliases: ["/project-a"],
+    };
+    draftWorkspaceState.isLoading = true;
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const publishProjectB = vi.fn(() => {
+      landing.publishLandingWorkspaceSelection({
+        hostId: "host-a",
+        workspace: "/project-b",
+        available: true,
+        project: "Project B",
+        reason: "",
+      });
+    });
+    mockConversations([]);
+
+    renderShell("/?project=Project%20B", undefined, <PassiveEffect run={publishProjectB} />);
+
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(publishProjectB).toHaveBeenCalledOnce();
+    expect(draftWorkspaceState.discard).not.toHaveBeenCalled();
+    expect(landing.readLandingWorkspaceState().selection).toEqual(beforeChange.selection);
+    expect(landing.readLandingWorkspaceState().browserNamespace).toBe(
+      beforeChange.browserNamespace,
+    );
+  });
+
+  it("ignores a shell that finishes after navigation", async () => {
+    const { publishLandingWorkspaceSelection, readLandingWorkspaceState } =
+      await import("@/lib/landingWorkspaceState");
+    publishLandingWorkspaceSelection({
+      hostId: "host-a",
+      workspace: "/workspace-a",
+      available: true,
+      reason: "",
+    });
+    const context = {
+      id: "context-a",
+      workspace: "/workspace-a",
+      session_id: null,
+      lease_seconds: 600,
+      hostId: "host-a",
+      workspaceAliases: ["/workspace-a"],
+    };
+    let resolveTerminal!: (terminal: {
+      id: string;
+      name: string;
+      session: string;
+      running: boolean;
+    }) => void;
+    draftWorkspaceState.ensureContext.mockResolvedValue(context);
+    draftWorkspaceState.createTerminal.mockReturnValue(
+      new Promise((resolve) => {
+        resolveTerminal = resolve;
+      }),
+    );
+    writeSessionWorkspaceState("conv_after", { open: false });
+    mockConversations([{ id: "conv_after", permission_level: null }]);
+    renderShell("/");
+
+    const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+    fireEvent.keyDown(window, {
+      code: "KeyT",
+      altKey: true,
+      metaKey: isMac,
+      ctrlKey: !isMac,
+    });
+    await waitFor(() => expect(draftWorkspaceState.createTerminal).toHaveBeenCalledWith(context));
+    fireEvent.click(screen.getByTestId("nav-conversation"));
+    resolveTerminal({ id: "late", name: "bash", session: "late", running: true });
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(readLandingWorkspaceState().panel.selectedTerminalKey).not.toBe("terminal:late");
+  });
+
+  it("shows the host upgrade detail when the new-shell shortcut fails", async () => {
+    const { publishLandingWorkspaceSelection } = await import("@/lib/landingWorkspaceState");
+    publishLandingWorkspaceSelection({
+      hostId: "older-host",
+      workspace: "/workspace-a",
+      available: true,
+      reason: "",
+    });
+    const detail = "draft workspace create failed: 409 Conflict — upgrade this host";
+    draftWorkspaceState.ensureContext.mockRejectedValue(new Error(detail));
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "error-toast");
+    try {
+      mockConversations([]);
+      renderShell("/");
+
+      const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+      fireEvent.keyDown(window, {
+        code: "KeyT",
+        altKey: true,
+        metaKey: isMac,
+        ctrlKey: !isMac,
+      });
+
+      await waitFor(() => expect(errorToast).toHaveBeenCalledWith(detail));
+      expect(draftWorkspaceState.createTerminal).not.toHaveBeenCalled();
+    } finally {
+      errorToast.mockRestore();
+    }
+  });
+
+  it("starts collapsed despite an open saved draft and global preference, preserving draft tools", async () => {
+    const { readLandingWorkspaceState, writeLandingWorkspacePanel } =
+      await import("@/lib/landingWorkspaceState");
+    writeWorkspacePanelDefault("open");
+    writeLandingWorkspacePanel({
+      open: true,
+      rightRailTab: "subagents",
+      openFiles: ["README.md"],
+      selectedFilePath: null,
+      openBrowsers: ["saved-browser"],
+      selectedBrowserId: "saved-browser",
+      selectedTerminalKey: "terminal:saved-shell",
+    });
+    const saved = readLandingWorkspaceState();
+    mockConversations([]);
+    renderShell("/");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(readLandingWorkspaceState()).toEqual({
+      ...saved,
+      panel: { ...saved.panel, open: false },
+    });
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Agents 0" })).toBeInTheDocument();
+    expect(readLandingWorkspaceState().browserNamespace).toBe(saved.browserNamespace);
+    expect(readLandingWorkspaceState().panel.openBrowsers).toEqual(["saved-browser"]);
+  });
+
+  it("collapses when entering New Chat from an open session and on each later New Chat entry", () => {
+    writeSessionWorkspaceState("conv_open", { open: true });
+    mockConversations([{ id: "conv_open", permission_level: null }]);
+    renderShell("/c/conv_open");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
+  it("keeps a manually opened landing rail visible while prefill normalizes search params", () => {
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("normalize-project-query"));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
+  it("collapses when New Chat replaces the already selected landing URL", () => {
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-home-replace"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
+  it("collapses for explicit New Chat, history entry, and replacement from another route", () => {
+    mockConversations([]);
+    renderShell("/?project=ready");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-back"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    fireEvent.click(screen.getByTestId("nav-home-replace"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+  });
+
+  it("opens and collapses the workspace before a session exists", async () => {
+    const { writeLandingWorkspacePanel } = await import("@/lib/landingWorkspaceState");
+    writeLandingWorkspacePanel({
+      open: false,
+      rightRailTab: "files",
+      openFiles: [],
+      selectedFilePath: null,
+    });
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("tab", { name: "Agents 0" })).toBeInTheDocument();
+    expect(useTerminalsMock.mock.calls.every(([id]) => id == null)).toBe(true);
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Agents 0" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.getByText("No agents yet. Start a chat to add an agent.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(
+      screen.queryByText("No agents yet. Start a chat to add an agent."),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("home")).toBeInTheDocument();
   });
 });

@@ -16,18 +16,28 @@ vi.mock("@/components/ai-elements/code-block", () => ({
   // NotebookPreview renders notebook code cells through CodeBlockContent.
   CodeBlockContent: ({ code }: { code: string }) => <pre>{code}</pre>,
 }));
-vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null }));
+vi.mock("./MarkdownRichTextViewer", () => ({
+  MarkdownRichTextViewer: ({ readOnly }: { readOnly?: boolean }) => (
+    <div data-testid="markdown-editor-stub" data-read-only={String(readOnly ?? false)} />
+  ),
+}));
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
-  MonacoCodeEditor: () => <div data-testid="monaco-editor-stub" />,
+  MonacoCodeEditor: ({ readOnly }: { readOnly?: boolean }) => (
+    <div data-testid="monaco-editor-stub" data-read-only={String(readOnly ?? false)} />
+  ),
 }));
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
 // jsdom) never load; its testid presence is the signal that a file was routed
 // to the PDF surface.
 vi.mock("./PdfViewer", () => ({
-  PdfViewer: ({ comments }: { comments: Comment[] }) => (
-    <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+  PdfViewer: ({ comments, readOnly }: { comments: Comment[]; readOnly?: boolean }) => (
+    <div
+      data-testid="pdf-viewer-stub"
+      data-comment-ids={comments.map((c) => c.id).join(",")}
+      data-read-only={String(readOnly ?? false)}
+    />
   ),
 }));
 // Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
@@ -95,6 +105,7 @@ function renderViewer(
   opts: {
     viewMode?: "editor" | "preview" | "source" | "diff";
     truncated?: boolean;
+    readOnly?: boolean;
     onRequestEditMode?: () => void;
   } = {},
 ) {
@@ -105,6 +116,7 @@ function renderViewer(
   return render(
     <CodeViewer
       conversationId="conv_1"
+      readOnly={opts.readOnly}
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
       comments={[]}
@@ -258,6 +270,19 @@ describe("CodeViewer editor routing", () => {
     // (TipTap handles markdown editing; Monaco is for non-markdown files).
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
   });
+
+  it("keeps the nested code editor read-only when explicitly requested", async () => {
+    renderViewer("const x = 1;", true, "src/index.ts", { readOnly: true });
+    expect(await screen.findByTestId("monaco-editor-stub")).toHaveAttribute(
+      "data-read-only",
+      "true",
+    );
+  });
+
+  it("keeps the nested markdown editor read-only when explicitly requested", () => {
+    renderViewer("# heading", true, "notes.md", { viewMode: "editor", readOnly: true });
+    expect(screen.getByTestId("markdown-editor-stub")).toHaveAttribute("data-read-only", "true");
+  });
 });
 
 describe("CodeViewer truncated preview", () => {
@@ -293,6 +318,15 @@ describe("CodeViewer markdown preview comment hint", () => {
   it("hides the hint for read-only viewers", () => {
     vi.mocked(permissions.useCanEdit).mockReturnValue(false);
     renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("hides the hint when the caller explicitly requests read-only mode", () => {
+    renderViewer("# doc", true, "notes.md", {
+      viewMode: "preview",
+      readOnly: true,
+      onRequestEditMode: () => {},
+    });
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
   });
 
@@ -584,10 +618,12 @@ describe("CodeViewer PDF routing", () => {
     comments: Comment[] = [],
     addressedComments: Comment[] = [],
     activeSelection: CodeViewerProps["activeSelection"] = null,
+    readOnly = false,
   ) {
     return render(
       <CodeViewer
         conversationId="conv_1"
+        readOnly={readOnly}
         path={path}
         fileQuery={makePdfQuery(contentType, truncated)}
         comments={comments}
@@ -608,6 +644,11 @@ describe("CodeViewer PDF routing", () => {
     expect(await screen.findByTestId("pdf-viewer-stub")).toBeDefined();
     expect(screen.queryByText(/binary file/i)).toBeNull();
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("keeps the nested PDF comment surface read-only when explicitly requested", async () => {
+    renderPdf("application/pdf", "report.pdf", false, [], [], null, true);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute("data-read-only", "true");
   });
 
   it("routes by content_type over extension (pdf MIME on a .bin name)", async () => {

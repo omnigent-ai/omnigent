@@ -134,7 +134,11 @@ function setupHooks(
 }
 
 function renderEditor(
-  props: { truncated?: boolean; onSaveStatusChange?: (s: SaveStatus) => void } = {},
+  props: {
+    truncated?: boolean;
+    readOnly?: boolean;
+    onSaveStatusChange?: (s: SaveStatus) => void;
+  } = {},
 ) {
   return render(
     <MonacoCodeEditor
@@ -249,6 +253,7 @@ describe("MonacoCodeEditor read-only / truncated gating", () => {
       name: "editable when permitted and not truncated",
       canEdit: true,
       truncated: false,
+      explicitReadOnly: false,
       readOnly: false,
       banner: false,
     },
@@ -256,6 +261,7 @@ describe("MonacoCodeEditor read-only / truncated gating", () => {
       name: "read-only without edit permission",
       canEdit: false,
       truncated: false,
+      explicitReadOnly: false,
       readOnly: true,
       banner: false,
     },
@@ -263,12 +269,21 @@ describe("MonacoCodeEditor read-only / truncated gating", () => {
       name: "read-only + banner when truncated, even with permission",
       canEdit: true,
       truncated: true,
+      explicitReadOnly: false,
       readOnly: true,
       banner: true,
     },
-  ])("$name", async ({ canEdit, truncated, readOnly, banner }) => {
+    {
+      name: "read-only when explicitly requested, even with permission",
+      canEdit: true,
+      truncated: false,
+      explicitReadOnly: true,
+      readOnly: true,
+      banner: false,
+    },
+  ])("$name", async ({ canEdit, truncated, explicitReadOnly, readOnly, banner }) => {
     setupHooks({ canEdit });
-    renderEditor({ truncated });
+    renderEditor({ truncated, readOnly: explicitReadOnly });
 
     // Wait for the ready effect to resolve and render the (mocked) editor.
     await waitFor(() => expect(h.editorProps).not.toBeNull());

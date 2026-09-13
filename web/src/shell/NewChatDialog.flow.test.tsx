@@ -17,6 +17,7 @@ import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { landingStorageKey } from "@/lib/landingStorage";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -32,8 +33,14 @@ const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
 const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
+const identityState = vi.hoisted(() => ({
+  userId: null as string | null,
+  resolveIdentity: () => Promise.resolve(null as string | null),
+}));
 let searchParams = new URLSearchParams();
 let projects: { id: string | null; name: string }[] = [];
+let projectConfigs: Record<string, { host_id?: string; workspace?: string; agent_id?: string }> =
+  {};
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Prompt history is scoped per conversation; the landing composer writes under
@@ -82,7 +89,11 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: () => identityState.userId,
+  resolveIdentity: () => identityState.resolveIdentity(),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -122,7 +133,10 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: () => ({ data: projects }),
-  useProjectConfig: () => ({ data: null, isLoading: false }),
+  useProjectConfig: (id: string | null) => ({
+    data: id === null ? null : (projectConfigs[id] ?? null),
+    isLoading: false,
+  }),
   // Same reason as useProjects above: the landing reads useConversations for
   // hasNoSessions, so stub it to avoid an authenticatedFetch skewing calls[0].
   useConversations: () => ({ data: undefined }),
@@ -176,10 +190,7 @@ function setAgents(agents: AvailableAgent[]): void {
   >);
 }
 
-function renderLanding(
-  cachedSessionIds: string[] = [],
-  infoOverrides: Partial<ServerInfo> = {},
-): void {
+function renderLanding(cachedSessionIds: string[] = [], infoOverrides: Partial<ServerInfo> = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -226,7 +237,7 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return render(<NewChatLandingScreen />, { wrapper: Wrapper });
 }
 
 /**
@@ -320,6 +331,8 @@ beforeEach(() => {
   removeLocalConversationMock.mockReturnValue(false);
   pushMatchers.length = 0;
   announcePushedSession = null;
+  identityState.userId = null;
+  identityState.resolveIdentity = () => Promise.resolve(identityState.userId);
   vi.mocked(authenticatedFetch).mockReset();
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
@@ -328,6 +341,7 @@ beforeEach(() => {
   localStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
+  projectConfigs = {};
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
       { id: "opus", displayName: "Opus" },
@@ -393,6 +407,84 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("waits for pending workspace tools before Start and freezes new resource creation until it settles", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => landing.setLandingWorkspaceBusy(true));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    act(() => landing.setLandingWorkspaceBusy(false));
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    expect(landing.readLandingWorkspaceState().starting).toBe(true);
+    expect(navigateMock).not.toHaveBeenCalled();
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_waited" }) } as Response);
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_waited"));
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+    expect(landing.readLandingWorkspaceState().starting).toBe(false);
+  });
+
+  it("does not redirect a newer same-URL landing after server-first Start resolves", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older start");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    landing.advanceLandingNavigationGeneration();
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_old" }) } as Response);
+
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalledWith("/c/conv_old");
+  });
+
+  it("rejects local handoff navigation after a newer same-URL landing entry", async () => {
+    let resolveCreate!: (response: Response) => void;
+    window.history.replaceState({ idx: 0 }, "", window.location.href);
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pendingMsgTempId: "pending-old",
+      createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older local start");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    window.history.pushState(
+      { ...(window.history.state ?? {}), key: "newer-landing" },
+      "",
+      window.location.href,
+    );
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_old" }) } as Response);
+
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    const mayNavigate = hydrateLocalConversationMock.mock.calls[0]?.[8] as () => boolean;
+    expect(mayNavigate()).toBe(false);
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -427,7 +519,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
-  it("resolves a navigate-first create from the exact-token top-level pushed row", async () => {
+  it("keeps draft tools on landing until the exact-token pushed row confirms creation", async () => {
     let resolveCreate!: (response: Response) => void;
     vi.mocked(authenticatedFetch).mockReturnValueOnce(
       new Promise<Response>((resolve) => {
@@ -445,9 +537,8 @@ describe("NewChatLandingScreen create flow", () => {
     typeMessage("inspect the repo");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
-    await waitFor(() =>
-      expect(navigateMock).toHaveBeenCalledWith("/c/temp:1234567890abcdef1234567890abcdef"),
-    );
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalled();
     await waitFor(() => expect(pushMatchers).toHaveLength(1));
     const isOurs = pushMatchers[0]!;
     expect(
@@ -497,7 +588,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(resolveCreate).toBeTypeOf("function");
   });
 
-  it("keeps a managed create on its temp route until the HTTP response succeeds", async () => {
+  it("keeps a managed create on landing until the HTTP response succeeds", async () => {
     let resolveCreate!: (response: Response) => void;
     vi.mocked(authenticatedFetch).mockReturnValueOnce(
       new Promise<Response>((resolve) => {
@@ -516,9 +607,8 @@ describe("NewChatLandingScreen create flow", () => {
     typeMessage("start a sandbox");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
-    await waitFor(() =>
-      expect(navigateMock).toHaveBeenCalledWith("/c/temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    );
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalled();
     expect(pushMatchers).toHaveLength(0);
     expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
 
@@ -574,6 +664,208 @@ describe("NewChatLandingScreen create flow", () => {
       ),
     );
     expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves restored tools while the initial host and folder defaults hydrate", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    landing.publishLandingWorkspaceSelection({
+      hostId: "host_1",
+      workspace: SEEDED_WORKSPACE,
+      available: true,
+      reason: "",
+    });
+    landing.writeLandingWorkspacePanel({
+      openBrowsers: ["restored-browser"],
+      selectedBrowserId: "restored-browser",
+      selectedTerminalKey: "terminal:restored-shell",
+    });
+    const namespace = landing.readLandingWorkspaceState().browserNamespace;
+    const discard = vi.fn().mockResolvedValue(undefined);
+    const unregister = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard,
+      adopt: vi.fn().mockResolvedValue(true),
+    });
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      expect(landing.readLandingWorkspaceState().browserNamespace).toBe(namespace);
+      expect(landing.readLandingWorkspaceState().panel.openBrowsers).toEqual(["restored-browser"]);
+      expect(discard).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  it("keeps the previous workspace when a remounted project change is cancelled", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    navigateMock.mockImplementation((to: string) => {
+      const query = to.split("?", 2)[1];
+      searchParams = new URLSearchParams(query ?? "");
+    });
+    searchParams = new URLSearchParams("project=Project A");
+    projects = [
+      { id: "project-a", name: "Project A" },
+      { id: "project-b", name: "Project B" },
+    ];
+    projectConfigs = {
+      "project-a": { host_id: "host_1", workspace: SEEDED_WORKSPACE },
+      "project-b": { host_id: "host_1", workspace: "/Users/corey/project-b" },
+    };
+    renderLanding();
+    await waitForWorkspaceSeed();
+    await waitFor(() =>
+      expect(landing.readLandingWorkspaceState().selection?.workspace).toBe(SEEDED_WORKSPACE),
+    );
+    const previous = landing.readLandingWorkspaceState();
+    const discard = vi.fn().mockResolvedValue(undefined);
+    const unregister = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard,
+      adopt: vi.fn().mockResolvedValue(true),
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    try {
+      cleanup();
+      searchParams = new URLSearchParams("project=Project B");
+      const remounted = renderLanding();
+
+      await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+      );
+      expect(discard).not.toHaveBeenCalled();
+      expect(landing.readLandingWorkspaceState()).toEqual(previous);
+      expect(navigateMock).toHaveBeenCalledWith("/?project=Project+A", { replace: true });
+
+      searchParams = new URLSearchParams("project=Project A");
+      remounted.rerender(<NewChatLandingScreen />);
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+      );
+      expect(confirm).toHaveBeenCalledOnce();
+    } finally {
+      unregister();
+    }
+  });
+
+  it("gives concurrent Starts exactly one owner of the draft shells and browser tabs", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    const responses: ((response: Response) => void)[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          responses.push(resolve);
+        }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const adopt = vi.fn().mockResolvedValue(true);
+    const unregister = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard: vi.fn().mockResolvedValue(undefined),
+      adopt,
+    });
+    act(() =>
+      landing.writeLandingWorkspacePanel({
+        selectedTerminalKey: "terminal:draft-shell",
+        openBrowsers: ["draft-browser"],
+        selectedBrowserId: "draft-browser",
+      }),
+    );
+    const firstNamespace = landing.readLandingWorkspaceState().browserNamespace;
+    const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { browserAdoptDraft },
+    });
+    try {
+      typeMessage("first owner");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(responses).toHaveLength(1));
+      cleanup();
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("second independent chat");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(responses).toHaveLength(2));
+      responses[1]!({ ok: true, json: async () => ({ id: "conv_second" }) } as Response);
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_second"));
+      expect(adopt).not.toHaveBeenCalled();
+      expect(browserAdoptDraft).not.toHaveBeenCalledWith(firstNamespace, "conv_second");
+      expect(landing.readLandingWorkspaceState().starting).toBe(true);
+      responses[0]!({ ok: true, json: async () => ({ id: "conv_first" }) } as Response);
+      await waitFor(() => expect(adopt).toHaveBeenCalledExactlyOnceWith("conv_first"));
+      expect(
+        browserAdoptDraft.mock.calls.filter(([namespace]) => namespace === firstNamespace),
+      ).toEqual([[firstNamespace, "conv_first"]]);
+      await waitFor(() => expect(landing.readLandingWorkspaceState().starting).toBe(false));
+    } finally {
+      unregister();
+      Reflect.deleteProperty(window, "omnigentDesktop");
+    }
+  });
+
+  it("cleans only the captured tools when an older Start fails after switching workspace", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const discardA = vi.fn().mockResolvedValue(undefined);
+    const unregisterA = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard: discardA,
+      adopt: vi.fn().mockResolvedValue(true),
+    });
+    const namespaceA = landing.readLandingWorkspaceState().browserNamespace;
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { browserClose },
+    });
+    let unregisterB: (() => void) | undefined;
+    try {
+      typeMessage("older start");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      act(() =>
+        landing.publishLandingWorkspaceSelection({
+          hostId: "host_1",
+          workspace: "/other-folder",
+          available: true,
+          reason: "",
+        }),
+      );
+      const namespaceB = landing.readLandingWorkspaceState().browserNamespace;
+      const discardB = vi.fn().mockResolvedValue(undefined);
+      unregisterB = landing.registerLandingResourceLifecycle({
+        hasTerminals: () => true,
+        discard: discardB,
+        adopt: vi.fn().mockResolvedValue(true),
+      });
+      expect(discardA).not.toHaveBeenCalled();
+      resolveCreate({
+        ok: false,
+        status: 500,
+        json: async () => ({ detail: "create failed" }),
+      } as Response);
+      await waitFor(() => expect(discardA).toHaveBeenCalledTimes(1));
+      expect(browserClose).toHaveBeenCalledWith(namespaceA);
+      expect(browserClose).not.toHaveBeenCalledWith(namespaceB);
+      expect(discardB).not.toHaveBeenCalled();
+      expect(landing.readLandingWorkspaceState().browserNamespace).toBe(namespaceB);
+    } finally {
+      unregisterB?.();
+      unregisterA();
+      Reflect.deleteProperty(window, "omnigentDesktop");
+    }
   });
 
   it("keeps a failed create's restored draft when a newer create succeeds", async () => {
@@ -663,6 +955,155 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("restore this draft");
+  });
+
+  it("clears a pending draft on the remounted landing when its create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("start this session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("start this session");
+
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(""));
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+  });
+
+  it("keeps a newly attached file when an older create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+    const file = new File(["diagram"], "new-diagram.png", { type: "image/png" });
+    await act(async () => {
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [file] },
+      });
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+    });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+    expect(screen.getByText("new-diagram.png")).toBeTruthy();
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+    expect(screen.getByText("new-diagram.png")).toBeTruthy();
+  });
+
+  it("keeps a newer prompt when an older create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+    cleanup();
+    renderLanding();
+    typeMessage("newer draft");
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+    });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("newer draft");
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("newer draft");
+  });
+
+  it("keeps dictated text when an older create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    const recognitionHandlers: Record<string, (event: unknown) => void> = {};
+    class FakeRecognition {
+      continuous = false;
+      interimResults = false;
+      lang = "";
+      start = vi.fn();
+      stop = vi.fn();
+      addEventListener(type: string, handler: (event: unknown) => void) {
+        recognitionHandlers[type] = handler;
+      }
+      removeEventListener() {}
+    }
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
+    });
+
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("older session");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+      cleanup();
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+      act(() => recognitionHandlers.start?.({}));
+
+      await act(async () => {
+        recognitionHandlers.result?.({
+          resultIndex: 0,
+          results: {
+            length: 1,
+            0: { length: 1, isFinal: true, 0: { transcript: "new dictated prompt" } },
+          },
+        });
+        resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+      });
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+        "new dictated prompt older session",
+      );
+      cleanup();
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+        "new dictated prompt older session",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      if (originalMediaDevices) {
+        Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+      } else {
+        Reflect.deleteProperty(navigator, "mediaDevices");
+      }
+    }
   });
 
   it("records the launched workspace under its host without corrupting other recents", async () => {
@@ -2147,6 +2588,102 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string).agent_id).toBe("ag_two");
+  });
+
+  it("hydrates the resolved account draft after delayed identity discovery", async () => {
+    const viewerId = "viewer@example.test";
+    const restoredWorkspace = "/Users/corey/restored-project";
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { model: "opus", effort: "high" } }),
+    );
+    setHosts([host(), host({ host_id: "restored-host", name: "restored-host" })]);
+    setAgents([
+      agent(),
+      agent({
+        id: "ag_native",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+    ]);
+    identityState.userId = viewerId;
+    const viewerDraftKey = landingStorageKey("omnigent:landing-composer");
+    const savedDraft = {
+      project: "",
+      message: "restore this account draft",
+      files: [],
+      pickedAgentId: "ag_native",
+      selectedHostId: "restored-host",
+      sandboxSelected: false,
+      sandboxProvider: null,
+      sandboxRepoSelections: [],
+      workspace: restoredWorkspace,
+      branchName: "",
+      autoSeededBranch: "",
+      prefilledBranch: "",
+      permissionMode: "default",
+      approvalMode: "on-request",
+      bypassSandbox: false,
+      cursorExecMode: "ask",
+      agySkipMode: "default",
+      pickedHarness: null,
+      pickedModel: "opus",
+      pickedEffort: "high",
+      costControlMode: null,
+      agentFromConfig: false,
+      workspaceFromConfig: false,
+    };
+    localStorage.setItem(viewerDraftKey, JSON.stringify(savedDraft));
+    identityState.userId = null;
+    let resolveIdentity: (viewer: string | null) => void = () => {};
+    const identityResolved = new Promise<string | null>((resolve) => {
+      resolveIdentity = resolve;
+    });
+    identityState.resolveIdentity = () => identityResolved;
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+
+    await act(async () => {
+      identityState.userId = viewerId;
+      resolveIdentity(viewerId);
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(savedDraft.message),
+    );
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+      "Host: restored-host, Online",
+    );
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+      "restored-project",
+    );
+    expect(JSON.parse(localStorage.getItem(viewerDraftKey) ?? "null")).toMatchObject(savedDraft);
+    cleanup();
+    expect(JSON.parse(localStorage.getItem(viewerDraftKey) ?? "null")).toMatchObject(savedDraft);
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(savedDraft.message),
+    );
+
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      agent_id: "ag_native",
+      host_id: "restored-host",
+      workspace: restoredWorkspace,
+      model_override: "opus",
+      reasoning_effort: "high",
+    });
   });
 
   it("falls back to the default agent when the remembered id is no longer listed", async () => {

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from base64 import b64encode
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from omnigent.runner.github_resource import (
     github_info,
     github_pr_diff,
 )
+from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
 
 def _stub_gh(
@@ -128,6 +130,8 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
         "author": {"login": "alice"},
         "baseRefName": "main",
         "headRefName": "alice/feature",
+        "headRefOid": "head-42",
+        "baseRefOid": "base-42",
         "statusCheckRollup": [],
     }
     calls: list[tuple[str, ...]] = []
@@ -151,7 +155,10 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     info = github_info(str(repo))
     assert info["pr"]["number"] == 42
     assert info["pr"]["head_ref"] == "alice/feature"
+    assert info["pr"]["head_sha"] == "head-42"
+    assert info["pr"]["base_sha"] == "base-42"
     assert info["pr"]["is_draft"] is True
+    assert info["selected_pr_url"] == "https://github.com/acme/repo/pull/42"
     assert info["base_ref"] == "main"
     assert any(c[:2] == ("pr", "view") for c in calls)
     assert not any(c[:2] == ("pr", "list") for c in calls)
@@ -234,6 +241,9 @@ def test_github_info_pr_via_commit_fork_fallback(
     assert info["base_ref"] == "main"
     # Resolved via the FORK's commits/{sha}/pulls, never a base-repo branch list.
     assert any(c[0] == "api" and "daniellok-db/repo/commits/" in c[1] for c in calls)
+    # Inference is read-only. The explicit -R lookup above does not need to
+    # persist a gh default into the workspace's git config.
+    assert not any(c[:2] == ("repo", "set-default") for c in calls)
 
 
 def test_github_info_no_false_positive_on_default_branch(
@@ -450,7 +460,11 @@ def test_github_info_runs_gh_as_preferred_account(
         "github_account_preference",
         lambda key: "bob" if key == "/ws/omnigent" else None,
     )
-    monkeypatch.setattr(github_resource, "_gh_auth_token", lambda _root, login: f"tok-{login}")
+    monkeypatch.setattr(
+        github_resource,
+        "_gh_auth_token",
+        lambda _root, login, host="github.com": f"tok-{login}",
+    )
     seen: dict[str, str | None] = {}
 
     def fake_gh(
@@ -474,6 +488,192 @@ def test_github_info_runs_gh_as_preferred_account(
     assert seen["repo_view"] == "tok-bob"
 
 
+def test_workspace_pr_reads_keep_workspace_account(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/omnigent")
+    monkeypatch.setattr(
+        github_resource._config,
+        "github_account_preference",
+        lambda key: "workspace-user" if key == "/ws/omnigent" else "other-user",
+    )
+    monkeypatch.setattr(
+        github_resource,
+        "_gh_auth_token",
+        lambda _root, login, host="github.com": f"token-{login}",
+    )
+    seen: list[tuple[tuple[str, ...], str | None]] = []
+
+    def encoded(value: str) -> str:
+        return b64encode(value.encode()).decode()
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        seen.append((tuple(argv), token))
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": 42,
+                        "title": "Draft PR",
+                        "state": "OPEN",
+                        "url": "https://github.com/acme/repo/pull/42",
+                        "isDraft": False,
+                        "author": {"login": "alice"},
+                        "baseRefName": "main",
+                        "headRefName": "feature",
+                        "headRefOid": "head",
+                        "baseRefOid": "base",
+                        "statusCheckRollup": [],
+                    }
+                ),
+                "",
+            )
+        if tuple(argv[:2]) == ("pr", "diff"):
+            return (0, "patch", "")
+        endpoint = argv[-1]
+        if endpoint.endswith("/files?per_page=100"):
+            return (0, "[[]]", "")
+        if endpoint == "repos/acme/repo/pulls/42":
+            value = {
+                "head": {"sha": "head", "repo": {"full_name": "alice/repo"}},
+                "base": {"sha": "base"},
+            }
+            return (0, json.dumps(value), "")
+        if endpoint == "repos/acme/repo/compare/base...head":
+            return (0, json.dumps({"merge_base_commit": {"sha": "merge"}}), "")
+        if endpoint == "repos/acme/repo/contents/fileA.py?ref=merge":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("before")}), "")
+        if endpoint == "repos/alice/repo/contents/fileA.py?ref=head":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("after")}), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    url = "https://github.com/acme/repo/pull/42"
+
+    info = github_info(str(repo))
+    assert info["selected_pr_url"] == url
+    assert github_changed_files(str(repo), pr_url=url)["data"] == []
+    assert github_pr_diff(str(repo), pr_url=url)["patch"] == "patch"
+    contents = github_file_diff(
+        str(repo), "main", "fileA.py", pr_url=url, head_sha="head", base_sha="base"
+    )
+    assert contents["before"] == "before"
+    assert contents["after"] == "after"
+    assert {token for argv, token in seen if argv[0] != "auth"} == {"token-workspace-user"}
+
+
+def test_session_pr_reads_keep_repository_account(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    url = "https://github.com/acme/repo/pull/42"
+    reference = PullRequestRef.from_url(url)
+    SessionPrRegistry("session-account").record(
+        [reference], relationship="attached", source="test"
+    )
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/omnigent")
+    monkeypatch.setattr(
+        github_resource._config,
+        "github_account_preference",
+        lambda key: "repo-user" if key == reference.repo_argument else "workspace-user",
+    )
+    monkeypatch.setattr(
+        github_resource,
+        "_gh_auth_token",
+        lambda _root, login, host="github.com": f"token-{login}",
+    )
+    seen: list[str | None] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        seen.append(token)
+        return (0, "[[]]", "")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    assert github_changed_files(str(repo), session_id="session-account", pr_url=url)["data"] == []
+    assert seen == ["token-repo-user"]
+
+
+def test_workspace_pr_reads_scope_token_to_enterprise_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/omnigent")
+    monkeypatch.setattr(
+        github_resource._config, "github_account_preference", lambda _key: "workspace-user"
+    )
+    token_hosts: list[str] = []
+
+    def auth_token(_root: str, _login: str, host: str = "github.com") -> str:
+        token_hosts.append(host)
+        return f"secret-for-{host}"
+
+    seen: list[tuple[tuple[str, ...], str | None]] = []
+
+    def encoded(value: str) -> str:
+        return b64encode(value.encode()).decode()
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        seen.append((tuple(argv), token))
+        if tuple(argv[:2]) == ("pr", "diff"):
+            return (0, "patch", "")
+        endpoint = argv[-1]
+        if endpoint.endswith("/files?per_page=100"):
+            return (0, "[[]]", "")
+        if endpoint == "repos/acme/repo/pulls/42":
+            value = {
+                "head": {"sha": "head", "repo": {"full_name": "alice/repo"}},
+                "base": {"sha": "base"},
+            }
+            return (0, json.dumps(value), "")
+        if endpoint == "repos/acme/repo/compare/base...head":
+            return (0, json.dumps({"merge_base_commit": {"sha": "merge"}}), "")
+        if endpoint == "repos/acme/repo/contents/fileA.py?ref=merge":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("before")}), "")
+        if endpoint == "repos/alice/repo/contents/fileA.py?ref=head":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("after")}), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh_auth_token", auth_token)
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(
+        github_resource,
+        "_list_accounts",
+        lambda _root: (
+            True,
+            [
+                {
+                    "login": "workspace-user",
+                    "active": True,
+                    "state": "success",
+                    "host": "github.example.org",
+                }
+            ],
+        ),
+    )
+    url = "https://github.example.org/acme/repo/pull/42"
+
+    assert github_changed_files(str(repo), pr_url=url)["data"] == []
+    assert github_pr_diff(str(repo), pr_url=url)["patch"] == "patch"
+    contents = github_file_diff(
+        str(repo), "main", "fileA.py", pr_url=url, head_sha="head", base_sha="base"
+    )
+
+    assert contents["before"] == "before"
+    assert contents["after"] == "after"
+    assert set(token_hosts) == {"github.example.org"}
+    assert {token for _argv, token in seen} == {"secret-for-github.example.org"}
+
+
 def test_github_changed_files_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The changed-files list resolves the PR number via bare ``gh pr view``, then fetches."""
     files = [{"filename": "a.py", "status": "added", "additions": 1, "deletions": 0}]
@@ -482,7 +682,11 @@ def test_github_changed_files_via_pr_view(repo: Path, monkeypatch: pytest.Monkey
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, json.dumps({"number": 9}), "")
+            return (
+                0,
+                json.dumps({"number": 9, "url": "https://github.com/acme/repo/pull/9"}),
+                "",
+            )
         if argv and argv[0] == "api":
             return (0, json.dumps(files), "")
         return (1, "", "no stub")
@@ -509,7 +713,11 @@ def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPa
     _stub_gh(
         monkeypatch,
         {
-            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "view"): (
+                0,
+                json.dumps({"number": 7, "url": "https://github.com/acme/repo/pull/7"}),
+                "",
+            ),
             ("api",): (0, json.dumps(files), ""),
         },
     )
@@ -545,6 +753,111 @@ def test_github_file_diff_deleted(repo: Path) -> None:
     assert diff["after"] is None
 
 
+@pytest.mark.parametrize("pr_url", [None, "https://github.com/acme/repo/pull/42"])
+def test_workspace_github_file_diff_reads_remote_pr_revisions(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, pr_url: str | None
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def encoded(value: str) -> str:
+        return b64encode(value.encode()).decode()
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (
+                0,
+                json.dumps({"number": 42, "url": "https://github.com/acme/repo/pull/42"}),
+                "",
+            )
+        endpoint = argv[-1]
+        if endpoint == "repos/acme/repo/pulls/42":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "head": {"sha": "remote-head", "repo": {"full_name": "alice/repo"}},
+                        "base": {"sha": "remote-base"},
+                    }
+                ),
+                "",
+            )
+        if endpoint == "repos/acme/repo/compare/remote-base...remote-head":
+            return (0, json.dumps({"merge_base_commit": {"sha": "merge-base"}}), "")
+        if endpoint == "repos/acme/repo/contents/fileA.py?ref=merge-base":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("remote base")}), "")
+        if endpoint == "repos/alice/repo/contents/fileA.py?ref=remote-head":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("remote head")}), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root, **_kwargs: None)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda _root, _reference: None)
+
+    diff = github_file_diff(
+        str(repo),
+        "main",
+        "fileA.py",
+        pr_url=pr_url,
+        head_sha="remote-head",
+        base_sha="remote-base",
+    )
+
+    assert diff["before"] == "remote base"
+    assert diff["after"] == "remote head"
+    assert any(call[-1] == "repos/acme/repo/pulls/42" for call in calls)
+
+
+@pytest.mark.parametrize("pr_url", [None, "https://github.com/upstream/repo/pull/42"])
+@pytest.mark.parametrize("file_count", [0, 101])
+def test_github_changed_files_preserves_multiple_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pr_url: str | None, file_count: int
+) -> None:
+    """Automatic and selected PRs retain empty pages and later deleted files."""
+    pages = (
+        [
+            [{"filename": f"file-{index}.py", "status": "added"} for index in range(100)],
+            [{"filename": "last-file.py", "status": "removed"}],
+        ]
+        if file_count
+        else [[]]
+    )
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    if pr_url:
+        SessionPrRegistry("pagination-session").record(
+            [PullRequestRef.from_url(pr_url)], relationship="created", source="test"
+        )
+    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root, **_kwargs: None)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda _root, _reference: None)
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (
+                0,
+                json.dumps({"number": 42, "url": "https://github.com/upstream/repo/pull/42"}),
+                "",
+            )
+        if argv[0] == "api":
+            assert argv[-1] == "repos/upstream/repo/pulls/42/files?per_page=100"
+            output = json.dumps(pages) if "--slurp" in argv else "\n".join(map(json.dumps, pages))
+            return 0, output, ""
+        raise AssertionError(f"Unexpected gh command: {argv}")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    result = github_changed_files(
+        "/workspace", session_id="pagination-session" if pr_url else None, pr_url=pr_url
+    )
+    assert len(result["data"]) == file_count
+    if file_count:
+        assert result["data"][-1]["path"] == "last-file.py"
+        assert result["data"][-1]["status"] == "deleted"
+    assert result["has_more"] is False
+
+
 def test_github_changed_files_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no PR for the branch, the list is empty (no local git fallback)."""
     _stub_gh(monkeypatch, {("pr", "view"): (1, "", "no pull requests found")})
@@ -557,7 +870,11 @@ def test_github_pr_diff_returns_gh_patch(monkeypatch: pytest.MonkeyPatch) -> Non
     _stub_gh(
         monkeypatch,
         {
-            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "view"): (
+                0,
+                json.dumps({"number": 7, "url": "https://github.com/acme/repo/pull/7"}),
+                "",
+            ),
             ("pr", "diff"): (0, patch, ""),
         },
     )
@@ -583,7 +900,11 @@ def test_github_pr_diff_resolves_number_then_diffs(
         calls.append(tuple(argv))
         head = tuple(argv[:2])
         if head == ("pr", "view"):
-            return (0, json.dumps({"number": 9}), "")
+            return (
+                0,
+                json.dumps({"number": 9, "url": "https://github.com/acme/repo/pull/9"}),
+                "",
+            )
         if head == ("pr", "diff"):
             return (0, patch, "")
         return (1, "", "no stub")
@@ -592,7 +913,56 @@ def test_github_pr_diff_resolves_number_then_diffs(
     result = github_pr_diff(str(repo))
     assert result == {"object": "session.github.pr_diff", "patch": patch}
     # The diff was fetched by the resolved number, never a bare 'gh pr diff'.
-    assert [c for c in calls if c[:2] == ("pr", "diff")] == [("pr", "diff", "9")]
+    assert [c for c in calls if c[:2] == ("pr", "diff")] == [
+        ("pr", "diff", "9", "-R", "github.com/acme/repo")
+    ]
+
+
+@pytest.mark.parametrize("operation", ["changes", "diff"])
+def test_github_workspace_operations_keep_fork_pr_base_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Commit fallback carries the fork PR's base repo into downstream reads."""
+    _run(["git", "remote", "add", "origin", "git@github.com:daniellok-db/repo.git"], repo)
+    files = [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 1}]
+    patch = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if tuple(argv[:2]) == ("pr", "view") and argv[2] == "--json":
+            return (1, "", "no pull requests found for branch")
+        if argv[0] == "api" and any("repos/daniellok-db/repo/commits/" in arg for arg in argv):
+            row = {"number": 77, "state": "open", "base": {"repo": {"full_name": "acme/repo"}}}
+            return (0, json.dumps([row]), "")
+        if tuple(argv[:2]) == ("pr", "view") and "-R" in argv:
+            assert argv[argv.index("-R") + 1] == "acme/repo"
+            return (
+                0,
+                json.dumps({"number": 77, "url": "https://github.com/acme/repo/pull/77"}),
+                "",
+            )
+        if argv[0] == "api" and any(
+            arg == "repos/acme/repo/pulls/77/files?per_page=100" for arg in argv
+        ):
+            return (0, json.dumps(files), "")
+        if tuple(argv[:2]) == ("pr", "diff"):
+            return (0, patch, "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+
+    if operation == "changes":
+        assert [entry["path"] for entry in github_changed_files(str(repo))["data"]] == ["a.py"]
+        assert any(
+            c[0] == "api" and "repos/acme/repo/pulls/77/files?per_page=100" in c for c in calls
+        )
+    else:
+        assert github_pr_diff(str(repo))["patch"] == patch
+        assert ("pr", "diff", "77", "-R", "github.com/acme/repo") in calls
+    assert not any(c[:2] == ("repo", "set-default") for c in calls)
 
 
 # ── Account selection ────────────────────────────────────────────────────────

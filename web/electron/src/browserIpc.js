@@ -120,11 +120,17 @@ function goForward(wc) {
  * @param {Electron.WebContents} params.webContents
  * @param {(channel: string, payload: unknown) => void} params.send  window-scoped sender
  */
-function attachNavListeners({ conversationId, webContents, send }) {
+function attachNavListeners({
+  conversationId,
+  getConversationId = () => conversationId,
+  webContents,
+  send,
+}) {
   const emitUrl = (url) => {
-    send("browser-url-changed", { conversationId, url });
+    const ownerId = getConversationId();
+    send("browser-url-changed", { conversationId: ownerId, url });
     const { canGoBack, canGoForward } = readNavState(webContents);
-    send("browser-nav-state", { conversationId, canGoBack, canGoForward });
+    send("browser-nav-state", { conversationId: ownerId, canGoBack, canGoForward });
   };
   // Full main-frame navigation (loadURL, redirects, back/forward, reload).
   webContents.on("did-navigate", (_e, url) => emitUrl(url));
@@ -297,12 +303,25 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (r.ok && r.created && r.entry) {
       attachNavListeners({
         conversationId,
+        getConversationId: () => r.entry.conversationId,
         webContents: r.entry.view.webContents,
         send: senderFor(event),
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
     return { ok: r.ok, created: r.created ?? false, error: r.error };
+  });
+
+  ipcMain.handle("omnigent:browser-adopt-draft", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.adoptDraft(args?.sourceId, args?.targetId);
+  });
+
+  ipcMain.handle("omnigent:browser-renew-draft-lease", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.renewDraftLease(args?.workspaceId);
   });
 
   // Attach the named conversation's view to the host window (detaching the

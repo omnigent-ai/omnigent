@@ -16,19 +16,22 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_unknown")).toEqual({});
   });
 
-  it("merges partial patches into one session rather than replacing", () => {
-    writeSessionWorkspaceState("conv_a", { open: true, widthPx: 480 });
-    writeSessionWorkspaceState("conv_a", { rightRailTab: "subagents" });
+  it.each(["subagents", "github"] as const)(
+    "merges partial patches including %s",
+    (rightRailTab) => {
+      writeSessionWorkspaceState("conv_a", { open: true, widthPx: 480 });
+      writeSessionWorkspaceState("conv_a", { rightRailTab });
 
-    // The second write patches only rightRailTab; open/widthPx from the first
-    // write must survive. A failure here means writes clobber the whole entry
-    // instead of merging.
-    expect(readSessionWorkspaceState("conv_a")).toEqual({
-      open: true,
-      widthPx: 480,
-      rightRailTab: "subagents",
-    });
-  });
+      // The second write patches only rightRailTab; open/widthPx from the first
+      // write must survive. A failure here means writes clobber the whole entry
+      // instead of merging.
+      expect(readSessionWorkspaceState("conv_a")).toEqual({
+        open: true,
+        widthPx: 480,
+        rightRailTab,
+      });
+    },
+  );
 
   it("keeps sessions isolated by id", () => {
     writeSessionWorkspaceState("conv_a", { open: true });
