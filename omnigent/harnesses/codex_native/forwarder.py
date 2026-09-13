@@ -24,6 +24,7 @@ from omnigent.harnesses.codex_native.app_server import (
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
     MCP_STARTUP_STARTING,
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
@@ -66,10 +67,6 @@ _logger = logging.getLogger(__name__)
 
 _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
-# How long to wait for a freshly launched Codex TUI to create its
-# app-server thread (emit ``thread/started``) before giving up. Generous
-# because a host-spawned TUI cold-starts over the runner.
-_THREAD_START_TIMEOUT_SECONDS = 30.0
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # A freshly created thread passes through a second transient state: its rollout
 # file exists but is still empty (the TUI created the thread but no turn has
@@ -7611,7 +7608,7 @@ def _thread_started_is_ephemeral(event: CodexMessage) -> bool:
 async def wait_for_thread_started(
     client: CodexAppServerClient,
     *,
-    timeout: float | None = _THREAD_START_TIMEOUT_SECONDS,
+    timeout: float | None = CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
 ) -> str:
     """
     Wait for a freshly launched Codex TUI to create its app-server thread.

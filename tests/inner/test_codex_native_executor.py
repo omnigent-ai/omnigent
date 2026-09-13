@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import omnigent.inner.codex_native_executor as codex_native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
@@ -16,6 +18,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     write_bridge_startup_error,
+    write_bridge_startup_timeout,
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
@@ -1342,8 +1345,12 @@ def test_run_turn_surfaces_recorded_startup_error(
     generic "bridge state is missing" (issue #59).
     """
 
+    sleep_calls = 0
+
     async def _no_sleep(_seconds: float) -> None:
         """No-op the poll backoff so the missing-state path is fast."""
+        nonlocal sleep_calls
+        sleep_calls += 1
 
     # asyncio.run does not depend on asyncio.sleep, so patching it is safe.
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
@@ -1351,6 +1358,7 @@ def test_run_turn_surfaces_recorded_startup_error(
         tmp_path,
         "Codex app-server never started a thread within the startup timeout.",
     )
+    write_bridge_startup_timeout(tmp_path, 120.0)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
     events = _collect_turn_events(executor, "hello")
@@ -1361,6 +1369,238 @@ def test_run_turn_surfaces_recorded_startup_error(
     assert "never started" in error.message
     assert "startup timeout" in error.message
     assert error.message != "Codex native bridge state is missing"
+    assert sleep_calls == 0
+
+
+def test_bridge_state_wait_preserves_legacy_and_configured_command_contracts(
+    tmp_path: Path,
+) -> None:
+    """Only an advertised configured-command launch extends the legacy 60s wait."""
+    assert codex_native_executor._bridge_state_wait_poll_count(tmp_path) == 60
+
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    assert codex_native_executor._bridge_state_wait_poll_count(tmp_path) == 125
+
+
+def test_run_turn_without_marker_keeps_exact_legacy_poll_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The ordinary path remains the existing 60 one-second polls."""
+    sleep_calls = 0
+
+    async def _count_sleep(seconds: float) -> None:
+        nonlocal sleep_calls
+        assert seconds == 1.0
+        sleep_calls += 1
+
+    monkeypatch.setattr(asyncio, "sleep", _count_sleep)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sleep_calls == 60
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_extended_bridge_wait_does_not_block_concurrent_enqueue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The configured-command wait remains outside the injection lock."""
+    write_bridge_startup_timeout(tmp_path, 120.0)
+    sleep_entered = asyncio.Event()
+    release_sleep = asyncio.Event()
+    sleep_calls = 0
+
+    async def _block_first_sleep(seconds: float) -> None:
+        nonlocal sleep_calls
+        assert seconds == 1.0
+        sleep_calls += 1
+        if sleep_calls == 1:
+            sleep_entered.set()
+            await release_sleep.wait()
+
+    async def _drive_run_turn(executor: CodexNativeExecutor) -> list[Any]:
+        events: list[Any] = []
+        async for event in executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            [],
+            "",
+        ):
+            events.append(event)
+        return events
+
+    monkeypatch.setattr(asyncio, "sleep", _block_first_sleep)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    run_turn_task = asyncio.create_task(_drive_run_turn(executor))
+    await asyncio.wait_for(sleep_entered.wait(), timeout=5.0)
+
+    accepted = await asyncio.wait_for(
+        executor.enqueue_session_message("session", "steer"),
+        timeout=5.0,
+    )
+    write_bridge_startup_error(tmp_path, "test completed")
+    release_sleep.set()
+    events = await asyncio.wait_for(run_turn_task, timeout=5.0)
+
+    assert accepted is False
+    assert sleep_calls == 1
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+def test_run_turn_honors_marker_published_after_wait_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A late persistent marker grants its full allowance exactly once."""
+    sleep_calls = 0
+
+    async def _publish_marker_during_wait(seconds: float) -> None:
+        nonlocal sleep_calls
+        assert seconds == 1.0
+        sleep_calls += 1
+        if sleep_calls == 3:
+            write_bridge_startup_timeout(tmp_path, 120.0)
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_marker_during_wait)
+    caplog.set_level(logging.DEBUG, logger=codex_native_executor.__name__)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sleep_calls == 128
+    assert "bridge-state wait extended from 60 to 128 polls" in caplog.text
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+def test_run_turn_rechecks_marker_before_reporting_the_generic_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A marker first observed after the wait exhausts still extends it once.
+
+    Boundary race: the runner can publish ``startup_timeout.json`` in the
+    instant after the wait loop's final re-read (for example while a steer
+    holds the injection lock). The executor must re-read the marker
+    immediately before surfacing the generic bridge-state miss and resume its
+    bounded wait, instead of reporting the false "never started" failure
+    while the forwarder is still inside its advertised budget.
+    """
+    sleep_calls = 0
+
+    async def _count_sleep(seconds: float) -> None:
+        nonlocal sleep_calls
+        assert seconds == 1.0
+        sleep_calls += 1
+
+    real_read_startup_error = codex_native_executor.read_bridge_startup_error
+    marker_published = False
+
+    def _publish_marker_at_the_locked_recheck(bridge_dir: Path) -> str | None:
+        # The wait loop's last startup-error read happens before its 60th
+        # sleep, so the first read at sleep_calls == 60 is the locked miss
+        # pre-check — after the legacy wait exhausted, before surfacing.
+        nonlocal marker_published
+        if sleep_calls == 60 and not marker_published:
+            write_bridge_startup_timeout(tmp_path, 120.0)
+            marker_published = True
+        return real_read_startup_error(bridge_dir)
+
+    monkeypatch.setattr(asyncio, "sleep", _count_sleep)
+    monkeypatch.setattr(
+        codex_native_executor,
+        "read_bridge_startup_error",
+        _publish_marker_at_the_locked_recheck,
+    )
+    caplog.set_level(logging.DEBUG, logger=codex_native_executor.__name__)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert marker_published
+    assert sleep_calls == 185
+    assert "bridge-state wait extended from 60 to 185 polls" in caplog.text
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.message == "Codex native bridge state is missing"
+
+
+@pytest.mark.asyncio
+async def test_late_marker_allows_state_after_absolute_advertised_poll_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A marker first seen at poll 10 still permits state published at poll 126."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    sleep_calls = 0
+
+    async def _publish_marker_then_state(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 10:
+            write_bridge_startup_timeout(tmp_path, 120.0)
+        if sleep_calls == 126:
+            _start_state(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_marker_then_state)
+    events: list[Any] = []
+    async for event in executor.run_turn(
+        [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        [],
+        "",
+    ):
+        events.append(event)
+
+    assert sleep_calls == 126
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_honors_configured_command_wait_past_legacy_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A delayed wrapped launch can publish state after the legacy wait expires."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_startup_timeout(tmp_path, 120.0)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    sleep_calls = 0
+
+    async def _publish_after_legacy_deadline(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 61:
+            _start_state(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_after_legacy_deadline)
+    events: list[Any] = []
+    async for event in executor.run_turn(
+        [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        [],
+        "",
+    ):
+        events.append(event)
+
+    assert sleep_calls == 61
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
 
 
 # ── MCP startup: no client-side gate + Stop cancel (issue #2058) ────────

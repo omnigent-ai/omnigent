@@ -4581,6 +4581,10 @@ async def _auto_create_codex_terminal(
             resolve_harness_args,
             resolve_harness_config,
         )
+        from omnigent.harnesses.codex_native.bridge import (  # noqa: FlagLocalImports
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+            write_bridge_startup_timeout,
+        )
 
         _codex_harness_cfg = load_effective_config()
         # Config-only command resolve: the managed host provisions
@@ -4590,11 +4594,41 @@ async def _auto_create_codex_terminal(
         # overrides are deliberately not consulted on this managed-host path.
         _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
         _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
-        codex_command = (
+        configured_codex_command = (
             _codex_cmd_override.strip()
             if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
-            else app_server.codex_path
+            else None
         )
+        codex_command = configured_codex_command or app_server.codex_path
+        thread_start_timeout_seconds = (
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            if configured_codex_command is not None and not _codex_launch.login_required
+            else None
+        )
+        if configured_codex_command is not None:
+            if launch_config.external_session_id is not None:
+                _logger.info(
+                    "Codex resume: bridge state is preloaded before configured "
+                    "command %r starts; no bridge-state wait extension is needed "
+                    "(session %s)",
+                    configured_codex_command,
+                    session_id,
+                )
+            elif _codex_launch.login_required:
+                _logger.info(
+                    "Codex startup: configured command %r requires interactive "
+                    "login; preserving the unbounded sign-in wait (session %s)",
+                    configured_codex_command,
+                    session_id,
+                )
+            elif thread_start_timeout_seconds is not None:
+                _logger.info(
+                    "Codex startup: configured command %r gets a %.0fs "
+                    "thread-start budget (session %s)",
+                    configured_codex_command,
+                    thread_start_timeout_seconds,
+                    session_id,
+                )
         codex_launch_args = resolve_harness_args(
             "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
         )
@@ -4645,6 +4679,27 @@ async def _auto_create_codex_terminal(
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
+    # Known-thread resumes publish bridge state before the terminal starts;
+    # only fresh discovery needs to extend the executor's state wait.
+    if launch_config.external_session_id is None and thread_start_timeout_seconds is not None:
+        try:
+            write_bridge_startup_timeout(bridge_dir, thread_start_timeout_seconds)
+        except OSError:
+            # The marker only extends the executor's legacy wait. A write
+            # failure must not strand the terminal before its forwarder owns
+            # it, and the forwarder must not keep waiting past the executor's
+            # legacy deadline that the marker can no longer extend: fall both
+            # sides back to the legacy timeout so the forwarder's precise
+            # startup error lands while the executor is still reporting.
+            thread_start_timeout_seconds = None
+            _logger.warning(
+                "Could not publish Codex startup timeout for session %s; "
+                "falling back to the legacy startup timeout for the executor "
+                "and the forwarder",
+                session_id,
+                exc_info=True,
+            )
+
     # Adopt the thread the fresh TUI creates and run the forwarder in the
     # background, so session creation never blocks on TUI startup.
     _forwarder_task = asyncio.create_task(
@@ -4658,6 +4713,7 @@ async def _auto_create_codex_terminal(
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
+                thread_start_timeout_seconds=thread_start_timeout_seconds,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4717,6 +4773,7 @@ async def _codex_discover_thread_and_forward(
     event_client: CodexAppServerClient,
     routing_summary: str,
     login_required: bool = False,
+    thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4753,6 +4810,9 @@ async def _codex_discover_thread_and_forward(
         the thread-start timeout), while thread discovery keeps listening
         so an interactive sign-in from the terminal still recovers the
         session.
+    :param thread_start_timeout_seconds: Configured-command thread-start
+        allowance. ``None`` preserves the forwarder's ordinary 30-second
+        default.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4760,6 +4820,7 @@ async def _codex_discover_thread_and_forward(
         started, torn down alongside the subagent one.
     """
     from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
         CodexNativeBridgeState,
         clear_bridge_startup_error,
         write_bridge_startup_error,
@@ -4804,6 +4865,11 @@ async def _codex_discover_thread_and_forward(
                 # No deadline: the turn-facing failure is already recorded,
                 # so this wait only serves a possible interactive sign-in.
                 thread_id = await wait_for_thread_started(event_client, timeout=None)
+            elif thread_start_timeout_seconds is not None:
+                thread_id = await wait_for_thread_started(
+                    event_client,
+                    timeout=thread_start_timeout_seconds,
+                )
             else:
                 thread_id = await wait_for_thread_started(event_client)
         except (TimeoutError, RuntimeError) as exc:
@@ -4816,11 +4882,15 @@ async def _codex_discover_thread_and_forward(
                 session_id,
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
-            cause = (
-                "startup timed out"
-                if isinstance(exc, TimeoutError)
-                else "event stream ended before a thread was created"
-            )
+            if isinstance(exc, TimeoutError):
+                timeout_seconds = (
+                    thread_start_timeout_seconds
+                    if thread_start_timeout_seconds is not None
+                    else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                )
+                cause = f"startup timed out after {timeout_seconds:g}s"
+            else:
+                cause = "event stream ended before a thread was created"
             write_bridge_startup_error(
                 bridge_dir,
                 f"Codex app-server never started a thread ({cause}: "
