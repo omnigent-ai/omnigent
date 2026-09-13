@@ -54,7 +54,8 @@ export type NativeCodingAgentCapability =
   | "cursorMode"
   | "skipPermissions"
   | "modelPicker"
-  | "devinMode";
+  | "devinMode"
+  | "devinPermissionMode";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -132,13 +133,14 @@ export const NATIVE_CODING_AGENTS = [
     // forwarder reconstructs each one's transcript from Devin's session store.
     // The bare `devin` harness spelling resolves to this native wrap.
     //
-    // `devinMode` owns Devin's own Model + Effort rows. It is deliberately the
-    // ONLY capability here:
-    //   * `permissionMode` would render Claude's vocabulary AND the server
-    //     hard-gates `permission_mode` to claude-native agents
-    //     (_PERMISSION_MODE_HARNESS in routes/_session_create_validation.py),
-    //     so a Devin session created with one is rejected 4xx. Devin's
-    //     `--permission-mode` stays reachable via `omnigent devin`.
+    // `devinMode` owns Devin's own Model + Effort rows; `devinPermissionMode`
+    // owns its create-time permission picker. These are deliberately Devin-
+    // specific rather than the shared claude/codex capabilities:
+    //   * `permissionMode` would render Claude's vocabulary and drive Claude's
+    //     running-session switch (Devin has none). Devin uses the identical
+    //     `--permission-mode` launch flag, so `devinPermissionMode` reuses that
+    //     flag with Devin's own vocabulary (DEVIN_NATIVE_PERMISSION_MODES),
+    //     delivered create-time via terminal_launch_args.
     //   * `modelPicker` would render pi's model list.
     key: "devin",
     agentName: "devin-native-ui",
@@ -148,7 +150,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Devin",
     iconKind: "devin",
     sortRank: 28,
-    capabilities: ["devinMode"],
+    capabilities: ["devinMode", "devinPermissionMode"],
     // Deliberately NOT fullySupported: that flag pins the picker's primary list
     // to Claude Code + Codex and is guarded by a test asserting exactly those
     // two, so promoting a brand-new harness there is a product call for a

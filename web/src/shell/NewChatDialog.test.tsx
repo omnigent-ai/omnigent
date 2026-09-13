@@ -3448,6 +3448,66 @@ describe("NewChatLandingScreen", () => {
     expect(body.terminal_launch_args).toEqual(args);
   });
 
+  function selectDevinFromMore(): void {
+    // Devin folds into the picker's "More" group (not fullySupported).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    if (screen.queryByTestId("new-chat-landing-agent-a_devin") == null) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    }
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a_devin"));
+    closeMenu();
+  }
+
+  function mockClaudeAndDevin(): void {
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_devin",
+        name: "devin-native-ui",
+        display_name: "Devin",
+        description: null,
+        harness: "devin-native",
+        skills: [],
+      },
+    ]);
+  }
+
+  it("emits Devin's --permission-mode as terminal_launch_args", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockClaudeAndDevin();
+    renderLanding();
+    selectDevinFromMore();
+    // Devin uses the same --permission-mode flag as Claude, carried as
+    // terminal_launch_args (verified against devin 3000.10.21).
+    pickPermissionOption("smart");
+    expect(readHarnessOptions("devin-native").mode).toBe("smart");
+    const { body } = await submitAndReadBody();
+    expect(body.terminal_launch_args).toEqual(["--permission-mode", "smart"]);
+  });
+
+  it("omits launch args for Devin's default (normal) permission mode", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockClaudeAndDevin();
+    renderLanding();
+    selectDevinFromMore();
+    // Default sends no flag, so Devin keeps its own configured default.
+    const { body } = await submitAndReadBody();
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
     // A live session in the seeded workspace ("/Users/corey/repo") on the
     // auto-selected host occupies the directory the picker opens at.
