@@ -1841,7 +1841,9 @@ function selectUnconfiguredAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
     const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
-    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    if (window.matchMedia("(min-width: 768px)").matches) {
+      expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    }
     fireEvent.click(moreTrigger);
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));

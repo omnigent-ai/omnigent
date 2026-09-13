@@ -166,9 +166,7 @@ def test_touch_tablet_row_kebab_visible_like_header_actions(
         # hover-reveal only applies under `(hover:hover) and (pointer:fine)`).
         header_filter = page.get_by_test_id("session-filter")
         expect(header_filter).to_be_visible()
-        header_opacity = float(
-            header_filter.evaluate("el => getComputedStyle(el).opacity")
-        )
+        header_opacity = float(header_filter.evaluate("el => getComputedStyle(el).opacity"))
         assert header_opacity >= 0.99, (
             f"sidebar header actions unexpectedly hidden on touch tablet "
             f"(opacity {header_opacity}); cannot judge row/header drift"
