@@ -185,16 +185,25 @@ as the worker finishes loading its model.
 
 ### Routes — `omnigent/server/routes/dictation.py`
 
-`create_dictation_router(*, auth_provider=None, engine_provider=None)`,
+`create_dictation_router(*, auth_provider=None, engine_provider=None,
+punctuation_provider=None, include_punctuation=True)`,
 registered in `create_app` under `/v1` like every other router. Dictation is
 not session-scoped (the new-chat composer has no session yet), so auth is
 identity-level only: authenticated user required when an auth provider is
 configured, open in single-user/dev mode — the same posture as
 `GET /v1/harnesses`.
 
-Availability rides the existing boot-time capability probe —
-`dictation_available` on **`GET /v1/info`** — rather than a dedicated
-endpoint; the UI needs one boolean, once per page load.
+Availability rides the existing boot-time capability probe:
+`dictation_available` reports audio transcription and
+`dictation_punctuation_available` independently reports final-text
+punctuation.
+
+- **`POST /v1/dictation/punctuation`** — accepts a completed transcript of at
+  most 500 characters
+  as `{"text": ...}` and returns `{"text": ...}` with Chinese/English
+  punctuation restored. Accounts deployments require an authenticated user;
+  one inference runs at a time, a concurrent request fails fast with 429, and
+  model load/inference failure returns 503 without logging transcript text.
 
 - **`WS /v1/dictation/stream`** — wire protocol (documented in the module
   docstring, mirroring `terminal_attach.py`):
