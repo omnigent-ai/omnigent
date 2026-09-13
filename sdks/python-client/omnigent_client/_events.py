@@ -67,6 +67,7 @@ class ResponseFailed:
     """``response.failed`` — unrecoverable error."""
 
     response: Response
+    source: str = "execution"  # "llm", "execution", "harness", or "tool"
 
 
 @dataclass
@@ -223,6 +224,24 @@ class MessageDone:
     content: list[dict[str, object]] = field(default_factory=list)
 
 
+@dataclass
+class ReasoningDone:
+    """A persisted reasoning item from ``output_item.done`` (type ``reasoning``).
+
+    Produced with no preceding reasoning deltas by native transcript
+    mirrors (e.g. claude-native thinking blocks); delta-streaming
+    harnesses may also publish it after the streamed section.
+
+    :param text: Joined raw reasoning text from the item's ``content``
+        blocks.
+    :param summary: Joined summary text from the item's ``summary``
+        blocks.
+    """
+
+    text: str
+    summary: str = ""
+
+
 # ── File output ──────────────────────────────────────────
 
 
@@ -335,6 +354,7 @@ StreamEvent = (
     | ToolResult
     | NativeToolCall
     | MessageDone
+    | ReasoningDone
     | OutputFileDone
     | RetryEvent
     | ErrorEvent

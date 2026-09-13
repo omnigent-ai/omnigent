@@ -2192,3 +2192,188 @@ async def test_serve_tunnel_wake_forces_prompt_reconnect(
     # Attempt 1 (error) escalates 0.5 -> 1.0; attempt 2 (wake) resets to 0.5
     # instead of sleeping the escalated 1.0.
     assert sleeps == [0.5, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_403_clears_server_error_decline_and_remints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upgrade 403 clears a 5xx-latched mint decline so the tunnel re-mints.
+
+    When an intermediary 5xx latched the managed-mint factory's ``declined``
+    while the server was down, the factory returns ``None`` without touching
+    the network. If the tunnel handshake itself requires the minted bearer,
+    the runner must recover without an HTTP callback triggering the reset
+    first: the upgrade rejection is the re-auth signal, so the tunnel clears
+    the latch and the loop-top refresh re-mints on the next attempt.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    attempt = 0
+    tokens: list[str | None] = []
+
+    class _DeclinedFactory:
+        """Managed-mint factory stand-in with a 5xx-latched decline."""
+
+        def __init__(self) -> None:
+            self.declined = True
+            self.declined_by_server_error = True
+
+        def __call__(self) -> str | None:
+            if self.declined:
+                return None
+            return "tok-reminted"
+
+        def reset_decline(self) -> None:
+            self.declined = False
+            self.declined_by_server_error = False
+
+    factory = _DeclinedFactory()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        """First (bare) attempt gets 403; the re-minted attempt succeeds.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Bearer token for this attempt.
+        :param tunnel_token: Tunnel binding token.
+        :raises InvalidStatus: On the first, bare attempt.
+        :returns: None on the re-minted attempt.
+        """
+        del app, tunnel_url, runner_id, runner_version, tunnel_token
+        nonlocal attempt
+        attempt += 1
+        tokens.append(auth_token)
+        if attempt == 1:
+            raise InvalidStatus(Response(403, "Forbidden", [], b""))  # type: ignore[arg-type]
+
+    sleep_calls = 0
+
+    async def _sleep(_delay: float) -> None:
+        """Let the post-403 backoff pass; cancel after the success.
+
+        :param _delay: Reconnect delay (unused).
+        :raises asyncio.CancelledError: On second call.
+        """
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_decline_recovery",
+            runner_version="0.1.0",
+            auth_token=None,
+            auth_token_factory=factory,
+        )
+
+    # Attempt 1 goes bare (declined latch); the 403 clears the latch, so
+    # attempt 2 carries the re-minted bearer.
+    assert tokens == [None, "tok-reminted"]
+    assert factory.declined is False
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_403_keeps_genuine_no_auth_decline_latched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upgrade 403 does NOT clear a decline from a genuine server refusal.
+
+    A decline latched by HTTP 400/404 (no-auth/header-mode server) is
+    definitive; the tunnel rejection path must not re-probe the mint
+    endpoint on every retry for a server that already refused to mint.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    resets: list[int] = []
+
+    class _RefusedFactory:
+        """Managed-mint factory stand-in with a definitive decline."""
+
+        def __init__(self) -> None:
+            self.declined = True
+            self.declined_by_server_error = False
+
+        def __call__(self) -> str | None:
+            return None
+
+        def reset_decline(self) -> None:
+            resets.append(1)
+
+    attempt = 0
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Reject the first attempt with 403, then succeed.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Bearer token for this attempt.
+        :param tunnel_token: Tunnel binding token.
+        :raises InvalidStatus: On the first attempt.
+        :returns: None on later attempts.
+        """
+        del app, tunnel_url, runner_id, runner_version, auth_token, tunnel_token
+        nonlocal attempt
+        attempt += 1
+        if attempt == 1:
+            raise InvalidStatus(Response(403, "Forbidden", [], b""))  # type: ignore[arg-type]
+
+    sleep_calls = 0
+
+    async def _sleep(_delay: float) -> None:
+        """Cancel after the second sleep.
+
+        :param _delay: Reconnect delay (unused).
+        :raises asyncio.CancelledError: On second call.
+        """
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_definitive_decline",
+            runner_version="0.1.0",
+            auth_token=None,
+            auth_token_factory=_RefusedFactory(),
+        )
+
+    assert resets == []

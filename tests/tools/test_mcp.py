@@ -12,6 +12,7 @@ from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from cachetools import TTLCache
 from mcp.shared.exceptions import McpError
@@ -33,7 +34,9 @@ from omnigent.tools.mcp import (
     _discovery_cache,
     _format_call_result,
     _is_connection_error,
+    _is_dead_session_timeout,
     _normalize_input_schema,
+    _TransportErrorRecordingStream,
     clear_discovery_cache,
 )
 
@@ -867,6 +870,262 @@ def test_is_connection_error_value_error() -> None:
     assert _is_connection_error(ValueError("bad")) is False
 
 
+def test_is_connection_error_httpx_network_error() -> None:
+    """
+    httpx transport-level network failures (connection reset,
+    read error mid-call) are transient and worth a reconnect-retry,
+    matching the LLM retry path's classification.
+    """
+    assert _is_connection_error(httpx.ReadError("connection reset")) is True
+    assert _is_connection_error(httpx.ConnectError("refused")) is True
+    assert _is_connection_error(httpx.WriteError("broken")) is True
+
+
+def test_is_connection_error_httpx_timeout_not_transient() -> None:
+    """
+    An httpx timeout is a slow server, not a dead connection —
+    it must not trigger a reconnect-retry by itself.
+    """
+    assert _is_connection_error(httpx.ReadTimeout("slow")) is False
+
+
+# ── _is_dead_session_timeout ─────────────────────────────
+
+
+def _request_timeout_error() -> McpError:
+    """Build the SDK's request-timeout McpError shape (code 408)."""
+    return McpError(
+        ErrorData(
+            code=int(httpx.codes.REQUEST_TIMEOUT),
+            message="Timed out while waiting for response to ClientRequest. Waited 8.0 seconds.",
+        )
+    )
+
+
+def test_dead_session_timeout_detected_when_session_dead() -> None:
+    """
+    A request-timeout McpError with no live session means the
+    transport died mid-call (the network error was swallowed by the
+    lifecycle task) — classified as reconnectable.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = None
+    assert _is_dead_session_timeout(_request_timeout_error(), conn) is True
+
+
+def test_dead_session_timeout_not_detected_when_session_live() -> None:
+    """
+    The same request-timeout with a live session and a clean
+    transport is a genuinely slow server — NOT retried, so a slow
+    tool doesn't get invoked multiple times.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = MagicMock()
+    assert conn._transport_error is None
+    assert _is_dead_session_timeout(_request_timeout_error(), conn) is False
+
+
+def test_dead_session_timeout_detected_when_transport_error_recorded() -> None:
+    """
+    A request-timeout with a live session but a recorded httpx-level
+    network failure means the SDK swallowed a mid-response transport
+    error (streamable-HTTP SSE/JSON response paths) — the response
+    can never arrive, so it is classified as reconnectable.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = MagicMock()
+    conn._transport_error = httpx.ReadError("connection reset by peer")
+    assert _is_dead_session_timeout(_request_timeout_error(), conn) is True
+
+
+def test_dead_session_timeout_ignores_other_mcp_errors() -> None:
+    """
+    Non-timeout McpErrors (e.g. invalid params) never classify as a
+    dead-session timeout, session state notwithstanding.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = None
+    exc = McpError(ErrorData(code=-32602, message="Invalid params"))
+    assert _is_dead_session_timeout(exc, conn) is False
+    assert _is_dead_session_timeout(ValueError("bad"), conn) is False
+
+
+# ── _TransportErrorRecordingStream ─────────────────────────────
+
+
+class _ExplodingByteStream(httpx.AsyncByteStream):
+    """Yields one chunk, then raises the configured exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aiter__(self) -> Any:
+        yield b"partial"
+        raise self._exc
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio()
+async def test_recording_stream_records_network_error() -> None:
+    """
+    A network failure while reading a response body is reported to
+    the ``on_error`` callback and re-raised — the explicit
+    unhealthy-transport signal for the swallowed-408 case.
+    """
+    recorded: list[BaseException] = []
+    stream = _TransportErrorRecordingStream(
+        _ExplodingByteStream(httpx.ReadError("connection reset by peer")),
+        recorded.append,
+    )
+    with pytest.raises(httpx.ReadError):
+        async for _ in stream:
+            pass
+    assert len(recorded) == 1
+    assert isinstance(recorded[0], httpx.ReadError)
+
+
+@pytest.mark.asyncio()
+async def test_recording_stream_does_not_record_timeouts() -> None:
+    """
+    A read timeout is a slow server, not a dead transport — it must
+    not be recorded, or a later genuine tool timeout would be
+    misclassified as reconnectable and retried.
+    """
+    recorded: list[BaseException] = []
+    stream = _TransportErrorRecordingStream(
+        _ExplodingByteStream(httpx.ReadTimeout("slow")),
+        recorded.append,
+    )
+    with pytest.raises(httpx.ReadTimeout):
+        async for _ in stream:
+            pass
+    assert recorded == []
+
+
+def _make_hook_response(method: str, request: httpx.Request | None = None) -> httpx.Response:
+    """Build a response attached to a request with the given method."""
+    if request is None:
+        request = httpx.Request(method, "http://127.0.0.1:9/mcp")
+    return httpx.Response(
+        200,
+        request=request,
+        stream=_ExplodingByteStream(httpx.ReadError("reset")),
+    )
+
+
+@pytest.mark.asyncio()
+async def test_response_hook_wraps_post_but_not_get() -> None:
+    """
+    The response hook records only tool-call (POST) traffic. The
+    SDK's server-initiated GET stream reconnects on its own; its
+    flaps must not taint an unrelated tool call's timeout
+    classification.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+
+    post_response = _make_hook_response("POST")
+    await conn._record_response_stream(post_response)
+    assert isinstance(post_response.stream, _TransportErrorRecordingStream)
+
+    get_response = _make_hook_response("GET")
+    await conn._record_response_stream(get_response)
+    assert not isinstance(get_response.stream, _TransportErrorRecordingStream)
+
+
+@pytest.mark.asyncio()
+async def test_response_hook_records_into_connection() -> None:
+    """
+    A network failure while reading a hooked POST response body lands
+    in ``conn._transport_error`` — the end-to-end wiring of the
+    recorder, with the request stamped at send time like the real
+    client's request hook does.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    request = httpx.Request("POST", "http://127.0.0.1:9/mcp")
+    await conn._stamp_request_serial(request)
+    response = _make_hook_response("POST", request)
+    await conn._record_response_stream(response)
+    with pytest.raises(httpx.ReadError):
+        async for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert isinstance(conn._transport_error, httpx.ReadError)
+
+
+@pytest.mark.asyncio()
+async def test_stale_attempt_transport_error_discarded() -> None:
+    """
+    The SDK never cancels the POST task of a timed-out request, so
+    its response body can keep reading — and fail — while a later
+    call is in flight. Such stale failures are attributed to the
+    attempt that sent the request and discarded, not recorded, so
+    they cannot flip the later call's genuine slow-tool timeout into
+    a retry of a non-idempotent tool.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    request = httpx.Request("POST", "http://127.0.0.1:9/mcp")
+    # Sent (and its response opened) while attempt N was current...
+    await conn._stamp_request_serial(request)
+    response = _make_hook_response("POST", request)
+    await conn._record_response_stream(response)
+    # ...but the failure only fires after a later attempt started.
+    conn._call_serial += 1
+    with pytest.raises(httpx.ReadError):
+        async for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert conn._transport_error is None
+
+
+@pytest.mark.asyncio()
+async def test_late_response_headers_do_not_steal_a_later_attempts_serial() -> None:
+    """
+    Regression for the send-vs-header-arrival race: attempt N's
+    request times out before its response headers arrive; attempt
+    N+1 starts; N's delayed headers only now reach the response
+    hook. The attempt token is bound at request-send time, so the
+    late response still carries N's serial and its subsequent body
+    failure is discarded — not attributed to attempt N+1.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    request = httpx.Request("POST", "http://127.0.0.1:9/mcp")
+    # Sent under attempt N.
+    await conn._stamp_request_serial(request)
+    # Attempt N+1 starts before N's response headers arrive.
+    conn._call_serial += 1
+    # N's late headers arrive during N+1's window; then the body
+    # fails with a network error.
+    response = _make_hook_response("POST", request)
+    await conn._record_response_stream(response)
+    with pytest.raises(httpx.ReadError):
+        async for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert conn._transport_error is None
+
+
+def test_recording_client_preserves_env_proxy_mounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Regression: installing the recorder must not disable httpx's
+    environment-proxy support. An explicit ``transport=`` argument
+    would (httpx only mounts env proxies when ``transport is None``),
+    so the recorder is a response event hook instead — with
+    ``HTTP(S)_PROXY`` set, the client must carry proxy mounts exactly
+    like the SDK's default ``create_mcp_http_client`` does.
+    """
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    conn = McpServerConnection(config=_make_http_config())
+    client = conn._make_recording_httpx_client()
+    proxy_mounts = [t for t in client._mounts.values() if t is not None]
+    assert proxy_mounts, "env-proxy mounts were not created"
+    assert client._event_hooks["request"], "serial-stamping request hook is missing"
+    assert client._event_hooks["response"], "recording response hook is missing"
+
+
 # ── _backoff_delay ────────────────────────────────────────
 
 
@@ -935,6 +1194,218 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
 
         assert result == "recovered"
         mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_on_httpx_network_error() -> None:
+    """
+    An httpx transport failure mid-call (connection reset by a
+    transient network blip) triggers a reconnect-retry, just like
+    the classic dead-pipe errors.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        mock_session.call_tool.side_effect = [
+            httpx.ReadError("connection reset by peer"),
+            ok_result,
+        ]
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_on_dead_session_timeout() -> None:
+    """
+    When the transport dies mid-call, the SDK surfaces a
+    request-timeout McpError while the lifecycle task clears the
+    session. That shape must reconnect-retry rather than fail the
+    call.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        def _die_mid_call(*args: object, **kwargs: object) -> MagicMock:
+            if not mock_session.call_tool.await_count > 1:
+                # Lifecycle task death: session cleared, request
+                # times out with no response.
+                conn._session = None
+                raise McpError(
+                    ErrorData(
+                        code=int(httpx.codes.REQUEST_TIMEOUT),
+                        message=(
+                            "Timed out while waiting for response to "
+                            "ClientRequest. Waited 8.0 seconds."
+                        ),
+                    )
+                )
+            return ok_result
+
+        mock_session.call_tool.side_effect = _die_mid_call
+
+        async def _restore_session() -> None:
+            conn._session = mock_session
+
+        with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        assert mock_reconnect.call_count == 1
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_on_swallowed_transport_error_timeout() -> None:
+    """
+    The locked MCP SDK can swallow a mid-response network failure
+    entirely (streamable-HTTP SSE/JSON response paths), leaving the
+    session live while the pending request times out. The httpx-level
+    recorded transport error must make that 408 reconnect-retry, and
+    the successful retry must clear the recorded error.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        def _swallowed_reset(*args: object, **kwargs: object) -> MagicMock:
+            if not mock_session.call_tool.await_count > 1:
+                # The SDK swallowed the reset: session stays live,
+                # only the httpx-layer recording betrays the fault.
+                conn._transport_error = httpx.ReadError("connection reset by peer")
+                raise McpError(
+                    ErrorData(
+                        code=int(httpx.codes.REQUEST_TIMEOUT),
+                        message=(
+                            "Timed out while waiting for response to "
+                            "ClientRequest. Waited 8.0 seconds."
+                        ),
+                    )
+                )
+            return ok_result
+
+        mock_session.call_tool.side_effect = _swallowed_reset
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+        # Each attempt starts with a clean signal, so the recorded
+        # error must not linger past the successful retry to
+        # misclassify a future genuine tool timeout.
+        assert conn._transport_error is None
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_timeout_with_live_session_not_retried() -> None:
+    """
+    A request timeout while the session is still live is a slow
+    server, not a dead connection — it must propagate without a
+    reconnect-retry so slow tools aren't invoked twice.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        mock_session.call_tool.side_effect = McpError(
+            ErrorData(
+                code=int(httpx.codes.REQUEST_TIMEOUT),
+                message=(
+                    "Timed out while waiting for response to ClientRequest. Waited 8.0 seconds."
+                ),
+            )
+        )
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with pytest.raises(McpError, match="Timed out"):
+                await conn.call_tool("test_tool", {"query": "hi"})
+
+        mock_reconnect.assert_not_awaited()
+        assert mock_session.call_tool.await_count == 1
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_retries_when_reconnect_itself_fails() -> None:
+    """
+    A reconnect attempted while the network is still down fails
+    with a connection error; that failure must consume a retry and
+    be re-attempted, not abort the whole call.
+    """
+    config = MCPServerConfig(
+        name="test-reconnect-blip",
+        url="http://localhost:9000/mcp",
+        retry=RetryPolicy(max_retries=3, backoff_base_s=0.1, backoff_max_s=1.0),
+    )
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        mock_session.call_tool.side_effect = [
+            httpx.ReadError("blip starts"),
+            ok_result,
+        ]
+
+        # First reconnect lands inside the outage window and fails;
+        # the second succeeds.
+        reconnect_results: list[Exception | None] = [
+            httpx.ConnectError("still refusing"),
+            None,
+        ]
+
+        async def _flaky_reconnect() -> None:
+            outcome = reconnect_results.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        with patch.object(conn, "_reconnect", side_effect=_flaky_reconnect) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        assert mock_reconnect.call_count == 2
 
     await conn.close()
 
@@ -2499,3 +2970,66 @@ async def test_open_http_transport_uses_streamable_for_non_sse_url() -> None:
         await conn._open_http_transport(stack)
 
     assert calls == ["streamable"], "plain URL must try Streamable HTTP first"
+
+
+def test_is_connection_error_mcp_session_terminated_code() -> None:
+    """
+    The streamable-HTTP transport's Session terminated (positive 32600,
+    raised when the server restarted and lost the session id) must be
+    classified as a connection error so the reconnect path runs.
+    """
+    exc = McpError(
+        ErrorData(
+            code=32600,
+            message="Session terminated",
+        )
+    )
+    assert _is_connection_error(exc) is True
+
+
+def test_is_connection_error_mcp_session_terminated_message_only() -> None:
+    """
+    The message match keeps classification correct if the SDK fixes the
+    sign of the code (32600 is a typo of JSON-RPC's -32600).
+    """
+    exc = McpError(
+        ErrorData(
+            code=-32600,
+            message="Session terminated",
+        )
+    )
+    assert _is_connection_error(exc) is True
+
+
+def test_is_connection_error_mcp_real_invalid_request_not_connection() -> None:
+    """
+    A genuine -32600 invalid-request error with different message text is
+    NOT a connection error.
+    """
+    exc = McpError(
+        ErrorData(
+            code=-32600,
+            message="Invalid Request",
+        )
+    )
+    assert _is_connection_error(exc) is False
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_managed_mcp_records_pr_before_result_formatting(
+    tmp_path, monkeypatch, failed
+) -> None:
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    url = "https://github.com/example/managed/pull/42"
+    response = CallToolResult.model_validate(
+        {"content": [{"type": "text", "text": json.dumps({"html_url": url})}], "isError": failed}
+    )
+    with _mock_mcp_transport() as session:
+        session.call_tool.return_value = response
+        connection = McpServerConnection(config=_make_http_config(name="custom-github"))
+        await connection.connect()
+        result = await connection._invoke_tool("create_pull_request", {}, session_id="conv_mcp")
+        assert url in result
+    assert [pr.url for pr in SessionPrRegistry("conv_mcp").list()] == ([] if failed else [url])

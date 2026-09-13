@@ -480,7 +480,7 @@ def test_configured_harness_map_all_true_with_clis(
 
     _all_clis_installed(monkeypatch)
     monkeypatch.setattr(
-        "omnigent.codex_native._codex_auth_unavailable_reason",
+        "omnigent.harnesses.codex_native.main._codex_auth_unavailable_reason",
         lambda: None,
     )
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
@@ -513,7 +513,7 @@ def test_configured_harness_map_probes_codex_readiness_once(
         return "needs-auth"
 
     monkeypatch.setattr(
-        "omnigent.codex_native._codex_auth_unavailable_reason",
+        "omnigent.harnesses.codex_native.main._codex_auth_unavailable_reason",
         _codex_reason,
     )
 

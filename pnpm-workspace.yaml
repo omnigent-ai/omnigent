@@ -4,6 +4,8 @@ packages:
   - '.github/ci-deps'
   - 'editors/vscode'
   - 'deploy/cloudflare'
+  - 'sdks/web-extension'
+  - 'examples/extensions/hello-page/web'
 
 settings:
   # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
@@ -37,12 +39,26 @@ overrides:
   '@tailwindcss/postcss': 4.3.1
   jiti: 2.7.0
   lightningcss: 1.32.0
-  postcss: 8.5.18
+  postcss: 8.5.23
+  browserslist: 4.28.8
+  fast-uri: 3.1.6
+  '@xmldom/xmldom': 0.8.15
+  qs: 6.16.0
+  query-string: 9.5.0
+  '@hono/node-server': 1.19.15
+  hono: 4.13.5
   linkify-it: 5.0.2
   shiki: "catalog:"
   react: "catalog:"
   react-dom: "catalog:"
-  dompurify: ^3.4.0
+  dompurify: 3.4.14
+  mermaid: 11.16.1
+  tar: 7.5.21
+  'node-gyp>undici': 6.28.0
+  'undici@>=7.0.0 <8.0.0': 7.29.0
+  'brace-expansion@>=1.0.0 <2.0.0': 1.1.18
+  'brace-expansion@>=2.0.0 <3.0.0': 2.1.4
+  'brace-expansion@>=5.0.0 <6.0.0': 5.0.9
   '@shikijs/core': 4.2.0
   '@shikijs/engine-javascript': 4.2.0
   '@shikijs/engine-oniguruma': 4.2.0
@@ -50,38 +66,38 @@ overrides:
   '@shikijs/themes': 4.2.0
   '@shikijs/types': 4.2.0
   '@shikijs/transformers': 4.2.0
-  '@tiptap/core': 3.23.4
-  '@tiptap/extension-blockquote': 3.23.4
-  '@tiptap/extension-bold': 3.23.4
-  '@tiptap/extension-bubble-menu': 3.23.4
-  '@tiptap/extension-bullet-list': 3.23.4
-  '@tiptap/extension-code': 3.23.4
-  '@tiptap/extension-code-block': 3.23.4
-  '@tiptap/extension-document': 3.23.4
-  '@tiptap/extension-dropcursor': 3.23.4
-  '@tiptap/extension-floating-menu': 3.23.4
-  '@tiptap/extension-gapcursor': 3.23.4
-  '@tiptap/extension-hard-break': 3.23.4
-  '@tiptap/extension-heading': 3.23.4
-  '@tiptap/extension-horizontal-rule': 3.23.4
-  '@tiptap/extension-image': 3.23.4
-  '@tiptap/extension-italic': 3.23.4
-  '@tiptap/extension-link': 3.23.4
-  '@tiptap/extension-list': 3.23.4
-  '@tiptap/extension-list-item': 3.23.4
-  '@tiptap/extension-list-keymap': 3.23.4
-  '@tiptap/extension-ordered-list': 3.23.4
-  '@tiptap/extension-paragraph': 3.23.4
-  '@tiptap/extension-strike': 3.23.4
-  '@tiptap/extension-table': 3.23.4
-  '@tiptap/extension-text': 3.23.4
-  '@tiptap/extension-underline': 3.23.4
-  '@tiptap/extensions': 3.23.4
-  '@tiptap/markdown': 3.23.4
-  '@tiptap/pm': 3.23.4
-  '@tiptap/react': 3.23.4
-  '@tiptap/starter-kit': 3.23.4
-  express-rate-limit>ip-address: ^10.1.1
+  '@tiptap/core': 3.30.5
+  '@tiptap/extension-blockquote': 3.30.5
+  '@tiptap/extension-bold': 3.30.5
+  '@tiptap/extension-bubble-menu': 3.30.5
+  '@tiptap/extension-bullet-list': 3.30.5
+  '@tiptap/extension-code': 3.30.5
+  '@tiptap/extension-code-block': 3.30.5
+  '@tiptap/extension-document': 3.30.5
+  '@tiptap/extension-dropcursor': 3.30.5
+  '@tiptap/extension-floating-menu': 3.30.5
+  '@tiptap/extension-gapcursor': 3.30.5
+  '@tiptap/extension-hard-break': 3.30.5
+  '@tiptap/extension-heading': 3.30.5
+  '@tiptap/extension-horizontal-rule': 3.30.5
+  '@tiptap/extension-image': 3.30.5
+  '@tiptap/extension-italic': 3.30.5
+  '@tiptap/extension-link': 3.30.5
+  '@tiptap/extension-list': 3.30.5
+  '@tiptap/extension-list-item': 3.30.5
+  '@tiptap/extension-list-keymap': 3.30.5
+  '@tiptap/extension-ordered-list': 3.30.5
+  '@tiptap/extension-paragraph': 3.30.5
+  '@tiptap/extension-strike': 3.30.5
+  '@tiptap/extension-table': 3.30.5
+  '@tiptap/extension-text': 3.30.5
+  '@tiptap/extension-underline': 3.30.5
+  '@tiptap/extensions': 3.30.5
+  '@tiptap/markdown': 3.30.5
+  '@tiptap/pm': 3.30.5
+  '@tiptap/react': 3.30.5
+  '@tiptap/starter-kit': 3.30.5
+  express-rate-limit>ip-address: 10.3.1
 
 allowBuilds:
   '@anthropic-ai/claude-code': true

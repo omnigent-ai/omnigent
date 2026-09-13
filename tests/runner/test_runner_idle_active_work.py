@@ -270,7 +270,7 @@ async def test_parked_approval_blocks_idle_shutdown() -> None:
     assert app.state.has_active_work() is True
 
     async def _release() -> None:
-        fut.set_result(True)
+        fut.set_result(pending_approvals.Verdict(approved=True))
         pending_approvals.cleanup("elicit_idle_pin")
 
     await _assert_monitor_blocked_then_shuts_down(
@@ -288,7 +288,7 @@ async def test_done_approval_future_does_not_pin_runner() -> None:
     """
     app = _scaffold_app()
     fut = pending_approvals.register("elicit_stale")
-    fut.set_result(False)
+    fut.set_result(pending_approvals.Verdict(approved=False))
     assert fut.done()
     assert app.state.has_active_work() is False
 

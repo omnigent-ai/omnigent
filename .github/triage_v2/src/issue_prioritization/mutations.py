@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from issue_prioritization.artifacts import RankedIssue
-from issue_prioritization.domain import Priority
+from issue_prioritization.domain import InformationStatus, Priority
 from issue_prioritization.labels import LEGACY_SEVERITY_LABELS, LabelManifest
 
 
@@ -34,6 +34,8 @@ class MutationTarget:
     issue_number: int
     priority: str
     components: tuple[str, ...]
+    issue_type: str | None = None
+    needs_info: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,28 @@ class MutationPlanner:
         labels_remove = existing & LEGACY_SEVERITY_LABELS
         blocked: list[str] = []
 
+        if target.issue_type is not None:
+            type_labels = {"Bug", "Feature", "Docs"}
+            current_types = existing & type_labels
+            if target.issue_type not in current_types:
+                labels_add.add(target.issue_type)
+            labels_remove.update(current_types - {target.issue_type})
+
+        if target.needs_info is True:
+            lifecycle_labels = {label.casefold() for label in existing}
+            exemption = next(
+                (label for label in ("security", "duplicate") if label in lifecycle_labels),
+                None,
+            )
+            if exemption:
+                blocked.append(f"needs_info_{exemption}_exempt")
+                if "needs-info" in existing:
+                    labels_remove.add("needs-info")
+            elif "needs-info" not in existing:
+                labels_add.add("needs-info")
+        elif target.needs_info is False and "needs-info" in existing:
+            labels_remove.add("needs-info")
+
         current_priorities = existing & self.priority_labels
         current_priority = next(iter(current_priorities)) if len(current_priorities) == 1 else None
         priority_written = False
@@ -149,6 +173,8 @@ def target_from_ranked(item: RankedIssue) -> MutationTarget:
         issue_number=item.issue.number,
         priority=item.result.priority.value,
         components=item.issue.component_labels,
+        issue_type=item.issue.issue_type.label,
+        needs_info=item.issue.information_status == InformationStatus.NEEDS_INFO,
     )
 
 

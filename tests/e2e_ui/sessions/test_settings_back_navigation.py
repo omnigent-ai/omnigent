@@ -42,7 +42,10 @@ def test_native_open_path_navigates_to_settings_without_reload(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The desktop bridge's basename-less ``/settings`` path routes in place."""
+    """The desktop bridge's basename-less ``/settings`` path routes in place.
+
+    Bare ``/settings`` canonicalizes to ``/settings/general``.
+    """
     base_url, session_id = seeded_session
     page.add_init_script(_NATIVE_OPEN_PATH_INIT_SCRIPT)
     page.goto(f"{base_url}/c/{session_id}")
@@ -52,7 +55,7 @@ def test_native_open_path_navigates_to_settings_without_reload(
 
     page.evaluate("window.__nativeOpenPathListener('/settings')")
 
-    expect(page).to_have_url(f"{base_url}/settings", timeout=30_000)
+    expect(page).to_have_url(f"{base_url}/settings/general", timeout=30_000)
     expect(page.get_by_role("link", name="Back", exact=True)).to_be_visible(timeout=30_000)
     assert page.evaluate("window.__documentLoadMarker") == load_marker
 

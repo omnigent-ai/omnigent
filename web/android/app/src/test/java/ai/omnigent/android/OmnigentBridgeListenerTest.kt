@@ -132,4 +132,42 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
     }
+
+    private fun serverSelectionListener(
+        pickerRequests: MutableList<Unit> = mutableListOf(),
+        switchCalls: MutableList<String> = mutableListOf(),
+        setupCalls: MutableList<Unit> = mutableListOf(),
+    ) = OmnigentBridgeListener(
+        notifications = NativeNotificationManager(context),
+        blobSaver = BlobSaver(context),
+        onServerPickerRequested = { pickerRequests.add(Unit) },
+        onSwitchServer = { switchCalls.add(it) },
+        onOpenServerSetup = { setupCalls.add(Unit) },
+    )
+
+    @Test
+    fun `requestServerPicker and openServerSetup dispatch to their callbacks`() {
+        val pickerRequests = mutableListOf<Unit>()
+        val setupCalls = mutableListOf<Unit>()
+        val wired =
+            serverSelectionListener(pickerRequests = pickerRequests, setupCalls = setupCalls)
+
+        wired.handle("""{"method":"requestServerPicker"}""")
+        wired.handle("""{"method":"openServerSetup"}""")
+
+        assertEquals(1, pickerRequests.size)
+        assertEquals(1, setupCalls.size)
+    }
+
+    @Test
+    fun `switchServer forwards the URL and drops an empty or missing one`() {
+        val switchCalls = mutableListOf<String>()
+        val wired = serverSelectionListener(switchCalls = switchCalls)
+
+        wired.handle("""{"method":"switchServer","url":"https://other.example.test"}""")
+        wired.handle("""{"method":"switchServer","url":""}""")
+        wired.handle("""{"method":"switchServer"}""")
+
+        assertEquals(listOf("https://other.example.test"), switchCalls)
+    }
 }

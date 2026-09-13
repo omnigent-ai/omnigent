@@ -12,10 +12,17 @@ from tests.repl.helpers import CapturingHost
 class _CompactSession:
     """Minimal session stub for ``/compact`` tests."""
 
-    def __init__(self, *, is_streaming: bool = False, fail: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        is_streaming: bool = False,
+        fail: Exception | None = None,
+        harness: str | None = None,
+    ) -> None:
         self.is_streaming = is_streaming
         self.calls = 0
         self._fail = fail
+        self.harness = harness
 
     async def compact(self) -> None:
         """Record the compaction request or raise the configured failure."""
@@ -72,6 +79,25 @@ async def test_compact_refuses_while_streaming() -> None:
 
     assert session.calls == 0
     assert "Cannot compact while a response is running" in host.text
+
+
+@pytest.mark.asyncio
+async def test_compact_blocked_for_sdk_harness() -> None:
+    """The command is blocked for non-native harnesses with a clear message."""
+    host = CapturingHost()
+    session = _CompactSession(harness="claude-sdk")
+
+    await handle_slash_command(
+        "/compact",
+        session,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        host,
+        RichBlockFormatter(),  # type: ignore[arg-type]
+    )
+
+    assert session.calls == 0
+    assert "only available for native-TUI sessions" in host.text
+    assert "claude-sdk" in host.text
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
-// Vitest cases for the MCP startup band's pure line formatters.
+// Vitest cases for the MCP startup band's pure line formatter.
 import { describe, expect, it } from "vitest";
 
-import { mcpSettledNames, mcpStartingLine } from "./ChatIndicators";
+import { mcpStartingLine } from "./ChatIndicators";
 
 describe("mcpStartingLine", () => {
   it("mirrors the Codex TUI header: caps the name list at three", () => {
@@ -17,16 +17,5 @@ describe("mcpStartingLine", () => {
 
   it("uses the singular header for a single-server round", () => {
     expect(mcpStartingLine(["safe"], 1)).toBe("Starting MCP server: safe…");
-  });
-});
-
-describe("mcpSettledNames", () => {
-  it("keeps short failure lists verbatim", () => {
-    expect(mcpSettledNames(["safe", "storage-console"])).toBe("safe, storage-console");
-  });
-
-  it("collapses long lists into a count so the band stays scannable", () => {
-    const names = Array.from({ length: 12 }, (_, i) => `s${String(i).padStart(2, "0")}`);
-    expect(mcpSettledNames(names)).toBe("s00, s01, s02, s03, s04, s05, s06, s07, +4 more");
   });
 });

@@ -12,6 +12,9 @@ from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins import get_builtin_tool
 from omnigent.tools.builtins.web_search import WebSearchTool
 from omnigent.tools.builtins.web_search_keenable import (
+    _SNIPPET_MAX_CHARS as _SNIPPET_MAX_CHARS_KEENABLE,
+)
+from omnigent.tools.builtins.web_search_keenable import (
     _resolve_max_results as _resolve_max_results_keenable,
 )
 from omnigent.tools.builtins.web_search_nimble import _resolve_max_results
@@ -614,7 +617,8 @@ def test_keenable_backend_via_spec_config(tool_ctx: ToolContext) -> None:
             {
                 "title": "Keenable Docs",
                 "url": "https://docs.keenable.ai",
-                "description": "Web search API for AI agents.",
+                "description": "",
+                "snippet": "Web search API for AI agents.",
             },
         ],
     }
@@ -630,6 +634,50 @@ def test_keenable_backend_via_spec_config(tool_ctx: ToolContext) -> None:
     assert "1. Keenable Docs" in result
     assert "https://docs.keenable.ai" in result
     assert "Web search API for AI agents." in result
+
+
+def test_keenable_reads_page_text_from_snippet(tool_ctx: ToolContext) -> None:
+    """
+    Keenable sends both fields and ``description`` is empty for most pages, so
+    the page text has to come from ``snippet``. It is whole-page text, so it is
+    collapsed and capped.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "results": [
+            {
+                "title": "Wrapped",
+                "url": "https://example.com/wrapped",
+                "description": "",
+                "snippet": "line one\n\nline two",
+            },
+            {
+                "title": "Long",
+                "url": "https://example.com/long",
+                "description": "",
+                "snippet": "word " * 400,
+            },
+            {
+                "title": "Meta only",
+                "url": "https://example.com/meta",
+                "description": "only a meta description",
+            },
+        ],
+    }
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "keenable"}), tool_ctx)
+
+    assert "line one line two" in result
+    assert "only a meta description" in result
+    long_line = next(line for line in result.splitlines() if line.startswith("   word"))
+    # 2000 chars of page text in, one search-snippet's worth out.
+    assert _SNIPPET_MAX_CHARS_KEENABLE - 10 < len(long_line.strip()) <= _SNIPPET_MAX_CHARS_KEENABLE
 
 
 def test_keenable_keyless_by_default(tool_ctx: ToolContext) -> None:

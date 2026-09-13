@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 
@@ -182,35 +182,57 @@ def codex_auth_has_credential(auth_path: Path) -> bool:
         when it is missing, unreadable, not valid JSON, not a JSON object, or
         carries no credential field.
     """
+    # Delegate so the credential set can never drift from the mode resolver.
+    return codex_auth_effective_mode(auth_path) is not None
+
+
+def codex_auth_effective_mode(auth_path: Path) -> str | None:
+    """Return the auth mode a Codex ``auth.json``'s credential effectively uses.
+
+    Mirrors the Codex CLI's own resolution (``openai/codex``,
+    ``codex-rs/login``): ChatGPT OAuth tokens win when present, else a baked-in
+    API key, else an enterprise personal access token. This is what ``codex``
+    itself reports as ``auth_mode`` — surfacing it keeps omnigent's listing
+    from calling an API-key-backed login a bare "subscription", which points a
+    quota diagnosis at the wrong credential.
+
+    :param auth_path: Path to the Codex ``auth.json`` to inspect, e.g.
+        ``Path("~/.codex/auth.json").expanduser()``.
+    :returns: ``"chatgpt"``, ``"apikey"``, or ``"pat"``; ``None`` when the file
+        is missing, malformed, or carries no usable credential (the same cases
+        :func:`codex_auth_has_credential` rejects).
+    """
     try:
-        raw = auth_path.read_text(encoding="utf-8")
-    except OSError:
-        # Missing or unreadable file — no login.
-        return False
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Malformed JSON — treat as no usable login rather than crash.
-        return False
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
     if not isinstance(data, dict):
-        return False
-    # apikey mode: a baked-in OpenAI API key.
-    api_key = data.get("OPENAI_API_KEY")
-    if isinstance(api_key, str) and api_key.strip():
-        return True
-    # chatgpt / OAuth mode: an access token, or a refresh token the CLI can
-    # exchange for a fresh access token.
+        return None
     tokens = data.get("tokens")
     if isinstance(tokens, dict):
         for field in ("access_token", "refresh_token"):
             value = tokens.get(field)
             if isinstance(value, str) and value.strip():
-                return True
-    # Enterprise / external-token integrations.
+                return "chatgpt"
+    api_key = data.get("OPENAI_API_KEY")
+    if isinstance(api_key, str) and api_key.strip():
+        return "apikey"
     personal_access_token = data.get("personal_access_token")
     if isinstance(personal_access_token, str) and personal_access_token.strip():
-        return True
-    return False
+        return "pat"
+    return None
+
+
+def codex_cli_effective_auth_mode() -> str | None:
+    """Return the effective auth mode of the Codex CLI's own login, if any.
+
+    Reads the default ``~/.codex/auth.json`` (honoring ``$HOME``) through
+    :func:`codex_auth_effective_mode`.
+
+    :returns: ``"chatgpt"``, ``"apikey"``, or ``"pat"``; ``None`` when there is
+        no usable login.
+    """
+    return codex_auth_effective_mode(_codex_auth_path())
 
 
 def _codex_config_path() -> Path:
@@ -477,7 +499,7 @@ def claude_managed_gateway(
 
     The single canonical parser for Claude Code's managed-settings credential,
     shared by ambient detection, the readiness gate, and the Smart-Routing
-    gateway check (:func:`omnigent.claude_native.managed_claude_gateway_signal`
+    gateway check (:func:`omnigent.harnesses.claude_native.main.managed_claude_gateway_signal`
     delegates here). A credential counts as delivered when the file carries a
     top-level ``apiKeyHelper`` (a token-printing command) or a truthy
     ``env.CLAUDE_CODE_USE_GATEWAY``.
@@ -514,6 +536,35 @@ def claude_managed_gateway(
         )
         return base_url or None, has_helper or use_gateway
     return None, False
+
+
+def claude_managed_model_picker(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Read a replacement model picker from Claude Code's managed settings."""
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        picker = payload.get("modelPicker")
+        if not isinstance(picker, dict) or picker.get("replaceBuiltInOptions") is not True:
+            return ()
+        options = picker.get("options")
+        if not isinstance(options, list):
+            return ()
+        return tuple(
+            (model.strip(), label.strip())
+            for option in options
+            if isinstance(option, dict)
+            and isinstance((model := option.get("model")), str)
+            and model.strip()
+            and isinstance((label := option.get("label", model)), str)
+            and label.strip()
+        )
+    return ()
 
 
 def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:

@@ -1078,3 +1078,35 @@ def test_omitting_live_still_renders_declared_only_without_creds(
 
     assert main(["--harness", "pi-native", "--dimension", "basic_turn"]) == 0
     assert "declared, not observed" in capsys.readouterr().out
+
+
+def test_native_profile_gates_on_the_binary_omnigent_launches() -> None:
+    """Every native TUI profile skip-gates on its install-spec binary.
+
+    The availability probe must look for the CLI omnigent actually installs
+    and launches. A profile derived by name-mangling the harness slug reports
+    a correctly set-up machine as missing the CLI (e.g. probing `antigravity`
+    when the installed binary is `agy`), sending users to reinstall a tool
+    they already have.
+    """
+    from omnigent.onboarding.harness_install import required_cli_for_harness
+    from tests.harness_bench.manifest import _native_tui_harnesses
+
+    for harness in _native_tui_harnesses():
+        spec = required_cli_for_harness(harness)
+        if spec is None:
+            continue  # no declared CLI; the slug-derived fallback is all we have
+        profile = resolve_profile(harness)
+        assert profile.cli_binary == spec.binary, (
+            f"{harness} probes {profile.cli_binary!r} but omnigent launches {spec.binary!r}"
+        )
+
+
+def test_antigravity_native_profile_probes_agy() -> None:
+    """The Antigravity native harness gates on `agy`, its real binary name.
+
+    Antigravity installs no `antigravity` binary; the launcher runs `agy`
+    (see omnigent/antigravity_native_launch.py), so the bench must probe that.
+    """
+    profile = resolve_profile("antigravity-native")
+    assert profile.cli_binary == "agy"

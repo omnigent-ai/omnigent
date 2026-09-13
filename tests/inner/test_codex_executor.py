@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -14,12 +15,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from omnigent import _native_forwarder_health as native_forwarder_health
-from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
     _build_initial_prompt,
+    _clean_codex_env,
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
@@ -31,6 +31,10 @@ from omnigent.inner.codex_executor import (
     _provider_codex_config_overrides,
     _to_codex_input_items,
 )
+from omnigent.inner.codex_goal_command import (
+    GOAL_OBJECTIVE_MAX_CHARS,
+    goal_objective_length_error,
+)
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
@@ -40,7 +44,9 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
-from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.models.codex_model_vocabulary import codex_spawn_model
+from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 
 
 def _run(coro):
@@ -380,6 +386,13 @@ class TestCodexExecutor(unittest.TestCase):
             )
         )
 
+    def test_goal_objective_length_error_boundary(self):
+        self.assertIsNone(goal_objective_length_error("x" * GOAL_OBJECTIVE_MAX_CHARS))
+        message = goal_objective_length_error("x" * (GOAL_OBJECTIVE_MAX_CHARS + 1))
+        self.assertIsNotNone(message)
+        self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS + 1), message)
+        self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS), message)
+
     def test_run_turn_delegates_to_app_server_session(self):
         async def _t():
             fake_session = _FakeAppSession(
@@ -677,6 +690,60 @@ class TestCodexExecutor(unittest.TestCase):
                     }
                 ],
             )
+
+        _run(_t())
+
+    def test_app_server_overlong_goal_fails_clearly_without_goal_set(self):
+        """A ``/goal`` past Codex's 4000-char cap never reaches thread/goal/set."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "x"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            events = []
+            async for event in session.run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "/goal " + "x" * 4001}],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                events.append(event)
+            await inject_task
+
+            self.assertEqual([type(event) for event in events], [ExecutorError])
+            message = events[0].message
+            # A clear client-side limit message, not the raw JSON-RPC payload.
+            self.assertIn("4000", message)
+            self.assertNotIn("-32600", message)
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertNotIn("thread/goal/set", methods)
 
         _run(_t())
 
@@ -1742,6 +1809,161 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_run_turn_new_reasoning_item_emits_started_marker(self):
+        """A reasoning delta with a new itemId marks a paragraph boundary and
+        must emit a reasoning_started marker between the items, so downstream
+        reducers flush the prior paragraph's tail and insert a separator
+        (instead of rendering "...folder names.I have the runner...")."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-1", "delta": "para one."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-1", "delta": " more of one."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-2", "delta": "para two."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "Answer.",
+                            },
+                        },
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "question"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            reasoning = [(e.event_type, e.delta) for e in events if isinstance(e, ReasoningChunk)]
+            # No marker before the first item or between same-item deltas;
+            # exactly one marker at the rs-1 -> rs-2 boundary.
+            self.assertEqual(
+                reasoning,
+                [
+                    ("reasoning_text", "para one."),
+                    ("reasoning_text", " more of one."),
+                    ("reasoning_started", ""),
+                    ("reasoning_text", "para two."),
+                ],
+            )
+
+        _run(_t())
+
+    def test_app_server_run_turn_summary_item_boundary_also_emits_marker(self):
+        """Reasoning text and summary deltas share the item-id tracker: a
+        summaryTextDelta arriving under a new itemId after a textDelta item is
+        a distinct reasoning item and must also emit the boundary marker, so
+        interleaved text/summary items don't render glued together."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-1", "delta": "thought."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/summaryTextDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-2", "delta": "summary."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "Answer.",
+                            },
+                        },
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "question"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            reasoning = [(e.event_type, e.delta) for e in events if isinstance(e, ReasoningChunk)]
+            self.assertEqual(
+                reasoning,
+                [
+                    ("reasoning_text", "thought."),
+                    ("reasoning_started", ""),
+                    ("reasoning_text", "summary."),
+                ],
+            )
+
+        _run(_t())
+
     def test_stderr_loop_handles_oversized_lines(self):
         async def _t():
             session = _CodexAppServerSession(
@@ -2499,6 +2721,29 @@ def test_populate_codex_skills_from_bundle_links_bundle_skills(tmp_path: Path) -
     assert (linked / "SKILL.md").is_file()
 
 
+def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Path) -> None:
+    """
+    ``source_codex_home`` reads host skills from the resolved ``$CODEX_HOME``.
+
+    Native Codex honors ``$CODEX_HOME``; its launch passes the resolved host
+    home here so the seeded skills match what the CLI loads. Without the
+    override the helper reads ``~/.codex`` (the wrapped executor's behavior),
+    so a host skill under a custom ``$CODEX_HOME`` is picked up only when the
+    override is supplied.
+    """
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+
+    custom_codex_home = tmp_path / "custom-codex"
+    _make_skill_dir(custom_codex_home / "skills", "host-skill")
+    codex_home = tmp_path / "codex_home"
+
+    populate_codex_skills_from_bundle(codex_home, None, "all", source_codex_home=custom_codex_home)
+
+    linked = codex_home / "skills" / "host-skill"
+    assert linked.is_symlink() or linked.is_dir()
+    assert (linked / "SKILL.md").is_file()
+
+
 def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) -> None:
     """
     ``skills_filter="none"`` produces no ``skills/`` dir even when the
@@ -3221,6 +3466,50 @@ def test_clean_codex_env_excludes_openai_api_key(monkeypatch) -> None:
     # Other OPENAI_* vars (retry/timeout knobs) must still pass through.
     assert env.get("OPENAI_MAX_RETRIES") == "3"
     assert env.get("OPENAI_TIMEOUT") == "60"
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [
+        (None, "launch_mode=omni"),
+        ("", "launch_mode=omni"),
+        (" , ", "launch_mode=omni"),
+        ("deployment=example,user=alice", "deployment=example,user=alice,launch_mode=omni"),
+        ("launch_mode=direct,user=alice", "user=alice,launch_mode=omni"),
+        ("user=alice,launch_mode=omni", "user=alice,launch_mode=omni"),
+        (
+            "launch_mode=direct,user=al%2Cice, launch_mode =other",
+            "user=al%2Cice,launch_mode=omni",
+        ),
+    ],
+)
+def test_clean_codex_env_tags_omni_launch(
+    monkeypatch: pytest.MonkeyPatch, inherited: str | None, expected: str
+) -> None:
+    if inherited is None:
+        monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
+    else:
+        monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", inherited)
+
+    env = _clean_codex_env()
+
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == expected
+    assert os.environ.get("OTEL_RESOURCE_ATTRIBUTES") == inherited
+
+
+def test_clean_codex_env_keeps_otel_exporter_settings_filtered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment=example")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer test-token")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example.com")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "Authorization=Bearer log-token")
+
+    env = _clean_codex_env()
+
+    assert {key: value for key, value in env.items() if key.startswith("OTEL_")} == {
+        "OTEL_RESOURCE_ATTRIBUTES": "deployment=example,launch_mode=omni"
+    }
 
 
 def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:

@@ -422,27 +422,60 @@ def test_download_file_saves_to_workspace(
 
 
 @pytest.mark.parametrize(
+    "destination",
+    [
+        "/root/.ssh/authorized_keys",
+        "../../etc/cron.d/x",
+    ],
+)
+def test_download_file_rejects_unsupported_destination(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+    destination: str,
+) -> None:
+    """
+    A removed ``destination`` argument is rejected before any write.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tool_ctx: Tool execution context.
+    :param destination: Absolute or traversing destination to reject.
+    """
+
+    def fail_on_write(path: Path, _data: bytes) -> int:
+        pytest.fail(f"unexpected write to {path}")
+
+    monkeypatch.setattr(Path, "write_bytes", fail_on_write)
+
+    tool = DownloadFileTool()
+    assert tool.get_schema()["function"]["parameters"]["additionalProperties"] is False
+    result = json.loads(
+        tool.invoke(
+            json.dumps({"file_id": "file_evil", "destination": destination}),
+            tool_ctx,
+        )
+    )
+
+    assert result == {"error": "unsupported argument(s): 'destination'"}
+
+
+@pytest.mark.parametrize(
     "malicious_filename",
     [
         "../escape.txt",
         "../../escape.txt",
-        "foo/../../bar.txt",
+        "../../etc/cron.d/x",
+        "nested/file.txt",
+        r"nested\file.txt",
         "/etc/passwd",
-        "/tmp/abs-escape.txt",
     ],
 )
-def test_download_file_confines_untrusted_filename_to_workspace(
+def test_download_file_rejects_path_bearing_store_filename(
     monkeypatch: pytest.MonkeyPatch,
     tool_ctx: ToolContext,
     malicious_filename: str,
 ) -> None:
     """
-    A malicious stored filename cannot write outside the workspace.
-
-    The stored filename is untrusted metadata (persisted verbatim from
-    whoever uploaded the file). Traversal sequences and absolute paths
-    must be reduced to a basename and confined to the workspace, never
-    escaping it.
+    A path-bearing stored filename is rejected before any write.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -469,60 +502,15 @@ def test_download_file_confines_untrusted_filename_to_workspace(
         lambda: _FakeArtifactStore({"file_evil": content}),
     )
 
+    def fail_on_write(path: Path, _data: bytes) -> int:
+        pytest.fail(f"unexpected write to {path}")
+
+    monkeypatch.setattr(Path, "write_bytes", fail_on_write)
+
     tool = DownloadFileTool()
     result = json.loads(tool.invoke('{"file_id": "file_evil"}', tool_ctx))
 
-    # The write must land strictly inside the workspace.
-    saved = Path(result["path"])
-    workspace = tool_ctx.workspace
-    assert workspace is not None
-    assert saved.resolve().is_relative_to(workspace.resolve())
-    # Nothing was written outside the workspace.
-    assert not Path("/etc/passwd").is_symlink()
-    assert saved.exists()
-    assert saved.read_bytes() == content
-
-
-def test_download_file_basenames_store_filename(
-    monkeypatch: pytest.MonkeyPatch,
-    tool_ctx: ToolContext,
-) -> None:
-    """
-    A filename with leading directory components is saved by basename.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tool_ctx: Tool execution context.
-    """
-    content = b"report-bytes"
-    monkeypatch.setattr(
-        "omnigent.runtime.get_file_store",
-        lambda: _FakeFileStore(
-            [
-                _FakeFile(
-                    "file_nested",
-                    "reports/2026/q2.csv",
-                    len(content),
-                    "text/csv",
-                    1000,
-                    session_id="conv_alice",
-                ),
-            ]
-        ),
-    )
-    monkeypatch.setattr(
-        "omnigent.runtime.get_artifact_store",
-        lambda: _FakeArtifactStore({"file_nested": content}),
-    )
-
-    tool = DownloadFileTool()
-    result = json.loads(tool.invoke('{"file_id": "file_nested"}', tool_ctx))
-
-    saved = Path(result["path"])
-    workspace = tool_ctx.workspace
-    assert workspace is not None
-    assert saved.name == "q2.csv"
-    assert saved.parent.resolve() == workspace.resolve()
-    assert saved.read_bytes() == content
+    assert result == {"error": "Stored filename must be a single path component."}
 
 
 def test_download_file_not_found(

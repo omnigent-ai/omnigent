@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -17,9 +18,11 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
+    HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostImportLocalSessionFrame,
@@ -45,8 +48,10 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    classify_launch_refusal,
     decode_host_frame,
     encode_host_frame,
+    workspace_missing_message,
 )
 
 
@@ -56,6 +61,21 @@ def test_import_local_frames_round_trip() -> None:
         encode_host_frame(HostImportLocalFrame(request_id="req_imp", source="claude", limit=3))
     )
     assert request == HostImportLocalFrame(request_id="req_imp", source="claude", limit=3)
+
+    exact_request = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalByIdFrame(
+                request_id="req_exact",
+                source="codex",
+                session_id="0198d07d-session",
+            )
+        )
+    )
+    assert exact_request == HostImportLocalByIdFrame(
+        request_id="req_exact",
+        source="codex",
+        session_id="0198d07d-session",
+    )
 
     session = decode_host_frame(
         encode_host_frame(
@@ -213,6 +233,7 @@ def test_hello_frame_round_trip() -> None:
         frame_protocol_version=1,
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
+        interactive_shells=["zsh", "bash"],
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -220,6 +241,23 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
+    assert decoded.interactive_shells == ["zsh", "bash"]
+
+
+def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
+    """An older host hello leaves its shell inventory unknown."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "old-host",
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.interactive_shells is None
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -293,12 +331,14 @@ def test_launch_runner_result_frame_failure_round_trip() -> None:
         request_id="req_001",
         status="failed",
         error="workspace path does not exist",
+        error_code=WORKSPACE_MISSING_ERROR_CODE,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerResultFrame)
     assert decoded.status == "failed"
     assert decoded.runner_id is None
     assert decoded.error == "workspace path does not exist"
+    assert decoded.error_code == WORKSPACE_MISSING_ERROR_CODE
 
 
 def test_hello_frame_configured_harnesses_round_trip() -> None:
@@ -1068,6 +1108,39 @@ def test_create_worktree_frame_optional_base_defaults_none() -> None:
     assert decoded.base_branch is None
 
 
+def test_create_worktree_frame_existing_branch_round_trip() -> None:
+    """Verify existing_branch=True survives encode → decode.
+
+    A dropped flag would make the host try to CREATE the branch (with
+    ``-b``), which fails because it already exists — the deleted-worktree
+    recreate would break.
+    """
+    original = HostCreateWorktreeFrame(
+        request_id="req_wt_3",
+        repo_path="/repo",
+        branch_name="fix-1",
+        existing_branch=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is True
+    assert decoded == original
+
+
+def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
+    """A frame from an older server (no existing_branch key) decodes as False."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_4", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("existing_branch", None)
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is False
+
+
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
@@ -1565,6 +1638,34 @@ def test_fs_request_non_object_params_raises() -> None:
         )
 
 
+def test_fs_write_round_trip() -> None:
+    """A host.fs_write_request round-trips op, workspace, session, and params.
+
+    The write frame carries the GitHub preference selection to the host when the
+    runner is offline; a dropped ``params`` would apply an empty selection.
+    """
+    original = HostFsWriteFrame(
+        request_id="req_fsw_1",
+        op="github_set_preference",
+        workspace="/Users/corey/project",
+        session_id="conv_abc123",
+        params={"account": "octocat", "remote": "origin"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsWriteFrame)
+    assert decoded == original
+
+
+def test_fs_write_non_object_params_raises() -> None:
+    """A non-object ``params`` on a write frame is rejected, like the read frame."""
+    with pytest.raises(ValueError, match="must be a JSON object: 'params'"):
+        decode_host_frame(
+            '{"kind": "host.fs_write_request", "request_id": "r", '
+            '"op": "github_set_preference", "workspace": "/w", "session_id": "s", '
+            '"params": []}'
+        )
+
+
 def test_fs_result_success_round_trip() -> None:
     """
     Verify a successful fs result round-trips with the payload intact.
@@ -1615,3 +1716,32 @@ def test_fs_result_null_payload_round_trip() -> None:
     assert isinstance(decoded, HostFsResultFrame)
     assert decoded.payload is None
     assert decoded.error_status == 500
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error", "expected"),
+    [
+        (HARNESS_NOT_CONFIGURED_ERROR_CODE, "any text", HARNESS_NOT_CONFIGURED_ERROR_CODE),
+        (WORKSPACE_MISSING_ERROR_CODE, "any text", WORKSPACE_MISSING_ERROR_CODE),
+        # Rolling upgrade: an older host sends the reason with no code.
+        (None, "workspace path does not exist: /w", WORKSPACE_MISSING_ERROR_CODE),
+        # Uncategorized failures stay generic, however they are worded.
+        (None, "workspace path does not exist: /elsewhere", None),
+        (None, "runner exited with code 1", None),
+        (None, None, None),
+        ("some_future_code", "any text", None),
+    ],
+)
+def test_classify_launch_refusal(
+    error_code: str | None, error: str | None, expected: str | None
+) -> None:
+    """Only the two categorical refusals classify; everything else is generic."""
+    assert classify_launch_refusal(error_code, error, "/w") == expected
+
+
+def test_workspace_missing_message_is_the_host_spelling() -> None:
+    """Producer and consumer share one spelling so the compat match holds."""
+    assert workspace_missing_message("/w") == "workspace path does not exist: /w"
+    assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
+        WORKSPACE_MISSING_ERROR_CODE
+    )

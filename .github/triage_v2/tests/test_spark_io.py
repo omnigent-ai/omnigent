@@ -88,8 +88,9 @@ def test_classification_schema_handles_empty_arrays() -> None:
 
     repository.upsert([classification])
 
-    assert spark.schemas[0].count("ARRAY<STRING>") == 2
+    assert spark.schemas[0].count("ARRAY<STRING>") == 3
     assert spark.rows[0][0]["issue_type"] == "Bug"
+    assert spark.rows[0][0]["evidence_kind"] == "none"
 
 
 def test_classification_repository_reads_and_updates_legacy_severity_schema() -> None:
@@ -132,7 +133,40 @@ def test_classification_repository_reads_and_updates_legacy_severity_schema() ->
     repository.upsert([loaded])
 
     assert loaded.impact == Impact.HIGH
+    assert loaded.content_hash == ""
     assert spark.rows[0][0]["severity"] == "S1"
+
+
+def test_current_unlabeled_classification_keeps_its_content_hash() -> None:
+    row = SimpleNamespace(
+        issue_number=1,
+        issue_type="Bug",
+        impact="high",
+        area_keys=[],
+        component_labels=[],
+        reasoning="Has logs",
+        content_hash="current-hash",
+        reported_type=None,
+        evidence_kind="diagnostic_evidence",
+        information_status="sufficient",
+        missing_information=[],
+    )
+
+    class Frame:
+        def collect(self):
+            return [row]
+
+    class Catalog:
+        def tableExists(self, table):
+            return True
+
+    spark = FakeSpark()
+    spark.catalog = Catalog()
+    spark.table = lambda table: Frame()
+
+    loaded = SparkClassificationRepository(spark, "main.team.classifications").load()[1]
+
+    assert loaded.content_hash == "current-hash"
 
 
 def test_score_sink_uses_schema_evolution() -> None:
@@ -167,12 +201,13 @@ def test_score_sink_uses_schema_evolution() -> None:
 
     sink.write(run)
 
-    assert spark.schemas[0].count("ARRAY<STRING>") == 5
+    assert spark.schemas[0].count("ARRAY<STRING>") == 6
     assert "upvote_count BIGINT" in spark.schemas[0]
     assert "duplicate_count BIGINT" in spark.schemas[0]
     assert "classification_reasoning STRING" in spark.schemas[0]
     assert spark.rows[0][0]["issue_type"] == "Feature"
     assert spark.rows[0][0]["classification_reasoning"] == "Useful but has a workaround."
+    assert spark.rows[0][0]["information_status"] == "not_applicable"
     assert spark.frames[0].write.options == {"mergeSchema": "true"}
     assert spark.statements[0].startswith("CREATE OR REPLACE VIEW main.team.scores_latest")
 

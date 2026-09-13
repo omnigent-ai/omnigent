@@ -55,9 +55,12 @@ from omnigent.server.schemas import (
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
     ServerStreamEvent,
+    SessionChildSessionUpdatedEvent,
+    SessionCreatedEvent,
     SessionStatusEvent,
 )
 
+from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._query import QueryResult, QueryStream
@@ -72,6 +75,9 @@ from ._tool_handler import (
     ResponseEndCtx,
     ResponseStartCtx,
     StreamHooks,
+    SubAgentCompletedCtx,
+    SubAgentInfo,
+    SubAgentSpawnedCtx,
     ToolCallEndCtx,
     ToolCallStartCtx,
 )
@@ -248,6 +254,13 @@ class _StreamHookState:
     reasoning_text: str = ""
     reasoning_summary_text: str = ""
     completed_tool_call_ids: set[str] = field(default_factory=set)
+    # Sub-agent lifecycle bookkeeping. Spawns are keyed on the discrete
+    # ``session.created`` event only — snapshot-on-connect child updates
+    # describe pre-existing children and must not re-fire the hook.
+    spawned_child_ids: set[str] = field(default_factory=set)
+    completed_child_ids: set[str] = field(default_factory=set)
+    child_agent_names: dict[str, str] = field(default_factory=dict)
+    child_previews: dict[str, str] = field(default_factory=dict)
 
 
 class SessionsChat:
@@ -900,6 +913,14 @@ class SessionsChat:
             await self._handle_elicitation_request(event, state)
             return
 
+        if isinstance(event, SessionCreatedEvent):
+            await self._fire_sub_agent_spawned(event, state)
+            return
+
+        if isinstance(event, SessionChildSessionUpdatedEvent):
+            await self._fire_sub_agent_completed_if_terminal(event, state)
+            return
+
         if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
             await self._end_reasoning_if_open(state)
             response = _response_from_server_object(event.response)
@@ -908,6 +929,91 @@ class SessionsChat:
                 self._hooks.on_response_end,
                 ResponseEndCtx(response=response, status=response.status),
             )
+
+    async def _fire_sub_agent_spawned(
+        self,
+        event: SessionCreatedEvent,
+        state: _StreamHookState,
+    ) -> None:
+        """
+        Fire ``on_sub_agent_spawned`` for a newly-created child session.
+
+        ``session.created`` is the discrete spawn signal on the parent's
+        stream (emitted once per child, live-only), so it fires the hook
+        exactly once per child; the id set guards against relays that
+        deliver the transient event more than once.
+        """
+        child_id = event.child_session_id
+        if not child_id or child_id in state.spawned_child_ids:
+            return
+        # Only announce children of THIS session: a relayed grandchild spawn
+        # would otherwise fire with the wrong parent_response_id.
+        parent_id = event.parent_session_id
+        if parent_id and parent_id != self._session.id:
+            return
+        state.spawned_child_ids.add(child_id)
+        agent_name = state.child_agent_names.get(child_id) or (event.agent_id or "")
+        await _call_hook(
+            self._hooks.on_sub_agent_spawned,
+            SubAgentSpawnedCtx(
+                parent_response_id=state.current_response_id,
+                sub_agents=[SubAgentInfo(response_id=child_id, agent_name=agent_name)],
+            ),
+        )
+
+    async def _fire_sub_agent_completed_if_terminal(
+        self,
+        event: SessionChildSessionUpdatedEvent,
+        state: _StreamHookState,
+    ) -> None:
+        """
+        Fire ``on_sub_agent_completed`` when a child reaches a terminal state.
+
+        ``session.child_session.updated`` carries partial child summaries
+        (status deltas, preview deltas, and snapshot-on-connect rows). The
+        hook fires only for children whose spawn this stream observed —
+        keeping spawn/complete callbacks paired and never re-announcing
+        pre-existing children from the connect snapshot — and only once,
+        on the first terminal (non-busy) status delta.
+
+        Spawn and completion must be observed by the same subscription:
+        ``stream()`` keeps one hook state for its whole lifetime, while each
+        ``send()`` turn starts fresh. A child that completes in a later
+        turn's continuation (e.g. an auto-wake) fires completion only for a
+        long-lived ``stream()`` consumer — the reliable path for adapters
+        that need paired spawn/complete spans.
+        """
+        child_id = event.child_session_id
+        if not child_id:
+            return
+        child = event.child if isinstance(event.child, dict) else {}
+        raw_name = child.get("tool") or child.get("agent_name")
+        if isinstance(raw_name, str) and raw_name:
+            state.child_agent_names[child_id] = raw_name
+        # Deltas are partial: a preview may arrive in a separate delta from
+        # the terminal status, so remember the last one seen per child.
+        raw_preview = child.get("last_message_preview")
+        if isinstance(raw_preview, str) and raw_preview:
+            state.child_previews[child_id] = raw_preview
+        if child_id not in state.spawned_child_ids or child_id in state.completed_child_ids:
+            return
+        status = child.get("current_task_status")
+        if not isinstance(status, str) or status not in TERMINAL_TASK_STATUSES:
+            return
+        # Shared busy predicate (web/CLI semantics): a terminal status with a
+        # still-set busy flag or pending elicitation has not settled yet.
+        if child_summary_busy(child):
+            return
+        state.completed_child_ids.add(child_id)
+        await _call_hook(
+            self._hooks.on_sub_agent_completed,
+            SubAgentCompletedCtx(
+                response_id=child_id,
+                agent_name=state.child_agent_names.get(child_id, ""),
+                status=status,
+                output_summary=state.child_previews.get(child_id),
+            ),
+        )
 
     async def _ensure_response_started(
         self,

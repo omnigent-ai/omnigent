@@ -163,6 +163,9 @@ def scan_cwd_mask_entries(
     - the entry is a symlink whose resolved target lies outside every
       path in *safe_roots*.
 
+    The explicit ``"*"`` allowlist entry disables dotpath masking for
+    trusted roots. Escaping symlinks remain masked.
+
     Walker termination is deterministic:
 
     - ``follow_symlinks=False`` on the recursion check ensures
@@ -246,6 +249,7 @@ def scan_cwd_mask_entries(
         return entries
 
     allow = set(allow_hidden)
+    allow_all_hidden = "*" in allow
     safe_root_list = list(safe_roots)
     cap_enabled = overflow != "unlimited"
     logger = logging.getLogger(logger_name) if logger_name else _LOGGER
@@ -289,7 +293,7 @@ def scan_cwd_mask_entries(
 
             child_path = Path(child.path)
             should_mask = False
-            if child.name.startswith(".") and child.name not in allow:
+            if child.name.startswith(".") and not allow_all_hidden and child.name not in allow:
                 should_mask = True
             elif child.is_symlink():
                 resolved_target = child_path.resolve(strict=False)

@@ -1,12 +1,12 @@
 """Built-in tool: unified web search.
 
-Backend selection is fully determined by the agent spec:
+Backend selection is determined by the harness, not the model name:
 
-- **OpenAI model** → passthrough to OpenAI's native
-  ``web_search_preview`` (server-side, uses the LLM API key).
-- **Other models** → use the ``search_provider`` named in the spec. Both
-  keyless backends (no ``api_key``) and keyed ones (credentials for a
-  sturdier / higher-rate backend) are supported; the ``_BACKENDS`` registry
+- **OpenAI Responses-compatible harnesses** (``openai-agents`` / ``codex``) →
+  passthrough to OpenAI's native ``web_search_preview`` (server-side).
+- **Other harnesses** (``claude-sdk``, ``databricks-*``, etc.) → use the
+  ``search_provider`` named in the spec. Both keyless backends (no
+  ``api_key``) and keyed ones are supported; the ``_BACKENDS`` registry
   at the bottom of this module is the single source of truth for which
   engines exist. ``web_search`` never picks an engine for you — with no
   ``search_provider`` set it returns an error naming the options, so it is
@@ -15,12 +15,12 @@ Backend selection is fully determined by the agent spec:
 
 Usage in config.yaml::
 
-    # OpenAI model — web search is built-in, no config needed:
+    # OpenAI Responses-compatible harness — web search is built-in, no config needed:
     tools:
       builtins:
         - web_search
 
-    # Non-OpenAI model — name a search_provider (there is no default):
+    # Other harnesses — name a search_provider (there is no default):
     tools:
       builtins:
         - name: web_search
@@ -55,20 +55,18 @@ class _Backend:
 
 class WebSearchTool(Tool):
     """
-    Unified web search tool with backend determined by the agent spec.
+    Unified web search tool with backend determined by the harness.
 
-    When the agent uses an OpenAI model, this emits the native
-    ``web_search_preview`` passthrough schema. For other models, the
-    spec must set ``search_provider`` to one of the engines in the
-    ``_BACKENDS`` registry (some keyless, some needing credentials) —
-    there is no default and no env var fallback, so the spec is
-    self-contained and the engine used is explicit.
+    On OpenAI Responses-compatible harnesses (``openai-agents`` / ``codex``),
+    this emits the native ``web_search_preview`` passthrough schema. On other
+    harnesses the spec must set ``search_provider`` to one of the engines in
+    the ``_BACKENDS`` registry — there is no default and no env var fallback.
 
     :param config: Spec-level config from config.yaml, e.g.
         ``{"search_provider": "perplexity", "api_key": "pplx-..."}``.
-    :param llm_provider: The LLM provider name extracted from
-        the model string, e.g. ``"openai"`` or ``"anthropic"``.
-        When ``None``, falls back to function-tool mode.
+    :param llm_provider: Provider string returned by
+        :func:`~omnigent.llms.routing.web_search_native_passthrough_provider`;
+        ``None`` means function-tool mode (non-OpenAI harness).
     """
 
     def __init__(

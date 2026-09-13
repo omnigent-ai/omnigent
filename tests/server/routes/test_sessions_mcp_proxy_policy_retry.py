@@ -578,6 +578,81 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
         _pending_policy_ask_writes.pop(eid, None)
 
 
+@pytest.mark.asyncio
+async def test_duplicate_accept_verdicts_apply_relay_writes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent duplicate accept verdicts must apply writes exactly once.
+
+    A client transport retry of the resolve POST can race its original
+    request (the retry fires while the first is still executing
+    server-side). Both handlers see the stashed entry unless it is
+    claimed atomically before the first ``await`` — and a double apply
+    re-runs non-idempotent ops (e.g. INCREMENT state updates for
+    cost-budget counters).
+    """
+    import asyncio
+
+    from omnigent.server.routes.sessions import _apply_pending_policy_ask_writes
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    eid = "elicit_DUPLICATE_verdicts"
+    _pending_policy_ask_writes[eid] = _PendingPolicyAskWrites(
+        state_updates=[
+            StateUpdate(key="budget.checkpoint", action=StateUpdateAction.INCREMENT, value=1)
+        ],
+        set_labels=None,
+        from_mcp=False,
+    )
+
+    applied: list[list[Any]] = []
+
+    @dataclass
+    class _CountingEngine(_FixedPolicyEngine):
+        def apply_state_updates(self, updates: list[Any]) -> None:
+            applied.append(updates)
+
+    engine = _CountingEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _engine_factory_expecting_preload(engine),
+    )
+
+    conv = _make_conversation()
+    store = _StubConversationStore(conv)
+    data = {"elicitation_id": eid, "action": "accept"}
+    try:
+        await asyncio.gather(
+            _apply_pending_policy_ask_writes(
+                session_id=_SESSION_ID,
+                conv=conv,
+                conversation_store=store,  # type: ignore[arg-type]
+                agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+                data=data,
+            ),
+            _apply_pending_policy_ask_writes(
+                session_id=_SESSION_ID,
+                conv=conv,
+                conversation_store=store,  # type: ignore[arg-type]
+                agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+                data=data,
+            ),
+        )
+        assert len(applied) == 1, (
+            f"stashed relay writes applied {len(applied)} times for duplicate "
+            "verdicts — non-idempotent ops (INCREMENT counters) double-apply."
+        )
+        assert eid not in _pending_policy_ask_writes
+    finally:
+        _pending_policy_ask_writes.pop(eid, None)
+
+
 # ---------------------------------------------------------------------------
 # Actor threading tests
 # ---------------------------------------------------------------------------

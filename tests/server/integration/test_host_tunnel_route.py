@@ -688,6 +688,47 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
+async def test_malformed_host_id_refused_with_400_before_accept(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A non-UUID host_id is refused with HTTP 400 + body, not a bare close.
+
+    Regression for the customer case where a host dialed in with a
+    human-readable id (``superagent-databricks-host``). A pre-accept bare
+    close reaches the client as an opaque 403 with an empty body,
+    indistinguishable from an auth failure; a 400 denial response naming
+    the cause lets the host surface an actionable error.
+    """
+    app, registry, _store = host_app
+    scope = _websocket_scope("/v1/hosts/superagent-databricks-host/tunnel")
+    # Advertise the denial-response extension, as uvicorn does in prod.
+    scope["extensions"] = {"websocket.http.response": {}}
+    comm = ApplicationCommunicator(app, scope)
+    await comm.send_input({"type": "websocket.connect"})
+
+    start = await comm.receive_output(timeout=1.0)
+    assert start["type"] == "websocket.http.response.start"
+    assert start["status"] == 400
+    body = await comm.receive_output(timeout=1.0)
+    assert body["type"] == "websocket.http.response.body"
+    assert b"UUID" in body["body"]
+    assert registry.get("superagent-databricks-host") is None
+
+
+async def test_malformed_host_id_refused_with_close_when_no_denial_extension(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Without the denial-response extension, the refusal falls back to a close."""
+    app, registry, _store = host_app
+    comm = ApplicationCommunicator(app, _websocket_scope("/v1/hosts/not-a-uuid/tunnel"))
+    await comm.send_input({"type": "websocket.connect"})
+
+    closed = await comm.receive_output(timeout=1.0)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4009
+    assert registry.get("not-a-uuid") is None
+
+
 # ── Managed-host launch-token auth ──────────────────────────
 
 
@@ -760,6 +801,40 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.status == "online"
     # The managed binding survives the connect upsert.
     assert host.sandbox_id == "sb-tunnel-1"
+
+
+async def test_managed_token_is_revalidated_after_websocket_accept(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Detaching after handshake auth still blocks final host registration."""
+    app, registry, store = host_app
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-race")
+    registered = store.get_host(_HOST_ID)
+    assert registered is not None
+
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-race"))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=1.0)
+    assert accepted["type"] == "websocket.accept"
+
+    assert store.detach_stale_managed_sandbox(
+        _HOST_ID,
+        sandbox_id="sb-tunnel-1",
+        expected_updated_at=registered.updated_at,
+    )
+    await communicator.send_input(
+        {"type": "websocket.receive", "text": _make_hello(name=f"managed-{_HOST_ID}")},
+    )
+    response = await communicator.receive_output(timeout=1.0)
+    if response["type"] == "websocket.send":
+        response = await communicator.receive_output(timeout=1.0)
+    assert response["type"] == "websocket.close"
+    assert registry.get(_HOST_ID) is None
+    detached = store.get_host(_HOST_ID)
+    assert detached is not None
+    assert detached.status == "offline"
+    assert detached.sandbox_id is None
+    assert detached.terminating_sandbox_id == "sb-tunnel-1"
 
 
 @pytest.mark.parametrize(

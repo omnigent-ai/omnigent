@@ -20,10 +20,13 @@ class SysSessionRenameTool(Tool):
     def description(cls) -> str:
         """Return the LLM-facing description."""
         return (
-            "Rename the current top-level session with a short summary-style title "
-            "(3-6 words, action-first). Strip filler and keep the noun plus verb. "
+            "Propose a concise title for the current top-level session. Include known "
+            "PR or issue numbers when relevant. The server applies the user's configured "
+            "title requirements, including date prefixes and formatting. Without custom "
+            "requirements, use 3-6 words, action-first. Strip filler. "
             "Never copy a conversational question or greeting verbatim. "
-            "The rename is ignored if the session title changed concurrently."
+            "The rename is silent and can be updated again as the work evolves. "
+            "Sub-agent sessions cannot rename themselves (returns not_top_level)."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -39,8 +42,9 @@ class SysSessionRenameTool(Tool):
                         "title": {
                             "type": "string",
                             "description": (
-                                "Short summary-style, action-first session title, for "
-                                "example 'Debug authentication timeout'."
+                                "Concise title proposal including relevant PR or issue numbers, "
+                                "for example 'Fix PR 123 authentication timeout'. The server "
+                                "may reformat it to match the user's title requirements."
                             ),
                             "minLength": 2,
                             "maxLength": DEFAULT_GENERATED_TITLE_MAX_CHARS,

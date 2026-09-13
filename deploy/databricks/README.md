@@ -138,7 +138,9 @@ The script builds wheels, archives the SPA as `dist/web-ui.tar.gz`, copies the
 wheels and the single UI archive into `src/`, regenerates `src/pyproject.toml`
 and `src/uv.lock`, runs `databricks bundle deploy --target prod`, runs
 `databricks bundle run omnigent --target prod`, and polls `/health`
-with backoff until 200.
+with backoff until 200. Use repeatable `--extension-wheel` arguments to install
+prebuilt Omnigent extension wheels alongside the server; `--skip-web-ui`
+remains API-only.
 
 Databricks Apps rejects any single source file over 10 MB. The SPA is
 therefore shipped as one `src/web-ui.tar.gz` archive instead of inside the
@@ -157,6 +159,9 @@ redeploy:
 ```bash
 --features usage_page,harness_install
 ```
+
+The Canvas page is off by default; include `canvas` in `--features` for the
+apps that should show it.
 
 See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
 inventory and rollback procedure.

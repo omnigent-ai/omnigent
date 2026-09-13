@@ -35,24 +35,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent import _native_forwarder_health as native_forwarder_health
-from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
-from omnigent.codex_model_vocabulary import (
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.models import model_catalog
+from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
 )
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
-from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
-from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
+from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
+from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -497,22 +498,48 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     codex signals back out of it, so those names have to survive the filter
     (see :data:`_CODEX_OMNIGENT_LAUNCH_ENV_VARS`).
 
+    Resource attributes retain deployment metadata and identify these launches
+    with ``launch_mode=omni``. Exporter endpoints and credentials remain filtered;
+    Codex's own telemetry configuration controls whether and where it exports.
+
     :returns: Filtered environment dict.
     """
-    return clean_agent_env(
+    env = clean_agent_env(
         allow_prefixes=("OPENAI_", "REQUESTS_", "CODEX_HOME"),
         allow_exact=(
             "PYTHONUTF8",
+            "OTEL_RESOURCE_ATTRIBUTES",
             "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
             "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+            # Service-principal M2M credentials, so a Databricks-gateway
+            # ``auth.command`` can mint an OAuth token from the SP on each
+            # refresh. Only DATABRICKS_BEARER survived before, forcing a
+            # pre-minted (expiring) token or an inlined secret; these let the
+            # standard client-credentials mint work on a non-interactive host.
+            # DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN are deliberately NOT
+            # here (they stay host secrets, gated behind env_passthrough).
+            "DATABRICKS_CLIENT_ID",
+            "DATABRICKS_CLIENT_SECRET",
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
+    resource_attributes = [
+        attribute
+        for attribute in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(",")
+        if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
+    ]
+    env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*resource_attributes, "launch_mode=omni"])
+    return env
 
 
-def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
+def codex_skill_sources(
+    bundle_dir: Path | None,
+    home: Path,
+    *,
+    codex_home: Path | None = None,
+) -> list[Path]:
     """
     Build the ordered Codex skill-source list: bundle skills, then host skills.
 
@@ -521,18 +548,24 @@ def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
     ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
     provider — so the linked set and the menu cannot drift on which roots
     are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    host-installed ``<home>/.codex/skills/`` (a bundled skill shadows a host
-    skill of the same name). Only existing directories are returned.
+    the host-installed skills dir (a bundled skill shadows a host skill of
+    the same name). Only existing directories are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
-        tests and the menu provider can pin it.
+        tests and the menu provider can pin it. The host skills dir defaults
+        to ``<home>/.codex/skills``.
+    :param codex_home: When set, the resolved Codex home whose ``skills/`` is
+        the host source instead of ``<home>/.codex/skills``. Codex honors
+        ``$CODEX_HOME`` for its config, so the native launch passes the
+        resolved home here to keep the seeded skills and the menu in step with
+        the CLI's own ``$CODEX_HOME``.
     :returns: Existing skill-dir roots in priority order.
     """
     sources: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
         sources.append(bundle_dir / "skills")
-    host = home / ".codex" / "skills"
+    host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
     return sources
@@ -662,6 +695,8 @@ def populate_codex_skills_from_bundle(
     codex_home: Path,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    *,
+    source_codex_home: Path | None = None,
 ) -> None:
     """
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
@@ -669,10 +704,9 @@ def populate_codex_skills_from_bundle(
     Shared by the wrapped ``codex`` executor and the ``codex-native``
     launch path so both expose the same skill surface. Builds the source
     list in priority order — the agent's own ``<bundle>/skills/`` before
-    host-installed ``~/.codex/skills/`` (so a bundled skill shadows a
-    host skill of the same name) — and delegates to
-    :func:`_populate_codex_skills`, which honours ``skills_filter``
-    (``"all"`` / ``"none"`` / list of names).
+    the host skills dir (so a bundled skill shadows a host skill of the same
+    name) — and delegates to :func:`_populate_codex_skills`, which honours
+    ``skills_filter`` (``"all"`` / ``"none"`` / list of names).
 
     :param codex_home: The CODEX_HOME whose ``skills/`` subdir Codex
         scans, e.g. a per-conversation temp dir or the per-bridge native
@@ -683,9 +717,13 @@ def populate_codex_skills_from_bundle(
         first (highest-priority) source when present.
     :param skills_filter: The spec's ``skills_filter``: ``"all"`` /
         ``"none"`` / a list of skill names.
+    :param source_codex_home: When set, the resolved host Codex home to read
+        skills from instead of ``~/.codex``. The native launch passes the
+        ``$CODEX_HOME``-resolved home so the seeded skills match what the CLI
+        loads; the wrapped executor omits it and keeps ``~/.codex``.
     :returns: None.
     """
-    skill_sources = codex_skill_sources(bundle_dir, Path.home())
+    skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
     _populate_codex_skills(codex_home / "skills", skills_filter, skill_sources)
 
 
@@ -2394,7 +2432,7 @@ class _CodexAppServerSession:
                 # App-server threads run persisted-trusted hooks only, so the
                 # routing hooks need the trust handshake to be enforced.
                 # Imported here: the app-server module imports this one.
-                from omnigent.codex_native_app_server import trust_codex_router_hooks
+                from omnigent.harnesses.codex_native.app_server import trust_codex_router_hooks
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
@@ -2606,6 +2644,13 @@ class _CodexAppServerSession:
         assert self.thread_id is not None
         latest_user_content = _extract_latest_user_content(messages)
         goal_objective = _goal_objective_from_content(latest_user_content)
+        if goal_objective is not None:
+            # Reject over-long objectives here so the app-server's raw
+            # JSON-RPC -32600 error never reaches the user.
+            length_error = _goal_objective_length_error(goal_objective)
+            if length_error is not None:
+                yield ExecutorError(message=length_error)
+                return
         prompt_messages = messages
         if goal_objective is not None:
             await self._request(
@@ -2690,6 +2735,7 @@ class _CodexAppServerSession:
                 break
 
         message_buffers: dict[str, str] = {}
+        last_reasoning_item_id: str | None = None
         pending_tool_results: dict[str, _PendingToolResult] = {}
         observed_builtin_tool_ids: set[str] = set()
         completed_builtin_tool_ids: set[str] = set()
@@ -2899,6 +2945,18 @@ class _CodexAppServerSession:
                     raw_reasoning_delta = params.get("delta")
                     if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
                         continue
+                    # Each reasoning paragraph streams as its own item, so a
+                    # new itemId marks a paragraph boundary. Surface it as a
+                    # reasoning_started marker: downstream reducers flush the
+                    # prior paragraph's held tail and insert a separator.
+                    raw_reasoning_item_id = params.get("itemId")
+                    if isinstance(raw_reasoning_item_id, str) and raw_reasoning_item_id:
+                        if (
+                            last_reasoning_item_id is not None
+                            and raw_reasoning_item_id != last_reasoning_item_id
+                        ):
+                            yield ReasoningChunk(delta="", event_type="reasoning_started")
+                        last_reasoning_item_id = raw_reasoning_item_id
                     yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
                     continue
 

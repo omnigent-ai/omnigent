@@ -55,11 +55,26 @@ export function buildHostFilesystemUrl(hostId: string, absolutePath: string): st
   if (absolutePath === "") {
     return base;
   }
+  if (absolutePath === "/") {
+    // Browsing exactly "/" must hit /filesystem/ (with trailing
+    // slash) to match the {path:path} route. Without the trailing
+    // slash we'd hit the no-path route which forwards ~ instead.
+    return `${base}/`;
+  }
+  // Windows drive and UNC paths are already absolute. Encode each
+  // segment after normalizing backslashes so FastAPI captures
+  // ``C:/Users/me`` (not ``/C:/Users/me``).
+  if (/^[A-Za-z]:[\\/]/.test(absolutePath) || absolutePath.startsWith("\\\\")) {
+    const normalized = absolutePath.replace(/\\/g, "/");
+    const encoded = normalized
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    return `${base}/${encoded}`;
+  }
   // Strip the single leading slash; the route handler re-adds it.
   const stripped = absolutePath.startsWith("/") ? absolutePath.slice(1) : absolutePath;
   if (stripped === "") {
-    // The user navigated to "/" exactly. Keep a trailing slash so
-    // the route still matches /filesystem/{path:path}.
     return `${base}/`;
   }
   const encoded = stripped
@@ -276,6 +291,25 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
     detail = null;
   }
   return detail ?? `Couldn't verify the working directory (HTTP ${res.status}).`;
+}
+
+/**
+ * Whether a host path is 404-missing, as opposed to every other pre-flight
+ * problem (exists-but-unlistable, host offline, network error).
+ *
+ * The fork dialog uses this to distinguish "the source's worktree directory
+ * was deleted — recreatable at the same path/branch" from problems where
+ * falling back to worktree creation would be wrong.
+ */
+export async function hostDirectoryMissing(hostId: string, path: string): Promise<boolean> {
+  const baseUrl = buildHostFilesystemUrl(hostId, path);
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  try {
+    const res = await authenticatedFetch(`${baseUrl}${sep}limit=1`);
+    return res.status === 404;
+  } catch {
+    return false;
+  }
 }
 
 /** Shape returned by ``POST /v1/hosts/{id}/directories``. */

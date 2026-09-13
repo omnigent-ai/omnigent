@@ -52,8 +52,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
 
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 from .datamodel import OSEnvSpec
 from .executor import (
@@ -459,7 +459,7 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     # Write a wrapper script that sets env vars and execs the hook. It bakes a
     # one-shot auth token + workspace-routing header, so it is owner-only
     # (0o700) — the secret is never world-readable.
-    from omnigent.native_policy_hook import policy_hook_wrapper_script
+    from omnigent.native.native_policy_hook import policy_hook_wrapper_script
 
     wrapper = hooks_dir / "omnigent-hook.sh"
     wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))

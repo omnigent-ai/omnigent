@@ -1728,7 +1728,7 @@ def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
             return_value=_fake_evaluate_response("POLICY_ACTION_ALLOW"),
         ),
     ):
@@ -1755,7 +1755,7 @@ def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
             return_value=_fake_evaluate_response("POLICY_ACTION_DENY", "dangerous command"),
         ),
     ):
@@ -1784,7 +1784,7 @@ def test_cursor_policy_hook_network_error_fails_closed(monkeypatch: pytest.Monke
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
             return_value=(None, "connection error: simulated"),
         ),
     ):
@@ -1819,7 +1819,7 @@ def test_cursor_policy_hook_malformed_fails_closed(monkeypatch: pytest.MonkeyPat
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
             return_value=(resp, None),
         ),
     ):
@@ -1869,7 +1869,7 @@ def test_cursor_policy_hook_ask_fails_closed(monkeypatch: pytest.MonkeyPatch) ->
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
             return_value=_fake_evaluate_response("POLICY_ACTION_ASK", "needs approval"),
         ),
     ):
@@ -1897,7 +1897,7 @@ def test_cursor_policy_hook_uses_long_read_timeout(monkeypatch: pytest.MonkeyPat
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("omnigent.native_policy_hook.post_evaluate_with_retry", mock_fn),
+        patch("omnigent.native.native_policy_hook.post_evaluate_with_retry", mock_fn),
     ):
         cursor_policy_hook.main()
 

@@ -430,3 +430,44 @@ async def test_create_failure_rolls_back_omnigent_created_worktree(
     assert len(cap.remove) == 1, f"expected a create-rollback remove frame, got {cap.remove}"
     assert cap.remove[0].branch == "feature/orphan"
     assert cap.remove[0].delete_branch is True
+
+
+async def test_create_failure_rollback_preserves_existing_branch(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create-rollback of an ``existing_branch`` recreate keeps the branch.
+
+    The deleted-worktree recreate path checks out a branch that predates
+    the request (it may carry unpushed commits). When persistence fails
+    after the worktree was recreated, rollback still removes the
+    directory but must NOT ``git branch -D`` the user's branch.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    cap = register_worktree_host()
+    agent = await create_test_agent(client, name="wt-existing-branch-rollback-agent")
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("simulated create_conversation failure")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated create_conversation failure"):
+        await _create_git_session(
+            client,
+            agent["id"],
+            {"branch_name": "feature/kept", "existing_branch": True},
+        )
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].existing_branch is True
+    assert len(cap.remove) == 1, f"expected a create-rollback remove frame, got {cap.remove}"
+    assert cap.remove[0].branch == "feature/kept"
+    assert cap.remove[0].delete_branch is False, (
+        "rollback of an existing-branch recreate must preserve the user's "
+        "pre-existing branch (unpushed commits would be lost)"
+    )

@@ -12,10 +12,12 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -180,6 +182,7 @@ def register_permissions_routes(
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
+        add_audit_attrs(target_user_id=body.user_id, level=body.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -274,6 +277,7 @@ def register_permissions_routes(
         # The leaver's own tab drops the row via the client mutation's success
         # handler; their other tabs converge on the next watch-set diff, which
         # reports the now-inaccessible id as removed. No extra push needed.
+        add_audit_attrs(target_user_id=target_user_id, left_self=leaving_self)
         return Response(status_code=204)
 
     @router.get(
@@ -368,7 +372,12 @@ def _policy_description(spec: PolicySpec) -> str | None:
     return None
 
 
-def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
+def _to_agent_object(
+    agent: Agent,
+    cache: AgentCache | None,
+    *,
+    terminals_override: list[str] | None = None,
+) -> AgentObject:
     """
     Convert a runtime :class:`Agent` entity to an API-layer
     :class:`AgentObject`.
@@ -382,6 +391,8 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
 
     :param agent: The runtime agent entity.
     :param cache: Agent cache, or ``None`` in test setups.
+    :param terminals_override: Selected host's shell inventory. Applied only
+        when the loaded spec is a recognized native wrapper.
     :returns: An :class:`AgentObject` for the API response.
     """
     mcp_servers: list[MCPServerSummary] = []
@@ -406,7 +417,12 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
                 description = loaded.spec.description
             # Declared terminal names, in spec order — the Web UI
             # gates its "new terminal" affordance on this list.
-            terminals = list(loaded.spec.terminals or {})
+            terminals = (
+                list(terminals_override)
+                if terminals_override is not None
+                and native_coding_agent_for_agent_name(loaded.spec.name) is not None
+                else list(loaded.spec.terminals or {})
+            )
             # Bundled skills only (mirrors GET /v1/agents); the merged
             # bundled + host-discovered set lives on the session snapshot.
             skills = [

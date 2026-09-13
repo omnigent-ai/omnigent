@@ -260,8 +260,8 @@ def register_native_commands(cli: click.Group) -> None:
             choice.conversation_id if choice.conversation_id is not None else session_id
         )
 
-        from omnigent.claude_native import run_claude_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.claude_native.main import run_claude_native
 
         startup_profiler.mark("native module imported")
 
@@ -278,7 +278,12 @@ def register_native_commands(cli: click.Group) -> None:
             explicit=claude_command,
             cfg=cfg,
         )
-        extra_args = _resolve_harness_startup_args(cfg, "claude-native", claude_args)
+        # The daemon runner is the single merge point for harness.<id>.args on
+        # the native claude/codex terminal (_auto_create_*_terminal resolves
+        # them), and every CLI launch here reaches that daemon path. Persist the
+        # RAW pass-through so the runner merge is not stacked on top of a
+        # CLI-merged prefix — that doubled the wrapper (e.g. `isaac -- -- …`).
+        extra_args = claude_args
         if smart_routing:
             # Arming creates the session (that is where Smart Routing is turned
             # on and the decision card lands), so attach to it instead of
@@ -398,8 +403,8 @@ def register_native_commands(cli: click.Group) -> None:
                 or session_id is not None
             )
 
-        from omnigent.codex_native import run_codex_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.codex_native.main import run_codex_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -434,7 +439,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            extra_args=_resolve_harness_startup_args(cfg, "codex-native", codex_args),
+            extra_args=codex_args,  # raw; runner is the sole arg-merge point (see claude)
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -506,7 +511,7 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent opencode --resume                  # interactive picker
           omnigent opencode --server https://<app>.databricksapps.com
         """
-        from omnigent.opencode_native import run_opencode_native
+        from omnigent.harnesses.opencode_native.main import run_opencode_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -605,7 +610,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.pi_native import run_pi_native
+        from omnigent.harnesses.pi_native.main import run_pi_native
 
         cfg = _load_effective_config()
         # Thread ``harness.pi-native.command`` config into the runner via the
@@ -716,8 +721,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.cursor_native import run_cursor_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.cursor_native.main import run_cursor_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.cursor-native.command`` config into the
@@ -842,7 +847,7 @@ def register_native_commands(cli: click.Group) -> None:
         _reject_reserved_kiro_resume_args(kiro_args)
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.kiro_native import run_kiro_native
+        from omnigent.harnesses.kiro_native.main import run_kiro_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.kiro-native.command`` config into the
@@ -939,8 +944,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.goose_native import run_goose_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.goose_native.main import run_goose_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.goose-native.command`` config into the
@@ -1027,7 +1032,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.hermes_native import run_hermes_native
+        from omnigent.harnesses.hermes_native.main import run_hermes_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.hermes-native.command`` config into the
@@ -1118,8 +1123,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.antigravity_native import run_antigravity_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.antigravity_native.main import run_antigravity_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -1218,7 +1223,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.qwen_native import run_qwen_native
+        from omnigent.harnesses.qwen_native.main import run_qwen_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.qwen-native.command`` config into the
@@ -1314,7 +1319,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.kimi_native import run_kimi_native
+        from omnigent.harnesses.kimi_native.main import run_kimi_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.kimi-native.command`` config into the

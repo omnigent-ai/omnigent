@@ -155,6 +155,12 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields an ExecutorError carrying observed usage."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "error_with_usage")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -401,6 +407,41 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_executor_error_usage_reaches_response_failed(
+    use_error_with_usage: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """An ExecutorError's observed usage rides on the response.failed event.
+
+    A turn that fails after the model call started has already observed its
+    prompt size. The adapter must stash that usage on the turn context so the
+    scaffold's terminal ``response.failed`` carries it — otherwise the web
+    client's context-occupancy ring freezes at the previous successful turn's
+    value exactly when the session is in trouble.
+
+    Regression guard: pre-fix the adapter dropped ``ExecutorError.usage``
+    and the failed response carried ``usage: null``.
+    """
+    conv_id = "conv_err_usage"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    usage = events[-1].data["response"]["usage"]
+    assert usage is not None
+    # context_tokens is the window-fill figure the ring renders from.
+    assert usage["context_tokens"] == 100_000
+    assert usage["input_tokens"] == 400
+    # The failure is still a failure — the error detail must not be
+    # displaced by the usage payload.
+    assert events[-1].data["response"]["error"] is not None
 
 
 async def test_turn_cancelled_terminates_with_response_cancelled(
@@ -985,6 +1026,8 @@ class _RecordingTurnContext:
 
     Only the surface the adapter touches is implemented.
     """
+
+    session_id = None
 
     def __init__(self, response_id: str = "resp_xyz") -> None:
         """Initialize recording state.
@@ -2476,3 +2519,54 @@ def test_interrupt_slice_covers_pi_rpc_session_close_reap_budget() -> None:
         "outer slice fires first, injects CancelledError (not TimeoutError) "
         "into close(), SIGKILL fallback is skipped, Pi subprocess orphaned."
     )
+
+
+def test_observer_records_raw_output_in_omnigent_session(tmp_path, monkeypatch) -> None:
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runner.session_prs import SessionPrRegistry
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    adapter = ExecutorAdapter(executor_factory=_StubExecutor)
+    ctx = _RecordingTurnContext(response_id="resp_pr")
+    url = "https://github.com/example/sdk/pull/42"
+    ctx.session_id = "conv_sdk"
+    adapter._translate_event(
+        ToolCallRequest(
+            name="mcp__custom__create_pull_request", args={}, metadata={"call_id": "pr1"}
+        ),
+        ctx,
+    )
+    adapter._translate_event(
+        ToolCallComplete(
+            name="mcp__custom__create_pull_request",
+            status=ToolCallStatus.SUCCESS,
+            result={"html_url": url},
+            metadata={"call_id": "pr1"},
+        ),
+        ctx,
+    )
+    assert [entry.url for entry in SessionPrRegistry("conv_sdk").list()] == [url]
+    assert SessionPrRegistry("resp_pr").list() == []
+
+
+async def test_subprocess_tracking_uses_validated_session_without_telemetry(
+    manager: HarnessProcessManager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "pr_tracking")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "0")
+    conv_id = "conv_pr_process"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        events = [event async for event in _stream_iter(response)]
+    assert events[-1].event == "response.completed"
+    assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
+        "https://github.com/example/sdk/pull/42"
+    ]

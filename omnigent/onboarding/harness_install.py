@@ -52,11 +52,11 @@ from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
-from omnigent.opencode_native_client import (
+from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -737,7 +737,7 @@ def _parse_harness_cli_version(text: str) -> str | None:
     """Extract a semver-ish string from ``<binary> --version`` output.
 
     Mirrors the OpenCode-specific parser in
-    :func:`omnigent.opencode_native_app_server.parse_opencode_version` but is
+    :func:`omnigent.harnesses.opencode_native.app_server.parse_opencode_version` but is
     kept generic so any harness can declare a version range in its install spec.
     Date-shaped versions (e.g. Cursor's ``2026.06.22`` or
     ``2026.06.19-20-24-33-653a7fb``) are normalized to ``YYYY.MM.DD``.

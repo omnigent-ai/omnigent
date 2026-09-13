@@ -26,12 +26,12 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
-from omnigent import model_catalog
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
-from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
+from omnigent.models import model_catalog
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
 
 from .async_utils import run_sync_on_thread
 from .executor import (

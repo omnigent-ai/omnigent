@@ -8,29 +8,55 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  apiErrorFromResponse,
   approve,
   bindOnlyOnlineRunner,
+  createBundledSession,
   createSession,
   fetchSessionItemsPage,
   forkSession,
   getSession,
   getSessionSlim,
+  importLocalSessions,
   interrupt,
   listRunners,
   openSessionStream,
   postEvent,
+  retryRateLimitedTurn,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
 } from "./sessionsApi";
+import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 
-function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
+function mockJsonResponse(
+  body: unknown,
+  init?: { ok?: boolean; status?: number; statusText?: string },
+): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
-    statusText: "OK",
+    statusText: init?.statusText ?? "OK",
     json: async () => body,
   } as unknown as Response;
+}
+
+// An NDJSON streaming response: each line is emitted as its own chunk so the
+// reader sees them arrive one at a time, matching the `/imports/local` stream.
+function mockNdjsonResponse(lines: string[]): Response {
+  const encoder = new TextEncoder();
+  let i = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (i < lines.length) {
+        controller.enqueue(encoder.encode(lines[i] + "\n"));
+        i += 1;
+      } else {
+        controller.close();
+      }
+    },
+  });
+  return { ok: true, status: 200, statusText: "OK", body } as unknown as Response;
 }
 
 const fetchMock = vi.fn();
@@ -38,10 +64,49 @@ const fetchMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
+  localStorage.clear();
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  localStorage.clear();
+});
+
+describe("apiErrorFromResponse", () => {
+  it("reads the AP `error` envelope (message + code)", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { error: { code: "conflict", message: "Session is busy." } },
+        { ok: false, status: 409 },
+      ),
+    );
+    expect(err.message).toBe("Session is busy.");
+    expect(err.code).toBe("conflict");
+    expect(err.status).toBe(409);
+  });
+
+  it("reads a top-level error envelope (error_code + message), as storage backends send", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        {
+          error_code: "INVALID_PARAMETER_VALUE",
+          message: "Workspace items cannot contain the '/' character",
+        },
+        { ok: false, status: 400 },
+      ),
+    );
+    expect(err.message).toBe("Workspace items cannot contain the '/' character");
+    expect(err.code).toBe("INVALID_PARAMETER_VALUE");
+    expect(err.status).toBe(400);
+  });
+
+  it("falls back to the status line when the body is not an error shape", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse({}, { ok: false, status: 404, statusText: "Not Found" }),
+    );
+    expect(err.message).toBe("404 Not Found");
+    expect(err.code).toBeNull();
+  });
 });
 
 describe("createSession", () => {
@@ -74,6 +139,7 @@ describe("createSession", () => {
       runnerId: undefined,
       hostId: null,
       hostResumable: false,
+      archived: false,
       status: "idle",
       createdAt: 1704067200,
       title: null,
@@ -89,6 +155,7 @@ describe("createSession", () => {
       harness: null,
       modelOverride: undefined,
       costControlModeOverride: undefined,
+      shareWorkspaceFiles: false,
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
@@ -130,6 +197,23 @@ describe("createSession", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string).initial_items).toEqual(seed);
+  });
+
+  it("sends the local opt-out header when background titles are disabled", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await createSession("agent_xyz");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
   it("forwards parent_session_id, sub_agent_name and title for the Add-agent path", async () => {
@@ -263,6 +347,26 @@ describe("createSession", () => {
   });
 });
 
+describe("createBundledSession", () => {
+  it("sends the local opt-out header when background titles are disabled", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        session_id: "conv_bundle",
+      }),
+    );
+
+    const result = await createBundledSession(
+      new File([], "agent.tar.gz", { type: "application/gzip" }),
+      { workspace: "/tmp/project" },
+    );
+
+    expect(result.id).toBe("conv_bundle");
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
+  });
+});
+
 describe("forkSession", () => {
   it("POSTs the fork endpoint with the (url-encoded) source id and parses the fork", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -300,7 +404,7 @@ describe("forkSession", () => {
       }),
     );
 
-    await forkSession("conv_src", "My clone");
+    await forkSession("conv_src", { title: "My clone" });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ title: "My clone" });
@@ -316,10 +420,12 @@ describe("forkSession", () => {
       }),
     );
 
-    await forkSession("conv_src", undefined, undefined, undefined, {
-      modelOverride: "opus",
-      reasoningEffort: "high",
-      terminalLaunchArgs: ["--permission-mode", "auto"],
+    await forkSession("conv_src", {
+      config: {
+        modelOverride: "opus",
+        reasoningEffort: "high",
+        terminalLaunchArgs: ["--permission-mode", "auto"],
+      },
     });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -341,10 +447,67 @@ describe("forkSession", () => {
     );
 
     // An empty config object (non-native target) sends no run overrides.
-    await forkSession("conv_src", undefined, undefined, undefined, {});
+    await forkSession("conv_src", { config: {} });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  it("asks for a managed sandbox when a sandbox target is given", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", {
+      sandbox: { provider: "modal", workspace: "https://github.com/org/repo#main" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      sandbox_provider: "modal",
+      workspace: "https://github.com/org/repo#main",
+    });
+  });
+
+  it("keeps an explicit null workspace, so a sandbox fork can start empty", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    // Null is a real choice (empty sandbox); dropping the key would instead
+    // inherit the source's repository server-side. A provider the server
+    // didn't name is omitted so it picks its first.
+    await forkSession("conv_src", { sandbox: { provider: null, workspace: null } });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ host_type: "managed", workspace: null });
+  });
+
+  it("sends no host_type when no sandbox target is given (the fork stays unbound)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", { config: {} });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).not.toHaveProperty("host_type");
   });
 
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
@@ -737,6 +900,38 @@ describe("getSession", () => {
     expect(session.permissionLevel).toBeNull();
   });
 
+  it("maps archived from the wire onto the snapshot", async () => {
+    // The snapshot is the only archived-flag carrier for a session opened
+    // directly by URL (the default sidebar list excludes archived rows).
+    // Dropping it at the parse boundary made the header kebab offer
+    // "Archive" on an already-archived session.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        archived: true,
+      }),
+    );
+    const session = await getSession("conv_abc");
+    expect(session.archived).toBe(true);
+  });
+
+  it("treats a missing archived flag as false", async () => {
+    // Older servers / recorded fixtures omit the field; absent means active.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+      }),
+    );
+    const session = await getSession("conv_abc");
+    expect(session.archived).toBe(false);
+  });
+
   it("maps parent_session_id from the wire to parentSessionId", async () => {
     // Child (sub-agent) sessions return their parent's id here so the
     // UI can mark the rail accordingly without an extra round-trip.
@@ -877,6 +1072,16 @@ describe("postEvent", () => {
     await expect(postEvent("conv_abc", { type: "bogus", data: {} })).rejects.toThrow(/422/);
   });
 
+  it("sends the local opt-out header when background titles are disabled", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+
+    await postEvent("conv_abc", { type: "message", data: {} });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
+  });
+
   it("reads pending_id for a native-terminal message", async () => {
     // Native sessions return a pending-input id instead of an item_id.
     // The id identifies the snapshot's replayed bubble on rebind and is
@@ -941,6 +1146,132 @@ describe("stopSession", () => {
   });
 });
 
+describe("retryRateLimitedTurn", () => {
+  it.each([
+    { queued: true, item_id: "ci_retry" },
+    { queued: true, pending_id: "pending_retry" },
+  ])("submits a continuation for an accepted retry: %o", async (response) => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(response));
+
+    await retryRateLimitedTurn("conv_retry");
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "Please continue from where you left off before the rate limit error.",
+          },
+        ],
+      },
+    });
+  });
+
+  it("shares one in-flight continuation across error cards in the same session", async () => {
+    let finishRetry: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishRetry = resolve;
+        }),
+    );
+
+    const first = retryRateLimitedTurn("conv_retry");
+    const second = retryRateLimitedTurn("conv_retry");
+
+    expect(second).toBe(first);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    finishRetry?.(mockJsonResponse({ queued: true }));
+    await Promise.all([first, second]);
+
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+    await retryRateLimitedTurn("conv_retry");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases a shared failed attempt so a later retry can succeed", async () => {
+    let finishRetry: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishRetry = resolve;
+        }),
+    );
+
+    const first = retryRateLimitedTurn("conv_retry");
+    const second = retryRateLimitedTurn("conv_retry");
+    const outcomes = Promise.allSettled([first, second]);
+    finishRetry?.(mockJsonResponse({ queued: false, denied: true }));
+
+    expect(await outcomes).toEqual([
+      { status: "rejected", reason: new Error("The retry was blocked by a policy") },
+      { status: "rejected", reason: new Error("The retry was blocked by a policy") },
+    ]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+    await retryRateLimitedTurn("conv_retry");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("allows different sessions to retry independently", async () => {
+    let finishFirst: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+
+    const first = retryRateLimitedTurn("conv_first");
+    await retryRateLimitedTurn("conv_second");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/sessions/conv_first/events",
+      "/v1/sessions/conv_second/events",
+    ]);
+    finishFirst?.(mockJsonResponse({ queued: true }));
+    await first;
+  });
+
+  it("rejects policy denials so the error card remains actionable", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, denied: true }));
+
+    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow(
+      "The retry was blocked by a policy",
+    );
+  });
+
+  it("rejects a response that did not queue a continuation", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
+
+    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow("The retry was not accepted");
+  });
+
+  it("propagates the server's dispatch error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "runner_unavailable", message: "The host is offline" } },
+        { ok: false, status: 503 },
+      ),
+    );
+
+    await expect(retryRateLimitedTurn("conv_retry")).rejects.toMatchObject({
+      code: "runner_unavailable",
+      message: "The host is offline",
+      status: 503,
+    });
+  });
+});
+
 describe("approve", () => {
   it("POSTs the MCP-shape result to the elicitation's resolve URL", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
@@ -968,5 +1299,118 @@ describe("approve", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve");
     expect(JSON.parse(init.body as string)).toEqual({ action: "decline" });
+  });
+});
+
+describe("importLocalSessions", () => {
+  it("streams each session through onSession and returns the final tally", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "First" }),
+        JSON.stringify({ event: "session", session_id: "c2", title: null }),
+        JSON.stringify({ event: "done", imported: 2, already_imported: 1, failed: 0 }),
+      ]),
+    );
+
+    const seen: string[] = [];
+    const result = await importLocalSessions("host_1", "all", 25, (s) => seen.push(s.id));
+
+    expect(seen).toEqual(["c1", "c2"]);
+    expect(result).toEqual({
+      imported: 2,
+      alreadyImported: 1,
+      failed: 0,
+      sessions: [
+        { id: "c1", title: "First" },
+        { id: "c2", title: null },
+      ],
+    });
+    // Hits the streaming endpoint with the snake_case body.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/imports/local/stream");
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_id: "host_1",
+      source: "all",
+      limit: 25,
+    });
+  });
+
+  it("throws the server's message on a mid-stream error, keeping delivered sessions", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "First" }),
+        JSON.stringify({ event: "error", message: "host stalled mid-import" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    const seen: string[] = [];
+    await expect(importLocalSessions("h", "claude", 10, (s) => seen.push(s.id))).rejects.toThrow(
+      "host stalled mid-import",
+    );
+    // The session that streamed before the error was still handed to the caller.
+    expect(seen).toEqual(["c1"]);
+  });
+
+  it("sends an exact session ID with its harness", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "Exact" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    await importLocalSessions("host_1", "codex", 25, undefined, "session-exact");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_id: "host_1",
+      source: "codex",
+      limit: 25,
+      session_id: "session-exact",
+    });
+  });
+
+  it("does not fall back to a server that cannot distinguish an exact import", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
+
+    await expect(
+      importLocalSessions("host_1", "codex", 25, undefined, "session-exact"),
+    ).rejects.toThrow("Direct session import is not supported");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the buffered endpoint when the stream endpoint 404s", async () => {
+    // Old server: the streaming endpoint is absent, so the client retries the
+    // buffered one and delivers every session through onSession at once.
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        imported: 2,
+        already_imported: 1,
+        failed: 0,
+        sessions: [
+          { session_id: "c1", title: "First" },
+          { session_id: "c2", title: null },
+        ],
+      }),
+    );
+
+    const seen: string[] = [];
+    const result = await importLocalSessions("host_1", "all", 25, (s) => seen.push(s.id));
+
+    expect(seen).toEqual(["c1", "c2"]);
+    expect(result).toEqual({
+      imported: 2,
+      alreadyImported: 1,
+      failed: 0,
+      sessions: [
+        { id: "c1", title: "First" },
+        { id: "c2", title: null },
+      ],
+    });
+    // First the stream endpoint (404), then the buffered fallback.
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/imports/local");
   });
 });

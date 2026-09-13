@@ -1284,6 +1284,80 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
     )
 
 
+def test_web_search_does_not_emit_web_search_preview_for_claude_sdk_harness() -> None:
+    """
+    When the agent's harness is ``claude-sdk``, the ``web_search`` builtin
+    must NOT emit ``{"type": "web_search_preview"}`` in its schema, even if
+    the model name (e.g. ``claude-opus-4-8``) has no provider prefix (which
+    would otherwise default to OpenAI).
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(type="claude_sdk", model="claude-opus-4-8"),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview", (
+        "web_search emitted web_search_preview schema on claude-sdk harness"
+    )
+
+
+def test_web_search_does_not_emit_web_search_preview_for_omnigent_claude_sdk_harness() -> None:
+    """
+    When the agent's executor is ``omnigent`` with ``harness: claude-sdk``,
+    the ``web_search`` builtin must NOT emit ``{"type": "web_search_preview"}``.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            model="claude-opus-4-8",
+            config={"harness": "claude-sdk"},
+        ),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview"
+
+
+def test_web_search_emits_web_search_preview_for_openai_agents_harness() -> None:
+    """
+    An ``agents_sdk`` executor with an OpenAI model keeps the native
+    ``web_search_preview`` passthrough (the OpenAI Responses API executes
+    the search server-side).
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="gpt-5.4"),
+        executor=ExecutorSpec(type="agents_sdk", model="gpt-5.4"),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") == "web_search_preview", (
+        f"OpenAI passthrough lost on the agents_sdk harness. Got schema: {schema!r}"
+    )
+
+
 def test_read_skill_file_registered_for_root_level_resources(tmp_path: Path) -> None:
     """A skill whose only extra files sit beside SKILL.md still gets the tool."""
     from omnigent.tools.builtins import any_skill_has_resources

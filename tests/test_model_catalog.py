@@ -21,21 +21,23 @@ import httpx
 import pytest
 from cachetools import TTLCache
 
-import omnigent.model_catalog as model_catalog
-from omnigent.codex_model_vocabulary import codex_spawn_model
-from omnigent.model_catalog import (
+import omnigent.models.model_catalog as model_catalog
+from omnigent.models.codex_model_vocabulary import codex_spawn_model
+from omnigent.models.model_catalog import (
     ModelEntry,
     ModelListing,
+    ResolvedModelProvider,
     catalog_for_spec,
     catalog_model_entries,
     list_models_for_worker,
+    model_configuration_source,
     model_family_token,
     resolve_catalog_model,
     resolve_model_provider,
     spec_harness,
 )
-from omnigent.model_fallbacks import _SMART_ROUTING_FALLBACKS, CODEX_DEFAULT_MODEL
-from omnigent.model_metadata import (
+from omnigent.models.model_fallbacks import _SMART_ROUTING_FALLBACKS, CODEX_DEFAULT_MODEL
+from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
     ModelIntent,
@@ -44,7 +46,7 @@ from omnigent.model_metadata import (
     ModelReasoningMode,
     ModelWireAPI,
 )
-from omnigent.model_resolver import ModelResolutionError, ModelResolutionSource
+from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec
@@ -100,6 +102,125 @@ def _worker_spec(harness: str, **executor_kwargs: object) -> AgentSpec:
         name="worker",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}, **executor_kwargs),  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        pytest.param(ResolvedModelProvider(kind="none"), None, id="none"),
+        pytest.param(
+            ResolvedModelProvider(kind="subscription", cli="claude"),
+            {"kind": "subscription", "label": "Subscription", "name": "claude"},
+            id="subscription",
+        ),
+        pytest.param(
+            ResolvedModelProvider(kind="databricks", profile="production-west"),
+            {"kind": "databricks", "label": "Workspace", "name": "production-west"},
+            id="databricks",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="gateway",
+                detail="provider 'production'",
+                base_url="https://gateway.example.com/v1",
+            ),
+            {
+                "kind": "gateway",
+                "label": "AI Gateway",
+                "name": "production",
+                "host": "gateway.example.com",
+            },
+            id="gateway",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="local",
+                detail="provider 'ollama'",
+                base_url="http://localhost:11434/v1",
+            ),
+            {
+                "kind": "local",
+                "label": "Local",
+                "name": "ollama",
+                "host": "localhost:11434",
+            },
+            id="local",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="bedrock",
+                family="anthropic",
+                detail="provider 'production-bedrock'",
+                base_url="https://bedrock-runtime.us-west-2.amazonaws.com",
+            ),
+            {
+                "kind": "bedrock",
+                "label": "Bedrock",
+                "name": "production-bedrock",
+                "host": "bedrock-runtime.us-west-2.amazonaws.com",
+            },
+            id="bedrock",
+        ),
+        pytest.param(
+            ResolvedModelProvider(kind="cli-config", cli="codex", detail="config.toml"),
+            {"kind": "cli-config", "label": "CLI config", "name": "config.toml"},
+            id="cli-config",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="key",
+                family="anthropic",
+                base_url="https://must-not-leak:secret@api.anthropic.com:8443/v1",
+                api_key="must-not-leak",
+            ),
+            {
+                "kind": "key",
+                "label": "API key",
+                "name": "anthropic",
+                "host": "api.anthropic.com:8443",
+            },
+            id="api-key",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="gateway",
+                detail="provider 'production'",
+                base_url="https://[malformed/v1",
+            ),
+            {"kind": "gateway", "label": "AI Gateway", "name": "production"},
+            id="malformed-url",
+        ),
+    ],
+)
+def test_model_configuration_source_exposes_only_safe_coordinates(
+    provider: ResolvedModelProvider, expected: dict[str, str] | None
+) -> None:
+    """Composer metadata identifies the connection without serializing credentials."""
+    source = model_configuration_source(provider)
+    assert source == expected
+    assert "must-not-leak" not in repr(source)
+    assert "secret" not in repr(source)
+
+
+def test_native_claude_legacy_api_key_source_is_its_cli_subscription() -> None:
+    """Native Claude ignores legacy API-key auth while SDK Claude consumes it."""
+    provider = ResolvedModelProvider(
+        kind="key",
+        family="anthropic",
+        api_key="must-not-leak",
+        detail="api_key auth",
+    )
+
+    assert model_configuration_source(provider, harness="claude-native") == {
+        "kind": "subscription",
+        "label": "Subscription",
+        "name": "claude",
+    }
+    assert model_configuration_source(provider, harness="claude-sdk") == {
+        "kind": "key",
+        "label": "API key",
+        "name": "anthropic",
+    }
 
 
 _DATABRICKS_DEFAULT_CONFIG = (
@@ -1004,7 +1125,7 @@ def test_cursor_listing_uses_live_cli_base_models(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
-    from omnigent import cursor_native
+    from omnigent.harnesses.cursor_native import main as cursor_native
 
     _isolate_config(monkeypatch, tmp_path, "")
     monkeypatch.setattr(
@@ -1030,7 +1151,7 @@ def test_cursor_listing_failure_is_empty_and_retryable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A transient Cursor CLI failure does not cache an empty catalog."""
-    from omnigent import cursor_native
+    from omnigent.harnesses.cursor_native import main as cursor_native
 
     _isolate_config(monkeypatch, tmp_path, "")
     calls = 0
@@ -1045,9 +1166,42 @@ def test_cursor_listing_failure_is_empty_and_retryable(
     first = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
     second = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
 
-    assert first.source == second.source == "none"
     assert first.models == second.models == ()
     assert calls == 2
+
+
+def test_cursor_listing_failure_degrades_to_usable_static_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed cursor listing probe must not report the dead-worker shape.
+
+    cursor-agent brings its own stored login, so a listing-probe failure
+    (CLI missing from the probe env, not logged in for listing, transient
+    error) says nothing about dispatchability. The row must degrade to the
+    ``source="static"`` shape the sibling subscription CLIs report — never
+    ``source="none"``, whose note tells orchestrators the worker cannot
+    run here.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.harnesses.cursor_native import main as cursor_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+
+    def fail() -> list[dict[str, object]]:
+        raise OSError("cursor unavailable")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", fail)
+
+    listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert listing.models == ()
+    # The note must say the worker still runs, not the dead-worker signal.
+    assert "can still run" in listing.note
+    assert "cannot run here" not in listing.note
 
 
 def test_none_listing_explains_dead_worker(
@@ -1645,7 +1799,7 @@ def test_model_services_listing_is_scoped_and_paginated() -> None:
     reported a handful of unrelated user schemas with a ``next_page_token`` this
     call never followed. Scope to ``schemas/system.ai`` and page through.
     """
-    from omnigent import model_catalog
+    from omnigent.models import model_catalog
 
     requests_seen: list[httpx.Request] = []
 
@@ -1702,7 +1856,7 @@ def test_model_services_listing_stops_on_repeated_page_token(
     bundled catalog's retired ``databricks-`` ids, so failing loud would
     reintroduce the 501 this scoping fix removes; a partial list still launches.
     """
-    from omnigent import model_catalog
+    from omnigent.models import model_catalog
 
     def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1719,7 +1873,7 @@ def test_model_services_listing_stops_on_repeated_page_token(
             request=request,
         )
 
-    with caplog.at_level("WARNING", logger="omnigent.model_catalog"):
+    with caplog.at_level("WARNING", logger="omnigent.models.model_catalog"):
         entries = model_catalog.fetch_databricks_model_service_entries(
             "https://workspace.example.com",
             "token",

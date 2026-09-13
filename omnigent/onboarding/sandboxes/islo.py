@@ -45,7 +45,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxLauncher,
     host_image_wheel_install_command,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxCapabilities
 
 API_BASE_URL_ENV_VAR: str = "ISLO_BASE_URL"
 """Optional Islo API base URL override. Defaults to
@@ -535,9 +535,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
@@ -549,9 +547,7 @@ class IsloSandboxLauncher(SandboxLauncher):
             host_id=host_id,
             host_name=host_name,
             server_url=server_url,
-            repo_url=repo_url,
-            repo_branch=repo_branch,
-            repo_name=repo_name,
+            repos=repos,
             host_config=host_config,
             on_stage=on_stage,
         )

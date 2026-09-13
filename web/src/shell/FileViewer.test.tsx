@@ -14,7 +14,7 @@
 //  12. Comments are marked seen (inbox-clearing registry) only while the
 //      comments panel is open — never from merely opening the file.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -29,12 +29,18 @@ vi.mock("./CodeViewer", () => ({
   // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
   CodeViewer: ({
     viewMode,
+    searchOpen,
     onDirtyChange,
   }: {
     viewMode: string;
+    searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => (
-    <div data-testid="code-viewer" data-view-mode={viewMode}>
+    <div
+      data-testid="code-viewer"
+      data-view-mode={viewMode}
+      data-search-open={String(!!searchOpen)}
+    >
       <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
     </div>
   ),
@@ -80,14 +86,17 @@ vi.mock("./MonacoDiffViewer", () => ({
   MonacoDiffViewer: ({
     wrapLines,
     hideWhitespace,
+    searchOpen,
   }: {
     wrapLines?: boolean;
     hideWhitespace?: boolean;
+    searchOpen?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
+      data-search-open={String(!!searchOpen)}
     />
   ),
 }));
@@ -1542,6 +1551,130 @@ describe("FileViewer keyboard shortcut — Alt+← / Alt+→", () => {
     expect(onNavigateTo).not.toHaveBeenCalled();
 
     document.body.removeChild(input);
+  });
+});
+
+describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
+  // The Monaco-backed surfaces (code source/editor and the diff view) open
+  // find via the shared `searchOpen` toggle rather than Monaco's own Cmd+F
+  // keybinding — the keybinding needs editor focus and doesn't fire inside the
+  // managed same-root embed, so cmd+f silently did nothing there. These assert
+  // that a Cmd/Ctrl+F flips the toggle FileViewer hands each surface.
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const searchOpenOf = (testId: string) =>
+    screen.getByTestId(testId).getAttribute("data-search-open");
+
+  it("opens find on the code (source) surface with Cmd+F", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("opens find on the code surface with Ctrl+F (Windows/Linux)", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("opens find in the diff view with Cmd+F", async () => {
+    renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
+    // Diff view renders MonacoDiffViewer, not CodeViewer.
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    expect(searchOpenOf("diff-viewer")).toBe("false");
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("diff-viewer")).toBe("true");
+  });
+
+  it("does not intercept Cmd+Shift+F (leaves other chords alone)", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.keyDown(window, { key: "f", metaKey: true, shiftKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+  });
+
+  it("leaves the markdown editor surface to CodeViewer's own find handler", () => {
+    // Markdown defaults to the rich-text editor — a non-Monaco surface whose
+    // Cmd+F is owned by CodeViewer, so FileViewer's handler must stay inert
+    // (the mocked CodeViewer never flips searchOpen on its own).
+    renderViewer({ open: true, path: "notes.md" });
+    expect(screen.getByTestId("code-viewer").getAttribute("data-view-mode")).toBe("editor");
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+  });
+
+  const insideButton = () =>
+    within(screen.getByTestId("file-viewer")).getByRole("button", { name: "make dirty" });
+
+  it("opens find when the last interaction was inside the file viewer", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.mouseDown(insideButton());
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("does NOT open file find when focus moves to the chat composer (outside the viewer)", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    // The viewer stays mounted beside the chat; focusing the composer must leave
+    // Cmd+F to the browser's find-in-page, not the file's find.
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    composer.focus();
+    fireEvent.keyDown(composer, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+    document.body.removeChild(composer);
+  });
+
+  it("does NOT open file find after the user clicks a non-focusable chat area", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    // Clicking a non-focusable region of the chat page drops focus to <body>,
+    // but the click marks the chat as the active surface — the exact case that
+    // used to still open the file's find.
+    const chatArea = document.createElement("div");
+    document.body.appendChild(chatArea);
+    fireEvent.mouseDown(chatArea);
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+    document.body.removeChild(chatArea);
+  });
+
+  it("re-claims Cmd+F after the user clicks back into the viewer", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    const chatArea = document.createElement("div");
+    document.body.appendChild(chatArea);
+    fireEvent.mouseDown(chatArea); // leave the viewer
+    fireEvent.mouseDown(insideButton()); // click back into the viewer
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+    document.body.removeChild(chatArea);
+  });
+
+  it.each(["pic.png", "doc.pdf", "widget.stl", "blob.bin"])(
+    "does NOT claim Cmd+F on non-Monaco viewers (%s)",
+    (path) => {
+      // Images, PDFs, 3D models, and binary files render CodeViewer's own
+      // viewers / "preview not available" notice, not Monaco — there is no find
+      // widget, so Cmd+F must fall through to the browser's find-in-page.
+      renderViewer({ open: true, path });
+      fireEvent.keyDown(window, { key: "f", metaKey: true });
+      expect(searchOpenOf("code-viewer")).toBe("false");
+    },
+  );
+
+  it("re-seeds the active surface when the viewer reopens the same path", () => {
+    const { rerender } = renderViewer({ open: true, path: "file1.py" });
+    // User clicks into the chat → the viewer is no longer the active surface.
+    const chatArea = document.createElement("div");
+    document.body.appendChild(chatArea);
+    fireEvent.mouseDown(chatArea);
+    // Close, then reopen the SAME path (no path change to re-seed on).
+    rerender(viewerTree({ open: false, path: "file1.py" }));
+    rerender(viewerTree({ open: true, path: "file1.py" }));
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+    document.body.removeChild(chatArea);
   });
 });
 

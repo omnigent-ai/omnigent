@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import {
+  isIOSShell,
+  setNativeServerSwitcherHidden,
+  supportsNativeServerPicker,
+} from "@/lib/nativeBridge";
 
 /**
  * Tracks whether `surface` is the frontmost element at its own centre — i.e.
@@ -68,11 +72,26 @@ export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean
 }
 
 /**
- * Drive the iOS shell's native server switcher overlay so it shows only while
- * `surface` is the frontmost element on screen and `active` is true. The
- * switcher is a native chrome element the web app toggles via the bridge; it
- * must hide whenever the sidebar (or any other overlay) covers the main
- * surface, and whenever the surface is unmounted.
+ * Whether the iOS shell's floating server-switcher pill should be hidden given
+ * the main surface's frontmost state.
+ *
+ * On shells that host the in-sidebar server picker (the bridge exposes
+ * `getServerPicker`), server selection lives in the navigation drawer — the
+ * pill must never float over the main surface, where it crowds the chat
+ * header's title and floating controls. Older shells lack the sidebar picker,
+ * so the pill stays their only selection affordance and follows `frontmost`.
+ */
+export function serverSwitcherHiddenForSurface(frontmost: boolean): boolean {
+  return supportsNativeServerPicker() || !frontmost;
+}
+
+/**
+ * Drive the iOS shell's native server switcher overlay. On shells with the
+ * in-sidebar server picker the overlay stays hidden over the main surface
+ * (selection lives in the drawer); on older shells it shows only while
+ * `surface` is the frontmost element on screen and `active` is true — hiding
+ * whenever the sidebar (or any other overlay) covers the main surface, and
+ * whenever the surface is unmounted.
  *
  * No-ops outside the iOS shell. Used by both the in-session main surface
  * (ChatPage) and the new-session landing screen (NewChatDialog).
@@ -84,7 +103,7 @@ export function useNativeServerSwitcherForMainSurface(
   const frontmost = useSurfaceFrontmost(surface, active);
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!frontmost);
+    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(frontmost));
   }, [frontmost]);
   useEffect(() => {
     if (!isIOSShell()) return;

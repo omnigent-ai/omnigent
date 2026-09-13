@@ -21,11 +21,11 @@ from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
-from omnigent.json_types import JsonValue
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
 )
+from omnigent.util.json_types import JsonValue
 
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -997,7 +997,7 @@ def _handle_helper_request(
         path = _resolve_path(cwd, raw_path)
         try:
             _assert_within_reach(cwd, sandbox, path, need_write=False)
-            _assert_read_allowed(sandbox, path)
+            _assert_read_allowed(sandbox, path, cwd)
         except PermissionError as exc:
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
@@ -1039,7 +1039,7 @@ def _handle_helper_request(
         path = _resolve_path(cwd, raw_path)
         try:
             _assert_within_reach(cwd, sandbox, path, need_write=True)
-            _assert_read_allowed(sandbox, path)
+            _assert_read_allowed(sandbox, path, cwd)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -1183,11 +1183,15 @@ def _assert_within_reach(
     )
 
 
-def _assert_read_allowed(policy: SandboxPolicy, path: Path) -> None:
+def _assert_read_allowed(policy: SandboxPolicy, path: Path, cwd: Path) -> None:
     roots = policy.read_roots
     if not policy.active or roots is None:
         return
-    if any(_is_within(path, root) for root in roots):
+    if _is_within(path, cwd):
+        return
+    if any(_is_within(path, root) for root in (*roots, *policy.write_roots)):
+        return
+    if any(path == allowed for allowed in policy.write_files):
         return
     raise PermissionError(f"Read access to '{path}' is blocked by sandbox.")
 

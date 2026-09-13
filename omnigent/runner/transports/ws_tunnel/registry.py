@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Protocol
 
+import httpx
+
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
@@ -759,8 +761,18 @@ class TunnelRegistry:
             self.close_request(runner_id, req_id, session=current)
             return False
         if isinstance(frame, ResponseEndFrame):
-            if _call_soon_threadsafe(state, lambda: _end_response_body(state)):
-                return True
+            if frame.error is not None:
+                # Runner signalled an abnormal stream end (mid-stream raise).
+                # Abort so the consumer raises instead of seeing clean EOF.
+                err = httpx.RemoteProtocolError(
+                    f"runner stream error: {frame.error}",
+                    request=None,  # type: ignore[arg-type]
+                )
+                if _call_soon_threadsafe(state, lambda: _abort_request_state(state, err)):
+                    return True
+            else:
+                if _call_soon_threadsafe(state, lambda: _end_response_body(state)):
+                    return True
             self.close_request(runner_id, req_id, session=current)
             return False
         return False

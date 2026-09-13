@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import {
   type ActiveChatOverride,
   bareConversationId,
@@ -399,6 +400,67 @@ describe("conversationDisplayLabel", () => {
         ),
       ),
     ).toBe("investigate the regression");
+  });
+
+  it("shows the optimistic first-prompt label while the title is unset", () => {
+    recordOptimisticTitle("conv_abcdefghijklmnopqrstuvwxyz", "debug the login redirect");
+    try {
+      expect(
+        conversationDisplayLabel(
+          conversation("conv_abcdefghijklmnopqrstuvwxyz", null, new Date(2026, 4, 14, 9), {
+            labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          }),
+        ),
+      ).toBe("debug the login redirect");
+    } finally {
+      clearOptimisticTitles();
+    }
+  });
+
+  it("lets the real title supersede the optimistic label once it lands", () => {
+    recordOptimisticTitle("conv_abcdefghijklmnopqrstuvwxyz", "debug the login redirect");
+    try {
+      expect(
+        conversationDisplayLabel(
+          conversation(
+            "conv_abcdefghijklmnopqrstuvwxyz",
+            "debug the login redirect",
+            new Date(2026, 4, 14, 9),
+            {
+              labels: { "omnigent.wrapper": "claude-code-native-ui" },
+            },
+          ),
+        ),
+      ).toBe("debug the login redirect");
+      // A server title — the seed, a generated title, or a rename — always
+      // wins over the stashed prompt.
+      expect(
+        conversationDisplayLabel(
+          conversation(
+            "conv_abcdefghijklmnopqrstuvwxyz",
+            "Login redirect loop",
+            new Date(2026, 4, 14, 9),
+            {
+              labels: { "omnigent.wrapper": "claude-code-native-ui" },
+            },
+          ),
+        ),
+      ).toBe("Login redirect loop");
+    } finally {
+      clearOptimisticTitles();
+    }
+  });
+
+  it("falls back to the wrapper name when no optimistic label was stashed", () => {
+    // Sessions born outside the landing form (forks, CLI, imports) never
+    // record one.
+    expect(
+      conversationDisplayLabel(
+        conversation("conv_abcdefghijklmnopqrstuvwxyz", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        }),
+      ),
+    ).toBe("Claude Code");
   });
 });
 

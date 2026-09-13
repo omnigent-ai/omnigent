@@ -57,12 +57,48 @@ interface HastElement {
 
 // Streamdown enables a link-safety confirmation modal by default: clicking any
 // markdown link pops an "Open external link?" dialog instead of following the
-// link. Disable it so the renderer can use native anchors without an extra
-// confirmation click. ChatMarkdown owns the final target: non-Electron links
-// use `_self` (native shells may still intercept off-origin activation), while
-// Electron keeps `_blank` so its main-process popup and external-protocol
-// policy remains on the navigation path.
+// link. Disable it so chat links behave like ordinary links — a plain click
+// opens them and cmd/ctrl-click opens a new tab. With safety off Streamdown
+// still renders the anchor as `<a target="_blank" rel="noreferrer">`, so we
+// keep new-tab opening plus referrer/reverse-tabnabbing protection without the
+// extra confirmation click.
 export const CHAT_LINK_SAFETY: LinkSafetyConfig = { enabled: false };
+
+/** Rewrites safe local `file:` URIs before sanitization removes their hrefs. */
+export function rewriteFileUriLinks() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      if (node.tagName !== "a") return;
+      const href = node.properties?.href;
+      if (typeof href !== "string" || !/^file:/i.test(href)) return;
+      const path = fileUriToLocalPath(href);
+      if (!path) return;
+      node.properties = { ...node.properties, href: path };
+    });
+  };
+}
+
+/** Returns a local absolute path only when rewriting preserves href meaning. */
+function fileUriToLocalPath(href: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "file:" || url.hostname || url.search || url.hash) return null;
+  let path: string;
+  try {
+    path = decodeURIComponent(url.pathname);
+  } catch {
+    return null;
+  }
+  // Keep the rewritten href absolute without introducing URL delimiters.
+  if (!path.startsWith("/") || path.startsWith("//") || path === "/" || /[?#]/.test(path)) {
+    return null;
+  }
+  return path;
+}
 
 /**
  * Moves the href of every file-path link onto {@link WORKSPACE_FILE_LINK_ATTR}
@@ -122,8 +158,15 @@ function isHardenOptions(value: unknown): value is StreamdownHardenOptions {
 
 function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehypePlugins {
   const plugins: StreamdownRehypePlugins = [];
+  let sawSanitize = false;
 
   for (const [key, plugin] of Object.entries(defaultRehypePlugins)) {
+    // Preserve local file URIs before sanitize removes their href.
+    if (key === "sanitize") {
+      sawSanitize = true;
+      if (markFileLinks) plugins.push(rewriteFileUriLinks);
+    }
+
     if (key !== "harden") {
       plugins.push(plugin);
       continue;
@@ -144,6 +187,10 @@ function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehype
       plugin[0],
       { ...plugin[1], allowedImagePrefixes: [] },
     ] satisfies StreamdownPluginTuple);
+  }
+
+  if (markFileLinks && !sawSanitize) {
+    throw new Error("Streamdown default rehype plugins carry no sanitize step");
   }
 
   return plugins;

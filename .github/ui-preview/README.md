@@ -16,6 +16,29 @@ when a PR changes the frontend (`web/`).
 3. A comment with the preview URL is posted on the PR and updated on each push.
 4. The app is deleted automatically when the PR is closed.
 
+## Provisioning retries
+
+Initial compute provisioning gets up to three attempts, each polling for about
+10 minutes. The logs include the compute state and Databricks' status message.
+If compute stays `STARTING` or enters `ERROR` / `STOPPED`, the workflow can
+delete the undeployed app and recreate it with the **same name**. It confirms
+deletion first, then backs off for 15 seconds before the second attempt and
+30 seconds before the third. An undeployed app left by an earlier failed run
+can also be recovered this way.
+
+Recreation is restricted to the same app ID, deployment principal, and preview
+description, with no deployments, source path, resources, or pending updates.
+Existing deployed previews are reused, never deleted by provisioning retries.
+API/authentication errors, identity changes, and unconfirmed deletions fail the
+step instead of triggering recreation. The final failed app is left for
+inspection; closing the PR still cleans it up.
+
+To verify the retry behavior without touching Databricks, run
+`uv run --no-sync python -m pytest tests/test_ui_preview_workflow.py`.
+These tests execute the workflow's shell with a fake CLI and no real sleeps.
+After a live deployment, check the `Create or update app` log for the attempt
+number and confirm the preview URL posted on the PR opens successfully.
+
 ## Fork PR safety
 
 `ui-preview.yml` runs its build/deploy on `pull_request_target`, so the label is

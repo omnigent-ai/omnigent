@@ -110,6 +110,71 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
     assert "HARNESS_ACP_MODEL" not in env
 
 
+def test_jcode_connect_injects_gateway_env_and_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a managed-connect host (and no explicit spec key), the jcode row's spawn env
+    carries the broker bearer + JCODE_HOME + runtime dir and names ALL THREE in
+    HARNESS_ACP_ENV_PASSTHROUGH — mandatory, since the ACP wrap forwards only
+    passthrough-named vars to the jcode subprocess."""
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.api_key_auth_precludes_broker", lambda spec: False
+    )
+    monkeypatch.setattr(
+        "omnigent.host.jcode_databricks.connect_jcode_gateway_env",
+        lambda **_kw: {
+            "JCODE_DBX_TOKEN": "fresh-bearer",
+            "JCODE_HOME": "/tmp/jc-home",
+            "JCODE_RUNTIME_DIR": "/tmp/jc-home/run",
+        },
+    )
+    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
+    assert env["JCODE_DBX_TOKEN"] == "fresh-bearer"
+    assert env["JCODE_HOME"] == "/tmp/jc-home"
+    assert env["JCODE_RUNTIME_DIR"] == "/tmp/jc-home/run"
+    names = set(env["HARNESS_ACP_ENV_PASSTHROUGH"].split(","))
+    assert {"JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR"} <= names
+
+
+def test_jcode_no_connect_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off a managed-connect host (connect_jcode_gateway_env returns None), the jcode row's
+    spawn env carries no JCODE_* vars and no passthrough — laptop/non-connect untouched."""
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.api_key_auth_precludes_broker", lambda spec: False
+    )
+    monkeypatch.setattr(
+        "omnigent.host.jcode_databricks.connect_jcode_gateway_env",
+        lambda **_kw: None,
+    )
+    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
+    assert "JCODE_DBX_TOKEN" not in env
+    assert "JCODE_HOME" not in env
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+
+
+def test_jcode_explicit_api_key_skips_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A jcode agent with its own API key must NOT be rerouted through the owner's
+    gateway: when api_key_auth_precludes_broker(spec) is True, the connect helper is
+    never consulted and no JCODE_* vars are injected."""
+    called = False
+
+    def _should_not_run(**_kw):
+        nonlocal called
+        called = True
+        return {"JCODE_DBX_TOKEN": "x", "JCODE_HOME": "/y", "JCODE_RUNTIME_DIR": "/y/run"}
+
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.api_key_auth_precludes_broker", lambda spec: True
+    )
+    monkeypatch.setattr(
+        "omnigent.host.jcode_databricks.connect_jcode_gateway_env", _should_not_run
+    )
+    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
+    assert called is False
+    assert "JCODE_DBX_TOKEN" not in env
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+
+
 def test_spawn_env_honors_path_override_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
     monkeypatch.setenv("OMNIGENT_FAKECLI_PATH", "/custom/fakecli")
@@ -137,6 +202,24 @@ def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.login_command == "fakecli login --device"
     assert _FAKE_ROW.label == "Fake CLI"
     assert _FAKE_ROW.binary == "fakecli"
+
+
+def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rows that opt out of MCP injection must propagate that to the wrap.
+
+    A vendor CLI that rejects ``session/new`` mcpServers (jcode) fails every
+    session if the Omnigent MCP server is advertised, so the row flag has to
+    reach ``HARNESS_ACP_OMNIGENT_MCP`` rather than relying on the wrap's
+    default-on.
+    """
+    no_mcp_row = dataclasses.replace(_FAKE_ROW, omnigent_mcp=False)
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", no_mcp_row)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +280,7 @@ def test_catalog_row_spawn_env_builds(name: str) -> None:
     if row.args:
         assert argv[-len(row.args) :] == list(row.args)
     assert env["HARNESS_ACP_NAME"] == row.label
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == ("1" if row.omnigent_mcp else "0")
 
 
 # ---------------------------------------------------------------------------
@@ -266,3 +350,8 @@ def test_spawn_env_forwards_permission_mode(monkeypatch: pytest.MonkeyPatch) -> 
     assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_cli_spawn_env(
         _spec("fakecli"), harness="fakecli"
     )
+
+
+# ---------------------------------------------------------------------------
+# jcode managed-connect support
+# ---------------------------------------------------------------------------

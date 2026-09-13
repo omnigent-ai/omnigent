@@ -69,12 +69,14 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxHostLauncher,
     render_host_config_write_command,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from kubernetes import client as k8s_client
+
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
 _logger = logging.getLogger(__name__)
@@ -129,6 +131,17 @@ _SANDBOX_CPU_LIMIT: str = "2"
 _SANDBOX_MEMORY_REQUEST: str = "1Gi"
 _SANDBOX_MEMORY_LIMIT: str = "4Gi"
 
+# Default ``sizeLimit`` on the writable-HOME emptyDir. An unbounded emptyDir
+# lives on the node's root filesystem (kubelet nodefs), so one sandbox that
+# fills its HOME (tool caches, clones, build output) pushes the whole node into
+# disk pressure and the kubelet then evicts by node-wide ranking — which can
+# kill a tiny, innocent Pod to reclaim space from the offender. With a
+# sizeLimit the kubelet evicts only the Pod that exceeded it. Overridable via
+# ``sandbox.kubernetes.home_size_limit`` (mirrored as a default in
+# omnigent.server.managed_hosts); an explicit ``null`` there restores the
+# unbounded behaviour.
+_HOME_SIZE_LIMIT_DEFAULT: str = "8Gi"
+
 # Labels stamped on every managed runner Pod + its token Secret, so an operator
 # (or a future reconciler) can select omnigent-managed objects for GC.
 _MANAGED_BY_LABEL: str = "app.kubernetes.io/managed-by"
@@ -174,9 +187,17 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 # image / clone its repo fails fast with a clear reason instead of as a generic
 # online timeout. Kept tight; a cold image pull is the usual slow case —
 # deployments whose host image regularly takes longer to pull can raise the
-# budget via ``sandbox.kubernetes.pod_ready_timeout_s``.
+# budget via ``sandbox.kubernetes.pod_ready_timeout_s``, or, when that isn't
+# set, via :data:`_POD_READY_TIMEOUT_ENV_VAR`.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
+
+# Env var fallback for the pod-ready wait budget, mirroring
+# omnigent.onboarding.sandboxes.e2b.MAX_LIFETIME_ENV_VAR. Only consulted when
+# the launcher wasn't constructed with an explicit pod_ready_timeout_s (i.e.
+# sandbox.kubernetes.pod_ready_timeout_s is unset in the bundle) — the
+# explicit config key always wins when both are present.
+_POD_READY_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_POD_READY_TIMEOUT_S"
 
 # Per-request client timeout for the blocking calls. Without it a stalled
 # apiserver socket blocks indefinitely and the wait deadline never fires.
@@ -199,6 +220,16 @@ _JOB_BACKOFF_LIMIT: int = 6
 # sandboxes when no explicit terminate arrives.  7 days matches the managed
 # launch-token TTL.
 _JOB_ACTIVE_DEADLINE_S: int = 7 * 24 * 3600
+
+# How long a Job's objects (and its terminated Pod) stick around after the
+# Job itself reaches a terminal state (Complete or Failed), before the
+# cluster garbage-collects them. Backstop for the case where nothing ever
+# calls terminate() on a Job that ends on its own — a crash-loop exhausting
+# backoffLimit, or activeDeadlineSeconds finally expiring — so a
+# credential-bearing Pod object doesn't linger indefinitely just because
+# application-level cleanup never ran. 24h leaves a window to inspect a
+# failed Job's status/logs before it's swept.
+_JOB_TTL_SECONDS_AFTER_FINISHED: int = 24 * 3600
 
 # Lines of container log tail surfaced in a start-failure message (e.g. the git
 # clone error from the init container).
@@ -290,6 +321,34 @@ def _ensure_sdk() -> None:
         ) from exc
 
 
+def _resolve_pod_ready_timeout_s(configured: int | None) -> int:
+    """
+    Resolve the pod-ready wait budget for :meth:`_wait_for_pod_running`.
+
+    Precedence: the explicit ``sandbox.kubernetes.pod_ready_timeout_s``
+    config value (``configured``, already parsed by the caller) wins when
+    set; otherwise :data:`_POD_READY_TIMEOUT_ENV_VAR` overrides the
+    :data:`_POD_READY_TIMEOUT_S` default, mirroring
+    ``omnigent.onboarding.sandboxes.e2b.resolve_max_lifetime_s``.
+
+    :param configured: The launcher's ``pod_ready_timeout_s`` constructor
+        argument, or ``None`` when the bundle didn't set it.
+    :returns: The timeout in seconds to wait for the Pod to reach ``Running``.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    if configured is not None:
+        return configured
+    raw = os.environ.get(_POD_READY_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return _POD_READY_TIMEOUT_S
+    try:
+        return int(float(raw))
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{_POD_READY_TIMEOUT_ENV_VAR} must be a number of seconds"
+        ) from exc
+
+
 def _env_name_is_sensitive(name: str) -> bool:
     """
     Whether an env var NAME looks like a credential — i.e. a ``_``-delimited
@@ -337,7 +396,13 @@ def _resolve_pod_resources(resources: dict[str, object] | None) -> dict[str, dic
 
     Each tier and field is optional; an omitted field keeps the default. The
     config shape is validated at parse time, so this merge reads only the
-    recognized string fields.
+    recognized string fields: ``cpu``, ``memory`` and ``ephemeral-storage``.
+
+    ``ephemeral-storage`` has no built-in default: when it is not configured
+    the field is left unset so a namespace ``LimitRange`` can default it. When
+    it is set, the request lets the scheduler spread sandboxes by disk and the
+    limit makes the kubelet evict *only* a sandbox that exceeds it (an
+    unbounded Pod is otherwise evicted by node-wide ranking).
 
     :param resources: The configured block, or ``None`` for the defaults.
     :returns: A ``{"requests": {...}, "limits": {...}}`` mapping.
@@ -351,7 +416,7 @@ def _resolve_pod_resources(resources: dict[str, object] | None) -> dict[str, dic
     for tier in ("requests", "limits"):
         tier_cfg = resources.get(tier)
         if isinstance(tier_cfg, dict):
-            for field in ("cpu", "memory"):
+            for field in ("cpu", "memory", "ephemeral-storage"):
                 value = tier_cfg.get(field)
                 if value is not None:
                     resolved[tier][field] = str(value)
@@ -408,44 +473,69 @@ def _token_secret_name(job_name: str) -> str:
 
 def _render_workspace_prep_command(
     workspace: str,
-    clone_dir: str | None,
-    repo_url: str | None,
-    repo_branch: str | None,
+    repos: Sequence[RepoWorkspace],
+    server_url: str,
+    host_id: str,
     host_config: dict[str, object] | None = None,
 ) -> list[str]:
     """
     Render the init container command that prepares the workspace.
 
-    Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
-    requested, and merges *host_config* into ``config.yaml`` under
-    ``$OMNIGENT_CONFIG_HOME`` or the default ``~/.omnigent`` when set — all
-    BEFORE the host starts. Running in an init container means a failure
-    terminates the init container non-zero — surfaced fast by the start wait
-    with the error as the container log tail — rather than silently leaving the
-    host without its workspace or provider config.
+    Creates ``<workspace>``, clones each requested repository into
+    ``<workspace>/<repo_name>`` **in parallel**, and merges *host_config* into
+    ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default
+    ``~/.omnigent`` when set — all BEFORE the host starts. Running in an init
+    container means a failure terminates the init container non-zero — surfaced
+    fast by the start wait with the error as the container log tail — rather
+    than silently leaving the host without its workspace or provider config.
 
     :param workspace: The workspace root to create, e.g. ``"/home/omnigent/workspace"``.
-    :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
-    :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
-    :param repo_branch: Branch to clone (``--branch … --single-branch``), or
-        ``None`` for the default branch.
+    :param repos: Repositories to clone into ``<workspace>/<repo_name>``; empty
+        for an empty workspace.
     :param host_config: Deployment-supplied config content to merge in (lands
         under the same config directory seen by the host container), or
         ``None``.
     :returns: The ``["bash", "-lc", script]`` command.
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
-    if repo_url is not None and clone_dir is not None:
-        # ``--`` separates options from the (already-validated) URL so it can
-        # never be parsed as a flag; --single-branch keeps branch-pinned clones
-        # fast. Private repos authenticate via the image's GIT_TOKEN credential
-        # helper (projected from the harness Secret).
-        branch = (
-            f"--branch {shlex.quote(repo_branch)} --single-branch "
-            if repo_branch is not None
-            else ""
+    if repos:
+        # Prefer the owner's per-user credential for the clone: when they've
+        # connected GitHub, wire the broker as the sole github.com helper so a
+        # private clone authenticates as *them*. Wired ONCE (it configures the
+        # global github.com helper for every clone below). When they haven't
+        # connected this is a no-op that leaves the image's shared ``$GIT_TOKEN``
+        # helper in place; ``|| true`` keeps a broker hiccup from failing the
+        # clone (it then falls back to ``$GIT_TOKEN``). Needs OMNIGENT_HOST_TOKEN.
+        wire = (
+            "from omnigent.git_credential_github import configure_clone_credentials; "
+            f"configure_clone_credentials({server_url!r}, {host_id!r})"
         )
-        script += f"git clone {branch}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}\n"
+        script += f"python3 -c {shlex.quote(wire)} || true\n"
+        # Clone every repo concurrently, then wait on each and fail the init
+        # container if ANY clone failed — a half-populated workspace must abort
+        # the launch loudly, not boot the host on it. ``set -e`` stays on, but a
+        # backgrounded failure doesn't trip it; the explicit per-pid exit-code
+        # check below does. ``--`` separates options from the (already-validated)
+        # URL so it can never be parsed as a flag; --single-branch keeps
+        # branch-pinned clones fast.
+        # ponytail: unbounded fan-out; add `xargs -P <n>` if huge repo sets on a
+        # 2-vCPU pod ever thrash.
+        script += "pids=''\n"
+        # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
+        # shared clone dir would fail the concurrent clones, so disambiguate.
+        for repo, dirname in zip(repos, clone_dir_names(repos), strict=True):
+            clone_dir = f"{workspace}/{dirname}"
+            branch = (
+                f"--branch {shlex.quote(repo.branch)} --single-branch "
+                if repo.branch is not None
+                else ""
+            )
+            script += (
+                f"git clone {branch}-- {shlex.quote(repo.url)} "
+                f'{shlex.quote(clone_dir)} & pids="$pids $!"\n'
+            )
+        script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
+        script += '[ "$rc" -eq 0 ]\n'
     if host_config is not None:
         script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]
@@ -518,16 +608,18 @@ def build_job_manifest(
     env_literals: dict[str, str],
     node_selector: dict[str, str] | None,
     workspace: str,
-    clone_dir: str | None = None,
-    repo_url: str | None = None,
-    repo_branch: str | None = None,
+    repos: Sequence[RepoWorkspace] = (),
     host_config: dict[str, object] | None = None,
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     secret_mounts: Sequence[Mapping[str, object]] | None = None,
+    tolerations: Sequence[Mapping[str, object]] | None = None,
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
+    ttl_seconds_after_finished: int = _JOB_TTL_SECONDS_AFTER_FINISHED,
+    runtime_class: str | None = None,
+    home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
 ) -> dict[str, object]:
     """
     Build the sandbox Job manifest as a plain dict.
@@ -540,10 +632,14 @@ def build_job_manifest(
     ``restartPolicy: OnFailure`` so the kubelet automatically restarts a
     crashed host container with exponential backoff (10 s, 20 s, 40 s, …
     capped at 5 min).  The Job's ``backoffLimit`` caps the total retry count,
-    and ``activeDeadlineSeconds`` enforces a hard lifetime.  Because
-    ``OnFailure`` restarts the SAME Pod in place, the Pod name is stable
-    across retries — the token Secret ``secretKeyRef`` keeps resolving and the
-    ``sandbox_id`` tracking in the managed-host machinery is unaffected.
+    and ``activeDeadlineSeconds`` enforces a hard lifetime.
+    ``ttlSecondsAfterFinished`` is a backstop on top of both: once a Job
+    reaches a terminal state on its own, the cluster garbage-collects it
+    even if this launcher's own ``terminate()`` never runs or never lands.
+    Because ``OnFailure`` restarts the SAME Pod in place, the Pod name is
+    stable across retries — the token Secret ``secretKeyRef`` keeps
+    resolving and the ``sandbox_id`` tracking in the managed-host machinery
+    is unaffected.
 
     The host's existing WebSocket reconnect logic (exponential backoff in
     ``omnigent/host/connect.py``) re-registers the tunnel automatically after
@@ -587,6 +683,14 @@ def build_job_manifest(
       container start. Refresh is eventually consistent (kubelet sync, up to
       ~1 min), so the in-sandbox consumer must re-read the file each use — a
       value cached at start defeats the rotation.
+    - An operator *runtime_class* becomes ``spec.runtimeClassName``, scheduling
+      the Pod onto a sandboxed container runtime the cluster provides via a
+      ``RuntimeClass`` object (e.g. Kata Containers micro-VMs, gVisor). Unset
+      keeps the cluster's default runtime — today's behaviour exactly.
+    - Operator *tolerations* become ``spec.tolerations`` verbatim, letting the
+      Pod land on a tainted NodePool dedicated to sandboxes. A toleration only
+      permits scheduling there — pair it with *node_selector* to also pin the
+      Pod to that pool, or it may just as well land anywhere else untainted.
 
     :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Job is created in.
@@ -605,9 +709,8 @@ def build_job_manifest(
         a default ``kubernetes.io/arch: amd64``; an operator-supplied
         ``kubernetes.io/arch`` entry overrides the default.
     :param workspace: Absolute workspace root created by the init container.
-    :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
-    :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
-    :param repo_branch: Branch to clone, or ``None`` for the default branch.
+    :param repos: Repositories the init container clones into
+        ``<workspace>/<repo_name>`` in parallel; empty for an empty workspace.
     :param host_config: Deployment-supplied config content merged in by the
         init container under the host's resolved config directory, or ``None``.
         Non-secret by design:
@@ -621,6 +724,10 @@ def build_job_manifest(
     :param secret_mounts: Normalized Secret mounts (``{secret_name,
         mount_path}``) added as read-only ``secret`` volumes on the host
         container only, or ``None``.
+    :param tolerations: Normalized Toleration entries (``{key?, operator?,
+        value?, effect?, tolerationSeconds?}``) added to ``spec.tolerations``
+        verbatim, or ``None`` for none. Permits scheduling onto a tainted
+        NodePool; it does not by itself attract the Pod there.
     :param agent_name: Server-resolved built-in agent name the session runs,
         added as the ``omnigent.ai/agent`` classifier label. Stamped verbatim
         when it is already a valid label value, otherwise omitted (extending the
@@ -630,9 +737,18 @@ def build_job_manifest(
     :param backoff_limit: Maximum container restart attempts before the Job
         is marked Failed.
     :param active_deadline_seconds: Hard lifetime cap for the Job.
+    :param runtime_class: ``RuntimeClass`` name set as ``spec.runtimeClassName``,
+        or ``None`` to keep the cluster's default container runtime.
+    :param home_size_limit: ``sizeLimit`` quantity for the writable-HOME
+        ``emptyDir`` (default :data:`_HOME_SIZE_LIMIT_DEFAULT`), or ``None``
+        for an unbounded emptyDir. Bounding it makes the kubelet evict only a
+        sandbox that outgrows its HOME instead of ranking every Pod on the node.
     :returns: The Job manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
+    home_volume: dict[str, object] = {"name": "home", "emptyDir": {}}
+    if home_size_limit is not None:
+        home_volume["emptyDir"] = {"sizeLimit": home_size_limit}
     container_security = {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
@@ -682,7 +798,21 @@ def build_job_manifest(
             {"name": f"secret-{i}", "mountPath": mount["mount_path"], "readOnly": True}
         )
 
-    init_env = [{"name": "HOME", "value": _HOME_DIR}]
+    init_env: list[dict[str, object]] = [{"name": "HOME", "value": _HOME_DIR}]
+    if repos:
+        # The clone wires the per-user broker when the owner has connected GitHub
+        # (see _render_workspace_prep_command), which reads the launch token from
+        # the env — project it the same way the host container does. Only added
+        # when there's a repo to clone, so a workspace-less sandbox's init
+        # container never sees the token.
+        init_env.append(
+            {
+                "name": HOST_TOKEN_ENV_VAR,
+                "valueFrom": {
+                    "secretKeyRef": {"name": token_secret_name, "key": HOST_TOKEN_ENV_VAR}
+                },
+            }
+        )
     config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
     if config_home is not None:
         # Init and host containers share ONLY the HOME emptyDir, and both run
@@ -715,7 +845,7 @@ def build_job_manifest(
         "image": image,
         "workingDir": _HOME_DIR,
         "command": _render_workspace_prep_command(
-            workspace, clone_dir, repo_url, repo_branch, host_config
+            workspace, repos, server_url, host_id, host_config
         ),
         "env": init_env,
         "resources": pod_resources,
@@ -767,7 +897,7 @@ def build_job_manifest(
             "fsGroupChangePolicy": "OnRootMismatch",
             "seccompProfile": {"type": "RuntimeDefault"},
         },
-        "volumes": [{"name": "home", "emptyDir": {}}, *pvc_volumes, *secret_volumes],
+        "volumes": [home_volume, *pvc_volumes, *secret_volumes],
         "initContainers": [init_container],
         "containers": [host_container],
     }
@@ -788,6 +918,14 @@ def build_job_manifest(
                 _AGENT_LABEL,
                 job_name,
             )
+    if runtime_class is not None:
+        # Opt-in only: an absent key (not an explicit None/null) keeps the
+        # manifest byte-compatible with pre-runtime_class deployments.
+        pod_spec["runtimeClassName"] = runtime_class
+    if tolerations:
+        # Opt-in only, same rationale as runtime_class above: an absent key
+        # keeps the manifest byte-compatible with pre-tolerations deployments.
+        pod_spec["tolerations"] = list(tolerations)
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -799,6 +937,7 @@ def build_job_manifest(
         "spec": {
             "backoffLimit": backoff_limit,
             "activeDeadlineSeconds": active_deadline_seconds,
+            "ttlSecondsAfterFinished": ttl_seconds_after_finished,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": pod_spec,
@@ -998,6 +1137,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
     provider: ClassVar[str] = "kubernetes"
     can_resume: ClassVar[bool] = True
 
+    workload_kind: ClassVar[str] = "job"
+    """What ``start_host`` calls the object it creates, for progress output.
+    Overridden by subclasses that wrap the Pod in a different workload kind."""
+
     @property
     def capabilities(self) -> SandboxCapabilities:
         return SandboxCapabilities(
@@ -1007,6 +1150,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             resume_stopped=True,
             programmatic_terminate=True,
             classifies_runner_by_agent=True,
+            # The init container clones repos in parallel. agent-sandbox
+            # inherits this; managed Databricks launchers (Lakebox, Arca, …)
+            # are on the exec-model branch and stay single-repo until they
+            # opt in themselves.
+            multi_repo=True,
         )
 
     def __init__(
@@ -1023,7 +1171,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        tolerations: Sequence[Mapping[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
+        runtime_class: str | None = None,
+        home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1033,6 +1184,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         constructing the launcher is always safe (no cluster reachability
         required) and so tests can inject fakes before the real client is
         created.
+
+        :param home_size_limit: ``sizeLimit`` for the writable-HOME emptyDir
+            of every Pod, or ``None`` for an unbounded emptyDir (the caller
+            decides; ``sandbox.kubernetes.home_size_limit: null`` maps here).
         """
         self._image_ref = image
         self._namespace = namespace
@@ -1045,7 +1200,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._tolerations = list(tolerations) if tolerations else None
         self._pod_ready_timeout_s = pod_ready_timeout_s
+        self._runtime_class = runtime_class
+        self._home_size_limit = home_size_limit
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1268,9 +1426,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
@@ -1283,9 +1439,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param host_id: Server-chosen host identity.
         :param host_name: Server-chosen host display name.
         :param server_url: URL the host dials back to.
-        :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
-        :param repo_branch: Branch to clone, or ``None`` for the default branch.
-        :param repo_name: Directory the clone lands in, or ``None``.
+        :param repos: Repositories the init container clones into
+            ``<workspace>/<repo_name>`` in parallel; empty for an empty
+            workspace. The returned path is the single clone directory when one
+            repo is cloned, else the workspace root parenting them all.
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content the init container merges in before the host starts, or
             ``None``.
@@ -1306,13 +1463,12 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         env_literals = self._resolve_sandbox_env()
         secret_name = _token_secret_name(sandbox_id)
         workspace = f"{_HOME_DIR}/workspace"
-        clone_dir = f"{workspace}/{repo_name}" if repo_name else None
         if on_stage is not None:
             on_stage("starting")
         core = self._load_core()
-        batch = self._load_batch()
         click.echo(
-            f"▸ Creating Kubernetes job '{sandbox_id}' in namespace '{namespace}' from {image}"
+            f"▸ Creating Kubernetes {self.workload_kind} '{sandbox_id}' in "
+            f"namespace '{namespace}' from {image}"
         )
         try:
             try:
@@ -1329,14 +1485,15 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     env_literals=env_literals,
                     node_selector=self._node_selector,
                     workspace=workspace,
-                    clone_dir=clone_dir,
-                    repo_url=repo_url,
-                    repo_branch=repo_branch,
+                    repos=repos,
                     host_config=host_config,
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
+                    tolerations=self._tolerations,
                     agent_name=agent_name,
+                    runtime_class=self._runtime_class,
+                    home_size_limit=self._home_size_limit,
                 )
                 # Secret before Job so the Pod's secretKeyRef resolves
                 # immediately.
@@ -1347,9 +1504,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     ),
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
-                batch.create_namespaced_job(
-                    namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
-                )
+                self._create_workload(namespace, manifest)
             except (ApiException, HTTPError) as exc:
                 self._best_effort_delete(namespace, sandbox_id, secret_name)
                 if isinstance(exc, ApiException):
@@ -1367,8 +1522,25 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 raise
         finally:
             self._close_clients()
-        click.echo(f"  → job '{sandbox_id}' is starting the host")
-        return clone_dir or workspace
+        click.echo(f"  → {self.workload_kind} '{sandbox_id}' is starting the host")
+        # One repo → drop the agent straight into it; several (or none) → the
+        # workspace root that parents every clone.
+        return f"{workspace}/{repos[0].repo_name}" if len(repos) == 1 else workspace
+
+    def _create_workload(self, namespace: str, manifest: dict[str, object]) -> None:
+        """
+        Create the object that runs the sandbox host from a Job manifest.
+
+        Seam for subclasses that wrap the same Pod template in a different
+        workload kind: see
+        :class:`~omnigent.onboarding.sandboxes.agent_sandbox.AgentSandboxLauncher`.
+
+        :param namespace: Namespace to create the object in.
+        :param manifest: The manifest from :func:`build_job_manifest`.
+        """
+        self._load_batch().create_namespaced_job(
+            namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+        )
 
     def _find_job_pod(self, namespace: str, job_name: str) -> str | None:
         """
@@ -1434,11 +1606,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        timeout_s = (
-            self._pod_ready_timeout_s
-            if self._pod_ready_timeout_s is not None
-            else _POD_READY_TIMEOUT_S
-        )
+        timeout_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
         deadline = time.monotonic() + timeout_s
         last_reason: str | None = None
         pod_name: str | None = None

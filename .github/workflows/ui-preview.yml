@@ -1,4 +1,9 @@
 name: UI Preview
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('Delete UI preview PR {0}', inputs.pr_number)
+      || github.event.pull_request.title
+      || github.event.head_commit.message }}
 
 # Per-PR live preview of the Omnigent web UI, deployed to Databricks Apps.
 # The preview is ephemeral (SQLite + local artifacts) and ships no LLM/runner --
@@ -18,18 +23,41 @@ name: UI Preview
 #   1. The build checks out the PR's *head SHA* (immutable), never the live
 #      `refs/pull/<n>/merge` ref that silently re-points to whatever was last
 #      pushed -- so a run only ever builds one specific, inspectable commit.
-#   2. For FORK PRs the secret-bearing `deploy` job runs in the protected
-#      `ui-preview-fork` Environment, which requires a human reviewer to approve
-#      *each* run -- so every new commit on a labelled fork PR waits for a fresh
-#      approval before it can deploy. Same-repo PRs (maintainer + resolve-agent
-#      bot branches, which outside contributors cannot push to) are trusted and
-#      deploy without the gate.
+#   2. For UNTRUSTED fork PRs the secret-bearing `deploy` job runs in the
+#      protected `ui-preview-fork` Environment, which requires a human reviewer
+#      to approve *each* run -- so every new commit on a labelled fork PR waits
+#      for a fresh approval before it can deploy. Trusted authors (repo
+#      owners/members/collaborators, incl. a maintainer pushing from their own
+#      personal fork) and same-repo branches (resolve-agent bot, which outside
+#      contributors cannot push to) are trusted and deploy without the gate.
 # Repo-settings prerequisite: create an Environment named `ui-preview-fork`
 # (Settings -> Environments) with "Required reviewers" set to the maintainer
 # team. Without it the gate is a no-op (the job just runs), so it must be
 # configured for guard #2 to take effect. See .github/ui-preview/README.md.
 
 on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR whose preview should be deleted'
+        required: true
+        type: string
+      expected_id:
+        description: 'App ID observed by the cleanup reconciler'
+        required: true
+        type: string
+      expected_create_time:
+        description: 'App creation timestamp observed by the cleanup reconciler'
+        required: true
+        type: string
+      expected_update_time:
+        description: 'App update timestamp observed by the cleanup reconciler'
+        required: true
+        type: string
+      expected_creator:
+        description: 'App creator observed by the cleanup reconciler'
+        required: true
+        type: string
   push:
     branches:
       - main
@@ -46,7 +74,11 @@ on:
       - closed
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || 'main' }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch'
+        && format('cleanup-{0}', inputs.pr_number)
+        || github.event.pull_request.number
+        || 'main' }}
   cancel-in-progress: true
 
 defaults:
@@ -225,22 +257,29 @@ jobs:
 
   deploy:
     needs: build
-    # Gate the secret-bearing deploy behind a protected Environment for FORK PRs
-    # only: a labelled fork PR that gets a new commit must wait for a human
-    # reviewer to approve this run before it can deploy with Databricks
-    # OAuth-M2M creds. Same-repo PRs (maintainer + resolve-agent bot branches,
-    # which outside contributors can't push to) and `push` to main are trusted
-    # and skip the gate. `environment` must be a static string, so select it with
-    # a conditional: `ui-preview-fork` (protected -> requires approval) for forks,
-    # empty (no gate) otherwise. The Environment's "Required reviewers" rule is
-    # configured in repo Settings; see the header note.
-    environment: ${{ (github.event.pull_request.head.repo.fork && 'ui-preview-fork') || '' }}
+    # Gate the secret-bearing deploy behind a protected Environment for
+    # UNTRUSTED fork PRs only: a labelled outside-contributor fork PR that gets a
+    # new commit must wait for a human reviewer to approve this run before it can
+    # deploy with Databricks OAuth-M2M creds. Trusted authors (repo
+    # owners/members/collaborators -- e.g. a maintainer working from their own
+    # personal fork) skip the gate, as do same-repo branches (resolve-agent bot,
+    # which outside contributors can't push to) and `push` to main. `fork` alone
+    # is true even for a maintainer's own fork, so we also check
+    # `author_association` to keep maintainer forks from hitting the approval
+    # prompt. `environment` must be a static string, so select it with a
+    # conditional: `ui-preview-fork` (protected -> requires approval) for
+    # untrusted forks, empty (no gate) otherwise. The Environment's "Required
+    # reviewers" rule is configured in repo Settings; see the header note.
+    environment: >-
+      ${{ (github.event.pull_request.head.repo.fork
+           && !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+           && 'ui-preview-fork') || '' }}
     # Use ubuntu-latest. If the Databricks workspace IP-allowlists, register a
     # static-IP runner and switch `runs-on` to it.
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Download app files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
@@ -255,6 +294,7 @@ jobs:
 
       - name: Create or update app
         id: app
+        timeout-minutes: 40
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
@@ -263,31 +303,126 @@ jobs:
           APP_NAME: ${{ github.event_name == 'push' && 'omnigent-ui-preview-dev' || format('omnigent-ui-preview-pr-{0}', github.event.pull_request.number) }}
           APP_DESCRIPTION: ${{ github.event.pull_request.html_url || format('{0}/{1}', github.server_url, github.repository) }}
         run: |
-          if databricks apps get "$APP_NAME" > /dev/null 2>&1; then
-            echo "App already exists"
-          else
-            echo "Creating app..."
-            databricks apps create \
-              --json "{\"name\": \"$APP_NAME\", \"description\": \"$APP_DESCRIPTION\"}" \
-              --no-wait
-            for i in $(seq 1 40); do
-              STATE=$(databricks apps get "$APP_NAME" -o json | jq -r '.compute_status.state')
-              echo "Compute state: $STATE"
-              if [ "$STATE" = "ACTIVE" ]; then
+          refresh_app() {
+            APP_JSON=$(databricks apps get "$APP_NAME" -o json)
+            if ! jq -e --arg id "$APP_ID" --arg name "$APP_NAME" \
+              '.id == $id and .name == $name' <<< "$APP_JSON" > /dev/null; then
+              echo "::error::App identity changed while provisioning; refusing to continue"
+              exit 1
+            fi
+            APP_STATE=$(jq -er '.compute_status.state' <<< "$APP_JSON")
+            jq -r '"Compute state: \(.compute_status.state): \(.compute_status.message // "no details")"' \
+              <<< "$APP_JSON"
+          }
+
+          # A failed lookup must not turn an auth/API error into a create attempt.
+          APP_JSON=$(databricks apps list -o json | jq -c --arg name "$APP_NAME" \
+            '.[] | select(.name == $name)')
+          if [ -n "$APP_JSON" ]; then
+            APP_JSON=$(databricks apps get "$APP_NAME" -o json)
+          fi
+
+          for attempt in $(seq 1 3); do
+            echo "Provisioning attempt $attempt/3"
+            if [ -z "$APP_JSON" ]; then
+              APP_JSON=$(databricks apps create \
+                --json "$(jq -cn --arg name "$APP_NAME" --arg description "$APP_DESCRIPTION" \
+                  '{name: $name, description: $description}')" --no-wait -o json)
+            fi
+            APP_ID=$(jq -er '.id | select(type == "string" and length > 0)' <<< "$APP_JSON")
+
+            # Existing deployments retain their app identity, permissions, and URL.
+            if jq -e '.active_deployment != null or .pending_deployment != null
+              or (.default_source_code_path // "") != ""' <<< "$APP_JSON" > /dev/null; then
+              echo "App already has a deployment; reusing without recreation"
+              break
+            fi
+
+            for poll in $(seq 1 40); do
+              refresh_app
+              if [ "$APP_STATE" = "ACTIVE" ]; then
                 break
-              elif [ "$STATE" = "ERROR" ] || [ "$STATE" = "STOPPED" ]; then
-                echo "::error::Compute entered $STATE state"
-                exit 1
+              elif [ "$APP_STATE" = "ERROR" ] || [ "$APP_STATE" = "STOPPED" ]; then
+                break
               fi
               sleep 15
             done
-            if [ "$STATE" != "ACTIVE" ]; then
-              echo "::error::Timed out waiting for compute to become ACTIVE (last state: $STATE)"
+
+            # Provisioning may have finished during the last polling interval.
+            if [ "$APP_STATE" != "ACTIVE" ]; then
+              refresh_app
+            fi
+            if [ "$APP_STATE" = "ACTIVE" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Compute did not become ACTIVE after 3 attempts (last state: $APP_STATE)"
               exit 1
             fi
-          fi
 
-          URL=$(databricks apps get "$APP_NAME" -o json | jq -r '.url')
+            # Only an undeployed preview owned by this workflow is disposable.
+            if ! jq -e --arg creator "$DATABRICKS_CLIENT_ID" --arg description "$APP_DESCRIPTION" \
+              '.creator == $creator and .description == $description
+              and .active_deployment == null and .pending_deployment == null
+              and .pending_update == null
+              and (.default_source_code_path // "") == ""
+              and ((.resources // []) | length == 0)
+              and (.compute_status.state | IN("STARTING", "ERROR", "STOPPED"))' \
+              <<< "$APP_JSON" > /dev/null; then
+              echo "::error::App is not an unchanged, undeployed preview; refusing to recreate"
+              exit 1
+            fi
+
+            echo "::warning::Compute did not become ACTIVE (last state: $APP_STATE); recreating $APP_NAME"
+            databricks apps delete "$APP_NAME" --auto-approve
+            for poll in $(seq 1 20); do
+              APP_JSON=$(databricks apps list -o json | jq -c --arg name "$APP_NAME" \
+                '.[] | select(.name == $name)')
+              if [ -z "$APP_JSON" ]; then
+                break
+              fi
+              if ! jq -e --arg id "$APP_ID" '.id == $id' <<< "$APP_JSON" > /dev/null; then
+                echo "::error::App identity changed during deletion; refusing to continue"
+                exit 1
+              fi
+              sleep 3
+            done
+            if [ -n "$APP_JSON" ]; then
+              echo "::error::App still exists after deletion; refusing to create another app"
+              exit 1
+            fi
+            sleep "$((attempt * 15))"
+          done
+
+          if ! URL=$(python3 -c '
+          import json
+          import sys
+          from urllib.parse import urlsplit
+
+          url = json.load(sys.stdin).get("url")
+          if not isinstance(url, str) or any(
+              char.isspace() or ord(char) < 32 or ord(char) == 127 or char == "\\"
+              for char in url
+          ):
+              sys.exit(1)
+          try:
+              parsed = urlsplit(url)
+              valid = (
+                  parsed.scheme == "https"
+                  and bool(parsed.hostname)
+                  and parsed.username is None
+                  and parsed.password is None
+                  and (parsed.port is None or parsed.port > 0)
+              )
+          except ValueError:
+              sys.exit(1)
+          if not valid:
+              sys.exit(1)
+          print(url)
+          ' <<< "$APP_JSON"); then
+            echo "::error::App has no usable preview URL"
+            exit 1
+          fi
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Upload files and deploy
@@ -405,8 +540,11 @@ jobs:
     # and workspace files forever. Run on every close; the delete step is a cheap
     # no-op (one existence check) for PRs that never had a preview.
     if: >-
-      github.event_name != 'push'
-      && github.event.action == 'closed'
+      github.event_name == 'workflow_dispatch'
+      || (
+        github.event_name != 'push'
+        && github.event.action == 'closed'
+      )
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -418,28 +556,114 @@ jobs:
           databricks --version
 
       - name: Delete app
+        id: delete
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
           DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
           DATABRICKS_AUTH_TYPE: oauth-m2m
-          APP_NAME: omnigent-ui-preview-pr-${{ github.event.pull_request.number }}
+          DISPATCHED: ${{ github.event_name == 'workflow_dispatch' }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+          EXPECTED_ID: ${{ inputs.expected_id }}
+          EXPECTED_CREATE_TIME: ${{ inputs.expected_create_time }}
+          EXPECTED_UPDATE_TIME: ${{ inputs.expected_update_time }}
+          EXPECTED_CREATOR: ${{ inputs.expected_creator }}
+          REPO: ${{ github.repository }}
         run: |
-          if databricks apps get "$APP_NAME" > /dev/null 2>&1; then
-            SOURCE_PATH=$(databricks apps get "$APP_NAME" -o json \
-              | jq -r '.default_source_code_path // empty')
-            databricks apps delete "$APP_NAME" --auto-approve
-            if [ -n "$SOURCE_PATH" ]; then
-              WS_PATH="${SOURCE_PATH#/Workspace}"
-              databricks workspace delete "$WS_PATH" --recursive 2>/dev/null || true
+          set -euo pipefail
+          RESULT="$RUNNER_TEMP/ui-preview-cleanup-result.json"
+          INVENTORY="$RUNNER_TEMP/ui-preview-apps.json"
+          APP_JSON="$RUNNER_TEMP/ui-preview-app.json"
+          record_result() {
+            jq -n --arg action "$1" --arg reason "$2" \
+              '{action: $action, reason: $reason}' > "$RESULT"
+            echo "action=$1" >> "$GITHUB_OUTPUT"
+          }
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            record_result error 'invalid PR number'
+            exit 1
+          fi
+          APP_NAME="omnigent-ui-preview-pr-$PR_NUMBER"
+
+          databricks apps list -o json > "$INVENTORY"
+          if ! jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
+              "$INVENTORY" > "$APP_JSON"; then
+            echo "App is already absent: $APP_NAME"
+            record_result absent 'app was already absent'
+            exit 0
+          fi
+
+          databricks apps get "$APP_NAME" -o json > "$APP_JSON"
+          if [[ "$DISPATCHED" == true ]]; then
+            EXPECTED_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+            jq -e \
+              --arg name "$APP_NAME" \
+              --arg id "$EXPECTED_ID" \
+              --arg create_time "$EXPECTED_CREATE_TIME" \
+              --arg update_time "$EXPECTED_UPDATE_TIME" \
+              --arg creator "$EXPECTED_CREATOR" \
+              --arg description "$EXPECTED_URL" \
+              '
+                .name == $name
+                and .id == $id
+                and .create_time == $create_time
+                and .update_time == $update_time
+                and .description == $description
+                and .creator == $creator
+                and .default_source_code_path == ("/Workspace/Users/" + .creator + "/apps/" + $name)
+                and ((.resources // []) | length == 0)
+                and (.compute_status.state | IN("ACTIVE", "STOPPED", "ERROR"))
+                and (.pending_deployment == null)
+                and (.pending_update == null)
+              ' "$APP_JSON" > /dev/null || {
+                echo 'App changed after cleanup review; refusing deletion'
+                record_result error 'app changed after cleanup review'
+                exit 1
+              }
+            if [[ "$EXPECTED_CREATOR" != "$DATABRICKS_CLIENT_ID" ]]; then
+              echo 'App belongs to another deployment principal; retaining it'
+              record_result retain 'app belongs to another deployment principal'
+              exit 0
             fi
           fi
 
+          SOURCE_PATH=$(jq -r '.default_source_code_path // empty' "$APP_JSON")
+          databricks apps delete "$APP_NAME" --auto-approve
+          for _ in $(seq 1 20); do
+            databricks apps list -o json > "$INVENTORY"
+            if ! jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
+                "$INVENTORY" > /dev/null; then
+              break
+            fi
+            sleep 3
+          done
+          if jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
+              "$INVENTORY" > /dev/null; then
+            echo "App still exists after deletion: $APP_NAME"
+            record_result error 'app still exists after deletion'
+            exit 1
+          fi
+          if [[ "$DISPATCHED" != true && -n "$SOURCE_PATH" ]]; then
+            WS_PATH="${SOURCE_PATH#/Workspace}"
+            databricks workspace delete "$WS_PATH" --recursive 2>/dev/null || true
+          fi
+          record_result deleted 'app deleted and absence verified'
+
+      - name: Upload cleanup result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ui-preview-cleanup-result
+          path: ${{ runner.temp }}/ui-preview-cleanup-result.json
+          retention-days: 1
+          if-no-files-found: warn
+
       - name: Update PR comment
+        if: steps.delete.outputs.action == 'deleted' || steps.delete.outputs.action == 'absent'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
         run: |
           BODY="${COMMENT_MARKER}
 

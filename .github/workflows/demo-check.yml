@@ -1,21 +1,18 @@
 name: PR Hygiene
 
-# Hourly sweep over recently-opened PRs. Two independent checks share the run:
+# Hourly issue-link and review-readiness sweep. Manual dispatch also runs the
+# demo check as recovery for missed live events and existing stale labels:
 #
-#   1. Demo check -- comment on PRs that check "Bug fix" / "Feature" /
-#      "UI / frontend change" but provide no demo (screenshot / video).
-#      See demo-check.js.
+#   1. Demo check (manual only) -- reconcile the `needs-demo` label.
 #   2. Issue-link check -- comment on PRs that reference no issue and label them
 #      `needs-issue`, then close one still unlinked 7 days later. Forward-only:
 #      nothing opened before its effective date is considered, so the backlog is
 #      untouched. Enforcing, capped at LIMIT comments and LIMIT closures per run.
 #      See pr-issue-link.js.
 #
-# Both skip drafts and PRs they've already flagged, each deduping on its own label
-# (`needs-demo`, `needs-issue`). The demo check never closes anything; the
-# issue-link check closes only over its own label, only past the deadline the nudge
-# announced, and reversibly via `/reopen`. Never checks out or runs PR code -- they
-# read PR metadata via the API using only the default-branch script.
+# The demo check never closes anything; the issue-link check closes only over its
+# own label, only past the deadline the nudge announced, and reversibly via
+# `/reopen`. Neither checks out nor runs PR code.
 #
 # Two dispatch inputs exist for one-off runs: `scan_hours` widens the issue-link
 # window so PRs older than a day can be brought into the rule (hand-labeling them
@@ -68,10 +65,10 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github
-      # demo-check.js has no dry-run mode, so a dry run skips it rather than pass a
-      # flag it ignores. Nothing in the sweep writes when enforce is "false".
+      # Normal demo reconciliation is event-driven in pr-hygiene-live.yml. This
+      # manual-only sweep is the recovery path for missed events and old labels.
       - name: Demo check
-        if: inputs.enforce != 'false'
+        if: github.event_name == 'workflow_dispatch' && inputs.enforce != 'false'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           retries: 3
