@@ -176,7 +176,8 @@ as the worker finishes loading its model.
 
 ### Routes — `omnigent/server/routes/dictation.py`
 
-`create_dictation_router(*, auth_provider=None, engine_provider=None)`,
+`create_dictation_router(*, auth_provider=None, engine_provider=None,
+punctuation_provider=None, include_punctuation=True)`,
 registered in `create_app` under `/v1` like every other router. Dictation is
 not session-scoped (the new-chat composer has no session yet), so auth is
 identity-level only: authenticated user required when an auth provider is
