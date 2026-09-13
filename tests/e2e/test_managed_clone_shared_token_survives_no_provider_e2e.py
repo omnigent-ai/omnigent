@@ -391,9 +391,12 @@ def test_shared_git_token_clone_survives_no_provider_probe(tmp_path: Path) -> No
         assert probe.status_code != 401, (
             "harness setup: the captured launch token does not resolve"
         )
-        assert not (probe.status_code == 200 and probe.json().get("connected")), (
-            "harness setup: this server unexpectedly vends a github credential: "
-            f"{probe.text[:200]}"
+        # Pin the exact trigger under test: the no-provider 404. A 200
+        # ``connected: false`` would exercise the (already-working)
+        # confirmed-unlinked path instead, and the pre-fix code would pass.
+        assert probe.status_code == 404, (
+            "harness setup: expected the no-provider 404 from the credential "
+            f"endpoint, got HTTP {probe.status_code}: {probe.text[:200]}"
         )
 
         # Stand-in kubelet + github.com: image git identity, projected

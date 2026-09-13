@@ -234,6 +234,15 @@ def test_fetch_keeps_transient_faults_ambiguous(monkeypatch: pytest.MonkeyPatch)
     assert h._fetch("http://s", "hid", "tok") is None
 
 
+def test_fetch_keeps_auth_failures_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Per-owner/per-host failures (unknown host, wrong or expired launch
+    # token) surface as 401, never 404. They must stay the ambiguous ``None``
+    # so connected-gated callers fail closed instead of falling back to the
+    # shared identity for what may be a linked owner.
+    monkeypatch.setattr(h.httpx, "get", lambda *a, **k: _Resp(401, {"detail": "unauthenticated"}))
+    assert h._fetch("http://s", "hid", "tok") is None
+
+
 def test_configure_clone_credentials_keeps_shared_helper_on_provider_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
