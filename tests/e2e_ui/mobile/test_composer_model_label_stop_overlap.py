@@ -62,8 +62,10 @@ from tests.e2e_ui.start_session.test_start_session import (
 # iPhone 13-class portrait viewport (matches Playwright's "iPhone 13" device
 # profile, so a recorder run with ``--device "iPhone 13"`` films pixel-exact).
 _IPHONE_VIEWPORT = {"width": 390, "height": 664}
-# A laptop window: wide enough for every composer label to fit on one row.
-_DESKTOP_VIEWPORT = {"width": 1200, "height": 852}
+# A wide desktop window: the chat page opens the sidebar and the workspace rail
+# beside the composer, so this is what it takes for the long Databricks model
+# label to fit on one row with room to spare.
+_DESKTOP_VIEWPORT = {"width": 1800, "height": 900}
 
 # The reporter's session shape: a Databricks-served Claude model (shown raw —
 # the id is not in the alias catalog) at xhigh effort. The composer label
@@ -361,7 +363,9 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         expect(label).to_be_visible()
         expect(label).to_contain_text(_MODEL_ID)
         expect(row).not_to_have_attribute("data-labels", "collapsed")
-        _assert_same_row(_box(page.get_by_test_id("composer-attach")), _box(stop))
+        # Measured against the model trigger, not the Stop button: the gated turn
+        # may have finished by now, and the row check doesn't depend on it.
+        _assert_same_row(_box(page.get_by_test_id("composer-attach")), _box(trigger))
         _screenshot(page, "chat-composer-desktop-expanded")
     finally:
         # Drop the snapshot route before teardown so an in-flight fetch
