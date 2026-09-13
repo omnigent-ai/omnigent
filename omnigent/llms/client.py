@@ -23,6 +23,11 @@ from omnigent.llms.errors import (
     PermanentLLMError,
     RetryableLLMError,
 )
+from omnigent.llms.reasoning_effort_support import (
+    accepts_reasoning_effort,
+    record_reasoning_effort_rejection,
+    strip_rejected_reasoning_effort,
+)
 from omnigent.llms.routing import parse_model_string
 from omnigent.llms.types import (
     Response,
@@ -57,6 +62,64 @@ async def _tee_stream_for_usage(
         if isinstance(event, ResponseCompletedEvent):
             _emit_usage_from_response(event.response)
         yield event
+
+
+async def _stream_with_reasoning_effort_fallback(
+    chunks: AsyncIterator[dict[str, Any]],
+    *,
+    adapter: Any,
+    messages: list[dict[str, Any]],
+    provider: str,
+    model: str,
+    tools: list[dict[str, Any]] | None,
+    extra: dict[str, Any],
+    connection_params: dict[str, str] | None,
+    timeout: int | None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield *chunks*, retrying once without ``reasoning_effort`` on rejection.
+
+    A provider that rejects the parameter fails at stream open (HTTP 400
+    before any chunk arrives), so the retry only fires when nothing has
+    been yielded yet — a mid-stream failure is never a capability
+    rejection and re-raises unchanged.
+
+    :param chunks: The original streaming chunk iterator.
+    :param adapter: The provider adapter to retry on.
+    :param messages: Chat Completions messages.
+    :param provider: Provider identifier, e.g. ``"xai"``.
+    :param model: Model id without provider prefix.
+    :param tools: Tool schemas or ``None``.
+    :param extra: The extra-params dict the first attempt used.
+    :param connection_params: Per-call connection overrides.
+    :param timeout: Request timeout in seconds or ``None``.
+    :returns: Async iterator of Chat Completions chunk dicts.
+    """
+    yielded = False
+    try:
+        async for chunk in chunks:
+            yielded = True
+            yield chunk
+        return
+    except Exception as exc:
+        stripped = strip_rejected_reasoning_effort(extra, exc) if not yielded else None
+        if stripped is None:
+            raise
+    retry_chunks = await adapter.chat_completions(
+        messages,
+        model,
+        tools,
+        True,
+        stripped,
+        connection_params=connection_params,
+        timeout=timeout,
+    )
+    assert not isinstance(retry_chunks, dict)
+    async for chunk in retry_chunks:
+        yield chunk
+    # The stripped retry streamed to completion, so the rejection is
+    # real — learn it. A retry that fails learns nothing, so a 400 that
+    # merely looked like a param rejection self-corrects.
+    record_reasoning_effort_rejection(provider, model)
 
 
 class _ResponsesNamespace:
@@ -225,7 +288,11 @@ class _ResponsesNamespace:
                     "type": "json_schema",
                     "json_schema": {k: v for k, v in fmt.items() if k != "type"},
                 }
-        if reasoning:
+        # Send reasoning_effort optimistically, but skip models with a
+        # seeded/learned HTTP 400 rejection (e.g. xAI rejects it on
+        # grok-4). An unlisted model that rejects it self-heals below:
+        # strip the param, retry once, and remember the rejection.
+        if reasoning and accepts_reasoning_effort(routed.provider, routed.model):
             extra["reasoning_effort"] = reasoning.get("effort")
 
         if stream:
@@ -239,20 +306,53 @@ class _ResponsesNamespace:
                 timeout=timeout,
             )
             assert not isinstance(chunks, dict)
+            if "reasoning_effort" in extra:
+                chunks = _stream_with_reasoning_effort_fallback(
+                    chunks,
+                    adapter=adapter,
+                    messages=messages,
+                    provider=routed.provider,
+                    model=routed.model,
+                    tools=tools,
+                    extra=extra,
+                    connection_params=connection_params,
+                    timeout=timeout,
+                )
             return chat_stream_to_response_events(
                 chunks,
                 model=routed.model,
             )
 
-        result = await adapter.chat_completions(
-            messages,
-            routed.model,
-            tools,
-            False,
-            extra,
-            connection_params=connection_params,
-            timeout=timeout,
-        )
+        try:
+            result = await adapter.chat_completions(
+                messages,
+                routed.model,
+                tools,
+                False,
+                extra,
+                connection_params=connection_params,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            stripped = strip_rejected_reasoning_effort(extra, exc)
+            if stripped is None:
+                raise
+            # One inline retry without the rejected param — a capability
+            # rejection is deterministic, so it stays outside the generic
+            # transient-failure backoff loop.
+            result = await adapter.chat_completions(
+                messages,
+                routed.model,
+                tools,
+                False,
+                stripped,
+                connection_params=connection_params,
+                timeout=timeout,
+            )
+            # Learn the rejection only after the stripped retry succeeded,
+            # so a 400 that merely looked like a param rejection
+            # self-corrects instead of durably disabling the param.
+            record_reasoning_effort_rejection(routed.provider, routed.model)
         assert isinstance(result, dict)
         return chat_response_to_response(result)
 

@@ -10,6 +10,7 @@ methods are async.
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
@@ -784,10 +785,18 @@ class _CapturingAdapter:
     """Adapter stub that captures the ``extra`` dict passed to chat_completions.
 
     :param captured_extra: List to append the extra dict into on each call.
+    :param side_effects: Optional per-call exceptions — each call pops the
+        first item and raises it when it is an exception; ``None`` items
+        mean "succeed".
     """
 
-    def __init__(self, captured_extra: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        captured_extra: list[dict[str, Any]],
+        side_effects: list[Exception | None] | None = None,
+    ) -> None:
         self._captured = captured_extra
+        self._side_effects = side_effects or []
 
     async def chat_completions(
         self,
@@ -809,6 +818,10 @@ class _CapturingAdapter:
         :returns: Minimal chat completion response.
         """
         self._captured.append(dict(extra))
+        if self._side_effects:
+            effect = self._side_effects.pop(0)
+            if effect is not None:
+                raise effect
         return {
             "choices": [{"message": {"content": "ok"}}],
             "model": model,
@@ -923,3 +936,292 @@ async def test_text_without_json_schema_not_translated(
     # (popped from extra but no response_format injected).
     assert "response_format" not in extra
     assert "text" not in extra
+
+
+# ── reasoning_effort gating and self-healing fallback ──────────────
+
+
+def _reasoning_effort_400() -> httpx.HTTPStatusError:
+    """Build the xAI-style HTTP 400 that rejects ``reasoning_effort``.
+
+    :returns: The constructed error.
+    """
+    return httpx.HTTPStatusError(
+        "HTTP 400",
+        request=httpx.Request("POST", "http://test/v1/chat/completions"),
+        response=httpx.Response(
+            400,
+            content=b'{"error": "Argument not supported on this model: reasoning_effort"}',
+        ),
+    )
+
+
+def _patch_chat_path(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+    *,
+    provider: str = "xai",
+    model: str = "test-model",
+) -> None:
+    """Route ``Client().responses.create`` to *adapter*'s chat path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param adapter: The adapter stub to route calls to.
+    :param provider: Routed provider name, e.g. ``"xai"``.
+    :param model: Routed bare model id.
+    """
+    from omnigent.llms.routing import RoutedModel
+
+    routed = RoutedModel(provider=provider, model=model)
+    monkeypatch.setattr("omnigent.llms.client.parse_model_string", lambda m: routed)
+    monkeypatch.setattr("omnigent.llms.client.get_adapter", lambda p: adapter)
+    monkeypatch.setattr(
+        "omnigent.llms.client.responses_input_to_chat_messages",
+        lambda input, instructions: [{"role": "user", "content": "test"}],
+    )
+    monkeypatch.setattr(
+        "omnigent.llms.client.chat_response_to_response",
+        lambda result: _make_response(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_reasoning_rejection_cache() -> None:
+    """Isolate the learned reasoning_effort rejections across tests."""
+    from omnigent.llms.reasoning_effort_support import clear_learned_rejections
+
+    clear_learned_rejections()
+
+
+@pytest.mark.asyncio
+async def test_seeded_rejection_omits_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model in the seeded rejection set never receives the param."""
+    captured: list[dict[str, Any]] = []
+    adapter = _CapturingAdapter(captured)
+    _patch_chat_path(monkeypatch, adapter, provider="xai", model="grok-4")
+
+    await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="xai/grok-4",
+        reasoning={"effort": "low"},
+    )
+
+    assert len(captured) == 1
+    assert "reasoning_effort" not in captured[0], (
+        f"seeded-rejection model still got the param: {captured[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unlisted_model_sends_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model outside the rejection sets keeps the optimistic send."""
+    captured: list[dict[str, Any]] = []
+    adapter = _CapturingAdapter(captured)
+    _patch_chat_path(monkeypatch, adapter, provider="groq", model="llama-3.3")
+
+    await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="groq/llama-3.3",
+        reasoning={"effort": "low"},
+    )
+
+    assert captured[0].get("reasoning_effort") == "low"
+
+
+@pytest.mark.asyncio
+async def test_param_rejection_strips_and_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live 400 naming the param triggers one stripped retry."""
+    captured: list[dict[str, Any]] = []
+    adapter = _CapturingAdapter(captured, side_effects=[_reasoning_effort_400(), None])
+    _patch_chat_path(monkeypatch, adapter, provider="xai", model="grok-new")
+
+    await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="xai/grok-new",
+        reasoning={"effort": "low"},
+    )
+
+    assert len(captured) == 2, f"expected optimistic send + stripped retry, got {len(captured)}"
+    assert captured[0].get("reasoning_effort") == "low"
+    assert "reasoning_effort" not in captured[1]
+
+    # The rejection is learned — the next call skips the param up front.
+    await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="xai/grok-new",
+        reasoning={"effort": "low"},
+    )
+    assert len(captured) == 3
+    assert "reasoning_effort" not in captured[2]
+
+
+@pytest.mark.asyncio
+async def test_failed_stripped_retry_learns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 400 that matched but whose stripped retry also fails is not learned.
+
+    A false-positive match (an unrelated 400 whose body happens to echo the
+    param and mention support) must self-correct: the retry fails the same
+    way, the error surfaces, and later calls keep sending the param.
+    """
+    captured: list[dict[str, Any]] = []
+    adapter = _CapturingAdapter(
+        captured, side_effects=[_reasoning_effort_400(), _reasoning_effort_400(), None]
+    )
+    _patch_chat_path(monkeypatch, adapter, provider="xai", model="grok-new")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await Client().responses.create(
+            input=[{"role": "user", "content": "hi"}],
+            model="xai/grok-new",
+            reasoning={"effort": "low"},
+        )
+    assert len(captured) == 2, "expected optimistic send + one stripped retry"
+
+    # Nothing was learned — the next call still sends the param.
+    await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="xai/grok-new",
+        reasoning={"effort": "low"},
+    )
+    assert captured[2].get("reasoning_effort") == "low"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_400_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 400 that doesn't reject the param re-raises without retry."""
+    unrelated = httpx.HTTPStatusError(
+        "HTTP 400",
+        request=httpx.Request("POST", "http://test"),
+        response=httpx.Response(400, content=b'{"error": "messages: field required"}'),
+    )
+    captured: list[dict[str, Any]] = []
+    adapter = _CapturingAdapter(captured, side_effects=[unrelated])
+    _patch_chat_path(monkeypatch, adapter, provider="xai", model="grok-new")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await Client().responses.create(
+            input=[{"role": "user", "content": "hi"}],
+            model="xai/grok-new",
+            reasoning={"effort": "low"},
+        )
+
+    assert len(captured) == 1, "an unrelated 400 must not trigger the fallback retry"
+
+
+class _StreamingCapturingAdapter:
+    """Adapter stub for the streaming path with per-call failure control.
+
+    :param captured_extra: List to append each call's extra dict into.
+    :param fail_first_open: Raise the param-rejection 400 when opening
+        the first stream.
+    :param fail_mid_stream: Raise the param-rejection 400 after the
+        first chunk of the first stream.
+    """
+
+    def __init__(
+        self,
+        captured_extra: list[dict[str, Any]],
+        *,
+        fail_first_open: bool = False,
+        fail_mid_stream: bool = False,
+    ) -> None:
+        self._captured = captured_extra
+        self._fail_first_open = fail_first_open
+        self._fail_mid_stream = fail_mid_stream
+
+    async def chat_completions(
+        self,
+        messages: Any,
+        model: str,
+        tools: Any,
+        stream: bool,
+        extra: dict[str, Any],
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Return a chunk iterator, failing per the configured mode.
+
+        :param messages: Chat messages (ignored).
+        :param model: Model id (ignored).
+        :param tools: Tool schemas (ignored).
+        :param stream: Streaming flag (ignored — always streams).
+        :param extra: The extra kwargs dict — captured per call.
+        :param kwargs: Additional kwargs (ignored).
+        :returns: Async iterator of Chat Completions chunk dicts.
+        """
+        call_index = len(self._captured)
+        self._captured.append(dict(extra))
+
+        async def _chunks() -> AsyncIterator[dict[str, Any]]:
+            if self._fail_first_open and call_index == 0:
+                raise _reasoning_effort_400()
+            yield {
+                "choices": [{"delta": {"role": "assistant", "content": "ok"}}],
+                "model": model,
+            }
+            if self._fail_mid_stream and call_index == 0:
+                raise _reasoning_effort_400()
+            yield {"choices": [{"delta": {}, "finish_reason": "stop"}], "model": model}
+
+        return _chunks()
+
+
+@pytest.mark.asyncio
+async def test_streaming_param_rejection_strips_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that 400s at open on the param retries without it."""
+    captured: list[dict[str, Any]] = []
+    adapter = _StreamingCapturingAdapter(captured, fail_first_open=True)
+    _patch_chat_path(monkeypatch, adapter, provider="xai", model="grok-new")
+
+    stream = await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="xai/grok-new",
+        reasoning={"effort": "low"},
+        stream=True,
+    )
+    assert not isinstance(stream, Response)
+    events = [event async for event in stream]
+
+    assert events, "the stripped retry must produce stream events"
+    assert len(captured) == 2
+    assert captured[0].get("reasoning_effort") == "low"
+    assert "reasoning_effort" not in captured[1]
+
+    # The completed stripped retry learned the rejection.
+    from omnigent.llms.reasoning_effort_support import accepts_reasoning_effort
+
+    assert not accepts_reasoning_effort("xai", "grok-new")
+
+
+@pytest.mark.asyncio
+async def test_streaming_mid_stream_failure_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after chunks were yielded re-raises — no silent replay."""
+    captured: list[dict[str, Any]] = []
+    adapter = _StreamingCapturingAdapter(captured, fail_mid_stream=True)
+    _patch_chat_path(monkeypatch, adapter, provider="xai", model="grok-new")
+
+    stream = await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="xai/grok-new",
+        reasoning={"effort": "low"},
+        stream=True,
+    )
+    assert not isinstance(stream, Response)
+    with pytest.raises(httpx.HTTPStatusError):
+        async for _event in stream:
+            pass
+
+    assert len(captured) == 1, "a mid-stream failure must not trigger a replaying retry"
