@@ -61,15 +61,30 @@ async def read_rate_limits(codex_path: str | None = None) -> JsonObject | None:
             await process.stdin.drain()
             return normalize_rate_limits(await _response(process.stdout, 2))
     finally:
-        if process.returncode is None:
-            _proc.terminate_tree(process)
-            try:
-                await asyncio.wait_for(process.wait(), 2)
-            except TimeoutError:
+        _cancelled: BaseException | None = None
+        try:
+            if process.returncode is None:
+                _proc.terminate_tree(process)
+                try:
+                    await asyncio.wait_for(process.wait(), 2)
+                except TimeoutError:
+                    _proc.kill_tree(process)
+                    with suppress(Exception):
+                        await process.wait()
+        except asyncio.CancelledError as exc:
+            _cancelled = exc
+            if process.returncode is None:
                 _proc.kill_tree(process)
-                with suppress(Exception):
-                    await process.wait()
-        process.stdin.close()
-        with suppress(Exception):
-            await process.stdin.wait_closed()
-        close_subprocess_transport(process)
+                with suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(process.wait()), 2)
+        try:
+            process.stdin.close()
+            with suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(process.stdin.wait_closed()), 2)
+            close_subprocess_transport(process)
+        except asyncio.CancelledError as exc:
+            _cancelled = exc
+            with suppress(Exception):
+                close_subprocess_transport(process)
+        if _cancelled is not None:
+            raise _cancelled
