@@ -8,9 +8,18 @@
 // returned cleanup directly — no `useEffect` + `useRef` dance, no
 // guard against a missing `ref.current`.
 
-import { Loader2Icon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  ArrowUpIcon,
+  CornerDownLeftIcon,
+  Loader2Icon,
+  type LucideIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
@@ -28,6 +37,7 @@ import {
   type ConnectionState,
   type TerminalActivityListener,
   type TerminalInputListener,
+  type TerminalMobileKey,
   isUnexpectedTerminalClose,
   TerminalSession,
   WS_CLOSE_WRONG_REPLICA,
@@ -138,6 +148,10 @@ export function TerminalView({
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
+  // Show an on-screen key bar for the keys a phone soft keyboard lacks
+  // (Esc, arrows, Shift+Tab) only on the mobile layout, and only for a
+  // writable attach — a read-only viewer can't type anyway.
+  const isMobile = useIsMobileViewport();
   const clipboardScope = `${sessionId}\0${terminalId}\0${readOnly ? "read-only" : "writable"}`;
   const [clipboardPrompt, setClipboardPrompt] = useState<{
     scope: string;
@@ -757,6 +771,9 @@ export function TerminalView({
       <div className="min-h-0 flex-1 overflow-hidden p-1">
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
       </div>
+      {isMobile && !readOnly && (
+        <MobileKeyBar onKey={(key) => sessionRef.current?.sendMobileKey(key)} />
+      )}
       {state.kind !== "connected" && (
         <StatusOverlay
           state={state}
@@ -766,6 +783,82 @@ export function TerminalView({
           resumeError={resumeError}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * The on-screen keys, left→right. Arrows and Enter render as icons; Esc as a
+ * glyph and Shift+Tab as stacked words (lucide has no icon for either), with
+ * the arrow cluster reading as a unit in the middle.
+ */
+const MOBILE_KEYS: readonly {
+  key: TerminalMobileKey;
+  label: string;
+  icon?: LucideIcon;
+  glyph?: string;
+  /** Stacked text lines, for keys with no single glyph (e.g. Shift+Tab). */
+  lines?: readonly string[];
+}[] = [
+  { key: "shift-tab", label: "Shift + Tab", lines: ["SHIFT", "TAB"] },
+  { key: "escape", label: "Escape", glyph: "esc" },
+  { key: "left", label: "Left arrow", icon: ArrowLeftIcon },
+  { key: "up", label: "Up arrow", icon: ArrowUpIcon },
+  { key: "down", label: "Down arrow", icon: ArrowDownIcon },
+  { key: "right", label: "Right arrow", icon: ArrowRightIcon },
+  { key: "enter", label: "Enter", icon: CornerDownLeftIcon },
+];
+
+/**
+ * Touch key bar under the xterm grid for the keys a mobile soft keyboard
+ * omits. Sits in the terminal-view's flex column as a fixed row, so the
+ * xterm grid re-fits above it (the session's ResizeObserver picks up the
+ * height change). While the bridge is connecting or closed the
+ * {@link StatusOverlay} covers it — the keys are only live once connected.
+ */
+function MobileKeyBar({ onKey }: { onKey: (key: TerminalMobileKey) => void }) {
+  return (
+    <div
+      data-testid="terminal-mobile-keys"
+      className="flex shrink-0 items-stretch gap-1 border-border border-t px-1 pt-1"
+    >
+      {MOBILE_KEYS.map(({ key, label, icon: Icon, glyph, lines }) => (
+        <Button
+          key={key}
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label={label}
+          title={label}
+          // Suppress the button's focus grab so the tap never blurs the
+          // xterm textarea — otherwise the soft keyboard would dismiss on
+          // every press. term.input still delivers the key without focus.
+          onPointerDown={(e) => e.preventDefault()}
+          onClick={() => onKey(key)}
+          className="h-9 flex-1 touch-manipulation px-0 text-muted-foreground"
+          componentId="diagnostics.terminal.mobile-key"
+        >
+          {Icon ? (
+            <Icon className="size-4" aria-hidden />
+          ) : lines ? (
+            // `leading-none` stacks the words tightly; `translate-y-px` nudges
+            // the block down 1px to optically center it — all-caps text with no
+            // descenders otherwise reads top-heavy in the line box.
+            <span
+              aria-hidden
+              className="flex translate-y-px flex-col items-center font-semibold text-[9px] leading-none tracking-tight"
+            >
+              {lines.map((line) => (
+                <span key={line}>{line}</span>
+              ))}
+            </span>
+          ) : (
+            <span aria-hidden className="text-sm">
+              {glyph}
+            </span>
+          )}
+        </Button>
+      ))}
     </div>
   );
 }

@@ -221,6 +221,53 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
   return null;
 }
 
+/**
+ * Keys the on-screen (mobile) key bar can send — the ones a phone soft
+ * keyboard has no dedicated key for.
+ */
+export type TerminalMobileKey = "escape" | "shift-tab" | "enter" | "up" | "down" | "left" | "right";
+
+/**
+ * Terminal byte sequence for a {@link TerminalMobileKey}.
+ *
+ * Arrow keys are mode-sensitive: a program that requested DECCKM
+ * (application cursor keys — xterm's ``applicationCursorKeysMode``) expects the
+ * ``ESC O x`` form; everything else expects plain ``ESC [ x``. Encoding against
+ * the pane's live mode makes a tapped arrow byte-identical to a physical arrow
+ * press, which is exactly what xterm's own ``onData`` emits. Escape (``ESC``),
+ * Shift+Tab (CSI ``Z`` — "backtab"), and Enter (``CR``) are mode-independent.
+ *
+ * Pure helper — exported for direct unit testing.
+ *
+ * :param key: The key the user tapped.
+ * :param applicationCursorKeys: The pane's current DECCKM state
+ *     (``term.modes.applicationCursorKeysMode``).
+ * :returns: The bytes to feed to the terminal input.
+ */
+export function terminalMobileKeyPayload(
+  key: TerminalMobileKey,
+  applicationCursorKeys: boolean,
+): string {
+  switch (key) {
+    case "escape":
+      return "\x1b";
+    case "shift-tab":
+      return "\x1b[Z";
+    case "enter":
+      // Carriage return, matching a physical Return key; the pane's tty
+      // translates CR→LF as needed.
+      return "\r";
+    case "up":
+      return applicationCursorKeys ? "\x1bOA" : "\x1b[A";
+    case "down":
+      return applicationCursorKeys ? "\x1bOB" : "\x1b[B";
+    case "right":
+      return applicationCursorKeys ? "\x1bOC" : "\x1b[C";
+    case "left":
+      return applicationCursorKeys ? "\x1bOD" : "\x1b[D";
+  }
+}
+
 // Reused across keystrokes — allocating a fresh TextEncoder per keypress
 // is needless churn on the input hot path.
 const INPUT_ENCODER = new TextEncoder();
@@ -747,6 +794,22 @@ export class TerminalSession {
    */
   focus(): void {
     this.term.focus();
+  }
+
+  /**
+   * Send a {@link TerminalMobileKey} as if the user pressed it — used by the
+   * on-screen key bar for keys a mobile soft keyboard lacks (Esc, arrows,
+   * Shift+Tab).
+   *
+   * Routes through ``term.input`` (like the wheel handler) so it takes the
+   * normal ``onData`` path — WS send plus input/clipboard bookkeeping — and
+   * encodes arrows against the pane's current cursor-key mode so a tap is
+   * byte-identical to a physical key press. Does not steal focus: the bar's
+   * buttons suppress their own focus so the soft keyboard stays put, and
+   * ``term.input`` fires regardless of focus.
+   */
+  sendMobileKey(key: TerminalMobileKey): void {
+    this.term.input(terminalMobileKeyPayload(key, this.term.modes.applicationCursorKeysMode), true);
   }
 
   /**
