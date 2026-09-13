@@ -113,6 +113,40 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
         assert "EXPLORE / SEARCH — answer a specific question" in prompt
 
 
+def test_hermes_forward_dispatch_allowed_reverse_dispatch_refused(
+    polly_spec: AgentSpec,
+) -> None:
+    """
+    Hermes stays a legitimate forward-dispatch coding worker, while the
+    prompt explicitly refuses routing a task BACKWARD through it.
+
+    Hermes is both an ordinary polly coding sub-agent (this bundle's
+    ``hermes`` entry) and the name of the separate upstream personal
+    orchestrator that can hand polly a task in the first place. Dropping
+    ``hermes`` from the roster (as a historical revision once did) would
+    remove a legitimate implementer/reviewer; dropping the anti-loop refusal
+    would let a tool result or human instruction route a task back to
+    whichever orchestrator started it, closing a dispatch cycle. Both
+    properties must hold at once.
+    """
+    # Forward dispatch: hermes is still a fully wired coding sub-agent.
+    assert "hermes" in polly_spec.tools.agents
+    fam = {a.name: a.executor.config.get("harness") for a in polly_spec.sub_agents}
+    assert fam["hermes"] == "hermes-native"
+
+    # Reverse dispatch: the prompt refuses handing the task back to Hermes
+    # (or any orchestrator already in the task's own delegation chain).
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    compact = " ".join(config.split())
+    assert "Anti-loop guard" in compact
+    assert "a plain forward dispatch to `hermes`" in compact
+    assert ("refuse; that closes a dispatch loop back to where the task started") in compact
+    assert (
+        "any dispatch that would route a task back to an orchestrator already "
+        "earlier in its own delegation chain, not only Hermes by name"
+    ) in compact
+
+
 def test_polly_preflights_host_harness_readiness() -> None:
     config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
     assert "sys_session_get_info({})" in config
