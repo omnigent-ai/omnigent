@@ -252,7 +252,9 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
 # constants in tests/test_harness_plugins.py). Claude also carries a bridge id
 # but resolves it through a runner helper with a server-side fallback, so it is
 # handled as a spawn-env special case rather than a plain label read.
-_BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "antigravity"})
+_BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset(
+    {"codex", "cursor", "opencode", "antigravity"}
+)
 
 
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
