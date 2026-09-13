@@ -128,7 +128,21 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
-    """Clean up per-session resources."""
+    """Clean up per-session resources.
+
+    Reap before removing the data dir: tests spawn real detached Omnigent
+    processes (host daemons, local servers, runner zygotes) that would
+    otherwise outlive the session — squatting port 6767 and serving a
+    deleted database. Reaping first also lets attribution use the live
+    directory path while orphans still reference it.
+    """
+    from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+
+    reaped, survivors = reap_leaked_omnigent_processes(_TEST_OMNIGENT_DATA_DIR)
+    for cmdline in reaped:
+        print(f"\nreaped leaked omnigent process: {cmdline}", file=sys.stderr)
+    for cmdline in survivors:
+        print(f"\nUNREAPED omnigent process survived SIGKILL: {cmdline}", file=sys.stderr)
     shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
 
 
@@ -532,6 +546,9 @@ def _worker_db_uri() -> Generator[str, None, None]:
                     "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
                 )
             )
+        elif dialect == "cockroachdb":
+            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
+            conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
         else:
             conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
             conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
@@ -548,6 +565,8 @@ def _worker_db_uri() -> Generator[str, None, None]:
     with root_engine2.connect() as conn:
         if dialect == "mysql":
             conn.execute(_sa.text(f"DROP DATABASE IF EXISTS `{db_name}`"))
+        elif dialect == "cockroachdb":
+            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
         else:
             conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
     root_engine2.dispose()
@@ -559,9 +578,9 @@ def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
     Per-test database URI.
 
     * **SQLite** (default): fresh file per test, fully isolated.
-    * **Postgres / MySQL** (``OMNIGENT_TEST_DB_URI`` set): reuses the
-      session-scoped worker database and truncates all non-alembic tables
-      between tests so each test starts clean without re-migrating.
+    * **Postgres / MySQL / CockroachDB** (``OMNIGENT_TEST_DB_URI`` set):
+      reuses the session-scoped worker database and clears all non-alembic
+      tables between tests so each test starts clean without re-migrating.
     """
     import sqlalchemy as _sa
 
@@ -581,10 +600,13 @@ def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
     tables = [t for t in _sa.inspect(engine).get_table_names() if t != "alembic_version"]
     # No FK constraints exist (dropped in p1a2b3c4d5e6) so no need to toggle
     # FOREIGN_KEY_CHECKS — one less round-trip per test on MySQL.
+    operation = "DELETE FROM" if dialect == "cockroachdb" else "TRUNCATE TABLE"
     with engine.begin() as conn:
         for table in tables:
             q = f"`{table}`" if dialect == "mysql" else f'"{table}"'
-            conn.execute(_sa.text(f"TRUNCATE TABLE {q}"))
+            # CockroachDB implements TRUNCATE as a schema change. DELETE keeps
+            # per-test cleanup transactional and avoids seconds of DDL work.
+            conn.execute(_sa.text(f"{operation} {q}"))
     yield _worker_db_uri
 
 

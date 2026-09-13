@@ -27,19 +27,19 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.claude_native_bridge import (
+from omnigent.entities.session_resources import SessionResourceView, terminal_resource_view
+from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
 )
-from omnigent.entities.session_resources import SessionResourceView, terminal_resource_view
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ToolsConfig
 from omnigent.terminals import TerminalListEntry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
-# Matches ``_TOOL_RELAY_FILE`` in ``omnigent.claude_native_bridge``.
+# Matches ``_TOOL_RELAY_FILE`` in ``omnigent.harnesses.claude_native.bridge``.
 _TOOL_RELAY_FILE = "tool_relay.json"
 
 
@@ -258,7 +258,7 @@ def _skip_tools_changed_notification(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # The runner imports the name from this module at call time, so patching
     # the module attribute is picked up by _ensure_comment_relay_started.
-    monkeypatch.setattr("omnigent.claude_native_bridge.post_tools_changed", _noop)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.post_tools_changed", _noop)
 
 
 @pytest.fixture
@@ -470,7 +470,7 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
     dispatching directly to comment/session-query handlers.  Policy enforcement
     on these relay tools was previously bypassed; this test pins the fix.
     """
-    import omnigent.claude_native_bridge as _bridge_mod
+    import omnigent.harnesses.claude_native.bridge as _bridge_mod
 
     # Records every POST sent to the fake Omnigent server.
     ap_mcp_posts: list[dict[str, Any]] = []
@@ -625,11 +625,11 @@ async def test_relay_policy_evaluate_proxies_to_server_client(
     """Relay POST /policies/evaluate forwards body to server_client and returns verdict."""
     import asyncio
 
-    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
-    from omnigent.claude_native_bridge import start_tool_relay
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir as _prep
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
     bridge_dir = _prep("relay-policy-test", workspace=tmp_path)
     session_id = "conv_relay_test"
@@ -692,11 +692,11 @@ async def test_relay_policy_evaluate_rejects_wrong_token(
     """Relay /policies/evaluate returns 401 for wrong bearer token."""
     import asyncio
 
-    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
-    from omnigent.claude_native_bridge import start_tool_relay
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir as _prep
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
     bridge_dir = _prep("relay-policy-auth-test", workspace=tmp_path)
 
@@ -743,11 +743,11 @@ async def test_relay_policy_evaluate_surfaces_upstream_error_in_502_body(
     """
     import asyncio
 
-    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
-    from omnigent.claude_native_bridge import start_tool_relay
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir as _prep
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
     bridge_dir = _prep("relay-policy-error-test", workspace=tmp_path)
 
@@ -801,11 +801,11 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
     """
     import asyncio
 
-    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
-    from omnigent.claude_native_bridge import start_tool_relay
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir as _prep
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
     bridge_dir = _prep("relay-policy-trunc-test", workspace=tmp_path)
 

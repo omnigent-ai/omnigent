@@ -428,7 +428,7 @@ def test_advertisement_is_written_owner_only_with_no_leftover_temp(tmp_path: Pat
 def test_prune_never_removes_the_shared_router_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from omnigent import claude_native_bridge
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 
     root = tmp_path / "subagent-routers"
     root.mkdir()

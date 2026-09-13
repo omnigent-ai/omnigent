@@ -286,3 +286,87 @@ def test_unusable_payloads_stay_omitted() -> None:
             b"\x89PNG\r\n\x1a\n"
         )
     )
+
+
+def test_sanitize_replayed_image_blocks_downgrades_the_compaction_marker() -> None:
+    """A compaction-stripped image nested in a tool_result becomes text."""
+    marker = "[image/png content omitted from the compaction snapshot]"
+    content = [
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_img",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": marker},
+                }
+            ],
+        }
+    ]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    inner = sanitized[0]["content"][0]
+    assert inner["type"] == "text"
+    assert "image/png" in inner["text"]
+    assert marker not in json.dumps(sanitized)
+
+
+def test_sanitize_replayed_image_blocks_preserves_valid_images() -> None:
+    """A still-valid image survives sanitization, canonicalized in place."""
+    content = [
+        {"type": "text", "text": "keep me"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _TINY_PNG_BASE64},
+        },
+    ]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0] == {"type": "text", "text": "keep me"}
+    assert sanitized[1]["type"] == "image"
+    assert sanitized[1]["source"]["media_type"] == "image/png"
+
+
+def test_sanitize_replayed_image_blocks_downgrades_bare_mcp_shape() -> None:
+    """A stripped MCP ``data``/``mimeType`` image block becomes text too."""
+    marker = "[image/png content omitted from the compaction snapshot]"
+    content = [{"type": "image", "data": marker, "mimeType": "image/png"}]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0]["type"] == "text"
+    assert "image/png" in sanitized[0]["text"]
+    assert marker not in json.dumps(sanitized)
+
+
+def test_sanitize_replayed_image_blocks_leaves_tool_use_input_untouched() -> None:
+    """A ``tool_use.input`` shaped like an image block is not rewritten.
+
+    The compacted-message path runs for assistant content, which carries
+    ``tool_use`` blocks. Their ``input`` is opaque structured data — a value
+    that merely looks like ``{"type": "image", ...}`` must survive verbatim.
+    """
+    tool_input = {"type": "image", "data": "not-base64", "media_type": "image/png"}
+    content = [
+        {
+            "type": "tool_use",
+            "id": "toolu_gen",
+            "name": "generate_image",
+            "input": tool_input,
+        }
+    ]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0]["input"] == tool_input
+
+
+def test_sanitize_replayed_image_blocks_preserves_url_source() -> None:
+    """A non-base64 ``source`` (e.g. url) carries no payload and is kept."""
+    content = [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0] == content[0]

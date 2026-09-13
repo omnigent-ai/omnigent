@@ -89,6 +89,44 @@ def test_header_folder_tag_moves_session_into_existing_project(
             httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
 
 
+def test_header_folder_tag_shows_the_projects_emoji_icon(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A session filed under a project with an icon shows that emoji, not a folder."""
+    base_url, session_id = seeded_session
+    uniq = uuid.uuid4().hex[:6]
+    project_name = f"E2E Header Icon {uniq}"
+    title = f"e2e-header-icon-{uniq}"
+    icon = "🚀"
+
+    project_id = httpx.post(
+        f"{base_url}/v1/projects",
+        json={"name": project_name, "config": {"icon": icon}},
+        timeout=10.0,
+    ).json()["id"]
+    httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"title": title, "project_id": project_id},
+        timeout=10.0,
+    ).raise_for_status()
+    # A committed turn settles the header title so the breadcrumb (and its
+    # folder tag) mounts.
+    seed_committed_turn(session_id, prompt="ping", reply="pong")
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+
+        tag = page.get_by_test_id("header-project-tag")
+        expect(tag).to_be_visible(timeout=30_000)
+        expect(tag).to_have_attribute("aria-label", f"Project: {project_name}")
+        # The project's emoji renders in place of the default folder glyph.
+        expect(tag.get_by_test_id("project-icon")).to_have_text(icon)
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
+
+
 def test_header_folder_tag_creates_project_from_typed_name(
     page: Page,
     seeded_session: tuple[str, str],

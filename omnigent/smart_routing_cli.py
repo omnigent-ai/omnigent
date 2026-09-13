@@ -37,7 +37,7 @@ import httpx
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import builtin_agent_id
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
 #: Provenance label on a CLI-routed session. The server merges the wrapper's
 #: own presentation labels (``omnigent.ui`` / ``omnigent.wrapper``) over it.
