@@ -64,6 +64,15 @@ describe("useSession — refresh_state", () => {
     expect(refreshFlags()).toEqual([true]);
   });
 
+  it("never fetches for a client-only temp id (no /v1/sessions/temp:*)", async () => {
+    const { Wrapper } = harness();
+    renderHook(() => useSession("temp:0a1b2c3d"), { wrapper: Wrapper });
+    await flush();
+    // The navigate-first invariant: a temp id has no server session, so the
+    // query is disabled by construction — no request is issued.
+    expect(getSessionSlimMock).not.toHaveBeenCalled();
+  });
+
   // Switching the session's agent invalidates this query. The refetch has to
   // re-read runner-backed state too, or `model_options` comes back from the
   // runner's process cache and the picker keeps showing the PREVIOUS agent's

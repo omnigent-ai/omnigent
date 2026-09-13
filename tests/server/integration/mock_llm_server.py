@@ -460,6 +460,110 @@ def anthropic_sse_text_response(
     return "".join(events)
 
 
+def anthropic_sse_thinking_text_response(
+    thinking: str,
+    text: str,
+    model: str = "mock-model",
+    usage: dict | None = None,
+) -> str:
+    """Build Anthropic Messages API SSE stream: a thinking block, then text.
+
+    Emits the extended-thinking wire shape — ``content_block_start`` of type
+    ``thinking``, word-chunked ``thinking_delta`` events, a ``signature_delta``,
+    ``content_block_stop`` — followed by the normal text block. Scripts a model
+    turn that visibly thinks before answering (e.g. Claude Code streaming
+    thinking into its TUI and transcript).
+
+    :param thinking: The thought text streamed in the thinking block.
+    :param text: The final assistant text streamed after the thought.
+    :param usage: Optional prompt-usage overrides merged into
+        ``message_start`` (see :func:`anthropic_sse_text_response`).
+    """
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    output_tokens = max(5, len(text.split()) + len(thinking.split()))
+
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+            },
+        },
+    )
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        },
+    )
+    # Word-chunked deltas so a paced stream (``chunk_delay``) shows the
+    # thought arriving progressively, the way a real thinking turn does.
+    words = thinking.split(" ")
+    for at in range(0, len(words), 6):
+        _evt(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": " ".join(words[at : at + 6]) + " ",
+                },
+            },
+        )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "mock-signature"},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 0})
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": text},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 1})
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
 def anthropic_sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
@@ -532,6 +636,69 @@ def anthropic_sse_tool_call_response(
     return "".join(events)
 
 
+def anthropic_sse_refusal_response(
+    model: str = "mock-model",
+    category: str = "cyber",
+) -> str:
+    """Build an Anthropic Messages SSE stream that ends in a safeguard refusal.
+
+    Mirrors the wire shape Claude's safeguards produce on a flagged message:
+    ``stop_reason: "refusal"`` plus ``stop_details.{type,category}`` in the
+    ``message_delta``. Claude Code reacts by arming its refusal-fallback and
+    re-issuing the turn on the family's ``ANTHROPIC_DEFAULT_*_MODEL`` pin — so
+    this is what exercises the fallback path on the claude-sdk harness.
+    """
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        },
+    )
+    _evt(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "I can't help with that."},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 0})
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "refusal",
+                "stop_sequence": None,
+                "stop_details": {"type": "refusal", "category": category},
+            },
+            "usage": {"output_tokens": 5},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
 # ── Response queue state ─────────────────────────────────
 
 
@@ -573,10 +740,26 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
-    # Prompt-usage overrides for the Anthropic ``message_start`` event
-    # (``/v1/messages`` only), e.g. {"input_tokens": 50000} — lets a test
-    # script the context size a claude harness observes mid-turn.
+    # Usage overrides. On ``/v1/messages`` merged into the Anthropic
+    # ``message_start`` event (e.g. {"input_tokens": 50000}) so a test can
+    # script the context size a claude harness observes mid-turn. On
+    # ``/v1/chat/completions`` returned verbatim as the OpenAI ``usage``
+    # object (JSON body and, when the client requests
+    # ``stream_options.include_usage``, the final stream chunk) so a test can
+    # script the token accounting an openai-wire harness (e.g. kimi) records.
     usage: dict | None = None
+    # When set, ``/v1/messages`` returns a safeguard-refusal SSE stream with
+    # this category (e.g. ``"cyber"``) instead of text — used to exercise
+    # Claude Code's refusal-fallback on the claude-sdk harness.
+    refusal_category: str | None = None
+    # When set, ``/v1/messages`` streams an extended-thinking block carrying
+    # this text before the ``text`` block — scripts a turn where the model
+    # visibly thinks before answering.
+    thinking: str | None = None
+    # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
+    # historical single-chunk body; a small value paces the stream so live
+    # surfaces (a native TUI) visibly render intermediate deltas.
+    chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -636,6 +819,8 @@ class MockState:
         self.captured_requests: list[dict] = []
         self.request_count: int = 0
         self.pending_gates: list[QueuedResponse] = []
+        # Ids ``GET /v1/models`` reports; see ``POST /mock/served_models``.
+        self.served_models: list[str] = []
         self._lock = asyncio.Lock()
 
     def get_queue(self, key: str) -> _ResponseQueue:
@@ -779,6 +964,7 @@ class MockState:
                 del self.queues[key]
         self.captured_requests.clear()
         self.request_count = 0
+        self.served_models = []
 
 
 _state = MockState()
@@ -902,17 +1088,36 @@ async def create_message(
         _state.pending_gates.append(qr)
         await qr._gate.wait()
 
-    if qr.tool_calls:
-        sse_body = anthropic_sse_tool_call_response(qr.tool_calls)
+    req_model = parsed.get("model") if isinstance(parsed, dict) else None
+    echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
+    if qr.refusal_category is not None:
+        sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
+    elif qr.tool_calls:
+        sse_body = anthropic_sse_tool_call_response(qr.tool_calls, model=echo_model)
+    elif qr.thinking:
+        sse_body = anthropic_sse_thinking_text_response(
+            qr.thinking, qr.text, model=echo_model, usage=qr.usage
+        )
     else:
-        sse_body = anthropic_sse_text_response(qr.text, usage=qr.usage)
+        sse_body = anthropic_sse_text_response(qr.text, model=echo_model, usage=qr.usage)
 
     # Mid-stream fault: emit only a prefix and end, dropping message_stop.
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
+    chunk_delay = qr.chunk_delay
+
     async def _generate() -> AsyncIterator[str]:
-        yield sse_body
+        if chunk_delay > 0:
+            # Pace the stream one SSE event at a time so live surfaces
+            # render intermediate deltas instead of one instant repaint.
+            for event in sse_body.split("\n\n"):
+                if not event:
+                    continue
+                yield event + "\n\n"
+                await asyncio.sleep(chunk_delay)
+        else:
+            yield sse_body
 
     return StreamingResponse(
         _generate(),
@@ -982,6 +1187,11 @@ async def create_chat_completion(
     if cc_tool_calls:
         cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
+    cc_usage: dict[str, object] = qr.usage or {
+        "prompt_tokens": 10,
+        "completion_tokens": max(5, len(text.split())),
+        "total_tokens": 15,
+    }
     body_json = {
         "id": f"chatcmpl-{resp_id}",
         "object": "chat.completion",
@@ -993,11 +1203,7 @@ async def create_chat_completion(
                 "finish_reason": finish_reason,
             }
         ],
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": max(5, len(text.split())),
-            "total_tokens": 15,
-        },
+        "usage": cc_usage,
     }
     if parsed.get("stream"):
         delta: dict[str, object] = {"role": "assistant", "content": text or None}
@@ -1016,7 +1222,24 @@ async def create_chat_completion(
             ],
         }
 
-        stream_body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+        events: list[dict[str, object]] = [chunk]
+        # OpenAI stream-usage semantics: when the client requests
+        # ``stream_options.include_usage``, a final chunk with empty
+        # ``choices`` carries the ``usage`` object right before ``[DONE]``.
+        # Harnesses on this wire (e.g. kimi-code) read their per-turn token
+        # accounting from exactly this chunk.
+        stream_options = parsed.get("stream_options") if isinstance(parsed, dict) else None
+        if isinstance(stream_options, dict) and stream_options.get("include_usage"):
+            events.append(
+                {
+                    "id": f"chatcmpl-{resp_id}",
+                    "object": "chat.completion.chunk",
+                    "model": model or "mock-model",
+                    "choices": [],
+                    "usage": cc_usage,
+                }
+            )
+        stream_body = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
         # Mid-stream fault: drop the trailing ``[DONE]`` (and, at 0, the chunk
         # too) so the client sees the stream end without a terminator.
         if qr.truncate_after is not None:
@@ -1031,8 +1254,28 @@ async def create_chat_completion(
 
 @app.get("/v1/models")
 async def list_models() -> dict:
-    """Return an empty model list (satisfies SDK preflight checks)."""
-    return {"object": "list", "data": []}
+    """List the models the mock gateway serves.
+
+    Empty unless a test sets them via ``POST /mock/served_models`` — the
+    claude-sdk executor reads this to pin Claude Code's family aliases to the
+    ids the gateway actually serves.
+    """
+    return {"object": "list", "data": [{"id": m, "object": "model"} for m in _state.served_models]}
+
+
+@app.post("/mock/served_models")
+async def set_served_models(request: Request) -> dict[str, object]:
+    """Set the model ids ``GET /v1/models`` reports (cleared by ``/mock/reset``).
+
+    Body::
+
+        {"models": ["gw-claude-fable-5", "gw-claude-opus-4-8"]}
+    """
+    body = await request.json()
+    models = body.get("models", [])
+    async with _state._lock:
+        _state.served_models = [m for m in models if isinstance(m, str) and m]
+    return {"configured": True, "count": len(_state.served_models)}
 
 
 @app.post("/mock/configure")
@@ -1078,6 +1321,9 @@ async def configure(request: Request) -> dict[str, object]:
                     delay=entry.get("delay", 0.0),
                     truncate_after=entry.get("truncate_after"),
                     usage=entry.get("usage"),
+                    refusal_category=entry.get("refusal_category"),
+                    thinking=entry.get("thinking"),
+                    chunk_delay=entry.get("chunk_delay", 0.0),
                 )
             )
         count = len(queue.responses)

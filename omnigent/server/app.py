@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -28,6 +30,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.debug_logging import (
+    add_audit_attrs,
     audit_event_logger,
     current_request_audit_attrs,
     debug_event,
@@ -36,7 +39,14 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.extensions import ExtensionPluginState
+from omnigent.extensions.assets import (
+    ResolvedBundle,
+    build_asset_index,
+    parse_dev_bundle_overrides,
+)
+from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
@@ -52,7 +62,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -60,6 +70,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
+from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -74,6 +85,8 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.routes.extension_assets import create_extension_assets_router
+from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -139,6 +152,11 @@ class ServerInfoResponse(BaseModel):
     managed_sandboxes_enabled: bool
     sandbox_provider: str | None
     sandbox_providers: list[str]
+    # UI-relevant capability flags per launchable provider, e.g.
+    # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
+    # (multi-repo picker vs single). Providers absent from the map default off.
+    sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     server_version: str
@@ -149,6 +167,41 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     dictation_available: bool
     branding: BrandingInfo
+
+
+def _resolve_extension_state(
+    provided: ExtensionPluginState | None,
+) -> ExtensionPluginState:
+    """Resolve extensions without allowing catalog discovery to stop the server."""
+    if provided is not None:
+        return provided
+    try:
+        return load_extension_plugin_state()
+    # Distribution metadata is an external installation boundary. Preserve the
+    # rest of the server if global discovery itself fails before per-plugin
+    # failure isolation can apply.
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
+        return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
+
+
+def _resolve_extension_assets(
+    state: ExtensionPluginState,
+) -> tuple[dict[str, ResolvedBundle], dict[str, str]]:
+    """Resolve bundle snapshots without allowing asset failures to stop the server."""
+    try:
+        overrides = None
+        raw_overrides = os.environ.get("OMNIGENT_EXTENSION_DEV_BUNDLES", "").strip()
+        if raw_overrides:
+            overrides = parse_dev_bundle_overrides(raw_overrides)
+            _logger.warning(
+                "using development extension bundle overrides for: %s",
+                ", ".join(sorted(overrides)),
+            )
+        return build_asset_index(state, overrides=overrides)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
+        return {}, {"registry": str(exc)}
 
 
 def _server_version() -> str:
@@ -720,7 +773,7 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     import inspect
     import tempfile
 
-    from omnigent.native_dispatch import resolve_hook
+    from omnigent.native.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
     materialize = resolve_hook(provider, "materialize_agent_spec")
@@ -757,7 +810,7 @@ def _ensure_default_native_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     for agent in NATIVE_CODING_AGENTS:
         provider = native_provider_for_key(agent.key)
@@ -1035,10 +1088,15 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
+    github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
+    databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    extension_state: ExtensionPluginState | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1113,6 +1171,15 @@ def create_app(
         ``host_type="managed"`` create fails with a clear error).
         Managed-host credentials live on the ``hosts`` table, so no
         extra store is wired.
+    :param github_config: Parsed GitHub App configuration
+        (:class:`omnigent.server.github_app.GitHubAppConfig`) enabling
+        the per-user "Connect GitHub" flow. ``None`` disables the
+        integration (the connect UI is hidden and the routes stay
+        unmounted).
+    :param github_store: Persistence for per-user GitHub connections
+        (:class:`omnigent.connections.github.GithubConnectionStore`).
+        Required alongside ``github_config`` to enable the integration;
+        wired together by ``create_app``'s caller.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1132,6 +1199,9 @@ def create_app(
     :param feature_flags: Optional immutable release-feature snapshot.
         When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
         enabled set once at application construction.
+    :param extension_state: Optional pre-resolved installed-extension registry.
+        When omitted, entry points are discovered once at application
+        construction and the process-cached state is reused thereafter.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -1164,6 +1234,8 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    resolved_extension_state = _resolve_extension_state(extension_state)
+    extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -1431,9 +1503,26 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        managed_sandbox_reaper: ManagedSandboxReaper | None = None
+        if sandbox_config is not None and sandbox_config.reaper.enabled:
+            if host_store is None:
+                _logger.warning(
+                    "Managed sandbox reaper is enabled but no host store is configured; "
+                    "the reaper will not run"
+                )
+            else:
+                managed_sandbox_reaper = ManagedSandboxReaper(
+                    host_store=host_store,
+                    sandbox_config=sandbox_config,
+                )
+                app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
+                await managed_sandbox_reaper.start()
+
         try:
             yield
         finally:
+            if managed_sandbox_reaper is not None:
+                await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
@@ -1482,6 +1571,30 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    # GitHub App integration: enabled only when both the config and the
+    # connection store are wired. The client is stateless (holds config),
+    # built once and reused for the connect flow.
+    # Per-user connection providers (GitHub, ...). One registry entry per
+    # provider (connections_registry) drives uniform wiring: each gets
+    # ``app.state.<name>_{config,store,client}``, populated only when both its
+    # config and its store are present, else None. The info endpoint's
+    # enabled_connections list and the router mounting below both read these.
+    from omnigent.server.connections_registry import connection_providers
+
+    _connection_inputs = {
+        "github": (github_config, github_store),
+        "databricks": (databricks_config, databricks_store),
+    }
+    for _provider in connection_providers():
+        _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
+        _on = _cfg is not None and _store is not None
+        setattr(app.state, f"{_provider.name}_config", _cfg if _on else None)
+        setattr(app.state, f"{_provider.name}_store", _store if _on else None)
+        setattr(
+            app.state,
+            f"{_provider.name}_client",
+            _provider.client_factory(_cfg) if _on else None,
+        )
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1581,6 +1694,9 @@ def create_app(
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
+    # Extend a managed sandbox while its runner tunnel is live (the managed-path
+    # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
+    managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
@@ -1734,13 +1850,49 @@ def create_app(
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
-        if exc.http_status >= 500:
+        # Stamp attribution onto the per-request audit-envelope row (table-only,
+        # one per request) for EVERY code, so the 4xx we deliberately don't log
+        # to the ERROR stream are still queryable by owner/impact/phase. The
+        # dedicated ERROR/WARN logs below stay reserved for the 5xx and the
+        # offline-runner state, keeping the ERROR stream low-noise (see #6242).
+        add_audit_attrs(
+            code=str(exc.code),
+            http_status=str(exc.http_status),
+            error_category=exc.category.value,
+            error_impact=exc.impact.value,
+            error_phase=exc.phase.value,
+        )
+        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+            # A session state, not a fault: the user's machine is asleep or
+            # the host disconnected, and clients render it as a reconnect
+            # affordance. Through the 5xx arm every poll of an offline
+            # session added an "Internal error" plus a stack, which is what
+            # buried the real 500s.
+            _logger.warning(
+                "Runner unavailable: %s",
+                exc.message,
+                extra=_error_audit_extra(
+                    request,
+                    phase="unavailable",
+                    code=str(exc.code),
+                    http_status="503",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
+                ),
+            )
+        elif exc.http_status >= 500:
             _logger.error(
                 "Internal error: %s",
                 exc.message,
                 exc_info=exc,
                 extra=_error_audit_extra(
-                    request, code=str(exc.code), http_status=str(exc.http_status)
+                    request,
+                    code=str(exc.code),
+                    http_status=str(exc.http_status),
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
@@ -1749,13 +1901,44 @@ def create_app(
                 request.url.path,
                 exc.message,
                 extra=_error_audit_extra(
-                    request, phase="rejected", code=str(exc.code), http_status="400"
+                    request,
+                    phase="rejected",
+                    code=str(exc.code),
+                    http_status="400",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        """Attribute schema-validation rejections, then return the stock 422 body.
+
+        A schema/transport-invalid request is caller-side input (category=user),
+        and it rejects one request without harming the session (impact=benign).
+        Attribution rides the per-request audit row rather than a dedicated
+        ERROR/WARN line; the response is delegated to FastAPI's default handler
+        so the 422 shape is unchanged.
+        """
+        # Attribute on the per-request audit row, not the ERROR stream: a schema
+        # rejection is expected, low-signal caller input, so it should be
+        # queryable without adding noise where the 500s must stand out.
+        add_audit_attrs(
+            code=str(ErrorCode.INVALID_INPUT),
+            http_status="422",
+            error_category=ErrorCategory.USER.value,
+            error_impact=ErrorImpact.BENIGN.value,
+            error_phase=ErrorPhase.REQUEST.value,
+        )
+        return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
@@ -1778,6 +1961,15 @@ def create_app(
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
         if isinstance(exc.orig, InvalidUuidError):
+            # A malformed id is caller-side input (a value no row can ever
+            # address), not a human referencing a real-but-gone one.
+            add_audit_attrs(
+                code=str(ErrorCode.NOT_FOUND),
+                http_status="404",
+                error_category=ErrorCategory.USER.value,
+                error_impact=ErrorImpact.BENIGN.value,
+                error_phase=ErrorPhase.REQUEST.value,
+            )
             # Keep a trace: a malformed id is usually a client bug, but this
             # branch would otherwise mask a server-side id-generation defect
             # as a routine 404.
@@ -1791,7 +1983,12 @@ def create_app(
             exc,
             exc_info=exc,
             extra=_error_audit_extra(
-                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.SERVER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
             ),
         )
         return JSONResponse(
@@ -1819,12 +2016,22 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
+        # fault is ours. Booking it as server would inflate our fault rate; the
+        # exception type is logged as a signature to rank for promotion to a real
+        # category. The client still gets internal_error / 500.
         _logger.error(
             "Unhandled exception: %s",
             exc,
             exc_info=exc,
             extra=_error_audit_extra(
-                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.UNKNOWN.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
+                error_type=type(exc).__name__,
             ),
         )
         return JSONResponse(
@@ -2254,10 +2461,23 @@ def create_app(
         managed_sandboxes_enabled = False
         sandbox_provider = None
         sandbox_providers: list[str] = []
+        sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
+            sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+        # enabled_connections lists the connection providers this deploy has
+        # wired (config + store present), in a stable order. The web UI shows
+        # the Sandbox Integrations nav when the list is non-empty and renders
+        # one panel per provider. A provider appears only when both its config
+        # and its connection store are present.
+        enabled_connections = [
+            provider
+            for provider in ("github", "databricks")
+            if getattr(app.state, f"{provider}_config", None) is not None
+            and getattr(app.state, f"{provider}_store", None) is not None
+        ]
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -2321,6 +2541,8 @@ def create_app(
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
+                "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "server_version": _server_version(),
@@ -2487,6 +2709,25 @@ def create_app(
         prefix="/v1",
         tags=["harnesses"],
     )
+    app.include_router(
+        create_extensions_router(
+            resolved_extension_state,
+            bundles=extension_bundles,
+            asset_errors=extension_asset_errors,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
+    )
+    app.include_router(
+        create_extension_assets_router(
+            extension_bundles,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
+    )
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so
     # registering unconditionally is free for servers without the extra.
@@ -2577,7 +2818,6 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
-
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:
@@ -2705,9 +2945,13 @@ def create_app(
             )
             return
         runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
+        # Graceful disconnect: clear the persisted liveness stamp so other replicas
+        # flip offline at once. Not on our own shutdown: the runner is alive and
+        # re-tunnels to the replacement, which must not settle its turns to idle.
+        if shutdown_state.server_shutting_down():
+            session_live_state.touch_runner_liveness([runner_id])
+        else:
+            session_live_state.clear_runner_liveness(runner_id)
 
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.
@@ -2960,6 +3204,44 @@ def create_app(
             prefix="/v1",
             tags=["hosts"],
         )
+        # Host-facing credential vending: a sandbox fetches its owner's
+        # per-provider credential over the launch-token-authenticated channel
+        # instead of having it injected. One generic route serves every provider
+        # that registered a credential_resolver (app.state set by the
+        # connection-provider wiring above); it 404s for a provider not
+        # configured on this server, so mounting it unconditionally is safe.
+        #
+        # Registered AFTER create_hosts_router on purpose: its ``{provider}`` path
+        # param would otherwise shadow that router's literal
+        # ``/hosts/{host_id}/credentials/detected`` (Starlette matches in
+        # registration order with no literal-over-parameter priority).
+        from omnigent.server.routes.host_credentials import create_host_credentials_router
+
+        app.include_router(
+            create_host_credentials_router(host_store),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+
+    # Per-user connection routes (/v1/connections/{provider}/*): connect /
+    # callback / status / disconnect. One registry entry per provider; each is
+    # mounted only when configured (config + store present), so an unconfigured
+    # provider's surface stays absent exactly like a build without the feature.
+    for _provider in connection_providers():
+        _cfg = getattr(app.state, f"{_provider.name}_config", None)
+        _store = getattr(app.state, f"{_provider.name}_store", None)
+        if _cfg is None or _store is None:
+            continue
+        app.include_router(
+            _provider.router_factory(
+                _cfg,
+                _store,
+                auth_provider=auth_provider,
+                client=getattr(app.state, f"{_provider.name}_client", None),
+            ),
+            prefix="/v1",
+            tags=["integrations"],
+        )
 
     # Mount the auth router that matches the active provider. OIDC and
     # accounts share the /auth prefix but expose different endpoints
@@ -3048,23 +3330,72 @@ def create_app(
                 type(auth_provider).__name__,
             )
 
+        # Client-credentials grant (RFC 6749 §4.4): a machine client mints a
+        # delegated, path-scoped token with no browser in the loop. It is a
+        # grant_type BRANCH of the one /oauth/token mounted below, never a
+        # second router on that path — FastAPI resolves first-match-wins, so a
+        # duplicate route would be shadowed with no warning. Opt-in and
+        # default-off: the factory returns None unless a machine client is
+        # configured and its principal passes the admin vetting.
+        # See designs/CLIENT_CREDENTIALS.md.
+        handle_client_credentials = None
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+            "oidc",
+            "accounts",
+        ):
+            from omnigent.server.routes.client_credentials import (
+                MachineClientConfig,
+                create_client_credentials_handler,
+            )
+
+            if device_grant_store is None:
+                # Both /oauth/token mounts below need the grant store, so there
+                # is no endpoint to carry this branch. Parse the config anyway:
+                # from_env raises on a malformed one, so an operator error still
+                # surfaces at startup, and a machine client that cannot take
+                # effect is reported rather than silently dropped. Decided here
+                # rather than after building the handler, so the factory never
+                # logs the grant as enabled when nothing can answer it.
+                if MachineClientConfig.from_env() is not None:
+                    _logger.warning(
+                        "client-credentials: a machine client is configured, but no "
+                        "device-grant store was built (this deploy has no permission "
+                        "store), so /oauth/token is not mounted and the grant cannot "
+                        "answer. Configure a permission store."
+                    )
+            else:
+                handle_client_credentials = create_client_credentials_handler(
+                    auth_provider, permission_store
+                )
+
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only (the
-        # in-browser consent flow needs the accounts login page). Wires
-        # the full /oauth/* surface including the token endpoint. See
+        # OMNIGENT_DEVICE_GRANT_ENABLED. Supported in accounts and oidc
+        # modes (both own a server-minted session cookie). Header mode has
+        # no server-mintable identity and is excluded. See
         # designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
+        _is_github_oidc = (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "oidc"
+            and auth_provider._oidc_config is not None
+            and getattr(auth_provider._oidc_config, "provider_type", None) == "github"
+        )
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source == "accounts"
+            and auth_provider._source in ("accounts", "oidc")
+            and not _is_github_oidc
             and device_grant_store is not None
         ):
             from omnigent.server.routes.device_auth import create_device_auth_router
 
             app.include_router(
-                create_device_auth_router(auth_provider, device_grant_store),
+                create_device_auth_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
@@ -3087,10 +3418,23 @@ def create_app(
             # No device flow, but login-issued refresh grants still need
             # their token/revoke endpoints — in OIDC mode and in accounts
             # mode without the flag alike.
+            if _is_github_oidc and env_var_is_truthy(
+                "OMNIGENT_DEVICE_GRANT_ENABLED", default=False
+            ):
+                _logger.warning(
+                    "device-grant: GitHub OAuth does not support prompt=login / "
+                    "max_age=0, so the anti-phishing re-auth gate cannot be enforced. "
+                    "Device-grant flow skipped for this deployment; only "
+                    "/oauth/token + /oauth/revoke are mounted."
+                )
             from omnigent.server.routes.device_auth import create_oauth_token_router
 
             app.include_router(
-                create_oauth_token_router(auth_provider, device_grant_store),
+                create_oauth_token_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("login-grant: /oauth/token + /oauth/revoke enabled")

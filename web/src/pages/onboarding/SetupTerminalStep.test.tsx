@@ -29,6 +29,28 @@ describe("SetupTerminalStep", () => {
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
   });
 
+  it("renders streamed log lines from onSetupLog and unsubscribes on unmount", async () => {
+    const unsubscribe = vi.fn();
+    let emit: ((line: string) => void) | undefined;
+    const onSetupLog = vi.fn((cb: (line: string) => void) => {
+      emit = cb;
+      return unsubscribe;
+    });
+    const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
+    const { unmount } = render(
+      <SetupTerminalStep onStartLocal={onStartLocal} onSetupLog={onSetupLog} onBack={vi.fn()} />,
+    );
+
+    expect(onSetupLog).toHaveBeenCalledOnce();
+    emit?.("Starting omnigent server on 127.0.0.1:6767");
+    emit?.("Uvicorn running on http://127.0.0.1:6767");
+    expect(await screen.findByText("Uvicorn running on http://127.0.0.1:6767")).toBeInTheDocument();
+    expect(screen.getByText("Starting omnigent server on 127.0.0.1:6767")).toBeInTheDocument();
+
+    unmount();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
   it("fires onBack from Back on the failure screen", async () => {
     const onBack = vi.fn();
     render(

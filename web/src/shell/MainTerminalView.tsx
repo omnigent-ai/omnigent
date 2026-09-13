@@ -14,8 +14,7 @@
 // shells are opened and created from the rail's tab strip ("+" menu).
 
 import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { TerminalView } from "@/components/blocks/TerminalView";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   AGENT_TERMINAL_IDS,
@@ -26,6 +25,10 @@ import {
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
+
+const TerminalView = lazy(() =>
+  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
+);
 
 interface MainTerminalViewProps {
   conversationId: string;
@@ -165,9 +168,12 @@ export function MainTerminalView({
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
   const setSurfaceElement = useCallback(
     (element: HTMLDivElement | null) => {
+      // xterm scrollbars can override inherited visibility. React 18 drops
+      // the boolean inert prop, so set the attribute directly.
+      element?.toggleAttribute("inert", !visible);
       onSurfaceElement?.(element);
     },
-    [onSurfaceElement],
+    [onSurfaceElement, visible],
   );
 
   return (
@@ -270,19 +276,21 @@ export function MainTerminalView({
                   key={`${conversationId}:${activeTerminal.id}`}
                   className="flex h-full flex-col"
                 >
-                  <TerminalView
-                    sessionId={conversationId}
-                    terminalId={activeTerminal.id}
-                    readOnly={readOnly}
-                    active={visible}
-                    directAttachUrl={activeTerminal.directAttachUrl}
-                    onResume={runnerOffline && onResume ? handleResume : undefined}
-                    resumePending={resumePending}
-                    onStateChange={(state) => {
-                      setTerminalConnectionState(activeTerminal.id, state);
-                    }}
-                    onActivity={() => markTerminalActive(activeTerminal.id)}
-                  />
+                  <Suspense fallback={null}>
+                    <TerminalView
+                      sessionId={conversationId}
+                      terminalId={activeTerminal.id}
+                      readOnly={readOnly}
+                      active={visible}
+                      directAttachUrl={activeTerminal.directAttachUrl}
+                      onResume={runnerOffline && onResume ? handleResume : undefined}
+                      resumePending={resumePending}
+                      onStateChange={(state) => {
+                        setTerminalConnectionState(activeTerminal.id, state);
+                      }}
+                      onActivity={() => markTerminalActive(activeTerminal.id)}
+                    />
+                  </Suspense>
                 </div>
               )}
             </div>

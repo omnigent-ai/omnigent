@@ -1,4 +1,4 @@
-"""UI journey: the web Stop button must interrupt a running hermes/qwen turn.
+"""UI journey: the composer must interrupt a running hermes/qwen turn.
 
 Reproduces the stop-button no-interrupt defect: the ``hermes`` and
 ``qwen`` SDK executors historically inherited the base no-op
@@ -13,7 +13,7 @@ Journey per harness:
    local stub, so no real Hermes/Qwen install or auth is needed),
 2. send a message from the composer — the stub CLI starts a long "turn" and
    records its PID under the stub state dir,
-3. click the composer's Stop (Interrupt) button while the turn is running,
+3. click Interrupt, or reload the working session and press Escape in a draft,
 4. assert the running harness subprocess observes the interrupt within
    ``_INTERRUPT_DEADLINE_S``: either it is terminated (kimi-style
    ``proc.terminate()``) or it receives an ACP ``session/cancel`` (qwen's
@@ -66,7 +66,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -203,7 +203,7 @@ _QWEN_STUB = textwrap.dedent(
 )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def stub_harness_runner(
     live_server: str,
     tmp_path_factory: pytest.TempPathFactory,
@@ -217,6 +217,12 @@ def stub_harness_runner(
     from its binding token) with ``OMNIGENT_HERMES_PATH`` /
     ``OMNIGENT_QWEN_PATH`` and the stub state-dir vars in its subprocess env
     — ``os.environ`` is never mutated and no boot-order assumption is made.
+
+    Function-scoped on purpose: under sharded CI an arbitrary number of
+    unrelated tests can run between this file's parametrizations, and a
+    runner spawned once per session must stay tunnel-registered across that
+    whole gap — when it drops, the session bind 400s (``runner … is not
+    registered``). A fresh runner per test binds while provably online.
 
     Yields ``(runner_id, state_dir)``: the runner to bind sessions to, and
     the dir the stubs write their pid/cancel markers into.
@@ -356,28 +362,24 @@ def _wait_for(predicate, timeout_s: float, interval_s: float = 0.25) -> bool:
 
 
 @pytest.mark.parametrize("harness", ["hermes", "qwen"])
-def test_stop_button_interrupts_running_turn(
+@pytest.mark.parametrize("interrupt_control", ["button", "escape-after-reload"])
+def test_composer_interrupts_running_turn(
     page: Page,
     live_server: str,
     stub_harness_runner: tuple[str, Path],
     harness: str,
+    interrupt_control: str,
 ) -> None:
-    """Clicking Stop while a turn runs must cancel the harness subprocess.
+    """Interrupt and Escape must cancel the harness subprocess.
 
-    The user-observable contract (matching kimi and the other SDK
-    harnesses): Stop ends the in-flight work. Concretely, within
-    ``_INTERRUPT_DEADLINE_S`` of the click the stub CLI must either be
-    terminated or receive the harness's cancel signal. With the bug, the
-    hermes executor's base no-op ``interrupt_session`` means neither ever
-    happens and the stub keeps "working" — this test then fails.
+    Hermes without an active response ID leaves local streaming idle after
+    reload; Qwen's streamed response restores it. Escape must interrupt both
+    without clearing a draft.
     """
     stub_runner_id, state_dir = stub_harness_runner
+    # state_dir is freshly minted per test, so no stale pid/cancel markers.
     pid_file = state_dir / f"{harness}.pid"
     cancel_marker = state_dir / f"{harness}.cancelled"
-    # Clean any leftovers from a prior parametrization/retry.
-    for stale in (pid_file, cancel_marker):
-        if stale.exists():
-            stale.unlink()
 
     session_id = _create_stub_session(live_server, stub_runner_id, harness)
     try:
@@ -401,7 +403,30 @@ def test_stop_button_interrupts_running_turn(
         # while the session is working and the draft is empty.
         interrupt_button = page.get_by_role("button", name="Interrupt", exact=True)
         expect(interrupt_button).to_be_visible(timeout=30_000)
-        interrupt_button.click()
+        if interrupt_control == "escape-after-reload":
+
+            def without_active_response(route: Route) -> None:
+                response = route.fetch()
+                snapshot = response.json()
+                if harness == "hermes":
+                    snapshot["active_response_id"] = None
+                route.fulfill(response=response, json=snapshot)
+
+            page.route(f"**/v1/sessions/{session_id}", without_active_response)
+            page.reload()
+            expect(interrupt_button).to_be_visible(timeout=30_000)
+            expect(interrupt_button).to_be_enabled()
+            expected_placeholder = (
+                "Send a message…"
+                if harness == "hermes"
+                else "Send a follow-up (queued) — Esc to stop"
+            )
+            expect(composer).to_have_attribute("placeholder", expected_placeholder)
+            composer.fill("Keep this unfinished follow-up")
+            composer.press("Escape")
+            expect(composer).to_have_value("Keep this unfinished follow-up")
+        else:
+            interrupt_button.click()
 
         # The reproduction's observable: the running harness subprocess must
         # see the interrupt — terminated, or handed the harness's cancel.
@@ -412,7 +437,7 @@ def test_stop_button_interrupts_running_turn(
         # Give the recording a beat to show the post-Stop UI state.
         page.wait_for_timeout(1_000)
         assert interrupted, (
-            f"Stop button did not interrupt the running {harness} turn: the "
+            f"{interrupt_control} did not interrupt the running {harness} turn: the "
             f"stub {harness} CLI (pid {stub_pid}) is still running "
             f"{_INTERRUPT_DEADLINE_S:.0f}s after the interrupt was sent and "
             f"never received a cancel — {harness}'s executor does not "

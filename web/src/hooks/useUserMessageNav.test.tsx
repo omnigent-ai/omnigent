@@ -161,6 +161,33 @@ describe("useUserMessageNav", () => {
     warn.mockRestore();
   });
 
+  it("pulls a windowed-out target into the DOM via ensureItemVisible, then scrolls to it", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // rAF isn't real under fake timers; run the deferred retry synchronously.
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+      cb(0);
+      return 0;
+    });
+    // The row for "a" is windowed out (no DOM node). ensureItemVisible reports
+    // it scrolled it into the mounted range and mounts the node on the retry.
+    setupDom([]);
+    const ensureItemVisible = vi.fn((id: string) => {
+      setupDom([id]);
+      return true;
+    });
+    const { result } = renderHook(() => useUserMessageNav(["a"], ensureItemVisible));
+
+    act(() => result.current.goPrev());
+
+    expect(ensureItemVisible).toHaveBeenCalledWith("a");
+    expect(warn).not.toHaveBeenCalled();
+    const target = scrollSpy.mock.contexts.at(-1) as Element;
+    expect(target.getAttribute("data-user-message-id")).toBe("a");
+
+    raf.mockRestore();
+    warn.mockRestore();
+  });
+
   it("clears flashItemId on the timer", () => {
     setupDom(["a"]);
     const { result } = renderHook(() => useUserMessageNav(["a"]));

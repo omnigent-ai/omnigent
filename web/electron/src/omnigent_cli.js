@@ -376,23 +376,67 @@ function resolveCliPath(configuredPath, deps = {}) {
 }
 
 /**
- * Run an `omnigent` subcommand and resolve with its captured output. Never
+ * Normalize a CLI invocation. Public paths pass a string (`/path/omnigent`);
+ * Databricks-internal host enrollment passes an executable + fixed argv prefix
+ * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
+ *
+ * @param {string | {
+ *   executable: string,
+ *   prefixArgs?: string[],
+ *   displayName?: string,
+ * }} command
+ * @returns {{ executable: string, prefixArgs: string[], displayName: string }}
+ */
+function cliCommandParts(command) {
+  if (typeof command === "string" && command !== "") {
+    return { executable: command, prefixArgs: [], displayName: "omnigent" };
+  }
+  if (
+    command &&
+    typeof command === "object" &&
+    typeof command.executable === "string" &&
+    command.executable !== "" &&
+    (command.prefixArgs === undefined ||
+      (Array.isArray(command.prefixArgs) &&
+        command.prefixArgs.every((arg) => typeof arg === "string")))
+  ) {
+    const prefixArgs = command.prefixArgs ?? [];
+    return {
+      executable: command.executable,
+      prefixArgs,
+      displayName:
+        typeof command.displayName === "string" && command.displayName !== ""
+          ? command.displayName
+          : [path.basename(command.executable), ...prefixArgs].join(" "),
+    };
+  }
+  throw new TypeError("invalid CLI command");
+}
+
+/**
+ * Run an Omnigent CLI subcommand and resolve with its captured output. Never
  * rejects — a failure surfaces as a non-zero `code` plus stderr so callers can
  * decide. `execFile` (no shell) avoids quoting pitfalls.
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cliCommandParts>[0]} command
  * @param {string[]} args
  * @param {{ timeoutMs?: number }} [opts]
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
-function runCli(cliPath, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  const { executable, prefixArgs } = cliCommandParts(command);
   return new Promise((resolve) => {
-    execFile(cliPath, args, { timeout: timeoutMs, encoding: "utf8" }, (err, stdout, stderr) => {
-      // execFile sets err.code to the numeric exit code on a normal non-zero
-      // exit, or a string errno (e.g. "ENOENT") when the spawn itself failed.
-      const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
-      resolve({ code, stdout: stdout || "", stderr: stderr || "" });
-    });
+    execFile(
+      executable,
+      [...prefixArgs, ...args],
+      { timeout: timeoutMs, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        // execFile sets err.code to the numeric exit code on a normal non-zero
+        // exit, or a string errno (e.g. "ENOENT") when the spawn itself failed.
+        const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
+        resolve({ code, stdout: stdout || "", stderr: stderr || "" });
+      },
+    );
   });
 }
 
@@ -549,6 +593,193 @@ async function startLocalServer(cliPath) {
     ok: false,
     error: res.stderr.trim() || res.stdout.trim() || "failed to start the local server",
   };
+}
+
+/** Directory the background server writes its per-run logfile into. Mirrors
+ * `open_process_log_file("server", root=<data_dir>/logs)` in local_server.py:
+ * files are named `server-<timestamp>.log` and created at spawn time. */
+function localServerLogDir() {
+  return path.join(localDataDir(), "logs", "server");
+}
+
+/**
+ * Find the background server's CURRENT-run logfile by scanning the server log
+ * dir for the newest `server-*.log` created at/after `startedAtMs`.
+ *
+ * Why not the `local_server.logpath` sidecar: that sidecar is written only
+ * AFTER the server is healthy (local_server.py records it post-`/health`), so
+ * during boot it doesn't exist yet — tailing it can't stream the startup, and a
+ * stale sidecar from a prior crashed run would stream old content. The child's
+ * real logfile, by contrast, is created the moment it spawns. The `startedAtMs`
+ * floor rejects a previous run's log so a failed start never tails stale lines.
+ *
+ * @param {number} startedAtMs Only consider files modified at/after this (ms).
+ * @returns {string | null} Absolute path of the freshest matching log, or null.
+ */
+function findLiveServerLog(startedAtMs) {
+  const dir = localServerLogDir();
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return null; // dir not created yet (child hasn't spawned)
+  }
+  let best = null;
+  let bestMtime = -1;
+  // A small floor tolerance: the child may open its log a beat before our
+  // recorded start, and mtime resolution is coarse on some filesystems.
+  const floor = startedAtMs - 2000;
+  for (const name of entries) {
+    if (!/^server-.*\.log$/.test(name)) continue;
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      const mtime = st.mtimeMs;
+      if (mtime >= floor && mtime > bestMtime) {
+        best = full;
+        bestMtime = mtime;
+      }
+    } catch {
+      // Racing file removal — skip it.
+    }
+  }
+  return best;
+}
+
+/**
+ * Strip ANSI SGR/escape sequences so log lines render as plain text in the
+ * setup terminal (uvicorn/app logs may be colorized).
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+function stripAnsi(s) {
+  return s.replace(ANSI_RE, "");
+}
+
+/**
+ * Split a growing byte stream into whole lines across chunk boundaries. Feed
+ * each chunk to `push`; complete lines (newline-terminated) are emitted via
+ * `onLine`, and a trailing partial line is buffered until its newline arrives.
+ * The classic bug this avoids: emitting a half line when a chunk splits mid-line.
+ *
+ * @param {(line: string) => void} onLine
+ * @returns {{ push: (chunk: string) => void }}
+ */
+function makeLineSplitter(onLine) {
+  let buf = "";
+  return {
+    push(chunk) {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        // Trim a trailing \r for CRLF logs; keep other content verbatim.
+        onLine(buf.slice(0, nl).replace(/\r$/, ""));
+        buf = buf.slice(nl + 1);
+      }
+    },
+  };
+}
+
+/**
+ * Tail the background server's boot logfile, forwarding each new line to
+ * `onLine`, until the caller signals stop (its `omnigent server --background`
+ * resolved — success or failure) or a discovery timeout elapses. Does NOT own
+ * the server process nor decide readiness — it only reads the logfile the
+ * detached child writes, keeping the daemon model intact.
+ *
+ * Discovery uses {@link findLiveServerLog} (the child's real logfile, created
+ * at spawn) rather than the post-health `local_server.logpath` sidecar — so
+ * lines stream DURING boot, and a prior run's stale log is never adopted. Naive
+ * read-from-offset driven by `fs.watch` + a poll fallback; no tail library.
+ *
+ * @param {(line: string) => void} onLine
+ * @param {{ signal?: AbortSignal, startedAtMs?: number, discoverTimeoutMs?: number, pollMs?: number }} [opts]
+ *   `signal` stops the tail (the caller aborts it once the start resolves);
+ *   `startedAtMs` floors log discovery so stale logs are ignored (default: now).
+ * @returns {Promise<void>} resolves when tailing stops (aborted, timed out, or
+ *   the log couldn't be found).
+ */
+async function tailLocalServerLog(onLine, opts = {}) {
+  const { signal, startedAtMs = Date.now(), discoverTimeoutMs = 15000, pollMs = 200 } = opts;
+  const emit = makeLineSplitter((line) => onLine(stripAnsi(line)));
+  const aborted = () => signal?.aborted === true;
+  const sleep = (ms) =>
+    new Promise((resolve) => {
+      const t = setTimeout(resolve, ms);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(t);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+
+  // 1. Wait for the child's logfile to appear. It's created at spawn, so this
+  //    is a short wait — bounded so a start that never writes a log can't hang.
+  const discoverDeadline = Date.now() + discoverTimeoutMs;
+  let logPath = null;
+  while (!aborted() && Date.now() < discoverDeadline) {
+    logPath = findLiveServerLog(startedAtMs);
+    if (logPath) break;
+    // eslint-disable-next-line no-await-in-loop -- sequential poll for a file that appears at spawn
+    await sleep(pollMs);
+  }
+  if (!logPath) return; // No logfile found — the caller still reports ready/fail.
+
+  // 2. Read from the start, then follow appended bytes. fs.watch can miss rapid
+  //    writes, so a poll tick also drains until the caller aborts.
+  let offset = 0;
+  const readNew = () => {
+    try {
+      const size = fs.statSync(logPath).size;
+      if (size <= offset) return;
+      const fd = fs.openSync(logPath, "r");
+      try {
+        // readSync may return fewer bytes than requested (large append, pipe-
+        // backed fs); loop until the range up to `size` is drained, advancing
+        // `offset` only by bytes actually read so a short read can't emit
+        // uninitialized buffer or skip content.
+        const buf = Buffer.alloc(size - offset);
+        let filled = 0;
+        while (offset + filled < size) {
+          const n = fs.readSync(fd, buf, filled, buf.length - filled, offset + filled);
+          if (n <= 0) break; // EOF (file truncated since stat) — emit what we have
+          filled += n;
+        }
+        if (filled > 0) {
+          offset += filled;
+          emit.push(buf.toString("utf8", 0, filled));
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      // File rotated/removed mid-tail — stop reading; the caller drives the end.
+    }
+  };
+
+  let watcher = null;
+  try {
+    watcher = fs.watch(logPath, { persistent: false }, readNew);
+  } catch {
+    // fs.watch unsupported here — the poll loop below still drains new bytes.
+  }
+  try {
+    readNew();
+    while (!aborted()) {
+      // eslint-disable-next-line no-await-in-loop -- sequential poll: tick, drain, until aborted
+      await sleep(pollMs);
+      readNew();
+    }
+    readNew(); // final drain of any lines written just before the abort
+  } finally {
+    if (watcher) watcher.close();
+  }
 }
 
 /**
@@ -941,11 +1172,16 @@ module.exports = {
   isExecutableFile,
   whichOmnigent,
   resolveCliPath,
+  cliCommandParts,
   runCli,
   parseJsonLoose,
   getCliStatus,
   getServerStatus,
   startLocalServer,
+  findLiveServerLog,
+  makeLineSplitter,
+  stripAnsi,
+  tailLocalServerLog,
   stopLocalServer,
   stopHost,
   serverAuthed,

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -493,6 +495,173 @@ async def test_read_nonexistent_file_returns_404(
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "path_not_found"
+
+
+@pytest.mark.asyncio
+async def test_download_returns_complete_file_past_read_cap(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """``?download=true`` streams the whole file where the read path truncates."""
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    payload = os.urandom(_MAX_READ_BYTES + 1)
+    (workspace / "big.bin").write_bytes(payload)
+    url = (
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/big.bin"
+    )
+
+    read = await client.get(url)
+    assert read.status_code == 200
+    assert read.json()["truncated"] is True
+
+    resp = await client.get(url, params={"download": "true"})
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "status", "code"),
+    [("src", 400, "invalid_path"), ("nope.bin", 404, "path_not_found")],
+)
+async def test_download_rejects_directory_and_missing_path(
+    client: httpx.AsyncClient,
+    path: str,
+    status: int,
+    code: str,
+) -> None:
+    """A directory has no raw bytes to serve, and a missing path stays a 404."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/{path}",
+        params={"download": "true"},
+    )
+    assert resp.status_code == status
+    assert resp.json()["error"]["code"] == code
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SANDBOX_BACKENDS = [
+    pytest.param(
+        "linux_bwrap",
+        marks=pytest.mark.skipif(
+            not (sys.platform.startswith("linux") and shutil.which("bwrap")),
+            reason="linux_bwrap requires Linux + bwrap on PATH",
+        ),
+    ),
+    pytest.param(
+        "darwin_seatbelt",
+        marks=pytest.mark.skipif(
+            not (sys.platform == "darwin" and shutil.which("sandbox-exec")),
+            reason="darwin_seatbelt requires macOS + sandbox-exec on PATH",
+        ),
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_download_under_real_sandbox_refuses_masked_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str,
+) -> None:
+    """A confined helper's view gates the download.
+
+    A masked dotfile is refused and its bytes never leave, while a plain
+    file streams intact. bwrap masks by binding ``/dev/null`` over the file
+    (stat succeeds on another inode) and Seatbelt by denying the read (stat
+    succeeds, the read fails); both must be caught.
+    """
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / ".env").write_text("OMNI_TEST_SECRET=super-secret-value-12345")
+    payload = os.urandom(256 * 1024)
+    (ws / "plain.bin").write_bytes(payload)
+    # The helper imports omnigent from this checkout, which the sandbox
+    # must be allowed to read.
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=[str(_REPO_ROOT)]),
+        )
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            masked = await client.get(f"{base}/.env", params={"download": "true"})
+            assert masked.status_code == 404
+            assert b"super-secret-value-12345" not in masked.content
+
+            plain = await client.get(f"{base}/plain.bin", params={"download": "true"})
+            assert plain.status_code == 200
+            assert plain.content == payload
+    finally:
+        os_env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "helper_view",
+    [
+        pytest.param(
+            lambda st: {"r": False, "dev": st.st_dev, "ino": st.st_ino}, id="read-denied"
+        ),
+        pytest.param(lambda st: {"r": False, "dev": 0, "ino": 0}, id="dev-null-bind"),
+        pytest.param(
+            lambda st: {"r": True, "dev": st.st_dev, "ino": st.st_ino + 1}, id="other-inode"
+        ),
+        pytest.param(lambda st: None, id="stat-denied"),
+    ],
+)
+async def test_download_refuses_what_the_helper_cannot_read(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    helper_view: object,
+) -> None:
+    """Each way a sandbox can hide a file from the helper refuses the download.
+
+    The fixture's ``none`` sandbox hides nothing, so the helper's answer is
+    stood in for with the signatures the real backends produce, plus a
+    file replaced under the check.
+    """
+    secret = workspace / ".env"
+    secret.write_text("SECRET=1")
+    view = helper_view(secret.stat())  # type: ignore[operator]
+    consulted: list[str] = []
+
+    async def _stat(self: CallerProcessFilesystem, target: str, *, probe_read: bool = False):
+        del self, probe_read
+        consulted.append(target)
+        return view
+
+    monkeypatch.setattr(CallerProcessFilesystem, "_helper_stat", _stat)
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/.env",
+        params={"download": "true"},
+    )
+    assert resp.status_code == 404
+    assert b"SECRET" not in resp.content
+    assert consulted == [".env"]
 
 
 @pytest.mark.asyncio
@@ -1182,25 +1351,27 @@ async def test_search_no_matches_returns_empty_list(
 
 
 @pytest.mark.asyncio
-async def test_search_returns_only_files_not_directories(
+async def test_search_returns_matching_directories(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /search results contain only file-type entries, not directory entries.
+    """GET /search returns directory entries whose name/path matches the query.
 
-    The workspace has a 'src' directory; a query matching it by name must not
-    return it as a result — directories are not useful for file-open actions.
+    The workspace has a 'src' directory; a query matching it by name must
+    surface it as a directory-type entry so the UI can reveal the folder,
+    alongside any files under it.
     """
     resp = await client.get(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=src"
     )
     assert resp.status_code == 200
-    for entry in resp.json()["data"]:
-        # Any directory entry in the results would indicate the search walk is
-        # including directories, which the UI cannot open.
-        assert entry["type"] == "file", (
-            f"Expected only file-type entries in search results, "
-            f"but got type={entry['type']!r} for path={entry['path']!r}."
-        )
+    entries = resp.json()["data"]
+    src = next((e for e in entries if e["path"] == "src"), None)
+    assert src is not None, f"Expected the 'src' directory in results, got: {entries}"
+    assert src["type"] == "directory", (
+        f"Expected 'src' to be a directory-type entry, got type={src['type']!r}."
+    )
+    # A directory has no byte size; bytes must be null for it.
+    assert src["bytes"] is None, "A directory entry must report null bytes."
 
 
 @pytest.mark.asyncio
@@ -1425,27 +1596,29 @@ async def test_search_glob_filters(
 
 
 @pytest.mark.asyncio
-async def test_search_glob_filter_returns_only_files(
+async def test_search_directory_match_honors_exclude_glob(
     glob_client: httpx.AsyncClient,
 ) -> None:
-    """A glob-scoped search returns file entries only, never directories.
+    """A directory match is dropped when an exclude glob prunes its subtree.
 
-    ``src/**`` matches the ``src/deep`` directory by path, but directories
-    must be filtered out so the UI only offers openable files. ``q=.`` matches
-    every file (all have extensions) so the include glob is what is exercised.
+    ``q=deep`` matches the ``src/deep`` directory by name. Without an exclude
+    it surfaces as a directory entry; with ``exclude=**/deep`` the subtree is
+    pruned from the walk so the directory itself never appears.
     """
-    resp = await glob_client.get(
-        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=.&include=src/**"
-    )
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search"
+    resp = await glob_client.get(f"{base}?q=deep")
     assert resp.status_code == 200, resp.text
-    data = resp.json()["data"]
-    assert data, "q=.&include=src/** should match files under src/"
-    for entry in data:
-        # A directory entry would mean the file-type filter in search_files
-        # regressed; the UI cannot open directories.
-        assert entry["type"] == "file", (
-            f"Expected only file entries, got type={entry['type']!r} for {entry['path']!r}"
-        )
+    paths = {(e["path"], e["type"]) for e in resp.json()["data"]}
+    assert ("src/deep", "directory") in paths, (
+        f"q=deep should surface the src/deep directory, got {paths}"
+    )
+
+    resp = await glob_client.get(f"{base}?q=deep&exclude=**/deep")
+    assert resp.status_code == 200, resp.text
+    excluded = {e["path"] for e in resp.json()["data"]}
+    assert "src/deep" not in excluded, (
+        f"exclude=**/deep must prune the src/deep directory, got {excluded}"
+    )
 
 
 # ── Per-session filesystem registry (worktree) ──────────────────────────────
@@ -1637,6 +1810,128 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
 
     assert entries == []
     assert truncated is True, "a budget-exhausted search must not look like 'no matches'"
+
+
+@pytest.mark.asyncio
+async def test_search_tree_of_exactly_budget_size_is_not_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tree with exactly `budget` entries is fully enumerable, not truncated.
+
+    The walk counts an entry then checks `> budget` (not `>= budget`), so a
+    tree whose entry count equals the budget is walked to completion and must
+    report ``truncated=False``. One more entry would flip it to True.
+    """
+    # 3 files + their parent dir = 4 walked entries. Budget 4 exactly covers it.
+    d = tmp_path / "d"
+    d.mkdir()
+    for i in range(3):
+        (d / f"f{i}.txt").write_text("x")
+
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 4)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    _entries, truncated = await fs.search_files("zznomatchzz")
+
+    assert truncated is False, (
+        "a tree of exactly budget size is fully enumerable and must not be flagged truncated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep dependency subtree must not starve a later-sorted real directory.
+
+    Layout (``aaa`` sorts before ``zzz``)::
+
+        aaa/node_modules/<many files>   # deprioritized, huge
+        zzz/target/keep.txt             # the real match, deep and late
+
+    Reordering only *sibling* dirs isn't enough: without globally deferring the
+    ``node_modules`` subtree, the walk descends all of ``aaa/node_modules``
+    first and exhausts a tight budget before it ever reaches ``zzz/target`` —
+    so a query for ``target`` would come back empty. Deferring noise subtrees
+    lets the real tree be scanned first, so the match is found.
+    """
+    noise = tmp_path / "aaa" / "node_modules"
+    noise.mkdir(parents=True)
+    for i in range(40):
+        (noise / f"dep{i}.js").write_text("x")
+    target = tmp_path / "zzz" / "target"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("y")
+
+    # Budget large enough for the whole real tree but far smaller than the noise
+    # subtree, so a non-deferring walk would run out inside node_modules.
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET",
+        20,
+    )
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, _truncated = await fs.search_files("target")
+
+    paths = {e.path for e in entries}
+    assert "zzz/target" in paths, (
+        f"the real 'zzz/target' directory must be reached despite the earlier "
+        f"aaa/node_modules subtree, got {paths}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_follow_symlinked_deprioritized_dir(
+    tmp_path: Path,
+) -> None:
+    """A symlinked deprioritized dir must not let the walk escape the workspace.
+
+    The deferred second pass walks each noise root directly, and ``os.walk``
+    follows a *top-level* symlink. A committed ``node_modules`` symlink pointing
+    outside the workspace would otherwise disclose file names/sizes/mtimes from
+    the target — content the single-pass ``os.walk(followlinks=False)`` could
+    never reach. Deferring only real directories preserves that boundary.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leaked")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # A committed noise-named symlink pointing at the sibling outside/ dir.
+    (ws / "node_modules").symlink_to(outside, target_is_directory=True)
+
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(ws),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, _truncated = await fs.search_files("secret")
+
+    paths = {e.path for e in entries}
+    assert not any("secret" in p for p in paths), (
+        f"search must not descend a symlinked node_modules and leak the target's "
+        f"contents, got {paths}"
+    )
 
 
 @pytest.mark.asyncio

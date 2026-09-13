@@ -1,10 +1,10 @@
 import type { ReactNode } from "react";
+
 import { TooltipContent } from "@/components/ui/tooltip";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { cn } from "@/lib/utils";
 
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+const IS_MAC = isMacPlatform();
 
 export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
 export const ALT_KEY = IS_MAC ? "⌥" : "Alt";

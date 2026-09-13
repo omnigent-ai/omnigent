@@ -17,6 +17,34 @@ function makeScroller({ clientHeight = 800, scrollHeight = 3000 } = {}) {
 afterEach(cleanup);
 
 describe("TranscriptScrollbar thumb", () => {
+  it("does not paint a thumb for a rounding-noise scroll range", () => {
+    // Fractional content heights and the latest-turn spacer's 1px write
+    // hysteresis can leave the document a couple of pixels taller than the
+    // viewport. A thumb for that noise advertises hidden content that does
+    // not exist, so the scrollbar must not render.
+    render(
+      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 803 })} />,
+    );
+    expect(screen.queryByTestId("transcript-scrollbar-thumb")).toBeNull();
+  });
+
+  it("paints a thumb once the scroll range is real", () => {
+    render(
+      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 850 })} />,
+    );
+    expect(screen.getByTestId("transcript-scrollbar-thumb")).toBeTruthy();
+  });
+
+  it("paints a thumb at exactly the minimum scroll range", () => {
+    // 804 − 800 sits right on the threshold: the gate is `<`, so a real range
+    // of exactly 4px still gets an indicator. Locks the boundary against an
+    // accidental flip to `<=`.
+    render(
+      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 804 })} />,
+    );
+    expect(screen.getByTestId("transcript-scrollbar-thumb")).toBeTruthy();
+  });
+
   it("opts out of native touch panning so a touch drag reaches the pointer handlers", () => {
     // The drag is driven by pointer events with pointer capture. Without
     // `touch-action: none` on the thumb, a touch pointerdown is followed by

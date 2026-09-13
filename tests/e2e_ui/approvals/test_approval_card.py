@@ -113,13 +113,14 @@ def test_pending_approval_keeps_interrupt_available(
     base_url, session_id = approval_session
     page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder(_COMPOSER)
+    composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill("Run the command now.")
     page.get_by_role("button", name="Send", exact=True).click()
 
     card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
     expect(card).to_be_visible(timeout=_AGENT_TURN_TIMEOUT_MS)
+    composer.fill("Keep this draft after interrupting.")
     interrupt = page.get_by_role("button", name="Interrupt", exact=True)
     expect(interrupt).to_be_visible()
     expect(interrupt).to_be_enabled()
@@ -133,6 +134,7 @@ def test_pending_approval_keeps_interrupt_available(
 
     assert request_info.value.post_data_json == {"type": "interrupt", "data": {}}
     expect(interrupt).not_to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    expect(composer).to_have_value("Keep this draft after interrupting.")
 
 
 @pytest.mark.timeout(90)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent-issue-prioritization"
-version = "0.2.0"
+version = "0.2.1"
 description = "Deterministic issue-prioritization pipeline for Omnigent"
 requires-python = ">=3.12"
 dependencies = ["databricks-sdk>=0.56.0,<1", "PyJWT[crypto]>=2.8,<3"]

@@ -18,6 +18,14 @@ interface Scroller {
 
 /** Thumb height. Constant — that is the whole point of this component. */
 const THUMB_PX = 56;
+/**
+ * Smallest scroll range worth a thumb. Fractional content heights round into
+ * `scrollHeight`, and LatestTurnSpacer's 1px write-hysteresis can leave the
+ * document a couple of pixels taller than the viewport — painting a thumb for
+ * that noise advertises hidden content that does not exist. The trade: a real
+ * range under 4px also goes unindicated — imperceptible at these sizes.
+ */
+const MIN_SCROLL_RANGE_PX = 4;
 /** Track inset from the top, clearing the ChatHeader overlay's controls. */
 const TRACK_TOP_PX = 64;
 const TRACK_BOTTOM_PX = 12;
@@ -53,7 +61,7 @@ export function TranscriptScrollbar({
     const measure = () => {
       const max = el.scrollHeight - el.clientHeight;
       const travel = travelOf(el);
-      if (max < 1 || travel <= 0) {
+      if (max < MIN_SCROLL_RANGE_PX || travel <= 0) {
         setScrollable(false);
         return;
       }
