@@ -1642,6 +1642,8 @@ def _build_acp_spawn_env(
 
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
+    # Also lazy: model_catalog pulls the onboarding provider config eagerly.
+    from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
         acp_agents,
@@ -1709,13 +1711,37 @@ def _build_acp_spawn_env(
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
 
-        model = _resolve_spec_model(spec)
+        # Spec model, else the embedded/configured agent's model, else the
+        # provider's ``models["default"]`` tier — the same precedence the picker
+        # catalog resolves (see _acp_launch_model), so the launch model and the
+        # picker's default row can never disagree.
+        model = _acp_launch_model(spec)
         if model is not None and not model.startswith(("databricks-", "databricks/")):
             env["HARNESS_ACP_MODEL"] = model
-        elif agent.model:
-            env["HARNESS_ACP_MODEL"] = agent.model
     # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
     # raises a clear request-time error pointing the user at `omnigent setup`.
+
+    # Curated model shortlist (launch model + the resolved provider's
+    # ``models:`` maps). The executor advertises these to the picker surface
+    # and withholds warm switches to models outside the curated set, mirroring
+    # pi-native's ``enabledModels`` scoping. Purely additive: an uncurated
+    # deployment (no providers:/models: config) forwards nothing.
+    curated = acp_curated_models(spec)
+    if len(curated) > 1:
+        # Forward only a real curated set: a single-entry list would gate
+        # warm switches to just the launch model all over again (uncurated
+        # deployments must keep the agent's own any-model picker behaviour).
+        env["HARNESS_ACP_MODEL_LIST"] = ",".join(curated)
+
+    # Credential vars the operator declared off-limits for generic ACP agents.
+    # The vendor CLI activates built-in providers on the mere presence of
+    # their credential (any value), flooding its own picker with entries that
+    # bypass the deployment's curated set. Names are forwarded (never values);
+    # the harness reads each from its own environment before spawning the CLI.
+    # Unset means no scrubbing, matching pi-native's OMNIGENT_PI_ENV_UNSET.
+    denylist = os.environ.get("OMNIGENT_ACP_ENV_UNSET", "").strip()
+    if denylist:
+        env["HARNESS_ACP_ENV_UNSET"] = denylist
 
     # Session workspace (selected working folder). ``None`` lets the acp
     # harness fall back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.

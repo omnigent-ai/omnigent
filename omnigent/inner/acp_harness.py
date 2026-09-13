@@ -22,6 +22,14 @@ Env vars read at startup:
 - ``HARNESS_ACP_NAME``: display label for logs / elicitation cards.
 - ``HARNESS_ACP_MODEL``: optional model id (only sent when the agent is
   configured to accept one in ``session/new``).
+- ``HARNESS_ACP_MODEL_LIST``: comma-separated curated model ids the deployment
+  verified for this agent (the launch model first, then the resolved
+  provider's ``models:`` maps). When set, warm model switches to ids outside
+  the list are withheld; unset means any model the agent accepts.
+- ``HARNESS_ACP_ENV_UNSET``: comma-separated environment variable *names* to
+  strip from the spawn env handed to the vendor CLI (operator-declared, e.g.
+  dummy tokens for other providers that would activate the CLI's built-ins).
+  Names only — unset means no scrubbing.
 - ``HARNESS_ACP_SESSION_ID_MODE``: ``server`` (default) or ``client``.
 - ``HARNESS_ACP_SEND_MODEL``: ``"1"`` to send the model in ``session/new``.
 - ``HARNESS_ACP_OMNIGENT_MCP``: ``"0"`` to disable Omnigent's MCP relay;
@@ -64,6 +72,8 @@ _logger = logging.getLogger(__name__)
 _ENV_COMMAND = "HARNESS_ACP_COMMAND"
 _ENV_NAME = "HARNESS_ACP_NAME"
 _ENV_MODEL = "HARNESS_ACP_MODEL"
+_ENV_MODEL_LIST = "HARNESS_ACP_MODEL_LIST"
+_ENV_ENV_UNSET = "HARNESS_ACP_ENV_UNSET"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
 _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
 _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
@@ -90,6 +100,17 @@ def _env_passthrough_names() -> tuple[str, ...]:
     """
     raw = os.environ.get(_ENV_ENV_PASSTHROUGH, "")
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _csv_names(env_name: str) -> tuple[str, ...]:
+    """Parse a comma-separated, deduplicated name list from the env."""
+    raw = os.environ.get(env_name, "")
+    names: list[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -155,6 +176,8 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
         send_model_in_session_new=send_model,
         omnigent_mcp=omnigent_mcp,
         env_passthrough=_env_passthrough_names(),
+        available_models=_csv_names(_ENV_MODEL_LIST),
+        env_unset=_csv_names(_ENV_ENV_UNSET),
         permission_mode=permission_mode,
         inject_system_prompt=inject_system_prompt,
     )

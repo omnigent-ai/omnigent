@@ -2028,3 +2028,91 @@ async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
     while _proc.process_alive(grandchild):
         assert time.monotonic() < deadline, f"agent child {grandchild} survived close()"
         await asyncio.sleep(0.05)
+
+
+# ── Curated model list gate + spawn-env denylist ────────────────────────────
+
+
+def test_spawn_env_env_unset_strips_declared_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``env_unset`` scrubs a name even when it was allowed through.
+
+    Mirrors codex's ``deny_exact`` contract: the denylist applies on top of
+    the passthrough allowlist, so an operator-declared dummy credential is
+    withheld from the vendor CLI (whose built-in providers would activate on
+    its mere presence).
+    """
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="agent stdio",
+            name="Grok",
+            env_passthrough=("XAI_API_KEY", "DEEPSEEK_API_KEY"),
+            env_unset=("XAI_API_KEY",),
+        )
+    )
+    monkeypatch.setenv("XAI_API_KEY", "xai-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-secret")
+    env = ex._build_spawn_env()
+    assert env.get("DEEPSEEK_API_KEY") == "ds-secret"
+    assert "XAI_API_KEY" not in env
+
+
+def test_spawn_env_env_unset_empty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No denylist configured → deny-exact adds no stripping."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=("A",)))
+    monkeypatch.setenv("A", "1")
+    env = ex._build_spawn_env()
+    assert env.get("A") == "1"
+
+
+@pytest.mark.asyncio
+async def test_model_override_withheld_outside_curated_list() -> None:
+    """A curated deployment rejects picks outside its verified model set.
+
+    This is the ACP counterpart of pi-native's ``enabledModels`` scoping:
+    the vendor CLI owns its own picker, so the gate sits at the warm-switch
+    boundary instead of a settings file.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", available_models=("model-a", "model-b")))
+    ex._handle_session_update(_model_option("model-a"))
+    ex._rpc = AsyncMock()  # type: ignore[assignment]
+
+    await ex._apply_model_override("s1", "model-c")
+    ex._rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_override_allowed_within_curated_list() -> None:
+    """A pick inside the curated set still switches warm via set_config_option."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", available_models=("model-a", "model-b")))
+    ex._handle_session_update(_model_option("model-a"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "model-b")
+
+    assert calls == [
+        ("session/set_config_option", {"sessionId": "s1", "configId": "model", "value": "model-b"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_override_uncurated_sessions_are_ungated() -> None:
+    """No curated list (the default) keeps the existing any-model behaviour."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("model-a"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "model-c")
+
+    assert calls == [
+        ("session/set_config_option", {"sessionId": "s1", "configId": "model", "value": "model-c"})
+    ]

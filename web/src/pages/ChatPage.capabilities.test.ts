@@ -62,7 +62,19 @@ describe("shouldShowModelPicker", () => {
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "pi-native-ui" } })).toBe(true);
   });
 
+  it("shows the picker for generic ACP sessions via the canonical harness field", () => {
+    // WHY: ACP sessions carry no wrapper label; the server canonicalizes
+    // acp:<slug> ids to "acp" in the snapshot's harness field, which is the
+    // session's only picker-family evidence.
+    expect(shouldShowModelPicker({ labels: {}, harness: "acp" })).toBe(true);
+  });
+
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
+    // A label-less codex-native session still shows the picker by design
+    // (isLabelLessCodexNative), so the negative cases pin non-picker kinds.
+    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: null })).toBe(false);
     // WHY: a wrapper-looking string is not a resolved harness, and
     // pre-hydration rows still have no capability evidence.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "codex-native" } })).toBe(false);

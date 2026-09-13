@@ -288,6 +288,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_error_event,
     _publish_external_conversation_item,
     _publish_input_consumed,
+    _publish_model_options,
     _publish_sandbox_status,
     _publish_status,
     _publish_terminal_pending,
@@ -9865,6 +9866,7 @@ async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
+    agent_store: AgentStore | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -9883,12 +9885,20 @@ async def _fetch_model_options(
       With no runner bound and a cold cache (server restart while the
       session slept), the session's host resolves a pre-launch preview
       instead — the same source the new-session picker uses.
+    * **acp** — the deployment's curated provider ``models:`` shortlist from
+      the session's spec (launch model first). Static and local to the
+      server, so a cold cache re-resolves inline with no runner round trip.
+      Served only when the deployment actually curated a set (2+ models); a
+      session configured without one shows no picker, matching pi-native's
+      no-scope-when-uncurated rule.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
+    :param agent_store: Optional store for the ACP spec lookup; resolves
+        from the runtime globals when ``None``.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -9903,6 +9913,11 @@ async def _fetch_model_options(
         return _pushed_model_options_cache.get(session_id, [])
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
+        # Generic ACP sessions carry no native wrapper label; their picker
+        # serves the deployment's curated provider ``models:`` shortlist
+        # resolved from the spec instead of a runner-owned catalog.
+        if _resolve_harness_impl_is_acp(conv, agent_store):
+            return await _load_acp_model_options(session_id, conv, agent_store)
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -9949,6 +9964,92 @@ async def _fetch_model_options(
     # A stale catalog serves while the re-fetch runs; success publishes
     # ``session.model_options`` so open clients re-read the snapshot.
     return cached or []
+
+
+def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:
+    """Return whether *conv* runs a generic ``acp`` harness.
+
+    ``canonicalize_harness`` folds ``acp:<slug>`` ids to ``"acp"``, so any
+    configured or embedded generic ACP agent matches.
+
+    :param conv: Conversation row the session snapshot was built from.
+    :param agent_store: Optional store for the harness lookup; ``None`` lets
+        :func:`_resolve_harness` fall back to the runtime global.
+    :returns: ``True`` when the session's resolved harness is ``"acp"``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    return canonicalize_harness(_resolve_harness(conv, agent_store=agent_store)) == "acp"
+
+
+async def _load_acp_model_options(
+    session_id: str,
+    conv: Conversation,
+    agent_store: AgentStore | None,
+) -> list[dict[str, Any]]:
+    """Resolve the curated picker options for a generic ACP session.
+
+    Serves the deployment's verified shortlist from the session's own spec —
+    the launch model first, then the resolved provider's ``models:`` tier
+    maps (see :func:`omnigent.model_catalog.acp_curated_models`). The
+    catalog is static over a session's life (provider curation is resolved
+    from spec + deployment config), so it fills the standard
+    :data:`_model_options_cache` once and stays served while the session
+    sleeps, mirroring claude-native's offline contract without needing a
+    runner round trip.
+
+    A session whose deployment curated nothing (fewer than two models, or no
+    provider ``models:`` map at all) returns ``[]`` — the picker simply does
+    not render, matching pi-native's rule that an uncurated deployment keeps
+    its default picker behaviour.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param conv: Conversation row the options are resolved for.
+    :param agent_store: Store for the bound-agent spec load; ``None`` falls
+        back to the runtime global store.
+    :returns: Option dicts (``id`` / ``displayName`` / ``isDefault``), or
+        ``[]`` when nothing was curated.
+    """
+    cached = _model_options_cache.get(session_id)
+    if cached is not None:
+        return cached
+    if agent_store is None:
+        from omnigent.runtime._globals import _agent_store
+
+        agent_store = _agent_store
+    if agent_store is None:
+        return []
+    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    if spec is None:
+        return []
+    resolved_spec: object = spec
+    if conv.sub_agent_name:
+        # For a bundled-agent head sub-agent, curate the HEAD's executor (the
+        # harness this session actually spawns), mirroring _resolve_harness.
+        sub = next(
+            (s for s in spec.sub_agents if s.name == conv.sub_agent_name),
+            None,
+        )
+        if sub is not None:
+            from types import SimpleNamespace
+
+            resolved_spec = SimpleNamespace(executor=sub.executor)
+    from omnigent.models.model_catalog import acp_curated_models
+
+    curated = acp_curated_models(resolved_spec)
+    if len(curated) < 2:
+        # Nothing was curated (or the launch model is the whole set): with
+        # one model there is nothing to pick between. Return without caching
+        # so a later deployment config change populates the picker.
+        return []
+    options = [
+        {"id": model_id, "displayName": model_id, "isDefault": index == 0}
+        for index, model_id in enumerate(curated)
+    ]
+    _model_options_cache[session_id] = options
+    _model_options_stale.discard(session_id)
+    _publish_model_options(session_id)
+    return options
 
 
 async def _get_session_snapshot(
@@ -10187,7 +10288,7 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed like skills so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    model_options = await _fetch_model_options(runner_client, session_id, conv)
+    model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.

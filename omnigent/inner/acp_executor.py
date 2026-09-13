@@ -211,6 +211,21 @@ class AcpAgentConfig:
         plain user content and lets the agent's own system prompt take effect
         unmodified. When ``omnigent_mcp`` is ``False`` and the agent manages its
         own context, setting this to ``False`` is strongly recommended.
+    :param available_models: Curated model ids the deployment verified for this
+        agent (``HARNESS_ACP_MODEL_LIST`` — launch model first, then the
+        provider's ``models:`` maps). Empty (the default) means nothing was
+        curated: every model the agent accepts is allowed. When set, warm
+        ``session/set_config_option`` switches to ids outside the list are
+        withheld — the ACP counterpart of pi-native's ``enabledModels`` scoping
+        (the vendor CLI owns its own picker, so the gate sits at the switch).
+    :param env_unset: Environment variable *names* stripped from the spawn env
+        handed to the vendor CLI (``HARNESS_ACP_ENV_UNSET``). Operator-declared:
+        some CLIs activate built-in providers on the mere presence of a
+        credential variable (any value), e.g. dummy tokens other harnesses
+        project — scrubbing them keeps the CLI's own picker from bypassing the
+        curated set. Applied on top of the deny-by-default allowlist, so a name
+        can be both passed through and later removed deliberately. Empty (the
+        default) means no scrubbing.
     """
 
     command: str
@@ -222,6 +237,8 @@ class AcpAgentConfig:
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
     inject_system_prompt: bool = True
+    available_models: tuple[str, ...] = ()
+    env_unset: tuple[str, ...] = ()
 
 
 class _AcpRequestError(Exception):
@@ -632,6 +649,7 @@ class AcpExecutor(Executor):
                 *getattr(config, "env_passthrough", ()),
                 *declared_passthrough(self._os_env),
             ),
+            deny_exact=getattr(config, "env_unset", ()),
         )
 
     def _warn_initialize_failed(self, reason: str) -> None:
@@ -1415,6 +1433,18 @@ class AcpExecutor(Executor):
         :param model: Requested model id, or ``None`` to leave it alone.
         """
         if not model or model == self._active_model or not self._model_switch_supported:
+            return
+        # Curated deployments only: a pick outside the verified set is withheld
+        # so the agent's own picker can't bypass the deployment's catalog.
+        # Uncurated sessions (no HARNESS_ACP_MODEL_LIST) pass everything through.
+        available = getattr(self._config, "available_models", ())
+        if available and model not in available:
+            logger.warning(
+                "acp[%s] model switch to %r withheld: not in the curated model list. "
+                "Add it to the provider's models: map to enable it.",
+                self._config.name,
+                model,
+            )
             return
         # Before the first ``config_option_update`` we don't know what's settable;
         # attempting is harmless because a rejection just latches the feature off.

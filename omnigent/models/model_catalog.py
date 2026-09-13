@@ -38,7 +38,7 @@ import re
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
 
 import click
@@ -46,6 +46,7 @@ import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.models.model_metadata import (
     ModelCapability,
@@ -76,6 +77,7 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from omnigent.onboarding.provider_config import FamilyConfig
     from omnigent.onboarding.providers import ModelInfo
     from omnigent.spec.types import AgentSpec
 
@@ -118,6 +120,7 @@ _ProviderHarness: TypeAlias = Literal[
     "antigravity",
     "kimi",
     "qwen",
+    "acp",
 ]
 
 # Harness spellings -> the workflow harness whose provider resolution they
@@ -148,6 +151,10 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "kimi-code": "kimi",
     # Native Kimi TUI harness shares the multi-provider kimi resolution path.
     "kimi-native": "kimi",
+    # Generic ACP (and its acp:<slug> ids, canonicalized before lookup) is
+    # family-agnostic like kimi; the curated picker reads every family's
+    # models: map from the resolved entry (see acp_curated_models).
+    "acp": "acp",
     "qwen": "qwen",
     # The native agy TUI bridge resolves its provider via the SDK sibling,
     # mirroring the claude-native -> claude-sdk rule above.
@@ -572,7 +579,7 @@ def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelPr
     """
     try:
         return _resolve_model_provider_unsafe(spec, harness)
-    except Exception as exc:  # noqa: BLE001 — total-function boundary: config/spec failures → "none"
+    except Exception as exc:  # noqa: BLE001
         from omnigent.errors import OmnigentError
 
         _logger.debug("model provider resolution failed for harness %r", harness, exc_info=True)
@@ -601,12 +608,13 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     # consumed from the runner's dispatch path.
     from omnigent.runtime.workflow import _resolve_provider_for_build
 
-    if (harness or "") in _CURSOR_HARNESSES:
+    canonical_harness = canonicalize_harness(harness) or harness
+    if (canonical_harness or "") in _CURSOR_HARNESSES:
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
         )
 
-    harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
+    harness_type = _PROVIDER_RESOLUTION_HARNESS.get(canonical_harness or "")
     if harness_type is None:
         return ResolvedModelProvider(
             kind=NONE_KIND,
@@ -614,7 +622,9 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
 
     agent_spec = cast("AgentSpec", spec)
-    entry = _resolve_provider_for_build(agent_spec, harness_type=harness_type)
+    # ``acp`` (family-agnostic, like pi) is not a workflow AgentHarnessType —
+    # routing it through the same resolver is deliberate: see acp_curated_models.
+    entry = _resolve_provider_for_build(agent_spec, harness_type=cast(Any, harness_type))
     if entry is not None:
         return _provider_from_entry(entry, harness_type)
     return _provider_from_legacy_auth(agent_spec, harness_type)
@@ -638,6 +648,11 @@ def _provider_from_legacy_auth(
     """
     if harness_type == "claude-sdk":
         return _legacy_claude_sdk_provider(spec)
+    if harness_type == "acp":
+        # The generic-ACP spawn builder consumes no legacy auth/profile fields
+        # at all -- the vendor CLI owns its auth. Curation comes from named
+        # providers (spec/global ``providers:``), not the legacy fields.
+        return _legacy_acp_provider(spec)
     if harness_type in ("openai-agents-sdk", "antigravity"):
         # Both resolve spec/global ``auth:`` api-key blocks via this branch.
         # NB: the antigravity spawn-env builder (unlike openai-agents) ignores
@@ -784,6 +799,148 @@ def _legacy_profile_only_provider(
     return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
 
 
+def _legacy_acp_provider(spec: AgentSpec) -> ResolvedModelProvider:
+    """Mirror the ACP builder's legacy branch: it consumes nothing legacy.
+
+    ``_build_acp_spawn_env`` never reads ``auth:`` blocks, ``executor.profile``,
+    ``config["profile"]``, or the ``databricks-*`` model prefix — the vendor
+    CLI owns its auth, so curation of the picker comes from named providers
+    (the ``providers:`` block), not from legacy fields.
+
+    :param spec: The worker's (sub-)agent spec.
+    :returns: A ``"none"`` provider naming the right config surface.
+    """
+    if spec.executor.auth is not None or spec.executor.profile:
+        return ResolvedModelProvider(
+            kind=NONE_KIND,
+            detail=(
+                "the acp spawn path does not consume legacy auth:/profile "
+                "fields; configure a 'providers:' entry instead"
+            ),
+        )
+    return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
+
+
+def _acp_launch_model(spec: AgentSpec) -> str | None:
+    """The model an ACP worker launches with, mirroring the spawn builder.
+
+    :param spec: The worker's (sub-)agent spec.
+    :returns: The spec model (unless a ``databricks-`` id, which the builder
+        drops), else the embedded/configured agent's model, else the resolved
+        provider's ``models["default"]`` tier, else ``None``.
+    """
+    model = getattr(spec.executor, "model", None)
+    if isinstance(model, str) and model and not model.startswith(("databricks-", "databricks/")):
+        return model
+    # Imported lazily: the onboarding config read should stay off the
+    # listing hot path (mirrors the cursor builder's own lazy read).
+    from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
+
+    cfg = getattr(spec.executor, "config", None)
+    if isinstance(cfg, dict) and "acp_agent" in cfg:
+        embedded = cfg.get("acp_agent")
+        embedded_model = embedded.get("model") if isinstance(embedded, dict) else None
+        if isinstance(embedded_model, str) and embedded_model:
+            return embedded_model
+        return None
+    raw_harness = str(cfg.get("harness") or "") if isinstance(cfg, dict) else ""
+    slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
+    agent = resolve_acp_agent(slug) if slug else None
+    if agent is None:
+        agents = acp_agents()
+        agent = agents[0] if agents else None
+    if agent is not None and agent.model:
+        return agent.model
+    # Deployment-curated default: the resolved provider's ``models["default"]``
+    # tier is the launch model when neither the spec nor the agent pins one,
+    # exactly as the gateway deployments curate for pi-native.
+    try:
+        from omnigent.runtime.workflow import _resolve_provider_for_build
+
+        entry = _resolve_provider_for_build(spec, harness_type=cast(Any, "acp"))
+        if entry is not None:
+            for family_name in entry.families:
+                default_model = entry.family_default_model(family_name)
+                if default_model:
+                    family = entry.families.get(family_name)
+                    if family is not None:
+                        default_model = _resolve_model_tier_alias(family, default_model)
+                    return default_model
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _resolve_model_tier_alias(family: FamilyConfig, model_id: str) -> str:
+    """Resolve a ``models:`` value naming another tier to its concrete id.
+
+    Deployments alias tier names to ids (``deepseek-pro: deepseek-v4-pro``)
+    and reference those aliases from other tiers (``default: deepseek-pro``).
+    Whatever reaches the gateway, the spawn env, and the picker must be the
+    concrete id, never the alias.
+    """
+    current = model_id
+    for _ in range(8):  # bounded: a cyclic alias map must terminate
+        alias = family.models.get(current)
+        if not isinstance(alias, str) or not alias or alias == current:
+            return current
+        current = alias
+    return model_id
+
+
+def acp_curated_models(spec: object) -> tuple[str, ...]:
+    """Curated model shortlist for a generic-ACP worker's picker.
+
+    The launch model first (the :func:`_acp_launch_model` selection — always
+    present when a model is known, so the picker never hides the active
+    model), then the union of every family ``models:`` tier map on the
+    resolved provider entry in config order, deduplicated. Tier values that
+    name another tier resolve to their concrete id first, so aliases never
+    leak into the list. This is the ACP
+    counterpart of pi-native's curated ``extra_models``: the deployment's
+    verified set, not a live vendor catalog.
+
+    Resolution is strict (no ambient fallback synthesis): the spec's named
+    ``executor.auth`` provider wins, then the configured default for an
+    unmapped harness (pi-style surface fallback). Credentials are not
+    consulted — the vendor CLI authenticates itself; only the ``models:``
+    maps are read, so a curated readout never fails on a missing key.
+
+    Total by contract: any resolution error collapses to ``()`` so spawn-env
+    and picker callers can treat an empty list as "nothing curated".
+
+    :param spec: The worker's (sub-)agent spec.
+    :returns: Deduplicated model ids, launch model first; empty when no
+        provider or no ``models:`` map is configured.
+    """
+    launch = None
+    curated: list[str] = []
+    try:
+        agent_spec = cast("AgentSpec", spec)
+        launch = _acp_launch_model(agent_spec)
+        from omnigent.runtime.workflow import _resolve_provider_for_build
+
+        # The generic acp harness is not a workflow AgentHarnessType (it
+        # carries no gateway env of its own), but resolution for an unmapped
+        # harness is family-agnostic, which is exactly acp's semantics.
+        entry = _resolve_provider_for_build(agent_spec, harness_type=cast(Any, "acp"))
+        if entry is not None:
+            for family_config in entry.families.values():
+                for model_id in family_config.models.values():
+                    if isinstance(model_id, str) and model_id:
+                        curated.append(_resolve_model_tier_alias(family_config, model_id))
+    except Exception:  # noqa: BLE001
+        return ()
+    ids: list[str] = []
+    seen: set[str] = set()
+    for model_id in (launch, *curated):
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        ids.append(model_id)
+    return tuple(ids)
+
+
 def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedModelProvider:
     """Map a resolved :class:`ProviderEntry` to a provider descriptor.
 
@@ -817,8 +974,12 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
             ),
         )
     # Inline-family kinds: single-family harnesses get exactly their family;
-    # pi takes the first whose credential resolves, anthropic preferred.
-    preferred = _KEY_AUTH_FAMILY[harness_type] if harness_type != "pi" else None
+    # pi and generic acp take the first whose credential resolves, anthropic
+    # preferred (acp vendors own their routing, so no single key family exists).
+    if harness_type in ("pi", "acp"):
+        preferred = None
+    else:
+        preferred = _KEY_AUTH_FAMILY[harness_type]
     candidates = (preferred,) if preferred is not None else _FAMILY_PREFERENCE
     for family_name in candidates:
         try:
@@ -939,7 +1100,7 @@ def _worker_row(
     harness = spec_harness(spec)
     try:
         listing = list_models_for_worker(spec, harness, transport=transport)
-    except Exception as exc:  # noqa: BLE001 — per-worker isolation: fail informative, never crash the tool
+    except Exception as exc:  # noqa: BLE001
         _logger.debug("worker model enumeration failed", exc_info=True)
         listing = ModelListing(
             source=NONE_KIND,
