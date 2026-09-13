@@ -60,6 +60,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.native._native_supersession import post_supersession_notice
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -2183,11 +2184,14 @@ async def _maybe_rotate_session_on_thread_started(
     """
     Rotate Omnigent ownership when Codex starts a new native thread.
 
-    Native Codex ``/clear`` starts a fresh app-server thread in the
+    Native Codex ``/new`` starts a fresh app-server thread in the
     existing terminal. The forwarder must move the Omnigent session binding
     to a fresh conversation and then subscribe this same app-server
     connection to the new thread; otherwise web messages keep targeting
-    the old thread and streaming appears to end.
+    the old thread and streaming appears to end. After rotating it posts
+    the shared supersession notice to the OLD conversation (idle status, a
+    message linking to the new chat, and the redirect event) so its web
+    view is not stranded.
 
     :param ap_client: Omnigent HTTP client used for session rotation.
     :param target: Mutable current AP/Codex target.
@@ -2234,6 +2238,16 @@ async def _maybe_rotate_session_on_thread_started(
     await old_delta_coalescer.close()
     await old_usage_coalescer.close()
     await old_elicitation_tracker.close()
+    # Tell the superseded conversation it was rotated away: stop its spinner,
+    # persist a link to the new chat, and emit the live redirect event. Fully
+    # best-effort — the rotation is already committed.
+    await post_supersession_notice(
+        ap_client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
+        command="/new",
+    )
     _logger.info(
         "Codex forwarder rotated Omnigent session after native thread switch: "
         "old_session=%s new_session=%s new_thread=%s",
