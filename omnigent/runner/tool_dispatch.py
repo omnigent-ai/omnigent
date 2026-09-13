@@ -27,6 +27,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
@@ -1725,6 +1726,15 @@ async def _inherited_parent_model(
             extra={"session_id": runner_primary_session_id()},
         )
         return None
+    if canonicalize_harness(child_harness) == "antigravity-native":
+        from omnigent.harnesses.antigravity_native.models import list_agy_cli_model_options
+
+        try:
+            options = await asyncio.to_thread(list_agy_cli_model_options)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if not any(option["id"] == parent_model for option in options):
+            return None
     return parent_model
 
 
