@@ -96,6 +96,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.terminal_attach import attach_native_terminal
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -1538,26 +1539,37 @@ async def _attach_terminal_resource(
     :param recover: Optional reconnect recovery callback.
     :returns: None after the attach exits.
     """
-    direct_tmux_error = _direct_tmux_unavailable_reason(prepared)
-    if direct_tmux_error is None:
-        if prepared.tmux_socket is None or prepared.tmux_target is None:
-            raise click.ClickException("Codex tmux attach metadata was incomplete.")
-        await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
-        return
-    if prepared.app_server_url is None:
-        raise click.ClickException(
-            f"Runner-owned Codex terminal requires direct tmux attach, but {direct_tmux_error}"
+
+    async def attach_websocket() -> None:
+        """Preserve Codex's active-session reader and reconnect recovery."""
+        await _attach_with_reconnect(
+            attach=attach_local_terminal,
+            attach_url=_attach_url(base_url, prepared.session_id, prepared.terminal_id),
+            headers=headers,
+            recover=recover,
+            session_name="Codex",
+            base_url=base_url,
+            session_id=prepared.session_id,
+            terminal_id=prepared.terminal_id,
+            active_session_id_reader=lambda: _active_codex_session_id(prepared.bridge_dir),
         )
-    await _attach_with_reconnect(
-        attach=attach_local_terminal,
-        attach_url=_attach_url(base_url, prepared.session_id, prepared.terminal_id),
-        headers=headers,
-        recover=recover,
-        session_name="Codex",
-        base_url=base_url,
-        session_id=prepared.session_id,
-        terminal_id=prepared.terminal_id,
-        active_session_id_reader=lambda: _active_codex_session_id(prepared.bridge_dir),
+
+    async def attach_default() -> None:
+        """Keep runner-owned direct-attach requirements on the default path."""
+        direct_tmux_error = _direct_tmux_unavailable_reason(prepared)
+        if direct_tmux_error is None:
+            if prepared.tmux_socket is None or prepared.tmux_target is None:
+                raise click.ClickException("Codex tmux attach metadata was incomplete.")
+            await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
+            return
+        if prepared.app_server_url is None:
+            raise click.ClickException(
+                f"Runner-owned Codex terminal requires direct tmux attach, but {direct_tmux_error}"
+            )
+        await attach_websocket()
+
+    await attach_native_terminal(
+        default_attach=attach_default, control_mode_attach=attach_websocket
     )
 
 
