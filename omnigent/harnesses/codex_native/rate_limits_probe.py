@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import suppress
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.harnesses.codex_native.rate_limits import normalize_rate_limits
@@ -60,31 +59,32 @@ async def read_rate_limits(codex_path: str | None = None) -> JsonObject | None:
             process.stdin.write(_READ_LIMITS)
             await process.stdin.drain()
             return normalize_rate_limits(await _response(process.stdout, 2))
+    # Record cancellation and re-raise after teardown so cleanup is not skipped.
     finally:
-        _cancelled: BaseException | None = None
-        try:
-            if process.returncode is None:
-                _proc.terminate_tree(process)
-                try:
-                    await asyncio.wait_for(process.wait(), 2)
-                except TimeoutError:
-                    _proc.kill_tree(process)
-                    with suppress(Exception):
-                        await process.wait()
-        except asyncio.CancelledError as exc:
-            _cancelled = exc
+        cancelled: asyncio.CancelledError | None = None
+        if process.returncode is None:
+            _proc.terminate_tree(process)
+            try:
+                await asyncio.wait_for(asyncio.shield(process.wait()), 2)
+            except TimeoutError:
+                pass
+            except asyncio.CancelledError as exc:
+                cancelled = exc
             if process.returncode is None:
                 _proc.kill_tree(process)
-                with suppress(Exception, asyncio.CancelledError):
+                try:
                     await asyncio.wait_for(asyncio.shield(process.wait()), 2)
+                except asyncio.CancelledError as exc:
+                    cancelled = cancelled or exc
+                except Exception:  # noqa: BLE001 - teardown is best effort
+                    pass
+        process.stdin.close()
         try:
-            process.stdin.close()
-            with suppress(Exception, asyncio.CancelledError):
-                await asyncio.wait_for(asyncio.shield(process.stdin.wait_closed()), 2)
-            close_subprocess_transport(process)
+            await asyncio.wait_for(asyncio.shield(process.stdin.wait_closed()), 2)
         except asyncio.CancelledError as exc:
-            _cancelled = exc
-            with suppress(Exception):
-                close_subprocess_transport(process)
-        if _cancelled is not None:
-            raise _cancelled
+            cancelled = cancelled or exc
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            pass
+        close_subprocess_transport(process)
+        if cancelled is not None:
+            raise cancelled
