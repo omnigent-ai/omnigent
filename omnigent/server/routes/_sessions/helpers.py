@@ -58,7 +58,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
@@ -1537,6 +1537,7 @@ def _publish_elicitation_resolved_to_ancestors(
         _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action, reason=reason)
 
 
+@restart_on_stale_cursor
 def _descendant_sessions(
     conv_store: ConversationStore,
     session_id: str,
@@ -3267,6 +3268,7 @@ def _parse_external_conversation_item(
     )
 
 
+@restart_on_stale_cursor
 def _find_claude_native_subagent_child(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -3312,6 +3314,7 @@ def _find_claude_native_subagent_child(
         after = page.last_id
 
 
+@restart_on_stale_cursor
 def _find_acp_subagent_child(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -3444,6 +3447,7 @@ async def _persist_external_acp_subagent_start(
     return child.id
 
 
+@restart_on_stale_cursor
 def _find_subagent_child_by_title(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -3768,6 +3772,7 @@ async def _create_and_publish_antigravity_child(
     return child.id
 
 
+@restart_on_stale_cursor
 def _find_codex_native_subagent_child(
     conversation_store: ConversationStore,
     parent_id: str,

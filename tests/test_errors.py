@@ -9,16 +9,19 @@ from omnigent.errors import (
     _CODE_TO_HTTP_STATUS,
     _CODE_TO_IMPACT,
     _CODE_TO_PHASE,
+    _STALE_CURSOR_ATTEMPTS,
     ErrorCategory,
     ErrorCode,
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    StaleCursorError,
     category_for_code,
     classify_exception,
     impact_for_code,
     is_before_harness_start,
     phase_for_code,
+    restart_on_stale_cursor,
 )
 
 
@@ -77,6 +80,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.CONFLICT, 409),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
+        (ErrorCode.STALE_CURSOR, 400),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:
@@ -119,6 +123,7 @@ def test_every_error_code_has_a_concrete_category() -> None:
         (ErrorCode.INVALID_INPUT, ErrorCategory.USER),
         (ErrorCode.UNAUTHORIZED, ErrorCategory.USER),
         (ErrorCode.WORKSPACE_MISSING, ErrorCategory.USER),
+        (ErrorCode.STALE_CURSOR, ErrorCategory.USER),
     ],
 )
 def test_code_category_mapping(code: str, expected_category: ErrorCategory) -> None:
@@ -192,6 +197,7 @@ def test_every_error_code_has_an_impact() -> None:
         (ErrorCode.NOT_FOUND, ErrorImpact.BENIGN),
         (ErrorCode.INVALID_INPUT, ErrorImpact.BENIGN),
         (ErrorCode.FORBIDDEN, ErrorImpact.BENIGN),
+        (ErrorCode.STALE_CURSOR, ErrorImpact.BENIGN),
     ],
 )
 def test_code_impact_mapping(code: str, expected_impact: ErrorImpact) -> None:
@@ -305,3 +311,63 @@ def test_harness_boundary_is_startup_not_before() -> None:
     assert is_before_harness_start(ErrorPhase.HARNESS_STARTUP) is False
     assert is_before_harness_start(ErrorPhase.TURN) is False
     assert is_before_harness_start(ErrorPhase.UNKNOWN) is False
+
+
+def test_stale_cursor_error_carries_cursor_and_maps_to_400() -> None:
+    """The error names the vanished cursor and rejects as a client 400.
+
+    The distinct code (not a bare empty page) is what lets a paging client
+    tell "restart the enumeration" apart from "fully enumerated".
+    """
+    err = StaleCursorError("conv_gone")
+    assert err.code == ErrorCode.STALE_CURSOR
+    assert err.http_status == 400
+    assert err.cursor_id == "conv_gone"
+    assert "conv_gone" in err.message
+
+
+def test_restart_on_stale_cursor_restarts_then_returns() -> None:
+    """One vanished cursor restarts the enumeration; the result is the
+    second (complete) walk's."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    def walk() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise StaleCursorError("conv_gone")
+        return "complete"
+
+    assert walk() == "complete"
+    assert calls == 2
+
+
+def test_restart_on_stale_cursor_reraises_when_persistent() -> None:
+    """Rows deleted faster than the walk can finish must surface, not loop."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    def walk() -> None:
+        nonlocal calls
+        calls += 1
+        raise StaleCursorError("conv_gone")
+
+    with pytest.raises(StaleCursorError):
+        walk()
+    assert calls == _STALE_CURSOR_ATTEMPTS
+
+
+def test_restart_on_stale_cursor_passes_other_errors_through() -> None:
+    """Only the stale-cursor signal restarts; anything else propagates."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    def walk() -> None:
+        nonlocal calls
+        calls += 1
+        raise ValueError("unrelated")
+
+    with pytest.raises(ValueError):
+        walk()
+    assert calls == 1

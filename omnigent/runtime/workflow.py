@@ -32,7 +32,7 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.models.model_resolver import ModelResolutionError
@@ -2475,6 +2475,7 @@ def _prepare_messages(
 # ── Pagination helper ─────────────────────────────────────
 
 
+@restart_on_stale_cursor
 def fetch_all_items(
     conv_store: ConversationStore,
     conversation_id: str,
@@ -2483,7 +2484,9 @@ def fetch_all_items(
     """
     Fetch all conversation items starting after the given
     cursor, paginating through every page until ``has_more``
-    is ``False``.
+    is ``False``. An item cursor invalidated mid-walk restarts
+    the walk (via :func:`restart_on_stale_cursor`) instead of
+    silently dropping the remaining items.
 
     :param conv_store: The ConversationStore to query.
     :param conversation_id: The conversation to fetch items

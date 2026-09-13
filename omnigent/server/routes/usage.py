@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
+from omnigent.errors import restart_on_stale_cursor
 from omnigent.runtime.policies.builder import load_session_tree, load_session_usage
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
@@ -114,6 +115,7 @@ def _session_cost(usage: dict[str, Any]) -> float:
         return 0.0
 
 
+@restart_on_stale_cursor
 def _build_usage_report(
     conversation_store: ConversationStore,
     user_id: str | None,
@@ -122,6 +124,11 @@ def _build_usage_report(
 ) -> UsageReport:
     """
     Build the usage report: a daily-rollup cost summary plus session detail.
+
+    A session deleted while the detail enumeration is paging invalidates the
+    page cursor; the whole report is rebuilt (via
+    :func:`restart_on_stale_cursor`) so the detail list is never silently
+    truncated.
 
     The summary (today / last 7 days / last 30 days / all-time) is summed
     from the per-user daily-cost rollup (``user_daily_cost``), which

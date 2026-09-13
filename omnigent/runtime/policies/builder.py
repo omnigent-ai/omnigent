@@ -25,7 +25,7 @@ import cachetools
 
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
@@ -1300,6 +1300,7 @@ def _policy_usage_seed(
     return _normalize_usage_for_engine(usage)
 
 
+@restart_on_stale_cursor
 def _load_tree_conversations(
     root_conversation_id: str,
     conversation_store: ConversationStore,
@@ -1310,7 +1311,11 @@ def _load_tree_conversations(
     Returns all conversations sharing ``root_conversation_id`` (the
     root plus every sub-agent, any ``kind``), paginating so a large
     tree is not silently truncated. The ``root_conversation_id`` column
-    is indexed, so this is a bounded indexed scan per page.
+    is indexed, so this is a bounded indexed scan per page. A delete
+    landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
 
     :param root_conversation_id: The tree's root conversation id (every
         conversation in a spawn tree shares it), e.g. ``"conv_abc123"``.
@@ -1342,12 +1347,18 @@ def _load_tree_conversations(
     return convs
 
 
+@restart_on_stale_cursor
 def _load_tree_pages(
     root_conversation_id: str,
     conversation_store: ConversationStore,
 ) -> tuple[list[Conversation], bool]:
     """
     Page through a spawn tree, reporting whether more than one page was read.
+
+    A delete landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
 
     :param root_conversation_id: The tree's root conversation id.
     :param conversation_store: Store to read from.
