@@ -113,8 +113,11 @@ _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 
 # ACP protocol constants (JSON-RPC 2.0 method names).
 _AGENT_METHOD_INITIALIZE = "initialize"
+_AGENT_METHOD_AUTHENTICATE = "authenticate"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+# Browser/device-login method ids that cannot complete on a headless sandbox.
+_ACP_INTERACTIVE_AUTH_METHODS = frozenset({"grok.com"})
 
 # Notification sent *from* the agent to the client (streaming progress).
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -295,6 +298,35 @@ def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     if not mime.startswith("image/") or not payload:
         return None
     return mime, payload
+
+
+def _unattended_auth_method_id(initialize_result: _AcpJsonObject) -> str | None:
+    """Pick a non-browser ACP auth method, or ``None`` if none is advertised.
+
+    Prefers ``_meta.defaultAuthMethodId`` (Grok sets this to ``cached_token``
+    when ``auth.json`` loaded) and otherwise the first method that is not a
+    known interactive login id.
+    """
+    methods = initialize_result.get("authMethods")
+    if not isinstance(methods, list) or not methods:
+        return None
+    ids = [
+        method.get("id")
+        for method in methods
+        if isinstance(method, dict) and isinstance(method.get("id"), str)
+    ]
+    meta = initialize_result.get("_meta")
+    default = meta.get("defaultAuthMethodId") if isinstance(meta, dict) else None
+    if (
+        isinstance(default, str)
+        and default in ids
+        and default not in _ACP_INTERACTIVE_AUTH_METHODS
+    ):
+        return default
+    for method_id in ids:
+        if method_id not in _ACP_INTERACTIVE_AUTH_METHODS:
+            return method_id
+    return None
 
 
 class AcpExecutor(Executor):
@@ -681,11 +713,41 @@ class AcpExecutor(Executor):
             message = resp["error"].get("message", resp["error"])
             self._warn_initialize_failed(str(message))
             raise RuntimeError(f"ACP initialize failed: {message}")
+        result = resp.get("result") or {}
         prompt_caps = (
-            (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
+            result.get("agentCapabilities", {}).get("promptCapabilities", {})
+            if isinstance(result, dict)
+            else {}
         )
         self._image_supported = bool(prompt_caps.get("image"))
+        await self._authenticate_if_needed(result if isinstance(result, dict) else {})
         self._initialized = True
+
+    async def _authenticate_if_needed(self, initialize_result: _AcpJsonObject) -> None:
+        """Call ACP ``authenticate`` when the agent advertised a headless method.
+
+        Grok Build (and the ACP spec) require ``authenticate`` before
+        ``session/new``. Without it, Grok returns ``Authentication required``
+        even when ``~/.grok/auth.json`` is valid. Skip when the agent lists
+        no methods (Codex/Gemini/our fake agent).
+        """
+        method_id = _unattended_auth_method_id(initialize_result)
+        if method_id is None:
+            methods = initialize_result.get("authMethods") or []
+            if isinstance(methods, list) and methods:
+                raise RuntimeError(
+                    "ACP authenticate requires a browser login; no cached "
+                    "token method is available"
+                )
+            return
+        auth_resp = await self._rpc(
+            _AGENT_METHOD_AUTHENTICATE,
+            {"methodId": method_id},
+            timeout=_INIT_TIMEOUT_SECONDS,
+        )
+        if "error" in auth_resp:
+            message = auth_resp["error"].get("message", auth_resp["error"])
+            raise RuntimeError(f"ACP authenticate failed: {message}")
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning the session id.

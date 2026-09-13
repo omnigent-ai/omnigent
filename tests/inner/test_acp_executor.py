@@ -27,7 +27,11 @@ import pytest
 from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
-from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.acp_executor import (
+    AcpAgentConfig,
+    AcpExecutor,
+    _unattended_auth_method_id,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorError,
@@ -72,6 +76,80 @@ def test_handles_tools_internally_and_streaming() -> None:
 # ---------------------------------------------------------------------------
 # session/new shapes (server- vs client-assigned id, optional model)
 # ---------------------------------------------------------------------------
+
+
+def test_unattended_auth_method_prefers_cached_token() -> None:
+    assert (
+        _unattended_auth_method_id(
+            {
+                "authMethods": [
+                    {"id": "cached_token"},
+                    {"id": "grok.com"},
+                ],
+                "_meta": {"defaultAuthMethodId": "cached_token"},
+            }
+        )
+        == "cached_token"
+    )
+
+
+def test_unattended_auth_method_none_when_only_browser_login() -> None:
+    assert _unattended_auth_method_id({"authMethods": [{"id": "grok.com"}]}) is None
+
+
+def test_unattended_auth_method_none_when_absent() -> None:
+    assert _unattended_auth_method_id({}) is None
+
+
+@pytest.mark.asyncio
+async def test_initialize_authenticates_cached_token() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        if method == "initialize":
+            return {
+                "result": {
+                    "agentCapabilities": {"promptCapabilities": {"image": False}},
+                    "authMethods": [{"id": "cached_token"}, {"id": "grok.com"}],
+                    "_meta": {"defaultAuthMethodId": "cached_token"},
+                }
+            }
+        if method == "authenticate":
+            return {"result": {}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert [c[0] for c in calls] == ["initialize", "authenticate"]
+    assert calls[1][1] == {"methodId": "cached_token"}
+
+
+@pytest.mark.asyncio
+async def test_initialize_skips_authenticate_without_auth_methods() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    calls: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        return {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert calls == ["initialize"]
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_browser_only_auth() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {"result": {"authMethods": [{"id": "grok.com"}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="browser login"):
+        await ex._ensure_initialized()
 
 
 @pytest.mark.asyncio
