@@ -3650,15 +3650,19 @@ async def test_sys_session_send_workspace_lands_in_child_create_body(
             runner_app._session_inboxes_ref.pop("conv_parent_workspace", None)
 
     assert json.loads(output)["status"] == "launching"
-    assert create_bodies == [
-        {
-            "agent_id": "ag_parent",
-            "parent_session_id": "conv_parent_workspace",
-            "title": "worker:task",
-            "sub_agent_name": "worker",
-            "workspace": str(workspace.resolve()),
-        }
-    ]
+    assert len(create_bodies) == 1
+    create_body = dict(create_bodies[0])
+    # Every child create is stamped with a fresh dispatch id; assert its
+    # shape separately so this test stays about the workspace plumbing.
+    dispatch_id = create_body.pop("labels")[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY]
+    assert dispatch_id.startswith("subagent_")
+    assert create_body == {
+        "agent_id": "ag_parent",
+        "parent_session_id": "conv_parent_workspace",
+        "title": "worker:task",
+        "sub_agent_name": "worker",
+        "workspace": str(workspace.resolve()),
+    }
 
 
 def test_subagent_workspace_resolves_relative_os_env_cwd(
