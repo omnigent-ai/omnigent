@@ -133,7 +133,9 @@ whole `tests/e2e_ui/start_session/` suite) drive Playwright *manually* —
 the `page` fixture, and `--video on` records **nothing** for those: the flag never
 sees their browser, so you get a green/red test but an empty `recordings/`.
 Setting `OMNIGENT_E2E_RECORD_DIR` makes the e2e_ui conftest inject
-`record_video_dir` into every page/context the test opens, so the journey is
+`record_video_dir` into every page/context the test opens — both fixture styles:
+tests that drive Playwright manually through the async or sync API *and* tests
+that take pytest-playwright's sync `page`/`context` fixtures — so the journey is
 filmed no matter how the test opened the browser. Playwright writes the `.webm` (a
 random hash name) into that dir when the context closes. (If a test already
 hard-codes its own `record_video_dir` — some authored reproductions do — that
@@ -144,7 +146,10 @@ explicit dir wins and the video lands there instead; check both locations.)
 it (do not copy) to a stable `recordings/<slug>/<kind>-<facet>.webm` and delete
 the leftover raw dir, so the same footage isn't collected twice. If that dir has
 **no** `.webm` after the run, the recording genuinely didn't happen (the test
-errored before opening a page, or the fixture never came online) — capture the
+errored before opening a page, or the fixture never came online). Before declaring
+the lane unfilmable, rule out the recorder itself: if the test takes the `page`
+fixture, re-run with `--video on` and check pytest's `--output` dir — a clip there
+means the env-var injection failed, not the journey. Only then capture the
 reason per the empty-recordings rule; never report a clip you didn't produce.
 
 ## `mobile` facets
