@@ -719,12 +719,6 @@ class AcpExecutor(Executor):
             )
         result = resp.get("result", {})
         server_session_id = result.get("sessionId") if isinstance(result, dict) else None
-        if isinstance(result, dict):
-            self._note_config_options(result.get("configOptions"))
-        models = result.get("models") if isinstance(result, dict) else None
-        current_model = models.get("currentModelId") if isinstance(models, dict) else None
-        if self._active_model is None and isinstance(current_model, str) and current_model:
-            self._active_model = current_model
         session_id = server_session_id or client_id
         if not session_id:
             raise RuntimeError(
@@ -737,6 +731,12 @@ class AcpExecutor(Executor):
         # server unable to attribute per-model token usage for the turn.
         if isinstance(result, dict):
             self._note_config_options(result.get("configOptions"))
+            # Legacy shape (Grok Build 1.0.4): the active model arrives as
+            # models.currentModelId instead of a config option.
+            models = result.get("models")
+            current_model = models.get("currentModelId") if isinstance(models, dict) else None
+            if self._active_model is None and isinstance(current_model, str) and current_model:
+                self._active_model = current_model
         return self._session_id
 
     def _session_mcp_servers(self) -> list[_AcpJsonObject]:

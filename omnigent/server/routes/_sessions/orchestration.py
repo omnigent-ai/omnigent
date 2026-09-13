@@ -275,7 +275,6 @@ from omnigent.server.routes._sessions.helpers import (
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
-    _persist_external_model_change,
     _persist_native_policy_notice,
     _persist_session_status_error_labels,
     _persist_stored_session_bundle,
@@ -6806,29 +6805,6 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                             )
                     if evt_type == "response.completed":
-                        response = event.get("response")
-                        usage = response.get("usage") if isinstance(response, dict) else None
-                        reported_model = usage.get("model") if isinstance(usage, dict) else None
-                        if isinstance(reported_model, str) and reported_model:
-                            conv = await asyncio.to_thread(
-                                conversation_store.get_conversation,
-                                session_id,
-                            )
-                            harness = _resolve_harness(conv)
-                            if (
-                                conv is not None
-                                and harness is not None
-                                and harness_owns_its_credential(harness)
-                            ):
-                                await _persist_external_model_change(
-                                    session_id,
-                                    conv,
-                                    SessionEventInput(
-                                        type="external_model_change",
-                                        data={"model": reported_model},
-                                    ),
-                                    conversation_store,
-                                )
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
