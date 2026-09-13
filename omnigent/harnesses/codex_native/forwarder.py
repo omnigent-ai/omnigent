@@ -60,6 +60,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.native.subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -436,6 +437,9 @@ class _CodexForwarderState:
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
+    subagent_parent_by_thread: dict[str, str | None] = field(default_factory=dict)
+    subagent_status_by_thread: dict[str, str] = field(default_factory=dict)
+    snapshot_publisher: NativeSubagentSnapshotPublisher | None = None
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
@@ -584,7 +588,17 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.subagents_by_thread[thread_id] = session_id
+        self.subagent_parent_by_thread.setdefault(thread_id, self.parent_session_id)
+        self.subagent_status_by_thread.setdefault(thread_id, "running")
+        self.publish_child_snapshot()
         self.pending_child_threads.pop(thread_id, None)
+
+    def publish_child_snapshot(self) -> None:
+        if self.snapshot_publisher is not None and self.parent_session_id is not None:
+            self.snapshot_publisher.update(
+                self.parent_session_id,
+                _codex_native_subagent_snapshot(self),
+            )
 
     def note_parent_rotation(self, session_id: str) -> None:
         """
@@ -594,7 +608,10 @@ class _CodexForwarderState:
             ``"conv_new_parent"``.
         :returns: None.
         """
+        if self.snapshot_publisher is not None and self.parent_session_id is not None:
+            self.snapshot_publisher.update(self.parent_session_id, {}, retired=True)
         self.parent_session_id = session_id
+        self.publish_child_snapshot()
         self.pending_child_threads.clear()
 
     def note_pending_child_thread(
@@ -2085,6 +2102,8 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
         )
+        snapshots = NativeSubagentSnapshotPublisher(ap_client)
+        forwarder_state.snapshot_publisher = snapshots
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -2105,6 +2124,7 @@ async def supervise_forwarder(
             name="codex-native-forwarder-subscribe",
         )
         await _sleep(0)
+        await snapshots.__aenter__()
         try:
             async for event in client.iter_events():
                 try:
@@ -2159,6 +2179,7 @@ async def supervise_forwarder(
                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
+            await snapshots.__aexit__()
             if mcp_settle_timer is not None:
                 mcp_settle_timer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2855,6 +2876,22 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    if is_child and forwarder_state is not None:
+        child_thread = _thread_id_from_params(params)
+        observed_status = None
+        if method == "turn/started":
+            observed_status = "running"
+        elif method in {"turn/completed", "turn/failed"}:
+            observed_status = (
+                "failed"
+                if method == "turn/failed"
+                or _turn_status_is_failed(params)
+                or _terminal_error_from_turn(params) is not None
+                else "idle"
+            )
+        if child_thread is not None and observed_status is not None:
+            forwarder_state.subagent_status_by_thread[child_thread] = observed_status
+            forwarder_state.publish_child_snapshot()
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.
@@ -5565,7 +5602,18 @@ async def _post_collab_agent_statuses(
             continue
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is not None:
+            forwarder_state.subagent_status_by_thread[thread_id] = ap_status
+            forwarder_state.publish_child_snapshot()
             await _post_status(client, child_session_id, ap_status)
+
+
+def _codex_native_subagent_snapshot(state: _CodexForwarderState) -> dict[str, str]:
+    """Keep late-event mappings while excluding children of rotated parents."""
+    return {
+        child_id: state.subagent_status_by_thread.get(thread_id, "activity_unverified")
+        for thread_id, child_id in state.subagents_by_thread.items()
+        if state.subagent_parent_by_thread.get(thread_id) == state.parent_session_id
+    }
 
 
 def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:
