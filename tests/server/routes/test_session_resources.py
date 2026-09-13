@@ -3379,6 +3379,69 @@ async def test_filesystem_delete_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "url", "body"),
+    [
+        (
+            "PUT",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/new.txt",
+            {"content": "hello", "encoding": "utf-8"},
+        ),
+        (
+            "PATCH",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/hello.txt",
+            {"old_text": "hello", "new_text": "goodbye"},
+        ),
+        (
+            "DELETE",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/old.txt",
+            None,
+        ),
+        (
+            "POST",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/shell",
+            {"command": "echo hello"},
+        ),
+        (
+            "DELETE",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
+            None,
+        ),
+    ],
+)
+async def test_mutating_proxy_maps_non_json_runner_reply_to_502(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    body: dict[str, Any] | None,
+) -> None:
+    """A non-JSON runner reply to a mutating proxy surfaces as a graceful 502.
+
+    A runner -- or an intermediary between the server and the runner -- can
+    answer a proxied request with an empty or HTML body instead of JSON. The
+    POST/PUT/PATCH/DELETE proxies must map that to the same 502 the GET proxy
+    already returns, not let ``json.JSONDecodeError`` escape as an unhandled
+    exception (an HTTP 500).
+
+    :param client: httpx client bound to the sessions router app.
+    :param method: HTTP method to drive.
+    :param url: Route under test (also the runner-relative proxy path).
+    :param body: JSON request body, or ``None`` for body-less methods.
+    :returns: None.
+    """
+    fake_runner = _FakeRunnerClient(
+        text_responses={url: (502, "", {"content-type": "text/html"})},
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.request(method, url, json=body)
+
+    assert (method, url) in fake_runner.calls
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint returned invalid JSON"
+
+
+@pytest.mark.asyncio
 async def test_filesystem_proxy_validates_session(
     client: httpx.AsyncClient,
 ) -> None:
