@@ -4313,12 +4313,14 @@ function SessionHarnessPicker({
       ? SMART_ROUTING_LABEL
       : (modelLabel ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
   // On narrow layouts the trigger may collapse to the harness icon, leaving
-  // this row in the open picker as the only model read-out. Child sessions
+  // this row in the open picker as the only model/effort read-out. Child sessions
   // carry their effective model in the persisted snapshot rather than the
   // live root-session model store, so prefer that value for this modal only.
   const modalModelLabel = routingOn
     ? SMART_ROUTING_LABEL
     : (childModelLabel ?? modelLabel ?? "Default");
+  const modalModelSummary =
+    routingOn || !effortLabel ? modalModelLabel : `${modalModelLabel} · ${effortLabel}`;
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
@@ -4514,7 +4516,7 @@ function SessionHarnessPicker({
               onOpenChange={setConfigMenuOpen}
               icon={<ComposerAgentIcon agent={iconAgent} />}
               label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-              summary={modalModelLabel}
+              summary={modalModelSummary}
               active={!routingOn}
               isMobile={isMobile}
               disabled={busy || pendingModelChange !== null}

@@ -1314,6 +1314,7 @@ describe("Composer model/effort label", () => {
         {...composerProps({
           subAgentLabel: "worker",
           sessionModel: "gpt-5-6-luna",
+          sessionReasoningEffort: "high",
           showModels: true,
           showEffort: false,
           modelPickerKind: "codex",
@@ -1324,7 +1325,7 @@ describe("Composer model/effort label", () => {
     openSessionConfig();
 
     expect(
-      within(screen.getByTestId("composer-agent-edit")).getByText("gpt-5.6-luna"),
+      within(screen.getByTestId("composer-agent-edit")).getByText("gpt-5.6-luna · High"),
     ).toBeVisible();
   });
 
