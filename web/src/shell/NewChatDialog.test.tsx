@@ -59,7 +59,7 @@ import {
   onHostStatusChanged,
 } from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
-import { readHarnessOptions } from "@/lib/modePreferences";
+import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -281,6 +281,15 @@ const CODEX_MODEL_OPTIONS_RESULT = {
         { reasoningEffort: "xhigh" },
       ],
     },
+  ],
+  isLoading: false,
+  isError: false,
+};
+const ANTIGRAVITY_MODEL_OPTIONS_RESULT = {
+  data: [
+    { id: "gemini-3.5-pro", displayName: "Gemini 3.5 Pro", isDefault: true },
+    { id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6" },
+    { id: "gpt-oss-120b", displayName: "GPT-OSS 120B" },
   ],
   isLoading: false,
   isError: false,
@@ -1045,7 +1054,9 @@ function setupLandingMocks() {
     (_hostId, harness) =>
       (harness === "codex-native"
         ? CODEX_MODEL_OPTIONS_RESULT
-        : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+        : harness === "antigravity-native"
+          ? ANTIGRAVITY_MODEL_OPTIONS_RESULT
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
   );
   mockAgents([
     {
@@ -1979,10 +1990,14 @@ describe("NewChatLandingScreen", () => {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
 
-      if (["claude", "codex", "pi"].includes(native.key)) {
+      if (["claude", "codex", "pi", "antigravity"].includes(native.key)) {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
-        expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+        if (native.key === "antigravity") {
+          expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
+        } else {
+          expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+        }
         expect(screen.queryByText("Advanced settings")).toBeNull();
       } else {
         expect(screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`)).toBeNull();
@@ -3223,6 +3238,132 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+  });
+
+  it("pins a selected Antigravity launch model without inferring effort", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockAgents([
+      {
+        id: "a_agy",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    openAgentModels("a_agy");
+    // The host-owned catalog is intentionally provider-agnostic: all rows
+    // the installed agy can launch remain selectable.
+    expect(screen.getByRole("menuitemcheckbox", { name: "Gemini 3.5 Pro" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Claude Sonnet 4.6" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-OSS 120B" })).toBeTruthy();
+    pickPrimaryOption("model", "Claude Sonnet 4.6");
+    expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a_agy");
+    expect(body.model_override).toBe("claude-sonnet-4-6");
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "antigravity-native", true);
+  });
+
+  it("restores Antigravity permissions alongside models and clears remembered skip", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockAgents([
+      {
+        id: "a_agy",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
+        skills: [],
+      },
+    ]);
+    writeHarnessOption("antigravity-native", { mode: "skip" });
+    renderLanding();
+
+    const permissions = screen.getByTestId("new-chat-landing-permission-chip");
+    expect(permissions).toBeVisible();
+    expect(permissions).toHaveAccessibleName("Permissions: Skip permissions");
+    openAgentModels("a_agy");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    pickPrimaryOption("model", "Claude Sonnet 4.6");
+    closePrimaryPicker();
+    expect(permissions).toHaveAccessibleName("Permissions: Skip permissions");
+
+    pickPermissionOption("default");
+    expect(permissions).toHaveAccessibleName("Permissions: Ask every time");
+    expect(readHarnessOptions("antigravity-native").mode).toBe("default");
+    remountLanding();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permissions: Ask every time",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("claude-sonnet-4-6");
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("leaves Antigravity on its harness default until the user picks a model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockAgents([
+      {
+        id: "a_agy",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("surfaces an Antigravity catalog error without offering stale model rows", () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "antigravity-native"
+          ? {
+              data: [],
+              isLoading: false,
+              isError: true,
+              error: new Error("Antigravity models unavailable on this host"),
+            }
+          : harness === "codex-native"
+            ? CODEX_MODEL_OPTIONS_RESULT
+            : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    mockAgents([
+      {
+        id: "a_agy",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    openAgentModels("a_agy");
+    expect(screen.getByText("Antigravity models unavailable on this host")).toBeVisible();
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Gemini 3.5 Pro" })).toBeNull();
   });
 
   it("keeps legacy Mod+Enter as a default-mode send alias", async () => {

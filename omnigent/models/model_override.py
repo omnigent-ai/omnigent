@@ -99,10 +99,6 @@ _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
         "antigravity",
         "agy",
         "google-antigravity",
-        # The native agy TUI bridge is equally Gemini-native (it drives the
-        # same Gemini-backed ``agy`` runtime), so it shares the reject-list.
-        "antigravity-native",
-        "native-antigravity",
     }
 )
 # A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
@@ -161,7 +157,8 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     The Gemini-native ``antigravity`` harness rejects the Claude/GPT
     families and any ``databricks-`` gateway id (it has no gateway path),
     but accepts Gemini shapes and bare/ambiguous ids the SDK may honor.
-    Multi-model harnesses (pi, openai-agents) accept any validated id.
+    Multi-model harnesses have no family restriction here; this helper
+    does not check whether a model appears in a provider catalog.
 
     :param harness: Harness id from the sub-agent spec, alias or
         canonical, e.g. ``"claude-native"``.

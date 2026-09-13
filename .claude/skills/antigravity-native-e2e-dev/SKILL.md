@@ -108,8 +108,11 @@ terminal, drive/observe from another:
 
 ```bash
 .venv/bin/omnigent antigravity --server "$SERVER" 2>&1   # attaches the agy TUI; leave it running
-# add a model:  --model gemini-2.5-pro   ;   pass-through agy args go at the end
+# pass-through agy args go at the end
 ```
+
+For model selection, follow the [native Antigravity guidance](../../../README.md#3-choose--switch-models)
+and pass a discovered ID with `--model <catalog-id>`.
 
 It prints `Web UI: <url>` and a resume hint to stderr — grab the conversation id
 (the `…/c/<conv_…>` segment) for the API calls below:

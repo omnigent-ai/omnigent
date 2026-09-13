@@ -21,7 +21,7 @@
 // harnesses with no carry path (kiro/kimi/goose) are offered by neither; an
 // unclassifiable harness (catalog harness=null) is conservatively dropped.
 
-/** Provider family a harness consumes, or null when unknown. */
+/** Legacy family grouping for fork/switch eligibility, or null when unknown. */
 export function harnessFamily(
   harness: string | null | undefined,
 ): "anthropic" | "openai" | "gemini" | null {
@@ -39,9 +39,8 @@ export function harnessFamily(
     case "openai-agents-sdk":
     case "agents_sdk":
       return "openai";
-    // Antigravity is Gemini-family: the native CLI (`antigravity-native`, `agy-native`)
-    // and the in-process SDK (`antigravity`, `agy`, plus reversed spellings) all
-    // consume Gemini models.
+    // Both Antigravity paths retain the legacy Gemini grouping for eligibility;
+    // this is not a model-compatibility check.
     case "antigravity-native":
     case "native-antigravity":
     case "agy-native":
@@ -129,8 +128,8 @@ const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
  * (kiro/kimi/goose).
  *
  * NOTE: the SDK branch is `harnessFamily(h) !== null`, which also matches the
- * one native harness that has a single family today — antigravity-native
- * (gemini). That preserves Antigravity's prior presence in the pickers, but a
+ * native Antigravity harness through its legacy Gemini grouping. That preserves
+ * Antigravity's prior presence in the pickers, but a
  * native Antigravity fork is in NEITHER server carry-set, so whether it truly
  * carries is unverified. TODO(fork-switch): confirm, then move it to a carry
  * set or drop it rather than leaning on this proxy.

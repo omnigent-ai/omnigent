@@ -1272,6 +1272,7 @@ const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[]
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
+    nativeAgentHasCapability(agent, "launchModelPicker") ||
     nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
   );
 }
@@ -2264,6 +2265,11 @@ export function NewChatLandingScreen() {
     "pi-native",
     !sandboxSelected,
   );
+  const {
+    data: hostAntigravityModelOptions,
+    isLoading: hostAntigravityModelsLoading,
+    error: hostAntigravityModelsError,
+  } = useHostModelOptions(selectedHostId, "antigravity-native", !sandboxSelected);
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -2297,6 +2303,19 @@ export function NewChatLandingScreen() {
             source: option.source,
           })),
     [hostPiModelOptions, sandboxSelected],
+  );
+  const antigravityModelOptions = useMemo(
+    () =>
+      sandboxSelected
+        ? []
+        : (hostAntigravityModelOptions ?? []).map((option) => ({
+            id: option.id,
+            model: option.model,
+            displayName: nativeModelLabel(option),
+            isDefault: option.isDefault,
+            source: option.source,
+          })),
+    [hostAntigravityModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -2917,7 +2936,9 @@ export function NewChatLandingScreen() {
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
-  const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
+  const supportsModelPicker =
+    nativeAgentHasCapability(selectedAgent, "modelPicker") ||
+    nativeAgentHasCapability(selectedAgent, "launchModelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
@@ -2979,8 +3000,10 @@ export function NewChatLandingScreen() {
       return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsModelPicker && !supportsPermissionMode) {
+      const modelOptions =
+        selectedNativeHarness === "antigravity-native" ? antigravityModelOptions : piModelOptions;
       const modelValue =
-        piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
+        modelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
       const thinkingLevelValue = !pickedEffort
         ? "Default"
         : (PI_NATIVE_EFFORTS.find((effort) => effort.value === pickedEffort)?.label ?? "Default");
@@ -2989,7 +3012,16 @@ export function NewChatLandingScreen() {
         ...(selectedNativeHarness === "pi-native"
           ? [{ label: "Thinking level", value: thinkingLevelValue }]
           : []),
-        ...sourceRows(piModelOptions),
+        ...(supportsAgySkipPermissions
+          ? [
+              {
+                label: "Permissions",
+                value:
+                  AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode,
+              },
+            ]
+          : []),
+        ...sourceRows(modelOptions),
       ];
     }
     if (supportsPermissionMode) {
@@ -3064,11 +3096,6 @@ export function NewChatLandingScreen() {
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
       return [{ label: "Mode", value: modeValue }, ...routingRow];
     }
-    if (supportsAgySkipPermissions) {
-      const skipValue =
-        AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
-      return [{ label: "Permissions", value: skipValue }, ...routingRow];
-    }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
       return [
@@ -3091,6 +3118,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    antigravityModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -3112,7 +3140,9 @@ export function NewChatLandingScreen() {
       ? piModelOptions
       : selectedNativeHarness === "codex-native"
         ? codexModelOptions
-        : [];
+        : selectedNativeHarness === "antigravity-native"
+          ? antigravityModelOptions
+          : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     !sandboxSelected &&
@@ -3123,13 +3153,17 @@ export function NewChatLandingScreen() {
         ? hostCodexModelsLoading
         : selectedNativeHarness === "pi-native"
           ? hostPiModelsLoading
-          : false);
+          : selectedNativeHarness === "antigravity-native"
+            ? hostAntigravityModelsLoading
+            : false);
   const pickerModelsError =
     selectedNativeHarness === "claude-native"
       ? hostClaudeModelsError
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
-        : null;
+        : selectedNativeHarness === "antigravity-native"
+          ? hostAntigravityModelsError
+          : null;
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
@@ -3316,7 +3350,9 @@ export function NewChatLandingScreen() {
             ? codexModelOptions
             : native.iconKind === "pi"
               ? piModelOptions
-              : [];
+              : native.iconKind === "antigravity"
+                ? antigravityModelOptions
+                : [];
       const model = catalog.find((option) => option.id === saved.model);
       const label = visibleModelLabel(model ? nativeModelLabel(model) : defaultModelLabel(catalog));
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
@@ -3406,7 +3442,9 @@ export function NewChatLandingScreen() {
         ? claudeModelOptions
         : selectedNativeHarness === "codex-native"
           ? codexModelOptions
-          : [];
+          : selectedNativeHarness === "antigravity-native"
+            ? antigravityModelOptions
+            : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -3456,6 +3494,18 @@ export function NewChatLandingScreen() {
           ? stored.effort
           : "",
       );
+    }
+    if (selectedNativeHarness === "antigravity-native") {
+      // agy consumes the chosen model only when its terminal is launched;
+      // there is deliberately no effort or in-session switching state.
+      setPickedModel(
+        projectSeed(antigravityModelOptions) ??
+          (stored.model != null &&
+          antigravityModelOptions.some((model) => model.id === stored.model)
+            ? stored.model
+            : ""),
+      );
+      setPickedEffort("");
     }
     if (supportsPermissionMode) {
       setPermissionMode(
@@ -3529,6 +3579,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    antigravityModelOptions,
     projectDefaultModel,
   ]);
   // Smart Routing is remembered per harness alongside the mode/model
@@ -4432,7 +4483,9 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
-      const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
+      const agentSupportsModelPicker =
+        nativeAgentHasCapability(agent, "modelPicker") ||
+        nativeAgentHasCapability(agent, "launchModelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is

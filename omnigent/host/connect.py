@@ -2920,8 +2920,8 @@ class HostProcess:
         This is a pre-launch PREVIEW of the host's ambient default
         configuration (``spec=None`` — no session exists yet, so there is no
         agent spec to pin). A session whose spec pins a different provider
-        resolves its own catalog at launch, and the in-session picker
-        re-reads that authoritative snapshot after bind.
+        resolves its own catalog at launch. Harnesses with an in-session
+        picker re-read that authoritative snapshot after bind.
         """
         harness = canonicalize_harness(frame.harness) or frame.harness
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
@@ -2960,6 +2960,27 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(pi_models),
+            )
+
+        if harness == "antigravity-native":
+            try:
+                from omnigent.harnesses.antigravity_native.models import (
+                    list_agy_cli_model_options,
+                )
+
+                models = await asyncio.to_thread(list_agy_cli_model_options)
+            except Exception:  # A missing CLI/login is a failed host probe.
+                _logger.exception("Failed to resolve pre-launch Antigravity model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="the antigravity model probe failed — see the host log",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(models),
+                routable_models=[model["id"] for model in models],
             )
 
         if is_claude_sdk_harness_name(harness):
