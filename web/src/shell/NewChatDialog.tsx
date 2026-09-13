@@ -2369,12 +2369,19 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const setPromptMessage = useCallback(
+    (next: string) => {
+      if (next !== message) landingDraftRevision += 1;
+      setMessage(next);
+    },
+    [message],
+  );
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(message, setMessage, textareaRef);
+  const dictation = useDictationInsert(message, setPromptMessage, textareaRef);
   // The CSS max-height keeps the reference's 180px scrolling cap while the
   // shared hook continues to grow from the one-row minimum.
   useAutoGrowTextarea(textareaRef, message, 9);
@@ -4298,7 +4305,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
   // argument — skills never auto-execute from the menu.
   function applySlashSelection(cmd: string) {
     setSlashMenuIndex(-1);
-    setMessage(cmd + " ");
+    setPromptMessage(cmd + " ");
     textareaRef.current?.focus();
   }
 
@@ -4309,7 +4316,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
 
   // Pills only render over an empty draft, so there's never args to preserve.
   function applySkillPill(name: string) {
-    setMessage(`/${name} `);
+    setPromptMessage(`/${name} `);
     textareaRef.current?.focus();
   }
 
@@ -4391,7 +4398,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
     setMention,
     mentionEntries,
     text: message,
-    setText: setMessage,
+    setText: setPromptMessage,
     textareaRef,
   });
 
@@ -5637,8 +5644,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
                 ref: textareaRef,
                 value: message,
                 onChange: (e) => {
-                  setMessage(e.target.value);
-                  landingDraftRevision += 1;
+                  setPromptMessage(e.target.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
@@ -5698,7 +5704,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
                       e.preventDefault();
                       // Dismiss the menu by clearing the draft so the user can
                       // start fresh.
-                      setMessage("");
+                      setPromptMessage("");
                       setSlashMenuIndex(-1);
                       return;
                     }
@@ -6353,7 +6359,7 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
                       onVoiceStart={() => {
                         voiceSnapshotRef.current = message;
                       }}
-                      onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                      onVoiceDiscard={() => setPromptMessage(voiceSnapshotRef.current)}
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />

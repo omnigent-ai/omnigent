@@ -1037,6 +1037,73 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("newer draft");
   });
 
+  it("keeps dictated text when an older create succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    const recognitionHandlers: Record<string, (event: unknown) => void> = {};
+    class FakeRecognition {
+      continuous = false;
+      interimResults = false;
+      lang = "";
+      start = vi.fn();
+      stop = vi.fn();
+      addEventListener(type: string, handler: (event: unknown) => void) {
+        recognitionHandlers[type] = handler;
+      }
+      removeEventListener() {}
+    }
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
+    });
+
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("older session");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+
+      cleanup();
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
+      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+      act(() => recognitionHandlers.start?.({}));
+
+      await act(async () => {
+        recognitionHandlers.result?.({
+          resultIndex: 0,
+          results: {
+            length: 1,
+            0: { length: 1, isFinal: true, 0: { transcript: "new dictated prompt" } },
+          },
+        });
+        resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+      });
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+        "new dictated prompt older session",
+      );
+      cleanup();
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+        "new dictated prompt older session",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      if (originalMediaDevices) {
+        Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+      } else {
+        Reflect.deleteProperty(navigator, "mediaDevices");
+      }
+    }
+  });
+
   it("records the launched workspace under its host without corrupting other recents", async () => {
     // Write-back hygiene for omnigent:recent-workspaces: the launched path
     // moves to the front of ITS host's list (deduplicated, not appended
