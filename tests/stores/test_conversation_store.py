@@ -3934,6 +3934,38 @@ def test_set_external_session_id_rejects_overwrite_with_different_value(
     assert fetched.external_session_id == "sid-1"
 
 
+def test_set_external_session_id_allow_rotation_overwrites(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``allow_rotation=True`` permits the one sanctioned overwrite.
+
+    A native TUI can start a NEW vendor chat inside the same terminal
+    (cursor-agent's in-pane ``/clear``); the wrapper bridge reports that
+    rotation so the cold-resume target follows the pane's current chat.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.set_external_session_id(conv.id, "sid-before-clear")
+    updated = conversation_store.set_external_session_id(
+        conv.id, "sid-after-clear", allow_rotation=True
+    )
+    assert updated.external_session_id == "sid-after-clear"
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.external_session_id == "sid-after-clear"
+
+
+def test_set_external_session_id_allow_rotation_sets_unset_value(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The rotation flag also performs a plain first write (NULL → value)."""
+    conv = conversation_store.create_conversation()
+    updated = conversation_store.set_external_session_id(
+        conv.id, "sid-first", allow_rotation=True
+    )
+    assert updated.external_session_id == "sid-first"
+
+
 def test_set_external_session_id_missing_conversation_raises(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

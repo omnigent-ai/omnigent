@@ -1513,6 +1513,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         value: str,
+        *,
+        allow_rotation: bool = False,
     ) -> Conversation:
         """
         Set the runtime-native session id this conversation wraps.
@@ -1530,17 +1532,26 @@ class ConversationStore(ABC):
         id per conversation, and a divergent write signals a bug
         worth surfacing loudly rather than silently overwriting.
 
+        ``allow_rotation=True`` permits that overwrite for the one
+        legitimate case: a native TUI that starts a NEW vendor chat
+        inside the same terminal (cursor-agent's in-pane ``/clear``),
+        where the resume target must follow the pane's current chat.
+        Only a wrapper bridge reporting a detected rotation may pass
+        it; everything else keeps the loud-failure default.
+
         :param conversation_id: Conversation to update, e.g.
             ``"conv_abc123"``.
         :param value: Runtime-native session id captured by the
             wrapper bridge, e.g. a Claude Code session uuid
             ``"a1b2c3d4-..."``.
+        :param allow_rotation: Permit overwriting a different
+            existing value (deliberate wrapper-reported rotation).
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
         :raises ValueError: If
             ``conversation.external_session_id`` is already set
-            to a different value.
+            to a different value and ``allow_rotation`` is false.
         """
         ...
 
