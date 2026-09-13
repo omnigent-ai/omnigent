@@ -465,6 +465,118 @@ def _main_repo_for_worktree(worktree_path: str) -> str:
     return str(common_dir.parent)
 
 
+@dataclass
+class WorktreeInspection:
+    """Facts about whether a worktree holds work that exists nowhere else.
+
+    The server combines these into a remove-vs-keep decision when a
+    worktree-attached session is archived: only a clean tree with nothing
+    unpushed and the branch merged may be removed.
+
+    :param dirty_files: Modified tracked files plus untracked files in
+        the worktree, e.g. ``3``.
+    :param unpushed_commits: Commits on ``branch`` unreachable from every
+        remote-tracking ref. When the repo has no remotes at all this is
+        every commit on the branch — nothing has been pushed anywhere.
+    :param merged: Whether ``branch`` is an ancestor of the default
+        branch. ``None`` when no default branch ref could be resolved
+        (cannot determine — callers must treat it as not-merged).
+    :param default_ref: The ref ``merged`` was checked against, e.g.
+        ``"origin/main"`` or ``"main"``. ``None`` when unresolved.
+    """
+
+    dirty_files: int
+    unpushed_commits: int
+    merged: bool | None
+    default_ref: str | None
+
+
+def _default_branch_ref(repo_root: str) -> str | None:
+    """Resolve the ref considered the repo's default branch.
+
+    Prefers the remote's HEAD (``origin/main`` — what a PR would merge
+    into), falling back to a local ``main`` or ``master`` for remote-less
+    repos.
+
+    :param repo_root: Absolute repo work-tree root, e.g.
+        ``"/Users/alice/myrepo"``.
+    :returns: The default ref name, or ``None`` when nothing resolves.
+    """
+    sym = _run_git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=repo_root)
+    if sym.returncode == 0:
+        ref = sym.stdout.strip()
+        prefix = "refs/remotes/"
+        if ref.startswith(prefix):
+            return ref[len(prefix) :]
+    for candidate in ("main", "master"):
+        if _local_branch_exists(repo_root, candidate):
+            return candidate
+    return None
+
+
+def inspect_worktree(
+    *,
+    worktree_path: str,
+    branch: str,
+) -> WorktreeInspection:
+    """Inspect a worktree for work that would be lost by removing it.
+
+    Read-only: gathers the dirty-file count, the unpushed-commit count,
+    and whether the branch is merged into the default branch. Any git
+    failure raises — a check that cannot complete must never read as an
+    all-clear, because the caller keeps the worktree only when the
+    inspection says it is safe to remove.
+
+    :param worktree_path: Absolute path of the worktree to inspect, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param branch: Branch checked out in the worktree, e.g.
+        ``"feature/login"``. Validated before reaching argv (it arrives
+        over the tunnel).
+    :returns: The inspection facts.
+    :raises WorktreeError: If the path is missing/not a worktree, the
+        branch is invalid or no longer exists, or a git command fails.
+    """
+    validate_branch_name(branch)
+    main_repo = _main_repo_for_worktree(worktree_path)
+    if not _local_branch_exists(main_repo, branch):
+        raise WorktreeError(f"branch does not exist: {branch!r}")
+
+    status = _run_git(
+        ["status", "--porcelain", "--untracked-files=all"],
+        cwd=worktree_path,
+    )
+    if status.returncode != 0:
+        raise _git_error("git status failed", status)
+    dirty_files = sum(1 for line in status.stdout.splitlines() if line.strip())
+
+    # Commits on the branch no remote-tracking ref can reach. With no
+    # remotes configured, --remotes matches nothing and every commit
+    # counts — there is nowhere the work could have been pushed to.
+    rev_list = _run_git(
+        ["rev-list", "--count", branch, "--not", "--remotes"],
+        cwd=main_repo,
+    )
+    if rev_list.returncode != 0:
+        raise _git_error("git rev-list failed", rev_list)
+    unpushed_commits = int(rev_list.stdout.strip())
+
+    merged: bool | None = None
+    default_ref = _default_branch_ref(main_repo)
+    if default_ref is not None:
+        probe = _run_git(["merge-base", "--is-ancestor", branch, default_ref], cwd=main_repo)
+        if probe.returncode == 0:
+            merged = True
+        elif probe.returncode == 1:
+            merged = False
+
+    return WorktreeInspection(
+        dirty_files=dirty_files,
+        unpushed_commits=unpushed_commits,
+        merged=merged,
+        default_ref=default_ref,
+    )
+
+
 def remove_worktree(
     *,
     worktree_path: str,

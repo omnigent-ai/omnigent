@@ -18,6 +18,7 @@ from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
     create_worktree,
+    inspect_worktree,
     list_worktrees,
     remove_worktree,
     validate_branch_name,
@@ -441,6 +442,149 @@ def test_validate_branch_name_rejects_bad(bad: str) -> None:
     """Branch names violating git ref-format are rejected before reaching argv."""
     with pytest.raises(WorktreeError):
         validate_branch_name(bad)
+
+
+# ── inspect_worktree ─────────────────────────────────────
+
+
+def _add_origin(git_repo: Path, tmp_path: Path) -> None:
+    """Attach a bare ``origin`` remote and push ``main`` to it.
+
+    Also points ``refs/remotes/origin/HEAD`` at ``origin/main`` the way a
+    clone would, so the default-branch resolution has its primary signal.
+
+    :param git_repo: The working repo to configure.
+    :param tmp_path: Test temp dir to create the bare remote under.
+    """
+    bare = (tmp_path / "origin.git").resolve()
+    _git(tmp_path, "init", "-q", "--bare", str(bare))
+    _git(git_repo, "remote", "add", "origin", str(bare))
+    _git(git_repo, "push", "-q", "origin", "main")
+    _git(
+        git_repo,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
+
+
+def test_inspect_worktree_clean_pushed_merged_reports_safe(git_repo: Path, tmp_path: Path) -> None:
+    """A pristine worktree whose branch is pushed and merged reports all-clear.
+
+    This is the shape that lets the server remove the worktree on archive:
+    zero dirty files, zero unpushed commits, and the branch tip reachable
+    from the default branch.
+    """
+    _add_origin(git_repo, tmp_path)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/login")
+    _git(git_repo, "push", "-q", "origin", "feature/login")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/login")
+
+    assert result.dirty_files == 0
+    assert result.unpushed_commits == 0
+    assert result.merged is True
+    assert result.default_ref == "origin/main"
+
+
+def test_inspect_worktree_counts_dirty_files(git_repo: Path, tmp_path: Path) -> None:
+    """Modified tracked files and untracked files each count as dirty."""
+    _add_origin(git_repo, tmp_path)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/dirty")
+    wt = Path(created.worktree_path)
+    # One tracked modification + one untracked file = 2 dirty entries.
+    (wt / "README.md").write_text("changed")
+    (wt / "new.txt").write_text("untracked")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/dirty")
+
+    assert result.dirty_files == 2
+
+
+def test_inspect_worktree_counts_unpushed_commits(git_repo: Path, tmp_path: Path) -> None:
+    """A commit that no remote-tracking ref can reach counts as unpushed."""
+    _add_origin(git_repo, tmp_path)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/wip")
+    wt = Path(created.worktree_path)
+    (wt / "wip.txt").write_text("wip")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-q", "-m", "wip")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/wip")
+
+    assert result.unpushed_commits == 1
+    assert result.dirty_files == 0
+
+
+def test_inspect_worktree_no_remote_counts_all_commits_unpushed(git_repo: Path) -> None:
+    """With no remote at all, every commit on the branch is unpushed.
+
+    A repo without remotes has nowhere the work could have been pushed to,
+    so nothing about the branch may read as safe-to-discard. The local
+    ``main`` still serves as the merge-base reference.
+    """
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/local")
+    wt = Path(created.worktree_path)
+    (wt / "local.txt").write_text("local")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-q", "-m", "local work")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/local")
+
+    # init commit + the branch commit — nothing is reachable from any remote.
+    assert result.unpushed_commits == 2
+    assert result.default_ref == "main"
+    assert result.merged is False
+
+
+def test_inspect_worktree_pushed_but_unmerged_branch(git_repo: Path, tmp_path: Path) -> None:
+    """A fully pushed branch still reports ``merged=False`` off the default branch."""
+    _add_origin(git_repo, tmp_path)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/open-pr")
+    wt = Path(created.worktree_path)
+    (wt / "pr.txt").write_text("open pr")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-q", "-m", "pr commit")
+    _git(git_repo, "push", "-q", "origin", "feature/open-pr")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/open-pr")
+
+    assert result.unpushed_commits == 0
+    assert result.merged is False
+
+
+def test_inspect_worktree_missing_path_fails(git_repo: Path) -> None:
+    """Inspecting a worktree path that doesn't exist fails loud."""
+    with pytest.raises(WorktreeError) as exc:
+        inspect_worktree(
+            worktree_path=str(git_repo.parent / "myrepo-worktrees" / "ghost"),
+            branch="feature/ghost",
+        )
+    assert "does not exist" in exc.value.message
+
+
+def test_inspect_worktree_unknown_branch_fails(git_repo: Path) -> None:
+    """Inspecting against a branch that doesn't exist fails loud.
+
+    The server must treat a failed check as 'keep the worktree', so the
+    check has to fail rather than invent all-clear numbers. (A branch
+    that vanished out from under its worktree lands here too — git
+    refuses to delete a checked-out branch, but a stale session row can
+    still name one that no longer resolves.)
+    """
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/stays")
+
+    with pytest.raises(WorktreeError) as exc:
+        inspect_worktree(worktree_path=created.worktree_path, branch="feature/never-existed")
+    assert "does not exist" in exc.value.message
+
+
+@pytest.mark.parametrize("bad", ["-f", "--all", "a..b"])
+def test_inspect_worktree_rejects_invalid_branch(git_repo: Path, bad: str) -> None:
+    """Branch names arrive over the tunnel — validate before they reach argv."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/ok")
+    with pytest.raises(WorktreeError):
+        inspect_worktree(worktree_path=created.worktree_path, branch=bad)
 
 
 @pytest.mark.parametrize("good", ["feature/login", "fix-123", "a/b/c", "release_2", "v1.2"])
