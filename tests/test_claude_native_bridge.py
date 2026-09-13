@@ -10490,3 +10490,28 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+def test_tmux_target_advertised_reports_valid_advertisement(tmp_path: Path) -> None:
+    """A written advertisement with both fields reads back as advertised."""
+    bridge_dir = tmp_path / "bridge"
+    assert not claude_native_bridge.tmux_target_advertised(bridge_dir)
+    write_tmux_target(
+        bridge_dir,
+        socket_path=tmp_path / "tmux.sock",
+        tmux_target="main",
+    )
+    assert claude_native_bridge.tmux_target_advertised(bridge_dir)
+
+
+def test_tmux_target_advertised_rejects_invalid_payloads(tmp_path: Path) -> None:
+    """Malformed or field-less tmux.json is not a usable advertisement."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    tmux_file = bridge_dir / "tmux.json"
+    tmux_file.write_text("not json", encoding="utf-8")
+    assert not claude_native_bridge.tmux_target_advertised(bridge_dir)
+    tmux_file.write_text(json.dumps({"socket_path": "/tmp/x.sock"}), encoding="utf-8")
+    assert not claude_native_bridge.tmux_target_advertised(bridge_dir)
+    tmux_file.write_text(json.dumps({"socket_path": 1, "tmux_target": "main"}), encoding="utf-8")
+    assert not claude_native_bridge.tmux_target_advertised(bridge_dir)
