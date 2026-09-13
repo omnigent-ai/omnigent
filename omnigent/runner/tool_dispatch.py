@@ -1684,6 +1684,9 @@ async def _inherited_parent_model(
     - a parent model outside the child harness's family (e.g. a Claude
       selection dispatched to a codex worker) is not forced across vendors.
 
+    Native CLI compatibility can be narrower than model-family compatibility;
+    see the native Antigravity contract in ``docs/AGENT_YAML_SPEC.md``.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
     :param sub_agent_name: Name of the sub-agent being dispatched.

@@ -155,11 +155,8 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 50,
   },
   {
-    // Antigravity's native CLI (Gemini-family). Mirrors the server's
-    // canonical `antigravity-native` harness and the `antigravity-native-ui`
-    // wrapper the runner keys off to boot the terminal. Added ALONGSIDE the
-    // upstream in-process `antigravity` SDK harness (see BRAIN_HARNESS_LABELS
-    // in agentLabels.ts) — they are distinct rows.
+    // The native terminal wrapper is distinct from the in-process SDK row
+    // in BRAIN_HARNESS_LABELS (agentLabels.ts).
     key: "antigravity",
     agentName: "antigravity-native-ui",
     harness: "antigravity-native",

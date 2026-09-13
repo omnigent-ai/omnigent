@@ -2920,8 +2920,8 @@ class HostProcess:
         This is a pre-launch PREVIEW of the host's ambient default
         configuration (``spec=None`` — no session exists yet, so there is no
         agent spec to pin). A session whose spec pins a different provider
-        resolves its own catalog at launch, and the in-session picker
-        re-reads that authoritative snapshot after bind.
+        resolves its own catalog at launch. Harnesses with an in-session
+        picker re-read that authoritative snapshot after bind.
         """
         harness = canonicalize_harness(frame.harness) or frame.harness
         with_source = functools.partial(_with_model_configuration_source, harness=harness)

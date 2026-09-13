@@ -19,8 +19,9 @@ Enumeration is deterministic per provider kind:
 - ``key`` (openai family) / ``gateway`` / ``local`` →
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
-- ``subscription`` → live CLI discovery for Cursor; curated static aliases for
-  CLIs without a listing API (source ``"static"``, ``verified: false``).
+- ``subscription`` → live CLI discovery for Cursor and native Antigravity;
+  curated static aliases for CLIs without a listing API (source ``"static"``,
+  ``verified: false``).
 - ``cli-config`` → the codex curated static list (source ``"static"``,
   ``verified: false`` — the credential lives in the CLI's own config
   file and is resolved by the CLI at launch).
@@ -1100,11 +1101,8 @@ def _listing_for_provider(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
         if provider.kind == SUBSCRIPTION_KIND:
-            # A failed cursor-agent listing probe says nothing about
-            # dispatchability: the CLI brings its own stored login, so the
-            # worker still runs. Degrade to the usable pre-launch shape the
-            # other subscription CLI logins report, not the dead-worker
-            # "none" that tells orchestrators the worker cannot run here.
+            # A failed CLI catalog probe does not prove the worker cannot run.
+            # Keep dispatch available and leave model discovery retryable.
             return ModelListing(
                 source="static",
                 verified=False,
