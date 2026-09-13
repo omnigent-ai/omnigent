@@ -11,3 +11,7 @@
 *.aab
 *.keystore
 !debug.keystore
+*.jks
+keystore.properties
+# Google Play service-account key for Gradle Play Publisher — secret.
+play-credentials.json

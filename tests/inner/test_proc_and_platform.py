@@ -8,11 +8,14 @@ file runs on both Linux CI and a Windows box.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from omnigent import _platform
@@ -69,18 +72,91 @@ def test_default_interactive_shell_honors_known_shell_on_path(
 def test_default_interactive_shell_falls_back_to_bash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unset / unknown / not-on-PATH ``$SHELL`` all fall back to bash."""
-    # Unset $SHELL → bash (known shells resolve on PATH here).
-    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    """Unset / unknown / uninstalled ``$SHELL`` all fall back to bash."""
+    # Resolution is fully hermetic: neither PATH nor the standard shell dirs
+    # yield anything, so only $SHELL's own absolute path could rescue a value.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_platform, "_resolve_interactive_shell", lambda name: None)
+    monkeypatch.setattr(os.path, "isabs", lambda path: False)
+    # Unset $SHELL → bash.
     monkeypatch.delenv("SHELL", raising=False)
     assert _platform.default_interactive_shell() == "bash"
-    # An unknown shell name is never honored, even if on PATH.
+    # An unknown shell name is never honored, even if it resolved.
     monkeypatch.setenv("SHELL", "/opt/weird/nushell")
     assert _platform.default_interactive_shell() == "bash"
-    # A known shell that does not resolve on PATH also falls back.
-    monkeypatch.setattr("shutil.which", lambda name: None)
+    # A known shell that resolves nowhere (not on PATH, not in a standard dir,
+    # $SHELL not usable as an absolute path) also falls back.
     monkeypatch.setenv("SHELL", "/bin/zsh")
     assert _platform.default_interactive_shell() == "bash"
+
+
+def test_normalize_interactive_shells_filters_and_deduplicates() -> None:
+    """Host and server accept only supported shell basenames."""
+    assert _platform.normalize_interactive_shells(["zsh", "bash", "zsh", "not-a-shell", 42]) == [
+        "zsh",
+        "bash",
+    ]
+    assert _platform.normalize_interactive_shells("bash") == []
+
+
+@pytest.mark.posix_only
+def test_default_interactive_shell_trusts_shell_absolute_path_off_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A known ``$SHELL`` whose absolute path is executable is honored even
+    when it does not resolve on a stripped ``PATH``.
+
+    Reproduces the frozen-PATH host daemon (GUI/launchd launch): ``$SHELL`` is
+    ``/bin/zsh`` but ``PATH`` omits ``/bin``, so a bare ``shutil.which("zsh")``
+    misses it. The login shell must still be honored.
+    """
+    zsh = tmp_path / "zsh"
+    zsh.write_text("#!/bin/sh\n")
+    zsh.chmod(0o755)
+    # Nothing resolves on PATH or in the standard shell dirs.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_platform, "_INTERACTIVE_SHELL_DIRS", ())
+    monkeypatch.setenv("SHELL", str(zsh))
+    assert _platform.default_interactive_shell() == "zsh"
+
+
+@pytest.mark.posix_only
+def test_resolve_interactive_shell_uses_matching_absolute_login_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A Nix-style login shell remains executable under a stripped PATH."""
+    fish = tmp_path / "profiles" / "default" / "bin" / "fish"
+    fish.parent.mkdir(parents=True)
+    fish.write_text("#!/bin/sh\n")
+    fish.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(fish))
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(_platform, "_INTERACTIVE_SHELL_DIRS", ())
+
+    assert _platform.default_interactive_shell() == "fish"
+    assert _platform._resolve_interactive_shell("fish") == str(fish)
+
+
+@pytest.mark.parametrize("name", ["/bin/bash", "../bash", "unknown"])
+def test_resolve_interactive_shell_rejects_paths_and_unknown_names(
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolver accepts allowlisted basenames only."""
+    monkeypatch.setattr("shutil.which", lambda value: pytest.fail(f"resolved {value}"))
+    assert _platform._resolve_interactive_shell(name) is None
+
+
+def _fake_resolver(installed: set[str]):
+    """A ``_resolve_interactive_shell`` stand-in: resolve only *installed*.
+
+    Fully hermetic — the real helper probes both PATH and standard shell dirs,
+    so patching it (not just ``shutil.which``) is what keeps a test from leaking
+    whatever shells the host machine actually has installed.
+    """
+    return lambda name: f"/usr/bin/{name}" if name in installed else None
 
 
 @pytest.mark.posix_only
@@ -88,7 +164,9 @@ def test_installed_interactive_shells_lists_default_first_then_alternatives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The default ($SHELL) leads; installed alternatives follow, deduped."""
-    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        _platform, "_resolve_interactive_shell", _fake_resolver({"bash", "zsh", "fish"})
+    )
     monkeypatch.setenv("SHELL", "/bin/zsh")
     # zsh is the default → first; bash/fish follow in offer order; no dupes.
     assert _platform.installed_interactive_shells() == ["zsh", "bash", "fish"]
@@ -98,21 +176,44 @@ def test_installed_interactive_shells_lists_default_first_then_alternatives(
 def test_installed_interactive_shells_skips_uninstalled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Alternatives that don't resolve on PATH are omitted."""
+    """Alternatives that resolve nowhere are omitted."""
     # Only bash and zsh installed; fish absent.
-    monkeypatch.setattr(
-        "shutil.which", lambda name: f"/usr/bin/{name}" if name in {"bash", "zsh"} else None
-    )
+    monkeypatch.setattr(_platform, "_resolve_interactive_shell", _fake_resolver({"bash", "zsh"}))
     monkeypatch.setenv("SHELL", "/bin/bash")
     assert _platform.installed_interactive_shells() == ["bash", "zsh"]
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_offers_shells_off_stripped_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shells in a standard dir are offered even when ``PATH`` omits it.
+
+    Regression for the frozen-PATH host daemon: with ``SHELL=/bin/zsh`` but a
+    ``PATH`` missing ``/bin``, ``shutil.which`` finds nothing, yet the standard
+    shell dirs still resolve zsh/bash — so the picker must offer both instead of
+    collapsing to a lone (phantom) ``bash``.
+    """
+    monkeypatch.setattr("shutil.which", lambda name: None)  # nothing on PATH
+
+    # Both live in /bin, off the stripped PATH.
+    def in_bin(path: str) -> bool:
+        return os.path.basename(path) in {"zsh", "bash"} and path.startswith("/bin/")
+
+    monkeypatch.setattr("os.path.isfile", in_bin)
+    monkeypatch.setattr("os.access", lambda p, mode: True)
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    assert _platform.installed_interactive_shells() == ["zsh", "bash"]
 
 
 @pytest.mark.posix_only
 def test_installed_interactive_shells_always_nonempty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With nothing resolvable the bash fallback is still offered alone."""
+    """With nothing resolvable anywhere the bash fallback is still offered alone."""
     monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_platform, "_resolve_interactive_shell", lambda name: None)
+    monkeypatch.setattr(os.path, "isabs", lambda path: False)
     monkeypatch.delenv("SHELL", raising=False)
     assert _platform.installed_interactive_shells() == ["bash"]
 
@@ -166,6 +267,10 @@ def test_spawn_kwargs_shape_matches_platform() -> None:
 
 def test_process_alive_is_a_nondestructive_probe() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    # Bind to the live PID so psutil pins its creation time; a recycled PID
+    # after teardown can't masquerade as the reaped child, so the final
+    # liveness check is free of the process_alive(pid) TOCTOU race.
+    handle = psutil.Process(proc.pid)
     try:
         assert _proc.process_alive(proc.pid) is True
         # Probing repeatedly must NOT kill the process (the os.kill(pid, 0)
@@ -175,7 +280,9 @@ def test_process_alive_is_a_nondestructive_probe() -> None:
     finally:
         _proc.kill_tree(proc)
         proc.wait(timeout=5)
-    assert _proc.process_alive(proc.pid) is False
+    # A reaped PID raises NoSuchProcess, which also means it isn't running.
+    with contextlib.suppress(psutil.NoSuchProcess):
+        assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
 
 
 def test_process_alive_false_for_bogus_pid() -> None:
@@ -183,11 +290,30 @@ def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(-1) is False
 
 
+def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A target pgid of 1 must never be signalled.
+
+    ``killpg(1, sig)`` is ``kill(-1, sig)`` -- a broadcast to every process
+    the user can signal (a mocked pid that coerces to 1 killed the CI runner).
+    """
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(_proc, "_getpgid_fn", lambda pid: 1 if pid else 54321)
+    monkeypatch.setattr(_proc, "_killpg_fn", lambda pgid, sig: sent.append((pgid, sig)))
+    assert _proc._killpg(1, signal.SIGTERM) is False
+    assert sent == []
+
+
 def test_terminate_tree_stops_the_process() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    # Bind to the live PID so psutil pins its creation time; a recycled PID
+    # after teardown can't masquerade as the reaped child, so the final
+    # liveness check is free of the process_alive(pid) TOCTOU race.
+    handle = psutil.Process(proc.pid)
     _proc.terminate_tree(proc, grace=5)
     proc.wait(timeout=5)
-    assert _proc.process_alive(proc.pid) is False
+    # A reaped PID raises NoSuchProcess, which also means it isn't running.
+    with contextlib.suppress(psutil.NoSuchProcess):
+        assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
 
 
 # --------------------------------------------------------------------------
@@ -342,3 +468,140 @@ def test_host_runner_env_lets_child_import_asyncio_and_resolve_home() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# resolve_cli_binary — CLIs that may live off the daemon's frozen PATH
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cli_binary_prefers_path(monkeypatch):
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == "/usr/bin/tool"
+
+
+def test_resolve_cli_binary_env_override_wins(monkeypatch, tmp_path):
+    override = tmp_path / "tool"
+    override.write_text("#!/bin/sh\n")
+    override.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(override))
+    # PATH would resolve elsewhere, but the override takes precedence.
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(override)
+
+
+def test_resolve_cli_binary_falls_back_to_global_dir(monkeypatch, tmp_path):
+    """A binary off PATH is still found in a common global install dir.
+
+    This is the nvm case: the host daemon's frozen PATH omits the bin dir,
+    but the binary is present on disk.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    tool = fallback_dir / "tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(tool)
+
+
+def test_resolve_cli_binary_returns_none_when_absent(monkeypatch, tmp_path):
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path / "empty",))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") is None
+
+
+def test_resolve_cli_binary_warns_on_bad_override(monkeypatch, tmp_path, caplog):
+    """A set-but-unresolvable override warns (so a misconfig surfaces) and then
+    falls back to PATH rather than launching nothing."""
+    monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(tmp_path / "does-not-exist"))
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    with caplog.at_level("WARNING"):
+        resolved = _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH")
+    assert resolved == "/usr/bin/tool"
+    assert "OMNIGENT_TESTCLI_PATH" in caplog.text
+
+
+def test_resolve_cli_binary_no_env_var(monkeypatch):
+    """Without an env_var, resolution is PATH then fallback dirs only."""
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: "/usr/bin/tool")
+    assert _platform.resolve_cli_binary("tool") == "/usr/bin/tool"
+
+
+def test_cli_fallback_dirs_includes_nvm_version_bins(monkeypatch, tmp_path):
+    """nvm keeps global bins under ~/.nvm/versions/node/<ver>/bin; the ladder
+    must include those (newest first) since that's the reported nvm case.
+
+    Ordering is by parsed numeric version, so double-digit majors (v10) beat
+    single-digit ones (v9) — a lexicographic sort would get this backwards.
+    """
+    nvm = tmp_path / ".nvm" / "versions" / "node"
+    for ver in ("v9.11.0", "v10.2.0", "v20.5.0"):
+        (nvm / ver / "bin").mkdir(parents=True)
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    dirs = _platform._cli_fallback_dirs()
+    for ver in ("v9.11.0", "v10.2.0", "v20.5.0"):
+        assert nvm / ver / "bin" in dirs
+    # newest → oldest, numerically: v20 > v10 > v9 (not the lexicographic
+    # order where "v9" would sort after "v10"/"v20").
+    order = [dirs.index(nvm / v / "bin") for v in ("v20.5.0", "v10.2.0", "v9.11.0")]
+    assert order == sorted(order)
+
+
+def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
+    """Absent ~/.nvm, the ladder still returns the static dirs without error."""
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    dirs = _platform._cli_fallback_dirs()
+    assert tmp_path / ".local" / "bin" in dirs
+
+
+def test_malloc_tuning_env_empty_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off Linux the tuning helper is a no-op so callers need no platform branch."""
+    monkeypatch.setattr(_proc, "IS_LINUX", False)
+    assert _proc.malloc_tuning_env() == {}
+
+
+def test_malloc_tuning_env_defaults_on_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Linux the helper caps arenas and sets a trim threshold by default."""
+    monkeypatch.setattr(_proc, "IS_LINUX", True)
+    monkeypatch.delenv("OMNIGENT_RUNNER_MALLOC_ARENA_MAX", raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", raising=False)
+    assert _proc.malloc_tuning_env() == {
+        "MALLOC_ARENA_MAX": "2",
+        "MALLOC_TRIM_THRESHOLD_": "134217728",
+    }
+
+
+def test_malloc_tuning_env_arena_max_zero_disables_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_RUNNER_MALLOC_ARENA_MAX=0`` drops the arena cap (revert knob)."""
+    monkeypatch.setattr(_proc, "IS_LINUX", True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_MALLOC_ARENA_MAX", "0")
+    monkeypatch.delenv("OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", raising=False)
+    env = _proc.malloc_tuning_env()
+    assert "MALLOC_ARENA_MAX" not in env
+    assert env["MALLOC_TRIM_THRESHOLD_"] == "134217728"
+
+
+def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operator overrides flow through to the child env values."""
+    monkeypatch.setattr(_proc, "IS_LINUX", True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_MALLOC_ARENA_MAX", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", "65536")
+    assert _proc.malloc_tuning_env() == {
+        "MALLOC_ARENA_MAX": "1",
+        "MALLOC_TRIM_THRESHOLD_": "65536",
+    }

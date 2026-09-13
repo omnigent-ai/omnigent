@@ -1,0 +1,54 @@
+{
+  "type": "CORTEX_STEP_TYPE_GENERIC",
+  "status": "CORTEX_STEP_STATUS_DONE",
+  "metadata": {
+    "stepGenerationVersion": 1,
+    "createdAt": "2026-08-02T04:53:21.430824720Z",
+    "viewableAt": "2026-08-02T04:53:21.448919282Z",
+    "finishedGeneratingAt": "2026-08-02T04:53:21.448918541Z",
+    "lastCompletedChunkAt": "2026-08-02T04:53:21.448911958Z",
+    "startedAt": "2026-08-02T04:53:21.449624836Z",
+    "completedAt": "2026-08-02T04:53:21.451371948Z",
+    "source": "CORTEX_STEP_SOURCE_MODEL",
+    "toolCall": {
+      "id": "oK1OngcX",
+      "name": "manage_subagents",
+      "thinkingSignature": "ErwDCrkDARFNMg9hffoRgjQhUU56sLFS3MLFOO/0C/7Htje7zd+/jFfbtwmqaiCt2FkAhYwrda1DgFvYAKy8nF1CG8iMn5jw4MIr/xKlt9IDhyV6aLDmfZ+wmCjWaimM36dFwuSXSppvvGObe1rjHzAg7V8D0K031u9ackNF9w/JOfnNeYIRkOdsPAAWmcGszKncUBEZEJY8yueKjQyBysy8QfxOWAIONMw2lrQzzIDU1md0grhXQuh3+7nfR1fZs+E0on4rMmKhW9kPQcpfYA5mLY3IjPW0J05qoM3cwfvCGwIqklnXEofuXrd7nekBh63QgGBjurI0D+svR6aqjStd81xdY9mgmW0ACryrVi5QJ201MlmAPpgYmrblq84N9IkTXRjVtVxoZPySSXe57ZK7fL3+EW39OXBgEu1v47k9iu6XfmNBDvLaKXqfr6hKyiQgoWlgX1zga1a2u/Ici7erRETdirzBoZh3GnU62DD1lrjhT3YI0z/16uvdHdeaCmmREUyQ+a99jHBWe/cIQQofC0j2qsIzbPDURMaYFayXbJfbqZAJb1s4QddsmljVB3E1rGwxgwmyEu9ajetI",
+      "originalName": "manage_subagents"
+    },
+    "argumentsOrder": [
+      "Action",
+      "toolAction",
+      "toolSummary"
+    ],
+    "generatorModel": "MODEL_PLACEHOLDER_M71",
+    "requestedModel": {
+      "model": "MODEL_PLACEHOLDER_M71"
+    },
+    "executionId": "a3507592-60aa-4cc8-b489-6ad02e719672",
+    "toolCallOutputTokens": 26,
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "stepIndex": 40,
+      "metadataIndex": 18,
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    },
+    "toolSummary": "List active subagents",
+    "toolAction": "Checking running subagent statuses"
+  },
+  "generic": {
+    "args": {
+      "Action": "list"
+    },
+    "result": {
+      "result": "You have 4 active subagent(s):\n[{\"role\":\"App Router Code Reviewer\",\"type\":\"research\",\"conversationId\":\"1eca7625-be65-409",
+      "stepRenderInfo": {
+        "title": "4 subagents",
+        "titlePrefix": "Found",
+        "markdown": "- App Router Code Reviewer\n- Component & 3D WebGL Code Reviewer\n- Database & Schema Code Reviewer\n- State Management & Real-time Sync Reviewer\n",
+        "icon": "robot_2",
+        "aggregationKey": "subagents"
+      }
+    }
+  }
+}

@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from playwright.sync_api import Page, expect
 
 
+@pytest.mark.compat_smoke
 def test_send_message_renders_assistant_response(
     page: Page,
     seeded_session: tuple[str, str],
@@ -55,7 +57,7 @@ def test_send_message_renders_assistant_response(
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill("Say 'pong' in one word.")
     page.get_by_role("button", name="Send", exact=True).click()

@@ -32,7 +32,11 @@ describe("copyText", () => {
     const selectedRange = document.createRange();
     const existingText = document.createTextNode("existing selection");
     const selectionContainer = document.createElement("p");
+    const focusTarget = document.createElement("button");
 
+    focusTarget.textContent = "keep focus";
+    document.body.appendChild(focusTarget);
+    focusTarget.focus();
     selectionContainer.appendChild(existingText);
     document.body.appendChild(selectionContainer);
     selectedRange.selectNodeContents(existingText);
@@ -63,9 +67,6 @@ describe("copyText", () => {
         expect(selectedTextAreas[0]?.selectionStart).toBe(0);
         expect(selectedTextAreas[0]?.selectionEnd).toBe("first line\nsecond line".length);
         expect(document.body.contains(selectedTextAreas[0] ?? null)).toBe(true);
-        // Marked so editable-focus detection ignores it: focusing this helper
-        // must not read as the keyboard opening and hide the iOS native bar.
-        expect(selectedTextAreas[0]?.hasAttribute("data-clipboard-helper")).toBe(true);
 
         const event = new Event("copy", {
           bubbles: true,
@@ -86,7 +87,8 @@ describe("copyText", () => {
     expect(setData).toHaveBeenCalledWith("text/plain", "first line\nsecond line");
     expect(document.querySelector("textarea")).toBeNull();
     expect(document.getSelection()?.rangeCount).toBe(1);
-    expect(document.getSelection()?.getRangeAt(0)).toBe(selectedRange);
+    expect(document.getSelection()?.toString()).toBe("existing selection");
+    expect(document.activeElement).toBe(focusTarget);
   });
 
   it("falls back to selected-textarea copy when async clipboard rejects", async () => {

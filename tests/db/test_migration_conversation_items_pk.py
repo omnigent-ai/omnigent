@@ -15,7 +15,8 @@ from omnigent.db.utils import (
 )
 
 _TABLE = "conversation_items"
-_HEAD_PK = ["workspace_id", "conversation_id", "id"]
+# z8a2b3c4d5e6 later widened the PK again with created_at (partition-ready).
+_HEAD_PK = ["workspace_id", "conversation_id", "id", "created_at"]
 _PRIOR_PK = ["workspace_id", "id"]
 
 
@@ -24,7 +25,7 @@ def _pk(engine: Engine) -> list[str]:
 
 
 def test_head_widens_conversation_items_pk(tmp_path: Path) -> None:
-    """At head the PK is ``(workspace_id, conversation_id, id)``."""
+    """At head the PK is ``(workspace_id, conversation_id, id, created_at)``."""
     uri = f"sqlite:///{tmp_path / 'head.db'}"
     engine = get_or_create_engine(uri)
     try:

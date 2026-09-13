@@ -34,10 +34,13 @@ import {
   type ToolGroup,
   type ToolResultBlock,
   type UserMessageBlock,
+  ELICITATION_RESPONSE_PREFIX,
   slashCommandEchoItemId,
   slashCommandEchoText,
+  structuredErrorFields,
 } from "./blocks";
 import type { StreamEvent } from "./events";
+import { routingExtras } from "./routingDecision";
 import type { Response } from "./types";
 
 const DEFAULT_FLUSH_THRESHOLD = 30;
@@ -119,6 +122,12 @@ interface ReducerState {
   // final ReasoningBlock is then suppressed so renderers don't show
   // the same text twice (once live, once as a summary panel).
   reasoningChunksEmitted: boolean;
+  // Set when ANY reasoning section of the current response streamed via
+  // deltas. A later persisted reasoning item (`reasoning_done`) is then
+  // suppressed — the deltas already painted the thought — while settled
+  // mirrors with no deltas (claude-native) still render. Per-response
+  // scope, reset with the other dedup state.
+  reasoningStreamed: boolean;
 
   inText: boolean;
   accumulated: string;
@@ -173,6 +182,7 @@ function createState(flushThreshold: number): ReducerState {
     summaryText: "",
     reasoningAccumulated: "",
     reasoningChunksEmitted: false,
+    reasoningStreamed: false,
     inText: false,
     accumulated: "",
     fullText: "",
@@ -204,6 +214,9 @@ function ctx(
     // under the item's true id without moving the reducer's active id.
     responseId: responseId || state.responseId,
     itemId,
+    // Live blocks carry no server stamp yet — record the client clock
+    // separately so same-clock duration guards never mix epochs.
+    clientCreatedAtS: Math.floor(Date.now() / 1000),
   };
 }
 
@@ -268,7 +281,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
   state.fullText = "";
 }
 
-function outputTextFromMessageContent(content: Array<Record<string, unknown>>): string {
+function outputTextFromMessageContent(content: Record<string, unknown>[]): string {
   let text = "";
   for (const block of content) {
     if (block.type !== "output_text") continue;
@@ -324,6 +337,7 @@ function* beginResponse(state: ReducerState, response: Response): Generator<AnyB
   // reuse must render independently (see migration plan §4.4).
   state.seenCallIds.clear();
   state.seenResultCallIds.clear();
+  state.reasoningStreamed = false;
   // Bump `turn` after the first task so blocks carry their task index.
   if (state.started) state.turn += 1;
   state.started = true;
@@ -384,6 +398,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       state.summaryText = "";
       state.reasoningAccumulated = "";
       state.reasoningChunksEmitted = false;
+      state.reasoningStreamed = true;
       yield {
         type: "reasoning_start",
         ctx: ctx(state),
@@ -404,6 +419,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.summaryText = "";
         state.reasoningAccumulated = "";
         state.reasoningChunksEmitted = false;
+        state.reasoningStreamed = true;
         yield {
           type: "reasoning_start",
           ctx: ctx(state),
@@ -660,6 +676,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         applied: event.applied,
         rationale: event.rationale,
         ...(event.agent !== undefined && { agent: event.agent }),
+        routing: routingExtras(event.routing),
       } satisfies RoutingDecisionBlock;
       return;
     }
@@ -708,6 +725,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.toolExecutionsByCallId.clear();
         state.seenCallIds.clear();
         state.seenResultCallIds.clear();
+        state.reasoningStreamed = false;
       }
 
       // Same-response: deltas already produced the text; skip event.content to
@@ -735,6 +753,40 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       return;
     }
 
+    case "reasoning_done": {
+      // A persisted reasoning item (`output_item.done`, type `reasoning`).
+      // When this response's reasoning already streamed via deltas, the
+      // thought is painted — the item only marks the section's end (same
+      // dedup contract as message_done's "deltas already produced the
+      // text"). With no deltas at all — a native transcript mirror such as
+      // claude-native thinking blocks — render the item as one settled
+      // reasoning block so the chat surfaces the thought.
+      if (state.inReasoning) {
+        yield* closeReasoning(state);
+        return;
+      }
+      if (state.reasoningStreamed) return;
+      // Entering reasoning closes open text — same boundary as
+      // reasoning_started.
+      yield* closeText(state);
+      // A mirrored thought opens its turn before any message names it; a
+      // new id is the same genuine turn transition message_done adopts.
+      if (event.responseId && event.responseId !== state.responseId) {
+        state.responseId = event.responseId;
+        state.pendingTools.clear();
+        state.toolExecutionsByCallId.clear();
+        state.seenCallIds.clear();
+        state.seenResultCallIds.clear();
+      }
+      yield {
+        type: "reasoning_block",
+        ctx: ctx(state, event.itemId || null),
+        reasoningText: event.text,
+        summaryText: event.summary,
+      } satisfies ReasoningBlock;
+      return;
+    }
+
     // ── Status events ───────────────────────────────
     case "compaction_in_progress": {
       // Spinner placeholder; replaced by CompactionBlock when
@@ -742,6 +794,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       yield {
         type: "compaction_loading",
         ctx: ctx(state),
+        ...(event.startedAtS !== undefined ? { startedAtS: event.startedAtS } : {}),
       } satisfies CompactionInProgressBlock;
       return;
     }
@@ -776,6 +829,8 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         message: event.error.message,
         source: event.source,
         code: event.error.code,
+        ...(event.error.level ? { level: event.error.level } : {}),
+        ...structuredErrorFields(event.error),
       } satisfies ErrorBlock;
       return;
     }
@@ -808,6 +863,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           message: event.response.error.message ?? "",
           source: "",
           code: event.response.error.code ?? "response_failed",
+          ...structuredErrorFields(event.response.error),
         } satisfies ErrorBlock;
       }
       yield {
@@ -845,7 +901,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         // inline with the turn that triggered it.
         ctx:
           event.phase === "request" || state.responseId === ""
-            ? ctx(state, null, `elicit_${event.elicitationId}`)
+            ? ctx(state, null, `${ELICITATION_RESPONSE_PREFIX}${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
         targetSessionId: event.targetSessionId,
@@ -861,7 +917,9 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         exitPlanMode: event.exitPlanMode,
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
+        allowAutoMode: event.allowAutoMode,
         rememberScope: event.rememberScope,
+        codexPersistModes: event.codexPersistModes,
       } satisfies ElicitationBlock;
       return;
     }
@@ -890,12 +948,39 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       return;
     }
 
+    // ── Native turn start ────────────────────────────
+    // A native harness (claude/codex-native) emits no `response.created`,
+    // so the reducer never learns the turn id and stamps its own blocks
+    // (reasoning, streamed text) with a stale or empty one. Those blocks
+    // then group into their own bubble — the turn rendered as several
+    // fragments live but one bubble on reload, which is what kept the
+    // "Worked for" fold from forming live and made it flicker as the
+    // fragment boundaries moved. A `running` status edge carrying a turn
+    // id IS the native turn-start signal, so adopt it exactly as
+    // `startResponse` does for lifecycle-driven harnesses. Bare edges
+    // (the PTY-activity relay publishes running/idle with no id) carry no
+    // information and are ignored.
+    case "session_status": {
+      const startedId = event.responseId;
+      if (event.status !== "running" || !startedId || startedId === state.responseId) return;
+      // No id yet means this edge is only NAMING the turn already in
+      // flight — codex opens its reasoning block ~2s before the edge
+      // lands — so adopt without sealing that in-progress section. A
+      // DIFFERENT id is a genuinely new turn, so close the previous
+      // turn's open sections first, as `startResponse` does.
+      if (state.responseId !== "") {
+        yield* closeReasoning(state);
+        yield* closeText(state);
+      }
+      state.responseId = startedId;
+      return;
+    }
+
     // Events the reducer intentionally ignores, listed so a new event
     // type surfaces loudly. `session.*` are store concerns (consumed off
     // the raw stream); `compaction_failed` is a store side effect.
     case "compaction_failed":
     case "client_task_cancel":
-    case "session_status":
     case "session_usage":
     case "session_todos":
     case "session_terminal_pending":
@@ -903,6 +988,8 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     case "session_mcp_startup":
     case "session_input_consumed":
     case "session_created":
+      return;
+
     // Mutates an existing block in the chat-store; see
     // `handleSessionEvent`.
     case "elicitation_resolved":

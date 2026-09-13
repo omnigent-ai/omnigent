@@ -13,7 +13,7 @@ export function NotFoundPage() {
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-sm flex-col items-center gap-3 text-center">
         <h1 className="font-medium text-foreground text-lg">Page not found</h1>
-        <p className="text-muted-foreground text-sm">
+        <p className="text-muted-foreground text-ui">
           The URL you followed doesn't match any route in this app.
         </p>
         <Button asChild variant="outline">

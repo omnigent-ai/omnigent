@@ -152,15 +152,19 @@ export function SwitchAgentDialog({
         <div className="flex flex-col gap-1.5">
           <label
             htmlFor="switch-agent-select"
-            className="text-xs font-medium text-muted-foreground"
+            className="text-sm font-medium text-muted-foreground"
           >
             Agent
           </label>
-          <Select value={agentChoice || undefined} onValueChange={setAgentChoice}>
+          <Select
+            value={agentChoice || undefined}
+            onValueChange={setAgentChoice}
+            componentId="switch_agent.agent"
+          >
             <SelectTrigger
               id="switch-agent-select"
               data-testid="switch-agent-select"
-              className="w-full text-xs"
+              className="w-full text-sm"
             >
               <SelectValue
                 placeholder={
@@ -181,7 +185,7 @@ export function SwitchAgentDialog({
                   key={agent.id}
                   value={agent.id}
                   data-testid={`switch-agent-option-${agent.id}`}
-                  className="text-xs"
+                  className="text-sm"
                 >
                   {agent.display_name}
                 </SelectItem>
@@ -191,14 +195,14 @@ export function SwitchAgentDialog({
         </div>
 
         {resetsModelSettings && (
-          <p data-testid="switch-agent-reset-warning" className="text-xs text-muted-foreground">
+          <p data-testid="switch-agent-reset-warning" className="text-sm text-muted-foreground">
             Model &amp; reasoning effort will reset to {chosen?.display_name}'s defaults (different
             provider).
           </p>
         )}
 
         {error !== null && (
-          <p data-testid="switch-agent-error" className="text-xs text-destructive">
+          <p data-testid="switch-agent-error" className="text-sm text-destructive">
             {error}
           </p>
         )}
@@ -210,9 +214,10 @@ export function SwitchAgentDialog({
           <Button
             data-testid="switch-agent-submit"
             onClick={handleSwitch}
-            disabled={submitting || agentChoice === NONE_CHOSEN}
+            loading={submitting}
+            disabled={agentChoice === NONE_CHOSEN}
           >
-            {submitting ? "Switching…" : "Switch"}
+            Switch
           </Button>
         </DialogFooter>
       </DialogContent>

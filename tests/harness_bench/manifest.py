@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from omnigent.harness_aliases import is_native_harness
-from omnigent.harness_capabilities import AuthModel, HarnessCapabilities, IntegrationMode
+from omnigent.harness_capabilities import AuthModel, HarnessCapabilities, IntegrationMode, Resume
 from omnigent.harness_plugins import (
     harness_aliases,
     harness_capabilities,
@@ -12,6 +12,7 @@ from omnigent.harness_plugins import (
     install_specs,
     model_env_keys,
 )
+from omnigent.onboarding.harness_install import required_cli_for_harness
 from tests.e2e._harness_probes import HARNESS_PROBES, HarnessProbe
 from tests.harness_bench.profile import BenchProfile
 from tests.harness_bench.verdict import Verdict
@@ -59,6 +60,15 @@ def _declared_from_capabilities(harness: str) -> dict[str, Verdict]:
     if caps is not None:
         declared["streaming"] = Verdict.SUPPORTED if caps.streaming else Verdict.UNSUPPORTED
         declared["interrupt"] = Verdict.SUPPORTED if caps.interrupt else Verdict.UNSUPPORTED
+        resume = getattr(caps, "resume", None)
+        if resume is not None:
+            declared["resume"] = (
+                Verdict.UNSUPPORTED if resume is Resume.NONE else Verdict.SUPPORTED
+            )
+        for dimension in ("steering", "live_queue", "images", "compaction"):
+            supported = getattr(caps, dimension, None)
+            if supported is not None:
+                declared[dimension] = Verdict.SUPPORTED if supported else Verdict.UNSUPPORTED
 
     if harness in model_env_keys() or is_native_harness(harness):
         declared["model_override"] = Verdict.SUPPORTED
@@ -98,15 +108,24 @@ _NATIVE_CREDENTIAL_MODELS: dict[str, str] = {
 }
 _NATIVE_DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
 
-_NATIVE_CLI_BINARY: dict[str, str] = {
-    "cursor-native": "cursor-agent",
-    "kiro-native": "kiro-cli",
-}
+
+def _native_cli_binary(harness: str) -> str:
+    """Return the CLI binary omnigent launches for a native TUI harness.
+
+    Resolves through the install-spec registry (the same source the launchers
+    and setup flows use), so harnesses whose binary differs from their slug
+    (``antigravity-native`` → ``agy``, ``cursor-native`` → ``cursor-agent``)
+    gate on the binary that actually exists on a correctly set-up machine.
+    """
+    spec = required_cli_for_harness(harness)
+    if spec is not None:
+        return spec.binary
+    return harness.removesuffix("-native")
 
 
 def _native_profile(harness: str) -> BenchProfile:
     caps = harness_capabilities().get(harness)
-    cli_binary = _NATIVE_CLI_BINARY.get(harness, harness.removesuffix("-native"))
+    cli_binary = _native_cli_binary(harness)
     env_prefix = "HARNESS_" + harness.upper().replace("-", "_") + "_"
     marker = harness.upper().replace("-", "_") + "_OK"
     return BenchProfile(

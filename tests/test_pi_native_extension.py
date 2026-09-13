@@ -637,6 +637,50 @@ def test_text_deltas_post_incrementally_with_stable_id() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_thinking_deltas_post_live_reasoning(tmp_path: Path) -> None:
+    """Pi reasoning streams live and persists for history hydration."""
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+
+  await feed({ type: "thinking_start", contentIndex: 0 });
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "plan " });
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "step" });
+  await feed({ type: "thinking_end", contentIndex: 0, content: "plan step" });
+
+  const message = {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "plan step", thinkingSignature: "sig-1" },
+      { type: "text", text: "Answer" },
+    ],
+  };
+  await handlers.message_end({ message }, ctx);
+  await handlers.turn_end({ message, toolResults: [] }, ctx);
+
+  const reasoning = posted.filter((e) => e.type === "external_output_reasoning_delta");
+  assert.deepEqual(
+    reasoning.map((e) => e.data),
+    [
+      { delta: "plan ", started: true },
+      { delta: "step", started: false },
+    ],
+  );
+  const completed = items().filter((e) => e.data.item_type === "reasoning");
+  assert.equal(completed.length, 1, JSON.stringify(completed));
+  assert.deepEqual(completed[0].data.item_data.content, [
+    { type: "reasoning_text", text: "plan step" },
+  ]);
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
     """Multiple text blocks in one message stream under one message_id.
 
@@ -1225,6 +1269,259 @@ require(extensionPath)(pi);
 
     result = subprocess.run(
         [node, "-e", script, str(extension_path), str(tmp_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_mcp_200_html_signin_is_classified_not_parsed_as_json(
+    tmp_path: Path,
+) -> None:
+    """A ``200 text/html`` sign-in page is an auth failure, not an MCP response.
+
+    ``resp.ok`` is true for a sign-in document served with status 200, so status
+    alone cannot distinguish it from a real answer. Before the fix the bare
+    ``resp.ok`` check fell straight through to ``resp.json()``, which threw and
+    surfaced an unclassified parse error whose ``err.message`` echoed the start
+    of the sign-in body back to the model.
+
+    Asserts, at the ``/mcp`` tool-call call site only:
+
+    1. a declared ``text/html`` 200 resolves to ``isError: true`` naming an
+       authentication / sign-in classification, without throwing;
+    2. the message leaks no part of the body, no header value, and no URL;
+    3. a declared ``application/json`` 200 still round-trips normally;
+    4. a JSON content type with an unparseable body is classified the same
+       bounded way rather than echoing the body through the outer catch;
+    5. a header accessor that *throws* is treated as an unreadable content type
+       rather than escaping to the outer catch, whose message would carry the
+       header/body text the accessor complained about — covering both a throwing
+       ``headers.get()`` and a throwing ``headers`` property getter.
+
+    Not covered here, and unchanged from ``main``: the outer catch still reports
+    a *transport* error's ``err.message``, which can name the request URL. That
+    predates this change and is asserted by
+    ``test_mcp_unreachable_fails_closed_without_throwing``.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const inboxDir = path.join(tmpDir, "inbox");
+const configPath = path.join(tmpDir, "config.json");
+
+fs.mkdirSync(inboxDir, { recursive: true });
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "conv_abc",
+    inboxDir,
+    authHeaders: {},
+    tools: [
+      { name: "sys_os_shell", description: "", parameters: { type: "object", properties: {} } },
+    ],
+  }),
+);
+
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+// A realistic edge sign-in document: served 200, carries an identifier a
+// classification string must never echo back to the model.
+const SIGNIN_HTML =
+  '<!DOCTYPE html><html><head><title>Sign in</title></head><body>' +
+  '<form action="/oauth2/authorize"><input name="state" ' +
+  'value="SECRET-STATE-b3f9c1"></form></body></html>';
+
+function headersOf(contentType) {
+  return { get: (name) => (String(name).toLowerCase() === "content-type" ? contentType : null) };
+}
+
+let mode = "html";
+global.fetch = async () => {
+  if (mode === "html") {
+    return {
+      ok: true,
+      status: 200,
+      headers: headersOf("text/html; charset=utf-8"),
+      async json() {
+        // What a real Response does with an HTML body: the message quotes it.
+        throw new SyntaxError(
+          'Unexpected token \'<\', "' + SIGNIN_HTML.slice(0, 24) + '"... is not valid JSON',
+        );
+      },
+      async text() {
+        return SIGNIN_HTML;
+      },
+    };
+  }
+  if (mode === "throwing-headers-getter") {
+    return {
+      ok: true,
+      status: 200,
+      get headers() {
+        throw new Error(
+          'headers getter blew up: set-cookie=SESSION=SECRET-STATE-b3f9c1; body=' + SIGNIN_HTML,
+        );
+      },
+      async json() {
+        return {
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: "real answer" }] },
+        };
+      },
+    };
+  }
+  if (mode === "throwing-headers") {
+    return {
+      ok: true,
+      status: 200,
+      headers: {
+        get() {
+          throw new Error(
+            'header parse failed: set-cookie=SESSION=SECRET-STATE-b3f9c1; body=' + SIGNIN_HTML,
+          );
+        },
+      },
+      async json() {
+        return {
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: "real answer" }] },
+        };
+      },
+    };
+  }
+  if (mode === "json-unparseable") {
+    return {
+      ok: true,
+      status: 200,
+      headers: headersOf("application/json"),
+      async json() {
+        throw new SyntaxError('Unexpected token \'x\', "SECRET-STATE-b3f9c1" is not valid JSON');
+      },
+    };
+  }
+  return {
+    ok: true,
+    status: 200,
+    headers: headersOf("application/json; charset=utf-8"),
+    async json() {
+      return {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { content: [{ type: "text", text: "real answer" }] },
+      };
+    },
+  };
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const registered = {};
+const pi = {
+  registerCommand() {},
+  on() {},
+  registerTool(spec) { registered[spec.name] = spec; },
+  sendUserMessage() {},
+};
+
+require(extensionPath)(pi);
+
+function soleText(result) {
+  assert.ok(result && Array.isArray(result.content), JSON.stringify(result));
+  return result.content.map((block) => block.text || "").join("");
+}
+
+(async () => {
+  // 1. A 200 text/html sign-in page is a classified auth/edge failure.
+  const html = await registered.sys_os_shell.execute("call-1", {});
+  assert.equal(html.isError, true, JSON.stringify(html));
+  const htmlText = soleText(html);
+  assert.ok(
+    /sign-in|sign in|authenticat/i.test(htmlText),
+    "message does not name an authentication classification: " + htmlText,
+  );
+
+  // 2. No part of the body, no header value, and no URL may appear.
+  for (const forbidden of [
+    "SECRET-STATE-b3f9c1",
+    "<!DOCTYPE",
+    "<html",
+    "oauth2/authorize",
+    "text/html",
+    "http://omnigent.test",
+    "conv_abc",
+  ]) {
+    assert.ok(
+      htmlText.indexOf(forbidden) === -1,
+      "classification leaked " + forbidden + ": " + htmlText,
+    );
+  }
+
+  // 3. A declared application/json 200 still round-trips unchanged.
+  mode = "json";
+  const good = await registered.sys_os_shell.execute("call-2", {});
+  assert.equal(good.isError, false, JSON.stringify(good));
+  assert.equal(soleText(good), "real answer");
+
+  // 4. A JSON content type with an unparseable body is bounded the same way.
+  mode = "json-unparseable";
+  const bad = await registered.sys_os_shell.execute("call-3", {});
+  assert.equal(bad.isError, true, JSON.stringify(bad));
+  const badText = soleText(bad);
+  assert.ok(
+    badText.indexOf("SECRET-STATE-b3f9c1") === -1,
+    "parse-failure path leaked the body: " + badText,
+  );
+
+  // 5. An unreadable (throwing) header accessor must not become an error
+  //    message carrying header or body text.
+  mode = "throwing-headers";
+  const thrower = await registered.sys_os_shell.execute("call-4", {});
+  const throwerText = soleText(thrower);
+  for (const forbidden of ["SECRET-STATE-b3f9c1", "<!DOCTYPE", "set-cookie", "oauth2/authorize"]) {
+    assert.ok(
+      throwerText.indexOf(forbidden) === -1,
+      "throwing header accessor leaked " + forbidden + ": " + throwerText,
+    );
+  }
+  // Unreadable is not a signal, so the parse still decides: this body is valid
+  // JSON and must round-trip.
+  assert.equal(thrower.isError, false, JSON.stringify(thrower));
+  assert.equal(throwerText, "real answer");
+
+  //    Same for a throwing `headers` *property* getter, not just get().
+  mode = "throwing-headers-getter";
+  const getterThrower = await registered.sys_os_shell.execute("call-5", {});
+  const getterText = soleText(getterThrower);
+  for (const forbidden of ["SECRET-STATE-b3f9c1", "<!DOCTYPE", "set-cookie", "oauth2/authorize"]) {
+    assert.ok(
+      getterText.indexOf(forbidden) === -1,
+      "throwing headers getter leaked " + forbidden + ": " + getterText,
+    );
+  }
+  assert.equal(getterThrower.isError, false, JSON.stringify(getterThrower));
+  assert.equal(getterText, "real answer");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+
+    result = subprocess.run(
+        [node, "-e", script, str(_extension_path()), str(tmp_path)],
         capture_output=True,
         check=False,
         text=True,
@@ -2592,4 +2889,343 @@ function usage(id) {
   process.exit(1);
 });
 """
+    _run_extension_script(node, _extension_path(), script)
+
+
+# Shared Node preamble for the model-switch tests: loads the extension with a
+# mocked ``pi`` that records ``setModel`` calls and drives the real inbox
+# poller through a temp inbox directory (so an inbox ``model_change`` payload
+# exercises the same path the runner uses).
+_MODEL_SWITCH_HARNESS = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-inbox-"));
+const configPath = path.join(inboxDir, "config.json");
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+const posted = [];
+global.fetch = async (_url, request) => {
+  posted.push(JSON.parse(request.body));
+  return { ok: true };
+};
+
+const setModelCalls = [];
+// The catalog Pi's modelRegistry exposes; setModel returns false for a model
+// with no configured API key (mirrors Pi's real contract).
+const catalog = [
+  { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet", hasKey: true },
+  { provider: "omnigent", id: "databricks-claude-opus-4-1", name: "Opus", hasKey: true },
+  { provider: "omnigent", id: "no-key-model", name: "NoKey", hasKey: false },
+];
+const pi = {
+  registerCommand() {},
+  on(name, handler) { (pi.__handlers = pi.__handlers || {})[name] = handler; },
+  sendUserMessage() {},
+  async setModel(model) {
+    setModelCalls.push(model);
+    return !!(model && model.hasKey);
+  },
+};
+
+require(extensionPath)(pi);
+const handlers = pi.__handlers;
+
+const ctx = {
+  isIdle: () => true,
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
+  // ``model`` is the model Pi launched with (used for the startup
+  // external_model_change). ``getAvailable`` returns only auth-configured
+  // models (what the picker should show); ``getAll`` is Pi's full built-in
+  // catalog (the fallback for older Pi).
+  model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+  modelRegistry: {
+    getAll: () => catalog,
+    getAvailable: () => catalog.filter((m) => m.hasKey),
+    find: (provider, id) => catalog.find((m) => m.provider === provider && m.id === id),
+  },
+};
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Drop a model_change payload into the inbox and wait for the poller to consume it.
+async function deliverModelChange(model) {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const file = path.join(inboxDir, `000-model-${suffix}.json`);
+  fs.writeFileSync(file, JSON.stringify({ id: path.basename(file), type: "model_change", model }));
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("model_change file was not consumed");
+    await sleep(20);
+  }
+  // The poller invokes handleModelChange (async, discarded) then unlinks; give
+  // the microtask/awaits a beat to settle.
+  await sleep(20);
+}
+
+function errorItems() {
+  return posted.filter(
+    (e) =>
+      e.type === "external_conversation_item" &&
+      e.data && e.data.item_data && e.data.item_data.code === "pi_model_change_failed",
+  );
+}
+
+function finish() {
+  if (pi.__omnigentInboxPoller) clearInterval(pi.__omnigentInboxPoller);
+  try { fs.rmSync(inboxDir, { recursive: true, force: true }); } catch (_err) {}
+}
+"""
+
+
+def test_inbox_model_change_applies_via_set_model(tmp_path: Path) -> None:
+    """A web-picked ``model_change`` inbox payload calls Pi's ``setModel``.
+
+    The runner queues the payload after the Omnigent server persisted the
+    override; the extension must resolve the id against ``ctx.modelRegistry``
+    and apply it live via ``pi.setModel`` — with no error item posted.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx); // starts the inbox poller
+  delete ctx.modelRegistry.find;
+  await deliverModelChange("omnigent/databricks-claude-opus-4-1");
+
+  assert.equal(setModelCalls.length, 1, JSON.stringify(setModelCalls));
+  assert.equal(setModelCalls[0].id, "databricks-claude-opus-4-1");
+  // Success posts no error item (the model_select mirror handles the web pill).
+  assert.equal(errorItems().length, 0, JSON.stringify(posted));
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
+    """An unresolvable model id posts a visible error item and never calls setModel."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  await deliverModelChange("model-that-does-not-exist");
+
+  assert.equal(setModelCalls.length, 0, JSON.stringify(setModelCalls));
+  const errs = errorItems();
+  assert.equal(errs.length, 1, JSON.stringify(posted));
+  assert.match(errs[0].data.item_data.message, /not available/);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
+    """A user ``/model`` pick inside Pi posts ``external_model_change`` (two-way sync).
+
+    Pi fires ``model_select`` for both in-TUI switches and startup restores.
+    A ``set`` / ``cycle`` source must mirror back to Omnigent; a ``restore``
+    (Pi re-applying the saved model at startup) must NOT.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  assert.equal(typeof handlers.model_select, "function");
+
+  // session_start itself mirrors the launch model (ctx.model) so the pill
+  // resolves from the start; ignore that when checking the user switch.
+  const startupChanges = posted.filter((e) => e.type === "external_model_change");
+  assert.equal(startupChanges.length, 1, JSON.stringify(posted));
+  assert.equal(startupChanges[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+
+  // A genuine user switch mirrors back.
+  await handlers.model_select(
+    { source: "set", model: { provider: "omnigent", id: "databricks-claude-opus-4-1" } },
+    ctx,
+  );
+  // A startup restore must be ignored (could clobber a pending web override).
+  await handlers.model_select(
+    { source: "restore", model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6" } },
+    ctx,
+  );
+
+  const changes = posted.filter((e) => e.type === "external_model_change");
+  // Two total: the startup mirror + the one user switch (restore ignored).
+  assert.equal(changes.length, 2, JSON.stringify(posted));
+  assert.equal(changes[1].data.model, "omnigent/databricks-claude-opus-4-1");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None:
+    """
+    On ``session_start`` the extension posts Pi's auth-configured model catalog.
+
+    The Web UI picker is populated from ``external_model_options``. The
+    extension prefers ``ctx.modelRegistry.getAvailable()`` — only models with
+    configured auth — over ``getAll()`` (Pi's entire built-in catalog), so the
+    picker shows only models the user can actually switch to (scoped to the
+    provider(s) they are logged into), not hundreds of credential-less models.
+    It also posts ``external_model_change`` for the launch model (``ctx.model``)
+    so the composer pill resolves from the start.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+
+  const opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 1, JSON.stringify(posted));
+  const models = opts[0].data.models;
+  // getAvailable() filters out ``no-key-model`` (no configured auth).
+  assert.deepEqual(
+    models.map((m) => m.id),
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
+    JSON.stringify(models),
+  );
+  // Display name falls back to the model's ``name``.
+  assert.equal(models[0].displayName, "Sonnet");
+
+  // The launch model is mirrored so the pill/active-row resolve immediately.
+  const changes = posted.filter((e) => e.type === "external_model_change");
+  assert.equal(changes.length, 1, JSON.stringify(posted));
+  assert.equal(changes[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_models_without_provider_keep_bare_id_behavior(tmp_path: Path) -> None:
+    """Older Pi model objects without ``provider`` still populate and mirror."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const legacyCatalog = catalog.map(({ provider: _provider, ...model }) => model);
+  const legacyCtx = {
+    ...ctx,
+    model: { id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+    modelRegistry: {
+      getAll: () => legacyCatalog,
+      getAvailable: () => legacyCatalog.filter((model) => model.hasKey),
+    },
+  };
+
+  await handlers.session_start({}, legacyCtx);
+  const opts = posted.filter((event) => event.type === "external_model_options");
+  assert.deepEqual(
+    opts[0].data.models.map((model) => model.id),
+    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+  );
+  assert.equal(opts[0].data.models[0].displayName, "Sonnet");
+
+  await handlers.model_select(
+    { source: "set", model: { id: "databricks-claude-opus-4-1" } },
+    legacyCtx,
+  );
+  const changes = posted.filter((event) => event.type === "external_model_change");
+  assert.deepEqual(
+    changes.map((event) => event.data.model),
+    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+  );
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_session_start_empty_registry_posts_no_model_options(tmp_path: Path) -> None:
+    """
+    An empty / unavailable model registry posts no ``external_model_options``.
+
+    Best-effort: when Pi exposes no registry (older Pi, or a registry that
+    throws), the extension stays silent rather than posting an empty catalog —
+    the server would only evict, and the picker stays hidden as before.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  // Registry present but empty.
+  await handlers.session_start({}, { ...ctx, modelRegistry: { getAll: () => [] } });
+  // No registry at all.
+  await handlers.session_start({}, { ...ctx, modelRegistry: undefined });
+
+  const opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 0, JSON.stringify(posted));
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
     _run_extension_script(node, _extension_path(), script)

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Managed configuration schema. An EMM/MDM console renders these entries for the
+  admin; the app reads whatever they push in ManagedConfig. Keys are a contract
+  with already-deployed policies, so never rename one.
+
+  No android:defaultValue: absence of the key is what "unmanaged" means, and the
+  platform doesn't guarantee XML defaults reach the app anyway.
+-->
+<restrictions xmlns:android="http://schemas.android.com/apk/res/android">
+    <restriction
+        android:key="serverUrls"
+        android:description="@string/restriction_server_urls_description"
+        android:restrictionType="string"
+        android:title="@string/restriction_server_urls_title" />
+</restrictions>

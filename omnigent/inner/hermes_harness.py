@@ -20,8 +20,9 @@ Env vars read at startup:
   ``None`` falls back to Hermes' own configured default.
 - ``HARNESS_HERMES_CWD``: working directory the subprocess runs in.
   ``None`` falls back to ``os.getcwd()``.
-- ``HARNESS_HERMES_PATH``: absolute path to the ``hermes`` CLI binary.
-  ``None`` searches ``PATH``.
+- ``OMNIGENT_HERMES_PATH``: absolute path to the ``hermes`` CLI binary.
+  ``None`` searches ``PATH``. (Legacy ``HARNESS_HERMES_PATH`` still honored,
+  deprecated.)
 - ``HARNESS_HERMES_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
   (from :func:`dataclasses.asdict`). When unset, the wrap
   falls back to a default
@@ -48,6 +49,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.hermes_executor import HermesExecutor
@@ -60,7 +62,10 @@ _logger = logging.getLogger(__name__)
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_HERMES_MODEL"
 _ENV_CWD = "HARNESS_HERMES_CWD"
-_ENV_HERMES_PATH = "HARNESS_HERMES_PATH"
+_ENV_HERMES_PATH = "OMNIGENT_HERMES_PATH"
+# Deprecated alias — read via resolve_harness_path() which warns on use.
+# Remove this constant and the HARNESS_HERMES_PATH read in v0.8.0.
+_LEGACY_ENV_HERMES_PATH = "HARNESS_HERMES_PATH"
 _ENV_OS_ENV = "HARNESS_HERMES_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_HERMES_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_HERMES_BUNDLE_DIR"
@@ -161,14 +166,14 @@ def _build_hermes_executor() -> Executor:
 
     :returns: A configured :class:`HermesExecutor` instance.
     :raises FileNotFoundError: If ``hermes`` is not on PATH and
-        ``HARNESS_HERMES_PATH`` isn't set.
+        ``OMNIGENT_HERMES_PATH`` (legacy ``HARNESS_HERMES_PATH``) isn't set.
     """
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = str(Path(bundle_dir_raw)) if bundle_dir_raw else None
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return HermesExecutor(
-        hermes_path=os.environ.get(_ENV_HERMES_PATH),
+        hermes_path=resolve_harness_path("hermes"),
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE"),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),

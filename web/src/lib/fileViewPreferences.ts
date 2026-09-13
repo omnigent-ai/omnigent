@@ -21,6 +21,8 @@ export interface FileViewPreferences {
   previewableViewMode: "editor" | "preview" | "source";
   /** Whether whitespace-only changes are hidden in the diff view. */
   hideWhitespace: boolean;
+  /** Whether long lines soft-wrap in the diff view (no horizontal scroll). */
+  wrapLines: boolean;
 }
 
 const STORAGE_KEY = "omnigent:file-view-preferences";
@@ -30,6 +32,7 @@ export const DEFAULT_FILE_VIEW_PREFERENCES: FileViewPreferences = {
   diffLayout: "unified",
   previewableViewMode: "editor",
   hideWhitespace: false,
+  wrapLines: false,
 };
 
 /**
@@ -61,6 +64,8 @@ export function readFileViewPreferences(): FileViewPreferences {
         typeof p.hideWhitespace === "boolean"
           ? p.hideWhitespace
           : DEFAULT_FILE_VIEW_PREFERENCES.hideWhitespace,
+      wrapLines:
+        typeof p.wrapLines === "boolean" ? p.wrapLines : DEFAULT_FILE_VIEW_PREFERENCES.wrapLines,
     };
   } catch {
     return DEFAULT_FILE_VIEW_PREFERENCES;

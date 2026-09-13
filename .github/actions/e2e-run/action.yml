@@ -81,9 +81,9 @@ runs:
         path: .venv
         key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
-    - name: Install project and dev dependencies
+    - name: Install project and test dependencies
       shell: bash
-      run: uv sync --locked --extra all --extra dev
+      run: uv sync --locked --extra all --group test
 
     - name: Install binary dependencies
       # npm install against .github/ci-deps/package.json with --ignore-scripts
@@ -103,6 +103,16 @@ runs:
         npm install --ignore-scripts
         node node_modules/@anthropic-ai/claude-code/install.cjs
         echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Install jcode harness CLI
+      # The builtin jcode catalog row launches via `jcode acp`. Host-daemon
+      # e2e tests bind sessions to the FIRST registered agent row, so a host
+      # without the jcode binary refuses the launch ("harness 'jcode' is not
+      # configured") and the runner never appears. Pin the version so CI is
+      # deterministic; bump to match the image bake's default when it moves.
+      shell: bash
+      run: |
+        sudo bash "${GITHUB_WORKSPACE}/deploy/docker/install-harness-cli.sh" jcode@v0.84.0
 
     - name: Build pinned old server (backwards-compat only)
       # Only runs when server_version is set. Builds the released tag into an

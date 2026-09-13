@@ -6,18 +6,28 @@ import type { ReactNode } from "react";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
 }));
 vi.mock("@/store/chatStore", () => ({
   useChatStore: vi.fn(),
 }));
+vi.mock("@/hooks/useSession", () => ({
+  useSession: vi.fn(),
+}));
 
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSession } from "@/hooks/useSession";
 import { useChatStore } from "@/store/chatStore";
+import type { Session } from "@/lib/types";
 import {
+  type WorkspaceEnvironment,
   MAX_RUNNER_OFFLINE_RETRIES,
   RunnerOfflineError,
+  browseLocationBase,
+  browseLocationSegment,
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
+  relativizeToWorkspace,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
   toWorkspaceRelativePath,
@@ -30,8 +40,27 @@ import {
 } from "./useWorkspaceChangedFiles";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
+const hostOnlineMock = vi.mocked(useSessionHostOnline);
+const sessionMock = vi.mocked(useSession);
 const chatStoreMock = vi.mocked(useChatStore);
 const fetchMock = vi.fn();
+
+function stubSession(opts: { hostId?: string | null; createdAtSecondsAgo?: number } | null) {
+  if (opts === null) {
+    sessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+    return;
+  }
+  const createdAt = Math.floor(Date.now() / 1000) - (opts.createdAtSecondsAgo ?? 0);
+  sessionMock.mockReturnValue({
+    session: {
+      hostId: opts.hostId ?? "host_1",
+      permissionLevel: null,
+      createdAt,
+    } as Session,
+    isLoading: false,
+    error: null,
+  });
+}
 
 type StubStatus = "idle" | "running" | "waiting" | "failed";
 
@@ -106,7 +135,7 @@ function EnvironmentDataProbe({
   onData,
 }: {
   id: string | undefined;
-  onData: (data: { available: boolean; root: string | null; home: string | null }) => void;
+  onData: (data: WorkspaceEnvironment) => void;
 }) {
   const query = useWorkspaceEnvironment(id);
   useEffect(() => {
@@ -142,6 +171,45 @@ function FileSearchProbe({
   return null;
 }
 
+function AllFilesPathsProbe({
+  id,
+  location,
+  onPaths,
+}: {
+  id: string;
+  location: string;
+  onPaths: (paths: string[]) => void;
+}) {
+  const query = useWorkspaceAllFiles(id, {}, location);
+  useEffect(() => {
+    if (query.isSuccess) onPaths(query.data.data.map((f) => f.path));
+  }, [query.isSuccess, query.data, onPaths]);
+  return null;
+}
+
+function DirectoryPathsProbe({
+  id,
+  path,
+  location,
+  onPaths,
+}: {
+  id: string;
+  path: string;
+  location: string;
+  onPaths: (paths: string[]) => void;
+}) {
+  const query = useWorkspaceDirectory(id, path, location);
+  useEffect(() => {
+    if (query.isSuccess) onPaths(query.data.map((f) => f.path));
+  }, [query.isSuccess, query.data, onPaths]);
+  return null;
+}
+
+function AllFilesProbeAt({ id, location }: { id: string; location: string }) {
+  useWorkspaceAllFiles(id, {}, location);
+  return null;
+}
+
 async function flushMicrotasks() {
   await Promise.resolve();
   await Promise.resolve();
@@ -154,6 +222,8 @@ beforeEach(() => {
   // assume sessionActive is false (initial fetch from `enabled`, no
   // polling). The trailing-invalidate test overrides per-call.
   stubChatStore();
+  hostOnlineMock.mockReturnValue(null);
+  stubSession(null);
 });
 
 afterEach(() => {
@@ -164,8 +234,9 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
-  it("does not fetch when the runner is offline", async () => {
+  it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
     fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [] }));
 
     render(
@@ -176,6 +247,46 @@ describe("useWorkspaceChangedFiles gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches when the runner is offline but the host can serve the workspace", async () => {
+    // Runner-offline no longer disables the panel: the server reads the
+    // workspace over the host tunnel, so the query must still fire.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(changedFilesResponse());
+
+    render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_asleep" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/v1/sessions/conv_asleep/resources/environments/default/changes",
+    );
+  });
+
+  it("fetches when the runner is offline but host liveness is still unknown", async () => {
+    // Transient window (e.g. a stream push flipped the runner before host
+    // liveness resolved): host `undefined` stays "unknown → serve" so the
+    // query fires rather than blanking the panel; if the host is really
+    // down it just 503s and shows the reconnect hint.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(undefined);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(changedFilesResponse());
+
+    render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_unknown_host" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   });
 
   it("fetches when the runner is online", async () => {
@@ -270,6 +381,37 @@ describe("useWorkspaceChangedFiles gating", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("surfaces the session's reach so the panel knows where it may navigate", async () => {
+    // The panel decides whether to offer navigation at all from this field;
+    // if it were dropped the control would never appear.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        metadata: {
+          root: "/home/u/ws",
+          home: "/home/u",
+          reachable: {
+            unconfined: true,
+            roots: [{ path: "/home/u/ws", access: "write", origin: "cwd" }],
+          },
+        },
+      }),
+    );
+    const results: WorkspaceEnvironment[] = [];
+
+    render(
+      <Wrap>
+        <EnvironmentDataProbe id="conv_live" onData={(data) => results.push(data)} />
+      </Wrap>,
+    );
+    await waitFor(() =>
+      expect(results.at(-1)?.reachable).toEqual({
+        unconfined: true,
+        roots: [{ path: "/home/u/ws", access: "write", origin: "cwd" }],
+      }),
+    );
+  });
+
   it("does not fetch when disabled by the caller", async () => {
     onlineMock.mockReturnValue(true);
 
@@ -285,8 +427,9 @@ describe("useWorkspaceChangedFiles gating", () => {
 });
 
 describe("useWorkspaceAllFiles gating", () => {
-  it("does not fetch when the runner is offline", async () => {
+  it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
 
     render(
       <Wrap>
@@ -396,7 +539,7 @@ describe("useWorkspaceEnvironment gating", () => {
   it("marks the environment unavailable when the server omits metadata.root", async () => {
     onlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValue(jsonResponse({ metadata: {} }));
-    const results: Array<{ available: boolean; root: string | null; home: string | null }> = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -404,7 +547,12 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: false, root: null, home: null }),
+      expect(results.at(-1)).toEqual({
+        available: false,
+        root: null,
+        home: null,
+        reachable: null,
+      }),
     );
   });
 
@@ -415,7 +563,7 @@ describe("useWorkspaceEnvironment gating", () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ metadata: { root: "/home/u/ws", home: "/home/u" } }),
     );
-    const results: Array<{ available: boolean; root: string | null; home: string | null }> = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -423,7 +571,12 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: true, root: "/home/u/ws", home: "/home/u" }),
+      expect(results.at(-1)).toEqual({
+        available: true,
+        root: "/home/u/ws",
+        home: "/home/u",
+        reachable: null,
+      }),
     );
   });
 
@@ -440,8 +593,9 @@ describe("useWorkspaceEnvironment gating", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not fetch when the runner is offline", async () => {
+  it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
 
     render(
       <Wrap>
@@ -455,10 +609,11 @@ describe("useWorkspaceEnvironment gating", () => {
 });
 
 describe("useWorkspaceDirectory gating", () => {
-  it("does not fetch when the runner is offline (on-demand expand)", async () => {
-    // Lazy expand path — not poll spam, but still 503s on a dead
-    // runner. Gated for consistency with the other workspace hooks.
+  it("does not fetch when the runner is offline and the host is also down (on-demand expand)", async () => {
+    // Lazy expand path — not poll spam, but still unserveable when both
+    // the runner and host are down. Gated like the other workspace hooks.
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
 
     render(
       <Wrap>
@@ -630,6 +785,16 @@ describe("isRunnerUnavailable503", () => {
     } as unknown as Response;
     expect(await isRunnerUnavailable503(res)).toBe(false);
   });
+
+  it("does not consume a non-503 response body", async () => {
+    const json = vi.fn(async () => {
+      throw new Error("body must not be read");
+    });
+    const res = { ok: true, status: 200, statusText: "OK", json } as unknown as Response;
+
+    expect(await isRunnerUnavailable503(res)).toBe(false);
+    expect(json).not.toHaveBeenCalled();
+  });
 });
 
 describe("looksLikeWorkspaceFilePath", () => {
@@ -657,6 +822,25 @@ describe("looksLikeWorkspaceFilePath", () => {
     ["/a", false, "leading slash → no parent segment"],
   ])("returns %o → %s (%s)", (input, expected) => {
     expect(looksLikeWorkspaceFilePath(input as string)).toBe(expected);
+  });
+});
+
+describe("relativizeToWorkspace", () => {
+  // The wire form decides the authorization level the server applies: an
+  // absolute location is owner-gated (it can name any path on the host), a
+  // relative one is not. So a folder INSIDE the workspace must go out
+  // relative, or every collaborator browsing their own workspace gets a 403.
+  it.each([
+    [null, "/work/proj", "", "the root is the empty location"],
+    ["/work/proj", "/work/proj", "", "the root itself normalizes to empty"],
+    ["/work/proj/", "/work/proj", "", "a trailing slash on the root still matches"],
+    ["/work/proj/src", "/work/proj", "src", "a child goes out relative"],
+    ["/work/proj/src/ui", "/work/proj", "src/ui", "a deep child keeps its subpath"],
+    ["/etc", "/work/proj", "/etc", "an outside path stays absolute"],
+    ["/work/proj-old", "/work/proj", "/work/proj-old", "a name-prefixed sibling is NOT a child"],
+    ["/work/proj", null, "/work/proj", "an unknown root cannot be relativized"],
+  ])("%s under %s -> %s (%s)", (browsed, root, expected, why) => {
+    expect(relativizeToWorkspace(browsed, root), why).toBe(expected);
   });
 });
 
@@ -815,6 +999,22 @@ describe("useWorkspaceFileExists", () => {
     expect(results.at(-1)).toBe(false);
   });
 
+  it("reports false without retrying when the runner is offline", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+    const results: boolean[] = [];
+    render(
+      <Wrap>
+        <FileExistsProbe id="conv_1" path="projects/out/foo.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(results).not.toContain(true);
+    expect(results.at(-1)).toBe(false);
+  });
+
   it("checks a trusted root-level basename against the workspace root listing", async () => {
     // A path resolved from an absolute/"~" form can be a bare basename
     // ("foo.md", no slash) that looksLikeWorkspaceFilePath rejects. With
@@ -907,5 +1107,233 @@ describe("runnerOfflineRetryDelay", () => {
     expect(runnerOfflineRetryDelay(3)).toBe(8000);
     expect(runnerOfflineRetryDelay(4)).toBe(15_000);
     expect(runnerOfflineRetryDelay(10)).toBe(15_000);
+  });
+});
+
+describe("runner-offline retry liveness gate", () => {
+  function renderEnvironment(id: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { staleTime: 0 } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <EnvironmentProbe id={id} />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("does not retry a 503 from a stale-online runner", async () => {
+    vi.useFakeTimers();
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_stuck");
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a 503 for an old session with unknown liveness", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
+    onlineMock.mockReturnValue(undefined);
+    stubSession({ createdAtSecondsAgo: 3600 });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_old");
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries while a fresh session is cold-booting", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
+    onlineMock.mockReturnValue(undefined);
+    stubSession({ createdAtSecondsAgo: 1 });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_fresh");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("retries while the session snapshot is loading", async () => {
+    vi.useFakeTimers();
+    onlineMock.mockReturnValue(undefined);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_loading");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("retries while an active turn relaunches an offline runner", async () => {
+    vi.useFakeTimers();
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    stubSession({ createdAtSecondsAgo: 3600 });
+    stubChatStore("conv_relaunch", "running");
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_relaunch");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("browse-location listings normalize to paths relative to the location", () => {
+  // The runner answers the two wire forms with DIFFERENT path shapes: a
+  // relative location is echoed back as a prefix on every entry, an absolute
+  // one is not. The panel picks the wire form on authorization grounds, so it
+  // must not also inherit a shape change -- an un-stripped prefix renders the
+  // browsed folder as an extra level inside its own tree.
+  function entries(...paths: string[]): Response {
+    return jsonResponse({
+      object: "list",
+      data: paths.map((path) => ({
+        id: path,
+        name: path.split("/").pop(),
+        path,
+        type: "file",
+        bytes: 1,
+        modified_at: null,
+      })),
+      has_more: false,
+    });
+  }
+
+  beforeEach(() => {
+    onlineMock.mockReturnValue(true);
+  });
+
+  it("strips the echoed prefix a relative location comes back with", async () => {
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(entries("reports/summary.md", "reports/q3.csv"));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_rel" location="reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
+  });
+
+  it("leaves an absolute location's already-bare paths alone", async () => {
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(entries("summary.md"));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_abs" location="/elsewhere/reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md"]);
+  });
+
+  it.each([
+    ["reports", "reports/quarterly/q3.csv", "a relative location echoes the whole target"],
+    ["/elsewhere/reports", "q3.csv", "an absolute one lists bare"],
+  ])("roots a lazily-expanded directory's children under it (%s)", async (location, wirePath) => {
+    // Children address themselves relative to the tree's root, not to the
+    // directory that was listed -- otherwise expanding one level deeper
+    // would request the wrong path.
+    fetchMock.mockResolvedValueOnce(entries(wirePath));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <DirectoryPathsProbe id="conv_dir" path="quarterly" location={location} onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
+  });
+});
+
+describe("browse-location wire form (survives a slash-merging proxy)", () => {
+  // The absolute/relative distinction must NOT ride on a leading "%2F" in the
+  // path: that decodes to a "//" which reverse proxies (the Databricks Apps
+  // front door) merge to a single "/", turning an absolute path into a
+  // workspace-relative one. Paths go out with literal slashes and no leading
+  // "%2F"; the base is named out of band via `?base=host`.
+  describe("browseLocationSegment", () => {
+    it.each([
+      ["", "", "root is empty"],
+      ["/", "", "filesystem root is empty (base names it)"],
+      ["src/app.ts", "src/app.ts", "relative path is bare"],
+      ["/Users/me", "Users/me", "absolute path drops its leading slash"],
+      ["/a/b/c", "a/b/c", "deep absolute path drops only the leading slash"],
+      ["/my docs/f", "my%20docs/f", "segments are still percent-encoded"],
+    ])("%s -> %s (%s)", (location, expected) => {
+      const seg = browseLocationSegment(location);
+      expect(seg, expected).toBe(expected);
+      expect(seg.includes("%2F"), "no %2F leading marker").toBe(false);
+    });
+  });
+
+  describe("browseLocationBase", () => {
+    it.each([
+      ["", null],
+      ["src/app.ts", null],
+      ["/", "host"],
+      ["/Users/me", "host"],
+    ])("%s -> %s", (location, expected) => {
+      expect(browseLocationBase(location)).toBe(expected);
+    });
+  });
+
+  it("requests an absolute location with a bare path plus base=host", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <AllFilesProbeAt id="conv_abs_url" location="/Users/me/reports" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const url = String(fetchMock.mock.calls[1][0]);
+    expect(url).toContain("/filesystem/Users/me/reports?");
+    expect(url).toContain("base=host");
+    expect(url.includes("%2F"), "no %2F in the absolute request").toBe(false);
+  });
+
+  it("requests a workspace-relative location with no base param", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <AllFilesProbeAt id="conv_rel_url" location="src/inner" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const url = String(fetchMock.mock.calls[1][0]);
+    expect(url).toContain("/filesystem/src/inner?");
+    expect(url).not.toContain("base=");
   });
 });

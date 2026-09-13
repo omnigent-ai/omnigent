@@ -50,7 +50,8 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --extra dev
+        # tests/inner includes tracing tests that import the OpenTelemetry SDK.
+        run: uv sync --locked --group test --extra tracing
 
       - name: Import + CLI smoke
         run: |

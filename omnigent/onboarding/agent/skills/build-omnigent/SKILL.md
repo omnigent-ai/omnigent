@@ -34,7 +34,8 @@ Include if needed:
   `export_agent`, `list_files`, `search_conversations`, `upload_file`,
   `web_fetch`, `web_search`. If the `list_builtin_tools` tool is available,
   call it for the authoritative live set rather than trusting this list.
-- `tools.agents` — sub-agents (must match `agents/` subdirectories).
+- `tools.agents` — sub-agents, by the `name` each declares under `agents/`
+  (a sub-agent's directory name may differ from its name).
 - `os_env` — filesystem/shell access for harness agents (see the
   shell-capable template).
 - `interaction.modalities` — if the agent handles images or files.
@@ -77,8 +78,12 @@ Only generate skills if the agent has distinct modes of operation.
 Each skill needs:
 
 ```
-skills/<skill-name>/SKILL.md
+skills/<dir>/SKILL.md
 ```
+
+The directory name is free-form and need not match the skill's `name` —
+the runtime identifies a skill by its frontmatter `name` and loads its files
+from whatever directory it sits in.
 
 With YAML frontmatter:
 ```markdown
@@ -189,7 +194,8 @@ headers:
 
 ### Multi-agent system with sub-agents
 
-Sub-agents need the `omnigent` executor (it provides the spawn tools).
+The **parent** needs the `omnigent` executor — that's what provides the spawn
+tools. Each sub-agent is a full agent and may use any executor.
 
 **Directory structure:**
 ```
@@ -197,11 +203,15 @@ Sub-agents need the `omnigent` executor (it provides the spawn tools).
   config.yaml
   AGENTS.md
   agents/
-    {sub_agent_1}/
+    {sub_agent_1_dir}/
       config.yaml
-    {sub_agent_2}/
+    {sub_agent_2_dir}/
       config.yaml
 ```
+
+Directory names are free-form. A sub-agent's identity is the `name` in its
+own `config.yaml`, and that is what the parent lists in `tools.agents` —
+`{sub_agent_1_dir}` and `{sub_agent_1}` may differ.
 
 **Parent config.yaml:**
 ```yaml
@@ -219,12 +229,12 @@ tools:
 instructions: AGENTS.md
 ```
 
-**Sub-agent config (agents/{sub_agent_1}/config.yaml):**
+**Sub-agent config (agents/{sub_agent_1_dir}/config.yaml):**
 ```yaml
 spec_version: 1
 name: {sub_agent_1}
 description: {sub_agent_1_description}
-executor:
+executor:            # any executor works here — only the parent needs omnigent
   type: omnigent
   config:
     harness: claude-sdk
@@ -268,8 +278,10 @@ Before presenting the generated files to the user, verify (and if
 - [ ] `instructions` (or `prompt`) points to a file that exists or is
       inline text
 - [ ] When declaring `tools.agents`, the parent uses `executor.type:
-      omnigent`, and each entry has a matching `agents/` subdirectory
-      (sub-agents may use any executor)
+      omnigent`, and each entry is the declared `name` of a sub-agent under
+      `agents/` (its directory name may differ; sub-agents may use any
+      executor)
 - [ ] `tools.builtins` names are from the known set (Step 2) — or, if
       `list_builtin_tools` is available, were confirmed against it
-- [ ] Skill names match their directory names and use `[a-z0-9-]+` pattern
+- [ ] Skill names use the `[a-z0-9-]+` pattern (they need not match their
+      directory names)

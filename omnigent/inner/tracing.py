@@ -42,7 +42,7 @@ import logging
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 if TYPE_CHECKING:
-    from opentelemetry.trace import Span
+    from opentelemetry.trace import Span, Tracer
 
 from omnigent.runtime.telemetry import (
     parse_provider_name,
@@ -106,7 +106,7 @@ def is_tracing_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _tracer() -> Any:
+def _tracer() -> Tracer:
     from opentelemetry import trace
 
     return trace.get_tracer("omnigent")

@@ -26,7 +26,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 
 # The agent must boot, take a turn, and emit the gated tool call before the

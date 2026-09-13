@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -419,6 +420,90 @@ def test_wrap_client_non_streaming_create_not_wrapped() -> None:
 
 
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
+    def test_close_closes_owned_client_but_not_injected_client(self):
+        class _ClosableClient:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+
+        async def _t():
+            owned_client = _ClosableClient()
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._get_openai_async_client",
+                return_value=owned_client,
+            ):
+                executor = OpenAIAgentsSDKExecutor()
+            await executor.close()
+            self.assertEqual(owned_client.close_calls, 1)
+
+            injected_client = _ClosableClient()
+            executor = OpenAIAgentsSDKExecutor(client=injected_client)
+            await executor.close()
+            self.assertEqual(injected_client.close_calls, 0)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_defaults_to_sdk_behavior(self):
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object(), model="gpt-test")
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _ = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi"}],
+                        [],
+                        "Be helpful.",
+                    )
+                ]
+
+            run_config = _FakeRunner.last_calls[0]["run_config"]
+            self.assertNotIn("reasoning_item_id_policy", run_config.kwargs)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_is_configurable(self):
+        async def _t():
+            for policy in ("preserve", "omit"):
+                with self.subTest(policy=policy):
+                    _FakeRunner.last_calls = []
+                    _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+                    executor = OpenAIAgentsSDKExecutor(
+                        client=object(),
+                        model="gpt-test",
+                        reasoning_item_id_policy=policy,
+                    )
+                    with patch(
+                        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                        return_value=_fake_agents_sdk(),
+                    ):
+                        _ = [
+                            event
+                            async for event in executor.run_turn(
+                                [{"role": "user", "content": "hi"}],
+                                [],
+                                "Be helpful.",
+                            )
+                        ]
+
+                    run_config = _FakeRunner.last_calls[0]["run_config"]
+                    self.assertEqual(run_config.kwargs["reasoning_item_id_policy"], policy)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_rejects_invalid_value(self):
+        with self.assertRaisesRegex(ValueError, "reasoning_item_id_policy"):
+            OpenAIAgentsSDKExecutor(
+                client=object(),
+                reasoning_item_id_policy="invalid",  # type: ignore[arg-type]
+            )
+
     def test_sanitize_replay_item_drops_long_ids(self):
         item = {
             "type": "message",
@@ -568,11 +653,11 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             self.assertEqual(events[-1].response, "done")
             self.assertEqual(
                 _FakeRunner.last_calls[0]["agent"].model,
-                "databricks-gpt-5-5",
+                "catalog-databricks-openai-default",
             )
             self.assertEqual(
                 _FakeRunner.last_calls[0]["run_config"].kwargs["model"],
-                "databricks-gpt-5-5",
+                "catalog-databricks-openai-default",
             )
 
         _run(_t())
@@ -1489,8 +1574,9 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 def test_get_openai_client_profile_uses_callback_auth(monkeypatch):
     """Explicit ``profile`` uses httpx callback auth, not a static ``api_key``.
 
-    Verifies that when a Databricks profile is provided, the client
-    is constructed with an ``http_client`` carrying a
+    Verifies that a Unity Catalog model-service name does not override an
+    explicit Databricks profile. The client is constructed with an
+    ``http_client`` carrying a
     ``_DatabricksBearerAuth`` that refreshes tokens per-request,
     and that the ``api_key`` is a placeholder (not the real token).
 
@@ -1521,7 +1607,10 @@ def test_get_openai_client_profile_uses_callback_auth(monkeypatch):
     import openai as _openai_mod
 
     with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
-        _get_openai_async_client(profile="dev")
+        _get_openai_async_client(
+            profile="dev",
+            model="production.agents.support_assistant",
+        )
 
     assert captured["base_url"] == "https://profile-host.example.com/ai-gateway/openai/v1"
     assert captured["api_key"] != "should-not-be-used"
@@ -1723,6 +1812,70 @@ def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
     assert captured["base_url"] == "https://env-host.example.com/v1"
     assert captured["api_key"] == "env-key"
     assert "http_client" not in captured
+
+
+def test_get_openai_client_model_service_without_provider_fails_loudly(monkeypatch):
+    """A model-service name alone does not imply ambient Databricks routing.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="No provider credentials"):
+        _get_openai_async_client(model="production.agents.support_assistant")
+
+
+def test_get_openai_client_unpinned_model_does_not_route_to_databricks(monkeypatch):
+    """An unpinned model is not a Databricks signal.
+
+    Leaving the model unset means "use the provider default", not
+    "this is Databricks-hosted". Routing it to ambient Databricks auth
+    made a credential-less OpenAI agent fail with an "install
+    databricks-sdk" error instead of naming the missing OpenAI key.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="no model is pinned"):
+        _get_openai_async_client(model=None)
+
+
+def test_get_openai_client_databricks_model_still_uses_ambient_auth(monkeypatch):
+    """A ``databricks-`` model keeps the ambient Databricks fallback.
+
+    Guards the unpinned-model fix from over-reaching into the legacy
+    Databricks routing path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    calls: list[str | None] = []
+
+    def _fake_resolve(profile=None, **kwargs):
+        calls.append(profile)
+        return httpx.BasicAuth("token", ""), "https://example.databricks.com"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    client = _get_openai_async_client(model="databricks-gpt-5-5")
+
+    assert calls == [None], "a 'databricks-' model must still resolve ambient Databricks auth"
+    assert (
+        str(client.base_url).rstrip("/") == "https://example.databricks.com/ai-gateway/openai/v1"
+    )
 
 
 def test_get_openai_client_invalid_profile_raises_auth_error(monkeypatch):
@@ -1978,6 +2131,43 @@ def test_normalize_content_blocks_strips_filename_from_input_image() -> None:
     assert result == [{"type": "input_image", "image_url": "data:image/png;base64,abcd"}]
     assert "filename" not in result[0]
     assert result is not blocks
+
+
+def test_normalize_responses_items_wraps_string_assistant_content() -> None:
+    """String content must become blocks before the chat converter sees it.
+
+    A plain string is legal Responses-API content, but ``items_to_messages``
+    iterates content expecting blocks — so it walks the string character by
+    character and indexes each one, raising ``string indices must be integers,
+    not 'str'``. Since history is replayed, one such item breaks every later
+    turn in the conversation.
+    """
+    items = [
+        {"type": "message", "role": "assistant", "content": "I'll explore the repo."},
+        {"type": "message", "role": "user", "content": "go ahead"},
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "I'll explore the repo."}]
+    # User strings reach a different converter branch that accepts them, and
+    # callers rely on them staying strings.
+    assert result[1]["content"] == "go ahead"
+
+
+def test_normalize_responses_items_leaves_block_content_alone() -> None:
+    """Content that is already a block list is untouched."""
+    items = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "hi"}]
 
 
 def test_normalize_content_blocks_preserves_input_image_detail_for_http_url() -> None:

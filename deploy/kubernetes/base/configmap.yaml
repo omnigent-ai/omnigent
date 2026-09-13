@@ -8,6 +8,8 @@ data:
   HOST: "0.0.0.0"
   PORT: "8000"
   ARTIFACT_DIR: "/data/artifacts"
+  # Comma-separated release features; empty keeps every feature off.
+  OMNIGENT_FEATURES: ""
   OMNIGENT_ADMIN_CREDENTIALS_PATH: "/data/admin-credentials"
   OMNIGENT_AUTH_ENABLED: "1"
   OMNIGENT_AUTH_PROVIDER: "accounts"

@@ -27,6 +27,8 @@ export interface ChildSessionInfo {
   id: string;
   /** Full title, ``"{tool}:{session_name}"``, e.g. ``"researcher:auth"``. */
   title: string | null;
+  /** Human-readable task-derived label, e.g. ``"Investigate auth flow"``. */
+  task_summary: string | null;
   /** Sub-agent type prefix, e.g. ``"researcher"``. */
   tool: string | null;
   /** Sub-agent instance name suffix, e.g. ``"auth"``. */
@@ -51,6 +53,12 @@ export interface ChildSessionInfo {
    * the Agents rail renders an "awaiting input" badge for it.
    */
   pending_elicitations_count: number;
+  /**
+   * Model the intelligent router picked for this sub-agent, e.g.
+   * ``"databricks-claude-sonnet-5"``. ``null``/absent when the child was
+   * not routed (routing off, or a server that predates the field).
+   */
+  routed_model?: string | null;
 }
 
 /**
@@ -61,6 +69,7 @@ export interface ChildSessionInfo {
 interface ChildSessionWire {
   id: string;
   title: string | null;
+  task_summary?: string | null;
   tool: string | null;
   session_name: string | null;
   labels?: Record<string, string>;
@@ -69,6 +78,7 @@ interface ChildSessionWire {
   busy: boolean;
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
+  routed_model?: string | null;
 }
 
 interface ChildSessionsResponse {
@@ -172,6 +182,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   return json.data.map((row) => ({
     id: row.id,
     title: row.title,
+    task_summary: row.task_summary ?? null,
     tool: row.tool,
     session_name: row.session_name,
     labels: row.labels ?? {},
@@ -180,6 +191,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     busy: row.busy,
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
+    routed_model: row.routed_model ?? null,
   }));
 }
 

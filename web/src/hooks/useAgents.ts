@@ -9,6 +9,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 export interface McpServerSummary {
   name: string;
@@ -17,6 +18,11 @@ export interface McpServerSummary {
   description?: string | null;
   /** HTTP SSE endpoint URL. Only present when transport === "http". */
   url?: string | null;
+  /**
+   * HTTP headers for the server. Values are always "[REDACTED]" in API
+   * responses; only key names are exposed.
+   */
+  headers?: Record<string, string>;
   /** Executable to spawn. Only present when transport === "stdio". */
   command?: string | null;
   /** Arguments passed to command. Only present when transport === "stdio". */
@@ -99,14 +105,15 @@ async function fetchAgents(): Promise<Agent[]> {
 /**
  * Fetch the agents list, derived from active sessions.
  *
- * Refetches every 30 seconds so new agents from recently created
- * sessions appear without a manual refresh.
+ * Intended for the landing page (no active session); the session
+ * detail page uses `useSessionAgent` for the bound agent instead.
  */
-export function useAgents() {
+export function useAgents({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: ["agents"],
     queryFn: fetchAgents,
-    staleTime: 30_000,
+    staleTime: Infinity,
+    enabled,
   });
 }
 
@@ -154,10 +161,13 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
  * sessions-derived agent list. Only fires when `sessionId` is non-null.
  */
 export function useSessionAgent(sessionId: string | null) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session —
+  // never fetch its agent.
+  const serverId = isTempConvId(sessionId) ? null : sessionId;
   return useQuery({
-    queryKey: ["session-agent", sessionId],
-    queryFn: () => fetchSessionAgent(sessionId!),
-    enabled: sessionId !== null,
+    queryKey: ["session-agent", serverId],
+    queryFn: () => fetchSessionAgent(serverId!),
+    enabled: serverId !== null,
     staleTime: Infinity,
   });
 }
@@ -167,6 +177,7 @@ export interface UpsertMcpServerInput {
   transport: "http" | "stdio";
   description?: string | null;
   url?: string | null;
+  headers?: Record<string, string> | null;
   command?: string | null;
   args?: string[];
 }

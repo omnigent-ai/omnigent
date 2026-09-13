@@ -17,11 +17,11 @@ def _conversation_with_wrapper(wrapper: str) -> Conversation:
     :returns: Conversation with that label and a bound agent_id.
     """
     return Conversation(
-        id="conv_test",
+        id="e1f7c651c9f97fac088ea70ef633409d",
         created_at=0,
         updated_at=0,
-        root_conversation_id="conv_test",
-        agent_id="ag_native_test",
+        root_conversation_id="e1f7c651c9f97fac088ea70ef633409d",
+        agent_id="d5de5cef9504e12d06e729f3071d4f48",
         labels={"omnigent.wrapper": wrapper},
     )
 
@@ -61,7 +61,7 @@ def test_codex_native_session_uses_codex_harness_for_web_messages() -> None:
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "codex-native-ui",
         "harness": "codex-native",
-        "agent_id": "ag_native_test",
+        "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
 
@@ -78,7 +78,7 @@ def test_kiro_native_session_uses_kiro_harness_for_web_messages() -> None:
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "kiro-native-ui",
         "harness": "kiro-native",
-        "agent_id": "ag_native_test",
+        "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
 
@@ -101,7 +101,7 @@ def test_antigravity_native_session_uses_antigravity_harness_for_web_messages() 
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "antigravity-native-ui",
         "harness": "antigravity-native",
-        "agent_id": "ag_native_test",
+        "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
 
@@ -205,11 +205,11 @@ def test_custom_native_harness_session_without_wrapper_label_is_native(
     from omnigent.server.routes import sessions as sessions_routes
 
     conv = Conversation(
-        id="conv_polly",
+        id="0e877e3fab4a2d5f5e386ef9f791eec0",
         created_at=0,
         updated_at=0,
-        root_conversation_id="conv_polly",
-        agent_id="ag_polly",
+        root_conversation_id="0e877e3fab4a2d5f5e386ef9f791eec0",
+        agent_id="61fc939de6af22c5349fa22ba6e62aca",
         labels={},  # chat-first: no wrapper / ui presentation labels
     )
     monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda _c: "codex-native")
@@ -232,11 +232,11 @@ def test_custom_sdk_harness_session_is_not_native(
     from omnigent.server.routes import sessions as sessions_routes
 
     conv = Conversation(
-        id="conv_sdk",
+        id="9842b654446e37e810871eba75f58608",
         created_at=0,
         updated_at=0,
-        root_conversation_id="conv_sdk",
-        agent_id="ag_sdk",
+        root_conversation_id="9842b654446e37e810871eba75f58608",
+        agent_id="112e3284aa0a61b1b971de591fae1a26",
         labels={},
     )
     monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda _c: "claude-sdk")

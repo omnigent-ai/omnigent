@@ -5,21 +5,33 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
 if TYPE_CHECKING:
     from alembic.config import Config
 from sqlalchemy.orm import Session, sessionmaker
 
+from omnigent.db.cockroachdb import (
+    _crdb_server_version,
+    _initialize_or_verify_crdb_schema,
+    _prepare_crdb_schema_transaction,
+    _verify_crdb_read_committed,
+)
+from omnigent.db.metrics import record_transaction_retry
+from omnigent.db.query_context import query_name_scope
 from omnigent.entities import NewConversationItem
 
 _logger = logging.getLogger(__name__)
@@ -27,9 +39,20 @@ _logger = logging.getLogger(__name__)
 # A callable that returns a context manager yielding a Session.
 ManagedSessionMaker = Callable[[], AbstractContextManager[Session]]
 
+
+class NamedManagedSessionMaker(Protocol):
+    """Managed session factory carrying its engine and semantic namespace."""
+
+    engine: Engine
+    query_name_prefix: str
+
+    def __call__(self, query_name: str) -> AbstractContextManager[Session]: ...
+
+
 # A zero-argument callable returning a fresh database password (e.g. a
 # short-lived Lakebase OAuth token). Invoked once per *new* DBAPI connection.
 LakebaseTokenProvider = Callable[[], str]
+_T = TypeVar("_T")
 
 
 # ── Lakebase token-aware connections ───────────────────
@@ -186,7 +209,47 @@ def normalize_database_url(url: str) -> str:
     for prefix in ("postgres://", "postgresql://"):
         if url.startswith(prefix):
             return "postgresql+psycopg://" + url[len(prefix) :]
+    if url.startswith("cockroachdb://"):
+        return "cockroachdb+psycopg://" + url[len("cockroachdb://") :]
     return url
+
+
+def is_cockroachdb(dialect_name: str) -> bool:
+    """Return whether *dialect_name* is the CockroachDB dialect."""
+    return dialect_name == "cockroachdb"
+
+
+def is_postgresql_family(dialect_name: str) -> bool:
+    """Return whether a dialect accepts PostgreSQL-family DML."""
+    return dialect_name in {"postgresql", "cockroachdb"}
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    """Read an integer environment setting, treating blank as unset."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}, got {raw!r}.")
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Read a floating-point environment setting, treating blank as unset."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number, got {raw!r}.") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}, got {raw!r}.")
+    return value
 
 
 # ── Engine caching ─────────────────────────────────────
@@ -218,10 +281,12 @@ def _create_engine(db_uri: str) -> Engine:
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
-        ``"postgresql://user:pass@host/dbname"``.
+        ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A configured :class:`~sqlalchemy.engine.Engine`.
     """
+    db_uri = normalize_database_url(db_uri)
     is_sqlite = db_uri.startswith("sqlite")
+    is_crdb = db_uri.startswith("cockroachdb+")
     if is_sqlite:
         # ``check_same_thread=False`` lets SQLAlchemy's pool hand a
         # connection to whichever worker thread asks for it (FastAPI,
@@ -231,6 +296,18 @@ def _create_engine(db_uri: str) -> Engine:
         engine = create_engine(
             db_uri,
             connect_args={"check_same_thread": False, "timeout": 20.0},
+            # Give SQLite a modest pool above SQLAlchemy's default
+            # QueuePool(5, 10) = 15, which the /health sidebar poll exhausts
+            # under load (surfacing as "QueuePool ... timeout" 500s).
+            # Deliberately NOT sized to the 200-token AnyIO thread limiter
+            # like the Postgres branch below: SQLite serializes at the file
+            # level, so handing out ~200 connections just lets that many
+            # worker threads thrash SQLite's page-cache mutex and burn CPU
+            # instead of queuing cheaply on the pool. ~40 total clears the
+            # exhaustion without inviting lock contention.
+            pool_size=15,
+            max_overflow=25,
+            pool_timeout=10,
         )
 
         # Apply WAL + busy_timeout on every fresh DBAPI connection
@@ -261,32 +338,125 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
-    engine = create_engine(
-        db_uri,
+    engine_kwargs: dict[str, Any] = {
         # Verify connections are alive before checking them out
         # from the pool. Prevents "server has gone away" errors
         # after idle periods.
-        pool_pre_ping=True,
+        "pool_pre_ping": True,
         # Recycle connections older than this window. Prevents stale
         # connections when the database server restarts or closes idle
         # connections; in Lakebase token mode the shorter window also keeps
         # each connection's OAuth token refreshed ahead of its ~1h expiry.
-        pool_recycle=pool_recycle,
-        # Aligned with the AnyIO thread limiter in
-        # ``server/app.py:_lifespan``. Every DB call runs via
-        # ``asyncio.to_thread``, so connections beyond the thread
-        # token count just sit idle. Overflow covers boot-time
-        # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
-        pool_size=200,
-        max_overflow=20,
+        "pool_recycle": pool_recycle,
+        # The defaults align the base pool with the server's 200-token AnyIO
+        # thread limiter. The environment overrides are global for every
+        # non-SQLite backend. SQLAlchemy permits a zero-sized base pool and
+        # max_overflow=-1 for unlimited overflow.
+        "pool_size": _env_int("OMNIGENT_DB_POOL_SIZE", 200, minimum=0),
+        "max_overflow": _env_int("OMNIGENT_DB_MAX_OVERFLOW", 20, minimum=-1),
         # Bound the wait when the pool is exhausted instead of
         # blocking indefinitely; surfaces real saturation as an
         # error rather than a hang.
-        pool_timeout=10,
-    )
+        "pool_timeout": _env_float("OMNIGENT_DB_POOL_TIMEOUT", 10.0, minimum=0.0),
+    }
+    if is_crdb:
+        engine_kwargs["isolation_level"] = "READ COMMITTED"
+    try:
+        engine = create_engine(db_uri, **engine_kwargs)
+    except (ImportError, NoSuchModuleError) as exc:
+        if is_crdb:
+            raise RuntimeError(
+                "CockroachDB support requires the optional dependencies. "
+                "Install them with `pip install 'omnigent[cockroachdb]'`."
+            ) from exc
+        if isinstance(exc, ModuleNotFoundError):
+            # SQLAlchemy imports the DBAPI lazily in create_engine; a missing
+            # Postgres driver surfaces as an opaque "No module named 'psycopg'".
+            # Bare re-raise on pass-through keeps the original truly untouched.
+            translated = _translate_missing_driver_error(db_uri, exc)
+            if translated is exc:
+                raise
+            raise translated from exc
+        if isinstance(exc, NoSuchModuleError):
+            # PaaS-style postgres:// is not a SQLAlchemy dialect at all; append
+            # conversion guidance for direct --database-uri callers (the spawn
+            # path normalizes it away). Non-Postgres dialect errors re-raise bare.
+            scheme = db_uri.split("://", 1)[0].lower()
+            if not scheme.startswith("postgres"):
+                raise
+            raise NoSuchModuleError(
+                f"{exc}. The scheme '{scheme}://' is not a valid SQLAlchemy "
+                f"dialect — use 'postgresql+psycopg://<rest of your URI>' "
+                f"(and install the driver via the 'omnigent[postgres]' extra "
+                f"if needed)."
+            ) from exc
+        raise
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine
+
+
+def _translate_missing_driver_error(db_uri: str, exc: ModuleNotFoundError) -> ModuleNotFoundError:
+    """
+    Rewrite a missing-DBAPI-driver import error into an actionable one.
+
+    When :func:`_create_engine` builds a Postgres engine but the ``psycopg``
+    driver is not installed, SQLAlchemy raises a bare
+    ``ModuleNotFoundError: No module named 'psycopg'`` from inside
+    ``create_engine``. That is technically correct but gives the operator no
+    hint that the driver ships in an optional extra. This returns a
+    replacement error whose message names the exact install commands.
+
+    Only the dialect part of *db_uri* is echoed (never the credentials), so
+    the message is safe to log.
+
+    :param db_uri: The connection string being opened, e.g.
+        ``"postgresql+psycopg://user:pass@host/db"``.
+    :param exc: The original ``ModuleNotFoundError`` from ``create_engine``.
+    :returns: A new ``ModuleNotFoundError`` with an actionable message when the
+        backend is Postgres and the driver is the missing module; otherwise the
+        original *exc* unchanged.
+    """
+    # Echo only the dialect — never the credentials. Prefer SQLAlchemy's own
+    # URL parser over string surgery; fall back to a plain scheme split for
+    # strings make_url rejects (the message must never crash error handling).
+    try:
+        backend = make_url(db_uri).drivername
+    except Exception:  # noqa: BLE001 — any parse failure falls back
+        backend = db_uri.split("://", 1)[0]
+    if "postgres" not in backend.lower() or exc.name not in {"psycopg", "psycopg2"}:
+        return exc
+    install_commands = (
+        "    uv tool install omnigent --with 'psycopg[binary]'   "
+        "# uv tool (e.g. `omni`/`omnigent` CLI)\n"
+        "    pip install 'omnigent[postgres]'                    "
+        "# the extra that bundles the driver\n"
+        "    pip install 'psycopg[binary]'                       "
+        "# plain virtualenv\n"
+    )
+    if exc.name == "psycopg2":
+        # Installing psycopg 3 would NOT fix the psycopg2 dialects — the
+        # guidance must lead with switching the URI scheme.
+        message = (
+            f"Database backend '{backend}' selects the legacy PostgreSQL "
+            f"driver 'psycopg2', which is not installed. Preferred fix: "
+            f"change the URI scheme to 'postgresql+psycopg://' (the modern "
+            f"psycopg 3 dialect) and install the driver with one of:\n"
+            f"{install_commands}"
+            f"Alternatively, keep the psycopg2 dialect by installing it "
+            f"explicitly: pip install psycopg2-binary\n"
+            f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
+            f"--database-uri."
+        )
+    else:
+        message = (
+            f"Database backend '{backend}' needs the PostgreSQL driver "
+            f"'{exc.name}', which is not installed. Install it with one of:\n"
+            f"{install_commands}"
+            f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
+            f"--database-uri."
+        )
+    return ModuleNotFoundError(message, name=exc.name)
 
 
 def get_or_create_engine(db_uri: str) -> Engine:
@@ -299,10 +469,11 @@ def get_or_create_engine(db_uri: str) -> Engine:
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
-        ``"postgresql://user:pass@host/dbname"``.
+        ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
     :raises RuntimeError: If automatic schema migration fails.
     """
+    db_uri = normalize_database_url(db_uri)
     if db_uri not in _engine_cache:
         with _engine_lock:
             if db_uri not in _engine_cache:
@@ -313,6 +484,54 @@ def get_or_create_engine(db_uri: str) -> Engine:
                 instrument_sqlalchemy_engine(engine)
                 _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]
+
+
+def get_or_create_conversation_engine(conv_uri: str) -> Engine:
+    """
+    Return a cached engine for the Agent Platform DB URI.
+
+    Unlike :func:`get_or_create_engine`, this does NOT run Alembic
+    migrations — the AP DB is expected to be a fresh database that
+    gets its tables created via ``ConversationBase.metadata.create_all()``.
+    For the common case where AP DB == Omnigent DB, callers should
+    use :func:`get_or_create_engine` directly and share the engine.
+
+    :param conv_uri: SQLAlchemy database URI for the AP DB.
+    :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
+    """
+    conv_uri = normalize_database_url(conv_uri)
+    if conv_uri not in _engine_cache:
+        with _engine_lock:
+            if conv_uri not in _engine_cache:
+                engine = _create_engine(conv_uri)
+                _ensure_conversation_tables(engine)
+                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+
+                instrument_sqlalchemy_engine(engine)
+                _engine_cache[conv_uri] = engine
+    return _engine_cache[conv_uri]
+
+
+def _ensure_conversation_tables(engine: Engine) -> None:
+    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    from omnigent.db.db_models import ConversationBase
+
+    with query_name_scope("omnigent.database.ensure_conversation_schema"):
+        if is_cockroachdb(engine.dialect.name):
+            version = _crdb_server_version(engine)
+            _verify_crdb_read_committed(engine, version)
+            with engine.connect() as connection:
+                _prepare_crdb_schema_transaction(connection, version)
+                ConversationBase.metadata.create_all(bind=connection, checkfirst=True)
+                connection.commit()
+        else:
+            ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+        ensure_fts_table(engine)
+
+
+def _set_alembic_database_url(config: Config, db_uri: str) -> None:
+    """Store a database URL safely in Alembic's ConfigParser-backed config."""
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
 
 
 def _build_alembic_config(db_uri: str) -> Config:
@@ -334,7 +553,7 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    _set_alembic_database_url(config, db_uri)
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 
@@ -359,26 +578,118 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     :param db_uri: Database connection string forwarded to
         Alembic's ``sqlalchemy.url`` config option, e.g.
         ``"sqlite:///mydb.db"``.
+    :raises RuntimeError: If the database revision is newer than
+        the revisions known to this build.
     """
     from alembic import command
 
-    from omnigent.db.db_models import Base
+    from omnigent.db.db_models import ConversationBase, OmnigentBase
+
+    current = _get_current_db_revision(engine)
+    head = _get_head_db_revision(db_uri)
+    _verify_db_revision_is_supported(db_uri, current, head)
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
-    # Pass a shared connection so Alembic operates within the same
-    # engine (required for SQLite in-memory databases, and avoids
-    # creating a second connection pool).
-    with engine.begin() as connection:
-        config.attributes["connection"] = connection
-        command.upgrade(config, "head")
-    # Belt-and-suspenders: if a future migration is added but a
-    # caller forgets to wire it into the chain, ``create_all`` will
-    # at least create any missing tables from ORM metadata so the
-    # server still boots. Cannot rescue missing COLUMNS on existing
-    # tables — those need a real migration, which is why the
-    # short-circuit above was removed.
-    Base.metadata.create_all(bind=engine, checkfirst=True)
+    # Pass a shared connection so Alembic operates within the same engine.
+    # Most dialects let Alembic own transaction demarcation. CRDB needs an
+    # externally started SERIALIZABLE transaction for schema changes; on
+    # versions that provide it, autocommit_before_ddl is also enabled.
+    with query_name_scope("omnigent.database.run_migrations"):
+        crdb_version = (
+            _crdb_server_version(engine) if is_cockroachdb(engine.dialect.name) else None
+        )
+        with engine.connect() as connection:
+            if crdb_version is not None:
+                _prepare_crdb_schema_transaction(connection, crdb_version)
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+            if crdb_version is not None:
+                if connection.in_transaction():
+                    connection.commit()
+                _prepare_crdb_schema_transaction(connection, crdb_version)
+                for base in (OmnigentBase, ConversationBase):
+                    base.metadata.create_all(bind=connection, checkfirst=True)
+                connection.commit()
+            else:
+                # If a future migration is added but a caller forgets to wire
+                # it into the chain, create_all still creates missing tables.
+                for base in (OmnigentBase, ConversationBase):
+                    base.metadata.create_all(bind=engine, checkfirst=True)
+
+
+def run_migrations_with_retry(
+    db_uri: str,
+    *,
+    max_attempts: int = 8,
+    backoff_seconds: float = 3.0,
+    engine_factory: Callable[[str], Engine] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Connect and run migrations, retrying a cold database with backoff.
+
+    Managed Postgres endpoints (e.g. Databricks Lakebase) suspend after
+    an idle window and take several seconds to resume. A process that
+    boots and migrates once at startup can hit that resume window and
+    fail with a transient :class:`~sqlalchemy.exc.OperationalError`
+    ("the database system is starting up" / connection refused). Callers
+    that treat a startup exception as fatal then crash-loop until the DB
+    happens to be warm. Retrying the connect+migrate with linear backoff
+    lets a cold start self-heal.
+
+    A fresh engine is created per attempt and disposed afterward so a
+    poisoned connection pool from a failed attempt is never reused. Only
+    :class:`~sqlalchemy.exc.OperationalError` is retried; every other
+    exception (including a real migration/schema error) propagates
+    immediately. The final attempt's error is re-raised so a genuinely
+    unreachable database still fails loudly.
+
+    :param db_uri: SQLAlchemy database URL to connect and migrate.
+    :param max_attempts: Total connect+migrate attempts before giving
+        up. Must be >= 1.
+    :param backoff_seconds: Base linear backoff; attempt *n* sleeps
+        ``backoff_seconds * n`` before attempt *n+1*.
+    :param engine_factory: Callable returning an :class:`Engine` for the
+        URI. Defaults to :func:`sqlalchemy.create_engine`. Injectable
+        for tests.
+    :param sleep: Sleep function, injectable for tests. Defaults to
+        :func:`time.sleep`.
+    :raises sqlalchemy.exc.OperationalError: If every attempt fails to
+        connect.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if engine_factory is None:
+        import sqlalchemy
+
+        engine_factory = sqlalchemy.create_engine
+
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(1, max_attempts + 1):
+        engine = engine_factory(db_uri)
+        try:
+            _run_migrations(engine, db_uri)
+            return
+        except OperationalError as exc:
+            if attempt == max_attempts:
+                _logger.error(
+                    "Database not reachable after %d attempt(s); giving up",
+                    max_attempts,
+                )
+                raise
+            delay = backoff_seconds * attempt
+            _logger.warning(
+                "DB connect/migrate attempt %d/%d failed (%s); retrying in %.0fs "
+                "(a managed endpoint may be resuming from suspend)",
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                delay,
+            )
+            sleep(delay)
+        finally:
+            engine.dispose()
 
 
 def _get_current_db_revision(engine: Engine) -> str | None:
@@ -396,12 +707,13 @@ def _get_current_db_revision(engine: Engine) -> str | None:
     """
     from alembic.runtime.migration import MigrationContext
 
-    inspector = inspect(engine)
-    if "alembic_version" not in inspector.get_table_names():
-        return None
-    with engine.connect() as connection:
-        ctx = MigrationContext.configure(connection)
-        return ctx.get_current_revision()
+    with query_name_scope("omnigent.database.select_current_revision"):
+        inspector = inspect(engine)
+        if "alembic_version" not in inspector.get_table_names():
+            return None
+        with engine.connect() as connection:
+            ctx = MigrationContext.configure(connection)
+            return ctx.get_current_revision()
 
 
 def _get_head_db_revision(db_uri: str) -> str:
@@ -430,11 +742,34 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
+def _verify_db_revision_is_supported(
+    db_uri: str,
+    current: str | None,
+    head: str,
+) -> None:
+    """Reject a database revision that is unknown to this build."""
+    if current is None or current == head:
+        return
+
+    from alembic.script import ScriptDirectory
+    from alembic.util import CommandError
+
+    script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
+    try:
+        script.get_revision(current)
+    except CommandError as exc:
+        raise RuntimeError(
+            "Omnigent database schema is newer than this version of Omnigent "
+            f"(found revision {current!r}, latest supported revision {head!r}). "
+            "Upgrade Omnigent before using this database."
+        ) from exc
+
+
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     Bring a fresh or stale database to head before the server starts.
 
-    Three cases:
+    Four cases:
 
     - **Fresh DB** (no ``alembic_version`` table) — run migrations to
       head. This covers brand-new SQLite files and freshly created
@@ -445,6 +780,8 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
       If the migration fails, re-raise with context so the server
       still terminates with an actionable error instead of continuing
       against an incompatible schema.
+    - **Newer than this build** — stop without attempting a migration
+      and tell the operator to upgrade Omnigent.
 
     :param engine: SQLAlchemy engine bound to the target database.
     :param db_uri: Database URL, used both for Alembic config and in
@@ -452,8 +789,13 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     :raises RuntimeError: If automatic schema migration fails or does
         not bring the database to head.
     """
+    if is_cockroachdb(engine.dialect.name):
+        _initialize_or_verify_crdb_schema(engine, db_uri)
+        return
+
     head = _get_head_db_revision(db_uri)
     current = _get_current_db_revision(engine)
+    _verify_db_revision_is_supported(db_uri, current, head)
 
     if current is None:
         _run_migrations(engine, db_uri)
@@ -508,6 +850,54 @@ def clear_engine_cache() -> None:
 # ── Managed session ────────────────────────────────────
 
 
+# Ambient per-engine sessions for a read-only "share one checkout" scope. When
+# active (see :func:`shared_read_scope`), ``managed_session()`` reuses the
+# scope's session for its engine instead of opening a fresh pool checkout,
+# collapsing several back-to-back reads (e.g. the access-control check's
+# permission + conversation lookups) into a single connection round-trip.
+# Keyed by ``id(engine)`` so distinct engines (split-DB) still get independent
+# checkouts. Unset outside a scope, so it is a strict no-op for every ordinary
+# caller.
+_shared_read_sessions: ContextVar[dict[int, Session] | None] = ContextVar(
+    "omnigent_shared_read_sessions", default=None
+)
+
+
+@contextmanager
+def shared_read_scope() -> Iterator[None]:
+    """Collapse back-to-back reads into one pool checkout per engine.
+
+    Within this scope, ``managed_session()`` reuses a single session per
+    engine rather than checking out a fresh pooled connection (plus a
+    ``pool_pre_ping`` round-trip) on every store call. Intended for a short,
+    strictly READ-ONLY burst — an access-control check, a snapshot assembly —
+    where the per-call checkout dominates the actual query time.
+
+    Nesting reuses the outer scope. Write makers (``immediate=True``) never
+    participate, so they keep their own ``BEGIN IMMEDIATE`` isolation even
+    when nested here. Never hold this open across network I/O: it pins a
+    pooled connection for the scope's whole duration.
+    """
+    if _shared_read_sessions.get() is not None:
+        # Already inside a scope — the outer one owns the sessions.
+        yield
+        return
+    sessions: dict[int, Session] = {}
+    token = _shared_read_sessions.set(sessions)
+    try:
+        yield
+        for session in sessions.values():
+            session.commit()
+    except BaseException:
+        for session in sessions.values():
+            session.rollback()
+        raise
+    finally:
+        for session in sessions.values():
+            session.close()
+        _shared_read_sessions.reset(token)
+
+
 def make_managed_session_maker(
     engine: Engine,
     *,
@@ -529,7 +919,14 @@ def make_managed_session_maker(
     :returns: A callable that, when invoked, returns a context
         manager yielding a :class:`~sqlalchemy.orm.Session`.
     """
-    factory = sessionmaker(bind=engine)
+    # expire_on_commit=False keeps column attributes accessible on ORM
+    # instances after the session commits and closes. Without it, SQLAlchemy
+    # expires all attributes on commit, and any access outside the session
+    # context (e.g. after the ``with session:`` block exits) raises
+    # DetachedInstanceError. This is safe here because each managed session
+    # is short-lived and single-writer, so there is no cross-session stale
+    # data concern.
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
     is_sqlite = engine.dialect.name == "sqlite"
 
     @contextmanager
@@ -540,7 +937,27 @@ def make_managed_session_maker(
         Commits on clean exit, rolls back on exception. For SQLite
         backends, enables foreign key enforcement and sets a
         busy timeout before yielding.
+
+        Inside a :func:`shared_read_scope` (and only for read makers), the
+        scope's per-engine session is reused instead of a fresh checkout;
+        the scope — not this block — owns its commit/close.
         """
+        if not immediate:
+            shared = _shared_read_sessions.get()
+            if shared is not None:
+                key = id(engine)
+                session = shared.get(key)
+                if session is None:
+                    session = factory()
+                    # Register before the PRAGMAs: those executes force the pool
+                    # checkout, so if one raises the scope must already track the
+                    # session to close it (otherwise the connection would leak).
+                    shared[key] = session
+                    if is_sqlite:
+                        session.execute(text("PRAGMA foreign_keys = ON"))
+                        session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                yield session
+                return
         with factory() as session:
             try:
                 if is_sqlite:
@@ -562,68 +979,173 @@ def make_managed_session_maker(
     return managed_session
 
 
+def make_named_managed_session_maker(
+    engine: Engine,
+    *,
+    query_name_prefix: str,
+    immediate: bool = False,
+) -> NamedManagedSessionMaker:
+    """Create managed sessions whose database work always has a semantic name.
+
+    The supplied suffix is joined to ``query_name_prefix`` and remains active
+    through the session's implicit flush and commit. A nested
+    :func:`query_name_scope` can provide a more specific name for one statement.
+
+    :param engine: The SQLAlchemy engine to bind sessions to.
+    :param query_name_prefix: Stable namespace shared by the store's queries,
+        e.g. ``"omnigent.file_store"``.
+    :param immediate: Forwarded to :func:`make_managed_session_maker`.
+    :returns: A callable accepting one semantic query-name suffix per session.
+    """
+    prefix = query_name_prefix.rstrip(".")
+    if not prefix.strip():
+        raise ValueError("query_name_prefix must not be empty")
+
+    managed_session = make_managed_session_maker(engine, immediate=immediate)
+
+    class _NamedManagedSessionMaker:
+        """Bind transaction naming metadata to the managed session callable."""
+
+        def __init__(self) -> None:
+            self.engine = engine
+            self.query_name_prefix = prefix
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[Session]:
+            if not query_name.strip():
+                raise ValueError("query_name must not be empty")
+            with query_name_scope(f"{prefix}.{query_name}"), managed_session() as session:
+                yield session
+
+    return _NamedManagedSessionMaker()
+
+
+def _is_serialization_failure(exc: DBAPIError) -> bool:
+    """Return whether a DBAPI error carries SQLSTATE 40001."""
+    original = exc.orig
+    return (
+        getattr(original, "sqlstate", None) == "40001"
+        or getattr(original, "pgcode", None) == "40001"
+    )
+
+
+def run_write_transaction(
+    session_maker: NamedManagedSessionMaker,
+    operation_name: str,
+    callback: Callable[[Session], _T],
+    *,
+    max_retries: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
+    random_value: Callable[[], float] = random.random,
+) -> _T:
+    """Run a named managed transaction, replaying CRDB serialization failures.
+
+    The callback must contain database work only. Callers must perform cache
+    invalidation and external side effects after this function returns. The
+    supplied maker remains responsible for query naming, commit, rollback,
+    SQLite write isolation, and session cleanup on every attempt.
+    """
+    if max_retries < 0:
+        raise ValueError("max_retries must be >= 0")
+    retryable = is_cockroachdb(session_maker.engine.dialect.name)
+    qualified_name = f"{session_maker.query_name_prefix}.{operation_name}"
+
+    for attempt in range(max_retries + 1):
+        try:
+            with session_maker(operation_name) as session:
+                return callback(session)
+        except DBAPIError as exc:
+            if not retryable or not _is_serialization_failure(exc):
+                raise
+            if attempt == max_retries:
+                record_transaction_retry(qualified_name, "exhausted")
+                _logger.error(
+                    "CockroachDB transaction retries exhausted",
+                    extra={"db_operation": qualified_name, "retry_count": attempt},
+                )
+                raise
+            ceiling = min(0.025 * (2**attempt), 0.1)
+            delay = ceiling * random_value()
+            record_transaction_retry(qualified_name, "scheduled")
+            _logger.warning(
+                "Retrying CockroachDB transaction after serialization failure",
+                extra={
+                    "db_operation": qualified_name,
+                    "retry_count": attempt + 1,
+                    "retry_delay_seconds": delay,
+                },
+            )
+            sleep(delay)
+    raise AssertionError("transaction retry loop exited unexpectedly")
+
+
 # ── ID generation ──────────────────────────────────────
 
-_ITEM_TYPE_PREFIX: dict[str, str] = {
-    "message": "msg_",
-    "function_call": "fc_",
-    "function_call_output": "fco_",
-    "error": "err_",
-    "reasoning": "rs_",
-    "compaction": "cmp_",
-    "native_tool": "nt_",
-    "resource_event": "rse_",
-    "slash_command": "sc_",
-    "terminal_command": "tc_",
-    "routing_decision": "rd_",
-}
+# Recognised conversation-item types, validated at id generation. The item's
+# type lives in the ``conversation_items.type`` column, not in its id. Kept in
+# parity with ``ITEM_TYPE_TO_DATA_CLS`` (see the db util tests).
+_ITEM_TYPES: frozenset[str] = frozenset(
+    {
+        "message",
+        "function_call",
+        "function_call_output",
+        "error",
+        "reasoning",
+        "compaction",
+        "native_tool",
+        "resource_event",
+        "slash_command",
+        "terminal_command",
+        "routing_decision",
+    }
+)
 
 
 def generate_agent_id() -> str:
     """
     Generate a unique agent identifier.
 
-    :returns: A string of the form ``"ag_<32-char hex>"``,
-        e.g. ``"ag_0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
     """
-    return f"ag_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def builtin_agent_id(name: str) -> str:
     """
     Deterministic agent id for a built-in agent, derived from its name.
 
-    Same shape and length as :func:`generate_agent_id` (``ag_`` + 32 hex), but
+    Same shape and length as :func:`generate_agent_id` (bare 32-char hex), but
     stable across processes: a multi-tenant deployment reseeds the built-ins into
     an ephemeral per-pod store, where a random id would change each boot and
     dangle a persisted ``conversation.agent_id``. Do NOT revert built-in seeding
     to :func:`generate_agent_id` (guarded by the ``builtin_agent_id`` tests).
 
     :param name: The built-in agent's unique name, e.g. ``"polly"``.
-    :returns: A deterministic id of the form ``"ag_<32-char hex>"``.
+    :returns: A deterministic bare 32-char hex id.
     """
     digest = hashlib.sha256(f"builtin:{name}".encode()).hexdigest()
-    return f"ag_{digest[:32]}"
+    return digest[:32]
 
 
 def generate_file_id() -> str:
     """
     Generate a unique file identifier.
 
-    :returns: A string of the form ``"file_<32-char hex>"``,
-        e.g. ``"file_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"file_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def generate_conversation_id() -> str:
     """
     Generate a unique conversation identifier.
 
-    :returns: A string of the form ``"conv_<32-char hex>"``,
-        e.g. ``"conv_e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
     """
-    return f"conv_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def generate_task_id() -> str:
@@ -640,25 +1162,16 @@ def generate_item_id(item_type: str) -> str:
     """
     Generate a unique conversation-item identifier.
 
-    The prefix is determined by the item type:
+    *item_type* is validated against :data:`_ITEM_TYPES` but no longer encoded
+    into the id — the type lives in the ``conversation_items.type`` column.
 
-    - ``"message"`` -> ``"msg_"``
-    - ``"function_call"`` -> ``"fc_"``
-    - ``"function_call_output"`` -> ``"fco_"``
-    - ``"error"`` -> ``"err_"``
-    - ``"reasoning"`` -> ``"rs_"``
-    - ``"compaction"`` -> ``"cmp_"``
-    - ``"native_tool"`` -> ``"nt_"``
-    - ``"slash_command"`` -> ``"sc_"``
-
-    :param item_type: One of the keys in :data:`_ITEM_TYPE_PREFIX`.
-    :returns: A prefixed identifier, e.g. ``"msg_a1b2c3d4..."``.
+    :param item_type: One of the members of :data:`_ITEM_TYPES`.
+    :returns: A bare 32-char hex uuid, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     :raises ValueError: If *item_type* is not a recognised type.
     """
-    prefix = _ITEM_TYPE_PREFIX.get(item_type)
-    if prefix is None:
+    if item_type not in _ITEM_TYPES:
         raise ValueError(f"unknown item type: {item_type!r}")
-    return f"{prefix}{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 # ── FTS (SQLite FTS5) ─────────────────────────────────
@@ -701,7 +1214,7 @@ def ensure_fts_table(engine: Engine) -> None:
         ``conversation_items_fts`` virtual table is created if absent.
     """
     if _supports_fts5(engine.dialect.name):
-        with engine.connect() as conn:
+        with query_name_scope("omnigent.database.ensure_fts_table"), engine.connect() as conn:
             conn.execute(_CREATE_FTS)
             conn.commit()
 
@@ -737,6 +1250,45 @@ def insert_fts(
         )
 
 
+def insert_fts_bulk(
+    session: Session,
+    rows: list[tuple[str, str, str]],
+) -> None:
+    """
+    Dual-write multiple rows into the FTS5 table in a single INSERT.
+
+    On dialects without FTS5 this is a no-op. An empty ``rows`` list is also
+    a no-op.
+
+    :param session: An active SQLAlchemy session.
+    :param rows: Each tuple is ``(item_id, conversation_id, search_text)``.
+    """
+    if not rows:
+        return
+    if not (session.bind and _supports_fts5(session.bind.dialect.name)):
+        return
+    # 3 params per row; keep total < 999 (SQLite's safe SQLITE_MAX_VARIABLE_NUMBER
+    # on pre-3.32 builds). Newer SQLite raised the limit to 32766, but chunking at
+    # 300 is safe on all versions.
+    _CHUNK_SIZE = 300
+    for chunk_start in range(0, len(rows), _CHUNK_SIZE):
+        chunk = rows[chunk_start : chunk_start + _CHUNK_SIZE]
+        placeholders = ", ".join(f"(:item_id_{i}, :cid_{i}, :st_{i})" for i in range(len(chunk)))
+        params: dict[str, str] = {}
+        for i, (item_id, conversation_id, search_text) in enumerate(chunk):
+            params[f"item_id_{i}"] = item_id
+            params[f"cid_{i}"] = conversation_id
+            params[f"st_{i}"] = search_text
+        session.execute(
+            text(
+                f"INSERT INTO {_FTS_TABLE}"
+                f"(item_id, conversation_id, search_text) "
+                f"VALUES {placeholders}"
+            ),
+            params,
+        )
+
+
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     """
     Remove all FTS rows for a conversation (SQLite-family dialects only).
@@ -752,6 +1304,26 @@ def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
         session.execute(
             text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
             {"cid": conversation_id},
+        )
+
+
+def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> None:
+    """
+    Remove all FTS rows for a list of conversations in a single query.
+
+    No-op when ``conv_ids`` is empty or the dialect lacks FTS5.
+
+    :param session: An active SQLAlchemy session.
+    :param conv_ids: Conversation IDs whose FTS rows should be removed.
+    """
+    if not conv_ids:
+        return
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        placeholders = ", ".join(f":cid{i}" for i in range(len(conv_ids)))
+        params = {f"cid{i}": cid for i, cid in enumerate(conv_ids)}
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id IN ({placeholders})"),
+            params,
         )
 
 

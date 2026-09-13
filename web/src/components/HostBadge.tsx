@@ -1,9 +1,19 @@
+import { useRef, useState } from "react";
+
 import { useHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
+import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
+import { ComposerHostTrigger } from "@/components/composer/ComposerControls";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 export type HostBadgeStatus = "online" | "offline" | "unknown";
 
@@ -55,15 +65,25 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
   unknown: "status unknown",
 };
 
+const RECONNECT_WORD = "offline — click to reconnect";
+
 /**
- * Host indicator for the open conversation, rendered in the composer's
- * status-line tray, immediately left of the worktree branch
- * (ComposerStatusLine). Reads its own data and renders nothing when the
- * session isn't host-bound — same self-contained shape as PresenceAvatars.
- * Shows the friendly host name (or sandbox-provider label) plus a status
- * circle: green online, red offline, neutral while liveness is still unknown.
+ * Session-bound host status with shared liveness, reconnect and switch behavior.
+ * The composer variant uses the compact host menu; the default retains the
+ * name-and-status badge. Managed sandbox placement remains server-owned.
  */
-export function HostBadge({ sessionId }: { sessionId: string }) {
+export function HostBadge({
+  sessionId,
+  onReconnect,
+  appearance = "status",
+  readOnly = false,
+}: {
+  sessionId: string;
+  onReconnect?: () => void;
+  appearance?: "status" | "composer";
+  readOnly?: boolean;
+}) {
+  const [switchOpen, setSwitchOpen] = useState(false);
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
@@ -73,36 +93,178 @@ export function HostBadge({ sessionId }: { sessionId: string }) {
   const liveOnline = useSessionHostOnline(sessionId);
 
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
+
+  // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
+  // poll. A host switch repoints `hostId` as soon as the session snapshot
+  // refetches, but the map still holds the value polled against the host we
+  // just left — so moving off a dead host paints a red dot beside a machine
+  // that is demonstrably up until the next tick. Treat the value as stale
+  // from the moment the binding changes until the poll reports something
+  // different, which can only be an observation of the new host.
+  const bindingRef = useRef<{
+    hostId: string | null;
+    at: boolean | null | undefined;
+    stale: boolean;
+  }>({ hostId, at: liveOnline, stale: false });
+  if (bindingRef.current.hostId !== hostId) {
+    bindingRef.current = { hostId, at: liveOnline, stale: true };
+  } else if (bindingRef.current.stale && bindingRef.current.at !== liveOnline) {
+    bindingRef.current = { hostId, at: liveOnline, stale: false };
+  }
+  const livenessPredatesBinding = bindingRef.current.stale;
+
   // Prefer the live health signal. Both `false` (host down) and `null`
   // (the stream's "not host-bound" signal) are meaningful answers, so we
   // only fall back to the host record's stored status when liveness has
-  // not been observed yet (`undefined`). Falling back on `null` would let
-  // a stale record's "online" flash a green dot for a session the stream
-  // says is unbound — `null` must reach resolveHostBadge as "unknown".
+  // not been observed yet (`undefined`) or still describes the previous
+  // binding. Falling back on `null` would let a stale record's "online"
+  // flash a green dot for a session the stream says is unbound — `null`
+  // must reach resolveHostBadge as "unknown".
   const online =
-    liveOnline === undefined ? (host ? host.status === "online" : undefined) : liveOnline;
+    liveOnline === undefined || livenessPredatesBinding
+      ? host
+        ? host.status === "online"
+        : undefined
+      : liveOnline;
 
   const badge = resolveHostBadge({ hostId, host, online });
+  if (appearance === "composer") {
+    const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
+    const canSwitch = host !== undefined && !host.sandbox_provider && !readOnly;
+    const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    return (
+      <>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <ComposerHostTrigger
+              label={label}
+              status={badge?.status ?? "unknown"}
+              cloud={!!host?.sandbox_provider}
+              data-testid="composer-host-select"
+            />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            side="top"
+            sideOffset={8}
+            className="composer-host-menu w-max min-w-[220px]"
+            data-testid="composer-host-menu"
+          >
+            <div className="px-2 py-1 text-xs text-muted-foreground">
+              {host?.sandbox_provider ? "Cloud" : "Local"}
+            </div>
+            <DropdownMenuItem disabled className="gap-2" data-selected="true">
+              <span
+                className={cn(
+                  "size-2 shrink-0 rounded-full",
+                  STATUS_DOT_CLASS[badge?.status ?? "unknown"],
+                )}
+              />
+              <span>{badge?.label ?? "No host bound"}</span>
+            </DropdownMenuItem>
+            {reconnectable && (
+              <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>
+                Reconnect host
+              </DropdownMenuItem>
+            )}
+            {canSwitch && (
+              <DropdownMenuItem onSelect={() => setSwitchOpen(true)}>Switch host…</DropdownMenuItem>
+            )}
+            {!badge && (
+              <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
+                This session has no host binding.
+              </p>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {switchOpen && canSwitch && (
+          <SwitchHostDialog
+            open
+            onOpenChange={setSwitchOpen}
+            sessionId={sessionId}
+            currentHostId={hostId}
+          />
+        )}
+      </>
+    );
+  }
   if (!badge) return null;
 
-  return (
-    <div
-      data-testid="host-badge"
-      className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
-      title={`Host ${badge.label}, ${STATUS_WORD[badge.status]}`}
-    >
+  // A resumable managed host that reports offline is idle-stopped, not
+  // disconnected — the next message resumes it, and `omnigent host` (what the
+  // reconnect dialog hands out) is the wrong instruction for it.
+  const reconnectable = badge.status === "offline" && !session?.hostResumable && !!onReconnect;
+  const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
+  // The dot is decorative (aria-hidden), so the status would otherwise be
+  // conveyed by color alone. Restate it in sr-only text — read together with
+  // the visible label, a screen reader announces "<host>, <status>". `title`
+  // carries the same text for mouse hover.
+  const content = (
+    <>
       <span
         aria-hidden
         className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[badge.status])}
       />
       <span className="truncate">{badge.label}</span>
-      {/* The dot is decorative (aria-hidden), so the status would otherwise be
-          conveyed by color alone. Restate it in sr-only text — read together
-          with the visible label, a screen reader announces "<host>, <status>".
-          `title` carries the same text for mouse hover. No aria-label: on a
-          non-interactive div it's announced unreliably and would only
-          duplicate this text where it is honored. */}
-      <span className="sr-only">, {STATUS_WORD[badge.status]}</span>
-    </div>
+      <span className="sr-only">, {statusWord}</span>
+    </>
+  );
+  const title = `Host ${badge.label}, ${statusWord}`;
+
+  if (reconnectable) {
+    return (
+      <button
+        type="button"
+        data-testid="host-badge"
+        onClick={onReconnect}
+        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        title={title}
+      >
+        {content}
+      </button>
+    );
+  }
+
+  // Sandbox-backed hosts are provisioned (and relaunched) by the server, so a
+  // manual move isn't meaningful. An unresolved record — a shared session, or
+  // the list still loading — can't be confirmed non-sandbox, so it stays
+  // passive too rather than offering a switch that may not apply.
+  const canSwitch = host !== undefined && !host.sandbox_provider;
+  if (!canSwitch) {
+    return (
+      // No aria-label: on a non-interactive div it's announced unreliably and
+      // would only duplicate the sr-only text where it is honored.
+      <div
+        data-testid="host-badge"
+        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
+        title={title}
+      >
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        data-testid="host-badge"
+        onClick={() => setSwitchOpen(true)}
+        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        title={`${title} — click to switch`}
+      >
+        {content}
+      </button>
+      {/* Mounted only while open: the badge renders on every session, and a
+          closed dialog would still run its host query and workspace hooks. */}
+      {switchOpen && (
+        <SwitchHostDialog
+          open
+          onOpenChange={setSwitchOpen}
+          sessionId={sessionId}
+          currentHostId={hostId}
+        />
+      )}
+    </>
   );
 }

@@ -12,7 +12,7 @@ import yaml
 from click import ClickException
 
 from omnigent._wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
-from omnigent.kiro_native import (
+from omnigent.harnesses.kiro_native.main import (
     _KIRO_PATH_ENV,
     LaunchedKiroTerminal,
     PreparedKiroTerminal,
@@ -30,8 +30,8 @@ from omnigent.kiro_native import (
     _update_startup_progress,
     _wait_for_kiro_terminal_ready,
     build_kiro_launch,
-    kiro_base_model_options,
     kiro_terminal_resource_id,
+    list_kiro_cli_model_options,
     resolve_kiro_executable,
     run_kiro_native,
 )
@@ -153,7 +153,7 @@ async def test_attach_terminal_resource_requires_tmux_metadata() -> None:
 
 def test_session_labels_use_kiro_wrapper_value() -> None:
     """Kiro wrapper sessions stamp the centralized wrapper label."""
-    from omnigent.kiro_native import _SESSION_LABELS
+    from omnigent.harnesses.kiro_native.main import _SESSION_LABELS
 
     assert _SESSION_LABELS[WRAPPER_LABEL_KEY] == KIRO_NATIVE_WRAPPER_VALUE
 
@@ -347,7 +347,7 @@ def test_resolve_session_id_for_resume_no_picker_returns_none() -> None:
 
 def test_run_kiro_native_requires_server(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing server URL is a programming error surfaced as a clear message."""
-    monkeypatch.setattr("omnigent.kiro_native._preflight_local_tools", lambda: None)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main._preflight_local_tools", lambda: None)
 
     with pytest.raises(ClickException, match="resolved Omnigent server URL"):
         run_kiro_native(server=None, session_id=None, kiro_args=())
@@ -357,7 +357,7 @@ def test_run_kiro_native_materializes_spec_and_delegates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The launcher writes a spec and hands a trimmed base URL to the server path."""
-    monkeypatch.setattr("omnigent.kiro_native._preflight_local_tools", lambda: None)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main._preflight_local_tools", lambda: None)
     captured: dict[str, object] = {}
 
     def _fake_remote(base_url: str, spec_path: Path, **kwargs: object) -> None:
@@ -365,7 +365,9 @@ def test_run_kiro_native_materializes_spec_and_delegates(
         captured["spec_exists"] = spec_path.exists()
         captured["kwargs"] = kwargs
 
-    monkeypatch.setattr("omnigent.kiro_native._run_with_remote_server", _fake_remote)
+    monkeypatch.setattr(
+        "omnigent.harnesses.kiro_native.main._run_with_remote_server", _fake_remote
+    )
 
     run_kiro_native(
         server="http://server/",
@@ -546,16 +548,92 @@ async def test_wait_for_kiro_terminal_ready_times_out() -> None:
         await _wait_for_kiro_terminal_ready(client, "conv", timeout_s=0.05)
 
 
-def test_kiro_base_model_options_shape_and_default() -> None:
-    """The curated kiro catalog exposes picker option dicts with one default."""
-    options = kiro_base_model_options()
-    ids = [o["id"] for o in options]
+def test_list_kiro_cli_model_options_maps_live_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "models": [
+            {
+                "model_name": "Automatic",
+                "model_id": "auto",
+                "description": "Choose by task",
+                "context_window_tokens": 1_000_000,
+                "rate_multiplier": 1.0,
+                "rate_unit": "Credit",
+            },
+            {"model_name": "Latest", "model_id": "provider-latest"},
+        ],
+        "default_model": "auto",
+    }
+    captured: list[list[str]] = []
 
-    # Canonical ids confirmed against ``kiro-cli --list-models`` (2.10.0).
-    assert ids[0] == "auto"
-    assert "claude-haiku-4.5" in ids and "glm-5" in ids
-    # Exactly one default, and every option carries the picker fields.
-    assert [o["id"] for o in options if o["isDefault"]] == ["auto"]
-    for option in options:
-        assert set(option) == {"id", "displayName", "isDefault", "isCurrent"}
-        assert option["isCurrent"] is False
+    def _run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(shutil, "which", lambda _command: "/opt/kiro-cli")
+    monkeypatch.setattr(subprocess, "run", _run)
+
+    options = list_kiro_cli_model_options()
+
+    assert captured == [["/opt/kiro-cli", "chat", "--list-models", "--format", "json"]]
+    assert options == [
+        {
+            "id": "auto",
+            "displayName": "Automatic",
+            "isDefault": True,
+            "description": "Choose by task",
+            "contextWindow": 1_000_000,
+            "rateMultiplier": 1.0,
+            "rateUnit": "Credit",
+        },
+        {
+            "id": "provider-latest",
+            "displayName": "Latest",
+            "isDefault": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize("default_model", [None, "missing-model"])
+def test_list_kiro_cli_model_options_allows_no_matching_default(
+    monkeypatch: pytest.MonkeyPatch,
+    default_model: str | None,
+) -> None:
+    payload: dict[str, object] = {
+        "models": [{"model_name": "Latest", "model_id": "provider-latest"}],
+    }
+    if default_model is not None:
+        payload["default_model"] = default_model
+    monkeypatch.setattr(shutil, "which", lambda _command: "/opt/kiro-cli")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **_: subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    options = list_kiro_cli_model_options()
+
+    assert options == [
+        {
+            "id": "provider-latest",
+            "displayName": "Latest",
+            "isDefault": False,
+        }
+    ]
+
+
+def test_list_kiro_cli_model_options_rejects_empty_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _command: "/opt/kiro-cli")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **_: subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"models": []}), stderr=""
+        ),
+    )
+
+    with pytest.raises(ValueError, match="valid models"):
+        list_kiro_cli_model_options()

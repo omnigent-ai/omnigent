@@ -206,6 +206,23 @@ def test_resolve_matching_text_leaves_entries_when_no_text_matches() -> None:
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [first]
 
 
+def test_resolve_matching_text_does_not_match_on_unanchored_suffix() -> None:
+    """A short pending entry must not be matched by an unrelated prompt that
+    merely ends with its text (e.g. queued "ok" vs. an accepted "...still ok"),
+    or that entry's file attachments would be merged into the wrong message."""
+    short_entry = pending_inputs.record(
+        "conv_a", [_text_block("ok"), {"type": "input_image", "url": "img://1"}]
+    )
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "Let's continue - ok")
+
+    assert drained.matched is None
+    assert drained.skipped == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [
+        short_entry
+    ]
+
+
 def test_resolve_removes_entry_idempotently() -> None:
     """
     :func:`resolve` drops an entry by id (forward-failed rollback).
@@ -330,3 +347,77 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     # Past the TTL: the lazy sweep on the next access evicts the ghost.
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_restore_returns_a_drained_entry_to_the_front() -> None:
+    """A restored entry reclaims the head of the FIFO.
+
+    Compensation for a drain whose persist deduplicated (the entry
+    belongs to the NEXT user message): the entry was the oldest when
+    drained, so it must come back ahead of everything queued after it.
+    """
+    first = pending_inputs.record("conv_r", [_text_block("first")])
+    second = pending_inputs.record("conv_r", [_text_block("second")])
+
+    drained = pending_inputs.resolve_oldest("conv_r")
+    assert drained is not None and drained.pending_id == first
+
+    pending_inputs.restore("conv_r", drained)
+    order = [e["pending_id"] for e in pending_inputs.snapshot_for("conv_r")]
+    assert order == [first, second]
+
+    # The restored entry drains again as the oldest.
+    redrained = pending_inputs.resolve_oldest("conv_r")
+    assert redrained is not None and redrained.pending_id == first
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("matched", [False, True])
+def test_title_preference_survives_drain_and_restore(enabled: bool, matched: bool) -> None:
+    content = [{"type": "input_text", "text": "investigate timeout"}]
+    pending_inputs.record("conv_title", content, background_titles_enabled=enabled)
+    drained = (
+        pending_inputs.resolve_matching_text("conv_title", "investigate timeout").matched
+        if matched
+        else pending_inputs.resolve_oldest("conv_title")
+    )
+    assert drained is not None
+    assert drained.background_titles_enabled is enabled
+    pending_inputs.restore("conv_title", drained)
+    restored = pending_inputs.resolve_oldest("conv_title")
+    assert restored is not None
+    assert restored.background_titles_enabled is enabled
+
+
+def test_has_pending_tracks_parked_messages() -> None:
+    assert pending_inputs.has_pending("conv_hp") is False
+    pending_id = pending_inputs.record("conv_hp", [_text_block("hello")])
+    assert pending_inputs.has_pending("conv_hp") is True
+    pending_inputs.resolve("conv_hp", pending_id)
+    assert pending_inputs.has_pending("conv_hp") is False
+
+
+def test_record_with_same_stable_id_returns_existing_pending_id() -> None:
+    """A retry POST carrying the same stable_id does not create a new entry."""
+    stable = "ab" * 16
+    first = pending_inputs.record("conv_dedup", [_text_block("hi")], stable_id=stable)
+    second = pending_inputs.record("conv_dedup", [_text_block("hi")], stable_id=stable)
+    assert first == second
+    # Only one entry in the queue — the runner is not re-dispatched.
+    assert len(pending_inputs.snapshot_for("conv_dedup")) == 1
+
+
+def test_record_without_stable_id_always_creates_new_entry() -> None:
+    """Messages without stable_id are never deduplicated."""
+    first = pending_inputs.record("conv_nodedup", [_text_block("hello")])
+    second = pending_inputs.record("conv_nodedup", [_text_block("hello")])
+    assert first != second
+    assert len(pending_inputs.snapshot_for("conv_nodedup")) == 2
+
+
+def test_stable_id_dedup_scoped_per_conversation() -> None:
+    """Same stable_id in different conversations does not collide."""
+    stable = "cd" * 16
+    id_a = pending_inputs.record("conv_scope_a", [_text_block("x")], stable_id=stable)
+    id_b = pending_inputs.record("conv_scope_b", [_text_block("x")], stable_id=stable)
+    assert id_a != id_b

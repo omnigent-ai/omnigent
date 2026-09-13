@@ -79,7 +79,7 @@ def ctx(tmp_path: Path) -> ToolContext:
         task_id="task_test",
         agent_id="agent_test",
         workspace=tmp_path,
-        conversation_id="conv_test",
+        conversation_id="e1f7c651c9f97fac088ea70ef633409d",
     )
 
 
@@ -735,7 +735,7 @@ def _build_idle_fixture(
     parent_conv = conv_store.create_conversation(kind="default")
     ctx = ToolContext(
         task_id="task_placeholder",
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         conversation_id=parent_conv.id,
     )
     return parent_conv.id, ctx

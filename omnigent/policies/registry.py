@@ -23,7 +23,6 @@ from __future__ import annotations
 import importlib
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -55,7 +54,7 @@ class PolicyRegistryEntry:
     kind: str
     name: str
     description: str
-    params_schema: dict[str, Any] | None = None
+    params_schema: dict[str, object] | None = None
     internal_only: bool = False
 
 
@@ -63,6 +62,31 @@ class PolicyRegistryEntry:
 _registry: list[PolicyRegistryEntry] = []
 # Lookup by handler path for O(1) schema retrieval.
 _registry_by_handler: dict[str, PolicyRegistryEntry] = {}
+
+
+def _string_object_dict(value: object) -> dict[str, object] | None:
+    """Return a string-keyed copy of a dynamic mapping."""
+    if not isinstance(value, dict):
+        return None
+    return {key: item for key, item in value.items() if isinstance(key, str)}
+
+
+def _string_list(value: object) -> list[str]:
+    """Return the string entries from a dynamic list."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _schema_properties(schema: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Return well-formed property schemas keyed by parameter name."""
+    raw_properties = _string_object_dict(schema.get("properties")) or {}
+    properties: dict[str, dict[str, object]] = {}
+    for key, value in raw_properties.items():
+        property_schema = _string_object_dict(value)
+        if property_schema is not None:
+            properties[key] = property_schema
+    return properties
 
 
 def load_registry(
@@ -96,7 +120,7 @@ def load_registry(
                 exc_info=True,
             )
             continue
-        raw_entries = getattr(mod, "POLICY_REGISTRY", None)
+        raw_entries: object = getattr(mod, "POLICY_REGISTRY", None)
         if not isinstance(raw_entries, list):
             _logger.warning(
                 "Module %s has no POLICY_REGISTRY list; skipping",
@@ -104,24 +128,36 @@ def load_registry(
             )
             continue
         for raw in raw_entries:
-            if not isinstance(raw, dict) or "handler" not in raw:
+            declaration = _string_object_dict(raw)
+            handler_path = declaration.get("handler") if declaration is not None else None
+            if declaration is None or not isinstance(handler_path, str):
                 _logger.warning(
                     "Skipping malformed registry entry in %s: %r",
                     module_path,
                     raw,
                 )
                 continue
-            handler_path = raw["handler"]
             # Auto-derive display name from the function name
             # if not explicitly provided.
-            name = raw.get("name") or handler_path.rsplit(".", 1)[-1].replace("_", " ").title()
+            name_value = declaration.get("name")
+            name = (
+                name_value
+                if isinstance(name_value, str) and name_value
+                else handler_path.rsplit(".", 1)[-1].replace("_", " ").title()
+            )
+            kind_value = declaration.get("kind")
+            description_value = declaration.get("description")
+            params_schema = _string_object_dict(declaration.get("params_schema"))
+            internal_only_value = declaration.get("internal_only")
             entry = PolicyRegistryEntry(
                 handler=handler_path,
-                kind=raw.get("kind", "callable"),
+                kind=kind_value if isinstance(kind_value, str) else "callable",
                 name=name,
-                description=raw.get("description", ""),
-                params_schema=raw.get("params_schema"),
-                internal_only=raw.get("internal_only", False),
+                description=description_value if isinstance(description_value, str) else "",
+                params_schema=params_schema,
+                internal_only=(
+                    internal_only_value if isinstance(internal_only_value, bool) else False
+                ),
             )
             _registry.append(entry)
             _registry_by_handler[entry.handler] = entry
@@ -191,7 +227,7 @@ def is_registered_handler(handler: str) -> bool:
     return handler in _registry_by_handler
 
 
-def get_params_schema(handler: str) -> dict[str, Any] | None:
+def get_params_schema(handler: str) -> dict[str, object] | None:
     """Look up the params schema for a handler path.
 
     :param handler: Full dotted import path, e.g.
@@ -207,7 +243,7 @@ def get_params_schema(handler: str) -> dict[str, Any] | None:
 
 def validate_factory_params(
     handler: str,
-    factory_params: dict[str, Any] | None,
+    factory_params: dict[str, object] | None,
 ) -> str | None:
     """Validate factory_params against the registry schema.
 
@@ -241,16 +277,18 @@ def validate_factory_params(
 
     if factory_params is None:
         # Check if all required params have defaults.
-        required = schema.get("required", [])
-        properties = schema.get("properties", {})
-        missing = [k for k in required if "default" not in properties.get(k, {})]
-        if missing:
-            return f"Policy '{handler}' requires params: {missing}"
+        required_params = _string_list(schema.get("required"))
+        properties = _schema_properties(schema)
+        missing_params = [
+            key for key in required_params if "default" not in properties.get(key, {})
+        ]
+        if missing_params:
+            return f"Policy '{handler}' requires params: {missing_params}"
         return None
 
     # Validate against schema properties.
-    properties = schema.get("properties", {})
-    required = set(schema.get("required", []))
+    properties = _schema_properties(schema)
+    required_keys = set(_string_list(schema.get("required")))
 
     # Check for unknown keys.
     unknown = set(factory_params.keys()) - set(properties.keys())
@@ -258,7 +296,7 @@ def validate_factory_params(
         return f"Unknown params for '{handler}': {sorted(unknown)}"
 
     # Check required keys.
-    missing = required - set(factory_params.keys())
+    missing = required_keys - set(factory_params.keys())
     # Exclude required keys that have defaults.
     missing = {k for k in missing if "default" not in properties.get(k, {})}
     if missing:
@@ -270,7 +308,7 @@ def validate_factory_params(
         if prop is None:
             continue
         expected_type = prop.get("type")
-        if expected_type and not _type_matches(value, expected_type):
+        if isinstance(expected_type, str) and not _type_matches(value, expected_type):
             return (
                 f"Param '{key}' for '{handler}' must be {expected_type}, "
                 f"got {type(value).__name__}"
@@ -279,7 +317,7 @@ def validate_factory_params(
     return None
 
 
-def _type_matches(value: Any, json_type: str) -> bool:
+def _type_matches(value: object, json_type: str) -> bool:
     """Check if a Python value matches a JSON Schema type.
 
     :param value: The value to check.

@@ -34,7 +34,7 @@ fi
 
 read -r -d '' matrix <<'JSON' || true
 {"include":[
-{"name":"openai-agents","harness":"openai-agents","model":"databricks-gpt-5-4-mini","workers":4}
+{"name":"openai-agents","harness":"openai-agents","model":"mock-model","workers":4}
 ]}
 JSON
 # Collapse to one line so the GITHUB_OUTPUT key=value contract holds.

@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import {
+  isIOSShell,
+  setNativeServerSwitcherHidden,
+  supportsNativeServerPicker,
+} from "@/lib/nativeBridge";
 
 /**
  * Tracks whether `surface` is the frontmost element at its own centre — i.e.
@@ -68,11 +72,26 @@ export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean
 }
 
 /**
- * Drive the iOS shell's native server switcher overlay so it shows only while
- * `surface` is the frontmost element on screen and `active` is true. The
- * switcher is a native chrome element the web app toggles via the bridge; it
- * must hide whenever the sidebar (or any other overlay) covers the main
- * surface, and whenever the surface is unmounted.
+ * Whether the iOS shell's floating server-switcher pill should be hidden given
+ * the main surface's frontmost state.
+ *
+ * On shells that host the in-sidebar server picker (the bridge exposes
+ * `getServerPicker`), server selection lives in the navigation drawer — the
+ * pill must never float over the main surface, where it crowds the chat
+ * header's title and floating controls. Older shells lack the sidebar picker,
+ * so the pill stays their only selection affordance and follows `frontmost`.
+ */
+export function serverSwitcherHiddenForSurface(frontmost: boolean): boolean {
+  return supportsNativeServerPicker() || !frontmost;
+}
+
+/**
+ * Drive the iOS shell's native server switcher overlay. On shells with the
+ * in-sidebar server picker the overlay stays hidden over the main surface
+ * (selection lives in the drawer); on older shells it shows only while
+ * `surface` is the frontmost element on screen and `active` is true — hiding
+ * whenever the sidebar (or any other overlay) covers the main surface, and
+ * whenever the surface is unmounted.
  *
  * No-ops outside the iOS shell. Used by both the in-session main surface
  * (ChatPage) and the new-session landing screen (NewChatDialog).
@@ -84,7 +103,7 @@ export function useNativeServerSwitcherForMainSurface(
   const frontmost = useSurfaceFrontmost(surface, active);
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!frontmost);
+    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(frontmost));
   }, [frontmost]);
   useEffect(() => {
     if (!isIOSShell()) return;
@@ -92,7 +111,7 @@ export function useNativeServerSwitcherForMainSurface(
   }, []);
 }
 
-function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
+export function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
   if (!surface) return false;
   const rect = surface.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return false;
@@ -106,21 +125,41 @@ function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
   // A Radix dropdown / select / popover sets `pointer-events: none` on the body
   // while open WITHOUT covering the surface, so elementFromPoint falls through
   // to the document root (or null). That's a transient layer, not a panel —
-  // keep the surface "frontmost" so the native overlays don't blink out.
+  // keep the surface "frontmost" so the native overlays don't blink out. BUT a
+  // menu opened from inside the mobile sidebar (e.g. a conversation-row kebab)
+  // means the sidebar overlay is up: the dropped pointer-events hide it from
+  // the hit test, so probe the sidebar directly and treat the surface as
+  // obscured when it covers the probe point.
   if (!topElement || topElement === document.documentElement || topElement === document.body) {
-    return true;
+    return !isProbeCoveredByOpenSidebar(x, y);
   }
   // Likewise if a popover/menu/listbox actually covers the probe point: those
-  // are transient, unlike a persistent drawer/sidebar/sheet.
+  // are transient, unlike a persistent drawer/sidebar/sheet — unless the
+  // sidebar overlay is what's behind the menu (see above).
   if (
     topElement.closest(
       '[data-radix-popper-content-wrapper], [role="menu"], [role="listbox"], [role="tooltip"]',
     )
   ) {
-    return true;
+    return !isProbeCoveredByOpenSidebar(x, y);
   }
 
   return surface.contains(topElement);
+}
+
+/**
+ * Whether the open mobile sidebar overlay covers `(x, y)`. Used to keep the
+ * native overlays hidden when a Radix menu opened from within the sidebar sits
+ * on top of it — the menu's `pointer-events: none` on the body otherwise hides
+ * the sidebar from elementFromPoint, misreading the surface as frontmost. The
+ * sidebar drops `data-collapsed` when open; on desktop it's a floating card
+ * that never spans the centre probe, so the rect test naturally excludes it.
+ */
+function isProbeCoveredByOpenSidebar(x: number, y: number): boolean {
+  const sidebar = document.querySelector("aside.conversations-sidebar:not([data-collapsed])");
+  if (!sidebar) return false;
+  const r = sidebar.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
 
 function clamp(value: number, min: number, max: number): number {

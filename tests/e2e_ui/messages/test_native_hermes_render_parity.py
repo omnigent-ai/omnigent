@@ -4,7 +4,7 @@ The native ``hermes-native`` ("Hermes") wrapper is terminal-first: the real
 ``hermes`` CLI runs in the session terminal, the SPA's **Terminal** view attaches
 to that live TUI over a WebSocket, and the SPA's **Chat** view renders the SAME
 canonical transcript the TUI prints. A native forwarder
-(:mod:`omnigent.hermes_native_forwarder`) tails Hermes' SQLite ``state.db`` and
+(:mod:`omnigent.harnesses.hermes_native.forwarder`) tails Hermes' SQLite ``state.db`` and
 mirrors the transcript back OUT as conversation items; web-composer messages are
 injected INTO the TUI's tmux pane by
 :class:`omnigent.inner.hermes_native_executor.HermesNativeExecutor`. This suite is
@@ -45,6 +45,7 @@ from .test_message_render_parity import (
     _assert_no_duplicate_render,
     _assert_transcript_parity,
     _ensure_chat_view,
+    _select_view_mode,
     _send,
     _turn_prompt,
 )
@@ -93,11 +94,10 @@ pytestmark = pytest.mark.skipif(
 
 def _open_terminal_view(page: Page) -> None:
     """Switch a terminal-first session to its Terminal (TUI) view."""
-    view_mode = page.get_by_role("group", name="View mode")
-    expect(view_mode).to_be_visible(timeout=_TERMINAL_READY_TIMEOUT_MS)
-    terminal_button = view_mode.get_by_role("button", name="Terminal")
-    expect(terminal_button).to_be_visible(timeout=30_000)
-    terminal_button.click()
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
+        timeout=_TERMINAL_READY_TIMEOUT_MS
+    )
+    _select_view_mode(page, "Terminal")
 
 
 def _wait_terminal_connected(page: Page) -> None:

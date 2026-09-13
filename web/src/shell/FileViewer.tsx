@@ -9,6 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { toast } from "sonner";
 import {
   lazy,
   Suspense,
@@ -24,6 +25,7 @@ import {
   AlertTriangleIcon,
   ArrowLeftIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CloudOffIcon,
@@ -34,6 +36,7 @@ import {
   EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
+  ListIcon,
   Loader2Icon,
   MessageSquareTextIcon,
   MoreHorizontalIcon,
@@ -42,6 +45,7 @@ import {
   SearchIcon,
   SquareArrowOutUpRightIcon,
   Trash2Icon,
+  WrapTextIcon,
 } from "lucide-react";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -64,7 +68,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { fileContentToBlob, triggerBrowserDownload, useFileContent } from "@/hooks/useFileContent";
+import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import {
   type Comment,
@@ -77,6 +81,7 @@ import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/Comment
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -86,11 +91,16 @@ import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
+  isBinaryPath,
   isImageFile,
+  isModelFile,
   isNotebookPath,
+  isPdfFile,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { useScrollRestore } from "./useScrollRestore";
+import { isPdfAnchor } from "./pdfCommentHelpers";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
 // actually shown.
@@ -125,6 +135,12 @@ export function classifyAndRemapComments(
     }
     // Draft with no anchor — keep as-is.
     if (!c.anchor_content) {
+      open.push(c);
+      continue;
+    }
+    // PDF anchors store geometry in anchor_content; byte-offset remapping does
+    // not apply to binary PDF content.
+    if (isPdfAnchor(c.anchor_content)) {
       open.push(c);
       continue;
     }
@@ -351,6 +367,13 @@ function FileViewerBody({
     50,
     frameless ? undefined : minWidthPx,
   );
+  // The mobile viewer is a `fixed inset-0` overlay, so the iOS shell-lock
+  // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
+  // doesn't lift it above the soft keyboard. Pad the overlay's bottom by the
+  // keyboard inset so the comments panel and its (auto-focused) textarea stay
+  // visible. No-op off iOS / with the keyboard closed. Not needed frameless
+  // (embedded in the desktop aside, never a fixed overlay).
+  const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
   const fileQuery = useFileContent(conversationId, path);
   const diffQuery = useFileDiff(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
@@ -384,6 +407,13 @@ function FileViewerBody({
   // null = not yet measured (or zero, e.g. jsdom) — treat as "wide enough" so
   // the toggle shows by default and only hides once a real narrow width lands.
   const contentAreaRef = useRef<HTMLDivElement | null>(null);
+  // The viewer's outer element, used to scope Cmd+F to when focus is inside the
+  // file viewer (vs the chat/composer, which owns find-in-page). Callback ref so
+  // one handle serves both the framed <aside> and the frameless <div> root.
+  const viewerRootRef = useRef<HTMLElement | null>(null);
+  const setViewerRoot = useCallback((el: HTMLElement | null) => {
+    viewerRootRef.current = el;
+  }, []);
   const [contentWidth, setContentWidth] = useState<number | null>(null);
   // Tracks the in-progress comment textarea body. Used by MarkdownCommentPlugin
   // to decide whether to preserve the pending mark when the user clicks away.
@@ -396,11 +426,14 @@ function FileViewerBody({
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  // TOC panel state (for markdown preview)
+  const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
   useEffect(() => {
     setActiveSelection(null);
     setIsEditorDirty(false);
     setSaveStatus("idle");
+    setTocOpen(false);
   }, [path]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
@@ -458,14 +491,6 @@ function FileViewerBody({
     [isEditorDirty],
   );
 
-  const handleSetActiveSelection = (sel: ActiveSelection | null) => {
-    setActiveSelection(sel);
-    if (sel !== null) {
-      commentsInitializedRef.current = true;
-      setCommentsOpen(true);
-    }
-  };
-
   useEffect(
     () => () => {
       window.clearTimeout(linkCopiedTimerRef.current);
@@ -474,10 +499,8 @@ function FileViewerBody({
   );
 
   const downloadFile = useCallback(() => {
-    const data = fileQuery.data;
-    if (!data) return;
-    triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
-  }, [fileQuery.data, path]);
+    downloadWorkspaceFile(conversationId, path).catch(() => toast.error("Download failed"));
+  }, [conversationId, path]);
 
   // Pop the HTML artifact into its own browser tab. The artifact is rendered in
   // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
@@ -522,12 +545,27 @@ function FileViewerBody({
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const { open: openComments, addressed: addressedComments } = useMemo(
     () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent], // eslint-disable-line react-hooks/exhaustive-deps
+    [allComments, fileContent],
   );
+
+  const handleSetActiveSelection = (selection: ActiveSelection | null) => {
+    let nextSelection = selection;
+    if (selection && selection.comment_id == null) {
+      const comment = openComments.find(
+        (c) => c.start_index === selection.start_index && c.end_index === selection.end_index,
+      );
+      if (comment) nextSelection = { ...selection, comment_id: comment.id };
+    }
+    setActiveSelection(nextSelection);
+    if (selection !== null) {
+      commentsInitializedRef.current = true;
+      setCommentsOpen(true);
+    }
+  };
 
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.
   // Waits for fileQuery.data so classifyAndRemapComments has run with real content,
-  // ensuring activeSelection uses remapped indices that match openComments.
+  // ensuring activeSelection uses remapped indices that match open comments.
   useEffect(() => {
     if (linkedCommentAppliedRef.current) return;
     const commentId = initialCommentIdRef.current;
@@ -541,6 +579,7 @@ function FileViewerBody({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
+      comment_id: comment.id,
     });
   }, [openComments]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -605,13 +644,24 @@ function FileViewerBody({
   // notebooks to their rendered preview, and everything else to source.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
-  // Images render through CodeViewer's <ImageViewer> regardless of view mode;
-  // they have no source/diff representation, so diff is suppressed for them
-  // (Monaco would otherwise render the base64 payload as garbage text).
+  // Images and PDFs render through CodeViewer's own viewers regardless of view
+  // mode; they have no source/diff representation, so diff is suppressed for
+  // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
+  const isPdf = isPdfFile(path, fileQuery.data?.content_type);
+  // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
+  // they have no meaningful source/diff/preview text representation, so diff is
+  // suppressed and they always resolve to the (viewer-owning) source surface.
+  const isModel = isModelFile(path, fileQuery.data?.content_type);
+  // Binary/base64 files render CodeViewer's "Preview not available" notice, not
+  // Monaco — mirrors CodeViewer's own base64/binary-path check.
+  const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
-    !isImage && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    !isImage &&
+    !isPdf &&
+    !isModel &&
+    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
@@ -636,6 +686,7 @@ function FileViewerBody({
   const [hideWhitespace, setHideWhitespace] = useState(
     () => persistedPrefsRef.current.hideWhitespace,
   );
+  const [wrapLines, setWrapLines] = useState(() => persistedPrefsRef.current.wrapLines);
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
@@ -658,12 +709,27 @@ function FileViewerBody({
     initialCommentIdRef.current ? path : null,
   );
 
+  // Switch a markdown file to the rich-text editor — the surface where text-
+  // selection commenting works. Used by the preview's "switch to edit mode"
+  // hint. Coming from preview/source there are no edits to guard, so it applies
+  // directly (mirrors the toolbar's switchTo for the non-editor case).
+  const handleRequestEditMode = useCallback(() => {
+    setDeepLinkBiasPath(null);
+    setPreviewableViewMode("editor");
+  }, []);
+
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
   useEffect(() => {
-    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
-  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
+    writeFileViewPreferences({
+      diffActive,
+      diffLayout,
+      previewableViewMode,
+      hideWhitespace,
+      wrapLines,
+    });
+  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace, wrapLines]);
   // Markdown supports all three previewable modes (preview / editor / source).
   // HTML and notebooks have no rich-text editor, so their "editor" preference
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
@@ -682,6 +748,87 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+
+  // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
+  // source/editor and the diff view). Those surfaces would otherwise rely on
+  // Monaco's own Cmd+F keybinding, which needs editor DOM focus and does not
+  // fire inside the managed (same-root embed) host — so cmd+f silently did
+  // nothing there. Driving `searchOpen` runs Monaco's find action imperatively
+  // instead, matching how the Shiki/markdown surfaces (handled by their own
+  // window listeners in CodeViewer) already open find. Gated to the Monaco
+  // surfaces so it never double-handles the CodeViewer-owned ones.
+  // The find toggle only reaches a Monaco surface: the diff view, or a non-diff
+  // file that CodeViewer renders in Monaco. Exclude the surfaces CodeViewer
+  // returns *before* the Monaco block — markdown (rich editor / its own find
+  // bar), previews, and the image/PDF/model/binary viewers — otherwise Cmd+F
+  // would swallow the browser's find-in-page with no find widget to show.
+  const isMonacoFindSurface =
+    diffViewActive ||
+    (lang !== "markdown" && viewMode !== "preview" && !isImage && !isPdf && !isModel && !isBinary);
+  // Cmd+F must open find-in-file only while the file viewer is the surface the
+  // user is working in. The viewer stays mounted beside the chat, so `open`
+  // alone can't tell them apart, and reading `document.activeElement` at
+  // keypress time is unreliable — clicking a non-focusable chat area drops focus
+  // to <body>, which reads the same as "nothing focused yet". Instead we track
+  // the last surface the user interacted with: seeded to the viewer (opening a
+  // file makes it active) and flipped by clicks / focus moves. When the user
+  // works in the chat/composer, Cmd+F falls through to the browser's find.
+  const viewerIsActiveSurfaceRef = useRef(true);
+  useEffect(() => {
+    // Opening the viewer (or switching files within it) makes it the active
+    // surface again. Keyed on `open` too, so reopening the same path after the
+    // user had clicked into the chat re-seeds the ref instead of staying stale.
+    if (open) viewerIsActiveSurfaceRef.current = true;
+  }, [open, path]);
+  useEffect(() => {
+    if (!open) return;
+    const track = (e: Event) => {
+      const root = viewerRootRef.current;
+      const target = e.target;
+      if (root !== null && target instanceof Node) {
+        viewerIsActiveSurfaceRef.current = root.contains(target);
+      }
+    };
+    window.addEventListener("mousedown", track, true);
+    window.addEventListener("focusin", track, true);
+    return () => {
+      window.removeEventListener("mousedown", track, true);
+      window.removeEventListener("focusin", track, true);
+    };
+  }, [open]);
+  useEffect(() => {
+    if (!open || !isMonacoFindSurface) return;
+    const handler = (e: KeyboardEvent) => {
+      if (!((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "f")) return;
+      if (!viewerIsActiveSurfaceRef.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setSearchOpen(true);
+    };
+    // Capture phase so the embed claims Cmd+F ahead of the host page's own
+    // listeners and the browser's native find (which would search the whole
+    // host page, not the file).
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [open, isMonacoFindSurface, setSearchOpen]);
+
+  // Reset the toggle when find is closed from inside Monaco (Escape or the
+  // widget's ✕) so the next Cmd+F re-opens it instead of no-opping. Shared by
+  // the diff view; the non-diff CodeViewer resets its own copy internally.
+  const handleSearchHandled = useCallback(() => setSearchOpen(false), [setSearchOpen]);
+
+  // Persist where the reader was in the content area (markdown source, plain
+  // text). The view mode is part of the key because each mode renders a
+  // different height, so sharing one offset across modes would drop the reader
+  // at an unrelated place after a toggle; the namespace is separate from the
+  // `viewer:` keys Monaco writes for its own internal scroller.
+  const contentScrollKey =
+    conversationId && path ? `viewer-content:${conversationId}:${viewMode}:${path}` : null;
+  const handleContentScroll = useScrollRestore(
+    contentAreaRef,
+    contentScrollKey,
+    fileQuery.data !== undefined,
+  );
   // Measure the content area so the split toggle can hide when there isn't
   // enough room for side-by-side. Only observe while the diff is shown — the
   // ref element only exists then, and it's the only mode that cares.
@@ -741,27 +888,40 @@ function FileViewerBody({
   // rendered as a single dropdown (a "picker" button inline, a submenu when
   // collapsed) rather than one button per choice. Markdown's view-mode picker
   // (Preview / Edit / Source) uses this so it occupies one toolbar slot.
-  type ToolbarOption = {
+  interface ToolbarOption {
     key: string;
     label: string;
     tooltip?: string;
     icon: ReactNode;
     onSelect: () => void;
     active: boolean;
-  };
-  type ToolbarAction = {
+    /** Keep the menu open after selecting — for toggles the user may flip in a
+     * row (e.g. wrap + whitespace). Action items (Find) omit it so the menu
+     * closes as they hand off. */
+    keepOpen?: boolean;
+    /** Suppress the active check mark — for toggles whose icon already reflects
+     * state (e.g. the whitespace eye flips open/closed). */
+    noActiveCheck?: boolean;
+  }
+  interface ToolbarAction {
     key: string;
     /** Accessible name for the inline icon button. */
     label: string;
+    /** Text label for the inline icon button. */
+    textLabel?: string;
     /** Tooltip + dropdown row text; falls back to `label` when omitted. */
     tooltip?: string;
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
-    /** When set, render a picker (dropdown/submenu) over these choices instead
-     * of a single button. `onSelect` is ignored. */
+    /** When set, render a picker (dropdown/submenu) over these mutually
+     * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
-  };
+    /** When set, render a menu of independent items (toggles + actions) under a
+     * single trigger. Unlike `options`, these are not mutually exclusive and
+     * carry no "selected choice" semantics. `onSelect` is ignored. */
+    menu?: ToolbarOption[];
+  }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
@@ -819,6 +979,7 @@ function FileViewerBody({
     toolbarActions.push({
       key: "md-view-mode",
       label: `View mode: ${activeMode.label}`,
+      textLabel: activeMode.label,
       tooltip: "View mode",
       icon: activeMode.icon,
       options: modeOptions,
@@ -852,6 +1013,17 @@ function FileViewerBody({
       onSelect: openHtmlInNewTab,
     });
   }
+  // Table of contents for markdown preview
+  if (lang === "markdown" && viewMode === "preview") {
+    toolbarActions.push({
+      key: "toc",
+      label: tocOpen ? "Hide table of contents" : "Show table of contents",
+      icon: <ListIcon className="size-4" />,
+      active: tocOpen,
+      onSelect: () => setTocOpen((prev) => !prev),
+    });
+  }
+  // PDFs render through PdfViewer with text-layer comment anchors.
   toolbarActions.push({
     key: "comments",
     label: commentsOpen ? "Hide comments" : "Show comments",
@@ -862,7 +1034,7 @@ function FileViewerBody({
       setCommentsOpen((prev) => !prev);
     },
   });
-  if (isDiffAvailable) {
+  if (!isPdf && isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
       label: viewMode === "diff" ? "Exit diff view" : "Show diff",
@@ -884,32 +1056,59 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
+  // A single "⋯" menu folds the view controls that were previously separate
+  // top-level icons: Find in file and Download (all views), plus the diff-only
+  // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
+  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
+  // diff-settings menu. The toggles keep the menu open; actions close it as they
+  // hand off.
+  const settingsMenu: ToolbarOption[] = [
+    {
+      key: "search",
+      label: "Find in file",
+      icon: <SearchIcon className="size-4" />,
+      active: false,
+      onSelect: openSearch,
+    },
+  ];
+  if (!isDeletedFile && fileQuery.data) {
+    settingsMenu.push({
+      key: "download",
+      label: "Download file",
+      tooltip: "Download",
+      icon: <DownloadIcon className="size-4" />,
+      active: false,
+      onSelect: downloadFile,
+    });
+  }
   if (viewMode === "diff") {
-    toolbarActions.push({
+    settingsMenu.push({
+      key: "wrap-lines",
+      label: "Wrap lines",
+      tooltip: "Soft-wrap long lines (no horizontal scroll)",
+      icon: <WrapTextIcon className="size-4" />,
+      active: wrapLines,
+      keepOpen: true,
+      onSelect: () => setWrapLines((prev) => !prev),
+    });
+    settingsMenu.push({
       key: "hide-whitespace",
-      label: hideWhitespace ? "Show whitespace changes" : "Hide whitespace changes",
+      label: "Hide whitespace changes",
       icon: hideWhitespace ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />,
       active: hideWhitespace,
+      keepOpen: true,
+      // The eye icon already flips open/closed to show state — no check needed.
+      noActiveCheck: true,
       onSelect: () => setHideWhitespace((prev) => !prev),
     });
   }
   toolbarActions.push({
-    key: "search",
-    label: "Find in file",
-    icon: <SearchIcon className="size-4" />,
-    onSelect: openSearch,
+    key: "view-settings",
+    label: "View settings",
+    tooltip: "View settings",
+    icon: <MoreHorizontalIcon className="size-4" />,
+    menu: settingsMenu,
   });
-  if (!isDeletedFile && fileQuery.data) {
-    toolbarActions.push({
-      key: "download",
-      label: "Download file",
-      tooltip: fileQuery.data.truncated
-        ? "Download (file was truncated — content may be incomplete)"
-        : "Download",
-      icon: <DownloadIcon className="size-4" />,
-      onSelect: downloadFile,
-    });
-  }
   toolbarActions.push({
     key: "copy-link",
     label: "Copy link to file",
@@ -950,8 +1149,10 @@ function FileViewerBody({
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
     toolbarActions.map((action) =>
-      action.options ? (
-        // A picker: one trigger opening a menu of mutually-exclusive choices.
+      action.menu ? (
+        // A settings menu: one trigger opening a list of independent items
+        // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
+        // as the user flips them; actions close it on select.
         <DropdownMenu key={action.key}>
           <TooltipProvider>
             <Tooltip>
@@ -972,11 +1173,55 @@ function FileViewerBody({
             </Tooltip>
           </TooltipProvider>
           <DropdownMenuContent align="end" className="w-auto min-w-40">
+            {action.menu.map((item) => (
+              <DropdownMenuItem
+                key={item.key}
+                className="whitespace-nowrap"
+                onSelect={
+                  interactive
+                    ? (e) => {
+                        if (item.keepOpen) e.preventDefault();
+                        item.onSelect();
+                      }
+                    : undefined
+                }
+              >
+                {item.icon}
+                {item.label}
+                {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : action.options ? (
+        // A picker: one trigger opening a menu of mutually-exclusive choices.
+        <DropdownMenu key={action.key}>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size={action.textLabel ? "sm" : "icon-sm"}
+                    aria-label={action.label}
+                    tabIndex={interactive ? undefined : -1}
+                  >
+                    {action.icon}
+                    {action.textLabel}
+                    <ChevronDownIcon />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <DropdownMenuContent align="end" className="w-auto min-w-40">
             <DropdownMenuLabel>{action.tooltip ?? action.label}</DropdownMenuLabel>
             {action.options.map((option) => (
               <DropdownMenuItem
                 key={option.key}
-                className={cn("whitespace-nowrap", option.active && "bg-accent")}
+                className={cn("whitespace-nowrap")}
                 onSelect={interactive ? option.onSelect : undefined}
               >
                 {option.icon}
@@ -1066,7 +1311,7 @@ function FileViewerBody({
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{path}</span>
+          <span className="min-w-0 truncate font-mono text-sm text-muted-foreground">{path}</span>
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"
@@ -1085,7 +1330,7 @@ function FileViewerBody({
                   : undefined
               }
               className={cn(
-                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px]",
+                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-sm",
                 saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
               )}
             >
@@ -1136,7 +1381,9 @@ function FileViewerBody({
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
                   {toolbarActions.map((action) =>
                     action.options ? (
-                      // A picker collapses to a nested submenu of its choices.
+                      // A mutually-exclusive picker (e.g. view mode) collapses to
+                      // a nested submenu so its "selected choice" semantics — one
+                      // highlighted option — stay intact.
                       <DropdownMenuSub key={action.key}>
                         <DropdownMenuSubTrigger className="whitespace-nowrap">
                           {action.icon}
@@ -1146,16 +1393,44 @@ function FileViewerBody({
                           {action.options.map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              className={cn("whitespace-nowrap", option.active && "bg-accent")}
-                              onSelect={option.onSelect}
+                              className={cn(
+                                "whitespace-nowrap",
+                                option.active && "bg-muted dark:bg-muted/50",
+                              )}
+                              onSelect={(e) => {
+                                if (option.keepOpen) e.preventDefault();
+                                option.onSelect();
+                              }}
                             >
                               {option.icon}
                               {option.label}
-                              {option.active && <CheckIcon className="ml-auto size-4" />}
+                              {option.active && !option.noActiveCheck && (
+                                <CheckIcon className="ml-auto size-4" />
+                              )}
                             </DropdownMenuItem>
                           ))}
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
+                    ) : action.menu ? (
+                      // The settings menu's items are already independent
+                      // toggles/actions, so flatten them straight into this "⋯"
+                      // overflow rather than nesting a "⋯"-in-"⋯" submenu.
+                      action.menu.map((option) => (
+                        <DropdownMenuItem
+                          key={option.key}
+                          className="whitespace-nowrap"
+                          onSelect={(e) => {
+                            if (option.keepOpen) e.preventDefault();
+                            option.onSelect();
+                          }}
+                        >
+                          {option.icon}
+                          {option.label}
+                          {option.active && !option.noActiveCheck && (
+                            <CheckIcon className="ml-auto size-4" />
+                          )}
+                        </DropdownMenuItem>
+                      ))
                     ) : (
                       <DropdownMenuItem
                         key={action.key}
@@ -1189,7 +1464,7 @@ function FileViewerBody({
           <span
             ref={toolbarPathMeasureRef}
             aria-hidden
-            className="pointer-events-none absolute left-[-9999px] top-0 font-mono text-xs whitespace-nowrap"
+            className="pointer-events-none absolute left-[-9999px] top-0 font-mono text-sm whitespace-nowrap"
           >
             {path}
           </span>
@@ -1197,13 +1472,17 @@ function FileViewerBody({
       </div>
 
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
-        <div ref={contentAreaRef} className="flex-1 overflow-y-auto min-w-0">
+        <div
+          ref={contentAreaRef}
+          onScroll={handleContentScroll}
+          className="flex-1 overflow-y-auto min-w-0"
+        >
           {isDeletedFile && viewMode !== "diff" ? (
-            <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
+            <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
               <Trash2Icon className="size-5 opacity-40" />
               <span>This file has been deleted.</span>
               {isDiffAvailable && (
-                <span className="text-xs">
+                <span className="text-sm">
                   Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
                   previous content.
                 </span>
@@ -1215,7 +1494,7 @@ function FileViewerBody({
             // hanging on "Loading diff…" forever — diffQuery.data stays
             // undefined on error, which would otherwise read as still-loading.
             diffQuery.isError ? (
-              <div className="flex items-center justify-center p-8 text-destructive text-sm">
+              <div className="flex items-center justify-center p-8 text-destructive text-ui">
                 Failed to load:{" "}
                 {diffQuery.error instanceof Error
                   ? diffQuery.error.message
@@ -1227,13 +1506,13 @@ function FileViewerBody({
             // wrong content and mis-set EOL (onMount runs once). Once data is
             // present, pass the real before/after through (legitimate nulls and all).
             !diffQuery.data ? (
-              <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
               </div>
             ) : (
               <Suspense
                 fallback={
-                  <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+                  <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                     Loading diff…
                   </div>
                 }
@@ -1247,11 +1526,14 @@ function FileViewerBody({
                   path={path}
                   layout={diffLayout}
                   hideWhitespace={hideWhitespace}
+                  wrapLines={wrapLines}
                   conversationId={conversationId}
                   comments={openComments}
                   activeSelection={activeSelection}
                   onSetActiveSelection={handleSetActiveSelection}
                   pendingBodyRef={pendingBodyRef}
+                  searchOpen={searchOpen}
+                  onSearchHandled={handleSearchHandled}
                 />
               </Suspense>
             )
@@ -1263,6 +1545,7 @@ function FileViewerBody({
               onDirtyChange={setIsEditorDirty}
               onSaveStatusChange={setSaveStatus}
               comments={openComments}
+              addressedComments={addressedComments}
               activeSelection={activeSelection}
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
@@ -1271,6 +1554,9 @@ function FileViewerBody({
               setSearchOpen={setSearchOpen}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
+              tocOpen={tocOpen}
+              onTocToggle={() => setTocOpen((prev) => !prev)}
+              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
             />
           )}
         </div>
@@ -1299,20 +1585,21 @@ function FileViewerBody({
               if (!sender) return;
               const ids = openComments.map((c) => c.id);
               sender.mutate({ comment_ids: ids });
-              setActiveSelection(null);
             }}
             onClickComment={(comment) => {
               setActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
                 anchor_content: comment.anchor_content ?? "",
+                comment_id: comment.id,
               });
               // Sync the selected comment into the URL so the address bar is
               // always shareable. AppShell clears this param when the viewer closes.
               setSearchParams(
                 (prev) => {
                   const next = new URLSearchParams(prev);
-                  next.set("comment", comment.id);
+                  if (comment.status === "draft") next.set("comment", comment.id);
+                  else next.delete("comment");
                   return next;
                 },
                 { replace: true },
@@ -1324,8 +1611,10 @@ function FileViewerBody({
               const deleted = [...openComments, ...addressedComments].find((c) => c.id === id);
               if (
                 deleted &&
-                activeSelection?.start_index === deleted.start_index &&
-                activeSelection?.end_index === deleted.end_index
+                (activeSelection?.comment_id === deleted.id ||
+                  (activeSelection?.comment_id == null &&
+                    activeSelection?.start_index === deleted.start_index &&
+                    activeSelection?.end_index === deleted.end_index))
               )
                 setActiveSelection(null);
             }}
@@ -1336,8 +1625,8 @@ function FileViewerBody({
       </div>
       <Dialog
         open={pendingAction !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingAction(null);
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setPendingAction(null);
         }}
       >
         <DialogContent showCloseButton={false}>
@@ -1370,6 +1659,7 @@ function FileViewerBody({
   if (frameless) {
     return (
       <div
+        ref={setViewerRoot}
         data-testid="file-viewer"
         className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
       >
@@ -1380,8 +1670,9 @@ function FileViewerBody({
 
   return (
     <aside
+      ref={setViewerRoot}
       data-testid="file-viewer"
-      style={{ width: panelWidth }}
+      style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
         // Mobile (default): fixed full-screen overlay, slide via translate-x.

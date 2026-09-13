@@ -93,7 +93,7 @@ def test_claude_native_skill_args_with_bundle(
 ) -> None:
     """
     A bundle with ``skills/`` yields ``--plugin-dir <bundle>`` (the CLI
-    plugin convention loads ``<bundle>/skills/<name>/SKILL.md``) and a
+    plugin convention loads ``<bundle>/skills/<dir>/SKILL.md``) and a
     written manifest. ``--setting-sources ""`` appears only for ``"none"``
     — the SDK-parity gate on host skills.
 

@@ -1,18 +1,21 @@
 # omnidev
 
-Dev tooling for Omnigent, in one binary with two independent capabilities:
+Dev tooling for Omnigent, in one binary with three surfaces:
 
 1. A per-repo dev **pod supervisor** (bare `omnidev`) — the default.
-2. **Install management** (`omnidev install`/`update`/`check`) — install and
-   keep a git-based omnigent up to date. See
+2. **Install management** (`omnidev install`/`update`/`check`) — install
+   and keep a git-based omnigent up to date. See
    [Managing your omnigent install](#managing-your-omnigent-install). These
-   subcommands need no checkout and run anywhere.
+   need no checkout and run anywhere.
+3. **An omnigent passthrough** (`omnidev omnigent …`) — run any omnigent command
+   against the current checkout's pod, with the pod's isolated env applied.
+   See [Running omnigent commands](#running-omnigent-commands).
 
 ## Pod supervisor
 
 A per-repo dev **pod** supervisor, as a single long-running terminal UI. It
 replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
-`npm run dev`) with one process that:
+`pnpm run dev`) with one process that:
 
 - runs each checkout in an **isolated pod** — its own state dir, database,
   artifacts, logs, and auto-allocated ports — so multiple worktrees never
@@ -20,12 +23,18 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
 - **supervises** the backend server, the host daemon, and the Vite frontend,
   restarting any that crash (with backoff);
 - **reloads the backend** (server → host) when you edit `omnigent/**/*.py`;
-  the frontend self-reloads through Vite HMR;
-- gives you **scrollable per-process log panes** plus a combined view.
+  gitignored files under `omnigent/` (e.g. the build-time `_build_info.py`) are
+  skipped so generated churn doesn't reload; the frontend self-reloads through
+  Vite HMR;
+- **prefills ten example conversations** after the OSS server first becomes
+  healthy, giving UI and API work realistic short, multi-turn, and tool-call
+  transcripts;
+- gives you **per-process log panes** plus a combined view, each a `less`-style
+  pager with wrap and search (see [Keys](#keys)).
 
 ## Build & run
 
-Requires the repo's usual dev prerequisites (`uv` for Python, `npm` for the
+Requires the repo's usual dev prerequisites (`uv` for Python, `pnpm` for the
 web UI) plus a Rust toolchain.
 
 ```bash
@@ -42,16 +51,18 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 
 | Process | Command | Notes |
 |---|---|---|
-| server | `uv run omnigent server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
-| host   | `uv run omnigent host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
-| vite   | `npm run dev -- --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
+| server | `uv run omnigent --log-to-stderr server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
+| host   | `uv run omnigent --log-to-stderr host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
+| vite   | `pnpm run dev --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
 
-Before Vite starts (and on a manual Vite restart), omnidev runs `npm install`
+Before Vite starts (and on a manual Vite restart), omnidev runs `pnpm install`
 in `web/` when needed — `node_modules/` is missing, or `package.json` /
-`package-lock.json` is newer than it — so a fresh checkout or a new dependency
+`pnpm-lock.yaml` is newer than it — so a fresh checkout or a new dependency
 doesn't make Vite fail its dependency scan. Output streams into the `vite` pane.
 
-Open the UI at the `ui` URL shown in the header (the Vite dev server).
+Once Vite begins serving, omnidev opens the `ui` URL shown in the header in
+your default browser. If the platform browser launcher is unavailable, startup
+continues and the combined log tells you to open that URL manually.
 
 ## Isolation
 
@@ -59,7 +70,7 @@ Only Omnigent's own state is isolated per pod — enough that concurrent pods
 never share a database, server pidfile, or `config.yaml` — via
 `OMNIGENT_DATA_DIR`, `OMNIGENT_DATABASE_URI`, `OMNIGENT_URL`, and
 `OMNIGENT_CONFIG_HOME`. Everything else (your real `HOME`, credentials, and
-uv/npm caches) is inherited, because the agents Omnigent runs need it. This is
+uv/pnpm caches) is inherited, because the agents Omnigent runs need it. This is
 deliberately lighter than the hermetic `scripts/backend-smoke.sh` sandbox,
 which repoints `HOME`/`XDG_*` to touch nothing real.
 
@@ -68,7 +79,16 @@ Each pod gets its own `config.yaml` under `<pod>/config/`, pointed to by
 `~/.omnigent/config.yaml` (if present) so the pod works out of the box — it
 keeps your providers — after which the two are independent: server-config edits
 inside a pod (via the UI or `omnigent config`) don't touch your real config.
-`--clean` wipes the pod dir, so the next run re-seeds from your real config.
+
+The OSS pod also imports the curated JSONL transcripts under
+`dev/omnidev/fixtures/conversations/` through `omnigent session import` once the
+server is healthy. Versioned per-fixture markers in the pod make normal starts
+and backend reloads idempotent. The imported rows remain ordinary conversations:
+you can edit, archive, or delete them without omnidev recreating them on the next
+start. External process profiles are not seeded.
+
+`--clean` wipes the pod dir, so the next run re-seeds both config and example
+conversations.
 
 The pod dir defaults to
 `${XDG_CACHE_HOME:-~/.cache}/omnidev/<repo-name>-<hash>/`, keyed to the
@@ -85,6 +105,7 @@ canonical checkout path. Per-process logs are written through to
 --pod-dir <PATH>    Use a specific pod dir instead of the per-repo default
 --no-vite           Backend + host only (no frontend)
 --clean             Wipe the pod dir before starting
+--debug             Log each watched file change and whether it reloads
 ```
 
 `--vite-host 0.0.0.0` exposes the Vite dev server on all interfaces for device
@@ -114,16 +135,53 @@ not auto-trusted (add those to `OMNIGENT_WS_ALLOWED_ORIGINS` yourself).
 
 ## Keys
 
+The log pane is a `less`-style pager, so the movement and search keys should
+feel familiar.
+
 | Key | Action |
 |---|---|
 | `1` / `2` / `3` / `0` | Focus server / host / vite / combined pane |
 | `Tab` | Cycle panes |
-| `↑` `↓` `PgUp` `PgDn` | Scroll (detaches from tail) |
-| `f` | Toggle follow-tail |
+| `j` / `k` (or `↓` / `↑`) | Scroll one line |
+| `f` / `Space` / `PgDn` (or `b` / `PgUp`) | Page forward / back one window |
+| `d` / `u` | Half-page forward / back |
+| `g` / `G` | Jump to top / bottom (bottom re-follows the tail) |
+| `F` | Toggle follow-tail (like `less +F`) |
+| `w` | Toggle line wrap (on by default) |
+| `/` `?` | Search forward / back — type, `Enter` to jump, `Esc` to cancel |
+| `n` / `N` | Next / previous match |
 | `r` | Restart the focused process (server/host restart as a pair) |
 | `R` | Restart the backend (server then host) |
 | `c` | Clear the focused pane |
 | `q` / `Ctrl-C` | Quit and tear down all processes |
+
+## Running omnigent commands
+
+`omnidev omnigent …` runs any omnigent command against the current checkout's
+pod, via `uv run omnigent …`, with the pod's isolated env applied
+(`OMNIGENT_DATA_DIR`, `OMNIGENT_DATABASE_URI`, `OMNIGENT_CONFIG_HOME`,
+`OMNIGENT_URL`). It resolves the same repo root and pod dir the supervisor
+uses, so a command talks to the pod's database and config — and `OMNIGENT_URL`
+points at a running supervisor's server when one is up.
+
+```bash
+omnidev omnigent agent run "fix the flaky test"
+omnidev omnigent config show
+omnidev --pod-dir /tmp/x omnigent agent list   # target a specific pod
+```
+
+Everything after the subcommand is forwarded verbatim to omnigent. It runs in
+the foreground (inheriting your stdio) and exits with omnigent's status code.
+It acquires **no** lock, so it coexists with a running supervisor — the common
+case: the server is up and you issue a command against it. Use `--` to pass
+flags that look like omnidev's own:
+
+```bash
+omnidev omnigent -- --verbose agent run …
+```
+
+Supervisor-only flags (`--server-port`, `--clean`, `--no-vite`, …) don't apply
+to the passthrough; only `--pod-dir` is shared.
 
 ## Managing your omnigent install
 
@@ -132,8 +190,8 @@ than develop it. This wraps the fiddly PEP 508 install syntax and adds a daily
 update check — filling a gap, since omnigent's own update notice only works for
 PyPI-wheel installs and skips git installs.
 
-These subcommands manage the global tool and work from **any directory** (no
-checkout needed).
+These subcommands manage the global tool and work from **any directory**
+(no checkout needed).
 
 ```
 omnidev install     # uv tool install omnigent from git (databricks extra, main)
@@ -148,9 +206,9 @@ omnidev shell-hook  # print the daily-check snippet for your shell rc
 extras), `--repo <url>`. The choice is saved to
 `${XDG_CONFIG_HOME:-~/.config}/omnidev/install.toml` so `update` reuses it.
 
-Installing from git **builds the web UI from source**, so Node 22+/npm must be
+Installing from git **builds the web UI from source**, so Node 22+/pnpm must be
 on PATH (the PyPI wheel ships the UI prebuilt; the git install does not).
-`omnidev install` fails early with a clear message if `uv` or `npm` is missing.
+`omnidev install` fails early with a clear message if `uv` or `pnpm` is missing.
 
 ### Daily update check
 
@@ -172,6 +230,21 @@ result (`${XDG_CACHE_HOME:-~/.cache}/omnidev/omnigent-check.json`) and, when
 stale (>24h), refreshes it in a detached background process — so shell startup
 never blocks on the network. When a newer commit is available it prints a notice
 and, on a terminal, prompts `Update omnigent now? [y/N]`; on yes it runs
-`omnidev update` in the foreground. Declining suppresses that same commit until a
-newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
+`omnidev update` in the foreground. Declining suppresses that same commit until
+a newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
 to silence omnigent's own separate notice.
+
+# External process profiles
+
+Integrations that embed the Omnigent server in another repository can reuse
+the supervisor without copying it:
+
+```bash
+omnidev --profile path/to/omnidev.toml
+```
+
+The profile supplies the server, optional host, Vite, and optional dependency
+preparation commands plus the backend and web directories. Command arguments
+may contain `{server_port}`, `{vite_port}`, `{vite_host}`, `{pod_dir}`, and
+`{repo_root}`. Environment variables from the launching integration are
+inherited; `OMNIGENT_URL` is set to the isolated backend as usual.

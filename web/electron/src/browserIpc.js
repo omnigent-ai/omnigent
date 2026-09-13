@@ -315,6 +315,16 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     return { ok: r.ok, error: r.error };
   });
 
+  // Hide/show the active view in place while a DOM overlay is open. The native
+  // view always paints above the renderer, so z-index can't put a dialog/menu/
+  // tooltip over it — the renderer ref-counts open overlays and toggles this.
+  ipcMain.handle("omnigent:browser-set-suppressed", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    const r = g.registry.setSuppressed(!!args?.suppressed);
+    return { ok: r.ok, error: r.error };
+  });
+
   // Reposition the active conversation's view to freshly-measured bounds.
   ipcMain.handle("omnigent:browser-resize", (event, args) => {
     const g = gateRegistry(event);
@@ -371,7 +381,13 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     const g = gateRegistry(event);
     if (g.error) return { exists: false };
     const { conversationId } = args ?? {};
-    return { exists: typeof conversationId === "string" && g.registry.has(conversationId) };
+    const entry = typeof conversationId === "string" ? g.registry.get(conversationId) : null;
+    if (!entry) return { exists: false };
+    return {
+      exists: true,
+      url: entry.view.webContents.getURL(),
+      ...readNavState(entry.view.webContents),
+    };
   });
 
   // Destroy the conversation's view (explicit close — unmount only detaches).

@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
+import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ResumeWithDirectoryDialog } from "./ResumeWithDirectoryDialog";
 import { useHosts } from "@/hooks/useHosts";
+import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
@@ -13,19 +15,47 @@ import type { Session } from "@/lib/types";
 // Heavy children are exercised by their own tests; stub them so this
 // test focuses on the dialog's prefill + bind + fallback logic.
 vi.mock("./WorkspacePathField", () => ({
-  WorkspacePathField: ({ value, onChange }: { value: string; onChange: (v: string) => void }) => (
+  WorkspacePathField: ({
+    value,
+    onChange,
+    onCommit,
+  }: {
+    value: string;
+    onChange: (v: string) => void;
+    onCommit?: (v: string) => void;
+  }) => (
     <input
       data-testid="mock-workspace-input"
       value={value}
       onChange={(e) => onChange(e.target.value)}
+      // Enter commits the typed path (opens the tree browser at it), the
+      // real field's onCommit contract.
+      onKeyDown={(e) => {
+        if (e.key === "Enter") onCommit?.((e.target as HTMLInputElement).value);
+      }}
     />
   ),
 }));
-vi.mock("./WorkspacePicker", () => ({
-  WorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
-  isNavigablePath: () => false,
+// Keep the real navigability helpers but stub the picker itself — its
+// filesystem fetch isn't under test. Its "Select" button commits an absolute
+// path (onSelect), the only way browsing feeds the form now that typed
+// ~-paths resolve directly.
+vi.mock("./WorkspacePicker", async (importActual) => ({
+  ...(await importActual<typeof WorkspacePickerModule>()),
+  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
+    <div data-testid="mock-workspace-picker">
+      <button
+        type="button"
+        data-testid="mock-pick-workspace"
+        onClick={() => onSelect("/Users/alice/git/omnigent")}
+      >
+        pick
+      </button>
+    </div>
+  ),
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
@@ -54,15 +84,16 @@ vi.mock("@/components/ui/select", () => ({
       {children}
     </select>
   ),
-  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectTrigger: ({ children }: { children: ReactNode }) => children,
   SelectValue: () => null,
-  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectContent: ({ children }: { children: ReactNode }) => children,
   SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
     <option value={value}>{children}</option>
   ),
 }));
 
 const useHostsMock = vi.mocked(useHosts);
+const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const getSessionMock = vi.mocked(getSessionSlim);
@@ -99,10 +130,17 @@ function renderDialog() {
 
 beforeEach(() => {
   useHostsMock.mockReset();
+  useHostFilesystemMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
   getSessionMock.mockReset();
   launchRunnerMock.mockReset();
+  // No home listing by default (the ~-resolve tests override this); the
+  // absolute-path tests don't need it.
+  useHostFilesystemMock.mockReturnValue({
+    data: undefined,
+    isPlaceholderData: false,
+  } as unknown as ReturnType<typeof useHostFilesystem>);
   useDirectorySessionsMock.mockReturnValue({ data: [] } as unknown as ReturnType<
     typeof useDirectorySessions
   >);
@@ -232,6 +270,80 @@ describe("ResumeWithDirectoryDialog", () => {
     expect(await screen.findByTestId("resume-dir-mismatch-warning")).toBeTruthy();
   });
 
+  it("enables the bind for a typed tilde path without opening the browser", async () => {
+    // The reported journey: type "~/git/omnigent" into the field and stop —
+    // no Enter, no browsing. The dialog resolves ~ against the host's home
+    // (from the home listing) so the typed path is directly submittable.
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_src", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    useHostFilesystemMock.mockReturnValue({
+      data: { entries: [{ name: "git", path: "/Users/alice/git", type: "directory" }] },
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+
+    renderDialog();
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    const input = screen.getByTestId("mock-workspace-input");
+    fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+
+    // No Enter, no browser — the bind enables purely from the ~-resolve.
+    expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(bindBtn);
+    // Launched with the resolved absolute path, not the raw tilde.
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_src",
+        "conv_clone",
+        "/Users/alice/git/omnigent",
+        undefined,
+      ),
+    );
+  });
+
+  it("adopts an absolute path picked from the tree browser", async () => {
+    // The browse route: type a ~-path (not yet submittable), open the tree
+    // browser via Enter, then "Select" commits the browser's absolute path,
+    // enabling the bind. (Typed ~-paths resolve directly, tested above — this
+    // covers the still-live browser path.)
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_src", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+
+    renderDialog();
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    const input = screen.getByTestId("mock-workspace-input");
+    // Replace the prefilled directory with a tilde path — not submittable
+    // (the server never expands ~).
+    fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(true));
+
+    // Enter commits the typed path and opens the tree browser at it.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
+
+    // "Select" commits the browser's absolute path into the form.
+    fireEvent.click(screen.getByTestId("mock-pick-workspace"));
+    expect((input as HTMLInputElement).value).toBe("/Users/alice/git/omnigent");
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(bindBtn);
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_src",
+        "conv_clone",
+        "/Users/alice/git/omnigent",
+        undefined,
+      ),
+    );
+  });
+
   it("stays in the loading state until the hosts list loads (no CLI-fallback flash)", async () => {
     // Hosts query not resolved yet (data: undefined) while the source IS
     // loaded. Without gating on hostsLoaded, sourceHostOnline would be
@@ -247,5 +359,102 @@ describe("ResumeWithDirectoryDialog", () => {
     expect(await screen.findByTestId("resume-dir-loading")).toBeTruthy();
     expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
     expect(screen.queryByTestId("resume-dir-bind-button")).toBeNull();
+  });
+});
+
+function renderHostless(prefill?: {
+  hostId?: string | null;
+  workspace?: string | null;
+  gitBranch?: string | null;
+}) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <ResumeWithDirectoryDialog
+        open
+        onOpenChange={() => {}}
+        sessionId="conv_imported"
+        // Host-less: no fork source.
+        sourceSessionId={null}
+        prefill={prefill}
+        serverUrl="http://localhost:5173"
+      />
+    </QueryClientProvider>,
+  );
+}
+
+describe("ResumeWithDirectoryDialog (host-less session)", () => {
+  it("prefills from the session's own fields and binds without fetching a source", async () => {
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_a", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_b", name: "desktop", owner: "me", status: "online" },
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+
+    // Prefer the session's recorded host when it's online; prefill the dir.
+    renderHostless({ hostId: "host_b", workspace: "/Users/alice/imported" });
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() =>
+      expect((screen.getByTestId("mock-workspace-input") as HTMLInputElement).value).toBe(
+        "/Users/alice/imported",
+      ),
+    );
+    fireEvent.click(bindBtn);
+
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_b",
+        "conv_imported",
+        "/Users/alice/imported",
+        undefined,
+      ),
+    );
+    // No fork source → the source session is never fetched.
+    expect(getSessionMock).not.toHaveBeenCalled();
+    // No source means no mismatch/CLI-fallback machinery.
+    expect(screen.queryByTestId("resume-dir-mismatch-warning")).toBeNull();
+    expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
+  });
+
+  it("defaults the host to the caller's current online machine when the recorded host is gone", async () => {
+    // Recorded host offline (or absent from the list) → fall back to the
+    // most-recent online machine (first in the list).
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_current", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_old", name: "old", owner: "me", status: "offline" },
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+
+    renderHostless({ hostId: "host_old", workspace: "/repo" });
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(bindBtn);
+
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_current",
+        "conv_imported",
+        "/repo",
+        undefined,
+      ),
+    );
+  });
+
+  it("shows the no-online-hosts message (no CLI fallback) when none are online", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_old", name: "old", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof useHosts>);
+
+    renderHostless({ workspace: "/repo" });
+
+    expect(await screen.findByTestId("resume-dir-no-hosts")).toBeTruthy();
+    expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
+    expect(screen.queryByTestId("resume-dir-host-select")).toBeNull();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
   });
 });

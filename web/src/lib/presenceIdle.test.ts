@@ -109,3 +109,43 @@ describe("createPresenceIdleTracker", () => {
     expect(t.idleNow()).toBe(true);
   });
 });
+
+// The store keeps one abort controller per LIVE stream and aborts them all on a
+// flip, because the `idle` query param rides on each stream's GET — recycling
+// only one would leave every other open stream reporting a stale flag. That
+// fan-out lives in `chatStore`'s `presenceAttemptControllers`; this pins the
+// contract it relies on, including that aborting mid-iteration (each abort
+// settles an attempt, which removes it from the live set) recycles every stream.
+describe("recycling every live stream on a flip", () => {
+  it("aborts all registered attempts, even as they deregister mid-flip", () => {
+    const live = new Set<AbortController>();
+    const t = createPresenceIdleTracker({
+      onFlip: () => {
+        // Copy first: abort handlers below mutate `live` while we iterate.
+        for (const c of [...live]) c.abort();
+      },
+      idleAfterMs: IDLE_AFTER_MS,
+    });
+
+    // Three concurrent streams, each deregistering itself when aborted — the
+    // shape `startStreamPump`'s `finally` produces.
+    const aborted: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const c = new AbortController();
+      c.signal.addEventListener("abort", () => {
+        aborted.push(i);
+        live.delete(c);
+      });
+      live.add(c);
+    }
+
+    t.noteReported(false);
+    t.handleVisibilityChange(true);
+    vi.advanceTimersByTime(IDLE_AFTER_MS + 1);
+
+    // All three recycled (a single shared controller would abort only one), and
+    // the set drains as each attempt tears down.
+    expect(aborted).toEqual([0, 1, 2]);
+    expect(live.size).toBe(0);
+  });
+});

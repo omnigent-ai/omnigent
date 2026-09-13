@@ -373,11 +373,10 @@ def load_omnigent_yaml(
     # ``match_tools``, ``action``, ``reason``, ``set_labels``).
     # Non-mapping roots are tolerated as an empty dict — the
     # omnigent loader would already have rejected them above.
-    # Use _OmnigentYamlLoader (not yaml.safe_load) so that
-    # booleans parse consistently — importing load_agent_def
-    # mutates yaml.SafeLoader's implicit resolvers as a side
-    # effect, causing yaml.safe_load to return string "false"
-    # for unquoted ``false`` values (e.g. use_responses: false).
+    # Use _OmnigentYamlLoader (not yaml.safe_load) so this raw
+    # read resolves booleans the same way load_agent_def's YAML
+    # parsing did — both loaders keep on/off as plain strings
+    # instead of the YAML 1.1 bool aliases.
     raw = _yaml.load(path.read_text(), Loader=_OmnigentYamlLoader) or {}
     if not isinstance(raw, dict):
         raw = {}

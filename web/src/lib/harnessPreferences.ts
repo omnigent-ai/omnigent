@@ -46,11 +46,12 @@ export function writeLastHarness(agentId: string | null | undefined, harness: st
   try {
     const map = readMap();
     if (harness === null) {
-      delete map[agentId];
+      const { [agentId]: _removedHarness, ...remainingHarnesses } = map;
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(remainingHarnesses));
     } else {
       map[agentId] = harness;
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
     }
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
   } catch {
     // localStorage quota or access errors shouldn't break the composer.
   }

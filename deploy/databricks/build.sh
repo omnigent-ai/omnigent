@@ -3,12 +3,15 @@
 # deployment of Omnigent.
 #
 # Inputs:
-#   SKIP_WEB_UI=1   Skip the web SPA build for API-only deployments.
+#   SKIP_WEB_UI=1         Skip the web SPA build for API-only deployments.
+#   EXTERNALIZE_WEB_UI=1  Build the SPA, then archive it outside the wheel so
+#                         the Databricks Apps source sync uploads one file.
 #
 # Outputs:
 #   dist/omnigent-<version>-py3-none-any.whl
 #   dist/omnigent_client-<version>-py3-none-any.whl
 #   dist/omnigent_ui_sdk-<version>-py3-none-any.whl
+#   dist/web-ui.tar.gz    SPA archive, when EXTERNALIZE_WEB_UI=1
 
 set -euo pipefail
 
@@ -28,12 +31,25 @@ rm -rf omnigent/server/static/web-ui dist build omnigent.egg-info
 
 if [[ "${SKIP_WEB_UI:-}" != "1" ]]; then
     echo "==> Building web SPA into omnigent/server/static/web-ui/"
-    cd web
-    npm install
-    npm run build
-    cd "${REPO_ROOT}"
+    pnpm install --frozen-lockfile --filter web
+    pnpm --filter web run build
+    if [[ "${EXTERNALIZE_WEB_UI:-}" == "1" ]]; then
+        # One archive avoids a Workspace round-trip for every one of the
+        # SPA's hundreds of hashed chunks. The fixed destination also means
+        # no caller-controlled path is ever passed to rm or mv.
+        echo "==> Packing SPA into dist/web-ui.tar.gz (excluded from wheel)"
+        mkdir -p "${REPO_ROOT}/dist"
+        rm -rf "${REPO_ROOT}/dist/web-ui" "${REPO_ROOT}/dist/web-ui.tar.gz"
+        tar -czf "${REPO_ROOT}/dist/web-ui.tar.gz" \
+            -C "${REPO_ROOT}/omnigent/server/static/web-ui" .
+        rm -rf "${REPO_ROOT}/omnigent/server/static/web-ui"
+        # Prevent setup.py from putting the archived SPA back into the wheel.
+        export OMNIGENT_SKIP_WEB_UI=true
+    fi
 else
     echo "==> SKIP_WEB_UI=1: skipping web build"
+    # The wheel build hook uses its own opt-out for API-only packages.
+    export OMNIGENT_SKIP_WEB_UI=true
 fi
 
 echo "==> Building omnigent-client wheel"

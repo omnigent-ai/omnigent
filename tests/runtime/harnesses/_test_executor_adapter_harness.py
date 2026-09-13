@@ -149,6 +149,35 @@ def _build_error() -> Executor:
     return executor
 
 
+def _build_error_with_usage() -> Executor:
+    """
+    MockExecutor scripted with an :class:`ExecutorError` carrying usage.
+
+    Mirrors a turn that failed after the model call started: the executor
+    observed the prompt size before dying, so the error carries it and the
+    scaffold's ``response.failed`` terminal event must surface it (else the
+    context-occupancy meter freezes at the previous turn's value).
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            ExecutorError(
+                message="mock error after usage observed",
+                usage={
+                    "input_tokens": 400,
+                    "output_tokens": 0,
+                    "total_tokens": 400,
+                    "context_tokens": 100_000,
+                    "model": "mock-model",
+                },
+            )
+        ]
+    )
+    return executor
+
+
 def _build_cancelled() -> Executor:
     """
     MockExecutor scripted with a provider-side :class:`TurnCancelled`.
@@ -176,10 +205,31 @@ def _build_capture_messages() -> Executor:
     return _CapturingExecutor()
 
 
+def _build_pr_tracking() -> Executor:
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            ToolCallRequest(
+                name="Bash", args={"command": "gh pr create"}, metadata={"call_id": "pr1"}
+            ),
+            ToolCallComplete(
+                name="Bash",
+                status=ToolCallStatus.SUCCESS,
+                result="https://github.com/example/sdk/pull/42",
+                metadata={"call_id": "pr1"},
+            ),
+            TurnComplete(response="Created"),
+        ]
+    )
+    return executor
+
+
 _SCRIPTS: dict[str, Callable[[], Executor]] = {
+    "pr_tracking": _build_pr_tracking,
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
     "error": _build_error,
+    "error_with_usage": _build_error_with_usage,
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
 }

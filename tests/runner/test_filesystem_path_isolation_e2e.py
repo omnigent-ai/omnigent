@@ -10,6 +10,7 @@ leak or mutate out-of-root content.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -125,19 +126,66 @@ async def test_traversal_rejected_on_mutating_methods(
     ],
     ids=["read", "write", "delete"],
 )
-async def test_absolute_path_rejected(
-    client: httpx.AsyncClient,
+async def test_absolute_path_refused_when_the_environment_is_confined(
+    planted: Path,
     method: str,
     json_body: dict | None,
 ) -> None:
-    """An absolute path (encoded leading slash) is rejected on read/write/delete."""
-    resp = await client.request(
-        method,
-        f"{_BASE}/filesystem/" + "%2Fetc%2Fpasswd",
-        json=json_body,
+    """A CONFINED environment refuses an absolute path on read/write/delete.
+
+    This is the runner's own check, made without knowing who is asking: the
+    sandbox policy declares no grant covering ``/etc/passwd``, so the request
+    is refused whatever the caller's identity. (The unconfined case is the
+    next test -- there the runner defers, and the SERVER decides, gating
+    absolute paths on session ownership. See
+    ``tests/server/routes/test_shell_permission_gate.py``.)
+    """
+    workspace = planted / "workspace"
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
     )
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["code"] == "invalid_path"
+    assert os_env is not None
+    # Declare the environment confined. The routing decision under test reads
+    # the policy, so this exercises the confined branch without needing a
+    # platform sandbox backend (bwrap is Linux-only).
+    os_env.sandbox = replace(os_env.sandbox, active=True)
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_iso"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as confined:
+        resp = await confined.request(
+            method,
+            f"{_BASE}/filesystem/" + "%2Fetc%2Fpasswd",
+            json=json_body,
+        )
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "path_unreachable"
+
+
+@pytest.mark.asyncio
+async def test_absolute_path_served_when_the_environment_is_unconfined(
+    client: httpx.AsyncClient,
+) -> None:
+    """An UNCONFINED environment serves an absolute path.
+
+    The runner cannot see the caller, so it does not decide who may browse
+    outside the workspace -- the server does, and requires session ownership.
+    Pinned here so the split is explicit: this endpoint is NOT the identity
+    boundary, and reading it as one would be a mistake.
+    """
+    resp = await client.get(f"{_BASE}/filesystem/" + "%2Fetc%2Fhosts")
+
+    assert resp.status_code == 200, resp.text
 
 
 @pytest.mark.asyncio

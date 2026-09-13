@@ -5,17 +5,23 @@ import {
   CODE_FONT_SIZE_DEFAULT,
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
+  CODE_FONT_WEIGHT_DEFAULT,
+  CODE_FONT_WEIGHT_HEAVIER,
+  CODE_FONT_WEIGHT_NORMAL,
   codeFontFamilyForEditor,
   readCodeFont,
   readCodeFontFamily,
   readCodeFontSizePx,
+  readCodeFontWeight,
   subscribeCodeFont,
   writeCodeFontFamily,
   writeCodeFontSizePx,
+  writeCodeFontWeight,
 } from "./codeFontPreferences";
 
 const SIZE_STORAGE_KEY = "omnigent:code-font-size";
 const FAMILY_STORAGE_KEY = "omnigent:code-font-family";
+const WEIGHT_STORAGE_KEY = "omnigent:code-font-weight";
 
 afterEach(() => {
   localStorage.clear();
@@ -145,7 +151,11 @@ describe("codeFontPreferences — pub/sub", () => {
     writeCodeFontSizePx(20);
     // The callback receives the freshly persisted font so a mounted editor can
     // re-apply it live without re-reading storage itself.
-    expect(cb).toHaveBeenCalledWith({ sizePx: 20, family: "" });
+    expect(cb).toHaveBeenCalledWith({
+      sizePx: 20,
+      family: "",
+      weight: CODE_FONT_WEIGHT_DEFAULT,
+    });
 
     unsubscribe();
   });
@@ -155,7 +165,11 @@ describe("codeFontPreferences — pub/sub", () => {
     const unsubscribe = subscribeCodeFont(cb);
 
     writeCodeFontFamily("Fira Code");
-    expect(cb).toHaveBeenCalledWith({ sizePx: CODE_FONT_SIZE_DEFAULT, family: "Fira Code" });
+    expect(cb).toHaveBeenCalledWith({
+      sizePx: CODE_FONT_SIZE_DEFAULT,
+      family: "Fira Code",
+      weight: CODE_FONT_WEIGHT_DEFAULT,
+    });
 
     unsubscribe();
   });
@@ -178,7 +192,11 @@ describe("codeFontPreferences — pub/sub", () => {
     writeCodeFontSizePx(999);
     // Subscribers see the same clamped value that was persisted, so the live
     // widget and a later reload agree.
-    expect(cb).toHaveBeenCalledWith({ sizePx: CODE_FONT_SIZE_MAX, family: "" });
+    expect(cb).toHaveBeenCalledWith({
+      sizePx: CODE_FONT_SIZE_MAX,
+      family: "",
+      weight: CODE_FONT_WEIGHT_DEFAULT,
+    });
 
     unsubscribe();
   });
@@ -193,7 +211,11 @@ describe("codeFontPreferences — pub/sub", () => {
     });
     try {
       writeCodeFontSizePx(19);
-      expect(cb).toHaveBeenCalledWith({ sizePx: 19, family: "" });
+      expect(cb).toHaveBeenCalledWith({
+        sizePx: 19,
+        family: "",
+        weight: CODE_FONT_WEIGHT_DEFAULT,
+      });
     } finally {
       setItem.mockRestore();
     }
@@ -208,7 +230,75 @@ describe("codeFontPreferences — pub/sub", () => {
     });
     try {
       writeCodeFontFamily("Fira Code");
-      expect(cb).toHaveBeenCalledWith({ sizePx: CODE_FONT_SIZE_DEFAULT, family: "Fira Code" });
+      expect(cb).toHaveBeenCalledWith({
+        sizePx: CODE_FONT_SIZE_DEFAULT,
+        family: "Fira Code",
+        weight: CODE_FONT_WEIGHT_DEFAULT,
+      });
+    } finally {
+      setItem.mockRestore();
+    }
+    unsubscribe();
+  });
+});
+
+describe("codeFontPreferences — weight", () => {
+  it("returns the default when nothing is stored", () => {
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_DEFAULT);
+  });
+
+  it("round-trips the supported presets", () => {
+    writeCodeFontWeight(CODE_FONT_WEIGHT_HEAVIER);
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_HEAVIER);
+    expect(localStorage.getItem(WEIGHT_STORAGE_KEY)).toBe(JSON.stringify(500));
+
+    writeCodeFontWeight(CODE_FONT_WEIGHT_NORMAL);
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_NORMAL);
+  });
+
+  it("maps legacy stored weights to the supported presets", () => {
+    localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(1500));
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_HEAVIER);
+
+    localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(10));
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_NORMAL);
+  });
+
+  it("falls back to the default for malformed values", () => {
+    localStorage.setItem(WEIGHT_STORAGE_KEY, "}{not json");
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_DEFAULT);
+
+    localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify("bold"));
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_DEFAULT);
+  });
+
+  it("notifies subscribers when the weight changes", () => {
+    const cb = vi.fn();
+    const unsubscribe = subscribeCodeFont(cb);
+
+    writeCodeFontWeight(CODE_FONT_WEIGHT_HEAVIER);
+    expect(cb).toHaveBeenCalledWith({
+      sizePx: CODE_FONT_SIZE_DEFAULT,
+      family: "",
+      weight: CODE_FONT_WEIGHT_HEAVIER,
+    });
+
+    unsubscribe();
+  });
+
+  it("live-applies the intended weight when persistence fails", () => {
+    const cb = vi.fn();
+    const unsubscribe = subscribeCodeFont(cb);
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("QuotaExceededError");
+    });
+    try {
+      writeCodeFontWeight(500);
+      expect(cb).toHaveBeenCalledWith({
+        sizePx: CODE_FONT_SIZE_DEFAULT,
+        family: "",
+        weight: 500,
+      });
     } finally {
       setItem.mockRestore();
     }
@@ -217,9 +307,14 @@ describe("codeFontPreferences — pub/sub", () => {
 });
 
 describe("readCodeFont", () => {
-  it("reads size and family together", () => {
+  it("reads size, family, and weight together", () => {
     writeCodeFontSizePx(15);
     writeCodeFontFamily("Menlo");
-    expect(readCodeFont()).toEqual({ sizePx: 15, family: "Menlo" });
+    writeCodeFontWeight(CODE_FONT_WEIGHT_HEAVIER);
+    expect(readCodeFont()).toEqual({
+      sizePx: 15,
+      family: "Menlo",
+      weight: CODE_FONT_WEIGHT_HEAVIER,
+    });
   });
 });

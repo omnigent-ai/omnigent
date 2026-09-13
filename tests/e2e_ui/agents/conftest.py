@@ -29,7 +29,7 @@ import pytest
 
 # Private helpers from the parent conftest — same import pattern the
 # sibling chat tests use for ``open_right_rail`` / ``TwoAgentChatSession``.
-from tests.e2e_ui.conftest import _ensure_runner_online, _server_state
+from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 _JOKE_DIRECTOR_NAME = "joke_director"
 
@@ -44,12 +44,14 @@ class JokeSubagentsSession:
         e.g. ``"scarecrow-3a7f9c2e1b"``.
     :param code_two: Per-run nonce only ``comic_two``'s joke carries,
         e.g. ``"sleepmode-9c2e1b3a7f"``.
+    :param routing_token: Per-run token that selects the parent's mock queue.
     """
 
     base_url: str
     session_id: str
     code_one: str
     code_two: str
+    routing_token: str
 
 
 def _joke_director_yaml(code_one: str, code_two: str) -> str:
@@ -122,21 +124,77 @@ tools:
 @pytest.fixture
 def joke_subagents_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[JokeSubagentsSession]:
     """Create a runner-bound session for the two-comedian joke director.
 
     Same runner-respawn + bind contract as ``two_agent_chat_session`` in
-    the parent conftest. Yields the per-run nonces so a test can assert
-    that the sub-agents' jokes (and only the sub-agents') reached the UI.
+    the parent conftest. Separate content-routed mock queues drive the
+    parent and each comedian so concurrent child turns cannot race for a
+    shared response. The original model ids remain in the agent spec, so
+    a future real-gateway job can reuse the same journey.
 
     :param live_server: Spawned server fixture from the parent conftest.
+    :param mock_llm_server_url: Mock LLM server used by credential-free runs.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: A :class:`JokeSubagentsSession` handle.
     """
     code_one = f"scarecrow-{uuid.uuid4().hex[:10]}"
     code_two = f"kitkat-{uuid.uuid4().hex[:10]}"
+    suffix = uuid.uuid4().hex[:10]
+    routing_token = f"joke-parent-{suffix}"
+    comic_one_token = f"joke-comic-one-{suffix}"
+    comic_two_token = f"joke-comic-two-{suffix}"
     yaml_text = _joke_director_yaml(code_one, code_two)
+
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_comic_one",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "comic_one",
+                                "title": "comic_one",
+                                "args": f"Tell a joke. Routing marker: {comic_one_token}",
+                            }
+                        ),
+                    },
+                    {
+                        "call_id": "call_comic_two",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "comic_two",
+                                "title": "comic_two",
+                                "args": f"Tell a joke. Routing marker: {comic_two_token}",
+                            }
+                        ),
+                    },
+                ]
+            },
+            {"text": "Dispatched both comedians; waiting for their replies."},
+            {"text": f"The comedians replied with joke codes {code_one} and {code_two}."},
+        ],
+        key=routing_token,
+        match=routing_token,
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": f"Scarecrow joke. Joke code: {code_one}."}],
+        key=comic_one_token,
+        match=comic_one_token,
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": f"Computer joke. Joke code: {code_two}."}],
+        key=comic_two_token,
+        match=comic_two_token,
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
@@ -171,6 +229,7 @@ def joke_subagents_session(
             session_id=session_id,
             code_one=code_one,
             code_two=code_two,
+            routing_token=routing_token,
         )
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)

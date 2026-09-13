@@ -209,7 +209,7 @@ environment:
 ```bash
 uv --no-config run --frozen \
   --default-index https://pypi-proxy.cloud.databricks.com/simple/ \
-  --extra dev \
+  --group test \
   pytest tests/codex_parity --codex-parity --codex-bin "$(which codex)" -q
 ```
 

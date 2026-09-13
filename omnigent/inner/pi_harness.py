@@ -33,11 +33,14 @@ Env vars read at startup:
 - ``HARNESS_PI_GATEWAY_BASE_URLS``: JSON object of gateway base
   URLs keyed by model family, e.g.
   ``{"claude": "https://example.databricks.com/ai-gateway/anthropic"}``.
+- ``HARNESS_PI_GATEWAY_OPENAI_WIRE_API``: ``"responses"`` or ``"chat"``
+  for a configured generic OpenAI-compatible provider.
 - ``HARNESS_PI_CWD``: working directory the executor launches
   the Pi CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE`` if set,
   then to the subprocess's inherited cwd.
-- ``HARNESS_PI_PATH``: absolute path to a ``pi`` CLI binary.
-  ``None`` searches ``PATH``.
+- ``OMNIGENT_PI_PATH``: absolute path to a ``pi`` CLI binary.
+  ``None`` searches ``PATH``. (Legacy ``HARNESS_PI_PATH`` still honored,
+  deprecated.)
 - ``HARNESS_PI_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
   (from :func:`dataclasses.asdict`). When unset, the wrap
   falls back to a default
@@ -55,7 +58,7 @@ Env vars read at startup:
   bundle skill.
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<name>/`` for the
+  bundled skills from ``<bundle>/skills/<dir>/`` for the
   ``"all"`` and named-list cases. Unset for agents without a
   bundled-skill directory.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
@@ -71,6 +74,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.pi_executor import PiExecutor
@@ -86,13 +90,17 @@ _ENV_GATEWAY = "HARNESS_PI_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_PI_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_PI_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_PI_CWD"
-_ENV_PI_PATH = "HARNESS_PI_PATH"
+_ENV_PI_PATH = "OMNIGENT_PI_PATH"
+# Deprecated alias — read via resolve_harness_path() which warns on use.
+# Remove this constant and the HARNESS_PI_PATH read in v0.8.0.
+_LEGACY_ENV_PI_PATH = "HARNESS_PI_PATH"
 _ENV_OS_ENV = "HARNESS_PI_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_PI_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_PI_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
 _ENV_GATEWAY_BASE_URLS = "HARNESS_PI_GATEWAY_BASE_URLS"
+_ENV_GATEWAY_OPENAI_WIRE_API = "HARNESS_PI_GATEWAY_OPENAI_WIRE_API"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_PI_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
 
@@ -201,7 +209,7 @@ def _build_pi_executor() -> Executor:
 
     :returns: A configured :class:`PiExecutor` instance.
     :raises ImportError: If the ``pi`` CLI isn't on PATH and
-        ``HARNESS_PI_PATH`` isn't set — the inner executor's
+        ``OMNIGENT_PI_PATH`` (legacy ``HARNESS_PI_PATH``) isn't set — the inner executor's
         constructor surfaces this as a clear ImportError.
     :raises OSError: If ``HARNESS_PI_GATEWAY`` is set but
         credentials are missing — the inner executor's
@@ -215,12 +223,13 @@ def _build_pi_executor() -> Executor:
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE"),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
-        pi_path=os.environ.get(_ENV_PI_PATH),
+        pi_path=resolve_harness_path("pi"),
         gateway=_parse_truthy(_ENV_GATEWAY, default=False),
         databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
         base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
         base_urls_override=_resolve_gateway_base_urls(),
+        openai_wire_api=os.environ.get(_ENV_GATEWAY_OPENAI_WIRE_API) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         bundle_dir=bundle_dir,
         agent_name=agent_name,

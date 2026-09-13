@@ -23,8 +23,9 @@ The `render.yaml` blueprint at the repo root defines:
 - **omnigent-db** (`basic-256mb` managed Postgres) — `DATABASE_URL` is injected
   into the service automatically
 - **artifact-data** (10 GB persistent disk) — mounted at `/data` so server
-  config, first-boot credentials, cookie secrets, and agent artifacts survive
-  redeploys. Artifacts live under `/data/artifacts`.
+  config, the auto-minted cookie secret, and agent artifacts survive redeploys.
+  Artifacts live under `/data/artifacts`. (Account rows and password hashes
+  live in the managed Postgres, not on the disk.)
 
 ## Quickstart (built-in accounts — the default)
 
@@ -34,18 +35,22 @@ mints its own cookie secret and auto-detects its public URL from Render.
 
 1. Click the Deploy to Render button above → **Apply**. Wait ~3–5 min for the
    image pull + health check.
-2. **Get the admin password:** open the service → **Logs** and find the
-   first-boot block:
-   ```
-   ✓ Created initial admin account (accounts auth provider).
-       password: <generated>
-   ```
-   (also written to `/data/admin-credentials` on the disk; printed once).
-3. Open your `https://<service>.onrender.com` URL, log in as the admin, and
-   invite teammates from **Members** in the web UI.
+2. **Create the first admin.** No credentials are auto-generated. Open your
+   `https://<service>.onrender.com` URL — a fresh instance shows a
+   Create-admin form where you pick your own username + password. (First-boot
+   **Logs** also print a "No admin yet" line with that URL.)
+3. Log in as the admin you just created, and invite teammates from **Members**
+   in the web UI.
 
-> To set a known admin password instead of the generated one, add
-> `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` in the dashboard before first boot.
+> To create the admin directly instead of claiming it through the web form
+> (e.g. a headless deploy), add `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` in the
+> dashboard before first boot.
+
+> **Security note for public deployments:** `POST /auth/setup` is
+> unauthenticated while no password-bearing account exists, so an instance
+> exposed before you reach the Create-admin form can be claimed by the first
+> visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`, or complete setup
+> promptly after the deploy goes live.
 
 ## Use your own IdP instead (OIDC)
 

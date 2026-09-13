@@ -17,22 +17,23 @@
   background-color: rgba(250, 204, 21, 0.3);
 }
 
-/* In dark mode, paint the editor surface with the app's --card tone instead of
-   github-dark's default, so the code editor / diff viewer blend into the card
-   they sit in. Monaco fills .monaco-editor(-background) from its own
-   --vscode-editor-background variable (set per-theme to a single concrete
-   color); rebinding that variable to var(--card) keeps the background tied to
-   the token so it tracks any change to --card with no JS. The .dark prefix
-   outranks Monaco's own single-class rule, and light mode keeps github-light.
-
-   The line-number gutter (.margin) paints from a separate variable,
-   --vscode-editorGutter-background. github-dark doesn't set editorGutter.background
-   explicitly, so Monaco resolves it from editor.background to a concrete hex at
-   theme-registration time — meaning it ignores our editor-background override
-   unless we rebind it too. */
-.dark .monaco-editor,
-.dark .monaco-diff-editor,
-.dark .monaco-component {
+/* Paint Monaco surfaces with the active Omnigent card tone so the file editor
+   follows both the app mode and palette instead of the syntax theme's fixed
+   background. The gutter uses a separate Monaco variable. */
+html .monaco-editor,
+html .monaco-diff-editor,
+html .monaco-component {
   --vscode-editor-background: var(--card);
   --vscode-editorGutter-background: var(--card);
+}
+
+/* Suppress the keyboard-hint tooltips Monaco attaches to its widget buttons
+   (e.g. the find widget's "Close (Escape)"). They render detached on <body> and
+   overlap the small floating find widget, reading as flaky. Monaco is the only
+   source of .monaco-hover in this app (the rest of the UI uses its own tooltip),
+   and this editor ships no language services, so no useful content hovers are
+   lost. The pointer caret element is hidden alongside it. */
+.monaco-hover.workbench-hover,
+.workbench-hover-pointer {
+  display: none !important;
 }

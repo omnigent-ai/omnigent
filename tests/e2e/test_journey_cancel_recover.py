@@ -34,6 +34,7 @@ from tests.e2e.helpers import final_assistant_text
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
+@pytest.mark.compat_smoke
 def test_multi_turn_recovery_journey(
     http_client: httpx.Client,
     live_runner_id: str,

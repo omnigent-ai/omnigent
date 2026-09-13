@@ -8,16 +8,50 @@ import asyncio
 import faulthandler
 import gc
 import inspect
+import json
 import logging
 import os
 import pathlib
+import shutil
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
 from tests import _model_pools
+
+
+@pytest.fixture
+def short_tmp_parent() -> Iterator[pathlib.Path]:
+    """A short-pathed temp dir under ``/tmp`` for Unix-socket-binding tests.
+
+    macOS caps an ``AF_UNIX`` path at ~103 bytes and its ``$TMPDIR`` is already
+    ~48 bytes, so pytest's ``tmp_path`` (which embeds the test name) overflows
+    before a socket filename is appended (issue #4279). Tests that bind a real
+    Unix socket — the private tmux server, the egress proxy — must place it
+    under a short parent. Production sockets already live under a short
+    ``$TMPDIR/omnigent-...`` path, so this is a test-path artifact only.
+    """
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="omni-inner-", dir="/tmp"))
+    try:
+        yield parent
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep executor unit tests deterministic without catalog network access."""
+
+    def _resolve(provider_name: str, *, family: str, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(model_id=f"catalog-{provider_name}-{family}-default")
+
+    monkeypatch.setattr("omnigent.models.model_catalog.resolve_catalog_model", _resolve)
+
 
 # Diagnostic: dump every thread's stack every 90s. The dispatcher's
 # stderr lands in the workflow log directly, but xdist workers route
@@ -137,6 +171,65 @@ async def _hang_diagnostic_task_dumper() -> asyncio.AsyncGenerator[None, None]:
     finally:
         if handle is not None:
             handle.cancel()
+
+
+def advertise_router(
+    router_dir: pathlib.Path,
+    *,
+    session_id: str | None = "conv_abc",
+    **extra: object,
+) -> pathlib.Path:
+    """Write a subagent-router advertisement into *router_dir*.
+
+    Shared by the claude and codex router-hook suites. The filename comes
+    from the hook script's own ``ADVERTISEMENT_FILE`` constant, so renaming
+    it fails these tests instead of quietly making every advertisement
+    invisible to the hook under test.
+
+    :param router_dir: Bridge/router directory the hook is pointed at.
+    :param session_id: Baked-in session id; ``None`` omits the key so the
+        hook has to fall back to its env/bridge-config sources.
+    :param extra: Extra advertisement keys to merge in.
+    :returns: *router_dir*, for use as the hook's ``--bridge-dir``.
+    """
+    from omnigent.inner.hook_scripts import subagent_router
+
+    # A live ``pid`` by default: the hook rejects an advertisement without
+    # one, since the runner always writes it.
+    payload: dict[str, object] = {
+        "url": "http://127.0.0.1:1/",
+        "token": "t0k",
+        "pid": os.getpid(),
+        **extra,
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    (router_dir / subagent_router.ADVERTISEMENT_FILE).write_text(json.dumps(payload))
+    return router_dir
+
+
+def advertise_relay_tools(bridge_dir: pathlib.Path, *tool_names: str) -> pathlib.Path:
+    """Write a ``tool_relay.json`` advertising *tool_names* into *bridge_dir*.
+
+    The hook reads this to decide whether a deny reason may name
+    ``sys_session_create``. The filename comes from the hook script's own
+    constant so a rename fails these tests instead of silently reading nothing.
+
+    :param bridge_dir: Bridge directory the hook is pointed at.
+    :param tool_names: Omnigent tool names to advertise; none writes an empty
+        list, which is how "the session holds no spawn tool" is expressed.
+    :returns: *bridge_dir*, for use as the hook's ``--bridge-dir``.
+    """
+    from omnigent.inner.hook_scripts import subagent_router
+
+    payload = {
+        "url": "http://127.0.0.1:2/",
+        "token": "relay-t0k",
+        "pid": os.getpid(),
+        "tools": [{"name": name, "input_schema": {"type": "object"}} for name in tool_names],
+    }
+    (bridge_dir / subagent_router._TOOL_RELAY_FILE).write_text(json.dumps(payload))
+    return bridge_dir
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:

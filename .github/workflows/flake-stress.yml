@@ -157,7 +157,7 @@ jobs:
       - name: Install dependencies
         # Matches ci.yml; ``--extra all`` pulls the harness SDKs so
         # executor adapters import at collection time.
-        run: uv sync --extra all --extra dev
+        run: uv sync --extra all --group test
 
       - name: Run pytest target
         # Inputs validated by prep. Word-splitting on $TEST_TARGET /

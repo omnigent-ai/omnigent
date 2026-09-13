@@ -1154,6 +1154,129 @@ def test_credential_proxy_https_bearer_swaps_injected_env_token(
     assert real_secret not in injected
 
 
+class _FakeDatabricksConfig:
+    """Stand-in SDK ``Config`` exposing a ``host`` + a static token."""
+
+    def __init__(self, host: str, token: str) -> None:
+        self.host = host
+        self._token = token
+
+    def authenticate(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"}
+
+
+def _databricks_cfg_probe(target_url: str) -> str:
+    """
+    Build a probe that authenticates using the materialized Databricks config.
+
+    It reads the placeholder token from ``DATABRICKS_CONFIG_FILE`` (the
+    file the parent materialized into the sandbox), sends it as a Bearer
+    header through ``HTTP_PROXY`` to *target_url*, and prints
+    ``STATUS <code>``. This mirrors how the ``databricks`` CLI would emit
+    ``Authorization: Bearer <placeholder>`` from its config file.
+
+    :param target_url: Absolute http URL of the local upstream.
+    :returns: Python source for use with :func:`_python_probe_argv`.
+    """
+    return "\n".join(
+        [
+            "import os, base64, http.client, configparser",
+            "from urllib.parse import urlparse",
+            "cfg = configparser.ConfigParser()",
+            "cfg.read(os.environ['DATABRICKS_CONFIG_FILE'])",
+            "token = cfg['prof']['token']",
+            "p = urlparse(os.environ['HTTP_PROXY'])",
+            "headers = {'Connection': 'close', 'Authorization': 'Bearer ' + token}",
+            "if p.username and p.password:",
+            "    creds = f'{p.username}:{p.password}'.encode()",
+            "    headers['Proxy-Authorization'] = 'Basic ' + base64.b64encode(creds).decode()",
+            "conn = http.client.HTTPConnection(p.hostname, p.port, timeout=30)",
+            f"conn.request('GET', '{target_url}', headers=headers)",
+            "resp = conn.getresponse()",
+            "print('STATUS', resp.status)",
+            "conn.close()",
+        ]
+    )
+
+
+def test_credential_proxy_databricks_cli_materializes_cfg_and_swaps(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    databricks_cli: placeholder cfg is materialized and the proxy swaps the token.
+
+    Full path: a ``databricks_cli`` policy resolves the (faked) profile to
+    a local upstream host + real token, materializes a placeholder-only
+    Databricks config and points ``DATABRICKS_CONFIG_FILE`` at it. The
+    operator lists the workspace host in ``egress_rules`` (same as every
+    other credential-proxy type — the proxy does NOT widen egress on its
+    own). The probe reads the placeholder token from that cfg and sends it
+    as a Bearer through the proxy; the upstream must receive the REAL
+    token. We assert:
+
+    - the upstream got the real token (swap fired via the refreshing
+      provider);
+    - the sandbox cfg holds only the ``oa_cred_*`` placeholder, never the
+      real token.
+    """
+    from omnigent.inner.datamodel import DatabricksProfileBinding, DatabricksProxySpec
+
+    real_token = "dbx-real-oauth-token-7c2"
+    upstream = _CapturingUpstream()
+    host_url = f"http://127.0.0.1:{upstream.port}"
+    monkeypatch.setattr(
+        "omnigent.inner.credential_proxy._databricks_config",
+        lambda _profile: _FakeDatabricksConfig(host_url, real_token),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.credential_proxy._databricks_authenticate",
+        lambda config: config.authenticate()["Authorization"].removeprefix("Bearer "),
+    )
+
+    spec = active_sandbox_spec_factory(
+        # The operator must list the workspace host explicitly — the
+        # credential proxy does not auto-add it (consistent with the
+        # other credential-proxy types).
+        egress_rules=["* 127.0.0.1/**"],
+        egress_allow_private_destinations=True,
+        credential_proxy=CredentialProxySpec(
+            entries=[],
+            databricks=DatabricksProxySpec(profiles=[DatabricksProfileBinding(profile="prof")]),
+        ),
+    )
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
+    )
+    probe = _databricks_cfg_probe(f"{host_url}/probe")
+    try:
+        result = run_async(os_env.shell(_python_probe_argv(probe)))
+        cfg_dump = run_async(os_env.shell('cat "$DATABRICKS_CONFIG_FILE"'))
+    finally:
+        os_env.close()
+        upstream.close()
+
+    assert result["exit_code"] == 0, (
+        f"Probe failed. stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
+    )
+    assert "STATUS 200" in result["stdout"], (
+        f"Did not reach upstream (the workspace host listed in egress_rules "
+        f"must make 127.0.0.1 reachable): {result['stdout']!r}"
+    )
+    assert upstream.captured == [f"Bearer {real_token}"], (
+        "Upstream MUST receive the real token after the proxy swap. "
+        f"Captured: {upstream.captured!r}."
+    )
+    # The materialized cfg carries only the placeholder — never the real token.
+    assert f"host = {host_url}" in cfg_dump["stdout"]
+    assert SYNTHETIC_CREDENTIAL_PREFIX in cfg_dump["stdout"]
+    assert real_token not in cfg_dump["stdout"], (
+        f"real token leaked into the sandbox Databricks config: {cfg_dump['stdout']!r}"
+    )
+
+
 # Module guard so the helpers don't trigger lint warnings about
 # unused module-level imports when no test in this file references
 # them directly.

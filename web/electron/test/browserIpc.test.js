@@ -67,6 +67,7 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
     reload: () => calls.push("reload"),
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
+    getURL: () => "https://example.com/restored",
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -109,6 +110,7 @@ function nonceFromScripts(scripts) {
 function makeRegistry(conversationId, webContents) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
+  const suppressedCalls = []; // booleans passed to setSuppressed, in order
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
@@ -119,7 +121,12 @@ function makeRegistry(conversationId, webContents) {
       return { ok: true, created: true, entry };
     },
     setActive: () => ({ ok: true }),
+    setSuppressed: (s) => {
+      suppressedCalls.push(s);
+      return { ok: true };
+    },
     close: () => ({ ok: true, removed: true }),
+    suppressedCalls,
   };
 }
 
@@ -139,6 +146,24 @@ function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
   return { ipcMain, registry, wc, sent, event };
 }
 
+it("restores the URL and history state for the requested browser tab only", () => {
+  const viewId = "browser-tab:conv_1:tab-two";
+  const { ipcMain, event } = setup({
+    conversationId: viewId,
+    webContents: makeWebContents({ canBack: true }),
+  });
+  assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
+    exists: true,
+    url: "https://example.com/restored",
+    canGoBack: true,
+    canGoForward: false,
+  });
+  assert.deepEqual(
+    ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
+    { exists: false },
+  );
+});
+
 describe("browserIpc — trust gate", () => {
   it("registers every browser-* channel", () => {
     const { ipcMain } = setup();
@@ -146,6 +171,7 @@ describe("browserIpc — trust gate", () => {
     for (const ch of [
       "omnigent:browser-open-or-navigate",
       "omnigent:browser-set-active",
+      "omnigent:browser-set-suppressed",
       "omnigent:browser-resize",
       "omnigent:browser-screenshot",
       "omnigent:browser-execute",
@@ -178,6 +204,24 @@ describe("browserIpc — trust gate", () => {
       assert.equal(r.ok, false, `${channels[i]} should be gated`);
       assert.match(r.error, /connected server's page/);
     });
+  });
+});
+
+describe("browserIpc — overlay suppression (#3980)", () => {
+  it("delegates set-suppressed to the registry with the boolean flag", async () => {
+    const { ipcMain, registry, event } = setup();
+    let r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: true });
+    assert.equal(r.ok, true);
+    r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: false });
+    assert.equal(r.ok, true);
+    assert.deepEqual(registry.suppressedCalls, [true, false]);
+  });
+
+  it("rejects an unpinned sender", async () => {
+    const { ipcMain, event } = setup({ pinned: false });
+    const r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: true });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /connected server's page/);
   });
 });
 

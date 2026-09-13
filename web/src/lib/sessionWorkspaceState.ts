@@ -1,24 +1,32 @@
 // Per-session UI state for the right "Workspace" rail, keyed by conversationId
 // so each session restores its own layout: whether the rail is open, its width,
-// the selected rail tab, and the set of open file tabs (plus which one is
-// active). A brand-new session (no stored entry) starts closed at the default
-// width with no open files.
+// the selected rail tab, the set of open file tabs, and the set of open shell
+// tabs (plus which one is active). A brand-new session (no stored `open`)
+// follows the Appearance Workspace panel default; width and tabs start empty.
+// Shell tabs restore to whichever terminals still exist — the AppShell prune
+// effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = ["files", "subagents", "terminals", "todos", "browser"];
+const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "subagents", "browser"];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected rail tab (Files / Agents / Shells / Tasks). */
+  /** The selected rail tab (Files / Changes / Agents). */
   rightRailTab?: RightRailTab;
   /** Ordered list of open file tabs. */
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
   selectedFilePath?: string | null;
+  /** Ordered list of open shell tabs (``terminalTabKey`` values). */
+  openTerminals?: string[];
+  /** The active shell tab (null = a file/scope view is active). */
+  selectedTerminalKey?: string | null;
+  openBrowsers?: string[];
+  selectedBrowserId?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -65,6 +73,27 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedFilePath === null || typeof record.selectedFilePath === "string") {
     state.selectedFilePath = record.selectedFilePath;
+  }
+  if (
+    Array.isArray(record.openTerminals) &&
+    record.openTerminals.every((k) => typeof k === "string")
+  ) {
+    state.openTerminals = record.openTerminals as string[];
+  }
+  if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
+    state.selectedTerminalKey = record.selectedTerminalKey;
+  }
+  if (Array.isArray(record.openBrowsers)) {
+    state.openBrowsers = [
+      ...new Set(
+        record.openBrowsers.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
+    state.selectedBrowserId = record.selectedBrowserId;
   }
   return state;
 }
@@ -116,6 +145,15 @@ export function writeSessionWorkspaceState(
   // Keep only the most-recent open-file tabs (tabs are appended in open order).
   if (next.openFiles && next.openFiles.length > MAX_OPEN_FILES) {
     next.openFiles = next.openFiles.slice(-MAX_OPEN_FILES);
+  }
+  // Same bound for shell tabs (also appended in open order).
+  if (next.openTerminals && next.openTerminals.length > MAX_OPEN_FILES) {
+    next.openTerminals = next.openTerminals.slice(-MAX_OPEN_FILES);
+  }
+  // Same bound for browser tabs. Native view creation enforces its own lower
+  // runtime cap; this keeps the persisted rail from growing without bound.
+  if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
+    next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
   }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).

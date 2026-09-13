@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from dataclasses import replace
 
 from tests.harness_bench.bench import run_bench
 from tests.harness_bench.events import LineSink
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
+from tests.harness_bench.native_tui_driver import NativeTuiDriver, requires_gateway
+from tests.harness_bench.probes import ALL_PROBES, PROBES_BY_NAME, CapabilityProbe
 from tests.harness_bench.profile import BenchProfile, resolve_profile
 from tests.harness_bench.report import render_json, render_markdown, render_table
 from tests.harness_bench.transport import driver_registry, resolve_transport_name
@@ -22,10 +25,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--harness",
         action="append",
-        metavar="NAME",
-        help="Harness to probe (repeatable). An official name, or a "
+        metavar="NAME[=MODEL]",
+        help="Harness to probe, optionally with a model override (repeatable). "
+        "NAME may be an official name, or a "
         "'module:attr' / 'module.ATTR' reference to a community "
-        "BenchProfile. Defaults to every official harness.",
+        "BenchProfile. Examples: 'codex' or "
+        "'codex=system.ai.gpt-5-6-sol'. Defaults to every official harness.",
+    )
+    parser.add_argument(
+        "--dimension",
+        action="append",
+        metavar="NAME[,NAME...]",
+        help="Capability dimension to run (repeatable or comma-separated), e.g. "
+        "'reasoning' or 'streaming,reasoning'. Basic turn is included as the "
+        "exercisability prerequisite. Defaults to every dimension.",
     )
     parser.add_argument(
         "--profile",
@@ -41,8 +54,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         dest="live",
         action="store_true",
         default=None,
-        help="Force the live layer (needs resolvable creds: --profile, a "
-        "configured ~/.omnigent profile, or ambient OPENAI_*).",
+        help="Force the live layer. Needs resolvable gateway creds (--profile, "
+        "a configured ~/.omnigent profile, or ambient OPENAI_*) unless every "
+        "selected harness authenticates its own model.",
     )
     parser.add_argument(
         "--no-live",
@@ -110,13 +124,71 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--markdown, else inferred from the extension (.json / .md), else plain text.",
     )
     parser.add_argument("--list", action="store_true", help="List official harnesses and exit.")
+    parser.add_argument(
+        "--list-dimensions", action="store_true", help="List capability dimensions and exit."
+    )
     return parser.parse_args(argv)
 
 
-def _resolve_profiles(names: list[str] | None) -> list[BenchProfile]:
-    if not names:
+def _resolve_profiles(values: list[str] | None) -> list[BenchProfile]:
+    if not values:
         return list(OFFICIAL_PROFILES.values())
-    return [resolve_profile(name) for name in names]
+    profiles: list[BenchProfile] = []
+    for value in values:
+        name, separator, model = value.partition("=")
+        name = name.strip()
+        model = model.strip()
+        if not name:
+            raise ValueError("--harness name cannot be empty")
+        if separator and not model:
+            raise ValueError(f"--harness {name!r} has an empty model override")
+        profile = resolve_profile(name)
+        profiles.append(replace(profile, model=model) if separator else profile)
+    return profiles
+
+
+def _resolve_probes(values: list[str] | None) -> list[CapabilityProbe]:
+    if not values:
+        return ALL_PROBES
+    requested = [
+        name.strip().lower().replace("-", "_") for value in values for name in value.split(",")
+    ]
+    requested = [name for name in requested if name]
+    unknown = sorted(set(requested) - PROBES_BY_NAME.keys())
+    if unknown:
+        known = ", ".join(PROBES_BY_NAME)
+        raise KeyError(f"unknown --dimension {unknown[0]!r}; known dimensions: {known}")
+    selected = set(requested)
+    if selected != {"basic_turn"}:
+        selected.add("basic_turn")
+    return [probe for probe in ALL_PROBES if probe.name in selected]
+
+
+def _all_own_auth_native(
+    profiles: list[BenchProfile], *, transport: str | None, fast: bool
+) -> bool:
+    """Whether every selected harness authenticates its own model.
+
+    Defers to :func:`~tests.harness_bench.native_tui_driver.requires_gateway`,
+    the predicate the driver itself uses, so this gate cannot drift from the one
+    ``NativeTuiDriver.unavailable`` applies a moment later.
+
+    :param profiles: The selected harness profiles.
+    :param transport: The ``--transport`` override, or ``None``.
+    :param fast: The ``--fast`` flag.
+    :returns: ``True`` when every profile lands on the native-tui driver with a
+        vendor that authenticates itself, so the run needs no gateway
+        credentials.
+    """
+    if not profiles:
+        return False
+    for profile in profiles:
+        resolved = resolve_transport_name(profile, override=transport, fast=fast)
+        if driver_registry().get(resolved) is not NativeTuiDriver:
+            return False
+        if requires_gateway(profile):
+            return False
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,9 +200,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name}\t{transport}\t{profile.model}")
         return 0
 
+    if args.list_dimensions:
+        for probe in ALL_PROBES:
+            print(f"{probe.name}\t{probe.title}\t{probe.priority.value}")
+        return 0
+
     try:
         profiles = _resolve_profiles(args.harness)
-    except KeyError as exc:
+        probes = _resolve_probes(args.dimension)
+    except (KeyError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -148,18 +226,31 @@ def main(argv: list[str] | None = None) -> int:
     from tests.harness_bench.runtime_env import bench_creds_skip_reason
 
     creds_skip = bench_creds_skip_reason(args.profile)
+    # Auto-live stays keyed on the gateway: with no explicit --live, a
+    # credential-less box gets the declared-only render rather than a surprise
+    # run that launches vendor CLIs.
     live = args.live if args.live is not None else creds_skip is None
+    if (
+        live
+        and creds_skip is not None
+        and _all_own_auth_native(profiles, transport=args.transport, fast=args.fast)
+    ):
+        # Every selected harness logs its own model in, so the run never reaches
+        # the gateway. NativeTuiDriver.unavailable() already waives the check for
+        # these; refusing here would skip them on any box without a gateway.
+        creds_skip = None
     if live and creds_skip is not None:
         print(f"--live needs resolvable gateway creds: {creds_skip}", file=sys.stderr)
         return 2
 
     sink = None
     if live:
-        sink = _select_progress_sink(args.rich)
+        sink = _select_progress_sink(args.rich, probes=probes)
 
     matrix = asyncio.run(
         run_bench(
             profiles,
+            probes=probes,
             databricks_profile=args.profile,
             live=live,
             transport=args.transport,
@@ -199,7 +290,7 @@ def _grid_already_shown(sink) -> bool:
     return bool(getattr(sink, "drew_grid", False))
 
 
-def _select_progress_sink(rich_flag: bool | None):
+def _select_progress_sink(rich_flag: bool | None, *, probes: list[CapabilityProbe] | None = None):
     """Pick the progress sink for a live run.
 
     ``rich_flag``: ``True`` forces rich, ``False`` forces plain, ``None`` =
@@ -213,7 +304,7 @@ def _select_progress_sink(rich_flag: bool | None):
     if rich_flag is not False:
         from tests.harness_bench.richreport import rich_sink_or_none
 
-        rich_sink = rich_sink_or_none(force=bool(rich_flag))
+        rich_sink = rich_sink_or_none(force=bool(rich_flag), probes=probes)
         if rich_sink is not None:
             return rich_sink
         if rich_flag is True:

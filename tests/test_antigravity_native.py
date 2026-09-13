@@ -16,15 +16,15 @@ from pathlib import Path
 import httpx
 import pytest
 
-import omnigent.antigravity_native as _mod
-import omnigent.antigravity_native_bridge as bridge_mod
+import omnigent.harnesses.antigravity_native.bridge as bridge_mod
+import omnigent.harnesses.antigravity_native.main as _mod
 from omnigent._wrapper_labels import ANTIGRAVITY_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
-from omnigent.antigravity_native import antigravity_terminal_resource_id
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     read_bridge_state,
     read_tmux_info,
 )
+from omnigent.harnesses.antigravity_native.main import antigravity_terminal_resource_id
 
 
 def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
@@ -48,7 +48,7 @@ def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     ``build_agy_launch`` uses ``agy_binary_path()`` as ``argv[0]`` unconditionally,
     and that raises ``RuntimeError`` when agy is absent from ``PATH`` — which is the
     case in CI. Patch the name at the site where ``build_agy_launch`` looks it up
-    (its own module), plus the re-export in :mod:`omnigent.antigravity_native` used
+    (its own module), plus the re-export in :mod:`omnigent.harnesses.antigravity_native.main` used
     by the direct-CLI launch path, so no test depends on agy being installed.
 
     This is autouse for the whole module; the real resolution / missing-agy
@@ -56,7 +56,9 @@ def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     ``tests/test_antigravity_native_launch.py`` (which patches ``shutil.which``
     directly), so nothing here needs the unstubbed binary lookup.
     """
-    monkeypatch.setattr("omnigent.antigravity_native_launch.agy_binary_path", lambda: "agy")
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.launch.agy_binary_path", lambda: "agy"
+    )
     monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
 
 
@@ -208,7 +210,7 @@ async def test_daemon_resume_reattaches_to_running_terminal(
     :param tmp_path: pytest temp dir, used to isolate the bridge root.
     :returns: None.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.bridge as bridge_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     terminal_id = antigravity_terminal_resource_id()
@@ -274,7 +276,7 @@ async def test_daemon_resume_cold_falls_through_to_launch(
     :param tmp_path: pytest temp dir, used to isolate the bridge root.
     :returns: None.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.bridge as bridge_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     terminal_id = antigravity_terminal_resource_id()
@@ -347,7 +349,7 @@ async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
     redundant terminal POST 500s). The pre-bind reattach check (resume path) cannot
     catch this because the runner only auto-creates AFTER the bind.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.bridge as bridge_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     terminal_id = antigravity_terminal_resource_id()
@@ -425,7 +427,7 @@ async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
     ``_prepare_antigravity_terminal_via_daemon``; this guards the local-server
     path.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.bridge as bridge_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     terminal_id = antigravity_terminal_resource_id()
@@ -617,6 +619,68 @@ async def test_launch_and_record_threads_headless_skip_flag(
         )
 
     assert "--dangerously-skip-permissions" in captured_args
+
+
+async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The CLI launch scopes agy to a per-session Gemini dir, like the runner path.
+
+    agy loads MCP servers and settings only from the dir its ``--gemini_dir``
+    points at. Without the flag this path read the user's real ``~/.gemini``: agy
+    saw no Omnigent relay (so no ``sys_*`` tools, #1194) and the survey/trust
+    seeds rewrote the user's own ``settings.json``. Asserts the relay config lands
+    in the isolated dir, the flag points at it, and ``HOME`` stays real so
+    keyring-backed auth (macOS Keychain) still resolves (#1477).
+    """
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    real_home = tmp_path / "real-home"
+    (real_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    user_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    user_settings.write_text('{"model":"gemini-3-pro"}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
+
+    captured_args: list[str] = []
+    captured_env: dict[str, str] = {}
+
+    def _capture_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured_args.extend(body["spec"]["args"])
+        captured_env.update(body["spec"]["env"])
+        return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
+
+    async with _mock_client(_capture_handler) as client:
+        await _mod._launch_and_record(
+            client,
+            session_id="conv_abc123",
+            bridge_id="bridge_gemini_dir_test",
+            conversation_id=_PLACEHOLDER_ID,
+            resume=False,
+            antigravity_args=(),
+            command="agy",
+            model=None,
+            permission_mode=None,
+            headless=True,
+            startup_progress=None,
+        )
+
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+    iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
+    # The flag leads the args so it is never swallowed by a later positional.
+    assert captured_args[0] == f"--gemini_dir={iso_gemini}"
+    # HOME must stay real: relocating it breaks keyring-backed auth on macOS.
+    assert "HOME" not in captured_env
+    # The relay config + token exist, so the wrapped agy can reach the sys_* tools.
+    relay_config = iso_gemini / "config" / "mcp_config.json"
+    payload = json.loads(relay_config.read_text(encoding="utf-8"))
+    assert "sys_session_create" in payload["mcpServers"]["omnigent"]["enabledTools"]
+    assert (bridge_dir / "bridge.json").is_file()
+    # The survey/trust seeds landed in the isolated dir, never the user's own file.
+    iso_settings = json.loads(
+        (iso_gemini / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
+    )
+    assert iso_settings["showFeedbackSurvey"] is False
+    assert user_settings.read_text(encoding="utf-8") == '{"model":"gemini-3-pro"}'
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +991,7 @@ async def test_attach_omits_remote_pane_from_cold_start(
 
 def _seed_bridge_state(bridge_dir: Path, conversation_id: str) -> None:
     """Seed bridge state with a given conversation id for cold-start tests."""
-    from omnigent.antigravity_native_bridge import (
+    from omnigent.harnesses.antigravity_native.bridge import (
         AntigravityNativeBridgeState,
         write_bridge_state,
     )
@@ -1047,7 +1111,7 @@ async def test_cli_cold_start_scopes_to_pane_agy(
     exists. Exercises the REAL ``resolve_cold_start_agy_rpc_port`` dispatch by
     stubbing its rpc-module seams.
     """
-    import omnigent.antigravity_native_rpc as rpc
+    import omnigent.harnesses.antigravity_native.rpc as rpc
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_pane")
@@ -1100,7 +1164,7 @@ async def test_cli_cold_start_falls_back_when_no_pane(
     path that has no local tmux socket: the cold-start falls back to
     ``_candidate_agy_rpc_ports()[0]`` and never consults the pane-scoped resolver.
     """
-    import omnigent.antigravity_native_rpc as rpc
+    import omnigent.harnesses.antigravity_native.rpc as rpc
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_nopane")
@@ -1151,7 +1215,7 @@ async def test_cli_cold_start_waits_when_pane_agy_absent(
     cold-start MUST keep polling (and, at the collapsed deadline, leave the
     placeholder) — NOT bind the foreign candidate.
     """
-    import omnigent.antigravity_native_rpc as rpc
+    import omnigent.harnesses.antigravity_native.rpc as rpc
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_earlypoll")
@@ -1208,7 +1272,7 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
     (``agy_found=True``) but its port is not lsof-attributable, so the lone
     candidate (ours) is used.
     """
-    import omnigent.antigravity_native_rpc as rpc
+    import omnigent.harnesses.antigravity_native.rpc as rpc
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_noport")
@@ -1219,6 +1283,10 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
         "resolve_pane_agy_rpc_port_state",
         lambda _sock, _tgt: rpc.PaneAgyResolution(agy_found=True, port=None),
     )
+    # Restricted /proc: lsof attributes no port for ANY agy, so the lone
+    # candidate really is ours. Pinned so the branch never reads the host's
+    # process table (where a live agy would mean "still booting" instead).
+    monkeypatch.setattr(rpc, "_can_attribute_any_agy_port", lambda: False)
     monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548])
     started: list[tuple[int, str]] = []
     monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))

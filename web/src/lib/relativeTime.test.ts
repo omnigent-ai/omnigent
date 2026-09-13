@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { relativeTime } from "./relativeTime";
+import { absoluteTime, relativeTime } from "./relativeTime";
 
 const NOW = new Date("2026-05-28T12:00:00Z").getTime();
 const MIN = 60_000;
@@ -52,6 +52,14 @@ describe("relativeTime", () => {
     // Clock skew can briefly put the server ahead of the client;
     // surface no time rather than a negative.
     expect(relativeTime(NOW + 5_000, NOW)).toBe("now");
+  });
+
+  it("renders empty for a non-finite timestamp instead of 'NaNy'", () => {
+    // A missing/malformed updated_at reaching the formatter must not fall
+    // through to the years branch as "NaNy".
+    expect(relativeTime(NaN, NOW)).toBe("");
+    expect(relativeTime(Number(undefined), NOW)).toBe("");
+    expect(absoluteTime(NaN)).toBe("");
   });
 
   it("rolls cleanly at unit boundaries", () => {

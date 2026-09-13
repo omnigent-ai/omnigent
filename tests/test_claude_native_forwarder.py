@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import queue
 import threading
-from collections.abc import Callable, Generator
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Generator, Iterator
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -17,22 +19,38 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-import omnigent.claude_native_forwarder as forwarder
-from omnigent.claude_native_bridge import (
+import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    BtwOverlay,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
+    TranscriptReadResult,
+    TranscriptRecordItems,
     prepare_bridge_dir,
     read_active_session_id,
     record_hook_event,
     write_active_session_id,
 )
-from omnigent.claude_native_forwarder import (
+from omnigent.harnesses.claude_native.forwarder import (
+    CompactionForwardState,
+    _claim_standalone_completion,
+    _consume_pending_compaction,
+    _handle_compact_summary_item,
+    _note_precompact,
     _persist_native_compaction_item,
+    _PostRetryTracker,
+    _prescan_precompact_edges,
+    _read_compaction_state,
+    _reset_compaction_skip_stats,
     forward_claude_transcript_to_session,
 )
-from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 
 @pytest.fixture(autouse=True)
@@ -44,8 +62,8 @@ def _allow_tmp_path_as_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
 
 
 class _RecordingHTTPServer(ThreadingHTTPServer):
@@ -252,6 +270,100 @@ async def _wait_for_json_state(
     raise AssertionError(f"{path} did not reach expected state; last={last_payload!r}")
 
 
+def test_observer_hook_stderr_is_logged_incrementally(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hook process errors reach the session-scoped runner log exactly once."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    stderr_path = bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE
+    stderr_path.write_text("ModuleNotFoundError: No module named 'omnigent'\n", encoding="utf-8")
+    caplog.set_level(logging.ERROR, logger=forwarder.__name__)
+
+    offset = forwarder._log_new_observer_hook_stderr(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        byte_offset=0,
+    )
+    assert offset == stderr_path.stat().st_size
+    assert "No module named 'omnigent'" in caplog.text
+    assert caplog.records[-1].session_id == "conv_abc"
+
+    with stderr_path.open("a", encoding="utf-8") as handle:
+        handle.write("PermissionError: bridge directory is not writable\n")
+    offset = forwarder._log_new_observer_hook_stderr(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        byte_offset=offset,
+    )
+    assert offset == stderr_path.stat().st_size
+    assert caplog.text.count("No module named 'omnigent'") == 1
+    assert caplog.text.count("bridge directory is not writable") == 1
+
+    record_count = len(caplog.records)
+    assert (
+        forwarder._log_new_observer_hook_stderr(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            byte_offset=offset,
+        )
+        == offset
+    )
+    assert len(caplog.records) == record_count
+
+
+def test_missing_transcript_logs_actionable_snapshot_once(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A silent observer failure becomes a bounded, session-scoped error."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=100.0)
+    warning_at = diagnostics.started_at + forwarder._TRANSCRIPT_DISCOVERY_WARNING_S
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        transcript_path=None,
+        diagnostics=diagnostics,
+        now=warning_at - 0.1,
+    )
+    assert "has not started" not in caplog.text
+
+    for now in (warning_at, warning_at + 30.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            transcript_path=None,
+            diagnostics=diagnostics,
+            now=now,
+        )
+
+    failures = [record for record in caplog.records if "has not started" in record.getMessage()]
+    assert len(failures) == 1
+    assert failures[0].session_id == "conv_abc"
+    assert "last_hook=UserPromptSubmit" in failures[0].getMessage()
+    assert "observer_stderr_bytes=missing" in failures[0].getMessage()
+    assert "hook_settings=present" in failures[0].getMessage()
+
+    transcript_path = tmp_path / "claude-session.jsonl"
+    for now in (warning_at + 31.0, warning_at + 32.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            transcript_path=transcript_path,
+            diagnostics=diagnostics,
+            now=now,
+        )
+    discoveries = [record for record in caplog.records if "path discovered" in record.getMessage()]
+    assert len(discoveries) == 1
+
+
 @pytest.mark.asyncio
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
@@ -266,7 +378,7 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     hook cursor past the clear record so the next poll does not fork
     again from the same hook line.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -402,7 +514,7 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
     is cleanup only; the executor active-session guard prevents stale
     old-session writes from reaching tmux.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -501,7 +613,7 @@ async def test_clear_hook_transfer_failure_does_not_loop(
     rotation must still consume the clear hook so the forwarder's next poll does
     not re-rotate and create another replacement session every tick.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -695,7 +807,7 @@ async def test_clear_hook_consumes_hook_rotated_session_without_duplicate_fork(
     It annotates the hook record so the background forwarder only
     advances its durable cursor and resets transcript state.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -764,7 +876,7 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
     active bridge session, clear the old runner binding, and advance
     the hook cursor so the same hook line is not processed again.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -784,7 +896,9 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("omnigent.claude_native_bridge.time.time", lambda: 1779922393.245)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.time.time", lambda: 1779922393.245
+    )
     record_hook_event(
         bridge_dir,
         {
@@ -898,7 +1012,7 @@ async def test_fork_hook_consumes_hook_rotated_session_without_duplicate_fork(
     cursor and seeds transcript state past Claude's copied fork
     history.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -987,7 +1101,7 @@ async def test_resume_seen_claude_fork_does_not_create_second_omnigent_fork(
     alone as a fresh `/fork` command after the hook recorded that the
     incoming Claude session had already been seen.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -1166,13 +1280,10 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         )
     )
     try:
-        # Collect the seven transcript items. This transcript's final turn is a
-        # ``!bash`` command (a ``terminal_command``, no assistant output), so
-        # ``current_response_id`` lands on a turn that runs no LLM turn and thus
-        # gets no id-bearing ``running`` edge (that would strand the web UI busy
-        # with no ``Stop`` hook to close it). The turn-start ``running`` edge is
-        # asserted for a real assistant turn in
-        # ``test_forwarder_emits_turn_start_running_with_response_id``.
+        # Collect the seven transcript items. The transcript path publishes no
+        # session status at all — Claude's status file owns the badge — which
+        # ``test_forwarder_publishes_no_status_for_assistant_output`` asserts
+        # directly.
         requests = [await _get_recorded_item_request(server) for _index in range(7)]
     finally:
         task.cancel()
@@ -1194,6 +1305,9 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         "terminal_command",
         "terminal_command",
     ]
+    # Every item carries its server-side idempotency key: a retried or
+    # concurrently re-posted record must dedupe on the server.
+    assert all(isinstance(item.get("source_id"), str) and item["source_id"] for item in posted)
     assert posted[0]["item_data"] == {
         "role": "user",
         "content": [{"type": "input_text", "text": "read TODO"}],
@@ -1371,9 +1485,8 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         )
     )
     try:
-        # The turn-start ``running`` status posts first (the transcript has an
-        # assistant turn), then the assistant message item.
-        running = await _get_recorded_request(server)
+        # The item posts FIRST: the transcript path publishes no status at all
+        # (Claude's status file owns the badge), so nothing precedes it.
         request = await _get_recorded_request(server)
     finally:
         task.cancel()
@@ -1383,8 +1496,6 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert running["body"]["type"] == "external_session_status"
-    assert running["body"]["data"]["status"] == "running"
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_type"] == "message"
@@ -1690,6 +1801,105 @@ async def test_forwarder_posts_compaction_in_progress_on_precompact_hook(
         "type": "external_compaction_status",
         "data": {"status": "in_progress"},
     }
+
+
+@pytest.mark.asyncio
+async def test_compact_refusal_in_progress_precedes_failed_same_poll(
+    tmp_path: Path,
+) -> None:
+    """
+    A same-poll ``/compact`` refusal posts ``in_progress`` BEFORE ``failed``.
+
+    Regression for the stranded spinner: the ``PreCompact`` hook (→
+    ``in_progress``, which raises the spinner) is forwarded AFTER transcript
+    items each poll, and Claude writes the refusal (transcript) and the
+    ``PreCompact`` (hook) close enough to land in one poll. If the dismissal
+    fired during the transcript phase it would clear nothing, then the hook
+    would raise a spinner that never clears. The dismissal is deferred to
+    after the hook phase, so the ordered posts are ``in_progress`` then
+    ``failed`` — a net-dismissed spinner.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    # The two records Claude writes for a declined /compact: the command echo
+    # and the standalone refusal stdout.
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-cmd",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/compact</command-name>\n<command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "uuid": "compact-stdout",
+                        "isMeta": False,
+                        "content": (
+                            "<local-command-stdout>Not enough messages to compact."
+                            "</local-command-stdout>"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Collect compaction-status posts until both edges are seen.
+        statuses: list[str] = []
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "failed" not in statuses and asyncio.get_running_loop().time() < deadline:
+            request = await _get_recorded_request(server)
+            if request["body"].get("type") == "external_compaction_status":
+                statuses.append(request["body"]["data"]["status"])
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # in_progress (spinner raised by the hook) must land before failed
+    # (the deferred dismissal), so the net effect is a dismissed spinner.
+    assert statuses == ["in_progress", "failed"], (
+        f"expected in_progress then failed, got {statuses!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2092,7 +2302,7 @@ async def test_forwarder_start_at_end_uses_byte_offset_for_new_lines(
         raise AssertionError("start_at_end should seed and poll with byte offsets")
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.read_transcript_items_since_with_position",
+        "omnigent.harnesses.claude_native.forwarder.read_transcript_items_since_with_position",
         _fail_line_cursor_reader,
     )
 
@@ -2244,7 +2454,7 @@ async def test_forwarder_waits_for_missing_fresh_transcript_without_warning(
             "transcript_path": str(transcript_path),
         },
     )
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -2301,6 +2511,100 @@ async def test_forwarder_waits_for_missing_fresh_transcript_without_warning(
     assert "cursor invalid" not in caplog.text
     assert "cursor missing fingerprint" not in caplog.text
     assert "cursor fingerprint changed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_measured_prefix_seed_keeps_a_prompt_injected_during_boot(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression: a prompt Claude records while booting must still forward.
+
+    Cold resume writes the transcript prefix itself, then launches Claude. The
+    forwarder cannot seed until Claude's first hook advertises the transcript
+    path — and the executor's ``inject_user_message`` waits on the same boot,
+    so the paste routinely lands first. Seeding from a live end-offset then
+    puts the user's prompt BEHIND the cursor: visible in the TUI pane, absent
+    from the Omnigent DB, silently, for the session's lifetime.
+
+    Passing the prefix length measured before launch makes the skip exactly the
+    prefix, so the boot-window records survive however late the seed runs.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    # The synthesized prefix, complete before Claude starts.
+    transcript_path.write_text(
+        "".join(
+            json.dumps({"type": "user", "uuid": f"old{n}", "message": {"role": "user"}}) + "\n"
+            for n in range(3)
+        ),
+        encoding="utf-8",
+    )
+    prefix_bytes = transcript_path.stat().st_size
+    # Claude boots and records the freshly-injected prompt before the forwarder
+    # is scheduled to seed.
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "boot-window-prompt",
+                    "message": {"role": "user", "content": "wake up and check the deploy"},
+                }
+            )
+            + "\n"
+        )
+
+    state = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=transcript_path,
+        start_at_end=True,
+        session_id="conv_boot_window",
+        start_at_offset=prefix_bytes,
+    )
+
+    # The measured prefix wins over ``start_at_end``: the cursor sits at the
+    # prefix boundary, not at EOF, so the prompt is still ahead of it.
+    assert state.byte_offset == prefix_bytes
+    result = forwarder._read_transcript_items_for_state(state, "claude-native-ui", None)
+    forwarded = [
+        block.get("text")
+        for item in result.items
+        for block in (item.data.get("content") or [])
+        if isinstance(block, dict)
+    ]
+    assert "wake up and check the deploy" in forwarded
+
+
+@pytest.mark.asyncio
+async def test_measured_prefix_never_seeks_past_the_transcript_end(tmp_path: Path) -> None:
+    """
+    A prefix length larger than the file clamps to the end.
+
+    Defensive: the measurement and the seed are separated by Claude's launch,
+    so a truncated or replaced transcript would otherwise leave the cursor
+    beyond EOF, where every later read looks like a stale-cursor reset.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "uuid": "only", "message": {"role": "user"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    state = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=transcript_path,
+        start_at_end=True,
+        session_id="conv_clamp",
+        start_at_offset=10**9,
+    )
+
+    assert state.byte_offset == transcript_path.stat().st_size
 
 
 @pytest.mark.asyncio
@@ -2806,7 +3110,7 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         "_forward_available_items",
         _fail_once_forward_available_items,
     )
-    caplog.set_level(logging.ERROR, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.ERROR, logger="omnigent.harnesses.claude_native.forwarder")
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -2831,6 +3135,8 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         thread.join(timeout=5.0)
 
     assert "Claude transcript forwarder loop failed" in caplog.text
+    assert "session=conv_abc" in caplog.text
+    assert str(bridge_dir) not in caplog.text
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_data"] == {
         "role": "assistant",
@@ -2915,19 +3221,17 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         )
 
     persisted = json.loads((bridge_dir / "transcript_forwarder.json").read_text("utf-8"))
-    # The turn-start ``running`` status (carrying the turn's response id) leads,
-    # then the poison item is attempted twice, then the forwarder-failed status.
+    # The poison item is attempted twice, then the forwarder-failed status. No
+    # status POST leads: the transcript path publishes none (Claude's status
+    # file owns the badge).
     assert [request["type"] for request in requests] == [
-        "external_session_status",
         "external_conversation_item",
         "external_conversation_item",
         "external_session_status",
     ]
-    # The turn-start ``running`` edge carries the turn's response id, and the
-    # failed edge carries BOTH the drop reason as ``output`` (#1113 — the
-    # server surfaces it as the failure detail) and that same response id so
+    # The failed edge carries BOTH the drop reason as ``output`` (#1113 — the
+    # server surfaces it as the failure detail) and the turn's response id so
     # it closes the streaming turn instead of leaving its tool cards spinning.
-    assert requests[0]["data"]["status"] == "running"
     assert requests[-1]["data"] == {
         "status": "failed",
         "output": "transcript item poison-item:0:message rejected",
@@ -2951,22 +3255,23 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Path) -> None:
+async def test_forwarder_retries_user_item_on_ambiguous_post_failure(tmp_path: Path) -> None:
     """
-    An ambiguous POST failure skips the item instead of re-posting it.
+    An ambiguous POST failure holds the cursor and re-posts the item.
 
     A user message typed while Claude is busy round-trips through the
     transcript and is POSTed as an ``external_conversation_item``. If
-    that POST's response is lost (e.g. a read timeout AFTER the server
-    appended the item and published ``session.input.consumed``), the
-    server has already committed it — and external items are not deduped
-    server-side. Retrying would append a second copy and re-publish the
-    consume event, producing a duplicate user bubble in the web UI.
-    The forwarder must instead treat the item as delivered:
-    mark it handled, advance the byte cursor, and never re-POST it.
+    that POST's response is lost (e.g. a read timeout on a flaky
+    forwarder->server hop), the forwarder cannot know whether the server
+    committed the item. Skipping it would silently lose the message from
+    the conversation store whenever the server had NOT committed it —
+    the web view then misses a message the terminal still shows. The
+    POST carries a ``source_id`` idempotency key the server dedupes on,
+    so re-posting a committed item is a no-op: the forwarder must retry.
 
-    A failure here (the item POSTed twice across two polls) is exactly
-    the duplicate-user-message regression this guards against.
+    A failure here (the item marked handled after one ambiguous failure,
+    never re-posted) is exactly the lost-user-message regression this
+    guards against.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -2992,20 +3297,25 @@ async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Pat
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
-        Record the POST, then fail the item POST with a read timeout.
+        Fail the first item POST with a read timeout, then succeed.
 
-        The timeout stands in for "server committed, response lost" —
-        the ambiguous case where a blind retry duplicates.
+        The timeout stands in for "request sent, response lost" — the
+        ambiguous case where the server may or may not have committed
+        the item.
 
         :param request: Outbound HTTP request from the forwarder.
-        :returns: HTTP response (never reached for the item POST).
-        :raises httpx.ReadTimeout: For every ``external_conversation_item``
-            POST, simulating a lost response.
+        :returns: HTTP response for every POST after the first item POST.
+        :raises httpx.ReadTimeout: For the first
+            ``external_conversation_item`` POST, simulating a lost
+            response.
         """
         payload = json.loads(request.content.decode("utf-8"))
         assert isinstance(payload, dict)
         requests.append(payload)
-        if payload["type"] == "external_conversation_item":
+        first_item_post = payload["type"] == "external_conversation_item" and (
+            sum(1 for r in requests if r["type"] == "external_conversation_item") == 1
+        )
+        if first_item_post:
             raise httpx.ReadTimeout("response lost", request=request)
         return httpx.Response(202, json={})
 
@@ -3032,18 +3342,25 @@ async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Pat
         )
 
     item_posts = [r for r in requests if r["type"] == "external_conversation_item"]
-    # The item was POSTed exactly once. If the ambiguous-failure skip
-    # were missing, the second poll would re-read offset 0 and POST it
-    # again (len 2) — the duplicate user bubble.
-    assert len(item_posts) == 1
-    # No "failed" status: unlike a permanent 4xx rejection, an ambiguous
-    # failure most likely succeeded, so we must not flag the turn failed.
+    # Re-POSTed on the second poll (2 attempts): the ambiguous failure
+    # must not mark the item handled — skipping it would lose the user
+    # message from the conversation store when the server had not
+    # committed it.
+    assert len(item_posts) == 2
+    # Every attempt carries the same server-side idempotency key, so the
+    # retry is a no-op when the first POST WAS committed — no duplicate
+    # user bubble.
+    source_ids = {post["data"]["source_id"] for post in item_posts}
+    assert source_ids == {"user-msg-1:0:message"}
+    # No "failed" status: unlike a permanent 4xx rejection, a transient
+    # failure is retried, so we must not flag the turn failed.
     assert all(r["type"] != "external_session_status" for r in requests)
-    # Cursor advanced past the item and it is recorded as handled, so it
-    # is not re-read on subsequent polls.
-    assert first.byte_offset == transcript_path.stat().st_size
-    assert first.seen_source_ids == ("user-msg-1:0:message",)
+    # First poll held the cursor (nothing handled); the successful retry
+    # advanced it past the item and recorded it as handled.
+    assert first.byte_offset == 0
+    assert first.seen_source_ids == ()
     assert second.byte_offset == transcript_path.stat().st_size
+    assert second.seen_source_ids == ("user-msg-1:0:message",)
 
 
 @pytest.mark.asyncio
@@ -3054,8 +3371,7 @@ async def test_forwarder_retries_user_item_on_connect_error(tmp_path: Path) -> N
     A connection-refused error proves the request never reached the
     server, so the item was not committed. Dropping it would silently
     lose a user message. The forwarder must hold the cursor and re-POST
-    on the next poll — the complement to the ambiguous-skip behavior, so
-    the duplicate fix does not turn into a message-loss bug.
+    on the next poll.
 
     A failure here (item marked handled / cursor advanced after a
     connect error) would mean a user message is silently lost whenever
@@ -3401,49 +3717,104 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
 
 
-def test_model_alias_for_collapses_concrete_id_to_tier_alias() -> None:
+@pytest.mark.asyncio
+async def test_forward_model_from_status_posts_the_status_model_verbatim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    ``_model_alias_for`` maps a concrete transcript model id to the
-    picker's tier alias so a TUI ``/model`` switch lands on a picker
-    row. Covers Anthropic + Databricks-gateway id shapes and the
-    no-match / empty cases (caller skips the post on ``None``).
+    The statusLine's model posts VERBATIM — the harness's own spelling,
+    never collapsed to a picker alias — and dedupes on repeat polls.
+
+    A family collapse here is how a routed Opus 4.9 rendered as the
+    ``opus`` row holding 4.8; the verbatim report is what makes the web's
+    exact-match highlight truthful for every generation and provider
+    spelling.
     """
-    assert forwarder._model_alias_for("claude-opus-4-8") == "opus"
-    assert forwarder._model_alias_for("anthropic/claude-opus-4-7") == "opus"
-    # The default Sonnet (4.6) collapses to the generic "sonnet" alias — the
-    # row it is bound to.
-    assert forwarder._model_alias_for("databricks-claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-haiku-4-5") == "haiku"
-    # Fable (the tier above Opus) collapses to its own alias — a miss
-    # here means a TUI switch to claude-fable-5 never reaches the picker.
-    assert forwarder._model_alias_for("claude-fable-5") == "fable"
-    assert forwarder._model_alias_for("databricks-claude-fable-5") == "fable"
-    # Sonnet 5 routes to its own opt-in picker slot, not the generic "sonnet"
-    # row — both ids contain the substring "sonnet", so a miss here means
-    # a TUI switch to the newer Sonnet generation would wrongly light up
-    # the default-Sonnet row instead.
-    assert forwarder._model_alias_for("anthropic/claude-sonnet-5") == "sonnet_5"
-    assert forwarder._model_alias_for("databricks-claude-sonnet-5") == "sonnet_5"
-    # Unknown family or empty → None (don't surface an unrenderable id).
-    assert forwarder._model_alias_for("gpt-5-4-mini") is None
-    assert forwarder._model_alias_for("") is None
-    assert forwarder._model_alias_for(None) is None
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge_dir: {"model": "databricks-claude-opus-4-9", "context_window_size": 200000},
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_model_from_status(
+            client, session_id="conv_abc", bridge_dir=tmp_path, dedupe=dedupe
+        )
+        await forwarder._forward_model_from_status(
+            client, session_id="conv_abc", bridge_dir=tmp_path, dedupe=dedupe
+        )
+
+    model_posts = [r for r in requests if r["type"] == "external_model_change"]
+    assert model_posts == [
+        {"type": "external_model_change", "data": {"model": "databricks-claude-opus-4-9"}}
+    ]
+    assert dedupe.posted_model == "databricks-claude-opus-4-9"
 
 
 @pytest.mark.asyncio
-async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path) -> None:
+async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) -> None:
     """
-    A TUI-side ``/model`` switch is POSTed as ``external_model_change``;
-    the spawn-default baseline is NOT (seed-first).
+    Reports preserve the generation and the ``[1m]`` marker byte-for-byte.
 
-    The first assistant entry establishes the baseline model silently —
-    so a passive spawn default never clobbers a pending silent model
-    handoff — and a later assistant entry on a different model posts a
-    single ``external_model_change`` carrying the normalized tier alias.
+    Two same-family models of different generations (a routed 4.9 beside a
+    pinned 4.8) and a 1M-context variant must each post as themselves —
+    any normalization would let the record claim a model the pane is not
+    on.
+    """
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for model in (
+            "<synthetic>",
+            "databricks-claude-opus-4-8",
+            "<synthetic>",
+            "databricks-claude-opus-4-9",
+            "databricks-claude-opus-4-9[1m]",
+            " <synthetic> ",
+        ):
+            await forwarder._post_model_change_if_new(
+                client, session_id="conv_abc", dedupe=dedupe, model=model
+            )
+
+    assert [r["data"]["model"] for r in requests] == [
+        "databricks-claude-opus-4-8",
+        "databricks-claude-opus-4-9",
+        "databricks-claude-opus-4-9[1m]",
+    ]
+    assert dedupe.observed_model == "databricks-claude-opus-4-9[1m]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_model", [None, "system.ai.claude-opus-4-8[1m]"])
+async def test_forwarder_reports_the_launch_model_then_a_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status_model: str | None
+) -> None:
+    """
+    EVERY observation posts, verbatim: the first is the launch report.
+
+    The first assistant entry names the model the session spawned on —
+    posting it is what seeds ``reported_model`` so surfaces show the
+    pane's truth within seconds of launch — and a later assistant entry
+    on a different model posts that new model, byte-for-byte.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
+    status = {"model": status_model}
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _: status)
 
     def _assistant(uuid: str, model: str, text: str) -> str:
         """
@@ -3499,13 +3870,16 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
             retry_tracker=retry_tracker,
             dedupe=dedupe,
         )
-        # First observation seeds the baseline WITHOUT posting a change.
-        assert "external_model_change" not in [r["type"] for r in requests]
-        assert dedupe.posted_model == "opus"
+        # The first observation IS the launch report — posted verbatim.
+        launch_posts = [r for r in requests if r["type"] == "external_model_change"]
+        expected_model = status_model or "claude-opus-4-8"
+        assert [p["data"] for p in launch_posts] == [{"model": expected_model}]
+        assert dedupe.posted_model == expected_model
 
         # User switches model inside the terminal.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_assistant("a2", "claude-sonnet-5", "switched") + "\n")
+        status["model"] = "claude-sonnet-5" if status_model else None
         requests.clear()
         await forwarder._forward_available_items(
             client=client,
@@ -3519,8 +3893,172 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
 
     model_posts = [r for r in requests if r["type"] == "external_model_change"]
     assert len(model_posts) == 1
-    assert model_posts[0]["data"] == {"model": "sonnet_5"}
-    assert dedupe.posted_model == "sonnet_5"
+    assert model_posts[0]["data"] == {"model": "claude-sonnet-5"}
+    assert dedupe.posted_model == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_mirrors_tui_rename_on_first_observation(tmp_path: Path) -> None:
+    """
+    A ``/rename`` posts ``external_session_title`` on the FIRST observation.
+
+    Unlike the model mirror there is no spawn default to protect: a
+    ``custom-title`` record exists only because the operator renamed the
+    session, so it is a real change worth posting immediately.
+
+    The second phase rewinds the byte cursor so the same ``custom-title``
+    record is read again — the restart / rewind path the dedupe exists
+    for. A steady-state poll reads only past its cursor and would never
+    re-see the record, so rewinding is what actually exercises the guard.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    retry_tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every forwarder POST and record its payload.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: 202 for every event.
+        """
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+        title_posts = [r for r in requests if r["type"] == "external_session_title"]
+        assert len(title_posts) == 1
+        assert title_posts[0]["data"] == {"title": "auth-refactor"}
+        assert dedupe.posted_title == "auth-refactor"
+
+        # Rewind to the top of the file so the rename record is re-read,
+        # as a restart / cursor rewind would. The dedupe must swallow it.
+        requests.clear()
+        rewound = forwarder.TranscriptForwardState(
+            transcript_path=transcript_path,
+            line_cursor=0,
+            byte_offset=0,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+        )
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=rewound,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+
+    assert [r for r in requests if r["type"] == "external_session_title"] == []
+
+
+@pytest.mark.asyncio
+async def test_forwarder_retries_title_post_after_transient_failure(tmp_path: Path) -> None:
+    """
+    A failed ``external_session_title`` POST is retried on a later poll.
+
+    ``observed_title`` is sticky across polls, so a poll whose incremental
+    window carries no ``custom-title`` record still reconciles the observed
+    title against the last POSTed one — the rename is not lost once the
+    original poll's window is gone.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    retry_tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+
+    fail_titles = True
+    title_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Fail title posts while ``fail_titles`` is set; accept everything else.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: 500 for the first title post, else 202.
+        """
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_title":
+            title_posts.append(payload)
+            if fail_titles:
+                return httpx.Response(500, json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+        # The POST failed, so the baseline stays behind the observation.
+        assert len(title_posts) == 1
+        assert dedupe.observed_title == "auth-refactor"
+        assert dedupe.posted_title is None
+
+        # Next poll: no new rename in the window, but the retry still fires.
+        fail_titles = False
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}}
+                )
+                + "\n"
+            )
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+
+    assert len(title_posts) == 2
+    assert dedupe.posted_title == "auth-refactor"
 
 
 @pytest.mark.asyncio
@@ -3594,25 +4132,165 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
                 dedupe=dedupe,
             )
 
-        # Poll 1: baseline "opus" seeded, no model POST.
+        # Poll 1: the launch report is attempted and fails transiently.
         await _poll()
-        assert model_posts == []
-        assert dedupe.posted_model == "opus"
+        assert model_posts == [{"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model is None  # NOT advanced — POST failed
+        assert dedupe.observed_model == "claude-opus-4-8"  # but remembered
 
-        # Poll 2: user switches to Sonnet 5; the POST fails transiently.
-        with transcript_path.open("a", encoding="utf-8") as fh:
-            fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
-        await _poll()
-        assert model_posts == [{"model": "sonnet_5"}]  # attempted once
-        assert dedupe.posted_model == "opus"  # NOT advanced — POST failed
-        assert dedupe.observed_model == "sonnet_5"  # but remembered
-
-        # Poll 3: a plain user turn (no message.model) still retries.
+        # Poll 2: a plain user turn (no message.model) still retries the drop.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_user("u1") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet_5"}, {"model": "sonnet_5"}]  # retried
-        assert dedupe.posted_model == "sonnet_5"  # now committed
+        assert model_posts == [{"model": "claude-opus-4-8"}, {"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model == "claude-opus-4-8"  # now committed
+
+        # Poll 3: a TUI switch posts the new model verbatim.
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
+        await _poll()
+        assert model_posts[-1] == {"model": "claude-sonnet-5"}
+        assert dedupe.posted_model == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_relay_permission_mode_mirrors_switch_and_dedupes() -> None:
+    """
+    Both the launch mode and a later shift+tab reach the session label.
+
+    Claude Code emits no event on a mode change, so the pane footer is
+    mirrored. The launch mode is posted as well: a manual-mode session has no
+    mode label and no launch flag, so skipping it would leave the web picker
+    with nothing to render. An unchanged footer stays quiet, and a footerless
+    (``None``) read must not post a reversal.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept every POST and record its payload."""
+        posts.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _relay(mode: str | None) -> None:
+            """Run one permission-mode relay pass for the given pane mode."""
+            await forwarder._relay_permission_mode(
+                client,
+                session_id="conv_abc",
+                mode=mode,
+                dedupe=dedupe,
+            )
+
+        # The launch mode is posted, so the picker has a mode to show.
+        await _relay("default")
+        assert [p["type"] for p in posts] == ["external_permission_mode_change"]
+        assert posts[0]["data"] == {"permission_mode": "default"}
+        assert dedupe.posted_permission_mode == "default"
+
+        # Unchanged footer is a no-op, not a repeat POST.
+        await _relay("default")
+        assert len(posts) == 1
+
+        # The user presses shift+tab into auto mode.
+        await _relay("auto")
+        assert posts[-1]["data"] == {"permission_mode": "auto"}
+        assert dedupe.posted_permission_mode == "auto"
+
+        # Still auto — the switch isn't re-posted every poll.
+        await _relay("auto")
+        assert len(posts) == 2
+
+        # A footerless pane reads as unknown and must not post a reversal.
+        await _relay(None)
+        assert len(posts) == 2
+        assert dedupe.posted_permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_relay_permission_mode_posts_manual_launch_mode() -> None:
+    """
+    A manual-mode launch publishes a mode, keeping the picker reachable.
+
+    Manual is the default, and launching into it writes no
+    ``--permission-mode`` arg and no mode label, leaving the pane footer as the
+    only source. The first relay must post it: with no mode stored the web
+    picker hides itself, and manual becomes a state no one can switch out of.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept the POST and record its payload."""
+        posts.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._relay_permission_mode(
+            client,
+            session_id="conv_abc",
+            mode="default",
+            dedupe=dedupe,
+        )
+
+    assert posts == [
+        {"type": "external_permission_mode_change", "data": {"permission_mode": "default"}}
+    ]
+    assert dedupe.posted_permission_mode == "default"
+
+
+@pytest.mark.asyncio
+async def test_relay_permission_mode_retries_after_transient_failure() -> None:
+    """
+    A failed mode POST is retried, so the switch isn't silently dropped.
+
+    The pane is the source of truth but the poll window moves on; if a 503
+    advanced the baseline, the web picker would stay stale until the user
+    switched modes again.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+    fail_modes = {"plan"}
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Fail the first ``plan`` POST with 503; accept everything else."""
+        payload = json.loads(request.content.decode("utf-8"))
+        posts.append(payload)
+        mode = payload["data"]["permission_mode"]
+        if mode in fail_modes:
+            fail_modes.discard(mode)
+            return httpx.Response(503, json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _relay(mode: str | None) -> None:
+            """Run one permission-mode relay pass for the given pane mode."""
+            await forwarder._relay_permission_mode(
+                client,
+                session_id="conv_abc",
+                mode=mode,
+                dedupe=dedupe,
+            )
+
+        await _relay("default")  # the launch mode lands
+        assert dedupe.posted_permission_mode == "default"
+
+        await _relay("plan")
+        assert len(posts) == 2
+        assert dedupe.posted_permission_mode == "default"  # NOT advanced — POST failed
+
+        await _relay("plan")
+        assert [p["data"] for p in posts] == [
+            {"permission_mode": "default"},
+            {"permission_mode": "plan"},
+            {"permission_mode": "plan"},
+        ]
+        assert dedupe.posted_permission_mode == "plan"  # now committed
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(
@@ -3638,7 +4316,7 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
         + "\n",
         encoding="utf-8",
     )
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     validated = forwarder._validated_transcript_state(
         forwarder.TranscriptForwardState(
@@ -3649,7 +4327,6 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
             seen_source_ids=("old-source",),
             cursor_fingerprint=None,
         ),
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_abc",
     )
 
@@ -3665,7 +4342,8 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
     )
     assert "cursor missing fingerprint" in caplog.text
     assert "conv_abc" in caplog.text
-    assert str(tmp_path / "bridge") in caplog.text
+    assert str(tmp_path / "bridge") not in caplog.text
+    assert str(transcript_path) not in caplog.text
 
 
 def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_reset(
@@ -3694,7 +4372,7 @@ def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_re
         + "\n",
         encoding="utf-8",
     )
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     pre_existing_seen = ("already-sent-id-1", "already-sent-id-2")
     state = forwarder.TranscriptForwardState(
@@ -3708,7 +4386,6 @@ def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_re
 
     validated = forwarder._validated_transcript_state(
         state,
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_fresh",
     )
 
@@ -3779,7 +4456,7 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
     )
     transcript_path.write_text(replacement_content, encoding="utf-8")
 
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     pre_existing_seen = ("item-a", "item-b", "item-c")
     state = forwarder.TranscriptForwardState(
@@ -3793,7 +4470,6 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
 
     validated = forwarder._validated_transcript_state(
         state,
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_replaced",
     )
 
@@ -3813,6 +4489,9 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
 
     # Warning logged because the fingerprint genuinely changed.
     assert "cursor fingerprint changed" in caplog.text
+    assert "session=conv_replaced" in caplog.text
+    assert str(tmp_path / "bridge") not in caplog.text
+    assert str(transcript_path) not in caplog.text
 
 
 # ── supervise_forwarder ────────────────────────────────────────────
@@ -3900,6 +4579,8 @@ async def test_supervise_forwarder_restarts_after_crash(
     # skips the post-iteration sleep.
     assert sleeps == [forwarder._SUPERVISOR_INITIAL_BACKOFF_S]
     assert "Claude transcript forwarder crashed" in caplog.text
+    assert "session=conv_abc" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -4336,7 +5017,7 @@ async def test_forwarder_posts_raw_todos_on_todo_write(tmp_path: Path) -> None:
 
 
 def _start_recording_server_with_responses(
-    response_for: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    response_for: Callable[[object], object] | None = None,
 ) -> tuple[_RecordingHTTPServer, threading.Thread, str]:
     """
     Start a local HTTP server that records POST bodies AND returns
@@ -4349,7 +5030,7 @@ def _start_recording_server_with_responses(
     that the forwarder reads back.
 
     :param response_for: Callback that takes the decoded request
-        body and returns the JSON dict to send back. ``None`` (the
+        body and returns the JSON value to send back. ``None`` (the
         default) responds with ``{}`` like the standard recorder.
     :returns: ``(server, thread, base_url)``.
     """
@@ -4416,6 +5097,8 @@ def _seed_subagent_on_disk(
     description: str,
     tool_use_id: str,
     transcript_records: list[dict[str, Any]] | None = None,
+    spawn_transcript_path: Path | None = None,
+    spawn_tool_name: str = "Agent",
 ) -> Path:
     """
     Create the ``.meta.json`` + ``.jsonl`` pair Claude Code would
@@ -4436,9 +5119,36 @@ def _seed_subagent_on_disk(
         rows to seed into the sub-agent's ``.jsonl``. ``None`` /
         empty leaves the transcript empty (the common case when a
         sub-agent has just been spawned).
+    :param spawn_transcript_path: Transcript containing the spawning
+        tool call. Defaults to the top-level transcript.
+    :param spawn_tool_name: Name on the spawning ``tool_use`` block.
+        Defaults to ``"Agent"``; pass ``"Task"`` to exercise the alias.
     :returns: Path to the sub-agent's ``.jsonl`` (handy for tests
         that append rows after the fact).
     """
+    spawn_path = spawn_transcript_path or transcript_path
+    with spawn_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "isSidechain": spawn_path != transcript_path,
+                    "type": "assistant",
+                    "uuid": f"spawn-{subagent_id}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": spawn_tool_name,
+                                "input": {"description": description},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
     subagents_dir.mkdir(parents=True, exist_ok=True)
     meta_path = subagents_dir / f"agent-{subagent_id}.meta.json"
@@ -4461,6 +5171,62 @@ def _seed_subagent_on_disk(
     else:
         jsonl_path.write_text("", encoding="utf-8")
     return jsonl_path
+
+
+async def test_subagent_watcher_registers_a_task_named_spawn(
+    tmp_path: Path,
+) -> None:
+    """A spawn recorded under the legacy ``Task`` name still registers.
+
+    ``Task`` was renamed to ``Agent`` in CLI 2.1.63 but remains a supported
+    alias, so a transcript may carry either name. Correlation gates all
+    registration, so missing the alias would strand every such sub-agent.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-worker",
+        agent_type="Explore",
+        description="spawned via the Task alias",
+        tool_use_id="toolu_task",
+        spawn_tool_name="Task",
+    )
+
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths == {"a-worker": "/v1/sessions/conv_root/events"}
+    assert state.subagents["a-worker"].child_conversation_id == "conv_a-worker"
+    assert state.subagents["a-worker"].parent_subagent_id is None
 
 
 async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
@@ -4548,12 +5314,340 @@ async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
         server.server_close()
 
 
+async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
+    tmp_path: Path,
+) -> None:
+    """Nested Claude agents register under their immediate Omnigent parent."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="z-parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+    )
+    child_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="nested child",
+        tool_use_id="toolu_child",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "nested-child-output",
+                "message": {"role": "assistant", "content": "working"},
+            }
+        ],
+        spawn_transcript_path=parent_transcript,
+    )
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": "mirrored-nested-spawn",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_child",
+                                "name": "Agent",
+                                "input": {"description": "nested child"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+        assert start_paths == {
+            "z-parent": "/v1/sessions/conv_root/events",
+            "a-child": "/v1/sessions/conv_z-parent/events",
+        }
+        assert state.subagents["z-parent"].parent_subagent_id is None
+        assert state.subagents["a-child"].parent_subagent_id == "z-parent"
+
+        reconstructed = forwarder._read_subagent_forward_state(bridge_dir)
+        assert reconstructed == state
+
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id="b-grandchild",
+            agent_type="Explore",
+            description="second nested level",
+            tool_use_id="toolu_grandchild",
+            spawn_transcript_path=child_transcript,
+        )
+        restarted = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=reconstructed,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths["b-grandchild"] == "/v1/sessions/conv_a-child/events"
+    assert restarted.subagents["b-grandchild"].parent_subagent_id == "a-child"
+
+
+async def test_subagent_watcher_parks_child_of_a_parked_parent(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A child whose parent was parked is parked too, not retried forever.
+
+    When a parent's registration exhausts its retries it is parked with an empty
+    ``child_conversation_id`` — its Omnigent conversation will never exist. A
+    child that resolves to that parent can therefore never attach; it must be
+    parked (and logged) rather than silently re-resolved on every poll.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="z-parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="nested child",
+        tool_use_id="toolu_child",
+        spawn_transcript_path=parent_transcript,
+    )
+    # The parent is already parked on disk (empty child id): its registration
+    # exhausted retries on an earlier tick.
+    parked = forwarder.SubagentForwardState(
+        subagents={
+            "z-parent": forwarder.SubagentEntry(
+                subagent_id="z-parent",
+                child_conversation_id="",
+                parent_subagent_id=None,
+            )
+        }
+    )
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=parked,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    # The child was parked, not registered: no start POST, empty child id,
+    # and the parked entry survives a state round-trip.
+    assert starts == 0
+    assert state.subagents["a-child"].child_conversation_id == ""
+    assert state.subagents["a-child"].parent_subagent_id == "z-parent"
+    assert forwarder._read_subagent_forward_state(bridge_dir) == state
+    assert "whose parent was dropped" in caplog.text
+
+    # No dead letter: a replay would re-post the child under the root session and
+    # flatten the hierarchy, so the child is parked (WARNING only), not recorded
+    # for replay.
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+
+
+async def test_subagent_watcher_defers_a_spawn_owned_by_two_transcripts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawn id claimed by two agent transcripts is dropped as ambiguous.
+
+    Attribution is trustworthy only when a spawn `tool_use` id has a single
+    owner. If the same id appears in two `agent-*.jsonl` transcripts, the owner
+    can't be resolved, so it must be dropped (not guessed) and the agent
+    deferred rather than mis-attributed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    # Seed a normal agent (spawn lands in the root transcript, owner=None); then
+    # write the SAME spawn tool-use id into an agent transcript too, so the id
+    # resolves to two conflicting owners (root and that agent) and is dropped.
+    jsonl_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-worker",
+        agent_type="Explore",
+        description="ambiguous spawn",
+        tool_use_id="toolu_dup",
+    )
+    other_owner = jsonl_path.parent / "agent-owner-two.jsonl"
+    other_owner.write_text(
+        json.dumps(
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "dup-spawn",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_dup", "name": "Agent"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert starts == 0
+    assert "a-worker" not in state.subagents
+    assert "no resolved parent" in caplog.text
+
+
+async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spawn(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A meta whose spawn record no transcript owns is deferred, not registered.
+
+    Claude can flush ``agent-<id>.meta.json`` before the spawning ``tool_use``
+    record lands in a transcript. The watcher must skip such an agent (retry next
+    tick) and log the miss so a spawn record that never arrives is diagnosable.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    (subagents_dir / "agent-orphan.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "Explore",
+                "description": "spawn record not flushed yet",
+                "toolUseId": "toolu_missing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (subagents_dir / "agent-orphan.jsonl").write_text("", encoding="utf-8")
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert starts == 0
+    assert "orphan" not in state.subagents
+    assert "no resolved parent" in caplog.text
+    assert "toolu_missing" in caplog.text
+
+
 async def test_subagent_watcher_forwards_transcript_items_to_child_session(
     tmp_path: Path,
 ) -> None:
     """
     After registering a sub-agent, the forwarder tails its
-    ``.jsonl`` and POSTs ``external_conversation_item`` events to
+    ``.jsonl`` and POSTs an array of ``external_conversation_item`` events to
     the Omnigent child session id (not the parent's).
     """
     bridge_dir = tmp_path / "bridge"
@@ -4598,13 +5692,17 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         },
     )
 
-    def response_for(body: dict[str, Any]) -> dict[str, Any]:
+    def response_for(body: object) -> object:
         """Mint a known child id for the start event.
 
         :param body: Decoded request body.
         :returns: Response payload.
         """
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, list):
+            return [
+                {"queued": False, "item_id": f"item-{index}"} for index, _event in enumerate(body)
+            ]
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return {"queued": False, "child_session_id": "conv_child_beta"}
         return {}
 
@@ -4621,22 +5719,17 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         )
     )
     try:
-        # We need: the start event + at least one item event addressed
-        # to the child. Drain up to N requests and collect every
-        # request bound for the child's ``/events`` path.
+        # We need the start event plus one event array addressed to the child.
         child_path = "/v1/sessions/conv_child_beta/events"
-        child_requests: list[dict[str, Any]] = []
+        batch: list[dict[str, Any]] | None = None
         for _ in range(40):
             req = await _get_recorded_request(server)
-            if req["path"] == child_path:
-                child_requests.append(req)
-                if len(child_requests) >= 2:
-                    break
-        assert len(child_requests) >= 2, (
-            f"only saw {len(child_requests)} requests to {child_path}: {child_requests!r}"
-        )
-        item_types = [r["body"]["type"] for r in child_requests]
-        assert "external_conversation_item" in item_types
+            if req["path"] == child_path and isinstance(req["body"], list):
+                batch = req["body"]
+                break
+        assert batch is not None
+        assert len(batch) == 2
+        assert all(event["type"] == "external_conversation_item" for event in batch)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -4645,19 +5738,15 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         server.server_close()
 
 
-async def test_subagent_watcher_retry_skips_previously_posted_items(
+async def test_subagent_watcher_retries_failed_batch_from_checkpoint(
     tmp_path: Path,
 ) -> None:
     """
-    Retrying a failed child item does not re-post earlier child items.
+    A rejected child batch leaves its byte cursor behind and retries in order.
 
-    The sub-agent watcher intentionally leaves ``byte_offset`` behind
-    when a later item fails, so the next poll re-reads the same JSONL
-    window. This test pins the durable ``seen_source_ids`` guard: item
-    A succeeds, item B fails once, and the retry must post only B.
-    Without that guard Omnigent live subscribers can see item A synced back
-    twice; the server no longer receives a ``source_id`` key that can
-    dedupe the post on AP's side.
+    The server deduplicates source ids, so an ambiguous response can safely
+    retry the entire batch even if some entries were already applied. The local
+    cursor advances only after the acknowledgement arrives.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -4696,27 +5785,30 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
         }
     )
     posted_items: list[str] = []
-    attempts_by_item: dict[str, int] = {}
+    batch_attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Fail the assistant item once and accept everything else.
+        Fail the first batch and acknowledge its retry.
 
         :param request: Request issued by the forwarder.
         :returns: Canned Omnigent response.
         """
+        nonlocal batch_attempts
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") != "external_conversation_item":
+        if not isinstance(body, list):
             return httpx.Response(202, json={})
-        item_data = body["data"]["item_data"]
-        role = item_data["role"]
-        text = item_data["content"][0]["text"]
-        item_key = f"{role}:{text}"
-        posted_items.append(item_key)
-        attempts_by_item[item_key] = attempts_by_item.get(item_key, 0) + 1
-        if item_key == "assistant:done" and attempts_by_item[item_key] == 1:
+        batch_attempts += 1
+        for event in body:
+            row = event["data"]
+            item_data = row["item_data"]
+            posted_items.append(f"{item_data['role']}:{item_data['content'][0]['text']}")
+        if batch_attempts == 1:
             return httpx.Response(503, json={"error": "try again"})
-        return httpx.Response(202, json={})
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
 
     item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     async with httpx.AsyncClient(
@@ -4746,13 +5838,1088 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
 
-    assert posted_items == ["user:go", "assistant:done", "assistant:done"]
+    assert posted_items == ["user:go", "assistant:done", "user:go", "assistant:done"]
     child_state = second.subagents["retry1"]
     assert child_state.byte_offset == subagent_jsonl.stat().st_size
     assert set(child_state.seen_source_ids) == {
         "sa-user-retry:0:message",
         "sa-assistant-retry:0:message",
     }
+
+
+def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
+    """Batching counts the complete UTF-8 JSON body and truncates one huge item."""
+    assert forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES == 5 * 1024 * 1024
+
+    def pending(index: int, text: str) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"source-{index}",
+                item_type="function_call_output",
+                data={"call_id": f"toolu_{index}", "output": text},
+                response_id="resp_batch",
+            ),
+            checkpoint_after=index + 1,
+        )
+
+    tiny_batches = forwarder._partition_subagent_batches(
+        [pending(index, "ok") for index in range(205)]
+    )
+    assert [len(batch) for batch in tiny_batches] == [100, 100, 5]
+
+    large_batches = forwarder._partition_subagent_batches(
+        [pending(1000, "€" * 1_000_000), pending(1001, "€" * 1_000_000)]
+    )
+    assert [len(batch) for batch in large_batches] == [1, 1]
+
+    oversized = forwarder._partition_subagent_batches([pending(2000, "€" * 2_000_000)])
+    assert len(oversized) == 1
+    truncated_output = oversized[0][0].item.data["output"]
+    assert isinstance(truncated_output, str)
+    assert "content truncated by omnigent" in truncated_output
+    for batch in [*tiny_batches, *large_batches, *oversized]:
+        assert (
+            len(forwarder._encoded_subagent_batch(batch))
+            <= forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES
+        )
+
+
+def test_oversized_subagent_item_does_not_truncate_identifiers() -> None:
+    """Batch fitting never rewrites schema-significant identifier fields."""
+    name = "n" * forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES
+    entry = forwarder._PendingSubagentItem(
+        item=ClaudeTranscriptItem(
+            source_id="oversized-name",
+            item_type="function_call",
+            data={"agent": "claude", "name": name, "arguments": "{}", "call_id": "call-1"},
+            response_id="resp-name",
+        )
+    )
+
+    fitted = forwarder._fit_subagent_item(entry)
+
+    assert fitted.drop_reason is not None
+    assert fitted.item.data["name"] == name
+
+
+@pytest.mark.parametrize(
+    ("field_name", "kind"),
+    [("input", "input"), ("stdout", "output"), ("stderr", "output")],
+)
+def test_oversized_subagent_terminal_text_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    kind: str,
+) -> None:
+    """Large terminal commands and output are shrunk instead of dropped."""
+    monkeypatch.setattr(forwarder, "MAX_SUBAGENT_EVENT_BATCH_BYTES", 1024)
+    entry = forwarder._PendingSubagentItem(
+        item=ClaudeTranscriptItem(
+            source_id=f"oversized-terminal-{field_name}",
+            item_type="terminal_command",
+            data={"kind": kind, field_name: "x" * 2048},
+            response_id="resp-terminal",
+        )
+    )
+
+    fitted = forwarder._fit_subagent_item(entry)
+
+    assert fitted.drop_reason is None
+    assert fitted.item.data["kind"] == kind
+    terminal_text = fitted.item.data[field_name]
+    assert isinstance(terminal_text, str)
+    assert "content truncated by omnigent" in terminal_text
+    assert len(forwarder._encoded_subagent_batch([fitted])) <= 1024
+
+
+def test_subagent_batch_partitioning_encodes_items_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Byte accounting never re-encodes the growing batch prefix."""
+
+    entries = [
+        forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"linear-{index}",
+                item_type="message",
+                data={"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                response_id="resp_linear",
+            )
+        )
+        for index in range(20)
+    ]
+    encoded_item_count = 0
+    original_encode = forwarder._encoded_subagent_batch
+
+    def record_encode(items: list[forwarder._PendingSubagentItem]) -> bytes:
+        nonlocal encoded_item_count
+        encoded_item_count += len(items)
+        return original_encode(items)
+
+    monkeypatch.setattr(forwarder, "_encoded_subagent_batch", record_encode)
+
+    batches = forwarder._partition_subagent_batches(entries)
+
+    assert batches == [entries]
+    assert encoded_item_count == 2 * len(entries)
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_partitioning_runs_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child-history JSON sizing does not block the live forwarding loop."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-worker.jsonl").write_text("", encoding="utf-8")
+    entry = forwarder.SubagentEntry(
+        subagent_id="worker",
+        child_conversation_id="conv_child_worker",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"worker": entry}),
+    )
+    event_loop_thread = threading.current_thread()
+    partition_threads: list[threading.Thread] = []
+    original_partition = forwarder._partition_subagent_batches
+
+    def record_partition(
+        items: list[forwarder._PendingSubagentItem],
+    ) -> list[list[forwarder._PendingSubagentItem]]:
+        partition_threads.append(threading.current_thread())
+        return original_partition(items)
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(forwarder, "_partition_subagent_batches", record_partition)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    assert partition_threads
+    assert all(thread is not event_loop_thread for thread in partition_threads)
+
+
+@pytest.mark.asyncio
+async def test_untruncatable_subagent_item_is_dead_lettered_and_checkpointed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One impossible item cannot livelock every later child-history poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-oversized.jsonl").write_text("{}\n", encoding="utf-8")
+    item = ClaudeTranscriptItem(
+        source_id="oversized-untruncatable",
+        item_type="message",
+        data={"x" * forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES: 1},
+        response_id="resp_oversized",
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=3,
+        current_response_id=None,
+        items=[item],
+        record_items=(TranscriptRecordItems(next_byte_offset=3, items=(item,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="oversized",
+        child_conversation_id="conv_child_oversized",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"oversized": entry}),
+    )
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    updated = checkpoint.state.subagents["oversized"]
+    assert updated.byte_offset == 3
+    assert updated.seen_source_ids == (item.source_id,)
+    dead_letter = json.loads(
+        (bridge_dir / "dead_letter.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert dead_letter["payload"]["source_id"] == item.source_id
+    assert "no truncatable text" in dead_letter["reason"]
+    assert dead_letter["http_status"] == 413
+
+
+@pytest.mark.asyncio
+async def test_subagent_batches_fall_back_once_for_older_server(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that rejects event arrays receives individual events thereafter."""
+
+    def pending(index: int) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"fallback-{index}",
+                item_type="message",
+                data={
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": str(index)}],
+                },
+                response_id="resp_fallback",
+            )
+        )
+
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "type": "model_attributes_type",
+                            "loc": ["body"],
+                            "msg": "Input should be a valid dictionary",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(202, json={"queued": False, "item_id": "item_fallback"})
+
+    capability = forwarder._SessionEventBatchCapability()
+    caplog.set_level(logging.INFO)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_one",
+            items=[pending(1), pending(2)],
+            batch_capability=capability,
+        )
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_two",
+            items=[pending(3), pending(4)],
+            batch_capability=capability,
+        )
+
+    assert capability.supported is False
+    assert len([body for body in bodies if isinstance(body, list)]) == 1
+    individual_source_ids = {
+        body["data"]["source_id"] for body in bodies if isinstance(body, dict)
+    }
+    assert individual_source_ids == {"fallback-1", "fallback-2", "fallback-3", "fallback-4"}
+    assert "does not accept session event arrays" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_failure_resumes_at_first_unsent_record(tmp_path: Path) -> None:
+    """A failed second batch keeps the durable cursor after record 100."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    records = [
+        {
+            "isSidechain": True,
+            "type": "assistant",
+            "uuid": f"sa-{index}",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": f"item {index}"}],
+            },
+        }
+        for index in range(150)
+    ]
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="checkpoint",
+        agent_type="Explore",
+        description="large history",
+        tool_use_id="toolu_checkpoint",
+        transcript_records=records,
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "checkpoint": forwarder.SubagentEntry(
+                subagent_id="checkpoint",
+                child_conversation_id="conv_child_checkpoint",
+            )
+        }
+    )
+    attempts: list[list[str]] = []
+    failed_second_batch = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal failed_second_batch
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        source_ids = [event["data"]["source_id"] for event in body]
+        attempts.append(source_ids)
+        if source_ids[0].startswith("sa-100:") and not failed_second_batch:
+            failed_second_batch = True
+            return httpx.Response(503, json={"error": "retry"})
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        with subagent_jsonl.open("rb") as handle:
+            expected_offset = sum(len(handle.readline()) for _ in range(100))
+        assert first.subagents["checkpoint"].byte_offset == expected_offset
+        persisted = forwarder._read_subagent_forward_state(bridge_dir)
+        assert persisted.subagents["checkpoint"].byte_offset == expected_offset
+
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert second.subagents["checkpoint"].byte_offset == subagent_jsonl.stat().st_size
+    attempted_ids = [source_id for batch in attempts for source_id in batch]
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 1 for index in range(100))
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 2 for index in range(100, 150))
+
+
+@pytest.mark.asyncio
+async def test_permanent_batch_failure_redrives_items_individually(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poison event cannot discard valid siblings from a failed batch."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-redrive.jsonl").write_text("{}\n", encoding="utf-8")
+    items = tuple(
+        ClaudeTranscriptItem(
+            source_id=source_id,
+            item_type="message",
+            data={"role": "assistant", "content": [{"type": "text", "text": source_id}]},
+            response_id="resp_redrive",
+        )
+        for source_id in ("before-poison", "poison", "after-poison")
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=3,
+        byte_offset=30,
+        current_response_id=None,
+        items=list(items),
+        record_items=tuple(
+            TranscriptRecordItems(next_byte_offset=(index + 1) * 10, items=(item,))
+            for index, item in enumerate(items)
+        ),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="redrive",
+        child_conversation_id="conv_child_redrive",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"redrive": entry}),
+    )
+    request_bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(400, json={"error": "poison in batch"})
+        if body["type"] == "external_conversation_item":
+            if body["data"]["source_id"] == "poison":
+                return httpx.Response(400, json={"error": "poison"})
+            return httpx.Response(202, json={"queued": False, "item_id": "item-ok"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0,
+                max_permanent_attempts=1,
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    individual_source_ids = [
+        body["data"]["source_id"]
+        for body in request_bodies
+        if isinstance(body, dict) and body.get("type") == "external_conversation_item"
+    ]
+    assert individual_source_ids == ["before-poison", "poison", "after-poison"]
+    updated = checkpoint.state.subagents["redrive"]
+    assert updated.byte_offset == 30
+    assert updated.seen_source_ids == tuple(item.source_id for item in items)
+    dead_letters = [
+        json.loads(line)
+        for line in (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert [record["payload"]["source_id"] for record in dead_letters] == ["poison"]
+
+
+@pytest.mark.asyncio
+async def test_individual_redrive_honors_not_confirmed_retry_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fallback item is retried before a not-confirmed 503 is dead-lettered."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-retry.jsonl").write_text("{}\n", encoding="utf-8")
+    item = ClaudeTranscriptItem(
+        source_id="retry-not-confirmed",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        response_id="resp-retry",
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=10,
+        current_response_id=None,
+        items=[item],
+        record_items=(TranscriptRecordItems(next_byte_offset=10, items=(item,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="retry",
+        child_conversation_id="conv_child_retry",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"retry": entry}),
+    )
+    batch_attempts = 0
+    individual_attempts = 0
+    forward_successes = 0
+
+    def note_forward_success() -> None:
+        nonlocal forward_successes
+        forward_successes += 1
+
+    monkeypatch.setattr(forwarder, "_note_forward_success", note_forward_success)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal batch_attempts, individual_attempts
+        body = json.loads(request.content.decode("utf-8"))
+        if isinstance(body, list):
+            batch_attempts += 1
+        else:
+            individual_attempts += 1
+        return httpx.Response(
+            503,
+            json={"error": "subagent_delivery_not_confirmed"},
+        )
+
+    retry_tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_permanent_attempts=1,
+        max_not_confirmed_attempts=2,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(3):
+            await forwarder._forward_one_subagent(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                subagents_dir=subagents_dir,
+                entry=checkpoint.state.subagents["retry"],
+                agent_name="claude-native-ui",
+                checkpoint=checkpoint,
+                item_retry_tracker=retry_tracker,
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                batch_capability=forwarder._SessionEventBatchCapability(),
+            )
+
+    assert batch_attempts == 2
+    assert individual_attempts == 2
+    assert forward_successes == 0
+    assert checkpoint.state.subagents["retry"].byte_offset == 10
+    dead_letters = [
+        json.loads(line)
+        for line in (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert [record["payload"]["source_id"] for record in dead_letters] == [item.source_id]
+    assert dead_letters[0]["reason"] == "delivery not confirmed after retries"
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_backoff_survives_new_tail_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Appending later items cannot reset backoff for the failing head item."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-backoff.jsonl").write_text("{}\n", encoding="utf-8")
+
+    def transcript_item(source_id: str) -> ClaudeTranscriptItem:
+        return ClaudeTranscriptItem(
+            source_id=source_id,
+            item_type="message",
+            data={"role": "assistant", "content": [{"type": "text", "text": source_id}]},
+            response_id="resp-backoff",
+        )
+
+    first = transcript_item("first")
+    second = transcript_item("second")
+    current_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=10,
+        current_response_id=None,
+        items=[first],
+        record_items=(TranscriptRecordItems(next_byte_offset=10, items=(first,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: current_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="backoff",
+        child_conversation_id="conv_child_backoff",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"backoff": entry}),
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(502, text="unavailable")
+
+    retry_tracker = forwarder._PostRetryTracker(base_delay_s=60.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=retry_tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+        current_result = TranscriptReadResult(
+            line_cursor=2,
+            byte_offset=20,
+            current_response_id=None,
+            items=[first, second],
+            record_items=(
+                TranscriptRecordItems(next_byte_offset=10, items=(first,)),
+                TranscriptRecordItems(next_byte_offset=20, items=(second,)),
+            ),
+        )
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=retry_tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+async def test_subagent_cleanup_swallows_finished_worker_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rotation cleanup cannot re-raise an already-finished worker error."""
+
+    async def fail() -> forwarder.SubagentForwardState:
+        raise RuntimeError("worker failed")
+
+    task = asyncio.create_task(fail())
+    await asyncio.sleep(0)
+
+    await forwarder._cancel_subagent_forward_task(task)
+
+    assert "worker failed during cleanup" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Path) -> None:
+    """Independent child conversations are concurrent while each stays ordered."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    entries: dict[str, forwarder.SubagentEntry] = {}
+    for index in range(16):
+        subagent_id = f"parallel-{index}"
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="parallel backlog",
+            tool_use_id=f"toolu_parallel_{index}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"parallel-message-{index}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    },
+                }
+            ],
+        )
+        entries[subagent_id] = forwarder.SubagentEntry(
+            subagent_id=subagent_id,
+            child_conversation_id=f"conv_child_{index}",
+        )
+
+    active = 0
+    maximum_active = 0
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 8:
+            release.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await asyncio.wait_for(
+            forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder.SubagentForwardState(subagents=entries),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            ),
+            timeout=3.0,
+        )
+    assert maximum_active == 8
+
+
+@pytest.mark.asyncio
+async def test_concurrent_subagent_502s_recover_without_phantom_completion(
+    tmp_path: Path,
+) -> None:
+    """A failed fan-out retries every child before any child can finish idle."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    old_activity = time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60
+    entries: dict[str, forwarder.SubagentEntry] = {}
+    for index in range(5):
+        subagent_id = f"recover-{index}"
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="concurrent retry",
+            tool_use_id=f"toolu_recover_{index}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"recover-message-{index}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    },
+                }
+            ],
+        )
+        entries[subagent_id] = forwarder.SubagentEntry(
+            subagent_id=subagent_id,
+            child_conversation_id=f"conv_recover_{index}",
+            last_activity_ts=old_activity,
+            last_status="running",
+        )
+
+    attempts: dict[str, int] = {}
+    statuses: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        child_id = request.url.path.split("/")[-2]
+        if isinstance(body, list):
+            attempts[child_id] = attempts.get(child_id, 0) + 1
+            if attempts[child_id] == 1:
+                return httpx.Response(502, text="bad gateway")
+            return httpx.Response(202, json=[{"item_id": f"item-{child_id}"}])
+        if body.get("type") == "external_session_status":
+            statuses.append((child_id, body["data"]["status"]))
+        return httpx.Response(202, json={})
+
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=3,
+    )
+    state = forwarder.SubagentForwardState(subagents=entries)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        assert statuses == []
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        quiet_entries = {
+            subagent_id: replace(entry, last_activity_ts=old_activity)
+            for subagent_id, entry in state.subagents.items()
+        }
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents=quiet_entries),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert set(attempts.values()) == {2}
+    assert sorted(status for _, status in statuses) == ["idle"] * 5
+    assert all(entry.delivery_error is None for entry in state.subagents.values())
+
+
+@pytest.mark.asyncio
+async def test_persistent_subagent_502_ends_as_explicit_failure(tmp_path: Path) -> None:
+    """A child that exhausts 502 retries fails with recoverable dead letters."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_id = "persistent-502"
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id=subagent_id,
+        agent_type="Explore",
+        description="persistent outage",
+        tool_use_id="toolu_persistent_502",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "persistent-message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "lost output"}],
+                },
+            }
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            subagent_id: forwarder.SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id="conv_persistent_502",
+            )
+        }
+    )
+    statuses: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if isinstance(body, list):
+            return httpx.Response(502, text="bad gateway")
+        if body.get("type") == "external_session_status":
+            statuses.append(body["data"])
+        return httpx.Response(202, json={})
+
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=2,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(2):
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=tracker,
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+        failed_entry = replace(
+            state.subagents[subagent_id],
+            last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60,
+        )
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={subagent_id: failed_entry}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert statuses == [{"status": "failed", "output": forwarder._SUBAGENT_DROPPED_ITEM_REASON}]
+    assert state.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
+    persisted = forwarder._read_subagent_forward_state(bridge_dir)
+    assert (
+        persisted.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
+    )
+    dead_letters = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    assert len(dead_letters) == 1
+    assert json.loads(dead_letters[0])["http_status"] == 502
+
+
+@pytest.mark.asyncio
+async def test_parent_output_forwards_while_child_history_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck child request cannot prevent the next live parent poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="blocked-child",
+        agent_type="Explore",
+        description="blocked history",
+        tool_use_id="toolu_blocked_child",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "blocked-child-item",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "old output"}],
+                },
+            }
+        ],
+    )
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(
+            subagents={
+                "blocked-child": forwarder.SubagentEntry(
+                    subagent_id="blocked-child",
+                    child_conversation_id="conv_blocked_child",
+                )
+            }
+        ),
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    child_request_started = asyncio.Event()
+    release_child = asyncio.Event()
+    parent_item_forwarded = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if isinstance(body, list):
+            child_request_started.set()
+            await release_child.wait()
+            return httpx.Response(
+                202,
+                json=[
+                    {"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)
+                ],
+            )
+        if (
+            request.url.path == "/v1/sessions/conv_parent/events"
+            and isinstance(body, dict)
+            and body.get("type") == "external_conversation_item"
+        ):
+            parent_item_forwarded.set()
+        return httpx.Response(202, json={})
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(child_request_started.wait(), timeout=2.0)
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "fresh-parent-item",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "fresh output"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        await asyncio.wait_for(parent_item_forwarded.wait(), timeout=1.0)
+    finally:
+        release_child.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 async def test_subagent_watcher_skips_subagents_already_in_state(
@@ -5062,6 +7229,122 @@ async def test_effort_sync_swallows_patch_failure() -> None:
     assert captured[0].method == "PATCH"
 
 
+async def _run_dismiss_stranded_spinner(
+    *,
+    bridge_dir: Path,
+    seq: int,
+    status: int = 200,
+) -> list[_CapturedRequest]:
+    """
+    Drive ``_maybe_dismiss_stranded_compaction_spinner`` against a mock AP.
+
+    :param bridge_dir: Bridge dir holding the compaction state.
+    :param seq: The refused compaction's ``PreCompact`` seq to dismiss.
+    :param status: HTTP status the mock endpoint returns.
+    :returns: Every request the helper issued, in order.
+    """
+    captured: list[_CapturedRequest] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the request and return a canned response."""
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        captured.append(_CapturedRequest(method=request.method, path=request.url.path, body=body))
+        return httpx.Response(status, json={"queued": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._maybe_dismiss_stranded_compaction_spinner(
+            client, session_id="conv_x", bridge_dir=bridge_dir, seq=seq
+        )
+    return captured
+
+
+async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> None:
+    """
+    A ``/compact`` refusal posts ``failed`` and drops the refused token.
+
+    Claude fired ``PreCompact`` (raising the spinner) but declined to
+    compact, so no completion signal follows. The forwarder must dismiss
+    the "Compacting…" spinner with ``external_compaction_status: failed``
+    and clear the dangling ``PreCompact`` token for that seq.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq)
+
+    assert captured == [
+        _CapturedRequest(
+            method="POST",
+            path="/v1/sessions/conv_x/events",
+            body={"type": "external_compaction_status", "data": {"status": "failed"}},
+        )
+    ], f"expected one failed compaction-status POST, got {captured!r}"
+    # Dangling token cleared so a later genuine compaction reconciles cleanly.
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
+
+
+async def test_compact_refusal_without_pending_token_no_ops(tmp_path: Path) -> None:
+    """
+    A refusal whose ``PreCompact`` was missed posts nothing.
+
+    No pending token means the ``PreCompact`` was never observed, so no
+    spinner is up and a ``failed`` post would be spurious.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=1)
+
+    assert captured == [], f"expected no POST without a pending token, got {captured!r}"
+
+
+async def test_compact_refusal_does_not_dismiss_a_different_compaction(tmp_path: Path) -> None:
+    """
+    A stale refusal seq never dismisses a later genuine compaction's token.
+
+    Regression for the flag-leak hazard: a refusal armed for seq N must not
+    fire against a fresh seq N+1 minted by a subsequent real ``/compact`` —
+    doing so would clear that live spinner and discard its boundary token.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A genuine, later compaction is pending (seq 1); the refusal we're
+    # flushing was armed for a missed earlier compaction (seq 0).
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    live_seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=live_seq - 1)
+
+    assert captured == [], f"a stale refusal seq must post nothing, got {captured!r}"
+    # The genuine compaction's token is untouched.
+    assert forwarder._read_compaction_state(bridge_dir).pending.seq == live_seq
+
+
+async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
+    """A failed dismissal POST is best-effort — attempted, logged, never raised."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq, status=503)
+
+    # Attempted once, the 503 swallowed. The token is still cleared (the
+    # spinner-owning PreCompact will never complete regardless).
+    assert len(captured) == 1
+    assert captured[0].method == "POST"
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
+
+
 def test_usage_from_status_state_surfaces_cumulative_cost() -> None:
     """
     ``_usage_from_status_state`` surfaces ``total_cost_usd`` as
@@ -5097,6 +7380,248 @@ def test_usage_from_status_state_omits_cost_when_absent() -> None:
     result = forwarder._usage_from_status_state(state)
     assert result is not None
     assert "cumulative_cost_usd" not in result
+
+
+@pytest.fixture
+def otel_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    """
+    Install a fresh TracerProvider with an in-memory exporter for one test.
+
+    Restores the previous provider on teardown so OTel's set-once
+    semantics do not leak into later tests in the same process.
+    """
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    previous = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    previous_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    in_mem = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(in_mem))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    try:
+        yield in_mem
+    finally:
+        in_mem.clear()
+        with contextlib.suppress(Exception):
+            provider.shutdown()
+        otel_trace._TRACER_PROVIDER = previous  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = previous_done  # type: ignore[attr-defined]
+
+
+def _ok_usage_client() -> httpx.AsyncClient:
+    """
+    Build a client whose ``POST /events`` always succeeds.
+
+    :returns: Client backed by a mock transport returning ``200``.
+    """
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        base_url="http://omnigent.test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_session_usage_records_gen_ai_token_attributes(
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A native Claude usage post carries the turn's tokens as ``gen_ai.usage.*``.
+
+    A native turn runs to completion in the terminal, so the harness
+    executor's ``TurnComplete`` reports no usage and the agent span closes
+    without token attributes. This post is where the real counts are known,
+    so it must record them or the session's tokens stay invisible to
+    MLflow / any OTel backend.
+    """
+    async with _ok_usage_client() as client:
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_abc123",
+            usage={"context_tokens": 1773, "input_tokens": 1523, "output_tokens": 847},
+            context_window=200_000,
+            token_usage={
+                "input_tokens": 1523,
+                "output_tokens": 847,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 50,
+            },
+        )
+
+    spans = [s for s in otel_exporter.get_finished_spans() if s.name == "claude_native.usage"]
+    assert len(spans) == 1
+    attrs = dict(spans[0].attributes or {})
+    assert attrs["gen_ai.usage.input_tokens"] == 1523
+    assert attrs["gen_ai.usage.output_tokens"] == 847
+    assert attrs["gen_ai.usage.total_tokens"] == 1523 + 847
+    assert attrs["gen_ai.usage.cache_read_input_tokens"] == 200
+    assert attrs["gen_ai.usage.cache_creation_input_tokens"] == 50
+
+
+@pytest.mark.asyncio
+async def test_post_session_usage_without_token_usage_records_no_tokens(
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A post with no ``token_usage`` records no token attributes.
+
+    Cost posts and context-window-only posts reach the same helper carrying
+    a usage snapshot but no new counts. Falling back to that snapshot would
+    re-record a figure already counted, or report a 0-token turn on every
+    cost tick.
+    """
+    async with _ok_usage_client() as client:
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_abc123",
+            usage={"cumulative_cost_usd": 0.42, "model": "claude-opus-4-8"},
+        )
+
+    spans = [s for s in otel_exporter.get_finished_spans() if s.name == "claude_native.usage"]
+    assert len(spans) == 1
+    attrs = dict(spans[0].attributes or {})
+    assert not [key for key in attrs if key.startswith("gen_ai.usage.")]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_records_each_api_call_usage_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    Each assistant API call contributes exactly one usage span.
+
+    The usage POST re-fires whenever the statusLine gauge or the context
+    window moves, which happens several times per API call. Recording the
+    snapshot on each of those would make a backend that SUMS
+    ``gen_ai.usage.*`` across spans multiply-count the same prompt. Only a
+    new completed assistant record may add a span.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+
+    def _assistant(uuid: str, text: str, usage: dict[str, int]) -> str:
+        """
+        Build one assistant JSONL line carrying ``message.usage``.
+
+        :param uuid: Transcript entry uuid, e.g. ``"a1"``.
+        :param text: Assistant text content.
+        :param usage: Anthropic ``message.usage`` block for the call.
+        :returns: A JSON-encoded transcript line.
+        """
+        return json.dumps(
+            {
+                "type": "assistant",
+                "uuid": uuid,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": usage,
+                },
+            }
+        )
+
+    # The statusLine gauge moves every poll (a streaming message's output
+    # grows, cache reads land) — the churn that used to re-record tokens.
+    status_box = {"value": {"input_tokens": 1000, "output_tokens": 10}}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"context_window_size": 200_000, "current_usage": status_box["value"]},
+    )
+
+    transcript_path.write_text(
+        _assistant("a1", "hi", {"input_tokens": 1000, "output_tokens": 50}) + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    retry_tracker = forwarder._PostRetryTracker()
+
+    transport = httpx.MockTransport(lambda _request: httpx.Response(202, json={}))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def poll() -> None:
+            """Run one forwarder poll against the shared cursor state."""
+            nonlocal state
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=dedupe,
+            )
+
+        await poll()
+        # Same API call, gauge still moving: re-posts usage, records nothing.
+        status_box["value"] = {"input_tokens": 1000, "output_tokens": 40}
+        await poll()
+        status_box["value"] = {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 900,
+        }
+        await poll()
+
+        recorded = _recorded_token_spans(otel_exporter)
+        assert recorded == [(1000, 50)], "one completed API call must record exactly one span"
+
+        # A second API call is new usage and does add a span.
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(_assistant("a2", "more", {"input_tokens": 2200, "output_tokens": 80}) + "\n")
+        await poll()
+
+    assert _recorded_token_spans(otel_exporter) == [(1000, 50), (2200, 80)]
+    assert dedupe.recorded_token_usage == {"input_tokens": 2200, "output_tokens": 80}
+
+
+def _recorded_token_spans(exporter: InMemorySpanExporter) -> list[tuple[int, int]]:
+    """
+    Collect ``(input_tokens, output_tokens)`` from every usage span recorded.
+
+    :param exporter: In-memory exporter holding the finished spans.
+    :returns: One pair per span that carried token attributes, in order.
+    """
+    pairs: list[tuple[int, int]] = []
+    for span in exporter.get_finished_spans():
+        attrs = dict(span.attributes or {})
+        if "gen_ai.usage.input_tokens" in attrs:
+            pairs.append((attrs["gen_ai.usage.input_tokens"], attrs["gen_ai.usage.output_tokens"]))
+    return pairs
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        # The cost tag and the derived context gauge are not token counters.
+        (
+            {"context_tokens": 1773, "input_tokens": 1523, "output_tokens": 847},
+            {"input_tokens": 1523, "output_tokens": 847},
+        ),
+        ({"cumulative_cost_usd": 0.42, "model": "claude-opus-4-8"}, None),
+        ({"context_tokens": 1773}, None),
+        (None, None),
+    ],
+)
+def test_gen_ai_usage_tokens_keeps_only_token_counters(
+    usage: dict[str, float | str] | None,
+    expected: dict[str, int] | None,
+) -> None:
+    """
+    Only real input/output token counters survive into the OTel payload.
+
+    :param usage: Usage payload posted to the Sessions API.
+    :param expected: Token counts to record, or ``None`` for no recording.
+    """
+    assert forwarder._gen_ai_usage_tokens(usage) == expected
 
 
 @dataclass
@@ -5279,6 +7804,203 @@ def test_delta_forward_state_round_trips(tmp_path: Path) -> None:
     assert forwarder._read_delta_forward_state(bridge_dir).byte_offset == 512
 
 
+def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -> None:
+    """
+    The turn-settle latch survives a forwarder restart via the cursor file.
+
+    A restart inside a scheduled-wake gap must still mark the wake; a
+    pre-latch state file (no ``settled_response_id`` key) loads as None.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b2", workspace=tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript,
+        line_cursor=3,
+        byte_offset=64,
+        current_response_id="resp_a",
+        settled_response_id="resp_a",
+        pending_settled_response_id="resp_b",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    loaded = forwarder._read_forward_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.settled_response_id == "resp_a"
+    assert loaded.pending_settled_response_id == "resp_b"
+
+    raw = json.loads((bridge_dir / forwarder._FORWARDER_STATE_FILE).read_text("utf-8"))
+    del raw["settled_response_id"]
+    (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text(json.dumps(raw), "utf-8")
+    legacy = forwarder._read_forward_state(bridge_dir)
+    assert legacy is not None
+    assert legacy.settled_response_id is None
+
+
+def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
+    """
+    A pending settle activates only once its turn has no output in flight.
+
+    The turn's final message can surface after its Stop edge — promoting
+    while that batch still
+    carries the turn's output would mis-read the tail as a scheduled
+    wake and split the answer into a phantom new turn.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    dedupe.pending_settled_response_id = "resp_a"
+    tail = ClaudeTranscriptItem(
+        source_id="s1:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "tail"}]},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [tail]) is False
+    assert dedupe.settled_response_id is None
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # A late tool result also defers: it can surface EARLIER than the
+    # assistant tail, and promoting on it would mis-mark that tail.
+    late_result = ClaudeTranscriptItem(
+        source_id="s2:0:function_call_output",
+        item_type="function_call_output",
+        data={"call_id": "c1", "output": "done"},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [late_result]) is False
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # Items for OTHER turns don't defer; a truly quiet batch promotes.
+    other = ClaudeTranscriptItem(
+        source_id="s3:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
+        response_id="resp_b",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [other]) is True
+    assert dedupe.settled_response_id == "resp_a"
+    assert dedupe.pending_settled_response_id is None
+
+    # Idempotent once promoted.
+    assert forwarder._promote_pending_settle(dedupe, []) is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path) -> None:
+    """
+    The full wake pipeline: settle → quiet-poll promote → marked new turn.
+
+    Poll 1 forwards a turn; its Stop edge records the pending settle
+    (covered by the status-events test — recorded directly here). Poll 2
+    is quiet and promotes the settle, persisting it. Poll 3 sees new
+    assistant entries — a cron firing writes no user entry — and must POST
+    the scheduled-wake marker ahead of the resumed output, all under a new
+    response id.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "iter-one",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Iteration 1: all green."}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every forwarder POST, recording its payload.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        payload = json.loads(request.content.decode("utf-8"))
+        assert isinstance(payload, dict)
+        requests.append(payload)
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        after_turn = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        turn_one_id = after_turn.current_response_id
+        assert turn_one_id is not None
+
+        # The turn ends: the Stop edge records the pending settle.
+        dedupe.pending_settled_response_id = turn_one_id
+        quiet = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=after_turn,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert dedupe.settled_response_id == turn_one_id
+        assert quiet.settled_response_id == turn_one_id
+
+        # A cron firing appends assistant output with NO user entry.
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "iter-two",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Iteration 2: still green."}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        requests.clear()
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=quiet,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    # No status POST: the transcript path publishes none (Claude's status file
+    # owns the badge). The wake is observable entirely in the items — a fresh
+    # turn id plus the marker ahead of the resumed output.
+    assert [request["type"] for request in requests] == ["external_conversation_item"] * len(
+        requests
+    )
+    items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    wake_turn_id = items[0]["response_id"]
+    assert wake_turn_id != turn_one_id
+    assert [item["item_data"]["role"] for item in items] == ["user", "assistant"]
+    assert items[0]["item_data"]["content"] == [
+        {"type": "input_text", "text": "[System: scheduled prompt fired]"}
+    ]
+    assert {item["response_id"] for item in items} == {wake_turn_id}
+
+
 async def test_post_external_output_text_delta_sends_expected_payload(tmp_path: Path) -> None:
     """
     The single-delta POST helper sends the canonical event body.
@@ -5302,497 +8024,6 @@ async def test_post_external_output_text_delta_sends_expected_payload(tmp_path: 
             },
         )
     ]
-
-
-# ── deltas-before-done ordering (assistant item hold-back) ────────────
-
-
-def _write_assistant_transcript(path: Path, uuid: str, text: str) -> None:
-    """
-    Append one assistant text record to a Claude transcript JSONL file.
-
-    :param path: Transcript file path.
-    :param uuid: Record uuid, e.g. ``"u1"``.
-    :param text: Assistant text block content, e.g. ``"Hello world"``.
-    :returns: None.
-    """
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "uuid": uuid,
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": text}],
-                    },
-                }
-            )
-            + "\n"
-        )
-
-
-def _transcript_state_for(transcript_path: Path) -> forwarder.TranscriptForwardState:
-    """
-    Build a fresh transcript cursor state for ``transcript_path``.
-
-    :param transcript_path: Transcript file the state points at.
-    :returns: A zero-cursor :class:`TranscriptForwardState`.
-    """
-    return forwarder.TranscriptForwardState(
-        transcript_path=transcript_path,
-        line_cursor=0,
-        byte_offset=0,
-        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
-    )
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_held_until_its_deltas_forward(tmp_path: Path) -> None:
-    """
-    An assistant item whose deltas haven't fully forwarded is deferred.
-
-    Drives the real commit-before-delta race: with only a non-final chunk
-    forwarded the item is held (no POST, cursor unadvanced); once the final
-    chunk forwards and the joined text byte-equals the item's, it posts
-    AFTER the deltas. Posting first would dupe (committed text + a late
-    ``live:`` preview from the trailing chunks).
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-    # Only the first chunk has been written by the hook so far.
-    _write_deltas_file(
-        bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
-    )
-
-    ordering = forwarder._DeltaOrderingState()
-    seen_deltas: dict[tuple[str, int], None] = {}
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        delta_state = await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys=seen_deltas,
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-        # Held: the item was NOT posted and the durable cursor did not
-        # advance past it, so the next poll re-reads it. (The turn-start
-        # ``external_session_status: running`` edge is filtered out here — this
-        # test is about delta-vs-item ordering, not the status edge.)
-        assert [
-            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
-        ] == ["external_output_text_delta"]
-        assert item_state.byte_offset == 0
-        assert item_state.seen_source_ids == ()
-
-        # Next poll: the hook's final chunk lands, completing the text.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 1, "final": True, "delta": "world"}]
-        )
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen_deltas,
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=item_state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-
-    # The item posted AFTER both of its chunks — the ordering every
-    # downstream suppression layer assumes. Content asserted (not just
-    # counts) to prove the matched item is the right one.
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 1
-    assert item_posts[0]["data"]["item_data"]["content"] == [
-        {"type": "output_text", "text": "Hello world"}
-    ]
-    assert [c.body["type"] for c in captured if c.body["type"] != "external_session_status"][
-        :2
-    ] == [
-        "external_output_text_delta",
-        "external_output_text_delta",
-    ]
-    assert item_state.byte_offset == transcript_path.stat().st_size
-    # The matched stream was consumed: a later identical-text message
-    # must match its own deltas, not this stale entry.
-    assert ordering.texts == {}
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_posts_after_hold_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    An item whose deltas never arrive posts once the hold timeout expires.
-
-    Deltas are best-effort (dropped chunks, multi-block messages that never
-    byte-match), so the hold must be bounded or such items would never
-    persist. Past ``_ASSISTANT_ITEM_DELTA_HOLD_S`` it posts with no match —
-    safe, since no forwarded deltas means no live preview to duplicate.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-    # Deltas file exists (hook active) but carries an UNRELATED stream,
-    # so the item can never match by text.
-    _write_deltas_file(
-        bridge_dir, [{"message_id": "m9", "index": 0, "final": True, "delta": "other"}]
-    )
-    clock = {"now": 100.0}
-    monkeypatch.setattr(forwarder, "_hold_monotonic", lambda: clock["now"])
-
-    ordering = forwarder._DeltaOrderingState()
-    captured: list[_CapturedDeltaPost] = []
-    # Share one dedupe across polls (as the real loop does) so the turn-start
-    # ``running`` status fires once, not per call.
-    dedupe = forwarder._ForwardDedupeState()
-    async with _delta_capture_client(captured) as client:
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys={},
-            ordering=ordering,
-        )
-        state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            ordering=ordering,
-        )
-        # Status edges (the turn-start ``running``) filtered out — this test
-        # is about the delta-then-held-item ordering.
-        assert [
-            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
-        ] == ["external_output_text_delta"]
-        assert state.byte_offset == 0  # held
-
-        clock["now"] = 100.0 + forwarder._ASSISTANT_ITEM_DELTA_HOLD_S
-        state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            ordering=ordering,
-        )
-
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 1
-    assert item_posts[0]["data"]["item_data"]["content"] == [
-        {"type": "output_text", "text": "Hello world"}
-    ]
-    assert state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_not_held_without_deltas_file(tmp_path: Path) -> None:
-    """
-    A session whose MessageDisplay hook never fired is never held.
-
-    No deltas file means no live preview, hence no duplicate — holding
-    would only add latency. The item posts on the first poll.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=forwarder._DeltaOrderingState(),
-        )
-
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 1
-    assert state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_stays_held_until_true_final_chunk(tmp_path: Path) -> None:
-    """
-    The commit stays held while a NON-final chunk lands after it.
-
-    Any chunk, not just the final one, can land after the commit (the
-    observed ``D D C D`` race). The hold must wait for the ``final`` chunk
-    to byte-match, NOT release on "another delta arrived" — else the late
-    non-final chunk builds a second ``live:`` preview after the commit.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello big world")
-
-    ordering = forwarder._DeltaOrderingState()
-    seen: dict[tuple[str, int], None] = {}
-    delta_state = forwarder.DeltaForwardState()
-    item_state = _transcript_state_for(transcript_path)
-    captured: list[_CapturedDeltaPost] = []
-    # Share one dedupe across polls (as the real loop does) so the turn-start
-    # ``running`` status fires once, not per poll.
-    dedupe = forwarder._ForwardDedupeState()
-
-    async def _poll(client: httpx.AsyncClient) -> None:
-        nonlocal delta_state, item_state
-        delta_state = await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen,
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=item_state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            ordering=ordering,
-        )
-
-    async with _delta_capture_client(captured) as client:
-        # Poll 1: only the first (non-final) chunk; the commit is ready.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
-        )
-        await _poll(client)
-        assert item_state.byte_offset == 0  # held — no final chunk yet
-
-        # Poll 2: a SECOND non-final chunk lands AFTER the commit — still held.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 1, "final": False, "delta": "big "}]
-        )
-        await _poll(client)
-        assert item_state.byte_offset == 0  # STILL held: stream not final
-        assert not [c for c in captured if c.body["type"] == "external_conversation_item"]
-
-        # Poll 3: the true final chunk lands → byte-matches → released.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 2, "final": True, "delta": "world"}]
-        )
-        await _poll(client)
-
-    # Commit posts only AFTER all three deltas — the order downstream assumes.
-    # The turn-start ``running`` status edge is filtered out (it fires once,
-    # before the deltas); this test is about delta-then-commit ordering.
-    assert [c.body["type"] for c in captured if c.body["type"] != "external_session_status"] == [
-        "external_output_text_delta",
-        "external_output_text_delta",
-        "external_output_text_delta",
-        "external_conversation_item",
-    ]
-    item = next(c.body for c in captured if c.body["type"] == "external_conversation_item")
-    assert item["data"]["item_data"]["content"] == [
-        {"type": "output_text", "text": "Hello big world"}
-    ]
-    assert item_state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_held_when_final_seen_but_chunk_missing(tmp_path: Path) -> None:
-    """
-    Seeing the ``final`` chunk is not enough — the join must byte-equal.
-
-    A dropped middle chunk leaves the joined text != commit text, so the
-    item stays held despite ``final`` being seen. This is why the release
-    gate requires BOTH ``entry.final`` and the byte-equal check.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello big world")
-    # Forward index 0 and the FINAL index 2 — but NOT the middle index 1.
-    _write_deltas_file(
-        bridge_dir,
-        [
-            {"message_id": "m1", "index": 0, "final": False, "delta": "Hello "},
-            {"message_id": "m1", "index": 2, "final": True, "delta": "world"},
-        ],
-    )
-
-    ordering = forwarder._DeltaOrderingState()
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys={},
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-
-    # final WAS seen, but join "Hello world" != commit "Hello big world".
-    assert ordering.texts["m1"].final is True
-    assert "".join(ordering.texts["m1"].parts) == "Hello world"
-    assert item_state.byte_offset == 0  # held despite the final flag
-    assert not [c for c in captured if c.body["type"] == "external_conversation_item"]
-
-
-@pytest.mark.asyncio
-async def test_two_identical_text_items_each_match_own_stream(tmp_path: Path) -> None:
-    """
-    Two assistant messages with identical text are matched by count.
-
-    Consume-once: the first commit pops one stream, the second pops the
-    other — both post, ordering ends empty. Identical text renders
-    identically, so which physical stream a commit consumes doesn't matter.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "OK")
-    _write_assistant_transcript(transcript_path, "u2", "OK")
-    _write_deltas_file(
-        bridge_dir,
-        [
-            {"message_id": "mA", "index": 0, "final": True, "delta": "OK"},
-            {"message_id": "mB", "index": 0, "final": True, "delta": "OK"},
-        ],
-    )
-
-    ordering = forwarder._DeltaOrderingState()
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys={},
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 2  # both released, neither blocked
-    assert all(
-        p["data"]["item_data"]["content"] == [{"type": "output_text", "text": "OK"}]
-        for p in item_posts
-    )
-    assert ordering.texts == {}  # both streams consumed (consume-once)
-    assert item_state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_without_hold_commit_posts_before_final_delta(tmp_path: Path) -> None:
-    """
-    Break-the-feature guard: with the hold disabled the bug reproduces.
-
-    ``ordering=None`` (pre-fix behaviour): the commit posts immediately,
-    BEFORE the final delta — the exact order that dupes the ``live:``
-    preview. Paired with the hold-on test, this pins the hold as the fix.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-    _write_deltas_file(
-        bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
-    )
-
-    seen: dict[tuple[str, int], None] = {}
-    delta_state = forwarder.DeltaForwardState()
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        delta_state = await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen,
-            ordering=None,
-        )
-        await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=None,
-        )
-        # Bug: with no hold the commit posts immediately, before the final
-        # chunk. The turn-start ``running`` status edge is filtered out.
-        assert [
-            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
-        ] == [
-            "external_output_text_delta",
-            "external_conversation_item",
-        ]
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 1, "final": True, "delta": "world"}]
-        )
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen,
-            ordering=None,
-        )
-
-    # The final delta lands AFTER the commit — the inverted order that dupes.
-    types = [c.body["type"] for c in captured if c.body["type"] != "external_session_status"]
-    commit_idx = types.index("external_conversation_item")
-    final_delta_idx = max(i for i, t in enumerate(types) if t == "external_output_text_delta")
-    assert commit_idx < final_delta_idx
 
 
 # ── session cost reconciliation (max(S, C)) ───────────────────────────
@@ -6070,6 +8301,57 @@ async def test_forward_session_cost_posts_status_when_no_subagents(
     assert dedupe.posted_policy_cost == pytest.approx(0.25)
 
 
+@pytest.mark.asyncio
+async def test_forward_session_cost_backs_off_after_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    monkeypatch.setattr(
+        forwarder, "read_claude_context_state", lambda _bridge: {"total_cost_usd": 0.25}
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: now["value"])
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"retry-after": "5"}, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        kwargs = {
+            "client": client,
+            "session_id": "conv_parent",
+            "bridge_dir": bridge_dir,
+            "parent_transcript_path": parent,
+            "subagent_state": forwarder.SubagentForwardState(subagents={}),
+            "dedupe": dedupe,
+            "cost_cache": {},
+        }
+        await forwarder._forward_session_cost(**kwargs)
+        assert calls == 1
+        assert dedupe.cost_retry_failures == 1
+        assert dedupe.cost_retry_not_before == pytest.approx(105.0)
+
+        await forwarder._forward_session_cost(**kwargs)
+        assert calls == 1
+
+        now["value"] = 105.0
+        await forwarder._forward_session_cost(**kwargs)
+
+    assert calls == 2
+    assert dedupe.cost_retry_failures == 0
+    assert dedupe.cost_retry_not_before == 0.0
+    assert dedupe.posted_cost == pytest.approx(0.25)
+
+
 def test_parse_json_response_returns_value_on_valid_json() -> None:
     """
     A normal JSON body parses through ``_parse_json_response`` unchanged.
@@ -6244,7 +8526,7 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
 
     with (
         patch(
-            "omnigent.claude_native_forwarder.read_claude_session_id",
+            "omnigent.harnesses.claude_native.forwarder.read_claude_session_id",
             return_value="claude-uuid-1",
         ),
         patch(
@@ -6300,7 +8582,7 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
 
     with (
         patch(
-            "omnigent.claude_native_forwarder.read_claude_session_id",
+            "omnigent.harnesses.claude_native.forwarder.read_claude_session_id",
             return_value=None,
         ),
     ):
@@ -6337,6 +8619,13 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             "transcript_path": str(transcript_path),
         },
     )
+    # PreCompact mints the pending token the completion signal consumes.
+    # A real compaction always fires PreCompact before the compact
+    # SessionStart; the hook path only persists when that token exists.
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
     # Post-compaction SessionStart — the completion signal.
     record_hook_event(
         bridge_dir,
@@ -6354,7 +8643,7 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
 
     persist_mock = AsyncMock(side_effect=_persist_side_effect)
     with patch(
-        "omnigent.claude_native_forwarder._persist_native_compaction_item",
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
         persist_mock,
     ):
         task = asyncio.create_task(
@@ -6369,8 +8658,18 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             )
         )
         try:
-            # Wait for the compaction status POST to arrive.
-            request = await _get_recorded_request(server)
+            # Wait for the compaction-completed status POST to arrive
+            # (the leading PreCompact in_progress edge is skipped).
+            request = None
+            for _ in range(10):
+                candidate = await _get_recorded_request(server)
+                if (
+                    candidate["body"].get("type") == "external_compaction_status"
+                    and candidate["body"]["data"].get("status") == "completed"
+                ):
+                    request = candidate
+                    break
+            assert request is not None, "compaction-completed status was never posted"
             # Wait for _persist_native_compaction_item to be called
             # (it runs right after the POST in the same await chain).
             await asyncio.wait_for(persist_called.wait(), timeout=5.0)
@@ -6382,7 +8681,7 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             server.server_close()
             thread.join(timeout=5.0)
 
-    # The recording server captured the compaction status POST.
+    # The recording server captured the compaction-completed status POST.
     assert request["body"]["type"] == "external_compaction_status"
     assert request["body"]["data"]["status"] == "completed"
     # _persist_native_compaction_item was called with the right session id.
@@ -6418,7 +8717,7 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     server, thread, base_url = _start_recording_server()
     persist_mock = AsyncMock()
     with patch(
-        "omnigent.claude_native_forwarder._persist_native_compaction_item",
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
         persist_mock,
     ):
         task = asyncio.create_task(
@@ -6447,6 +8746,705 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Durable compaction-boundary reconciliation (native resume/replay fix)
+# ---------------------------------------------------------------------------
+
+
+def _compact_summary_item(text: str = "compaction summary text") -> ClaudeTranscriptItem:
+    """
+    Build a transcript item flagged as a Claude ``isCompactSummary`` record.
+
+    :param text: The continuation-summary text carried by the item.
+    :returns: A ``ClaudeTranscriptItem`` with ``is_compact_summary=True``.
+    """
+    return ClaudeTranscriptItem(
+        source_id="summary-uuid:0:compact_summary",
+        item_type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        response_id="resp_summary",
+        is_compact_summary=True,
+    )
+
+
+def _persist_mock() -> AsyncMock:
+    """
+    Build an ``AsyncMock`` standing in for ``_persist_native_compaction_item``.
+
+    :returns: An async mock that records calls and returns ``None``.
+    """
+    return AsyncMock(return_value=None)
+
+
+@pytest.mark.asyncio
+async def test_missing_compact_session_start_still_persists_from_transcript(
+    tmp_path: Path,
+) -> None:
+    """
+    A transcript ``isCompactSummary`` record persists the boundary alone.
+
+    Reproduces the core bug: the flaky ``SessionStart source=compact`` hook
+    never fires, so only the transcript summary is available. The transcript
+    path must still persist exactly one compaction boundary (carrying the
+    summary text) once a ``PreCompact`` token is pending.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_missing_hook",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("the summary"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    assert persist.call_args[1]["session_id"] == "conv_missing_hook"
+    assert persist.call_args[1]["summary_override"] == "the summary"
+    # Boundary marked persisted; pending cleared.
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert 1 in state.persisted_seqs
+
+
+@pytest.mark.asyncio
+async def test_normal_hook_after_transcript_does_not_double_persist(tmp_path: Path) -> None:
+    """
+    The completion hook does not re-persist a boundary the transcript wrote.
+
+    After the transcript path persists the boundary and marks the sequence
+    done, a later ``SessionStart source=compact`` hook finds no consumable
+    pending token, so ``_consume_pending_compaction`` returns ``None`` and no
+    second boundary is written.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        # Transcript path persists first.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_dedupe",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert persist.call_count == 1
+
+    # Hook path arrives later — the token is already consumed.
+    seq = await _consume_pending_compaction(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    assert seq is None
+
+
+@pytest.mark.asyncio
+async def test_failed_boundary_post_is_retried_not_consumed(tmp_path: Path) -> None:
+    """
+    A hard POST failure leaves the summary unconsumed for retry.
+
+    ``_handle_compact_summary_item`` must return ``False`` (so the caller
+    holds the transcript cursor before the summary record) and must NOT mark
+    the sequence persisted, so the boundary is retried on a later poll rather
+    than silently lost — which would make resume reload the full history.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    # A definitively-permanent 400 (not an ambiguous/network failure).
+    request = httpx.Request("POST", "http://x/events")
+    response = httpx.Response(400, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("bad", request=request, response=response)
+    )
+
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_retry",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is False
+    state = _read_compaction_state(bridge_dir)
+    # Pending still set, nothing persisted — the summary will be retried.
+    assert state.pending is not None
+    assert state.pending.seq == 1
+    assert state.persisted_seqs == ()
+
+
+@pytest.mark.asyncio
+async def test_restart_reattach_does_not_repersist_completed_boundary(tmp_path: Path) -> None:
+    """
+    An already-persisted boundary is never re-persisted after a rewind.
+
+    Simulates a process restart / cursor rewind that re-reads a summary whose
+    boundary already POSTed: ``persisted_seqs`` records the sequence, so
+    ``_consume_pending_compaction`` returns ``None`` and
+    ``_handle_compact_summary_item`` drops the record without persisting.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Durable state as it would exist after a completed compaction: seq 1
+    # persisted, but a stale pending token for the same seq lingers (e.g.
+    # crash between POST success and mark). The persisted set must win.
+    from omnigent.harnesses.claude_native.forwarder import (
+        _PendingCompaction,
+        _write_compaction_state,
+    )
+
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            pending=_PendingCompaction(seq=1, claude_session_id="claude-1"),
+            last_seq=1,
+            persisted_seqs=(1,),
+        ),
+    )
+
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_restart",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_repeated_compactions_persist_distinct_boundaries(tmp_path: Path) -> None:
+    """
+    Two compaction cycles persist two distinct boundaries.
+
+    Each ``PreCompact`` mints a fresh monotonic sequence, so a second
+    compaction is not blocked by the first's ``persisted_seqs`` entry.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    persist = _persist_mock()
+
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        # First compaction.
+        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_repeat",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("first"),
+            retry_tracker=_PostRetryTracker(),
+        )
+        # Second compaction, later in the same session.
+        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_repeat",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("second"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert persist.call_count == 2
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert set(state.persisted_seqs) == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` record with no pending PreCompact is dropped.
+
+    On a cold resume the transcript may contain a historical compact-summary
+    record from a prior compaction with no live ``PreCompact`` token. It must
+    not persist a spurious boundary, and must not be forwarded as a user
+    bubble — ``_handle_compact_summary_item`` returns handled with no persist.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()  # no _note_precompact — no pending token
+
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_historical",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+    assert _read_compaction_state(bridge_dir).persisted_seqs == ()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
+    """
+    An ambiguous POST failure is treated as delivered (no duplicate boundary).
+
+    Mirrors the item-forwarding rule: when the server may already have
+    committed the boundary (e.g. a dropped response on a 2xx), retrying would
+    risk a duplicate compaction bubble, so the sequence is marked persisted
+    and the record advanced.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
+
+    with (
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", ambiguous
+        ),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder.post_may_have_been_delivered",
+            return_value=True,
+        ),
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_ambiguous",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    state = _read_compaction_state(bridge_dir)
+    assert 1 in state.persisted_seqs
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_precompact_and_summary_same_poll_persists_boundary(tmp_path: Path) -> None:
+    """
+    P1-1: a PreCompact + summary first visible in one poll persists a boundary.
+
+    The transcript forwarder (which consumes the ``isCompactSummary`` record)
+    runs before the hook forwarder (which mints the ``PreCompact`` token)
+    within a single poll. Without the pre-items prescan, a ``PreCompact`` and
+    its summary that both first appear in the same poll would lose the
+    boundary — the summary is consumed with no token yet minted.
+    ``_prescan_precompact_edges`` mints the token first, so the summary that
+    follows in the same poll finds it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A PreCompact hook is written but the hook cursor has NOT advanced past
+    # it yet (mirrors the same-poll ordering: hooks are forwarded AFTER items).
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-1"},
+    )
+    hook_state = await forwarder._ensure_hook_state(
+        bridge_dir, start_at_end=False, session_id="conv_same_poll"
+    )
+
+    # No pending token before the prescan.
+    assert _read_compaction_state(bridge_dir).pending is None
+
+    # Prescan mints the token BEFORE the transcript summary is processed.
+    await _prescan_precompact_edges(bridge_dir, hook_state)
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.pending.seq == 1
+
+    # The summary in the same poll now finds the token and persists once.
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_same_poll",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("same-poll summary"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    state = _read_compaction_state(bridge_dir)
+    assert 1 in state.persisted_seqs
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_prescan_is_idempotent_with_hook_phase(tmp_path: Path) -> None:
+    """
+    P1-1: the prescan and the main hook phase mint one token per PreCompact.
+
+    Both scans see the same ``PreCompact`` record each poll. The
+    ``event_cursor`` idempotency key must keep them converging on a single
+    pending token — never two — so a re-mint cannot overwrite a token whose
+    boundary is mid-persist.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-1"},
+    )
+    hook_state = await forwarder._ensure_hook_state(
+        bridge_dir, start_at_end=False, session_id="conv_idem"
+    )
+
+    # Prescan mints seq 1.
+    await _prescan_precompact_edges(bridge_dir, hook_state)
+    first = _read_compaction_state(bridge_dir)
+    assert first.pending is not None and first.pending.seq == 1
+    assert first.last_precompact_cursor == 1
+
+    # The main hook phase would note the SAME edge (same event_cursor=1).
+    # It must be a no-op: same seq, no second token.
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=1
+    )
+    second = _read_compaction_state(bridge_dir)
+    assert second.pending is not None and second.pending.seq == 1
+    assert second.last_seq == 1
+
+    # A genuinely NEW PreCompact edge (higher cursor) mints the next seq.
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=2
+    )
+    third = _read_compaction_state(bridge_dir)
+    assert third.pending is not None and third.pending.seq == 2
+    assert third.last_precompact_cursor == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_completion_hook_persists_without_pending(tmp_path: Path) -> None:
+    """
+    P1-2: a compact SessionStart with no pending token still persists a boundary.
+
+    Restores the legacy standalone-completion safety. When the
+    ``PreCompact`` hook was dropped (or the forwarder attached after it
+    fired) AND no transcript summary has persisted a boundary, the
+    ``SessionStart source=compact`` completion hook must still persist
+    exactly one boundary — otherwise resume reloads the full pre-compaction
+    history. ``_claim_standalone_completion`` mints the sequence for it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # No _note_precompact, no persisted boundary — genuinely standalone.
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq == 1
+    state = _read_compaction_state(bridge_dir)
+    # A pending token is installed so a later transcript summary reconciles
+    # against the same sequence instead of double-persisting.
+    assert state.pending is not None
+    assert state.pending.seq == 1
+
+    # After the caller persists and marks it done, the boundary is recorded.
+    from omnigent.harnesses.claude_native.forwarder import _mark_compaction_persisted
+
+    await _mark_compaction_persisted(bridge_dir, seq)
+    final = _read_compaction_state(bridge_dir)
+    assert 1 in final.persisted_seqs
+    assert final.pending is None
+
+
+@pytest.mark.asyncio
+async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Path) -> None:
+    """
+    P1-2: a completion hook trailing a transcript-persisted boundary is absorbed.
+
+    The transcript ``isCompactSummary`` path and the
+    ``SessionStart source=compact`` hook are two completion signals for the
+    SAME compaction. When the transcript path persists first it arms the
+    completion-ack window; the trailing hook must be absorbed (return
+    ``None``, no new sequence) rather than persist a spurious standalone
+    boundary.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        # Transcript path persists the boundary; arms expect_completion_ack.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_absorb",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert persist.call_count == 1
+    armed = _read_compaction_state(bridge_dir)
+    assert armed.expect_completion_ack is True
+
+    # The trailing completion hook finds no pending token and is absorbed.
+    seq = await _consume_pending_compaction(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    assert seq is None
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq is None  # absorbed, NOT a new standalone boundary
+    after = _read_compaction_state(bridge_dir)
+    assert after.expect_completion_ack is False
+    assert after.persisted_seqs == (1,)  # still exactly one boundary
+
+
+@pytest.mark.asyncio
+async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
+    """
+    P1-3: a summary skipped with no token and no boundary is counted as a miss.
+
+    A skipped ``isCompactSummary`` with no pending token AND no boundary ever
+    persisted is the observable ``PreCompact``-miss failure mode — it must
+    bump the ``precompact_miss`` counter (not be silently dropped). A skip
+    that follows a persisted boundary is an expected replay/dedupe and bumps
+    ``expected_skip`` instead.
+    """
+    _reset_compaction_skip_stats()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()  # no PreCompact, no persisted boundary
+
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_miss",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+    assert forwarder._compaction_skip_stats.precompact_miss == 1
+    assert forwarder._compaction_skip_stats.expected_skip == 0
+
+    # A skip AFTER a boundary was persisted is an expected replay, not a miss.
+    from omnigent.harnesses.claude_native.forwarder import _write_compaction_state
+
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(pending=None, last_seq=1, persisted_seqs=(1,)),
+    )
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_miss",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert forwarder._compaction_skip_stats.precompact_miss == 1  # unchanged
+    assert forwarder._compaction_skip_stats.expected_skip == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_completion_ack_does_not_swallow_a_later_boundary(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: a completion ack is bound to its seq and is one-shot per boundary.
+
+    The lost-boundary hazard: compaction A persists via the transcript path
+    and arms ``expect_completion_ack``; A's own ``SessionStart source=compact``
+    hook never fires (flaky), so the flag stays armed. A later compaction B's
+    ``PreCompact`` is *also* dropped, then B's completion hook fires. With a
+    bare unattributed flag, B's hook would be absorbed as A's stale ack and
+    B's boundary lost.
+
+    Binding the ack to a ``seq`` and making absorption one-shot fixes it: the
+    window is consumed exactly once (the trailing hook for A), and any
+    *further* standalone completion — B's — falls through to a fresh persist
+    instead of being swallowed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
+        # Compaction A persists via the transcript path → arms the ack for A's seq.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_p21",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    armed = _read_compaction_state(bridge_dir)
+    assert armed.expect_completion_ack is True
+    assert armed.expect_completion_ack_seq == 1  # bound to A's seq, not a bare bool
+    assert armed.persisted_seqs == (1,)
+
+    # A's own trailing completion hook arrives late and is absorbed (one-shot).
+    absorbed = await _claim_standalone_completion(bridge_dir)
+    assert absorbed is None
+    after_absorb = _read_compaction_state(bridge_dir)
+    assert after_absorb.expect_completion_ack is False
+    assert after_absorb.expect_completion_ack_seq == 0  # window closed
+
+    # Compaction B: its PreCompact was dropped too, so B arrives as a
+    # standalone completion hook with NO pending token and NO armed ack. It
+    # must persist a fresh boundary, not be swallowed as A's stale ack.
+    b_seq = await _claim_standalone_completion(bridge_dir)
+    assert b_seq == 2, "B's boundary must be persisted, not lost to a stale ack"
+    final = _read_compaction_state(bridge_dir)
+    assert final.pending is not None
+    assert final.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: an ack armed for a seq that is NOT persisted persists (bias-to-safe).
+
+    If durable state is somehow armed (corrupt/partial write, or a legacy
+    ``compaction_forwarder.json`` from before ``expect_completion_ack_seq``
+    existed so the seq reads back as ``0``) the standalone path cannot prove
+    the arriving hook is a duplicate. A lost boundary reloads the full
+    pre-compaction history on resume — far worse than an at-most-once
+    duplicate — so the path biases to persisting a fresh boundary rather than
+    silently absorbing the hook.
+    """
+    from omnigent.harnesses.claude_native.forwarder import _write_compaction_state
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Legacy/corrupt shape: flag armed but the seq it points at is not in
+    # persisted_seqs (here it reads back as 0, mimicking an old state file).
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            pending=None,
+            last_seq=1,
+            persisted_seqs=(),
+            expect_completion_ack=True,
+            expect_completion_ack_seq=0,
+        ),
+    )
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq == 2, "bias-to-safe: persist rather than absorb an unprovable ack"
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-2: a standalone-completion persist failure holds the hook cursor.
+
+    A ``SessionStart source=compact`` with no pending token and no transcript
+    summary is a hook-only standalone compaction. If its boundary POST fails
+    transiently the forwarder must NOT advance past the hook (losing the
+    boundary, since no transcript summary will ever retry it) — it holds the
+    hook cursor and retries next poll, mirroring the transcript path. The
+    pending token minted by ``_claim_standalone_completion`` makes the retry
+    idempotent: the re-seen hook re-consumes the same seq. A later successful
+    POST persists exactly one boundary.
+    """
+    bridge_dir = tmp_path / "bridge"
+    # A lone compact SessionStart (no preceding PreCompact) — standalone.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": "claude-standalone",
+        },
+    )
+    start_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+
+    request = httpx.Request("POST", "http://test/items")
+    response = httpx.Response(503, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("boom", request=request, response=response)
+    )
+
+    async def _run_once(state: forwarder.HookForwardState) -> forwarder.HookForwardState:
+        # The best-effort spinner status post is orthogonal to the durable
+        # persist under test; stub it so the client mock stays quiet.
+        with patch(
+            "omnigent.harnesses.claude_native.forwarder._post_external_compaction_status",
+            AsyncMock(return_value=None),
+        ):
+            return await forwarder._forward_available_status_events(
+                client=AsyncMock(),
+                session_id="conv_p22",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=_PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+
+    # Poll 1: persist fails → cursor is held BEFORE the compaction hook record,
+    # a pending token is minted, and no boundary is marked persisted.
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+    ):
+        after_fail = await _run_once(start_state)
+    assert failing.await_count == 1
+    assert after_fail.event_cursor == start_state.event_cursor  # cursor held
+    held = _read_compaction_state(bridge_dir)
+    assert held.pending is not None  # token minted, awaiting a durable persist
+    assert not held.persisted_seqs  # nothing marked persisted on failure
+    minted_seq = held.pending.seq
+
+    # Poll 2 (retry): the same hook record is re-seen; the persist succeeds and
+    # re-consumes the SAME seq (idempotent), marking exactly one boundary.
+    ok = _persist_mock()
+    with patch("omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", ok):
+        after_ok = await _run_once(after_fail)
+    assert ok.await_count == 1
+    persisted = _read_compaction_state(bridge_dir)
+    assert persisted.persisted_seqs == (minted_seq,)  # exactly one boundary
+    assert persisted.pending is None
+    assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
 
 
 def test_forward_failures_escalate_to_degraded_once() -> None:
@@ -6565,9 +9563,9 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
         :returns: Canned Omnigent response.
         """
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
-        if body.get("type") == "external_conversation_item":
+        if isinstance(body, list) or body.get("type") == "external_conversation_item":
             return httpx.Response(400, json={"error": "nope"})
         return httpx.Response(202, json={})
 
@@ -6657,16 +9655,17 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
+async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     tmp_path: Path,
 ) -> None:
     """
-    ``Stop`` with ``background_tasks`` → ``waiting`` instead of ``idle``.
+    ``Stop`` with ``background_tasks`` posts ``idle`` plus the shell count.
 
-    When Claude Code's Stop hook carries a non-empty ``background_tasks``
-    array (shells still running), the forwarder must publish ``waiting``
-    so the web UI keeps showing the spinner. Without this, the chat
-    interface shows "idle" while the terminal shows "1 shell running".
+    The turn really has ended, so the status is ``idle`` — the spinner stays
+    lit off the count instead (``showsWorking`` is ``isWorking || tally > 0``).
+    The count is the one thing Claude's status file cannot report: its
+    ``shell`` literal is a boolean and the indicator renders a number, which
+    is why this hook still posts at all.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -6720,7 +9719,21 @@ async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "waiting", "background_task_count": 1},
+        "data": {
+            "status": "idle",
+            "background_task_count": 1,
+            # Per-shell detail rides alongside the count so the UI can name the
+            # running shells (see BackgroundTaskInfo / _normalize_background_task).
+            "background_tasks": [
+                {
+                    "id": "abc123",
+                    "type": "shell",
+                    "status": "running",
+                    "description": "Wait for CI",
+                    "command": "sleep 120",
+                }
+            ],
+        },
     }
 
 
@@ -6779,6 +9792,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
         return httpx.Response(200, json={})
 
     transport = httpx.MockTransport(handler)
+    dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
         hook_state = await forwarder._ensure_hook_state(
             bridge_dir, start_at_end=False, session_id="conv_abc"
@@ -6789,11 +9803,17 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
             bridge_dir=bridge_dir,
             state=hook_state,
             retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
             task_subjects={},
             task_statuses={},
             task_order=[],
             response_id="resp_turn_1",
         )
+
+    # The posted turn-end edge records the turn as a PENDING settle for
+    # scheduled-wake detection (it activates once the transcript is quiet).
+    assert dedupe.pending_settled_response_id == "resp_turn_1"
+    assert dedupe.settled_response_id is None
 
     assert bodies == [
         {
@@ -6811,15 +9831,15 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Path) -> None:
+async def test_forwarder_publishes_no_status_for_assistant_output(tmp_path: Path) -> None:
     """
-    The first assistant output of a turn publishes ``running`` + its response id.
+    Assistant output forwards items and publishes NO session status.
 
-    Native Claude's running/idle BADGE stays PTY-derived; this id-bearing
-    ``running`` edge is the additional signal that lets ap-web open a streaming
-    ``activeResponse`` for the turn, so the forwarded tool cards (which share
-    the same response id) render LIVE rather than as static completed cards.
-    The running edge's response id must equal the forwarded items' response id.
+    Claude's ``sessions/<pid>.json`` owns the running/idle badge. A status edge
+    derived from the transcript can only fire once a poll has parsed assistant
+    output, so on a short turn it lands *after* the file's ``idle`` and
+    re-asserts ``running`` on a session that already finished — the user sees
+    idle → running → idle. The items still carry their own ``response_id``.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -6876,9 +9896,7 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
         )
     )
     try:
-        # First POST of the poll is the turn-start running status (it runs
-        # before the items in _forward_available_items); the two items follow.
-        running = await _get_recorded_request(server)
+        # Both POSTs of the poll are items — no status edge precedes them.
         item_a = await _get_recorded_request(server)
         item_b = await _get_recorded_request(server)
     finally:
@@ -6889,20 +9907,90 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert running["body"]["type"] == "external_session_status"
-    assert running["body"]["data"]["status"] == "running"
-    running_rid = running["body"]["data"]["response_id"]
-    assert isinstance(running_rid, str) and running_rid
-    # The running edge's response id matches the ASSISTANT turn's forwarded
-    # item (the function_call), so that bubble enters the streaming lifecycle
-    # on the client. The user message carries its own distinct response id.
+    # Neither POST is a status edge — the transcript path publishes none.
+    assert [body["body"]["type"] for body in (item_a, item_b)] == [
+        "external_conversation_item",
+        "external_conversation_item",
+    ]
+    # The assistant turn's item still carries its own response id, which is
+    # what groups its bubble and its tool cards on the client.
     function_call = next(
-        body
-        for body in (item_a, item_b)
-        if body["body"]["type"] == "external_conversation_item"
-        and body["body"]["data"]["item_type"] == "function_call"
+        body for body in (item_a, item_b) if body["body"]["data"]["item_type"] == "function_call"
     )
-    assert function_call["body"]["data"]["response_id"] == running_rid
+    rid = function_call["body"]["data"]["response_id"]
+    assert isinstance(rid, str) and rid
+
+
+@pytest.mark.asyncio
+async def test_short_turn_poll_posts_items_without_a_status_edge(tmp_path: Path) -> None:
+    """
+    Regression: a short turn's poll must not re-assert ``running``.
+
+    The status file reports the turn ending the moment Claude settles, but a
+    transcript-derived edge can only fire once a poll has parsed assistant
+    output — so it arrived *after* that ``idle`` and flipped the session back to
+    ``running``, then ``Stop`` closed it again: the user saw
+    idle → running → idle on every short turn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "message": {"role": "user", "content": "i'll keep testing"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Sounds good."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Record every forwarder POST body.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        posted.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    assert [body["type"] for body in posted] == ["external_conversation_item"] * 2
+    assert not [body for body in posted if body["type"] == "external_session_status"]
 
 
 @pytest.mark.asyncio
@@ -7020,3 +10108,316 @@ async def test_forwarder_does_not_leave_running_open_for_slash_command_only_turn
         request["data"] for request in requests if request["type"] == "external_conversation_item"
     ]
     assert any(item["item_type"] == "slash_command" for item in forwarded)
+
+
+# _PostRetryTracker: bounded subagent_delivery_not_confirmed retries (L2)
+# ---------------------------------------------------------------------------
+
+
+def _http_status_error(status_code: int, body: object) -> httpx.HTTPStatusError:
+    """Build an httpx.HTTPStatusError whose response.json() returns `body`."""
+    request = httpx.Request("POST", "http://omnigent/v1/sessions/conv_x/events")
+    content = json.dumps(body).encode() if body is not None else b""
+    response = httpx.Response(status_code, request=request, content=content)
+    return httpx.HTTPStatusError("rejected", request=request, response=response)
+
+
+def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(
+        503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_work_entry"}
+    )
+    # Attempts 1 and 2 keep retrying...
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    # ...attempt 3 hits the not-confirmed budget and gives up.
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(503, {"error": "internal_error"})
+    for _ in range(10):
+        assert tracker.record_failure("k", exc).exhausted is False
+
+
+def test_unbounded_transient_retries_keep_delay_capped_without_overflow() -> None:
+    # A transport-level failure is neither permanent nor not-confirmed, so it
+    # retries with no give-up budget and `attempts` grows without bound. The
+    # backoff exponent must be clamped before `2 ** n` is evaluated: min()
+    # computes both operands, so an unclamped exponent overflows float at
+    # attempt ~1025 and raises OverflowError out of record_failure.
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = httpx.RequestError("Databricks token refresh returned no token")
+    for _ in range(2000):
+        decision = tracker.record_failure("k", exc)
+        assert decision.exhausted is False
+        assert decision.delay_s <= 30.0
+    # The schedule still saturates at the cap instead of decaying.
+    assert decision.delay_s == 30.0
+
+
+def test_backoff_schedule_unchanged_below_the_cap() -> None:
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = httpx.RequestError("boom")
+    delays = [tracker.record_failure("k", exc).delay_s for _ in range(6)]
+    assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+
+
+def test_permanent_4xx_still_exhausts_at_three() -> None:
+    tracker = forwarder._PostRetryTracker(max_permanent_attempts=3)
+    exc = _http_status_error(400, {"error": "bad_request"})
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_is_subagent_delivery_not_confirmed_classifier() -> None:
+    yes = _http_status_error(503, {"error": "subagent_delivery_not_confirmed"})
+    no_status = _http_status_error(500, {"error": "subagent_delivery_not_confirmed"})
+    no_body = _http_status_error(503, {"error": "something_else"})
+    assert forwarder._is_subagent_delivery_not_confirmed(yes) is True
+    assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
+
+
+@pytest.mark.asyncio
+async def test_forward_progress_timeout_resets_after_each_response() -> None:
+    """A healthy long drain is not cancelled while responses keep arriving."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.06)
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        async with forwarder._forward_progress_timeout(client, 0.1):
+            for _ in range(3):
+                await client.post("/events", json={})
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A stalled await inside one poll iteration is cancelled and the loop resumes.
+
+    A silent stall in any forwarding stage used to stop mirroring, status
+    events and the pane busy signal forever — with zero log output — and
+    the pane reaper then killed the live session an hour later. The
+    iteration deadline converts such a stall into a logged, bounded
+    hiccup: the stuck await is cancelled (the warning's traceback names
+    it) and the next iteration proceeds.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setattr(forwarder, "_FORWARD_LOOP_STALL_DEADLINE_S", 0.2)
+    ensure_calls: list[int] = []
+    real_ensure = forwarder._ensure_hook_state
+
+    async def _stalls_on_first_call(*args: Any, **kwargs: Any) -> Any:
+        ensure_calls.append(len(ensure_calls) + 1)
+        if len(ensure_calls) == 1:
+            await asyncio.Event().wait()
+        return await real_ensure(*args, **kwargs)
+
+    monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
+    monkeypatch.setattr(forwarder._logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(forwarder._logger, "propagate", False)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder"):
+        task = asyncio.create_task(
+            forward_claude_transcript_to_session(
+                base_url="http://127.0.0.1:9",
+                headers={},
+                session_id="conv_stall",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=False,
+                poll_interval_s=0.01,
+            )
+        )
+        try:
+
+            async def _second_iteration_ran() -> None:
+                while len(ensure_calls) < 2:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_second_iteration_ran(), timeout=5.0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    stall_warnings = [r for r in caplog.records if "made no live progress" in r.getMessage()]
+    assert stall_warnings, "the deadline trip must be loudly logged, never silent"
+    # The warning's traceback names the stalled await for next-time forensics.
+    assert stall_warnings[0].exc_info is not None
+
+
+# ── /btw side-chat overlay relay ───────────────────────────────────
+
+
+def _btw_recording_client_calls() -> tuple[list[dict[str, Any]], httpx.MockTransport]:
+    """
+    Build a MockTransport that records POST bodies for /btw relay tests.
+
+    :returns: The shared ``calls`` list and the transport to hand an
+        ``httpx.AsyncClient``.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record each POST body and return a benign success."""
+        calls.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
+
+    return calls, httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_relays_after_stability_then_dedupes() -> None:
+    """
+    A settled /btw overlay relays ONE transient side-chat event.
+
+    The first read only records the exchange as pending (torn-capture
+    guard); the second (same exchange) posts the transient
+    ``external_btw_sidechat`` event; the third is deduped and posts nothing.
+    """
+    overlay = BtwOverlay(question="/btw is this ok?", answer="Yes, all good.", truncated=False)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(3):
+            await forwarder._relay_btw_overlay(
+                client,
+                session_id="conv1",
+                overlay=overlay,
+                dedupe=dedupe,
+            )
+
+    assert len(calls) == 1
+    (body,) = calls
+    assert body["type"] == "external_btw_sidechat"
+    assert body["data"]["question"] == "/btw is this ok?"
+    assert body["data"]["answer"] == "Yes, all good."
+    assert body["data"]["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_relays_truncated_flag() -> None:
+    """A clipped overlay relays the visible answer with truncated=True."""
+    overlay = BtwOverlay(question="/btw big", answer="line1\nline2", truncated=True)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(2):
+            await forwarder._relay_btw_overlay(
+                client,
+                session_id="conv1",
+                overlay=overlay,
+                dedupe=dedupe,
+            )
+
+    assert len(calls) == 1
+    assert calls[0]["data"]["answer"] == "line1\nline2"
+    assert calls[0]["data"]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_no_overlay_is_noop() -> None:
+    """No visible overlay posts nothing and clears any pending key."""
+    dedupe = forwarder._ForwardDedupeState()
+    dedupe.btw_pending_key = "stale"
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._relay_btw_overlay(
+            client,
+            session_id="conv1",
+            overlay=None,
+            dedupe=dedupe,
+        )
+
+    assert calls == []
+    assert dedupe.btw_pending_key is None
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_signals_captures_once_and_relays_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    One throttled capture feeds both the permission-mode and /btw relays.
+
+    Back-to-back polls inside one throttle window capture the pane exactly
+    once (the shared-capture win), and the single snapshot's mode + settled
+    overlay both reach the wire (the overlay after its two-read stability
+    guard).
+    """
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    overlay = BtwOverlay(question="/btw ok?", answer="Yes.", truncated=False)
+    reads = 0
+
+    def _fake_signals(_bridge_dir: Path) -> PaneSignals:
+        """Serve one snapshot carrying both signals, counting captures."""
+        nonlocal reads
+        reads += 1
+        return PaneSignals(permission_mode="auto", btw_overlay=overlay)
+
+    monkeypatch.setattr(forwarder, "read_pane_signals", _fake_signals)
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(3):
+            await forwarder._forward_pane_signals(
+                client,
+                session_id="conv1",
+                bridge_dir=tmp_path,
+                dedupe=dedupe,
+            )
+
+    types = [c["type"] for c in calls]
+    assert types.count("external_permission_mode_change") == 1
+    assert types.count("external_btw_sidechat") == 1
+    assert dedupe.posted_permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_signals_throttles_capture(tmp_path: Path) -> None:
+    """Back-to-back polls inside one throttle window capture the pane once."""
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    reads = 0
+
+    def _fake_signals(_bridge_dir: Path) -> PaneSignals:
+        """Count captures; the signals themselves are irrelevant here."""
+        nonlocal reads
+        reads += 1
+        return PaneSignals()
+
+    with patch.object(forwarder, "read_pane_signals", _fake_signals):
+        dedupe = forwarder._ForwardDedupeState()
+        transport = httpx.MockTransport(lambda _req: httpx.Response(202, json={}))
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+            for _ in range(5):
+                await forwarder._forward_pane_signals(
+                    client,
+                    session_id="conv1",
+                    bridge_dir=tmp_path,
+                    dedupe=dedupe,
+                )
+
+    assert reads == 1
+    assert dedupe.pane_next_read > 0.0

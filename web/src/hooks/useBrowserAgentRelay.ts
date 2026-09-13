@@ -338,24 +338,31 @@ async function postResult(
 }
 
 /**
- * Register the embedded-browser relay for a conversation. No-op outside Electron.
- * Mount ONE instance per active conversation (typically from `BrowserPane`).
+ * Register the embedded-browser relay. No-op outside Electron. Mounted for the
+ * active conversation (from `AppShell`), but it serves EVERY conversation's
+ * actions: an action is claimed, dispatched, and answered against the session
+ * whose stream delivered it (`sourceConversationId`), not the mounted one — a
+ * background conversation can issue a browser action while another is on screen,
+ * and its WebContentsView is keyed by that session. Claiming at the mounted
+ * (visible) session would be rejected by the server as an owner mismatch.
  *
- * @param conversationId The conversation whose WebContentsView this relay drives.
+ * @param conversationId Gate only — the relay registers while a conversation is
+ *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
   useEffect(() => {
     if (!conversationId) return;
     if (!supportsBrowser()) return;
 
-    const handler = async (evt: BrowserActionRequestEvent) => {
+    const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
+      if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
       if (!desktop) return; // no browser-capable shell — nothing to claim
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
-      const claimToken = await claimAction(conversationId, evt.actionId);
+      const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const result = await dispatch(conversationId, evt.action, evt.args, desktop);
-      await postResult(conversationId, evt.actionId, claimToken, result);
+      const result = await dispatch(sourceConversationId, evt.action, evt.args, desktop);
+      await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
     return onBrowserActionRequest(handler);

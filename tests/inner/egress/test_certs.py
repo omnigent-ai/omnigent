@@ -2,13 +2,48 @@
 
 from __future__ import annotations
 
+import datetime
 import ssl
 from pathlib import Path
 
+import pytest
 from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.x509.oid import NameOID
 
 from omnigent.inner.egress.ca import ensure_ca
 from omnigent.inner.egress.certs import HostCertCache
+
+
+def test_host_cert_cache_rejects_unsupported_ca_key(tmp_path: Path) -> None:
+    """Ed25519 CAs fail early because leaf signing uses SHA-256."""
+    key = ed25519.Ed25519PrivateKey.generate()
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Unsupported CA")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, algorithm=None)
+    )
+    cert_path = tmp_path / "ca.pem"
+    key_path = tmp_path / "ca-key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    with pytest.raises(ValueError, match="RSA, DSA, or EC"):
+        HostCertCache(cert_path, key_path)
 
 
 def test_host_cert_cache_generates_valid_cert(tmp_path: Path) -> None:

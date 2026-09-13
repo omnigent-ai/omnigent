@@ -1,6 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RunnerStartingIndicator } from "./ChatPage";
+import { RunnerStartingIndicator } from "./ChatIndicators";
 import { useChatStore } from "@/store/chatStore";
 import {
   TerminalFirstContextProvider,

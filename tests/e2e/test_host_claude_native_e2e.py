@@ -12,7 +12,7 @@ pending terminal input when its TUI initializes. So a first message
 typed into that gap is silently dropped — the UI shows "Working…"
 forever and nothing is persisted. ``inject_user_message`` now waits for
 Claude's input prompt to render before typing (see
-``omnigent.claude_native_bridge._wait_for_claude_prompt_ready``).
+``omnigent.harnesses.claude_native.bridge._wait_for_claude_prompt_ready``).
 
 Making the race deterministic
 -----------------------------
@@ -79,6 +79,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 
@@ -96,10 +97,6 @@ pytestmark = pytest.mark.skipif(
         "OMNIGENT_E2E_CLAUDE_NATIVE=1 (and have `claude` installed + logged in) to run"
     ),
 )
-
-# The built-in agent the server auto-registers for the Web UI's
-# "Claude Code" option (see server.app._ensure_default_agents).
-_CLAUDE_NATIVE_AGENT_NAME = "claude-native-ui"
 
 # Seconds the claude wrapper sleeps before exec'ing the real binary.
 # Must comfortably exceed the runner's launch→inject latency so that,
@@ -265,10 +262,10 @@ def _claude_native_agent_id(client: httpx.Client) -> str:
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     for agent in resp.json()["data"]:
-        if agent["name"] == _CLAUDE_NATIVE_AGENT_NAME:
+        if agent["name"] == CLAUDE_NATIVE_AGENT_NAME:
             return str(agent["id"])
     raise AssertionError(
-        f"{_CLAUDE_NATIVE_AGENT_NAME!r} not registered on the server "
+        f"{CLAUDE_NATIVE_AGENT_NAME!r} not registered on the server "
         "(expected from _ensure_default_agents at startup)"
     )
 

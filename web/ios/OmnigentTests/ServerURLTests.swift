@@ -13,6 +13,29 @@ final class ServerURLTests: XCTestCase {
     XCTAssertEqual(url.absoluteString, "http://localhost:6767")
   }
 
+  /// A remote host must not be downgraded to http just because the debug build
+  /// allows insecure http: an http pin that the server upgrades to https breaks
+  /// every pinned-origin check in the web view.
+  func testDebugPolicyStillDefaultsRemoteHostToHTTPS() throws {
+    let url = try ServerURL.normalize(
+      "dbc-b7cf3f6a-ac9f.cloud.databricks.com", allowsInsecureHTTP: true)
+    XCTAssertEqual(url.absoluteString, "https://dbc-b7cf3f6a-ac9f.cloud.databricks.com")
+  }
+
+  /// Loopback keeps defaulting to http so local dev still works.
+  func testDebugPolicyDefaultsLoopbackVariantsToHTTP() throws {
+    XCTAssertEqual(
+      try ServerURL.normalize("127.0.0.1:6767", allowsInsecureHTTP: true).absoluteString,
+      "http://127.0.0.1:6767")
+  }
+
+  /// An explicitly typed http:// URL is still honoured under the debug policy.
+  func testDebugPolicyHonoursExplicitHTTPForRemoteHost() throws {
+    XCTAssertEqual(
+      try ServerURL.normalize("http://example.com", allowsInsecureHTTP: true).absoluteString,
+      "http://example.com")
+  }
+
   func testReleasePolicyRejectsHTTP() {
     XCTAssertThrowsError(try ServerURL.normalize("http://example.com", allowsInsecureHTTP: false)) {
       error in
@@ -25,6 +48,59 @@ final class ServerURLTests: XCTestCase {
       error in
       XCTAssertEqual(error as? ServerURLError, .unsupportedScheme("ftp"))
     }
+  }
+}
+
+final class InWebViewAuthTests: XCTestCase {
+  func testDatabricksHostsUseInWebViewAuth() {
+    for origin in [
+      "https://databricks.com",
+      "https://dbc-123.cloud.databricks.com",
+      "https://azuredatabricks.net",
+      "https://adb-123.azuredatabricks.net",
+      "https://databricksapps.com",
+      "https://my-app.aws.databricksapps.com",
+      "https://DBC-123.CLOUD.DATABRICKS.COM",
+    ] {
+      XCTAssertTrue(usesInWebViewAuth(origin), origin)
+    }
+  }
+
+  func testOtherHostsUseSystemBrowserAuth() {
+    for origin in [
+      "https://example.com",
+      "https://notdatabricks.com",
+      "https://databricks.com.example.org",
+      "https://databricksapps.com.example.org",
+      "not a URL",
+    ] {
+      XCTAssertFalse(usesInWebViewAuth(origin), origin)
+    }
+    XCTAssertFalse(usesInWebViewAuth(nil))
+  }
+}
+
+final class AppDeviceSupportTests: XCTestCase {
+  func testAppSupportsIPhoneAndIPad() throws {
+    let deviceFamilies = try XCTUnwrap(
+      Bundle.main.object(forInfoDictionaryKey: "UIDeviceFamily") as? [Int])
+
+    XCTAssertEqual(deviceFamilies, [1, 2])
+  }
+
+  func testIPadSupportsAllOrientations() throws {
+    let orientations = try XCTUnwrap(
+      Bundle.main.object(forInfoDictionaryKey: "UISupportedInterfaceOrientations~ipad")
+        as? [String])
+
+    XCTAssertEqual(
+      Set(orientations),
+      Set([
+        "UIInterfaceOrientationPortrait",
+        "UIInterfaceOrientationPortraitUpsideDown",
+        "UIInterfaceOrientationLandscapeLeft",
+        "UIInterfaceOrientationLandscapeRight",
+      ]))
   }
 }
 

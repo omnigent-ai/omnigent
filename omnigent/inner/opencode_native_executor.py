@@ -1,9 +1,9 @@
 """Executor that bridges Omnigent web turns into a native OpenCode session.
 
-Built on :class:`omnigent.native_server_harness.NativeServerHarness`: the
+Built on :class:`omnigent.native.native_server_harness.NativeServerHarness`: the
 runner owns the ``opencode serve`` process + SSE forwarder, and this
 executor injects the latest web turn over the
-:class:`omnigent.opencode_http_transport.OpenCodeHttpTransport` using the
+:class:`omnigent.harnesses.opencode_native.http_transport.OpenCodeHttpTransport` using the
 loopback URL + auth secret published in the bridge state. Output is
 streamed back by the runner-side forwarder, so ``run_turn`` only admits the
 prompt and yields ``TurnComplete`` — the same injection/completion split as
@@ -17,16 +17,15 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 
-from omnigent.native_server_harness import NativeServerHarness
-from omnigent.native_server_transport import NativePrompt
-from omnigent.opencode_http_transport import OpenCodeHttpTransport
-from omnigent.opencode_native_bridge import (
+from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR,
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     read_bridge_state,
 )
+from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+from omnigent.native.native_server_harness import NativeServerHarness
+from omnigent.native.native_server_transport import NativePrompt
 
 # Canonical harness id, surfaced in harness error messages.
 OPENCODE_NATIVE_HARNESS_ID = "opencode-native"
@@ -54,7 +53,11 @@ class OpenCodeNativeExecutor(NativeServerHarness):
             build_prompt=self._build_prompt_with_model_override,
         )
 
-    def _build_prompt_with_model_override(self, content: Any) -> NativePrompt | None:
+    def _gate_system_prompt(self, system_prompt: str) -> str | None:
+        """Attach the runner's composed instructions to this turn; ``None`` omits the field."""
+        return system_prompt or None
+
+    def _build_prompt_with_model_override(self, content: object) -> NativePrompt | None:
         """
         Build a prompt, pinning the resolved model so it governs from turn one.
 
@@ -131,7 +134,7 @@ def _session_is_active(session_id: str, request_session_id: str | None) -> bool:
     return request_session_id is None or request_session_id == session_id
 
 
-def _content_to_native_prompt(content: Any) -> NativePrompt | None:
+def _content_to_native_prompt(content: object) -> NativePrompt | None:
     """
     Normalize executor message content into a :class:`NativePrompt`.
 
@@ -148,7 +151,7 @@ def _content_to_native_prompt(content: Any) -> NativePrompt | None:
         return NativePrompt(text=content) if content else None
     if isinstance(content, list):
         texts: list[str] = []
-        attachments: list[Mapping[str, Any]] = []
+        attachments: list[Mapping[str, object]] = []
         for block in content:
             if not isinstance(block, dict):
                 continue

@@ -19,6 +19,7 @@ const serverInfoMocks = vi.hoisted(() => ({
   accountsEnabled: true,
   loginUrl: null as string | null,
   serverVersion: "0.3.0.dev0" as string | null,
+  singleUser: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -26,6 +27,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: serverInfoMocks.accountsEnabled,
     login_url: serverInfoMocks.loginUrl,
     server_version: serverInfoMocks.serverVersion,
+    single_user: serverInfoMocks.singleUser,
   }),
 }));
 
@@ -90,6 +92,7 @@ beforeEach(() => {
   serverInfoMocks.accountsEnabled = true;
   serverInfoMocks.loginUrl = null;
   serverInfoMocks.serverVersion = "0.3.0.dev0";
+  serverInfoMocks.singleUser = false;
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   setPolicies([]);
@@ -321,9 +324,12 @@ describe("PoliciesPage actions", () => {
 
 describe("PoliciesPage single-user mode", () => {
   beforeEach(() => {
+    // Explicit single-user local runtime (single_user marker): no auth
+    // endpoints, so the admin probe is skipped and the page renders directly.
     serverInfoMocks.accountsEnabled = false;
     serverInfoMocks.loginUrl = null;
     serverInfoMocks.serverVersion = "0.3.0.dev0";
+    serverInfoMocks.singleUser = true;
   });
 
   it("shows the full page without the admin gate (empty state)", async () => {
@@ -340,5 +346,27 @@ describe("PoliciesPage single-user mode", () => {
     renderPage();
     expect(await screen.findByText("block_canada")).toBeInTheDocument();
     expect(identity.resolveIdentity).not.toHaveBeenCalled();
+  });
+});
+
+describe("PoliciesPage on a multi-user header-auth deploy", () => {
+  beforeEach(() => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false — so the admin gate must
+    // still run (probe identity, 403 non-admins). This is the regression the
+    // single_user signal fixes: before, this deploy skipped the gate entirely.
+    serverInfoMocks.accountsEnabled = false;
+    serverInfoMocks.loginUrl = null;
+    serverInfoMocks.serverVersion = "0.3.0.dev0";
+    serverInfoMocks.singleUser = false;
+  });
+
+  it("probes identity and gates non-admins", async () => {
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    renderPage();
+    expect(
+      await screen.findByText("You don't have permission to manage global policies."),
+    ).toBeInTheDocument();
+    expect(identity.resolveIdentity).toHaveBeenCalled();
   });
 });

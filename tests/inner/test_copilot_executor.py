@@ -13,13 +13,16 @@ gated e2e test.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import types
 from typing import Any
 
 import pytest
 
+from omnigent.inner import copilot_executor
 from omnigent.inner.copilot_executor import (
+    COPILOT_HOST_ENV_VAR,
     CopilotExecutor,
     _accumulate_usage,
     _ambient_github_token,
@@ -44,6 +47,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.onboarding import copilot_auth
 
 
 def _user(content: str, session_id: str = "conv1") -> Message:
@@ -335,11 +339,83 @@ def test_usage_without_copilot_cost_omits_cost_usd() -> None:
 def test_ambient_github_token_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # Stub the gh-CLI fallback: this test pins env-var precedence, and the dev
+    # machine running it may well have a real ``gh`` login.
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", lambda host=None: None)
     assert _ambient_github_token() is None
     monkeypatch.setenv("GITHUB_TOKEN", "gho_c")
     monkeypatch.setenv("GH_TOKEN", "gho_b")
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_a")
     assert _ambient_github_token() == "gho_a"
+
+
+def test_ambient_github_token_falls_back_to_gh_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No token env var but a ``gh auth login`` session: use the gh token.
+
+    Copilot only picks a ``gh`` login up by reading ``oauth_token`` out of
+    ``~/.config/gh/hosts.yml``, which is absent when ``gh`` keeps the token in an
+    OS keychain (the default on macOS) — so a logged-in user looks
+    credential-less and the session fails to authenticate.
+    """
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", lambda host=None: "gho_from_gh")
+    assert _ambient_github_token() == "gho_from_gh"
+
+
+def test_ambient_github_token_prefers_env_over_gh_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_env")
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", lambda host=None: "gho_from_gh")
+    assert _ambient_github_token() == "gho_env"
+
+
+def test_gh_cli_token_requested_for_configured_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A GHE user's gh token must be fetched for their host, not github.com."""
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(copilot_executor, "_AMBIENT_HOST", "acme.ghe.com")
+    seen: list[str | None] = []
+
+    def _fake(host: str | None = None) -> str:
+        seen.append(host)
+        return "gho_ghe"
+
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", _fake)
+    assert _ambient_github_token() == "gho_ghe"
+    assert seen == ["acme.ghe.com"]
+
+
+def test_host_env_var_spelling_matches_onboarding() -> None:
+    """The executor spells the CLI's host env var itself (onboarding is lazy-imported)."""
+    assert COPILOT_HOST_ENV_VAR == copilot_auth.COPILOT_HOST_ENV_VAR
+
+
+async def test_github_host_exported_for_bundled_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK has no host parameter, so the GHE host only reaches the bundled
+    CLI as an env var it inherits from us."""
+    _install_fake_copilot(monkeypatch, [[]])
+    monkeypatch.delenv(COPILOT_HOST_ENV_VAR, raising=False)
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
+    ex = CopilotExecutor(github_host="acme.ghe.com")
+    assert ex._github_host == "acme.ghe.com"
+    assert COPILOT_HOST_ENV_VAR not in os.environ, "set at session start, not construction"
+    async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
+        pass
+    assert os.environ[COPILOT_HOST_ENV_VAR] == "acme.ghe.com"
+
+
+async def test_hostless_executor_clears_a_leftover_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hostless executor must not inherit a host another one left in the env."""
+    _install_fake_copilot(monkeypatch, [[]])
+    monkeypatch.setenv(COPILOT_HOST_ENV_VAR, "stale.ghe.com")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
+    monkeypatch.setattr(copilot_executor, "_AMBIENT_HOST", None)
+    monkeypatch.setattr(copilot_auth, "copilot_github_host", lambda config=None: None)
+    ex = CopilotExecutor()
+    assert ex._github_host is None
+    async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
+        pass
+    assert COPILOT_HOST_ENV_VAR not in os.environ
 
 
 def test_capabilities() -> None:

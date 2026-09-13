@@ -1,11 +1,14 @@
 """Tests for llms.adapters.gemini — translation logic."""
 
+import asyncio
 import json
 
+import httpx
 import pytest
 
 from omnigent.llms._responses_to_chat import chat_stream_to_response_events
 from omnigent.llms.adapters.gemini import (
+    GeminiAdapter,
     _chat_to_gemini,
     _convert_tools,
     _extract_usage,
@@ -14,7 +17,9 @@ from omnigent.llms.adapters.gemini import (
     _normalize_finish_reason,
     _translate_part_to_gemini,
 )
+from omnigent.llms.errors import ContextWindowExceededError
 from omnigent.llms.types import FunctionCallOutput
+from omnigent.runtime.llm_retry import classify_llm_error
 
 # ── Request translation ──────────────────────────────────
 
@@ -562,3 +567,62 @@ def test_file_data_without_data_uri_raises() -> None:
     }
     with pytest.raises(ValueError, match="data: URI"):
         _translate_part_to_gemini(part)
+
+
+# ── Streaming error body buffering ───────────────────────
+
+
+def test_streamed_400_overflow_classified_as_context_window_exceeded(
+    serve_streamed_response,
+) -> None:
+    """
+    A streamed HTTP 400 buffers the error body before raising so
+    ``classify_llm_error`` can detect context-window overflow.
+
+    Without the ``aread()`` guard in ``_stream_request`` the body of a
+    streamed error response is never read; ``exc.response.text`` then
+    raises ``ResponseNotRead``, degrades to
+    ``"<unreadable response body>"``, and a genuine overflow 400 is
+    misclassified as a plain ``PermanentLLMError`` — the workflow's
+    compact-and-retry path never fires.
+
+    Failure meaning: the guard has been removed and streaming Gemini
+    (and Vertex, which inherits ``_stream_request``) overflow errors
+    no longer trigger compaction.
+    """
+    overflow_body = json.dumps(
+        {
+            "error": {
+                "code": 400,
+                "message": (
+                    "The input token count (1194139) exceeds the maximum"
+                    " number of tokens allowed (1048576)."
+                ),
+                "status": "INVALID_ARGUMENT",
+            }
+        }
+    ).encode()
+    serve_streamed_response(400, overflow_body)
+
+    adapter = GeminiAdapter()
+
+    async def _run() -> Exception:
+        gen = adapter._stream_request(
+            "https://fake-host/v1beta/models/gemini-test:streamGenerateContent",
+            {},
+            {"contents": []},
+        )
+        try:
+            async for _ in gen:
+                pass
+        except httpx.HTTPStatusError as exc:
+            return classify_llm_error(exc, [429, 500, 502, 503])
+        raise AssertionError("Expected HTTPStatusError was not raised")
+
+    err = asyncio.run(_run())
+
+    assert isinstance(err, ContextWindowExceededError)
+    assert err.max_context_tokens == 1048576
+    assert err.actual_tokens == 1194139
+    assert err.detail is not None
+    assert "input token count" in (err.detail.response_body or "")

@@ -5,20 +5,28 @@ from __future__ import annotations
 import io
 import json
 import re
+import shlex
 import sys
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-from omnigent import claude_native_hook, native_policy_hook
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import hook as claude_native_hook
+from omnigent.harnesses.claude_native.bridge import (
+    OBSERVER_HOOK_STDERR_FILE,
+    ClaudeNativeHookInterpreterMismatchError,
+    approval_wait_is_fresh,
+    approval_wait_marker_path,
     build_hook_settings,
     prepare_bridge_dir,
     read_transcript_path,
     record_hook_event,
+    validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
+from omnigent.native import native_policy_hook
 from tests.native_hook_helpers import make_failing_client
 
 
@@ -31,8 +39,80 @@ def _trust_tmp_bridge_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+
+
+def test_wsl_rejects_windows_native_claude_for_hook_interpreter() -> None:
+    """WSL must fail before Windows Claude Code reaches its incompatible hook."""
+    path = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError, match="WSL-native"):
+        validate_claude_hook_interpreter_compatibility(path, wsl=True)
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError):
+        validate_claude_hook_interpreter_compatibility("/opt/claude/claude.exe", wsl=True)
+
+
+@pytest.mark.parametrize(
+    ("path", "wsl"),
+    [
+        ("/home/example/.local/bin/claude", True),
+        ("/usr/local/bin/claude", False),
+        ("/Applications/Claude/bin/claude", False),
+        ("C:/Users/example/AppData/Roaming/npm/claude.cmd", False),
+    ],
+    ids=["wsl-native-claude", "linux", "macos", "windows"],
+)
+def test_claude_hook_interpreter_check_allows_compatible_platforms(path: str, wsl: bool) -> None:
+    """Only the WSL runner plus Windows-native CLI combination is rejected."""
+    validate_claude_hook_interpreter_compatibility(path, wsl=wsl)
+
+
+@pytest.mark.parametrize(
+    ("path", "head"),
+    [
+        ("/mnt/c/dev/myproject/node_modules/.bin/claude", b"\x7fELF\x02\x01\x01"),
+        ("/mnt/c/dev/myproject/.venv/bin/claude", b"#!/usr/bin/env node\n"),
+    ],
+    ids=["elf-binary", "shebang-script"],
+)
+def test_wsl_allows_posix_binary_checked_out_on_a_windows_mount(path: str, head: bytes) -> None:
+    """
+    A real Linux binary living under /mnt/<drive> must not be rejected.
+
+    Regression guard for a false-positive: /mnt/<drive> is also where a repo
+    checked out on a Windows-mounted drive puts its own
+    ``node_modules/.bin/claude`` shim or a vendored interpreter. The mount
+    location alone is not a reliable Windows-native signal for an
+    extensionless path -- only the file's own magic bytes (ELF header or a
+    ``#!`` shebang) or a recognized Windows extension are.
+    """
+    validate_claude_hook_interpreter_compatibility(path, wsl=True, read_head=lambda _p: head)
+
+
+@pytest.mark.parametrize(
+    ("head", "case_id"),
+    [
+        (b"MZ\x90\x00", "pe-header"),
+        (b"", "unreadable"),
+    ],
+    ids=["pe-header", "unreadable"],
+)
+def test_wsl_rejects_extensionless_windows_binary_under_a_mount(head: bytes, case_id: str) -> None:
+    """
+    An extensionless Windows PE binary under /mnt/<drive> is still rejected.
+
+    Confirms the magic-byte check is a real gate rather than a blanket allow
+    for every /mnt/<drive> path: a PE header ('MZ') -- or a file this check
+    can't even read -- keeps the original reject-by-default behavior for
+    this ambiguous, extensionless case.
+    """
+    del case_id
+    path = "/mnt/c/Users/example/AppData/Roaming/npm/claude"
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError, match="WSL-native"):
+        validate_claude_hook_interpreter_compatibility(path, wsl=True, read_head=lambda _p: head)
 
 
 def test_session_start_hook_records_transcript_state_without_output(
@@ -53,7 +133,7 @@ def test_session_start_hook_records_transcript_state_without_output(
         "hook_event_name": "SessionStart",
         "transcript_path": str(transcript_path),
     }
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
     exit_code = claude_native_hook.main(
@@ -82,8 +162,8 @@ def test_session_start_hook_emits_conversation_url_system_message(
     through Claude's hook output path, leaving users with no startup
     pointer back to the Omnigent conversation.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_shared",
@@ -129,8 +209,8 @@ def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
     """
     from omnigent.cli_auth import store_databricks_auth
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(
         "omnigent.cli_auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
@@ -278,9 +358,9 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
                 request=httpx.Request("PATCH", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -461,9 +541,9 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
                 request=httpx.Request("PATCH", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -589,9 +669,9 @@ def test_resume_session_start_without_branch_marker_does_not_fork(
             """
             del args
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FailingHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FailingHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -639,7 +719,7 @@ def test_non_session_start_hook_does_not_emit_conversation_url_context(
     """
     bridge_dir = tmp_path / "bridge"
     payload = {"hook_event_name": "Stop"}
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
     exit_code = claude_native_hook.main(
@@ -725,9 +805,9 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -864,9 +944,9 @@ def test_permission_request_hook_retries_transport_cut_with_same_id(
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FlakyHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FlakyHttpxClient)
     # Zero backoff keeps the retry loop instant in tests; production
     # waits between attempts.
     monkeypatch.setattr(claude_native_hook, "_PERMISSION_RETRY_INITIAL_BACKOFF_S", 0.0)
@@ -957,9 +1037,9 @@ def test_permission_request_hook_does_not_retry_rejections(
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _RejectingHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RejectingHttpxClient)
     monkeypatch.setattr(claude_native_hook, "_PERMISSION_RETRY_INITIAL_BACKOFF_S", 0.0)
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_reject")
     payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
@@ -990,8 +1070,8 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
     be gated. This fails if the hook registration is dropped or guarded
     behind a different condition than ``ap_server_url``.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_test",
@@ -1007,20 +1087,19 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
         "PreToolUse hook not registered — native tools bypass TOOL_CALL policy evaluation"
     )
     assert "PermissionRequest" in hooks
-    # PreToolUse has two entries: the AskUserQuestion-specific hook first,
-    # then the catch-all policy evaluation hook.
-    assert len(hooks["PreToolUse"]) == 2, (
-        f"Expected 2 PreToolUse entries (AskUserQuestion + catch-all policy), "
-        f"got {len(hooks['PreToolUse'])}"
+    # PreToolUse carries only the catch-all policy hook. AskUserQuestion rides
+    # the PermissionRequest hook; a dedicated PreToolUse forwarder parked a
+    # second elicitation for the same question and the web showed two cards.
+    assert len(hooks["PreToolUse"]) == 1, (
+        f"Expected 1 PreToolUse entry (catch-all policy), got {len(hooks['PreToolUse'])}"
     )
-    # First entry: AskUserQuestion-specific hook with matcher.
-    ask_uq_entry = hooks["PreToolUse"][0]
-    assert ask_uq_entry.get("matcher") == "AskUserQuestion"
-    ask_uq_cmd = ask_uq_entry["hooks"][0]["command"]
-    assert "ask-user-question" in ask_uq_cmd
-    assert str(bridge_dir) in ask_uq_cmd
-    # Second entry: catch-all policy evaluation hook (no matcher).
-    policy_entry = hooks["PreToolUse"][1]
+    assert not any(
+        "ask-user-question" in str(hook.get("command", ""))
+        for groups in hooks.values()
+        for group in groups
+        for hook in group["hooks"]
+    ), "an AskUserQuestion forwarder hook would surface the question twice"
+    policy_entry = hooks["PreToolUse"][0]
     assert "matcher" not in policy_entry
     pre_tool_use_cmd = policy_entry["hooks"][0]["command"]
     assert "evaluate-policy" in pre_tool_use_cmd
@@ -1050,6 +1129,22 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
     assert any("evaluate-policy" not in cmd for cmd in user_prompt_cmds)
 
 
+def test_build_hook_settings_captures_observer_stderr(tmp_path: Path) -> None:
+    """Observer process failures are persisted where the forwarder can log them."""
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+
+    settings = build_hook_settings(
+        bridge_dir,
+        python_executable="/venv/bin/python",
+    )
+
+    expected_redirection = f"2>> {shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))}"
+    hooks = settings["hooks"]
+    for event_name in ("SessionStart", "UserPromptSubmit", "Stop", "StopFailure"):
+        command = hooks[event_name][0]["hooks"][0]["command"]
+        assert command.endswith(expected_redirection)
+
+
 def test_build_hook_settings_registers_message_display_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1059,14 +1154,15 @@ def test_build_hook_settings_registers_message_display_hook(
 
     Without this entry, Claude never invokes the deltas-appender and live
     token streaming silently does nothing (the web UI falls back to the
-    whole-message-on-completion behavior). It must route to the dedicated
-    stdlib-only module — NOT the heavier observer hook — so the per-chunk
-    hot path stays cheap, and it must NOT depend on ``ap_server_url``
-    (streaming works for local servers too). Fails if the registration
-    is dropped or pointed at the wrong module.
+    whole-message-on-completion behavior). It must be the /bin/sh
+    one-liner appending to ``message_deltas.jsonl`` — never an
+    interpreter spawn, since Claude blocks on it once per streamed
+    chunk — and it must NOT depend on ``ap_server_url`` (streaming
+    works for local servers too). Fails if the registration is dropped
+    or pointed at something heavier.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
 
     # No ap_server_url: streaming must still be registered.
@@ -1076,11 +1172,11 @@ def test_build_hook_settings_registers_message_display_hook(
         "MessageDisplay hook not registered — live token streaming is dead"
     )
     command = hooks["MessageDisplay"][0]["hooks"][0]["command"]
-    # Routes to the dedicated lightweight module with this bridge dir...
-    assert "omnigent.claude_native_message_display_hook" in command
+    # Appends straight to this bridge dir's deltas file from shell...
+    assert "message_deltas.jsonl" in command
     assert str(bridge_dir) in command
-    # ...and NOT through the heavier observer/policy subcommands (which
-    # would import claude_native_bridge on every streamed chunk).
+    # ...with no interpreter or server dependency on the per-chunk path.
+    assert "python" not in command
     assert "evaluate-policy" not in command
     assert "permission-request" not in command
 
@@ -1095,8 +1191,8 @@ def test_build_hook_settings_omits_policy_hooks_without_omnigent_server_url(
     Without an Omnigent server there are no policies to evaluate; registering
     the hooks would cause no-op subprocesses on every tool call.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_test",
@@ -1184,8 +1280,8 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
@@ -1273,9 +1369,9 @@ def test_evaluate_policy_stamps_live_model_from_context_json(
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1363,9 +1459,9 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_shared",
@@ -1407,296 +1503,22 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     assert captured.err == ""
 
 
-def test_ask_user_question_hook_noop_in_non_bypass_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_ask_user_question_subcommand_is_a_silent_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """
-    ``ask-user-question`` subcommand is a no-op when not in bypassPermissions mode.
+    The retired ``ask-user-question`` forwarder exits 0 with no output.
 
-    In default / acceptEdits / plan modes the ``PermissionRequest`` hook fires
-    and owns the elicitation.  The ``ask-user-question`` PreToolUse hook must
-    return empty output (no opinion) so the form is not shown twice.
-
-    This fails if the handler forwards the payload to Omnigent in non-bypass mode —
-    which would cause a duplicate elicitation card in the web UI and race for
-    the same answer.
+    Settings written before it was retired still invoke it until the
+    terminal restarts. It must never reach the server — that parked a
+    second elicitation for the question — and must not block the tool,
+    so Claude Code proceeds to the PermissionRequest hook.
     """
-    calls: list[str] = []
-
-    class _RaisesIfCalled:
-        """HTTP client stub that fails the test if called unexpectedly."""
-
-        def __init__(self, **_kwargs: object) -> None:
-            """
-            Record unexpected construction.
-
-            :param _kwargs: Ignored constructor args.
-            :returns: None.
-            """
-            calls.append("constructed")
-
-        def __enter__(self) -> _RaisesIfCalled:
-            """
-            Enter context — should not be reached.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context — should not be reached.
-
-            :param _args: Ignored exception args.
-            :returns: None.
-            """
-
-        def post(self, *_args: object, **_kwargs: object) -> object:
-            """
-            Fail if Omnigent is called — must not happen in non-bypass mode.
-
-            :param _args: Ignored.
-            :param _kwargs: Ignored.
-            :returns: Never.
-            :raises AssertionError: Always, so the test fails visibly.
-            """
-            raise AssertionError(
-                "AP was called for ask-user-question in non-bypass mode — "
-                "PermissionRequest hook should own the elicitation instead"
-            )
-
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _RaisesIfCalled)
-    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="b1", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_abc")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
-
-    for mode in ("default", "acceptEdits", "plan", None):
-        payload: dict[str, object] = {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "AskUserQuestion",
-            "tool_input": {"questions": []},
-        }
-        if mode is not None:
-            payload["permission_mode"] = mode
-        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-        exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
-        captured = capsys.readouterr()
-        # No Omnigent call, no output — "no opinion" so PermissionRequest takes over.
-        assert exit_code == 0, f"Non-zero exit for mode={mode!r}"
-        assert captured.out == "", f"Unexpected output for mode={mode!r}: {captured.out!r}"
-        assert calls == [], f"AP client was constructed for mode={mode!r}"
-
-
-def test_ask_user_question_hook_posts_and_returns_pre_tool_use_output_in_bypass_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """
-    In bypassPermissions mode the hook posts to Omnigent and returns PreToolUse output.
-
-    In bypass mode ``PermissionRequest`` never fires, so this PreToolUse hook
-    is the only opportunity to surface ``AskUserQuestion`` in the web UI.  It
-    must POST the payload to the Omnigent session's permission-request endpoint, then
-    convert the ``PermissionRequest``-format response to ``PreToolUse`` format
-    (lifting ``decision.updatedInput`` to the top-level ``updatedInput`` field).
-
-    Fails if: Omnigent is not called in bypass mode, the URL targets the wrong session,
-    the response is not converted from PermissionRequest to PreToolUse format,
-    or the user's answers are not surfaced in ``updatedInput``.
-    """
-    posted: dict[str, object] = {}
-    answers = {"q1": "Option A"}
-    server_response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {
-                "behavior": "allow",
-                "updatedInput": {
-                    "questions": [{"question": "Pick one", "options": [{"label": "Option A"}]}],
-                    "answers": answers,
-                },
-            },
-        }
-    }
-
-    class _FakeHttpxClient:
-        """
-        Minimal sync HTTP client stub for the ask-user-question hook.
-
-        :param headers: Headers passed to :class:`httpx.Client`.
-        :param timeout: Timeout passed to :class:`httpx.Client`.
-        """
-
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            """
-            Capture constructor inputs.
-
-            :param headers: HTTP headers.
-            :param timeout: Request timeout.
-            :returns: None.
-            """
-            posted["headers"] = headers
-            posted["timeout"] = timeout
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """
-            Enter context manager.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context manager.
-
-            :param _args: Ignored.
-            :returns: None.
-            """
-
-        def post(self, url: str, *, json: dict[str, object]) -> object:
-            """
-            Record the Omnigent request and return a canned PermissionRequest response.
-
-            :param url: Target URL.
-            :param json: Request body.
-            :returns: Fake HTTP response.
-            """
-            import httpx as _httpx
-
-            posted["url"] = url
-            posted["json"] = json
-            import json as _json
-
-            return _httpx.Response(
-                200,
-                text=_json.dumps(server_response),
-                request=_httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir("conv_bypass", bridge_id="b2", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_bypass")
-    build_hook_settings(
-        bridge_dir,
-        ap_server_url="http://127.0.0.1:8787",
-        ap_auth_headers={"Authorization": "Bearer token"},
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_post_hook_with_reattach",
+        lambda *_args, **_kwargs: pytest.fail("retired ask-user-question hook posted"),
     )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "AskUserQuestion",
-        "tool_input": {
-            "questions": [{"question": "Pick one", "options": [{"label": "Option A"}]}]
-        },
-        "permission_mode": "bypassPermissions",
-    }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    # Omnigent must be called with the active session's URL.
-    assert posted["url"] == (
-        "http://127.0.0.1:8787/v1/sessions/conv_bypass/hooks/permission-request"
-    )
-    # The full PreToolUse payload (including permission_mode) is
-    # forwarded verbatim, plus the minted re-attach id.
-    sent = posted["json"]
-    assert isinstance(sent, dict)
-    assert {k: v for k, v in sent.items() if k != "_omnigent_elicitation_id"} == payload
-    assert re.fullmatch(r"elicit_claude_[0-9a-f]{32}", sent["_omnigent_elicitation_id"])
-    # Auth headers from bridge config are forwarded.
-    assert posted["headers"] == {"Authorization": "Bearer token"}
-    # Output must be PreToolUse-format, NOT PermissionRequest-format.
-    result = json.loads(captured.out)
-    hs = result["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PreToolUse", (
-        "Response was not converted from PermissionRequest to PreToolUse format"
-    )
-    assert hs["permissionDecision"] == "allow"
-    # User answers must be lifted into top-level updatedInput so Claude skips
-    # its TUI picker and uses the web form's selections.
-    assert hs["updatedInput"]["answers"] == answers, (
-        "User answers were not propagated in updatedInput — Claude will fall back "
-        "to its TUI picker and ignore the web form selection"
-    )
-    assert captured.err == ""
-
-
-def test_ask_user_question_hook_returns_deny_without_updated_input(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """
-    When the user denies AskUserQuestion in bypass mode, hook output is deny with no updatedInput.
-
-    A denial blocks the tool call entirely.  There are no answers to inject, so
-    ``updatedInput`` must be absent from the PreToolUse output.
-
-    Fails if ``updatedInput`` is included on a deny (which would produce a
-    malformed output and confuse Claude), or if the denial is not surfaced.
-    """
-    server_response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {"behavior": "deny"},
-        }
-    }
-
-    class _FakeHttpxClient:
-        """Fake HTTP client returning a deny response."""
-
-        def __init__(self, **_kwargs: object) -> None:
-            """
-            Accept constructor kwargs.
-
-            :param _kwargs: Ignored.
-            :returns: None.
-            """
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """
-            Enter context.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context.
-
-            :param _args: Ignored.
-            :returns: None.
-            """
-
-        def post(self, url: str, *, json: object) -> object:
-            """
-            Return the canned deny response.
-
-            :param url: Ignored.
-            :param json: Ignored.
-            :returns: Fake HTTP response.
-            """
-            import json as _json
-
-            import httpx as _httpx
-
-            return _httpx.Response(
-                200,
-                text=_json.dumps(server_response),
-                request=_httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir("conv_deny", bridge_id="b3", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_deny")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
     payload = {
         "hook_event_name": "PreToolUse",
         "tool_name": "AskUserQuestion",
@@ -1705,18 +1527,12 @@ def test_ask_user_question_hook_returns_deny_without_updated_input(
     }
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
+    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(tmp_path)])
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    result = json.loads(captured.out)
-    hs = result["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PreToolUse"
-    assert hs["permissionDecision"] == "deny"
-    # No updatedInput on deny — answers are meaningless when the tool is blocked.
-    assert "updatedInput" not in hs, (
-        "updatedInput must not appear on a deny response — there are no answers to inject"
-    )
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
@@ -1733,9 +1549,9 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     so a server outage / non-2xx / empty / malformed response must fail
     CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client(mode))
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -1752,7 +1568,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
 
@@ -1768,9 +1584,9 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     sessions — a server outage must not let an over-budget or otherwise-
     blocked request proceed. The output must be ``decision: "block"``.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -1800,9 +1616,9 @@ def test_evaluate_policy_post_tool_use_fails_open_on_error(
 
     Mirroring the runner-side ``FAIL_CLOSED_PHASES``.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -1834,13 +1650,47 @@ def test_build_hook_settings_omits_apikeyhelper_when_none(
     never write the string ``"None"`` — a regression to an unconditional
     assignment would also corrupt the existing key/gateway/local flows.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
 
     assert "apiKeyHelper" not in build_hook_settings(bridge_dir, api_key_helper=None)
     with_helper = build_hook_settings(bridge_dir, api_key_helper="printf tok")
     assert with_helper["apiKeyHelper"] == "printf tok"
+
+
+def test_build_hook_settings_merges_model_overrides_next_to_apikeyhelper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical-to-served rewrites land next to ``apiKeyHelper``."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+    overrides = {"claude-opus-4-8": "databricks-claude-opus-4-8"}
+
+    settings = build_hook_settings(
+        bridge_dir,
+        api_key_helper="printf tok",
+        model_overrides=overrides,
+    )
+
+    assert settings["apiKeyHelper"] == "printf tok"
+    assert settings["modelOverrides"] == overrides
+
+
+def test_build_hook_settings_omits_model_overrides_when_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty map leaves Claude Code as it behaves today."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+
+    assert "modelOverrides" not in build_hook_settings(bridge_dir)
+    assert "modelOverrides" not in build_hook_settings(bridge_dir, model_overrides=None)
+    assert "modelOverrides" not in build_hook_settings(bridge_dir, model_overrides={})
 
 
 def test_evaluate_policy_retries_5xx_and_succeeds(
@@ -1879,8 +1729,8 @@ def test_evaluate_policy_retries_5xx_and_succeeds(
                 request=req,
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     # Sleep is a no-op so retries are instant.
     monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _: None)
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _FlakyThenOkClient)
@@ -1943,8 +1793,8 @@ def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
                 )
             return httpx.Response(200, text='{"result":"POLICY_ACTION_ALLOW"}', request=req)
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _RedirectThenOkClient)
     # The hook re-mints through the runner's token factory; stub a fresh token.
     monkeypatch.setattr(
@@ -2014,8 +1864,8 @@ def test_evaluate_policy_reauths_on_403_invalid_token(
                 return httpx.Response(403, text="Invalid Token", request=req)
             return httpx.Response(200, text='{"result":"POLICY_ACTION_ALLOW"}', request=req)
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _ForbiddenThenOkClient)
     monkeypatch.setattr(
         "omnigent.runner._entry._make_auth_token_factory",
@@ -2085,8 +1935,8 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _RedirectClient)
     monkeypatch.setattr(
         "omnigent.runner._entry._make_auth_token_factory",
@@ -2111,9 +1961,9 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert result["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert result["hookSpecificOutput"]["permissionDecisionReason"].startswith(
-        native_policy_hook._EVAL_UNAVAILABLE_REASON
+        native_policy_hook._EVAL_UNAVAILABLE_ASK_REASON
     )
 
 
@@ -2145,7 +1995,9 @@ def _scripted_client(
       * ``"connect"`` — :class:`httpx.ConnectError` (server never reached: hard)
       * ``"severed"`` — :class:`httpx.RemoteProtocolError` (established then
         dropped: a held-poll sever iff ``held_s`` >= the floor)
-      * ``"5xx"``     — a 503 response (server sick: hard)
+      * ``"5xx"``     — a 503 response (hard iff ``held_s`` < the floor; a
+        gateway 5xx ending a held poll is a sever)
+      * ``"ok"``      — a 200 response (the human answered: final)
 
     :param script: Per-attempt ``(kind, held_s)`` plan.
     :param monkeypatch: Installs the fake clock + no-op sleep.
@@ -2182,6 +2034,8 @@ def _scripted_client(
                 raise httpx.RemoteProtocolError("server dropped the poll", request=req)
             if kind == "5xx":
                 return httpx.Response(503, text="upstream down", request=req)
+            if kind == "ok":
+                return httpx.Response(200, json={"ok": True}, request=req)
             raise AssertionError(f"unknown scripted kind {kind!r}")
 
     _ScriptedClient.calls = calls
@@ -2196,7 +2050,7 @@ def test_reattach_bounds_consecutive_hard_failures(monkeypatch: pytest.MonkeyPat
     ``None`` (caller fails-ask) — not spin until the day-long budget.
     """
     client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2218,7 +2072,7 @@ def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) ->
     unreachable one, so it must hit the same cap.
     """
     client = _scripted_client(script=[("5xx", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2243,7 +2097,7 @@ def test_reattach_cap_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> Non
     reloaded = importlib.reload(claude_native_hook)
     try:
         client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
-        monkeypatch.setattr(reloaded.httpx, "Client", client)
+        monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
         resp = reloaded._post_hook_with_reattach(
             url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2318,7 +2172,7 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
                 raise httpx.RemoteProtocolError("proxy severed idle poll", request=req)
             return httpx.Response(200, json={"ok": True}, request=req)
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _SeverThenAnswerClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _SeverThenAnswerClient)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2333,6 +2187,253 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
     assert len(calls) == n_severs + 1  # retried through every sever, then answered
 
 
+def test_reattach_gateway_5xx_after_held_poll_never_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway 5xx that ends a HELD poll is a sever, not a sick server.
+
+    The Databricks front door answers an idle long-poll with 504 after 300s.
+    Counting those as hard failures fail-asked a parked approval into the
+    unwatched TUI after ``cap`` severs (40 minutes). Held past the floor, a
+    5xx must reset the counter exactly like a torn connection does.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    client = _scripted_client(
+        script=[("5xx", held)] * (cap * 3) + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200, (
+        "a slow human behind a 504-answering gateway was capped"
+    )
+    assert len(client.calls) == cap * 3 + 1
+
+
+def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a held-poll sever the next re-POST waits only the initial backoff.
+
+    The server clears the approval card ``_HARNESS_ELICITATION_REPARK_GRACE_S``
+    (30s) after a severed wait unless the same id re-parks first, so a
+    backoff that kept doubling towards its 30s cap flipped the card to
+    "Resolved elsewhere" on every proxy sever. Growth is reserved for hard
+    failures.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    client = _scripted_client(
+        script=[("connect", 0.0)] * 3 + [("severed", floor + 290.0)] * 2 + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(claude_native_hook.time, "sleep", sleeps.append)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200
+    initial = claude_native_hook._PERMISSION_RETRY_INITIAL_BACKOFF_S
+    # Three hard failures double the wait; each held-poll sever resets it.
+    assert sleeps == [initial, initial * 2, initial * 4, initial, initial]
+
+
+def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked hook keeps its approval-wait marker fresh on every attempt.
+
+    A pane parked on a permission prompt emits nothing and reports no active
+    turn, so the idle pane reaper reads it as abandoned and kills the prompt.
+    This marker is the pane's only evidence of the wait, so it must be fresh
+    for every re-POST across a severed poll — and gone once the wait ends, so
+    the pane returns to normal idle accounting instead of lingering.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT", tmp_path / "approval-waits"
+    )
+    session_id = "conv_marked"
+    marker = approval_wait_marker_path(session_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    fresh_per_attempt: list[bool] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _ObservingClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _ObservingClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            fresh_per_attempt.append(approval_wait_is_fresh(session_id))
+            req = httpx.Request("POST", url)
+            if len(fresh_per_attempt) <= 2:
+                clock["t"] += held
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ObservingClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_marked/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        wait_marker=marker,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert fresh_per_attempt == [True, True, True], (
+        "the marker must read fresh on every attempt, including after a sever"
+    )
+    assert not approval_wait_marker_path(session_id).exists()
+
+
+def test_reattach_marker_stays_fresh_through_an_unsevered_held_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One long held POST keeps the marker fresh past the TTL while in flight.
+
+    A direct server (no front door) holds the poll for the whole wait, so the
+    single touch a per-attempt refresh made went stale after the TTL and the
+    idle reaper killed the parked pane an hour later. Real clock, scaled TTL.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT", tmp_path / "approval-waits"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.APPROVAL_WAIT_MARKER_REFRESH_S", 0.05
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.APPROVAL_WAIT_MARKER_TTL_S", 0.5)
+    session_id = "conv_direct"
+    marker = approval_wait_marker_path(session_id)
+    marker.parent.mkdir(parents=True)
+    freshness: list[bool] = []
+
+    class _HoldingClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _HoldingClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            for _ in range(3):
+                time.sleep(0.5)  # each hold spans a whole TTL
+                freshness.append(approval_wait_is_fresh(session_id))
+            return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _HoldingClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_direct/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        wait_marker=marker,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert freshness == [True, True, True], "the marker must stay fresh for the whole held poll"
+    assert not marker.exists()
+
+
+def test_reattach_reauths_again_after_a_held_poll_sever(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Every token lapse across a long wait is re-minted, not only the first.
+
+    A parked approval outlives the ~1h token: the server bounces the lapsed
+    bearer, the hook re-mints once, the gateway severs the next held poll, and
+    an hour later the fresh token lapses too. The held poll must re-arm the
+    one-shot re-mint, or the second bounce fail-asks into the unwatched TUI.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    # Per attempt: a bounce, a gateway sever after a held poll, a second bounce,
+    # then the verdict.
+    script = [("302", 0.0), ("severed", floor + 290.0), ("302", 0.0), ("ok", 0.0)]
+    seen_auth: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            seen_auth.append(self._headers.get("Authorization", ""))
+            kind, held_s = script[len(seen_auth) - 1]
+            clock["t"] += held_s
+            req = httpx.Request("POST", url)
+            if kind == "302":
+                return httpx.Response(
+                    302,
+                    headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+                    request=req,
+                )
+            if kind == "severed":
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    minted: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        """
+        Mint a distinguishable fresh bearer.
+
+        :returns: Headers carrying the new token.
+        """
+        minted.append(len(minted) + 1)
+        return {"Authorization": f"Bearer fresh{len(minted)}"}
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=_reauth,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert minted == [1, 2], "the second lapse must be re-minted too"
+    assert seen_auth == ["Bearer stale", "Bearer fresh1", "Bearer fresh1", "Bearer fresh2"]
+
+
 def test_reattach_fast_flapping_connection_is_hard_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2344,7 +2445,7 @@ def test_reattach_fast_flapping_connection_is_hard_failure(
     tight loop is still bounded (it must not masquerade as a parked poll).
     """
     client = _scripted_client(script=[("severed", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2411,7 +2512,7 @@ def test_reattach_never_resolving_severs_are_bounded_by_deadline(
     # stop it. Fake clock advances 15s per attempt + 30s backoff.
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 5.0  # 15s: a held sever
     client = _scripted_client(script=[("severed", held)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2461,7 +2562,7 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
             type(self).calls += 1
             return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _OkClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _OkClient)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2473,3 +2574,479 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
     assert resp is not None
     assert resp.status_code == 200
     assert _OkClient.calls == 1
+
+
+# ── route-turn (first-message model routing) ────────────────────────
+
+
+def _turn_routing_bridge_dir(tmp_path: Path) -> Path:
+    """
+    Create a bridge dir whose active session is ``conv_active``.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: The bridge directory.
+    """
+    bridge_dir = prepare_bridge_dir("conv_active", bridge_id="bridge_turn", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    return bridge_dir
+
+
+def _advertise_turn_router(bridge_dir: Path, *, session_id: str | None = "conv_active") -> None:
+    """
+    Write a live ``turn_router.json`` advertisement into *bridge_dir*.
+
+    :param bridge_dir: The session's bridge directory.
+    :param session_id: Session id to advertise, or ``None`` to omit it so
+        the hook has to fall back to the bridge's active session.
+    :returns: None.
+    """
+    import os
+
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    payload: dict[str, object] = {
+        "url": "http://127.0.0.1:54321",
+        "token": "turn-token",
+        "pid": os.getpid(),
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    (bridge_dir / ADVERTISEMENT_FILE).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _run_route_turn(
+    bridge_dir: Path, payload: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> int:
+    """
+    Feed *payload* on stdin and run the ``route-turn`` subcommand.
+
+    :param bridge_dir: The session's bridge directory.
+    :param payload: The claude ``UserPromptSubmit`` hook payload.
+    :param monkeypatch: pytest monkeypatch fixture.
+    :returns: The hook process exit code.
+    """
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    return claude_native_hook.main(
+        ["route-turn", "--bridge-dir", str(bridge_dir), "--harness", "claude-native"]
+    )
+
+
+def test_route_turn_fast_skips_on_the_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A consumed marker short-circuits before any network call.
+
+    This is the re-entrancy guard the replayed prompt relies on: the replay
+    re-fires ``UserPromptSubmit``, and a second block would erase it.
+    """
+    from omnigent.runner.turn_routing import write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    write_turn_routing_marker(bridge_dir, session_id="conv_active", decision_id="d1")
+
+    def _boom(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("the marker must skip the route-turn round trip")
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _boom)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_blocks_on_a_routed_verdict_without_touching_the_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A routed verdict writes the marker and blocks — and switches nothing.
+
+    Claude's pane is frozen waiting on this very subprocess, so keystrokes
+    sent from here would queue behind the block. The runner owns the switch;
+    the hook's only job is the marker (its "you owe me a replay" handshake)
+    and the block itself.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    # The live model is read from the statusLine snapshot, never a config file.
+    (bridge_dir / "context.json").write_text(
+        json.dumps({"model": "databricks-claude-opus-4-8", "context_window_size": 200000}),
+        encoding="utf-8",
+    )
+    sent: dict[str, object] = {}
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        sent.update({"url": url, "token": token, "body": body, "timeout": timeout})
+        return {
+            "action": "route",
+            "model": "databricks-claude-sonnet-5",
+            "rationale": "short lookup",
+            "terminal": True,
+        }
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "inject_slash_command",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("the hook must not drive tmux")),
+        raising=False,
+    )
+
+    exit_code = _run_route_turn(
+        bridge_dir,
+        {"hook_event_name": "UserPromptSubmit", "prompt": "what test runner is this?"},
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert sent["url"] == "http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"
+    assert sent["token"] == "turn-token"
+    assert sent["body"] == {
+        "harness": "claude-native",
+        "prompt": "what test runner is this?",
+        # Claude's payload carries no turn id, and a blocked prompt starts
+        # no turn for the replay to wait out.
+        "turn_id": None,
+        "model": "databricks-claude-opus-4-8",
+    }
+    assert (bridge_dir / MARKER_FILE).exists()
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert "databricks-claude-sonnet-5" in result["reason"]
+
+
+def test_route_turn_marks_a_terminal_allow_so_it_stops_asking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A terminal ``allow`` consumes the marker but never blocks the prompt.
+
+    That is the already-routed / already-pinned session: nothing will route
+    it again, so later prompts should not pay for the round trip.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "allow", "terminal": True, "rationale": "already routed"},
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_keeps_asking_after_a_non_terminal_allow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-terminal ``allow`` leaves no marker.
+
+    Routing being off is not permanent — it can be toggled on before the
+    next prompt — so the hook must keep asking.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "allow", "terminal": False, "rationale": "routing is off"},
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_does_not_block_when_the_marker_cannot_be_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    Without a marker on disk the prompt must run, not be blocked.
+
+    The marker is what tells the runner to replay. Blocking without one
+    would drop the user's prompt entirely.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "route", "model": "databricks-claude-sonnet-5"},
+    )
+    monkeypatch.setattr(claude_native_hook, "_write_turn_routing_marker", lambda *_args: False)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_falls_back_to_the_bridges_active_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An advertisement with no session id uses the bridge's active session.
+
+    Claude's hook payload carries claude's own session id, never omnigent's,
+    so the bridge is the only other place the id can come from.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir, session_id=None)
+    urls: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> None:
+        urls.append(url)
+        return
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert urls == ["http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"prompt": "   "},
+        {"prompt": 42},
+        {},
+    ],
+)
+def test_route_turn_no_ops_without_a_usable_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prompt, no round trip")),
+    )
+
+    assert _run_route_turn(bridge_dir, payload, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_without_an_advertisement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    No advertised endpoint means routing is not installed — fail open.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_when_the_endpoint_is_unreachable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A dead loopback endpoint lets the prompt run on the current model.
+
+    The real ``_route_turn_post`` is exercised here (nothing is listening on
+    the advertised port), so the fail-open path is the transport's own.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_falls_open_on_the_ladders_own_request_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The hook waits ``HOOK_REQUEST_TIMEOUT_S`` for a verdict, and no longer.
+
+    The user-visible cost of a wedged router: the typed prompt sits in the pane
+    until this expires. Asserted against the constant rather than a wall clock,
+    so the test pins the ladder instead of timing the machine it runs on.
+    """
+    from omnigent.runner.turn_routing import HOOK_REQUEST_TIMEOUT_S, MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    seen: list[float] = []
+
+    def _timed_out(url: str, token: str, body: object, timeout: float) -> None:
+        del url, token, body
+        seen.append(timeout)
+        return
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _timed_out)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert seen == [HOOK_REQUEST_TIMEOUT_S]
+    # Single digits: a fail-open the user waits half a minute for is blocking
+    # in practice, whatever the code path says.
+    # Must outlast a healthy route (catalog prep + router call), capped at the
+    # owner's 15s ceiling.
+    assert HOOK_REQUEST_TIMEOUT_S <= 15.0
+    # Nothing blocked and nothing marked, so the prompt ran.
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_build_hook_settings_registers_the_route_turn_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``UserPromptSubmit`` carries the ``route-turn`` command.
+
+    Without it a bare ``omnigent claude --smart-routing`` launch never routes:
+    nothing else can see a prompt typed straight into the TUI. It must ride
+    the same bridge dir the runner advertises into, name the harness, and
+    carry the timeout ladder's outermost budget.
+    """
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_rt", workspace=tmp_path)
+
+    settings = build_hook_settings(bridge_dir, turn_routing=True)
+    entries = [
+        hook
+        for group in settings["hooks"]["UserPromptSubmit"]
+        for hook in group["hooks"]
+        if "route-turn" in hook["command"]
+    ]
+    assert len(entries) == 1, "route-turn must be registered exactly once"
+    command = entries[0]["command"]
+    assert "omnigent.harnesses.claude_native.hook" in command
+    assert str(bridge_dir) in command
+    assert "claude-native" in command
+    assert entries[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
+    # The spike scaffolding this replaced must be gone.
+    assert "spike-userprompt" not in json.dumps(settings)
+
+
+def test_route_turn_ignores_a_marker_another_session_left_in_the_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``/clear`` rotation hands this bridge dir to a NEW conversation.
+
+    ``_create_clear_replacement_session`` re-keys the superseded session onto
+    ``{id}-cleared`` and gives the new one the same live dir, which
+    ``prepare_bridge_dir`` does not wipe the marker from. A bare marker
+    therefore stopped every later conversation in the pane from routing its
+    first message.
+    """
+    from omnigent.runner.turn_routing import turn_routing_marker_session, write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    write_turn_routing_marker(bridge_dir, session_id="conv_superseded", decision_id="d0")
+    asked: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        del token, body, timeout
+        asked.append(url)
+        return {"action": "allow", "rationale": "already pinned", "terminal": True}
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert asked == ["http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"]
+    # The terminal answer re-keys the marker onto THIS session, so its own
+    # later prompts still fast-skip.
+    assert turn_routing_marker_session(bridge_dir) == "conv_active"
+
+
+def test_build_hook_settings_omits_the_route_turn_hook_when_routing_is_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session that cannot route registers no first-message routing hook.
+
+    Registered unconditionally, every submit of every claude-native session
+    paid the hook's routing round trip (25s worst case on a degraded server)
+    only to be told the session does not route. The forwarder's status hook and
+    the request-phase policy gate stay on ``UserPromptSubmit`` either way.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_off", bridge_id="bridge_off", workspace=tmp_path)
+
+    settings = build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+
+    commands = [
+        hook["command"]
+        for group in settings["hooks"]["UserPromptSubmit"]
+        for hook in group["hooks"]
+    ]
+    assert not any("route-turn" in command for command in commands)
+    assert any("evaluate-policy" in command for command in commands)
+    assert commands, "the forwarder's own UserPromptSubmit hooks must survive"
+
+
+def test_route_turn_follows_a_clear_rotation_onto_the_new_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After ``/clear`` the hook asks — and marks — as the NEW conversation.
+
+    ``turn_router.json`` is written once at launch, so its session id goes
+    stale the moment ``_create_clear_replacement_session`` re-keys the pane.
+    Reading it made the replacement conversation ask (and fast-skip) under the
+    superseded session's id, so the marker the old session wrote silenced it
+    and its routing — had any happened — would have been pinned on the wrong
+    conversation. The bridge's active session is the live source, exactly as
+    the permission hook reads it.
+    """
+    from omnigent.runner.turn_routing import turn_routing_marker_session, write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir, session_id="conv_active")
+    # What the /clear rotation leaves behind: the old session's marker, and the
+    # bridge pointed at the replacement conversation.
+    write_turn_routing_marker(bridge_dir, session_id="conv_active", decision_id="d0")
+    write_active_session_id(bridge_dir, "conv_replacement")
+    urls: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        del token, body, timeout
+        urls.append(url)
+        return {"action": "allow", "rationale": "already pinned", "terminal": True}
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert urls == ["http://127.0.0.1:54321/v1/sessions/conv_replacement/route-turn"]
+    assert turn_routing_marker_session(bridge_dir) == "conv_replacement"

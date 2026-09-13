@@ -1,0 +1,41 @@
+/* Browser-only highlight overlays for PDF comment anchors. Colors mirror the
+   Monaco/Shiki comment decorations (yellow wash). */
+
+.pdf-viewer .textLayer *::selection {
+  /* pdf.js text spans are transparent; keep selection yellow so it doesn't
+     clash with the app-wide brand-accent ::selection styling. */
+  background: rgba(250, 204, 21, 0.4);
+  color: transparent;
+}
+
+.dark .pdf-viewer .textLayer *::selection {
+  background: rgba(250, 204, 21, 0.35);
+  color: transparent;
+}
+
+.pdf-comment-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.pdf-comment {
+  position: absolute;
+  background-color: rgba(250, 204, 21, 0.25);
+  border-radius: 2px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.pdf-comment-active {
+  background-color: rgba(250, 204, 21, 0.45);
+}
+
+.dark .pdf-comment {
+  background-color: rgba(250, 204, 21, 0.22);
+}
+
+.dark .pdf-comment-active {
+  background-color: rgba(250, 204, 21, 0.38);
+}

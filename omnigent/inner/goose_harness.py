@@ -25,8 +25,9 @@ Env vars read at startup:
 - ``HARNESS_GOOSE_PROVIDER``: optional ``GOOSE_PROVIDER`` override.
 - ``HARNESS_GOOSE_CWD``: working directory for the goose subprocess. ``None``
   falls back to ``OMNIGENT_RUNNER_WORKSPACE`` then the inherited cwd.
-- ``HARNESS_GOOSE_PATH``: absolute path to a ``goose`` CLI binary. ``None``
-  searches ``PATH``.
+- ``OMNIGENT_GOOSE_PATH``: absolute path to a ``goose`` CLI binary.
+  ``None`` searches ``PATH``. (Legacy ``HARNESS_GOOSE_PATH`` still honored,
+  deprecated.)
 - ``HARNESS_GOOSE_BUILTINS``: comma-separated Goose builtin extensions to load
   (``--with-builtin``). ``None`` defaults to ``developer`` (shell + editor).
 - ``HARNESS_GOOSE_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
@@ -41,6 +42,7 @@ import os
 
 from fastapi import FastAPI
 
+from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.goose_executor import GooseExecutor
@@ -51,7 +53,10 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_GOOSE_MODEL"
 _ENV_PROVIDER = "HARNESS_GOOSE_PROVIDER"
 _ENV_CWD = "HARNESS_GOOSE_CWD"
-_ENV_GOOSE_PATH = "HARNESS_GOOSE_PATH"
+_ENV_GOOSE_PATH = "OMNIGENT_GOOSE_PATH"
+# Deprecated alias — read via resolve_harness_path() which warns on use.
+# Remove this constant and the HARNESS_GOOSE_PATH read in v0.8.0.
+_LEGACY_ENV_GOOSE_PATH = "HARNESS_GOOSE_PATH"
 _ENV_BUILTINS = "HARNESS_GOOSE_BUILTINS"
 _ENV_OS_ENV = "HARNESS_GOOSE_OS_ENV"
 
@@ -97,7 +102,7 @@ def _build_goose_executor() -> Executor:
     cwd = cwd_raw or None
     model = os.environ.get(_ENV_MODEL, "").strip() or None
     provider = os.environ.get(_ENV_PROVIDER, "").strip() or None
-    goose_path = os.environ.get(_ENV_GOOSE_PATH, "").strip() or None
+    goose_path = resolve_harness_path("goose")
     builtins_raw = os.environ.get(_ENV_BUILTINS, "").strip()
     builtins = (
         tuple(part.strip() for part in builtins_raw.split(",") if part.strip())

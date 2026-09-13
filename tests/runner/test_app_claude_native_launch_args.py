@@ -12,13 +12,22 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from omnigent.claude_native import (
+from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
 )
 from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
+from omnigent.runner.native.orchestration import (
+    _ROUTED_SPAWN_ALLOWED_TOOLS,
+    _claude_launch_metadata_from_envelope,
+    _load_legacy_claude_launch_metadata,
+    _routed_spawn_launch_args,
+)
+from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 
 
 @pytest.mark.parametrize(
@@ -59,6 +68,16 @@ from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal
         # An unrecognised effort is dropped (not a Claude effort), so it
         # never reaches the CLI as a bogus ``--effort`` value.
         ("bogus-effort", None, None, ()),
+        # A leading positional prompt (how the CLI forwards ``-p``) keeps
+        # its place ahead of pass-through value flags, and the model
+        # default is appended after — re-appending the prompt last would
+        # let a variadic flag like ``--mcp-config`` swallow it.
+        (
+            None,
+            "claude-opus-4-7",
+            ["hello", "--mcp-config", "mcp.json"],
+            ("hello", "--mcp-config", "mcp.json", "--model", "claude-opus-4-7"),
+        ),
     ],
     ids=[
         "effort-only",
@@ -69,6 +88,7 @@ from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal
         "all-none",
         "empty-passthrough-still-adds-model",
         "unknown-effort-dropped",
+        "leading-prompt-stays-first",
     ],
 )
 def test_build_claude_native_base_args(
@@ -145,6 +165,32 @@ def test_build_claude_native_base_args_resume_prefix(
     )
 
 
+def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:
+    """
+    A pinned ``--permission-mode`` reaches the cold-resume argv unchanged.
+
+    The server pins a picker-confirmed mode into ``terminal_launch_args``
+    precisely because this builder is the only thing a relaunch consults;
+    the pass-through must land after ``--resume`` and survive the
+    ``--model`` default so the resumed Claude opens in the chosen mode.
+    """
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override="claude-opus-5",
+        terminal_launch_args=["--permission-mode", "auto"],
+        resume_external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+    )
+
+    assert args == (
+        "--resume",
+        "02857840-6362-408f-b41f-309e396ed7c6",
+        "--permission-mode",
+        "auto",
+        "--model",
+        "claude-opus-5",
+    )
+
+
 def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
     """An apiKeyHelper launch strips the raw key + nested-session marker.
 
@@ -210,6 +256,44 @@ def test_native_launch_passes_synthesized_model_as_flag() -> None:
         terminal_launch_args=None,
     )
     assert args == ("--model", "gateway-served-claude")
+
+
+def test_routed_launch_model_reaches_the_terminal_env_as_the_custom_slot() -> None:
+    """A routed exact id is launchable AND switchable back to mid-session.
+
+    Mirrors the runner's composition: the session override becomes
+    ``--model`` and the same value is pinned into Claude Code's custom picker
+    slot, which is the only spelling ``/model`` accepts for an id no family
+    alias points at (``opus`` here resolves to the newer generation).
+    """
+    from omnigent.harnesses.claude_native.main import claude_config_with_launch_model_pinned
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+        },
+        api_key_helper="printf %s sk-gateway",
+        model="databricks-claude-opus-5",
+    )
+    session_model_override = "databricks-claude-opus-4-8"
+
+    launched = claude_config_with_launch_model_pinned(config, session_model_override)
+    assert launched is not None
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override=session_model_override,
+        terminal_launch_args=None,
+    )
+    terminal_env = build_native_claude_terminal_env(launched)
+
+    assert args == ("--model", "databricks-claude-opus-4-8")
+    assert terminal_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-8"
+    assert (
+        claude_model_command_arg(session_model_override, terminal_env)
+        == "databricks-claude-opus-4-8"
+    )
 
 
 def test_build_native_claude_terminal_env_rejects_raw_key_on_helper_path() -> None:
@@ -279,3 +363,163 @@ def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
     )
     assert args == ("--model", "databricks-claude-opus-4-8")
     assert config.api_key_helper
+
+
+@pytest.fixture
+def bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """
+    Yield a bridge dir the claude-native bridge accepts.
+
+    ``augment_claude_args`` validates the bridge dir against the real
+    ``$TMPDIR/omnigent-<uid>/claude-native`` root, so a raw ``tmp_path`` is
+    rejected. Point the bridge root and its trusted parent at the test's temp
+    dir the way ``tests/test_claude_native_bridge.py`` does.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp directory.
+    :returns: Bridge dir under the patched bridge root.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+    return tmp_path
+
+
+def _augmented(bridge_dir: Path, *, auto_harness: bool) -> list[str]:
+    """Run the runner's own claude-native argv composition for one session shape."""
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
+
+    note, allowed = _routed_spawn_launch_args(auto_harness)
+    return augment_claude_args(
+        ("--model", "databricks-claude-sonnet-5"),
+        bridge_dir=bridge_dir,
+        python_executable="/venv/bin/python",
+        append_system_prompt=note,
+        allowed_tools=allowed,
+    )
+
+
+def test_auto_harness_launch_names_the_routed_spawn_tool_and_preapproves_it(
+    bridge_dir: Path,
+) -> None:
+    """An auto-harness Claude launch carries the note AND the tool allowlist.
+
+    Both halves of the live failure: the model reported
+    ``mcp__omnigent__sys_session_create`` as nonexistent (no note, and the
+    schema is deferred behind tool search), and Claude Code's don't-ask mode
+    denied the Omnigent MCP call outright (no ``--allowedTools``).
+    """
+    args = _augmented(bridge_dir, auto_harness=True)
+
+    note = args[args.index("--append-system-prompt") + 1]
+    assert "mcp__omnigent__sys_session_create" in note
+    assert "mcp__omnigent__sys_agent_list" in note
+    # Bare spellings would send the model looking for a tool Claude does not
+    # advertise, which is the bug.
+    assert "`sys_session_create`" not in note
+    allowed = args[args.index("--allowedTools") + 1].split(",")
+    assert "mcp__omnigent__sys_session_create" in allowed
+    assert "mcp__omnigent__sys_agent_list" in allowed
+    assert "mcp__omnigent__sys_session_send" in allowed
+    assert set(_ROUTED_SPAWN_ALLOWED_TOOLS) <= set(allowed)
+
+
+def test_pinned_harness_launch_argv_is_unchanged(bridge_dir: Path) -> None:
+    """A pinned session's argv must stay byte-identical to the pre-change one.
+
+    The routed-spawn note and the tool allowlist are additions for auto-harness
+    sessions only; leaking either into a pinned launch would change every
+    non-routed native session's command line.
+    """
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
+
+    baseline = augment_claude_args(
+        ("--model", "databricks-claude-sonnet-5"),
+        bridge_dir=bridge_dir,
+        python_executable="/venv/bin/python",
+    )
+
+    assert _augmented(bridge_dir, auto_harness=False) == baseline
+    assert "--append-system-prompt" not in baseline
+    assert "--allowedTools" not in baseline
+
+
+def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
+    assert _routed_spawn_launch_args(False) == (None, ())
+    note, allowed = _routed_spawn_launch_args(True)
+    assert note
+    assert allowed == _ROUTED_SPAWN_ALLOWED_TOOLS
+
+
+@pytest.mark.parametrize(
+    ("labels", "harness_override", "expected"),
+    [
+        ({AUTO_HARNESS_LABEL_KEY: "1"}, None, True),
+        # The sentinel is replaced once first-message routing resolves a
+        # harness, so a session still carrying it is auto-harness too.
+        ({}, "auto", True),
+        ({}, "claude-native", False),
+        ({AUTO_HARNESS_LABEL_KEY: "0"}, None, False),
+        ({}, None, False),
+    ],
+    ids=["label", "sentinel", "pinned", "label-off", "neither"],
+)
+def test_envelope_metadata_reads_the_auto_harness_flag(
+    labels: dict[str, str],
+    harness_override: str | None,
+    expected: bool,
+) -> None:
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_abc",
+        agent_id="agent",
+        snapshot={
+            "created_at": 0,
+            "updated_at": 0,
+            "labels": labels,
+            "harness_override": harness_override,
+        },
+    )
+
+    assert _claude_launch_metadata_from_envelope(envelope).auto_harness is expected
+
+
+@pytest.mark.parametrize(
+    ("labels", "harness_override", "expected"),
+    [
+        ({AUTO_HARNESS_LABEL_KEY: "1"}, None, True),
+        ({}, "auto", True),
+        ({}, "claude-native", False),
+        ({}, None, False),
+    ],
+    ids=["label", "sentinel", "pinned", "neither"],
+)
+async def test_legacy_metadata_loader_reads_the_auto_harness_flag(
+    labels: dict[str, str],
+    harness_override: str | None,
+    expected: bool,
+) -> None:
+    """The removable legacy snapshot path must parse the flag too.
+
+    A server predating the init envelope still answers ``GET /v1/sessions``, and
+    an auto-harness session launched through it needs the same note.
+    """
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"labels": labels, "harness_override": harness_override},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
+
+    assert metadata.auto_harness is expected

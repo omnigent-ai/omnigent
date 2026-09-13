@@ -37,8 +37,12 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Protocol
 
+import httpx
+
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,
@@ -328,9 +332,14 @@ class TunnelRegistry:
                     "Deregistering runner %s; aborting %d in-flight request(s)",
                     runner_id,
                     in_flight_count,
+                    extra={"session_id": runner_primary_session_id()},
                 )
             else:
-                _logger.info("Deregistering runner %s; no in-flight requests", runner_id)
+                _logger.info(
+                    "Deregistering runner %s; no in-flight requests",
+                    runner_id,
+                    extra={"session_id": runner_primary_session_id()},
+                )
             self._abort_session_inflight(
                 removed,
                 ConnectionError("tunnel closed before request completed"),
@@ -341,18 +350,29 @@ class TunnelRegistry:
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:
         for state in list(session.in_flight.values()):
-            _call_soon_threadsafe(state, lambda state=state: _abort_request_state(state, error))
+            _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
         session.in_flight.clear()
         for channel in list(session.ws_channels.values()):
-            _call_channel_soon_threadsafe(
-                channel, lambda ch=channel: ch.inbound_queue.put_nowait(None)
-            )
+            _call_channel_soon_threadsafe(channel, partial(channel.inbound_queue.put_nowait, None))
         session.ws_channels.clear()
 
     def get(self, runner_id: str) -> RunnerSession | None:
         """Return the session for a runner_id, or None if not online."""
         with self._lock:
             return self._sessions.get(runner_id)
+
+    def is_runner_telemetry_opted_out(self, runner_id: str) -> bool:
+        """Return whether the runner's host has opted out of telemetry.
+
+        :param runner_id: Runner id, e.g. ``"runner_0123456789abcdef"``.
+        :returns: ``True`` when the runner sent ``telemetry_opt_out=True``
+            in its hello frame, or when the runner is offline (unknown
+            runners default to not opted out).
+        """
+        session = self.get(runner_id)
+        if session is None:
+            return False
+        return session.hello.telemetry_opt_out
 
     async def wait_for_runner(
         self,
@@ -404,6 +424,7 @@ class TunnelRegistry:
                 overflow_reason,
                 runner_id,
                 timeout_s,
+                extra={"session_id": runner_primary_session_id()},
             )
             await asyncio.sleep(timeout_s)
             return self.get(runner_id)
@@ -649,6 +670,7 @@ class TunnelRegistry:
                     _logger.warning(
                         "ws-channel %s: dropping frame with malformed base64",
                         frame.ch_id,
+                        extra={"session_id": runner_primary_session_id()},
                     )
                     return False
                 item = ("data", decoded)
@@ -657,6 +679,7 @@ class TunnelRegistry:
                     "ws-channel %s: dropping frame with unknown encoding %r",
                     frame.ch_id,
                     frame.encoding,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return False
 
@@ -738,8 +761,18 @@ class TunnelRegistry:
             self.close_request(runner_id, req_id, session=current)
             return False
         if isinstance(frame, ResponseEndFrame):
-            if _call_soon_threadsafe(state, lambda: _end_response_body(state)):
-                return True
+            if frame.error is not None:
+                # Runner signalled an abnormal stream end (mid-stream raise).
+                # Abort so the consumer raises instead of seeing clean EOF.
+                err = httpx.RemoteProtocolError(
+                    f"runner stream error: {frame.error}",
+                    request=None,  # type: ignore[arg-type]
+                )
+                if _call_soon_threadsafe(state, lambda: _abort_request_state(state, err)):
+                    return True
+            else:
+                if _call_soon_threadsafe(state, lambda: _end_response_body(state)):
+                    return True
             self.close_request(runner_id, req_id, session=current)
             return False
         return False
@@ -839,6 +872,7 @@ def _resolve_connect_waiter(
             "Dropping runner-connect wakeup for closed waiter loop (runner_id=%s)",
             session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
 
 
@@ -897,6 +931,7 @@ def _call_soon_threadsafe(state: RequestState, callback: Callable[[], None]) -> 
             "Dropping tunnel response wakeup for closed request loop (runner_id=%s)",
             state.session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         return False
     return True
@@ -926,6 +961,7 @@ def _call_channel_soon_threadsafe(
             "Dropping ws-channel wakeup for closed loop (runner_id=%s)",
             state.session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         return False
     return True

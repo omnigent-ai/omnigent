@@ -5,6 +5,13 @@
 # over the internal docker network — the omnigent container is no
 # longer directly exposed to the host.
 #
+# Fronting the server with Caddy also gives you HTTP/2 (negotiated over
+# TLS via ALPN, no extra config). That matters beyond HTTPS: each open
+# session in the web UI holds a long-lived event-stream connection, and
+# HTTP/1.1's ~6-connections-per-origin cap makes the UI stall once a
+# user opens several windows/tabs. HTTP/2 multiplexes them over one
+# connection, so this proxy is the fix. See ../README.md ("Serving").
+#
 # No ACME email is required: Let's Encrypt allows anonymous account
 # registration, so the cert issues without one. If you WANT expiry /
 # renewal notices, add a global email option above the site block:

@@ -14,7 +14,8 @@ Design decisions (locked with the product owner):
 
 - **File only.** No env-var roster. The file is editable at runtime
   without a redeploy — in the bundled Docker stack it lives on the
-  persistent ``/data`` volume next to ``admin-credentials``.
+  persistent ``/data`` volume alongside the other operator-editable
+  files (e.g. ``allowed_domains``).
 - **Additive promotion only.** A listed identity is promoted on login.
   Removing an identity from the file NEVER demotes them — demotion is a
   separate, explicit admin action. This makes the file safe to edit:
@@ -50,13 +51,15 @@ logger = logging.getLogger(__name__)
 def resolve_data_dir() -> Path:
     """Resolve the directory that holds OSS server-side state files.
 
-    Co-locates the admin list (and the allowed-domains file) with the
-    accounts ``admin-credentials`` file so a single mounted volume holds
-    all operator-editable state. Resolution:
+    Co-locates the admin list and the allowed-domains file on a single
+    mounted volume so all operator-editable state lives together.
+    Resolution:
 
     1. The parent directory of ``OMNIGENT_ADMIN_CREDENTIALS_PATH`` if
-       that env var is set (Docker compose mounts
-       ``/data/admin-credentials``, so this yields ``/data``).
+       that env var is set (Docker compose points it at
+       ``/data/admin-credentials`` purely to anchor the data dir at
+       ``/data``; no credentials file is written there). The name is
+       retained for compatibility — see #2832 for the rename.
     2. ``~/.omnigent`` for a laptop deploy.
 
     :returns: The resolved data directory. Not created here — callers

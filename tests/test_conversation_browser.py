@@ -9,66 +9,6 @@ import pytest
 import omnigent.conversation_browser as browser
 
 
-@pytest.mark.parametrize(
-    "url,expected",
-    [
-        # Databricks workspace API mount → the recognizable /omnigent SPA URL.
-        (
-            "https://e2-dogfood.staging.cloud.databricks.com/api/2.0/omnigent",
-            "https://e2-dogfood.staging.cloud.databricks.com/omnigent",
-        ),
-        # A trailing ``?o=<org>`` selector on the API base is dropped.
-        (
-            "https://ws.databricks.com/api/2.0/omnigent?o=123",
-            "https://ws.databricks.com/omnigent",
-        ),
-        # Trailing slash on the API mount still maps cleanly.
-        (
-            "https://ws.databricks.com/api/2.0/omnigent/",
-            "https://ws.databricks.com/omnigent",
-        ),
-        # Non-Databricks URLs pass through unchanged (sans trailing slash).
-        ("http://127.0.0.1:6767", "http://127.0.0.1:6767"),
-        ("https://omnigent-02m5.onrender.com/", "https://omnigent-02m5.onrender.com"),
-    ],
-)
-def test_display_server_url_maps_databricks_api_mount(url: str, expected: str) -> None:
-    """
-    ``display_server_url`` rewrites the Databricks API mount to the SPA URL.
-
-    What this proves: the startup banner shows the workspace ``/omnigent``
-    URL a user recognizes instead of the internal ``/api/2.0/omnigent``
-    proxy path, while every other target is shown verbatim. A regression
-    that stopped mapping would leak the API path back into the banner.
-
-    :returns: None.
-    """
-    assert browser.display_server_url(url) == expected
-
-
-@pytest.mark.parametrize(
-    "url,expected",
-    [
-        ("https://ws.databricks.com/api/2.0/omnigent", True),
-        ("https://ws.databricks.com/api/2.0/omnigent/", True),
-        ("https://ws.databricks.com/omnigent", False),  # the SPA URL, not the API mount
-        ("http://127.0.0.1:6767", False),
-        ("https://omnigent-02m5.onrender.com", False),
-    ],
-)
-def test_is_workspace_hosted_url(url: str, expected: bool) -> None:
-    """
-    ``is_workspace_hosted_url`` is true only for the workspace API mount.
-
-    What this proves: the predicate the banner uses to suppress the
-    server-version row fires for ``/api/2.0/omnigent`` and nothing else, so
-    non-Databricks targets keep showing their version.
-
-    :returns: None.
-    """
-    assert browser.is_workspace_hosted_url(url) is expected
-
-
 def test_conversation_url_quotes_session_id() -> None:
     """
     Conversation URLs percent-encode ids before appending them to the base URL.
@@ -290,3 +230,100 @@ def test_conversation_url_plain_server_unchanged(tmp_path, monkeypatch) -> None:
         conversation_url("http://127.0.0.1:6767", "conv_abc123")
         == "http://127.0.0.1:6767/c/conv_abc123"
     )
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # The URL a user copies from the address bar with a conversation open.
+        (
+            "https://app.databricksapps.com/c/9bed9ec6fd244725b60e159dc0052fea",
+            "https://app.databricksapps.com",
+        ),
+        ("https://app.databricksapps.com/c/conv_abc/", "https://app.databricksapps.com"),
+        ("http://127.0.0.1:6767/c/conv_abc", "http://127.0.0.1:6767"),
+        # Workspace web-UI mount keeps its prefix; only the route is trimmed.
+        ("https://ws.databricks.com/omnigent/c/conv_abc", "https://ws.databricks.com/omnigent"),
+        # Real server bases must survive untouched.
+        (
+            "https://ws.databricks.com/api/2.0/omnigent",
+            "https://ws.databricks.com/api/2.0/omnigent",
+        ),
+        ("http://127.0.0.1:6767", "http://127.0.0.1:6767"),
+        # A path that merely contains /c/ elsewhere is not a conversation route.
+        ("https://host.example/c/conv_abc/extra", "https://host.example/c/conv_abc/extra"),
+    ],
+)
+def test_strip_conversation_path(url: str, expected: str) -> None:
+    """A copied conversation link resolves back to the server base.
+
+    The SPA catch-all serves its HTML shell for any GET under ``/c/<id>``, so a
+    pasted conversation URL answers an auth probe with ``200`` and is accepted
+    as a server; every later API call then 404s because no router owns that
+    prefix. Trimming the client-side route is what keeps that URL usable.
+
+    :param url: Input URL.
+    :param expected: Expected server base.
+    :returns: None.
+    """
+    assert browser.strip_conversation_path(url) == expected
+
+
+def test_strip_conversation_path_inverts_conversation_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``strip_conversation_path`` undoes what ``conversation_url`` builds.
+
+    These two must stay inverses: the CLI prints a conversation link with one
+    and has to accept that same link back through the other. If either changes
+    shape independently, a pasted link silently becomes an unusable server URL.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    base = "https://app.databricksapps.com"
+    link = browser.conversation_url(base, "conv_abc123")
+    assert link == f"{base}/c/conv_abc123"
+    assert browser.strip_conversation_path(link) == base
+
+
+def test_announce_conversation_url_echo_sink() -> None:
+    """The announcement emits one stable, greppable line and returns the URL.
+
+    A headless CI wrapper scrapes this line to surface the session link the
+    moment the session exists (before the turn finishes), so the prefix and
+    the ``<prefix><url>`` shape are a contract with that scraper.
+
+    :returns: None.
+    """
+    captured: list[str] = []
+    url = browser.announce_conversation_url(
+        base_url="http://127.0.0.1:6767",
+        conversation_id="conv_abc123",
+        echo=captured.append,
+    )
+    assert url == "http://127.0.0.1:6767/c/conv_abc123"
+    assert captured == [
+        f"{browser.SESSION_URL_ANNOUNCE_PREFIX}http://127.0.0.1:6767/c/conv_abc123"
+    ]
+
+
+def test_announce_conversation_url_defaults_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With no echo sink the line goes to stderr, never stdout.
+
+    A one-shot ``-p`` run prints only the final answer to stdout; the session
+    announcement must not intermix with it, so it defaults to stderr.
+
+    :param capsys: Pytest capture fixture.
+    :returns: None.
+    """
+    browser.announce_conversation_url(
+        base_url="http://127.0.0.1:6767",
+        conversation_id="x",
+    )
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.strip() == f"{browser.SESSION_URL_ANNOUNCE_PREFIX}http://127.0.0.1:6767/c/x"

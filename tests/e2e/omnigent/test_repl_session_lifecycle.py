@@ -33,7 +33,7 @@ from tests.e2e.omnigent._pexpect_harness import (
     ensure_repl_test_theme_env,
     submit_prompt,
 )
-from tests.e2e.omnigent.conftest import configure_mock_llm
+from tests.e2e.omnigent.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _MODEL = "mock-session-lifecycle"
 _HARNESS = "openai-agents"
@@ -178,6 +178,8 @@ def _repl_env(
     :returns: Environment dict for ``pexpect.spawn``.
     """
     env = dict(base_env)
+    # This process uses its per-test HOME for daemon state and logs.
+    env.pop("OMNIGENT_DATA_DIR", None)
     env["HOME"] = str(home)
     env["TERM"] = "xterm-256color"
     env["LINES"] = "40"
@@ -444,10 +446,11 @@ def _runner_pid_from_daemon_log(home: Path, runner_id: str) -> int:
     :returns: The runner subprocess pid.
     :raises AssertionError: When the pid is not found in the daemon log.
     """
-    log_dir = home / ".omnigent" / "logs" / "host-daemon"
-    logs = sorted(log_dir.glob("daemon-*.log"))
+    log_root = home / ".omnigent" / "logs"
+    logs = sorted((log_root / "host").glob("host-*.log"))
+    logs += sorted((log_root / "host-daemon").glob("daemon-*.log"))
     if not logs:
-        raise AssertionError(f"no connect-daemon log under {log_dir}")
+        raise AssertionError(f"no connect-daemon log under {log_root}")
     text = "".join(p.read_text(errors="replace") for p in logs)
     matches = re.findall(
         rf"Launched runner {re.escape(runner_id)}\b.*?\(pid=(\d+)\)",
@@ -455,7 +458,7 @@ def _runner_pid_from_daemon_log(home: Path, runner_id: str) -> int:
     )
     if not matches:
         raise AssertionError(
-            f"runner {runner_id!r} launch pid not found in daemon log under {log_dir}"
+            f"runner {runner_id!r} launch pid not found in daemon log under {log_root}"
         )
     return int(matches[-1])
 
@@ -687,7 +690,9 @@ def test_repl_full_session_lifecycle(
     try:
         _wait_ready(child)
         result = _drive_turn(child, "SESSION_LIFECYCLE_OK", mock_llm_server_url)
-        assert result.session_id.startswith("conv_")
+        # Conversation ids are bare 32-char hex (stored in a Uuid16 column);
+        # runner ids keep their runtime ``runner_`` prefix (not a DB id).
+        assert re.fullmatch(r"[0-9a-f]{32}", result.session_id)
         assert result.runner_id.startswith("runner_")
 
         submit_prompt(child, "/history")
@@ -882,6 +887,7 @@ async def test_repl_reasoning_effort_threads_through(
         [{"text": "SESSION_REASONING_OK"}],
         key=_MODEL,
     )
+    set_fallback_mock_llm(mock_llm_server_url, _MODEL, "SESSION_REASONING_OK")
     with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
         from omnigent.cli import _bundle
 
@@ -891,7 +897,10 @@ async def test_repl_reasoning_effort_threads_through(
             omnigent_repo_root,
             yaml_path,
             tmp_path,
-            extra_env={k: env[k] for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY") if k in env},
+            extra_env={
+                key: env[key]
+                for key in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OMNIGENT_CONFIG_HOME")
+            },
         ) as runner_id:
             async with OmnigentClient(base_url=server.base_url) as client:
                 created = await client.sessions.create(bundle, reasoning_effort="high")

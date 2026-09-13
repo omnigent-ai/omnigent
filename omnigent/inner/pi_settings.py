@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias, cast
 
 _logger = logging.getLogger(__name__)
+
+_Settings: TypeAlias = dict[str, object]
 
 # Default global Pi agent root (``PI_CODING_AGENT_DIR`` when unset).
 DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
@@ -25,7 +28,7 @@ DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
 _PI_AGENT_RESOURCE_DIRS: tuple[str, ...] = ("npm", "git")
 
 
-def _read_settings_file(path: Path) -> dict[str, Any]:
+def _read_settings_file(path: Path) -> _Settings:
     """Load a Pi ``settings.json`` file, returning ``{}`` when absent/invalid."""
     if not path.is_file():
         return {}
@@ -34,10 +37,10 @@ def _read_settings_file(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         _logger.warning("Ignoring unreadable Pi settings at %s: %s", path, exc)
         return {}
-    return raw if isinstance(raw, dict) else {}
+    return cast(_Settings, raw) if isinstance(raw, dict) else {}
 
 
-def _deep_merge_settings(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+def _deep_merge_settings(base: Mapping[str, object], overlay: Mapping[str, object]) -> _Settings:
     """Merge *overlay* onto *base* using Pi's nested-object merge semantics."""
     merged = dict(base)
     for key, value in overlay.items():
@@ -75,7 +78,7 @@ def _symlink_agent_resource_dirs(
 def prepare_managed_pi_agent_dir(
     managed_dir: Path,
     *,
-    overlay: dict[str, Any] | None = None,
+    overlay: Mapping[str, object] | None = None,
     global_agent_dir: Path | None = None,
 ) -> None:
     """

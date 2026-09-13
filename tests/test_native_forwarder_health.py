@@ -13,7 +13,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import _native_forwarder_health as health
+from omnigent.native import _native_forwarder_health as health
 
 
 class _FakeClock:
@@ -89,5 +89,17 @@ def test_note_post_success_clears_a_prior_failure() -> None:
         assert health.recent_post_failure(60.0) is not None
         health.note_post_success()
         assert health.recent_post_failure(60.0) is None
+    finally:
+        health.clear()
+
+
+def test_record_transport_failure_surfaces_preformatted_detail() -> None:
+    """A ready-to-surface detail (e.g. an SDK head's parsed gateway 401) is
+    stored verbatim and returned within the recency window."""
+    health.clear()
+    try:
+        health.record_transport_failure("gateway returned 401 Unauthorized at https://h/x")
+        detail = health.recent_post_failure(60.0)
+        assert detail == "gateway returned 401 Unauthorized at https://h/x"
     finally:
         health.clear()

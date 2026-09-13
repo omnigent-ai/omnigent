@@ -77,12 +77,35 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_for_session(self, conversation_id: str) -> list[SessionPermission]:
-        """Return all grants on a session.
+    def reassign_user_grants(self, from_user_id: str, to_user_id: str) -> int:
+        """Move one user's grants to another user.
 
-        :param conversation_id: The session to query, e.g.
-            ``"conv_abc123"``.
-        :returns: List of :class:`SessionPermission` objects.
+        Existing destination grants win when both users have access to the
+        same session, and the duplicate source grant is removed.
+
+        :param from_user_id: Source grantee whose grants move.
+        :param to_user_id: Destination grantee that receives them.
+        :returns: Number of grants moved to *to_user_id*.
+        """
+        ...
+
+    @abstractmethod
+    def list_for_session(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[SessionPermission], str | None]:
+        """Return grants on a session with cursor pagination.
+
+        :param conversation_id: The session to query.
+        :param limit: Max grants to return (default 100).
+        :param after_user_id: Exclusive cursor — return grants with
+            user_id > this value.
+        :returns: Tuple of (grants, next_cursor). next_cursor is the
+            user_id to pass as after_user_id on the next call, or None
+            if no more results.
         """
         ...
 
@@ -105,11 +128,12 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_for_user(self, user_id: str) -> list[SessionPermission]:
+    def list_for_user(self, user_id: str, *, limit: int = 1000) -> list[SessionPermission]:
         """Return all grants for a user.
 
         :param user_id: The user to query, e.g.
             ``"alice@example.com"``.
+        :param limit: Maximum number of grants to return (default 1000).
         :returns: List of :class:`SessionPermission` objects.
         """
         ...
@@ -129,7 +153,7 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_users(self) -> list[Account]:
+    def list_users(self, *, limit: int = 1000) -> list[Account]:
         """Return every real user row, for the admin user list.
 
         Excludes the reserved sentinels (``"__public__"`` and
@@ -140,6 +164,7 @@ class PermissionStore(ABC):
 
         Result is unordered; callers sort for display.
 
+        :param limit: Maximum number of user rows to return (default 1000).
         :returns: List of :class:`Account` rows.
         """
         ...

@@ -5,10 +5,14 @@ import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.text.TextUtils
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
@@ -16,17 +20,25 @@ import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebView
-import androidx.activity.ComponentActivity
+import android.widget.FrameLayout
+import android.widget.PopupMenu
+import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
+import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -36,7 +48,7 @@ import androidx.webkit.WebViewFeature
  * Server URL comes from [ServerStore]; when none is set yet, launch routes to
  * [ConnectActivity] first. Sidebar edge-swipe is intentionally absent (README).
  */
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
@@ -48,8 +60,21 @@ class MainActivity : ComponentActivity() {
     private var pendingNavigatePath: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+    private var bridgeTransportInstalled = false
+    private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
+
+    // Renderer-crash budget: crashes chained closer than RENDERER_CRASH_WINDOW_MS
+    // count toward a give-up threshold, so a reliably-crashing page can't loop
+    // forever. lastRendererCrashAt is the last crash's wall-clock time (the gap).
+    private var rendererCrashes = 0
+    private var lastRendererCrashAt = 0L
+
+    // Hidden while the current page provides the sidebar picker. A watchdog
+    // restores the native recovery path for old or broken web builds.
+    private lateinit var switchButton: TextView
+    private val revealSwitcherFallback = Runnable { switchButton.visibility = View.VISIBLE }
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -60,9 +85,12 @@ class MainActivity : ComponentActivity() {
     private var pendingMicRequest: PermissionRequest? = null
 
     private val requestNotifications =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-            // Granted or not: notify() no-ops when notifications are disabled and
-            // the web layer keeps working without OS toasts.
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            // Denied: notify() no-ops when notifications are disabled and the
+            // web layer keeps working without OS toasts. Granted: replay the
+            // badge the web layer may have computed (and deduped) while the
+            // permission dialog was still open — its post was silently dropped.
+            if (granted) notifications.replayBadge()
         }
 
     private val requestMic =
@@ -83,7 +111,6 @@ class MainActivity : ComponentActivity() {
             callback?.onReceiveValue(uris.toTypedArray())
         }
 
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -111,67 +138,50 @@ class MainActivity : ComponentActivity() {
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
-        webView =
-            WebView(this).apply {
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                settings.mediaPlaybackRequiresUserGesture = false
-
-                webViewClient =
-                    OmnigentWebViewClient(
-                        pinnedOrigin = { pinnedOrigin },
-                        onPageReady = ::onPageReady,
-                        onLoginRequired = ::startLogin,
-                    )
-                webChromeClient =
-                    OmnigentWebChromeClient(
-                        onChooseFiles = ::chooseFiles,
-                        onPermission = ::handlePermissionRequest,
-                    )
-                setDownloadListener { downloadUrl, _, contentDisposition, mimeType, _ ->
-                    downloadFile(downloadUrl, contentDisposition, mimeType)
-                }
+        webView = buildWebView()
+        // Wrap the WebView in a FrameLayout so the floating server-switcher
+        // pill can sit on top of it. The pill uses the app's brand palette
+        // (values/values-night colors.xml) so it adapts to light/dark mode.
+        val container = FrameLayout(this)
+        container.addView(webView)
+        val dp = resources.displayMetrics.density
+        switchButton =
+            TextView(this).apply {
+                text = hostLabelOf(serverUrl)
+                background =
+                    ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_floating_switch)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.brand_foreground))
+                textSize = 12f
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.MIDDLE
+                visibility = View.GONE
+                setPadding((12 * dp).toInt(), (6 * dp).toInt(), (12 * dp).toInt(), (6 * dp).toInt())
+                elevation = 6 * dp
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { showServerSwitcherMenu(it) }
             }
-        setContentView(webView)
+        updateServerSwitcherWidth(resources.displayMetrics.widthPixels)
+        switchButton.layoutParams =
+            FrameLayout
+                .LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+                ).apply {
+                    // Initial position below the status bar; corrected by the
+                    // insets listener once system bar insets are measured.
+                    topMargin = (8 * dp).toInt()
+                }
+        container.addView(switchButton)
+        container.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
+            if (right - left != oldRight - oldLeft) updateServerSwitcherWidth(right - left)
+        }
+        setContentView(container)
+        applySystemBarContrast()
         installBridge()
 
-        // Measure the OS safe area and push it into the page as CSS custom
-        // properties — Android WebView can't rely on `env(safe-area-inset-*)`
-        // alone (unreliable < API 30 and across OEM builds). Cached so the first
-        // post-load emit (in onPageReady) isn't lost to the pre-load race.
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
-            // manifest's adjustResize: the window no longer shrinks when the IME
-            // opens, so bottom-anchored web content (a chat composer, a terminal
-            // input) would sit BEHIND the keyboard. Resize the WebView ourselves —
-            // shrink its laid-out HEIGHT by the IME inset. It must be the view
-            // height (a bottom margin), not bottom padding: the CSS viewport
-            // (100vh / the visual viewport that fixed/sticky content anchors to)
-            // tracks the WebView's height, not its content box, so padding alone
-            // wouldn't reflow the composer above the keyboard. This is the
-            // adjustResize equivalent for an edge-to-edge window; the status/nav
-            // bars stay CSS safe-areas so content still draws behind them.
-            // Type.ime() is the real platform inset on API 30+; on 28-29 androidx
-            // backfills it from adjustResize's systemWindowInsets, so the resize
-            // still fires. If some pre-30 OEM reports none, the margin stays 0 and
-            // we simply degrade to the old (unresized) behavior — no regression.
-            (view.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
-                if (lp.bottomMargin != ime.bottom) {
-                    lp.bottomMargin = ime.bottom
-                    view.layoutParams = lp
-                }
-            }
-            // Bottom safe-area: the nav bar when the keyboard is hidden; 0 while
-            // it's up (the resize already lifts content above the keyboard, and the
-            // keyboard covers the nav bar). Top/left/right are IME-independent.
-            val bottom = if (ime.bottom > 0) 0 else bars.bottom
-            lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
-            emitInsets()
-            insets
-        }
-
+        attachInsetsListener(webView)
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
@@ -221,6 +231,271 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Hide the pill for a fresh navigation and arm the liveness watchdog: if
+     * the page never speaks the server-selection protocol over the bridge
+     * within [SWITCHER_LIVENESS_TIMEOUT_MS] — an older web build, a login
+     * redirect, or a broken page — reveal the pill so the user is never
+     * stranded without a way back to server selection.
+     */
+    private fun armServerSwitcherWatchdog() {
+        switchButton.removeCallbacks(revealSwitcherFallback)
+        switchButton.visibility = View.GONE
+        switchButton.postDelayed(revealSwitcherFallback, SWITCHER_LIVENESS_TIMEOUT_MS)
+    }
+
+    /** Stand the watchdog down and show the pill now (broken-page recovery). */
+    private fun revealServerSwitcherNow() {
+        switchButton.removeCallbacks(revealSwitcherFallback)
+        switchButton.visibility = View.VISIBLE
+    }
+
+    /**
+     * The web asked for the picker payload — proof the page hosts the
+     * in-sidebar server picker, so selection lives there for this document.
+     */
+    private fun onServerPickerRequested() {
+        switchButton.removeCallbacks(revealSwitcherFallback)
+        switchButton.visibility = View.GONE
+        emitServerPicker()
+    }
+
+    /**
+     * Answer a picker request with the current origin plus the managed and
+     * recent server lists (recents that duplicate a managed origin are
+     * dropped) — the payload the SPA's in-sidebar picker renders. Mirrors the
+     * iOS shell's `emitServerPicker`.
+     */
+    private fun emitServerPicker() {
+        val origin = pinnedOrigin ?: return
+        val store = ServerStore(this)
+        val payload =
+            JSONObject()
+                .put("currentOrigin", origin)
+                .put("managedServers", JSONArray(store.managed.serverUrls))
+                .put(
+                    "recentServers",
+                    JSONArray(store.recentServers().filterNot(store.managed::includes)),
+                )
+        webView.evaluateJavascript(
+            "window.__omnigentNativeEmitServerPicker && " +
+                "window.__omnigentNativeEmitServerPicker($payload);",
+            null,
+        )
+    }
+
+    /**
+     * Switch only to a server the picker itself offered — the same allow-list
+     * gate the desktop and iOS shells apply, so page script can't steer the
+     * shell to an arbitrary origin through the bridge.
+     */
+    private fun onSwitchServerRequested(url: String) {
+        val store = ServerStore(this)
+        if (url !in store.offeredServers()) return
+        store.connect(url)
+        val target = store.currentServerUrl()
+        originOf(target)?.let { reloadWithNewServer(target, it) }
+    }
+
+    /** "Connect to new server…" from the sidebar picker — manual URL entry. */
+    private fun onOpenServerSetupRequested() {
+        startActivity(Intent(this, ConnectActivity::class.java))
+    }
+
+    /** Build a WebView wired with the shell's settings, clients, and listeners. */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun buildWebView(): WebView =
+        WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
+
+            webViewClient =
+                OmnigentWebViewClient(
+                    pinnedOrigin = { pinnedOrigin },
+                    shouldInjectBridgeAtPageReady = {
+                        bridgeTransportInstalled && bridgeScriptHandler == null
+                    },
+                    onPageReady = ::onPageReady,
+                    onNavigationStarted = ::armServerSwitcherWatchdog,
+                    onLoginRequired = ::startLogin,
+                    onRendererGone = ::recoverFromRendererDeath,
+                )
+            webChromeClient =
+                OmnigentWebChromeClient(
+                    onChooseFiles = ::chooseFiles,
+                    onPermission = ::handlePermissionRequest,
+                )
+            setDownloadListener { downloadUrl, _, contentDisposition, mimeType, _ ->
+                downloadFile(downloadUrl, contentDisposition, mimeType)
+            }
+        }
+
+    /**
+     * Measure the OS safe area and push it into the page as CSS custom
+     * properties — Android WebView can't rely on `env(safe-area-inset-*)`
+     * alone (unreliable < API 30 and across OEM builds). Cached so the first
+     * post-load emit (in onPageReady) isn't lost to the pre-load race.
+     */
+    private fun attachInsetsListener(target: WebView) {
+        val dp = resources.displayMetrics.density
+        ViewCompat.setOnApplyWindowInsetsListener(target) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
+            // manifest's adjustResize: the window no longer shrinks when the IME
+            // opens, so bottom-anchored web content (a chat composer, a terminal
+            // input) would sit BEHIND the keyboard. Resize the WebView ourselves —
+            // shrink its laid-out HEIGHT by the IME inset. It must be the view
+            // height (a bottom margin), not bottom padding: the CSS viewport
+            // (100vh / the visual viewport that fixed/sticky content anchors to)
+            // tracks the WebView's height, not its content box, so padding alone
+            // wouldn't reflow the composer above the keyboard. This is the
+            // adjustResize equivalent for an edge-to-edge window; the status/nav
+            // bars stay CSS safe-areas so content still draws behind them.
+            // Type.ime() is the real platform inset on API 30+; on 28-29 androidx
+            // backfills it from adjustResize's systemWindowInsets, so the resize
+            // still fires. If some pre-30 OEM reports none, the margin stays 0 and
+            // we simply degrade to the old (unresized) behavior — no regression.
+            (view.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
+                if (lp.bottomMargin != ime.bottom) {
+                    lp.bottomMargin = ime.bottom
+                    view.layoutParams = lp
+                }
+            }
+            // Bottom safe-area: the nav bar when the keyboard is hidden; 0 while
+            // it's up (the resize already lifts content above the keyboard, and the
+            // keyboard covers the nav bar). Top/left/right are IME-independent.
+            val bottom = if (ime.bottom > 0) 0 else bars.bottom
+            lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
+            // Push the floating switch button below the status bar so it doesn't
+            // disappear under the notch/status icons on edge-to-edge layouts.
+            (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.topMargin = bars.top + (8 * dp).toInt()
+                switchButton.layoutParams = lp
+            }
+            emitInsets()
+            insets
+        }
+    }
+
+    /**
+     * The WebView's renderer died; the instance can't render again, so always
+     * destroy it and swap in a fresh one — otherwise the framework kills the app.
+     * The crash budget only decides what the fresh view loads (the user's route,
+     * or an offline recovery page over budget), never whether we rebuild, so the
+     * server-switcher recovery paths always act on a live instance. In-page state
+     * (composer text, scroll) is lost either way; only the route is preserved.
+     *
+     * @param dead The WebView whose renderer died.
+     * @param didCrash True for a real crash, false for a system reclaim (which
+     *   never counts against the budget).
+     */
+    private fun recoverFromRendererDeath(
+        dead: WebView,
+        didCrash: Boolean,
+    ) {
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        // A late delivery for an already-replaced WebView must not tear down
+        // the healthy replacement.
+        if (dead !== webView) return
+
+        val serverUrl = ServerStore(this).currentServerUrl()
+        val lastUrl = dead.url
+        val loopExhausted = didCrash && !withinCrashBudget()
+        if (loopExhausted) authLog("renderer crash budget exhausted; showing recovery page")
+
+        val parent = dead.parent as? ViewGroup
+        val index = parent?.indexOfChild(dead) ?: 0
+        parent?.removeView(dead)
+        dead.destroy()
+
+        // The bridge and page-ready state died with the WebView; reset so
+        // installBridge() re-registers and the fresh document rebuilds them.
+        bridgeScriptHandler = null
+        bridgeTransportInstalled = false
+        pageLoaded = false
+        historyCleared = false
+
+        webView = buildWebView()
+        parent?.addView(webView, index)
+        attachInsetsListener(webView)
+        installBridge()
+        // A rebuilt view may miss the first inset dispatch; request one so the
+        // IME resize margin isn't stale if the keyboard was up at death.
+        ViewCompat.requestApplyInsets(webView)
+
+        if (loopExhausted) {
+            // The local recovery page has no bridge — surface the pill straight
+            // away as the recovery affordance.
+            revealServerSwitcherNow()
+            // Offline page (no network) so it can't re-trigger the crash.
+            webView.loadDataWithBaseURL(
+                null,
+                recoveryErrorHtml(serverUrl),
+                "text/html",
+                "utf-8",
+                null,
+            )
+            return
+        }
+
+        // Reload the user's route; a blank or foreign URL falls back to the root.
+        val reloadUrl =
+            if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
+        webView.loadUrl(reloadUrl)
+    }
+
+    /**
+     * Consume one unit of the crash budget, returning whether auto-reload may
+     * proceed. Gap-based: the counter resets only after a gap longer than
+     * [RENDERER_CRASH_WINDOW_MS], so crashes chained closer accumulate toward
+     * [MAX_RENDERER_CRASHES]. Not reset on page load — a load-then-crash loop
+     * loads fine every cycle, so a page-load reset would defeat the guard.
+     */
+    private fun withinCrashBudget(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastRendererCrashAt > RENDERER_CRASH_WINDOW_MS) {
+            rendererCrashes = 0
+        }
+        lastRendererCrashAt = now
+        rendererCrashes++
+        return rendererCrashes <= MAX_RENDERER_CRASHES
+    }
+
+    /**
+     * Self-contained recovery page for a crash loop. No network/assets so it
+     * can't reproduce the crash; its link returns to the server root.
+     */
+    private fun recoveryErrorHtml(serverUrl: String): String {
+        val escaped = serverUrl.replace("&", "&amp;").replace("\"", "&quot;")
+        return """
+            <!DOCTYPE html>
+            <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+              body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
+                     display: flex; flex-direction: column; align-items: center;
+                     justify-content: center; gap: 16px; padding: 24px; text-align: center; }
+              a.retry { padding: 12px 20px; border-radius: 8px; text-decoration: none;
+                        background: #2f6feb; color: #fff; font-weight: 600; }
+            </style></head>
+            <body>
+              <h2>Something went wrong</h2>
+              <p>The app hit a repeated display problem and stopped reloading on its own.</p>
+              <a class="retry" href="$escaped">Reload</a>
+            </body></html>
+            """.trimIndent()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applySystemBarContrast()
+        if (::webView.isInitialized) {
+            // Notify matchMedia listeners without reloading the SPA.
+            webView.dispatchConfigurationChanged(newConfig)
+        }
+    }
+
+    /**
      * Install the web -> native bridge as an origin-allowlisted web message
      * listener (NOT addJavascriptInterface): the transport object reaches only
      * frames on the pinned origin, and [OmnigentBridgeListener] also drops
@@ -236,10 +511,40 @@ class MainActivity : ComponentActivity() {
                 webView,
                 OmnigentBridgeListener.JS_OBJECT_NAME,
                 setOf(origin),
-                OmnigentBridgeListener(notifications, blobSaver),
+                OmnigentBridgeListener(
+                    notifications = notifications,
+                    blobSaver = blobSaver,
+                    onServerPickerRequested = ::onServerPickerRequested,
+                    onSwitchServer = ::onSwitchServerRequested,
+                    onOpenServerSetup = ::onOpenServerSetupRequested,
+                ),
             )
         } catch (_: IllegalArgumentException) {
             // Malformed origin rule — leave the bridge absent; the web layer falls back.
+            return
+        }
+        bridgeTransportInstalled = true
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            try {
+                bridgeScriptHandler =
+                    WebViewCompat.addDocumentStartJavaScript(
+                        webView,
+                        NativeBridgeScript.source,
+                        setOf(origin),
+                    )
+            } catch (_: IllegalArgumentException) {
+                // Keep the transport; onPageFinished will inject the facade instead.
+            }
+        }
+    }
+
+    private fun applySystemBarContrast() {
+        val isLightMode =
+            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+                Configuration.UI_MODE_NIGHT_YES
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = isLightMode
+            isAppearanceLightNavigationBars = isLightMode
         }
     }
 
@@ -357,25 +662,159 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Extract a short host[:port] label from a URL for the server switcher pill.
+     * Mirrors the iOS `URL.omnigentHostLabel` in `URL+Omnigent.swift`.
+     */
+    private fun hostLabelOf(url: String): String {
+        val uri = Uri.parse(url)
+        val host = uri.host ?: return url
+        val port = uri.port
+        return if (port != -1 &&
+            !(
+                (uri.scheme?.lowercase() == "https" && port == 443) ||
+                    (uri.scheme?.lowercase() == "http" && port == 80)
+            )
+        ) {
+            "$host:$port"
+        } else {
+            host
+        }
+    }
+
     override fun onDestroy() {
         // Unblock a pending file input / mic request, then release WebView + worker.
+        if (::switchButton.isInitialized) switchButton.removeCallbacks(revealSwitcherFallback)
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
         pendingMicRequest?.deny()
         pendingMicRequest = null
         loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
-        if (::webView.isInitialized) webView.destroy() // releases the bridge chain
+        if (::webView.isInitialized) {
+            removeBridge()
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+
+        // Detect a server change: ConnectActivity re-enters us via
+        // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
+        // bridge is origin-allowlisted, so a server switch without re-registering
+        // leaves the bridge dead for the new origin.
+        val store = ServerStore(this)
+        val newServerUrl = store.currentServerUrl()
+        val newOrigin = originOf(newServerUrl)
+        if (newOrigin != null && newOrigin != pinnedOrigin) {
+            reloadWithNewServer(newServerUrl, newOrigin)
+        }
+
         val path = navigatePathOf(intent) ?: return
         pendingNavigatePath = path
         // Replay now if the page is up; otherwise onPageReady will flush it.
         if (pageLoaded) flushPendingActivation()
+    }
+
+    /**
+     * Swap to a new pinned server: remove the old bridge (allowlisted to the
+     * old origin), update [pinnedOrigin], re-install the bridge for the new
+     * origin, reset page state, and reload. Called from [onNewIntent] when
+     * ConnectActivity returns with a different server.
+     */
+    private fun reloadWithNewServer(
+        serverUrl: String,
+        newOrigin: String,
+    ) {
+        // Cancel any in-flight login before pinning the new origin: the poll runs
+        // against the old server and its token must never land on the new origin's
+        // cookie store. cancel() also resets inFlight so the new server can start
+        // its own login immediately rather than waiting up to 5 minutes.
+        loginManager.cancel()
+        removeBridge()
+        pinnedOrigin = newOrigin
+        pageLoaded = false
+        historyCleared = false
+        loginAttempts = 0
+        switchButton.text = hostLabelOf(serverUrl)
+        installBridge()
+        webView.loadUrl(serverUrl)
+    }
+
+    private fun updateServerSwitcherWidth(containerWidthPx: Int) {
+        if (containerWidthPx <= 0) return
+        val density = resources.displayMetrics.density
+        val containerWidthDp = containerWidthPx / density
+        switchButton.maxWidth = ((containerWidthDp * 0.38f).coerceIn(120f, 172f) * density).toInt()
+    }
+
+    private fun removeBridge() {
+        bridgeScriptHandler?.remove()
+        bridgeScriptHandler = null
+        bridgeTransportInstalled = false
+        try {
+            WebViewCompat.removeWebMessageListener(
+                webView,
+                OmnigentBridgeListener.JS_OBJECT_NAME,
+            )
+        } catch (_: Exception) {
+            // Not registered (feature unsupported, or already removed) — no-op.
+        }
+    }
+
+    /**
+     * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
+     * `Menu`. Lists the current server (disabled header), the other servers on
+     * offer (organization presets, then recents), Reload, and Connect to New
+     * Server. Tapping a server switches directly without leaving the app;
+     * "Connect to New Server" opens [ConnectActivity] for manual URL entry.
+     */
+    private fun showServerSwitcherMenu(anchor: View) {
+        val store = ServerStore(this)
+        val currentUrl = store.currentServerUrl()
+        val otherServers = store.offeredServers().filter { originOf(it) != pinnedOrigin }
+
+        val popup = PopupMenu(this, anchor, Gravity.TOP)
+        MenuCompat.setGroupDividerEnabled(popup.menu, true)
+        popup.menu.apply {
+            // Group 0: current server — disabled header.
+            add(0, 0, 0, hostLabelOf(currentUrl)).isEnabled = false
+            // Group 1: the other servers on offer (divider before this group).
+            otherServers.forEachIndexed { i, url ->
+                add(1, 100 + i, 0, hostLabelOf(url))
+            }
+            // Group 2: actions (divider before this group).
+            add(2, 3, 0, getString(R.string.menu_reload))
+            add(2, 4, 0, getString(R.string.menu_connect_new))
+        }
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                3 -> {
+                    webView.reload()
+                    true
+                }
+
+                4 -> {
+                    startActivity(Intent(this@MainActivity, ConnectActivity::class.java))
+                    true
+                }
+
+                in 100..Int.MAX_VALUE -> {
+                    val url = otherServers[item.itemId - 100]
+                    store.connect(url)
+                    originOf(url)?.let { reloadWithNewServer(url, it) }
+                    true
+                }
+
+                else -> {
+                    false
+                }
+            }
+        }
+        popup.show()
     }
 
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */
@@ -385,16 +824,17 @@ class MainActivity : ComponentActivity() {
         // pendingNavigatePath or push insets into a page that can't consume them.
         if (originOf(url) != pinnedOrigin) return
         // First authenticated app page: drop everything before it from the
-        // back/forward list. Otherwise Back walks into the pre-auth root and the
-        // login-redirect reload (the `loadUrl(origin)` after the cookie injection),
-        // which bounces to login or shows a blank — "back lands on the wrong
-        // screen" / "exits the app". After this the SPA builds clean history.
+        // back/forward list — the pre-auth root, any IdP pages, and the post-login
+        // reload all bounce to login or show a blank if Back reaches them. After
+        // this the SPA builds clean history.
         if (!historyCleared) {
             historyCleared = true
             webView.clearHistory()
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
+        // Does NOT reset the crash budget: a load-then-crash loop fires onPageReady
+        // every cycle, so resetting here would defeat withinCrashBudget()'s guard.
         flushPendingActivation()
         emitInsets()
     }
@@ -569,5 +1009,17 @@ class MainActivity : ComponentActivity() {
         // (a few ms) always wins the race, short enough to not feel stuck if it
         // doesn't answer. Only the timer ever fires when the renderer is gone.
         const val BACK_FALLBACK_MS = 600L
+
+        // Renderer-crash budget. A handful of rebuilds absorbs transient crashes;
+        // beyond that within the window it's a crash loop, so stop auto-recovering
+        // rather than churn forever. Window bounds "rolling" so long-separated
+        // one-off crashes never accumulate.
+        const val MAX_RENDERER_CRASHES = 3
+        const val RENDERER_CRASH_WINDOW_MS = 60_000L
+
+        // How long after a navigation begins we wait for the page to speak the
+        // server-selection protocol before revealing the pill as a recovery
+        // path. Mirrors the iOS shell's bridgeLivenessTimeout.
+        const val SWITCHER_LIVENESS_TIMEOUT_MS = 6_000L
     }
 }

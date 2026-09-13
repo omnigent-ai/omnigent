@@ -70,7 +70,11 @@ def load_or_generate_cookie_secret(data_dir: str | os.PathLike[str]) -> str:
     fresh = secrets.token_hex(32)
     fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        # fchmod is POSIX-only; os.open(..., 0o600) already sets the right
+        # bits at creation time, so the call is belt-and-suspenders on POSIX
+        # and a no-op skip on Windows (where it would crash).
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
         os.write(fd, fresh.encode("ascii") + b"\n")
     finally:
         os.close(fd)

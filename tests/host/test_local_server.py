@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import httpx
 import pytest
 
 from omnigent.host import local_server
@@ -32,13 +33,13 @@ def test_local_server_url_if_healthy_returns_url_when_alive_and_healthy(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", pid_file)
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: pid == 4242)
 
-    health_targets: list[str] = []
+    health_targets: list[tuple[str, bool]] = []
 
     class _Resp:
         status_code = 200
 
-    def _fake_get(url: str, *, timeout: float) -> _Resp:
-        health_targets.append(url)
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        health_targets.append((url, trust_env))
         return _Resp()
 
     monkeypatch.setattr("httpx.get", _fake_get)
@@ -46,7 +47,36 @@ def test_local_server_url_if_healthy_returns_url_when_alive_and_healthy(
     assert local_server.local_server_url_if_healthy() == "http://127.0.0.1:8123"
     # The probe must hit the recorded port's /health, proving the port from
     # the pidfile (not a hardcoded default) was used.
-    assert health_targets == ["http://127.0.0.1:8123/health"]
+    assert health_targets == [("http://127.0.0.1:8123/health", False)]
+
+
+def test_wait_for_local_server_bypasses_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The readiness poll must connect to loopback without system proxies."""
+
+    class _Proc:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class _Resp:
+        status_code = 200
+
+    health_targets: list[tuple[str, bool]] = []
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        health_targets.append((url, trust_env))
+        return _Resp()
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+
+    local_server._wait_for_local_omnigent_server(
+        "http://127.0.0.1:8123", _Proc(), tmp_path / "server.log"
+    )
+
+    assert health_targets == [("http://127.0.0.1:8123/health", False)]
 
 
 def test_local_server_url_if_healthy_none_when_pid_dead(
@@ -175,6 +205,47 @@ def test_ensure_local_omnigent_server_respawns_on_config_drift(
     assert (tmp_path / "local_server.sig").read_text().strip() == (
         local_server.server_config_signature()
     )
+
+
+def test_server_config_signature_changes_with_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing the startup feature set forces a managed-server respawn."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    sig_off = local_server.server_config_signature()
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "usage_page")
+    sig_on = local_server.server_config_signature()
+
+    assert sig_off != sig_on
+    assert sig_on == local_server.server_config_signature()
+
+
+def test_server_config_signature_changes_with_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    config_path = config_home / "config.yaml"
+    config_path.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    sig_default = local_server.server_config_signature()
+
+    config_path.write_text("session_title_instructions: Prefix titles with the current date.\n")
+    sig_custom = local_server.server_config_signature()
+
+    assert sig_default != sig_custom
+    assert sig_custom == local_server.server_config_signature()
+
+
+def test_remote_daemon_signature_ignores_local_server_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote host daemons do not parse config for a server they do not own."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "not-a-feature")
+
+    assert local_server.server_config_signature(include_features=False)
 
 
 def test_server_config_signature_changes_with_version(
@@ -573,7 +644,7 @@ def test_clear_local_server_record_leaves_other_pids_alone(
 
 
 # ---------------------------------------------------------------------------
-# Server log-path sidecar — so `server start`/`status` name the exact log
+# Server log-path sidecar — so `server --background`/`status` name the exact log
 # ---------------------------------------------------------------------------
 
 
@@ -583,7 +654,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
 ) -> None:
     """A spawned server returns its captured-log path and records it for status.
 
-    ``omnigent server start`` used to be a black box — it printed only the
+    ``omnigent server --background`` used to be a black box — it printed only the
     URL. The spawn now threads the captured stdout/stderr log file out via
     ``LocalServerStartup.log_path`` AND into the log-path sidecar, so both
     the spawning call and a later ``server status`` can name the exact file.
@@ -597,7 +668,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)
     # Point the persistent data dir at tmp so logs/server lands under tmp.
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
 
     class _Proc:
         pid = 9001
@@ -623,7 +694,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     # The captured log lives under the per-user server log dir as a .log file.
     assert result.log_path.parent == tmp_path / ".omnigent" / "logs" / "server"
     assert result.log_path.suffix == ".log"
-    assert result.log_path.name.startswith("local-server-")
+    assert result.log_path.name.startswith("server-")
     # Recorded in the sidecar so a later status/reuse names the same file.
     assert log_ref.read_text().strip() == str(result.log_path)
 
@@ -645,7 +716,7 @@ def test_ensure_local_omnigent_server_reuse_reads_log_path_sidecar(
 
     The reuse path never sees the original spawn's ``log_path`` variable, so
     it must read the recorded path back from the sidecar — otherwise a
-    ``server start`` that reuses an existing background server could not name
+    ``server --background`` that reuses an existing background server could not name
     its log. Popen must not fire (the stub fails the test if it does).
     """
     monkeypatch.setattr(
@@ -654,7 +725,7 @@ def test_ensure_local_omnigent_server_reuse_reads_log_path_sidecar(
     sig_file = tmp_path / "local_server.sig"
     sig_file.write_text(local_server.server_config_signature() + "\n")
     log_ref = tmp_path / "local_server.logpath"
-    recorded = tmp_path / ".omnigent" / "logs" / "server" / "local-server-cd34.log"
+    recorded = tmp_path / ".omnigent" / "logs" / "server" / "server-cd34.log"
     log_ref.write_text(str(recorded) + "\n")
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)
@@ -752,9 +823,12 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     confirm it's our server via ``/health``, resolve its PID via lsof, and
     terminate it — returning the PID so the off-switch can report it.
     """
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"status": "ok"})
-    )
+
+    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"status": "ok"})
+
+    monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n93360\n"))
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
     terminated: list[int] = []
@@ -777,7 +851,8 @@ def test_stop_untracked_local_server_noop_when_nothing_listening(
     """
     import httpx
 
-    def _refused(url: str, *, timeout: float) -> Any:
+    def _refused(url: str, *, timeout: float, trust_env: bool) -> Any:
+        assert trust_env is False
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr("httpx.get", _refused)
@@ -795,9 +870,12 @@ def test_stop_untracked_local_server_noop_on_non_omnigent_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A 200 that isn't ``{"status": "ok"}`` is some other app — never killed."""
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"hello": "world"})
-    )
+
+    def _foreign(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"hello": "world"})
+
+    monkeypatch.setattr("httpx.get", _foreign)
     monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
 
     assert local_server.stop_untracked_local_server(port=8000) is None
@@ -811,9 +889,12 @@ def test_stop_untracked_local_server_noop_when_lsof_unavailable(
     Without a PID we can't terminate, so the sweep returns ``None`` rather
     than crashing — the off-switch then leaves a manual hint to the user.
     """
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"status": "ok"})
-    )
+
+    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"status": "ok"})
+
+    monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(
         local_server, "subprocess", _fake_subprocess(raises=FileNotFoundError("lsof"))
     )
@@ -1085,3 +1166,319 @@ def test_ensure_does_not_advertise_pidfile_before_ownership_confirmed(
     assert result.url == "http://127.0.0.1:6767"
     # Once confirmed, the record IS advertised for reuse/discovery.
     assert pid_file.read_text() == "9001\n6767\n"
+
+
+def test_wait_adopts_a_slow_boot_while_the_process_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A server that outlives the ready timeout but is still booting is adopted.
+
+    A first boot (cold imports + DB migrations) has taken ~40s in the
+    wild — past the ready timeout. While the child process is alive the
+    wait must extend to the boot ceiling instead of failing a server
+    that is seconds from healthy (and then leaking it).
+    """
+
+    class _Proc:
+        pid = 4321
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class _Resp:
+        status_code = 200
+
+    calls = {"n": 0}
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        del url, timeout, trust_env
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ConnectError("not ready yet")
+        return _Resp()
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+
+    local_server._wait_for_local_omnigent_server(
+        "http://127.0.0.1:8123",
+        _Proc(),
+        tmp_path / "server.log",
+        timeout=0.05,
+        boot_ceiling=30.0,
+    )
+
+    assert calls["n"] == 3
+
+
+def test_wait_stops_the_spawned_server_when_the_boot_ceiling_expires(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exhausting the wait stops our own child before raising.
+
+    Raising while the spawned server keeps running leaves a healthy but
+    untracked orphan (the failure path clears the pidfile record) — the
+    exact leak behind background servers accumulating on a dev box.
+    """
+
+    class _Proc:
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+            self._exited = False
+
+        def poll(self) -> int | None:
+            return 0 if self._exited else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self._exited = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> None:
+        del url, timeout, trust_env
+        raise httpx.ConnectError("never ready")
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
+    proc = _Proc()
+
+    with pytest.raises(click.ClickException):
+        local_server._wait_for_local_omnigent_server(
+            "http://127.0.0.1:8123",
+            proc,
+            tmp_path / "server.log",
+            timeout=0.05,
+            boot_ceiling=0.3,
+        )
+
+    assert proc.terminated is True
+    assert proc.killed is False
+
+
+def test_wait_fails_fast_without_stopping_a_child_that_already_died(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A dead child fails immediately; there is nothing left to stop."""
+
+    class _Proc:
+        pid = 4321
+        terminated = False
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+        def terminate(self) -> None:
+            type(self).terminated = True
+
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
+    proc = _Proc()
+
+    with pytest.raises(click.ClickException):
+        local_server._wait_for_local_omnigent_server(
+            "http://127.0.0.1:8123",
+            proc,
+            tmp_path / "server.log",
+            timeout=5.0,
+            boot_ceiling=5.0,
+        )
+
+    assert proc.terminated is False
+
+
+def test_log_tail_redacts_credentials_and_strips_control_sequences(tmp_path: Path) -> None:
+    """
+    Regression for the credential-exposure review finding: migration errors
+    deliberately embed the full db_uri (``user:password@host``) for a
+    copy-pasteable command, and that traceback lands in the server log. The
+    surfaced tail must redact URL userinfo — terminal output routinely gets
+    pasted into bug reports. ANSI/control sequences from captured subprocess
+    output must be stripped so the log cannot inject terminal control.
+    """
+    log = tmp_path / "server-20260101-000000-000000.log"
+    log.write_text(
+        "RuntimeError: ... Take a backup of your database, then run\n"
+        "    omnigent debug db-upgrade 'postgresql+psycopg://user:secret@host/db'\n"
+        "\x1b[31mred alert\x1b[0m and a bell \x07 plus \x1b]0;title\x1b\\\n"
+    )
+
+    tail = local_server._read_log_tail(log)
+
+    assert "secret" not in tail  # the password never reaches the terminal
+    assert "[REDACTED]@host/db" in tail  # host part stays readable
+    assert "\x1b" not in tail and "\x07" not in tail  # no terminal control
+    assert "red alert" in tail  # visible text survives
+
+
+def test_failure_record_roundtrip_requires_matching_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The failure record must be surfaced only for the daemon attempt the CLI
+    was waiting on: the recorded writer PID has to match. Freshness alone is
+    not correlation — a record from another attempt (or a concurrent
+    foreground server) must be dropped. Consumed on read either way, so a
+    later unrelated failure can never resurface it.
+    """
+    import os
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    failed = log_dir / "server-20260101-000000-000000.log"
+    failed.write_text("ModuleNotFoundError: No module named 'psycopg'\n")
+
+    local_server._record_server_startup_failure(failed)
+
+    # Matching PID (the recorder is this process): exact log surfaces.
+    result = local_server.consume_failed_server_log_tail(os.getpid())
+    assert result is not None
+    path, tail = result
+    assert path == failed
+    assert "No module named 'psycopg'" in tail
+    # Consumed: a second read finds nothing.
+    assert local_server.consume_failed_server_log_tail(os.getpid()) is None
+
+    # Mismatched PID: record is dropped (and still consumed), never shown.
+    local_server._record_server_startup_failure(failed)
+    assert local_server.consume_failed_server_log_tail(os.getpid() + 1) is None
+    assert local_server.consume_failed_server_log_tail(os.getpid()) is None
+
+
+def test_failure_record_ignores_stale_unknown_and_garbage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A stale record (old log mtime), an unknown daemon PID, or a degenerate
+    sidecar must yield ``None`` — better no tail than a misleading one, and
+    never an exception.
+    """
+    import os
+    import time
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "server-20260101-000000-000000.log"
+    log.write_text("old failure\n")
+    ancient = time.time() - 24 * 3600
+    os.utime(log, (ancient, ancient))
+
+    record_path = tmp_path / "local_server_failed.logpath"
+    pid = os.getpid()
+    # Stale: the referenced log was last written far outside the window.
+    record_path.write_text(f"{log}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Unknown daemon PID: nothing can be attributed.
+    record_path.write_text(f"{log}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(None) is None
+    # Missing PID line (legacy/corrupt record).
+    record_path.write_text(f"{log}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Non-numeric PID line.
+    record_path.write_text(f"{log}\nnot-a-pid\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Record pointing at a vanished log file.
+    record_path.write_text(f"{log_dir / 'gone.log'}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+
+
+def test_read_log_tail_is_bounded(tmp_path: Path) -> None:
+    """
+    Tailing must not read the whole file: a long-lived server's log can be
+    hundreds of MB. Only the trailing block is read, and the last lines
+    survive intact.
+    """
+    log = tmp_path / "big.log"
+    filler = "x" * 100
+    with log.open("w") as fh:
+        for i in range(5000):  # ~500 KB, well past the 64 KB tail window
+            fh.write(f"{filler} {i}\n")
+        fh.write("FINAL: ModuleNotFoundError: No module named 'psycopg'\n")
+
+    tail = local_server._read_log_tail(log, max_lines=50)
+
+    assert "FINAL: ModuleNotFoundError" in tail
+    assert len(tail.splitlines()) == 50
+
+
+def test_read_log_tail_never_leaks_credentials_from_a_chopped_first_line(
+    tmp_path: Path,
+) -> None:
+    """
+    The 64 KiB tail window can start mid-line, chopping the ``scheme://``
+    prefix off a credential-bearing URI while leaving ``user:password@host``
+    in the retained fragment — which the userinfo redaction (anchored on
+    ``://``) would then miss. The partial first line must be discarded so
+    the chopped fragment can never reach the terminal.
+    """
+    log = tmp_path / "server.log"
+    password = "hunter2secret" * 6000  # one ~78 KB line, larger than the window
+    with log.open("w") as fh:
+        fh.write(f"connecting to postgresql+psycopg://user:{password}@host/db failed\n")
+        for i in range(10):
+            fh.write(f"context line {i}\n")
+        fh.write("ModuleNotFoundError: No module named 'psycopg'\n")
+
+    tail = local_server._read_log_tail(log, max_lines=50)
+
+    assert "hunter2secret" not in tail  # the chopped fragment never surfaces
+    assert "ModuleNotFoundError" in tail  # complete trailing lines survive
+    assert "context line 9" in tail
+
+
+def test_read_log_tail_suppresses_single_oversized_line(tmp_path: Path) -> None:
+    """
+    A log that is one line larger than the tail window has no complete line
+    inside the window; surfacing the fragment could leak a chopped
+    credential, so the tail is suppressed with a placeholder instead.
+    """
+    log = tmp_path / "server.log"
+    log.write_text("postgresql+psycopg://user:" + "s3cr3tvalue" * 7000 + "@host/db\n")
+
+    tail = local_server._read_log_tail(log)
+
+    assert "s3cr3tvalue" not in tail
+    assert tail == "(log tail suppressed: last line exceeds the tail read window)"
+
+
+def test_spawn_normalizes_paas_postgres_uri(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``OMNIGENT_DATABASE_URI=postgres://…`` (PaaS style) is not a SQLAlchemy
+    dialect and bare ``postgresql://`` selects the psycopg2 driver no extra
+    ships. The spawn path must canonicalize both to ``postgresql+psycopg://``
+    — the same normalization the Docker entrypoint applies.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATABASE_URI", "postgres://user:pw@127.0.0.1:5432/db")
+
+    captured_args: list[str] = []
+
+    class _Proc:
+        pid = 4242
+
+        def __init__(self, args: list[str], **_kwargs: Any) -> None:
+            captured_args.extend(args)
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _Proc)
+
+    local_server._spawn_local_server(6767)
+
+    uri = captured_args[captured_args.index("--database-uri") + 1]
+    assert uri == "postgresql+psycopg://user:pw@127.0.0.1:5432/db"

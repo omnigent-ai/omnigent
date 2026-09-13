@@ -12,9 +12,10 @@
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
-import { type Comment } from "@/hooks/useComments";
+import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { getEmbedRoot } from "@/lib/host";
+import { randomUUID } from "@/lib/randomUUID";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import {
   anchorOccurrence,
@@ -46,9 +47,7 @@ interface FloatingAnchor {
 }
 
 function genNonce(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
-  // Deterministic-enough fallback for environments without crypto.randomUUID.
-  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  return randomUUID();
 }
 
 /** Bridge payload for one comment: its id, anchor text, and which occurrence of
@@ -69,6 +68,7 @@ function activePayload(content: string, sel: ActiveSelection | null) {
   return {
     anchor_content: sel.anchor_content,
     occ: anchorOccurrence(content, sel.anchor_content, sel.start_index),
+    comment_id: sel.comment_id,
   };
 }
 
@@ -124,13 +124,17 @@ export function HtmlCommentViewer({
         const existing =
           offsets &&
           commentsRef.current.find(
-            (c) => c.start_index === offsets.start_index && c.end_index === offsets.end_index,
+            (c) =>
+              c.status === "draft" &&
+              c.start_index === offsets.start_index &&
+              c.end_index === offsets.end_index,
           );
         if (existing) {
           onSetActiveSelectionRef.current({
             start_index: existing.start_index,
             end_index: existing.end_index,
             anchor_content: existing.anchor_content ?? "",
+            comment_id: existing.id,
           });
           setFloating(null);
           return;
@@ -150,6 +154,7 @@ export function HtmlCommentViewer({
             start_index: c.start_index,
             end_index: c.end_index,
             anchor_content: c.anchor_content ?? "",
+            comment_id: c.id,
           });
         }
         setFloating(null);
@@ -233,7 +238,6 @@ export function HtmlCommentViewer({
     <iframe
       ref={iframeRef}
       srcDoc={srcDoc}
-      // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
       sandbox={HTML_PREVIEW_SANDBOX}
       title="HTML preview"
       className="w-full h-full border-0"
@@ -250,7 +254,7 @@ export function HtmlCommentViewer({
           <button
             data-add-comment-btn
             type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
             style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
             onClick={() => {
               onSetActiveSelection({

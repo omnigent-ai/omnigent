@@ -88,6 +88,22 @@ def test_looks_like_test_db_rejects_real_uris(db_uri: str) -> None:
     assert looks_like_test_db(db_uri) is False
 
 
+def test_looks_like_test_db_rejects_symlink_to_real_db(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A test-named symlink in a writable dir must not launder a real DB.
+
+    A file in a world-writable dir like /tmp can be a symlink an attacker
+    (or a stale fixture) planted to point a ``test``-named path at a real
+    database. The classifier resolves symlinks, so the real (non-throwaway)
+    target is what gets judged.
+    """
+    # The symlink sits in a temp dir with a ``test`` name (both of which the
+    # classifier would otherwise trust); its target is a real DB outside any
+    # temp root. Without resolution this passes on name/location alone.
+    link = tmp_path / "test.db"
+    link.symlink_to("/opt/omnigent/prod.db")
+    assert looks_like_test_db(f"sqlite:///{link}") is False
+
+
 @pytest.mark.parametrize("db_uri", ["", "   "])
 def test_empty_db_uri_skips_db_check(
     db_uri: str,

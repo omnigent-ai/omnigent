@@ -113,8 +113,8 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
     with Session(engine) as s:
         s.add(
             SqlComment(
-                id="cmt_1",
-                conversation_id="conv_x",
+                id="747618b4b2dd94383e50ddf180ceddc3",
+                conversation_id="8af356d908005a65f872c246158c6293",
                 path="a.py",
                 start_index=0,
                 end_index=1,
@@ -128,7 +128,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
         )
         s.add(
             SqlPolicy(
-                id="pol_1",
+                id="12a6858438cb1aa1b9e00dc79bb04dd9",
                 name="p",
                 session_id=None,
                 scope=encode_policy_scope("default"),
@@ -150,9 +150,9 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
         )
         s.add(
             SqlHost(
-                owner="alice",
+                user_id="alice",
                 name="laptop",
-                host_id="h1",
+                host_id="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                 status=encode_host_status("offline"),
                 created_at=1,
                 updated_at=1,
@@ -163,11 +163,105 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
     remap_identities(engine, {"alice": "alice@example.com"}, dry_run=False)
 
     with Session(engine) as s:
-        assert s.get(SqlComment, (0, "cmt_1")).created_by == "alice@example.com"
-        assert s.get(SqlPolicy, (0, "pol_1")).created_by == "alice@example.com"
+        assert (
+            s.get(
+                SqlComment,
+                (0, "8af356d908005a65f872c246158c6293", "747618b4b2dd94383e50ddf180ceddc3"),
+            ).created_by
+            == "alice@example.com"
+        )
+        assert (
+            s.get(SqlPolicy, (0, "12a6858438cb1aa1b9e00dc79bb04dd9")).created_by
+            == "alice@example.com"
+        )
         assert s.get(SqlAccountToken, (0, "tok_1")).created_by == "alice@example.com"
-        host_owners = s.execute(select(SqlHost.owner)).scalars().all()
+        host_owners = s.execute(select(SqlHost.user_id)).scalars().all()
         assert host_owners == ["alice@example.com"]
+
+
+def test_remap_refuses_host_name_collision_with_tombstone(db_uri: str) -> None:
+    account_store = SqlAlchemyAccountStore(db_uri)
+    for user_id in (
+        "alice",
+        "alice@example.com",
+        "bob",
+        "bob@example.com",
+    ):
+        account_store.create_user_with_password(user_id, hash_password("password123"))
+    engine = get_or_create_engine(db_uri)
+    hosts = [
+        SqlHost(
+            user_id="alice",
+            name="old-tombstone",
+            host_id="07d47e6d61e34c79a4fab73c1a1b8790",
+            status=encode_host_status("offline"),
+            created_at=1,
+            updated_at=1,
+            sandbox_provider="modal",
+            sandbox_id="old-tombstone-sandbox",
+            deleted_at=1,
+        ),
+        SqlHost(
+            user_id="alice@example.com",
+            name="old-tombstone",
+            host_id="5a719585ea684939a0dc82fd321b8348",
+            status=encode_host_status("online"),
+            created_at=1,
+            updated_at=1,
+            sandbox_provider="modal",
+            sandbox_id="new-live-sandbox",
+        ),
+        SqlHost(
+            user_id="bob",
+            name="new-tombstone",
+            host_id="dfe6c207feec41cbaf6b91fafbf7a334",
+            status=encode_host_status("online"),
+            created_at=1,
+            updated_at=1,
+            sandbox_provider="modal",
+            sandbox_id="old-live-sandbox",
+        ),
+        SqlHost(
+            user_id="bob@example.com",
+            name="new-tombstone",
+            host_id="a017ff8f65044b01a68be30a7b4f75cc",
+            status=encode_host_status("offline"),
+            created_at=1,
+            updated_at=1,
+            sandbox_provider="modal",
+            sandbox_id="new-tombstone-sandbox",
+            deleted_at=1,
+        ),
+    ]
+    expected_hosts = {
+        host.host_id: (host.user_id, host.sandbox_id, host.deleted_at) for host in hosts
+    }
+    with Session(engine) as session:
+        session.add_all(hosts)
+        session.commit()
+
+    report = remap_identities(
+        engine,
+        {
+            "alice": "alice@example.com",
+            "bob": "bob@example.com",
+        },
+        dry_run=False,
+        force=True,
+    )
+
+    assert report.refused == [
+        "alice -> alice@example.com",
+        "bob -> bob@example.com",
+    ]
+    for user_id in ("alice", "alice@example.com", "bob", "bob@example.com"):
+        assert account_store.get_user(user_id) is not None
+    with Session(engine) as session:
+        persisted = {
+            host.host_id: (host.user_id, host.sandbox_id, host.deleted_at)
+            for host in session.execute(select(SqlHost)).scalars()
+        }
+    assert persisted == expected_hosts
 
 
 def test_dry_run_mutates_nothing_but_reports(db_uri: str) -> None:

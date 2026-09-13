@@ -1,3 +1,4 @@
+import type { RefObject, UIEvent } from "react";
 import type { BundledLanguage } from "shiki";
 import AnsiDefault from "ansi-to-react";
 import ReactMarkdown from "react-markdown";
@@ -124,7 +125,7 @@ function AnsiText({ text, className }: { text: string; className?: string }) {
   return (
     <pre
       className={cn(
-        "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-xs p-2",
+        "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-sm p-2",
         className,
       )}
     >
@@ -177,10 +178,10 @@ function OutputView({ output }: { output: NotebookOutput }) {
   return (
     <div>
       {imageError && (
-        <div className="text-xs text-muted-foreground italic px-2 pt-1">{imageError}</div>
+        <div className="text-sm text-muted-foreground italic px-2 pt-1">{imageError}</div>
       )}
       {suppressedHtml && (
-        <div className="text-xs text-muted-foreground italic px-2 pt-1">
+        <div className="text-sm text-muted-foreground italic px-2 pt-1">
           Rich HTML output hidden — showing plain text.
         </div>
       )}
@@ -193,11 +194,11 @@ function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLan
   const count = cell.execution_count;
   return (
     <div className="flex gap-2">
-      <div className="w-14 shrink-0 pt-1 text-right font-mono text-xs text-muted-foreground select-none">
+      <div className="w-14 shrink-0 pt-1 text-right font-mono text-sm text-muted-foreground select-none">
         In [{count ?? " "}]:
       </div>
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="rounded border bg-muted/30 text-xs">
+        <div className="rounded border bg-muted/30 text-sm">
           <CodeBlockContent code={joinSource(cell.source)} language={language} />
         </div>
         {(cell.outputs ?? []).map((output, i) => (
@@ -209,12 +210,20 @@ function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLan
   );
 }
 
-export function NotebookPreview({ content }: { content: string }) {
+export function NotebookPreview({
+  content,
+  rootRef,
+  onScroll,
+}: {
+  content: string;
+  rootRef?: RefObject<HTMLDivElement | null>;
+  onScroll?: (event: UIEvent<HTMLElement>) => void;
+}) {
   const { notebook, error } = parseNotebook(content);
 
   if (error || !notebook) {
     return (
-      <div className="p-8 text-sm">
+      <div className="p-8 text-ui">
         <div className="text-destructive">Cannot render notebook: {error}</div>
         <div className="mt-1 text-muted-foreground">
           Switch to the source view to inspect the raw file.
@@ -227,7 +236,12 @@ export function NotebookPreview({ content }: { content: string }) {
   const language = langName as BundledLanguage;
 
   return (
-    <div className="h-full space-y-4 overflow-auto px-6 py-4">
+    <div
+      ref={rootRef}
+      data-preview-scroll
+      onScroll={onScroll}
+      className="h-full space-y-4 overflow-auto px-6 py-4"
+    >
       {(notebook.cells ?? []).map((cell, i) => {
         if (cell.cell_type === "markdown") {
           return (

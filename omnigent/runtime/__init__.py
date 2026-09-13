@@ -359,6 +359,24 @@ def get_runner_ws_factory() -> Any:
     return _globals._runner_ws_factory
 
 
+def set_runner_direct_attach_resolver(resolver: Any) -> None:
+    """Set the conversation-id → direct-attach-endpoint resolver.
+
+    The resolver is a callable ``(conversation_id: str) ->
+    DirectAttachEndpoint | None`` built by
+    :func:`omnigent.server._runner_ws_tunnel.make_direct_attach_resolver`.
+    The terminals API uses it to expose a loopback attach URL for
+    browsers on the same machine as the runner. Leave unset (``None``)
+    when the server has no runner tunnels.
+    """
+    _globals._runner_direct_attach_resolver = resolver
+
+
+def get_runner_direct_attach_resolver() -> Any:
+    """Return the direct-attach resolver, or ``None`` if unset."""
+    return _globals._runner_direct_attach_resolver
+
+
 def set_runner_id(runner_id: str | None) -> None:
     """Set the stable runner UUID for conversation affinity."""
     _globals._runner_id = runner_id

@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { ImageIcon } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import { getOmnigentHostConfig, hostFetch } from "@/lib/host";
+import { getOmnigentHostConfig } from "@/lib/host";
+import { authenticatedFetch } from "@/lib/identity";
 import { ZoomableImage } from "@/components/ImageLightbox";
 
 export interface SessionImageProps {
@@ -16,10 +17,50 @@ export interface SessionImageProps {
 }
 
 /**
+ * Fixed-height box every inline preview renders into, reserved before the bytes
+ * arrive and unchanged once they land. The chat scroller runs with
+ * `overflow-anchor: none` (history prepends own the anchoring) and its
+ * resize-compensating observer is iOS-only, so an image that grew on decode
+ * would shove the transcript down under the reader with nothing to absorb it.
+ */
+const PREVIEW_BOX = "flex h-64 max-w-full shrink-0 items-center justify-center";
+
+/**
+ * Cap on the image itself, in the same absolute unit as the box's height so the
+ * two can't drift apart. It has to be absolute rather than `max-h-full`: the
+ * lightbox wraps the image in an auto-height button, and a percentage height
+ * resolves against that wrapper, leaving a tall image free to overflow the box.
+ */
+const PREVIEW_IMAGE = "max-h-64 max-w-full";
+
+/** Placeholder width, so the box holds a slot on the row before its image lands. */
+const PREVIEW_PLACEHOLDER_BOX = "flex h-64 w-40 shrink-0 items-center justify-center";
+
+/**
+ * Fallback for an image that can't be shown: a compact labelled chip, so an
+ * unusable attachment costs a line rather than a tall box of broken glyph.
+ */
+function UnavailableImage({ alt, className }: { alt: string; className?: string }) {
+  return (
+    <div
+      role="img"
+      aria-label={alt}
+      className={cn(
+        "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
+        className,
+      )}
+    >
+      <ImageIcon className="size-3.5 shrink-0" />
+      <span className="truncate">{alt}</span>
+    </div>
+  );
+}
+
+/**
  * Inline preview for an uploaded image stored as a session file resource.
  *
- * Standalone the file path is same-origin, so a plain `<img src>` works and we
- * keep it as-is (native streaming + HTTP caching). Embedded, the host proxies
+ * Standalone the file path is same-origin, so a plain `<img src>` works (native
+ * streaming + HTTP caching) and {@link InlineImage} renders it. Embedded, the host proxies
  * the API behind a path prefix and cookie+CSRF auth that a browser `<img>` GET
  * can't satisfy (no way to send the prefix or the CSRF header), so we pull the
  * bytes through the host fetcher — which handles both — and render an object
@@ -29,32 +70,151 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
   // safe to branch on it before any hooks. Hooks live in the embedded child.
   if (!getOmnigentHostConfig().fetcher) {
-    return <ZoomableImage src={path} alt={alt} className={className} />;
+    // Same reserved box and failure chip as a transcript-carried image; only the
+    // source differs, so the two must not drift apart.
+    return <InlineImage src={path} alt={alt} className={className} />;
   }
   return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
 }
 
+/**
+ * Preview for an image the browser can load straight from `src`: a `data:` URI
+ * the transcript carries, or a same-origin session file path.
+ *
+ * Owns the reserved box and the failure chip for both, so a sizing or loading
+ * fix lands on every direct-`<img>` preview at once. `src` may be undefined
+ * while a session is still resolving; the box holds its place until it lands.
+ *
+ * Only a corrupt `data:` URI collapses to the chip — its bytes are the source,
+ * so the failure is final. A fetched path can fail transiently (blocked or
+ * slow bytes), and swapping its reserved box for a chip would shift everything
+ * below it mid-read; that box stays reserved.
+ */
+export function InlineImage({
+  src,
+  alt,
+  className,
+}: {
+  src?: string;
+  alt: string;
+  className?: string;
+}) {
+  // Tracked by source rather than as a bare flag, so a later block swapping in a
+  // different `src` on the same slot retries instead of staying stuck failed.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+
+  // A truncated or corrupt `data:` URI decodes to nothing; showing the chip
+  // keeps it out of the reserved box and off the lightbox.
+  if (src !== undefined && failedSrc === src) {
+    return <UnavailableImage alt={alt} className={className} />;
+  }
+
+  return (
+    <div className={PREVIEW_BOX}>
+      <ZoomableImage
+        src={src}
+        alt={alt}
+        className={cn(PREVIEW_IMAGE, className)}
+        // Offscreen history images cost nothing until scrolled to, and decoding
+        // off the main thread keeps the swap from blocking paint.
+        loading="lazy"
+        decoding="async"
+        // An absent src never resolved, so nothing has failed yet — latching
+        // here would strand the slot on a chip once the path arrives. A
+        // non-data src keeps its reserved box on error (see the doc comment).
+        onError={() => {
+          if (src !== undefined && src.startsWith("data:")) setFailedSrc(src);
+        }}
+      />
+    </div>
+  );
+}
+
 type LoadState = "loading" | "loaded" | "error";
 
+/**
+ * Object URLs for image bytes already pulled through the host fetcher, keyed by
+ * content path. A file id addresses one immutable set of bytes, so a hit is
+ * always current — re-opening a session re-renders the same attachments, and
+ * without this every remount re-downloaded and re-decoded megabytes.
+ *
+ * Bounded and evicted least-recently-used: entries outlive the components that
+ * created them, so nothing else would ever release them.
+ */
+const MAX_CACHED_IMAGES = 32;
+const blobUrlCache = new Map<string, string>();
+
+/** In-flight fetches, so concurrent mounts of one path share a single download. */
+const inFlight = new Map<string, Promise<string>>();
+
+function cacheBlobUrl(path: string, url: string): void {
+  blobUrlCache.set(path, url);
+  while (blobUrlCache.size > MAX_CACHED_IMAGES) {
+    const oldest = blobUrlCache.keys().next();
+    if (oldest.done) break;
+    const evicted = blobUrlCache.get(oldest.value);
+    blobUrlCache.delete(oldest.value);
+    if (evicted) URL.revokeObjectURL(evicted);
+  }
+}
+
+function loadBlobUrl(path: string): Promise<string> {
+  const cached = blobUrlCache.get(path);
+  if (cached) {
+    // Re-insert to mark it most-recently-used.
+    blobUrlCache.delete(path);
+    blobUrlCache.set(path, cached);
+    return Promise.resolve(cached);
+  }
+  const pending = inFlight.get(path);
+  if (pending) return pending;
+
+  // Route this host-scoped file-content read through authenticatedFetch (not
+  // hostFetch) so it stamps the slice-key routing header and reaches the replica
+  // holding the session's runner tunnel (the oxlint no-restricted-imports rule
+  // forbids direct hostFetch here for exactly this reason).
+  const request = authenticatedFetch(path)
+    .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      cacheBlobUrl(path, url);
+      return url;
+    })
+    .finally(() => {
+      inFlight.delete(path);
+    });
+  inFlight.set(path, request);
+  return request;
+}
+
 function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [state, setState] = useState<LoadState>("loading");
+  // Seed from cache so a revisited image paints on the first frame instead of
+  // flashing the placeholder.
+  const [blobUrl, setBlobUrl] = useState<string | null>(() =>
+    path ? (blobUrlCache.get(path) ?? null) : null,
+  );
+  const [state, setState] = useState<LoadState>(() =>
+    path && blobUrlCache.has(path) ? "loaded" : "loading",
+  );
 
   useEffect(() => {
     if (!path) {
       setState("error");
       return;
     }
+    const cached = blobUrlCache.get(path);
+    if (cached) {
+      setBlobUrl(cached);
+      setState("loaded");
+      return;
+    }
     setState("loading");
     setBlobUrl(null);
     let cancelled = false;
-    let objectUrl: string | null = null;
-    hostFetch(path)
-      .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
-      .then((blob) => {
+    loadBlobUrl(path)
+      .then((url) => {
         if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setBlobUrl(objectUrl);
+        setBlobUrl(url);
         setState("loaded");
       })
       .catch(() => {
@@ -62,24 +222,11 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
       });
     return () => {
       cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [path]);
 
   if (state === "error") {
-    return (
-      <div
-        role="img"
-        aria-label={alt}
-        className={cn(
-          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-xs text-muted-foreground",
-          className,
-        )}
-      >
-        <ImageIcon className="size-3.5 shrink-0" />
-        <span className="truncate">{alt}</span>
-      </div>
-    );
+    return <UnavailableImage alt={alt} className={className} />;
   }
 
   if (state === "loading" || !blobUrl) {
@@ -87,10 +234,9 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
       <div
         role="status"
         aria-label="Loading image"
-        // Square placeholder keeps the bubble from collapsing before the
-        // (unknown-dimension) image resolves.
         className={cn(
-          "flex size-24 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground",
+          PREVIEW_PLACEHOLDER_BOX,
+          "rounded-md border border-border bg-muted text-muted-foreground",
           className,
         )}
       >
@@ -99,5 +245,14 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
     );
   }
 
-  return <ZoomableImage src={blobUrl} alt={alt} className={className} />;
+  return (
+    <div className={PREVIEW_BOX}>
+      <ZoomableImage
+        src={blobUrl}
+        alt={alt}
+        className={cn(PREVIEW_IMAGE, className)}
+        decoding="async"
+      />
+    </div>
+  );
 }

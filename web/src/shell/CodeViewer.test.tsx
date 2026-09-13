@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
-import { CodeViewer } from "./CodeViewer";
+import type { Comment } from "@/hooks/useComments";
+import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
@@ -20,6 +21,22 @@ vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null 
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
   MonacoCodeEditor: () => <div data-testid="monaco-editor-stub" />,
+}));
+// Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
+// jsdom) never load; its testid presence is the signal that a file was routed
+// to the PDF surface.
+vi.mock("./PdfViewer", () => ({
+  PdfViewer: ({ comments }: { comments: Comment[] }) => (
+    <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+  ),
+}));
+// Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
+// (which has no WebGL); its presence in the DOM is the signal that a model file
+// was routed to the 3D preview instead of the binary-rejection placeholder.
+vi.mock("./ModelViewer", () => ({
+  ModelViewer: ({ path }: { path: string }) => (
+    <div data-testid="model-viewer-stub" data-path={path} />
+  ),
 }));
 
 import * as permissions from "@/hooks/usePermissions";
@@ -51,13 +68,35 @@ function makeImageQuery(contentType: string, truncated = false): ReturnType<type
   } as unknown as ReturnType<typeof useFileContent>;
 }
 
+// A tiny base64 blob standing in for a PDF's bytes — the stubbed PdfViewer never
+// parses it, so any base64 payload with the application/pdf content type is enough
+// to exercise routing.
+const PDF_BASE64 = "JVBERi0xLjQK";
+
+function makePdfQuery(
+  contentType: string | null = "application/pdf",
+  truncated = false,
+): ReturnType<typeof useFileContent> {
+  return {
+    data: { content: PDF_BASE64, encoding: "base64", content_type: contentType, truncated },
+    isLoading: false,
+    isError: false,
+    isSuccess: true,
+    error: null,
+  } as unknown as ReturnType<typeof useFileContent>;
+}
+
 const noopRef = { current: null };
 
 function renderViewer(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: { viewMode?: "editor" | "preview" | "source" | "diff"; truncated?: boolean } = {},
+  opts: {
+    viewMode?: "editor" | "preview" | "source" | "diff";
+    truncated?: boolean;
+    onRequestEditMode?: () => void;
+  } = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
@@ -76,6 +115,7 @@ function renderViewer(
       setSearchOpen={() => {}}
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
+      onRequestEditMode={opts.onRequestEditMode}
     />,
   );
 }
@@ -235,6 +275,47 @@ describe("CodeViewer truncated preview", () => {
   });
 });
 
+describe("CodeViewer markdown preview comment hint", () => {
+  // The rendered preview can't anchor text-selection comments, so it points the
+  // user at the editor instead of offering a second, fuzzier comment surface.
+  it("shows the switch-to-edit hint in markdown preview", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeDefined();
+  });
+
+  it("switches to the editor when the hint is clicked", () => {
+    const onRequestEditMode = vi.fn();
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode });
+    fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
+    expect(onRequestEditMode).toHaveBeenCalledOnce();
+  });
+
+  it("hides the hint for read-only viewers", () => {
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint when the editor isn't reachable (no callback)", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview" });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint in the editor surface", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "editor", onRequestEditMode: () => {} });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint for a truncated file (the editor can't comment on it either)", () => {
+    renderViewer("# big", true, "notes.md", {
+      viewMode: "preview",
+      truncated: true,
+      onRequestEditMode: () => {},
+    });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+});
+
 describe("CodeViewer markdown preview rendering (issue #970)", () => {
   // The read-only markdown preview is now the default surface for .md files, so
   // it must faithfully render the GFM feature set the issue calls out:
@@ -264,6 +345,21 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
   it("renders fenced code blocks", () => {
     const { container } = renderMd("```js\nconst x = 1;\n```");
     expect(container.querySelector("pre code")?.textContent).toContain("const x = 1;");
+  });
+
+  it("renders raw HTML pre blocks without treating them as Mermaid fences", () => {
+    const { container } = renderMd("<pre>literal raw pre</pre>");
+    expect(container.querySelector("pre")?.textContent).toBe("literal raw pre");
+    expect(screen.queryByTestId("mermaid-preview")).toBeNull();
+  });
+
+  it("renders Mermaid fences as diagrams instead of plain code", async () => {
+    const { container } = renderMd("```mermaid\nflowchart LR\n  A --> B\n```");
+    expect(screen.getByTestId("mermaid-preview")).toBeDefined();
+    expect(container.querySelector("pre > code.language-mermaid")).toBeNull();
+    await waitFor(() =>
+      expect(container.querySelector("[data-testid='mermaid-preview'] svg")).not.toBeNull(),
+    );
   });
 
   it("renders blockquotes", () => {
@@ -477,6 +573,144 @@ describe("CodeViewer image rendering", () => {
     expect(await screen.findByRole("dialog")).toBeDefined();
     expect(screen.getByLabelText("Zoom in")).toBeDefined();
     expect(screen.getByLabelText("Zoom out")).toBeDefined();
+  });
+});
+
+describe("CodeViewer PDF routing", () => {
+  function renderPdf(
+    contentType: string | null = "application/pdf",
+    path = "report.pdf",
+    truncated = false,
+    comments: Comment[] = [],
+    addressedComments: Comment[] = [],
+    activeSelection: CodeViewerProps["activeSelection"] = null,
+  ) {
+    return render(
+      <CodeViewer
+        conversationId="conv_1"
+        path={path}
+        fileQuery={makePdfQuery(contentType, truncated)}
+        comments={comments}
+        addressedComments={addressedComments}
+        activeSelection={activeSelection}
+        onSetActiveSelection={() => {}}
+        panelOpen={true}
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="source"
+      />,
+    );
+  }
+
+  it("routes a .pdf to the PDF viewer, not the binary placeholder", async () => {
+    renderPdf();
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeDefined();
+    expect(screen.queryByText(/binary file/i)).toBeNull();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("routes by content_type over extension (pdf MIME on a .bin name)", async () => {
+    renderPdf("application/pdf", "data.bin");
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeDefined();
+  });
+
+  it("falls back to the .pdf extension when content type is null", async () => {
+    renderPdf(null, "report.pdf");
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeDefined();
+  });
+
+  it("renders an addressed anchor only while that comment is active", async () => {
+    const open = { id: "open", status: "draft" } as Comment;
+    const addressed = { id: "addressed", status: "addressed" } as Comment;
+
+    renderPdf("application/pdf", "report.pdf", false, [open], [addressed]);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute(
+      "data-comment-ids",
+      "open",
+    );
+
+    cleanup();
+    renderPdf("application/pdf", "report.pdf", false, [open], [addressed], {
+      start_index: 0,
+      end_index: 1,
+      anchor_content: "anchor",
+      comment_id: "addressed",
+    });
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute(
+      "data-comment-ids",
+      "open,addressed",
+    );
+  });
+});
+
+describe("CodeViewer 3D model routing", () => {
+  // A base64 model payload stands in for a binary STL/3MF the server returns
+  // (encoding="base64"); ASCII OBJ arrives as utf-8. Either way the file must
+  // route to <ModelViewer>, not the binary-rejection placeholder or Monaco.
+  function makeModelQuery(
+    encoding: "base64" | "utf-8",
+    contentType: string | null,
+  ): ReturnType<typeof useFileContent> {
+    return {
+      data: { content: "AAAA", encoding, content_type: contentType, truncated: false },
+      isLoading: false,
+      isError: false,
+      isSuccess: true,
+      error: null,
+    } as unknown as ReturnType<typeof useFileContent>;
+  }
+
+  function renderModel(path: string, encoding: "base64" | "utf-8", contentType: string | null) {
+    return render(
+      <CodeViewer
+        conversationId="conv_1"
+        path={path}
+        fileQuery={makeModelQuery(encoding, contentType)}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen={true}
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="source"
+      />,
+    );
+  }
+
+  it("routes a binary .stl to the 3D model viewer, not the binary placeholder", async () => {
+    renderModel("parts/widget.stl", "base64", "application/octet-stream");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+    expect(screen.queryByText(/binary file/i)).toBeNull();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("routes an ASCII .obj (utf-8) to the 3D model viewer, not raw source", async () => {
+    renderModel("mesh.obj", "utf-8", "text/plain");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("routes a .3mf to the 3D model viewer", async () => {
+    renderModel("assembly.3mf", "base64", "application/octet-stream");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+  });
+
+  it("routes by content_type when the extension is unknown (MIME-only)", async () => {
+    // A file with no recognizable model extension but a model MIME must still
+    // route to the viewer — dispatch and loader selection share one resolver.
+    renderModel("download", "base64", "model/stl");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+    expect(screen.queryByText(/binary file/i)).toBeNull();
+  });
+
+  it("routes a 3MF by content_type when the extension is absent (MIME-only)", async () => {
+    // Same MIME-only resolver path for 3MF: no recognizable model extension but
+    // a model/3mf content type must still route to the viewer.
+    renderModel("download", "base64", "model/3mf");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+    expect(screen.queryByText(/binary file/i)).toBeNull();
   });
 });
 

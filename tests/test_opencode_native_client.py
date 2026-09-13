@@ -8,7 +8,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from omnigent.opencode_native_client import (
+from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeClientError,
     OpenCodeEvent,
@@ -67,6 +67,16 @@ async def test_list_messages() -> None:
     client = _client(handler)
     messages = await client.list_messages("ses_1")
     assert messages == [{"info": {"id": "msg_1"}, "parts": []}]
+    await client.aclose()
+
+
+async def test_list_models() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/model"
+        return httpx.Response(200, json={"models": [{"id": "opencode-go/glm-5.2"}]})
+
+    client = _client(handler)
+    assert await client.list_models() == [{"id": "opencode-go/glm-5.2"}]
     await client.aclose()
 
 

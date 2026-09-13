@@ -13,6 +13,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import { isTempConvId } from "@/lib/tempConversationId";
 import type { Session } from "@/lib/types";
 
 /**
@@ -36,15 +37,27 @@ interface UseSessionResult {
  * Pass ``null`` to disable. The query is otherwise long-lived
  * (``staleTime: Infinity``) because chatStore is the source of truth
  * for refresh — it refetches on every bind, which writes back into
- * this same cache key. A cache-cold page load asks the server to
- * refresh runner-backed state so browser refresh pierces stale AP
- * process caches.
+ * this same cache key.
+ *
+ * EVERY fetch asks the server to re-read runner-backed state, not just the
+ * cache-cold one. The runner-backed fields (``model_options``, skills) are
+ * process-cached, and the fetches this query makes are exactly the moments
+ * they can have gone stale: a page load, and an invalidation after the
+ * session's agent/harness changed. Skipping the refresh on the invalidation
+ * refetch left the previous agent's model catalog on screen until a hard
+ * reload. There is no poll on this query, so nothing re-asks often enough
+ * for the refresh to thrash those caches.
  */
 export function useSession(conversationId: string | null | undefined): UseSessionResult {
+  // A `temp:*` id is a client-only routing token with no server session behind
+  // it (navigate-first new-chat window). Disable the fetch by construction so no
+  // caller can leak a `GET /v1/sessions/temp:*` — cheaper than gating every
+  // call site.
+  const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
   const { data, isLoading, error } = useQuery({
-    queryKey: conversationId ? ["session", conversationId] : ["session", null],
-    queryFn: () => getSessionSlim(conversationId as string, { refreshState: true }),
-    enabled: Boolean(conversationId),
+    queryKey: serverId ? ["session", serverId] : ["session", null],
+    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
+    enabled: serverId !== null,
     staleTime: Infinity,
     retry: false,
   });

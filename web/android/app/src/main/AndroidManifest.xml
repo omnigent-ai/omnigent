@@ -25,6 +25,11 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Omnigent">
 
+        <!-- Lets an EMM/MDM preconfigure server URLs; read by ManagedConfig. -->
+        <meta-data
+            android:name="android.content.APP_RESTRICTIONS"
+            android:resource="@xml/app_restrictions" />
+
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|keyboardHidden|uiMode|smallestScreenSize|screenLayout|density"

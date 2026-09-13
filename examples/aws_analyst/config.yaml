@@ -1,0 +1,70 @@
+# AWS Analyst — query governed AWS data through official awslabs MCP servers.
+#
+# This example agent wires two AWS Labs MCP servers as Omnigent connectors:
+#   - Amazon Redshift  (awslabs.redshift-mcp-server)
+#   - Amazon S3 Tables (awslabs.s3-tables-mcp-server)
+# Both run read-only by default. The agent uses them to answer analytical
+# questions over data governed in AWS — a natural companion to Databricks Genie
+# in a Databricks-on-AWS "better together" setup.
+#
+# Prerequisites:
+#   - `uvx` on PATH (the awslabs servers are published to PyPI as awslabs.*).
+#   - AWS credentials resolvable by the servers (AWS_PROFILE + AWS_REGION, or a role).
+#
+# Usage:
+#   AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws_analyst
+
+spec_version: 1
+name: aws_analyst
+description: >-
+  An analyst agent that answers questions over governed AWS data — Amazon Redshift
+  and Amazon S3 Tables — through the official awslabs MCP servers (read-only).
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+tools:
+  # Amazon Redshift — discovery + read-only SQL over your clusters.
+  redshift:
+    type: mcp
+    command: uvx
+    args: [awslabs.redshift-mcp-server@latest]
+    env:
+      AWS_PROFILE: ${AWS_PROFILE}
+      AWS_REGION: ${AWS_REGION}
+      FASTMCP_LOG_LEVEL: INFO
+    # Allow-list: only these tools are surfaced to the model. execute_query is
+    # read-only on the server side; the discovery tools let the agent map the
+    # environment before querying.
+    tools: [list_clusters, list_databases, list_schemas, list_tables, list_columns, execute_query]
+
+  # Amazon S3 Tables — read-only metadata discovery + SQL over table buckets.
+  # (Server defaults to read-only; --allow-write is intentionally NOT set.)
+  s3-tables:
+    type: mcp
+    command: uvx
+    args: [awslabs.s3-tables-mcp-server@latest]
+    env:
+      AWS_PROFILE: ${AWS_PROFILE}
+      AWS_REGION: ${AWS_REGION}
+
+prompt: |
+  You are an AWS data analyst. You answer questions over governed AWS data using
+  two toolsets:
+
+  - `redshift` — Amazon Redshift. Start by discovering the environment
+    (list_clusters → list_databases → list_schemas → list_tables → list_columns)
+    before writing SQL, then use execute_query for read-only analytical queries.
+  - `s3-tables` — Amazon S3 Tables. Use it for metadata discovery and read-only
+    SQL over table buckets.
+
+  Rules:
+  - Prefer discovery before querying; never assume a table or column exists —
+    confirm it with the list_* tools first.
+  - These tools are read-only. Do not attempt inserts, updates, or deletes.
+  - Always state which source (Redshift or S3 Tables) and which table an answer
+    came from, so results are auditable.
+  - When a question spans multiple tables, explain your join logic before running
+    the query.

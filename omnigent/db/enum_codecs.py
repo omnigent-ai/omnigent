@@ -3,7 +3,10 @@
 Several low-cardinality closed-set columns (``conversations.kind``,
 ``conversation_items.type``/``status``, ``comments.status``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
-``hosts.status``, ``agents.kind``) are stored as integer codes rather
+``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
+``scheduled_tasks.execution_target``,
+``scheduled_task_runs.status``) are stored as
+integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
 free ``VARCHAR``. The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
@@ -61,6 +64,17 @@ COMMENT_STATUS: dict[str, int] = {
     "addressed": 2,
 }
 
+# Last relay-observed turn status persisted on the conversation's metadata
+# row (``omnigent_conversation_metadata.live_status``) so any server replica
+# can serve the sidebar's activity state, not just the pod holding the
+# runner tunnel.
+SESSION_LIVE_STATUS: dict[str, int] = {
+    "idle": 1,
+    "running": 2,
+    "waiting": 3,
+    "failed": 4,
+}
+
 ACCOUNT_TOKEN_KIND: dict[str, int] = {
     "invite": 1,
     "magic": 2,
@@ -69,6 +83,14 @@ ACCOUNT_TOKEN_KIND: dict[str, int] = {
 POLICY_TYPE: dict[str, int] = {
     "python": 1,
     "url": 2,
+}
+
+DEVICE_GRANT_STATUS: dict[str, int] = {
+    "pending": 1,
+    "approved": 2,
+    "denied": 3,
+    "redeemed": 4,
+    "revoked": 5,
 }
 
 HOST_STATUS: dict[str, int] = {
@@ -84,6 +106,25 @@ AGENT_KIND: dict[str, int] = {
 POLICY_SCOPE: dict[str, int] = {
     "default": 1,
     "session": 2,
+}
+
+SCHEDULED_TASK_STATE: dict[str, int] = {
+    "active": 1,
+    "paused": 2,
+    "deleted": 3,
+}
+
+SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
+    "connected_host": 1,
+    "managed_sandbox": 2,
+}
+
+SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
+    "scheduled": 1,
+    "running": 2,
+    "succeeded": 3,
+    "failed": 4,
+    "skipped": 5,
 }
 
 
@@ -199,6 +240,16 @@ def decode_comment_status(code: int) -> str:
     return _decode(COMMENT_STATUS, code, field="comments.status")
 
 
+def encode_session_live_status(name: str) -> int:
+    """Encode an ``omnigent_conversation_metadata.live_status`` name to its int code."""
+    return _encode(SESSION_LIVE_STATUS, name, field="omnigent_conversation_metadata.live_status")
+
+
+def decode_session_live_status(code: int) -> str:
+    """Decode an ``omnigent_conversation_metadata.live_status`` int code to its name."""
+    return _decode(SESSION_LIVE_STATUS, code, field="omnigent_conversation_metadata.live_status")
+
+
 def encode_account_token_kind(name: str) -> int:
     """Encode an ``account_tokens.kind`` name to its int code."""
     return _encode(ACCOUNT_TOKEN_KIND, name, field="account_tokens.kind")
@@ -207,6 +258,16 @@ def encode_account_token_kind(name: str) -> int:
 def decode_account_token_kind(code: int) -> str:
     """Decode an ``account_tokens.kind`` int code to its name."""
     return _decode(ACCOUNT_TOKEN_KIND, code, field="account_tokens.kind")
+
+
+def encode_device_grant_status(name: str) -> int:
+    """Encode a ``device_grants.status`` name to its int code."""
+    return _encode(DEVICE_GRANT_STATUS, name, field="device_grants.status")
+
+
+def decode_device_grant_status(code: int) -> str:
+    """Decode a ``device_grants.status`` int code to its name."""
+    return _decode(DEVICE_GRANT_STATUS, code, field="device_grants.status")
 
 
 def encode_policy_type(name: str) -> int:
@@ -247,3 +308,33 @@ def encode_policy_scope(name: str) -> int:
 def decode_policy_scope(code: int) -> str:
     """Decode a ``policies.scope`` int code to its name."""
     return _decode(POLICY_SCOPE, code, field="policies.scope")
+
+
+def encode_scheduled_task_state(name: str) -> int:
+    """Encode a ``scheduled_tasks.state`` name to its int code."""
+    return _encode(SCHEDULED_TASK_STATE, name, field="scheduled_tasks.state")
+
+
+def decode_scheduled_task_state(code: int) -> str:
+    """Decode a ``scheduled_tasks.state`` int code to its name."""
+    return _decode(SCHEDULED_TASK_STATE, code, field="scheduled_tasks.state")
+
+
+def encode_scheduled_task_execution_target(name: str) -> int:
+    """Encode a ``scheduled_tasks.execution_target`` name to its int code."""
+    return _encode(SCHEDULED_TASK_EXECUTION_TARGET, name, field="scheduled_tasks.execution_target")
+
+
+def decode_scheduled_task_execution_target(code: int) -> str:
+    """Decode a ``scheduled_tasks.execution_target`` int code to its name."""
+    return _decode(SCHEDULED_TASK_EXECUTION_TARGET, code, field="scheduled_tasks.execution_target")
+
+
+def encode_scheduled_task_run_status(name: str) -> int:
+    """Encode a ``scheduled_task_runs.status`` name to its int code."""
+    return _encode(SCHEDULED_TASK_RUN_STATUS, name, field="scheduled_task_runs.status")
+
+
+def decode_scheduled_task_run_status(code: int) -> str:
+    """Decode a ``scheduled_task_runs.status`` int code to its name."""
+    return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")

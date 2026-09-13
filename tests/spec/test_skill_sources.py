@@ -26,10 +26,21 @@ def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = N
     (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name} desc\n{ui}---\nbody\n")
 
 
-def _ctx(root: Path, home: Path, skills_filter: str | list[str] = "all") -> SkillSourceContext:
+def _ctx(
+    root: Path,
+    home: Path,
+    skills_filter: str | list[str] = "all",
+    claude_config_dir: Path | None = None,
+    codex_home: Path | None = None,
+) -> SkillSourceContext:
     """Build a context with a single discovery root and a pinned home."""
     return SkillSourceContext(
-        roots=(root,), home=home, skills_filter=skills_filter, bundle_dir=None
+        roots=(root,),
+        home=home,
+        skills_filter=skills_filter,
+        bundle_dir=None,
+        claude_config_dir=claude_config_dir,
+        codex_home=codex_home,
     )
 
 
@@ -50,7 +61,11 @@ def _ctx(root: Path, home: Path, skills_filter: str | list[str] = "all") -> Skil
         ("pi-native", "pi"),
         ("native-pi", "pi"),
         ("openai-agents", None),
+        # Only the agy CLI reads ~/.gemini plugins; the in-process Gemini SDK
+        # harness (bare "antigravity") does not, so it stays unmapped.
         ("antigravity", None),
+        ("antigravity-native", "antigravity"),
+        ("native-antigravity", "antigravity"),
         ("qwen", None),
         (None, None),
         ("", None),
@@ -84,6 +99,197 @@ def test_none_harness_falls_back_to_generic_host_walk(
 
     out = resolve_harness_skills(_ctx(workspace, home), None)
     assert [s.name for s in out] == ["ws-skill"]
+
+
+def test_claude_provider_excludes_agents_skills_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code does not read ``.agents/skills``, so its menu must not.
+
+    A claude-family session's ``/name`` is expanded by the Claude CLI
+    itself; listing a skill it never discovers surfaces a command that
+    fails when invoked (the terminal/web parity gap).
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".claude" / "skills", "claude-tier-skill")
+    _write_skill(workspace / ".agents" / "skills", "workspace-agents-skill")
+    _write_skill(home / ".agents" / "skills", "home-agents-skill")
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [s.name for s in out] == ["claude-tier-skill"]
+
+
+def test_claude_provider_sources_user_skills_from_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured Claude config dir replaces ``~/.claude`` as the user tier.
+
+    Claude Code loads user skills from ``$CLAUDE_CONFIG_DIR/skills`` when
+    set — and then no longer reads ``~/.claude/skills`` — so the menu must
+    follow the same tier or the surfaces diverge in both directions.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".claude" / "skills", "default-home-skill")
+    cfg = tmp_path / "claude-config"
+    _write_skill(cfg / "skills", "config-dir-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home, claude_config_dir=cfg), "claude-native")
+    assert [s.name for s in out] == ["config-dir-skill"]
+
+
+def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminal-matching resolution is native-only; SDK keeps the generic walk.
+
+    A ``claude-native`` session types ``/name`` into the CLI as plaintext, so
+    its menu must mirror the tiers the CLI loads: ``.claude/skills`` plus the
+    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``. The in-process
+    ``claude-sdk`` harness has no such terminal, so it stays on the generic host
+    walk it used before this scoping — which lists ``.agents/skills`` and ignores
+    ``$CLAUDE_CONFIG_DIR``. The same seeded tree must diverge by harness.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    (home / ".claude" / "skills").mkdir(parents=True)  # empty default user tier
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".claude" / "skills", "claude-dir-skill")
+    _write_skill(workspace / ".agents" / "skills", "agents-only-skill")
+    cfg = tmp_path / "claude-config"
+    _write_skill(cfg / "skills", "user-cfg-skill")
+    ctx = _ctx(workspace, home, claude_config_dir=cfg)
+
+    sdk = {s.name for s in resolve_harness_skills(ctx, "claude-sdk")}
+    native = {s.name for s in resolve_harness_skills(ctx, "claude-native")}
+
+    # SDK (unchanged): generic walk lists the .agents entry, ignores config-dir.
+    assert "agents-only-skill" in sdk
+    assert "claude-dir-skill" in sdk
+    assert "user-cfg-skill" not in sdk
+    # Native: mirrors the CLI — .agents excluded, config-dir user tier sourced.
+    assert native == {"claude-dir-skill", "user-cfg-skill"}
+
+
+def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a configured ``$CODEX_HOME`` both codex harnesses read ``~/.codex``.
+
+    The Codex provider never scans ``.agents`` and, absent a resolved
+    ``$CODEX_HOME`` (``ctx.codex_home is None``), the native provider falls back
+    to the same ``~/.codex/skills`` the SDK path uses — so the two agree until a
+    custom codex home is in play (see the divergence test below).
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".codex" / "skills", "codex-host-skill")
+    _write_skill(home / ".agents" / "skills", "agents-only-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    ctx = _ctx(workspace, home)
+
+    native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
+    sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
+    assert native == sdk == {"codex-host-skill"}
+
+
+def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native codex sources host skills from ``$CODEX_HOME``; SDK keeps ``~/.codex``.
+
+    The codex analog of the ``$CLAUDE_CONFIG_DIR`` facet: codex-native honors
+    ``$CODEX_HOME`` (its launch seeds the per-bridge home from that resolved
+    home), so the menu must read it too. The in-process ``codex`` (SDK) harness
+    has no such terminal, so it stays on ``~/.codex`` — the same seeded tree
+    must diverge by harness.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".codex" / "skills", "default-codex-skill")
+    custom = tmp_path / "custom-codex-home"
+    _write_skill(custom / "skills", "custom-codex-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    ctx = _ctx(workspace, home, codex_home=custom)
+
+    native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
+    sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
+    # Native reads $CODEX_HOME's skills; SDK ignores codex_home and reads ~/.codex.
+    assert native == {"custom-codex-skill"}
+    assert sdk == {"default-codex-skill"}
+
+
+def test_claude_provider_defaults_user_tier_to_home_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a configured config dir the user tier stays ``~/.claude/skills``."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".claude" / "skills", "default-home-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [s.name for s in out] == ["default-home-skill"]
+
+
+def test_claude_provider_workspace_skill_wins_user_tier_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace ``.claude/skills`` name shadows the user tier's (project wins)."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    workspace = tmp_path / "ws"
+    ws_dir = workspace / ".claude" / "skills" / "shared-name"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "SKILL.md").write_text(
+        "---\nname: shared-name\ndescription: workspace copy\n---\nbody\n"
+    )
+    home_dir = home / ".claude" / "skills" / "shared-name"
+    home_dir.mkdir(parents=True)
+    (home_dir / "SKILL.md").write_text(
+        "---\nname: shared-name\ndescription: user copy\n---\nbody\n"
+    )
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [(s.name, s.description) for s in out] == [("shared-name", "workspace copy")]
+
+
+def test_claude_plugins_read_from_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugin settings/manifests follow the configured Claude config dir.
+
+    With ``$CLAUDE_CONFIG_DIR`` set, Claude Code keeps ``settings.json``
+    and ``plugins/`` under that dir, so plugin slash-commands must be
+    resolved from there rather than ``~/.claude``.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    cfg = tmp_path / "claude-config"
+    install = cfg / "plugins" / "cache" / "mkt" / "toolkit" / "1.0.0"
+    _write_skill(install / "skills", "review")
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps({"enabledPlugins": {"toolkit@mkt": True}}))
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {"toolkit@mkt": [{"scope": "user", "installPath": str(install)}]},
+            }
+        )
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home, claude_config_dir=cfg), "claude-native")
+    assert [s.name for s in out] == ["toolkit:review"]
 
 
 def _claude_home_with_plugin(
@@ -638,3 +844,204 @@ def test_cursor_provider_tolerates_unreadable_skills_dir(
     # Must not raise.
     out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "cursor-native")
     assert out == []
+
+
+# ---------------------------------------------------------------------------
+# antigravity (agy CLI) provider
+# ---------------------------------------------------------------------------
+#
+# Layout live-verified against agy 1.1.9:
+#   ~/.gemini/config/plugins/<name>/skills/<skill>/SKILL.md   (imported plugins)
+#   ~/.gemini/antigravity-cli/builtin/skills/<skill>/SKILL.md (shipped builtins)
+# A plugin is DISABLED by renaming its manifest to ``plugin.json.disabled``
+# (``agy plugin disable`` performs exactly that rename; the import manifest and
+# config.json are left untouched, and ``agy plugin list`` still lists it).
+
+
+def _write_agy_plugin(home: Path, plugin: str, *skills: str, enabled: bool = True) -> None:
+    """Write an agy plugin with *skills*, enabled or disabled via its manifest name."""
+    root = home / ".gemini" / "config" / "plugins" / plugin
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ("plugin.json" if enabled else "plugin.json.disabled")).write_text('{"name":"x"}')
+    for skill in skills:
+        _write_skill(root / "skills", skill)
+
+
+def test_antigravity_provider_surfaces_plugin_and_builtin_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agy's own skills — imported plugins plus shipped builtins — reach the menu."""
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers", "brainstorming", "writing-plans")
+    _write_skill(home / ".gemini" / "antigravity-cli" / "builtin" / "skills", "antigravity-guide")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    # Plugin skills are namespaced <plugin>:<skill> (agy's own /skills panel
+    # lists them that way and the TUI only accepts that spelling); builtins are
+    # bare. Live-verified against agy 1.1.9.
+    assert sorted(names) == [
+        "antigravity-guide",
+        "superpowers:brainstorming",
+        "superpowers:writing-plans",
+    ]
+
+
+def test_antigravity_provider_skips_disabled_plugin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plugin disabled via the plugin.json -> plugin.json.disabled rename is hidden.
+
+    The skills stay on disk and the import manifest still lists the plugin, so the
+    manifest is NOT a usable enabled-signal — the manifest name is.
+    """
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers", "brainstorming", enabled=False)
+    _write_agy_plugin(home, "othertools", "still-on", enabled=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    assert "superpowers:brainstorming" not in names
+    assert "othertools:still-on" in names
+
+
+def test_antigravity_session_does_not_inherit_generic_claude_host_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agy session must not surface ~/.claude/skills (those belong to Claude).
+
+    agy owns an enumerable host-skill mechanism, so it lists exactly what agy has
+    rather than falling through to the generic walk.
+    """
+    home = tmp_path / "home"
+    _write_skill(home / ".claude" / "skills", "claude-only-skill")
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    assert "claude-only-skill" not in names
+    assert "superpowers:brainstorming" in names
+
+
+def test_antigravity_sdk_harness_keeps_the_generic_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-process Gemini SDK harness is NOT agy and keeps the generic fallback.
+
+    It never launches the agy CLI, so ~/.gemini plugins are not its skills; its
+    skills are the omnigent-injected generic ones.
+    """
+    home = tmp_path / "home"
+    _write_skill(home / ".claude" / "skills", "claude-only-skill")
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity")]
+    assert "claude-only-skill" in names
+    assert "superpowers:brainstorming" not in names
+
+
+def test_antigravity_provider_filters_user_invocable_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user-invocable:false agy skill is dropped (consistent across harnesses)."""
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers")
+    _write_skill(home / ".gemini" / "config" / "plugins" / "superpowers" / "skills", "shown")
+    _write_skill(
+        home / ".gemini" / "config" / "plugins" / "superpowers" / "skills",
+        "internal",
+        user_invocable=False,
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    assert names == ["superpowers:shown"]
+
+
+def test_antigravity_provider_respects_none_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``skills: none`` in the agent spec suppresses agy's host skills."""
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home, "none"), "antigravity-native")
+    assert out == []
+
+
+def test_antigravity_provider_tolerates_missing_and_unreadable_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ~/.gemini at all (or an unreadable tree) yields [] rather than raising."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    assert resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native") == []
+
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    real_iterdir = Path.iterdir
+
+    def _boom(self: Path):
+        if self.name == "plugins":
+            raise PermissionError("permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr("pathlib.Path.iterdir", _boom)
+    # Must not raise.
+    assert resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native") == []
+
+
+def test_antigravity_provider_surfaces_all_five_agy_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every source agy's own /skills panel lists is surfaced.
+
+    Live-verified against agy 1.1.9, whose panel names them: Workspace
+    (``<ws>/.agents/skills``), Global (``antigravity-cli/skills``), Shared
+    (``.gemini/skills``), plus imported plugins and shipped builtins.
+    """
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".agents" / "skills", "ws-skill")
+    _write_skill(home / ".gemini" / "antigravity-cli" / "skills", "global-skill")
+    _write_skill(home / ".gemini" / "skills", "shared-skill")
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    _write_skill(home / ".gemini" / "antigravity-cli" / "builtin" / "skills", "antigravity-guide")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = sorted(s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native"))
+    assert names == [
+        "antigravity-guide",
+        "global-skill",
+        "shared-skill",
+        "superpowers:brainstorming",
+        "ws-skill",
+    ]
+
+
+def test_antigravity_provider_reads_agents_skills_not_claude_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``.agents/skills`` in the workspace is agy's; ``.claude/skills`` is not.
+
+    The generic walk scans both, which is why agy previously saw Claude's. agy
+    genuinely reads the vendor-neutral ``.agents/skills``, so that one stays.
+    """
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".agents" / "skills", "neutral-skill")
+    _write_skill(ws / ".claude" / "skills", "claude-ws-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
+    assert names == ["neutral-skill"]

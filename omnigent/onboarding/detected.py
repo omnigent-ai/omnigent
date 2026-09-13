@@ -22,7 +22,6 @@ Two surfaces:
 
 from __future__ import annotations
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -42,6 +41,7 @@ from omnigent.onboarding.provider_config import (
     provider_families,
     set_default_provider,
 )
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 # The families auto-default resolution walks, in a stable order. ``gemini``
 # is included so a detected-only GEMINI_API_KEY (the antigravity-sdk harness's
@@ -331,7 +331,7 @@ def effective_config_with_detected(
     # Explicit entries override synthesized ones of the same name.
     merged: dict[str, object] = {**synthesized, **explicit}
 
-    explicit_config = {"providers": explicit}
+    explicit_config: dict[str, object] = {"providers": explicit}
     merged_parsed = load_providers({"providers": merged})
     for family in _FAMILIES:
         # An explicit default for this family always wins — never overridden.

@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 /// The root is the first ancestor holding a `.jj/` or `.git/` marker — the VCS
 /// root. We then require `web/` and `omnigent/` to be present so we fail early
 /// on an unrelated repo rather than mid-spawn.
-pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
+pub fn find_repo_root(start: &Path, external_profile: bool) -> Result<PathBuf> {
     let start = start
         .canonicalize()
         .with_context(|| format!("resolving start dir {}", start.display()))?;
@@ -18,7 +18,8 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
     while let Some(dir) = cur {
         if dir.join(".jj").is_dir() || dir.join(".git").exists() {
             let root = dir.to_path_buf();
-            if !root.join("omnigent").is_dir() || !root.join("web").is_dir() {
+            if !external_profile && (!root.join("omnigent").is_dir() || !root.join("web").is_dir())
+            {
                 bail!(
                     "found a VCS root at {} but it lacks omnigent/ and web/ — \
                      run omnidev from inside an Omnigent checkout",

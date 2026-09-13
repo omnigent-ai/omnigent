@@ -111,3 +111,28 @@ async def test_success_deny_verdict_passed_through() -> None:
     verdict = await _run(server, "PHASE_TOOL_CALL")
     assert verdict["action"] == "POLICY_ACTION_DENY", verdict
     assert verdict["reason"] == "blocked"
+
+
+# ── ExecutorAdapter._stable_policy_evaluator fail-closed ──────────────────
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_action"),
+    [
+        ("PHASE_TOOL_CALL", "POLICY_ACTION_DENY"),
+        ("PHASE_LLM_REQUEST", "POLICY_ACTION_ALLOW"),
+        ("PHASE_LLM_RESPONSE", "POLICY_ACTION_ALLOW"),
+        ("PHASE_TOOL_RESULT", "POLICY_ACTION_ALLOW"),
+    ],
+)
+async def test_missing_context_tool_call_fails_closed(phase: str, expected_action: str) -> None:
+    """No active turn context defaults TOOL_CALL to DENY, advisory phases to ALLOW."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: None)  # type: ignore[arg-type,return-value]
+    # No turn is active: _current_ctx is None.
+    assert adapter._current_ctx is None
+    verdict = await adapter._stable_policy_evaluator(phase, {})
+    assert verdict.action == expected_action, (phase, verdict)
+    if expected_action == "POLICY_ACTION_DENY":
+        assert verdict.reason, "fail-closed verdict should carry a reason"

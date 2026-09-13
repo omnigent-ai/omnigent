@@ -8,7 +8,7 @@
 # Memory is keyed by the agent id, so all of Remy's runs share one memory bank.
 #
 # Setup:
-#   pip install 'omnigent[memory]'
+#   pip install 'omnigent[hindsight]'
 #   export HINDSIGHT_API_KEY=hsk_...        # https://ui.hindsight.vectorize.io
 #
 # Usage:

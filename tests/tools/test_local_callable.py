@@ -193,6 +193,11 @@ def test_resolution_failures_are_explicit(
         tool.get_schema()
 
 
+def test_pathless_callable_fails_at_construction() -> None:
+    with pytest.raises(ValueError, match="no server-side path"):
+        LocalCallableTool(_info("pathless", None))
+
+
 def test_load_local_callable_tools_filters_to_omnigent_server_callables() -> None:
     loaded = load_local_callable_tools(
         [
@@ -202,6 +207,11 @@ def test_load_local_callable_tools_filters_to_omnigent_server_callables() -> Non
                 "uc_function",
                 None,
                 runtime=ToolRuntime.UC_FUNCTION,
+            ),
+            _info(
+                "client_tool",
+                None,
+                runtime=ToolRuntime.CLIENT,
             ),
             _info("unimportable", "does.not.exist"),
         ]

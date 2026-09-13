@@ -31,7 +31,7 @@ export interface InboxItem {
 export interface InboxSource {
   row: Conversation;
   /** Raw `response.elicitation_request` event dicts from `Session.pendingElicitations`. */
-  pendingElicitations: Array<Record<string, unknown>>;
+  pendingElicitations: Record<string, unknown>[];
 }
 
 /**

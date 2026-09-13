@@ -18,6 +18,7 @@ import type {
   ElicitationResolved,
   ErrorEvent,
   MessageDone,
+  ReasoningDone,
   NativeToolCall,
   OutputFileDone,
   PolicyDenied,
@@ -32,6 +33,7 @@ import type {
   ResponseInProgress,
   ResponseQueued,
   RetryEvent,
+  SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
   SessionModelOptionsEvent,
@@ -48,7 +50,10 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionTitleEvent,
   SessionCollaborationModeEvent,
+  SessionPermissionModeEvent,
+  SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -63,10 +68,19 @@ import type {
   StreamEvent,
   TextDelta,
   ToolCall,
+  ToolOutputDelta,
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
-import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
+import { routingExtrasFromWire } from "./routingDecision";
+import type {
+  BackgroundTaskInfo,
+  CodexPersistMode,
+  ErrorInfo,
+  ModelUsage,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -75,6 +89,86 @@ import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
  */
 export interface SseStreamResult {
   sawDone: boolean;
+}
+
+// The server heartbeats the session live-tail every 15 s of queue idleness
+// (`_SESSION_STREAM_HEARTBEAT_INTERVAL_S`), so a healthy connection is never
+// byte-silent for long. `fetch` has no read timeout: on a half-open socket
+// (laptop sleep, network path change, a proxy reaping the connection without
+// a close) `reader.read()` blocks forever and the transcript silently
+// freezes. Three missed heartbeats in a row trip the guard; one late
+// heartbeat doesn't.
+export const SSE_STALL_TIMEOUT_MS = 45_000;
+
+/**
+ * Wrap an SSE byte stream with a silence watchdog.
+ *
+ * Chunks pass through unchanged; a stall timer is armed while a read is
+ * pending on the wire. If no bytes arrive within `stallMs` the upstream
+ * reader is cancelled, which ends the wrapped stream cleanly — consumers
+ * see the same shape as a transport drop without `[DONE]`, so the chat
+ * pump's reconnect loop answers with its usual re-subscribe + snapshot
+ * reconcile.
+ *
+ * @param source The fetch response body to guard.
+ * @param opts.stallMs Silence window before the stream is declared dead;
+ *   defaults to {@link SSE_STALL_TIMEOUT_MS}.
+ * @param opts.onActivity Called on every received chunk — a liveness stamp
+ *   for callers that want to judge staleness on external signals (tab
+ *   visibility, network regained) without waiting out the full window.
+ * @param opts.onStall Called once when the guard trips.
+ * @returns The guarded stream to consume in place of `source`.
+ */
+export function withStallGuard(
+  source: ReadableStream<Uint8Array>,
+  opts: { stallMs?: number; onActivity?: () => void; onStall?: () => void } = {},
+): ReadableStream<Uint8Array> {
+  const stallMs = opts.stallMs ?? SSE_STALL_TIMEOUT_MS;
+  const reader = source.getReader();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const clearTimer = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      // Cancelling the reader resolves the pending read as `done`, which
+      // closes the wrapped stream through the normal path below.
+      timer = setTimeout(() => {
+        timer = null;
+        opts.onStall?.();
+        reader.cancel().catch(() => {});
+      }, stallMs);
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (err) {
+        clearTimer();
+        reader.releaseLock();
+        controller.error(err);
+        return;
+      }
+      clearTimer();
+      if (result.done) {
+        // Release the source on every terminal path: a consumer that
+        // re-reads the same body (a rebind against a mocked response)
+        // must find it unlocked, exactly as it did before the guard
+        // sat between it and the raw stream.
+        reader.releaseLock();
+        controller.close();
+        return;
+      }
+      opts.onActivity?.();
+      controller.enqueue(result.value);
+    },
+    async cancel(reason) {
+      clearTimer();
+      await reader.cancel(reason);
+      reader.releaseLock();
+    },
+  });
 }
 
 /**
@@ -190,7 +284,7 @@ export function* parseEventLines(lines: Iterable<string>): Iterable<StreamEvent>
 }
 
 /** Token/cost bucket keys on a `ModelUsage`, mapping wire (snake) to camel. */
-const MODEL_USAGE_FIELDS: ReadonlyArray<{ wire: string; camel: keyof ModelUsage }> = [
+const MODEL_USAGE_FIELDS: readonly { wire: string; camel: keyof ModelUsage }[] = [
   { wire: "input_tokens", camel: "inputTokens" },
   { wire: "output_tokens", camel: "outputTokens" },
   { wire: "total_tokens", camel: "totalTokens" },
@@ -254,6 +348,32 @@ function normalizeEventType(eventType: string): string {
     return `response.${status}`;
   }
   return eventType;
+}
+
+const BACKGROUND_TASK_KEYS = ["id", "type", "status", "description", "command"] as const;
+
+/**
+ * Parse the `background_tasks` detail off a `session.status` payload.
+ *
+ * Keeps only the string display fields (see {@link BACKGROUND_TASK_KEYS}) and
+ * drops non-object / field-less entries. Returns `undefined` when the value is
+ * not an array or nothing usable survives, so callers can treat "no detail"
+ * uniformly (the count alone still drives the pill).
+ */
+export function parseBackgroundTasks(raw: unknown): BackgroundTaskInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const tasks: BackgroundTaskInfo[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const info: BackgroundTaskInfo = {};
+    for (const key of BACKGROUND_TASK_KEYS) {
+      const value = record[key];
+      if (typeof value === "string" && value) info[key] = value;
+    }
+    if (Object.keys(info).length > 0) tasks.push(info);
+  }
+  return tasks.length > 0 ? tasks : undefined;
 }
 
 /**
@@ -322,6 +442,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const final = typeof data.final === "boolean" ? data.final : undefined;
     return { type: "text_delta", delta, messageId, index, final } satisfies TextDelta;
   }
+  if (eventType === "response.function_call_output.delta") {
+    const callId = data.call_id;
+    const delta = data.delta;
+    if (typeof callId !== "string" || !callId || typeof delta !== "string") return null;
+    return { type: "tool_output_delta", callId, delta } satisfies ToolOutputDelta;
+  }
 
   // Reasoning.
   if (eventType === "response.reasoning.started") {
@@ -378,7 +504,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
 
   // Compaction.
   if (eventType === "response.compaction.in_progress") {
-    return { type: "compaction_in_progress" } satisfies CompactionInProgress;
+    const startedAt = data.started_at;
+    return {
+      type: "compaction_in_progress",
+      ...(typeof startedAt === "number" ? { startedAtS: startedAt } : {}),
+    } satisfies CompactionInProgress;
   }
   if (eventType === "response.compaction.completed") {
     const tt = data.total_tokens;
@@ -430,12 +560,31 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         typeof data.background_task_count === "number" && data.background_task_count >= 0
           ? data.background_task_count
           : undefined;
+      const backgroundTasks = parseBackgroundTasks(data.background_tasks);
+      const rawError = data.error;
+      // Parse via parseErrorInfo so a classified failure's optional
+      // title/cause/remediation flow through, but keep the guard that both
+      // code and message are present (a bare/blank error object is dropped).
+      const error =
+        rawError != null &&
+        typeof rawError === "object" &&
+        typeof (rawError as Record<string, unknown>).code === "string" &&
+        typeof (rawError as Record<string, unknown>).message === "string"
+          ? parseErrorInfo(rawError)
+          : undefined;
+      // Absent = not parked. An empty string is treated the same, so a
+      // blank reason never renders as a dangling parenthetical.
+      const rawBlockedOn = data.blocked_on;
+      const blockedOn = typeof rawBlockedOn === "string" && rawBlockedOn ? rawBlockedOn : undefined;
       return {
         type: "session_status",
         conversationId,
         status,
         responseId,
         backgroundTaskCount,
+        ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+        ...(blockedOn !== undefined ? { blockedOn } : {}),
+        ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }
     return null;
@@ -504,6 +653,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
   }
+  if (eventType === "session.title") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const title = data.title;
+    if (typeof title !== "string" || !title) return null;
+    return { type: "session_title", conversationId, title } satisfies SessionTitleEvent;
+  }
   if (eventType === "session.reasoning_effort") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -525,6 +681,28 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       mode,
     } satisfies SessionCollaborationModeEvent;
+  }
+  if (eventType === "session.permission_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const permissionMode = data.permission_mode;
+    if (typeof permissionMode !== "string" || !permissionMode) return null;
+    return {
+      type: "session_permission_mode",
+      conversationId,
+      permissionMode,
+    } satisfies SessionPermissionModeEvent;
+  }
+  if (eventType === "session.codex_approval_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const approvalMode = data.approval_mode;
+    if (typeof approvalMode !== "string" || !approvalMode) return null;
+    return {
+      type: "session_codex_approval_mode",
+      conversationId,
+      approvalMode,
+    } satisfies SessionCodexApprovalModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;
@@ -697,6 +875,23 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       reason: "clear",
     } satisfies SessionSupersededEvent;
   }
+  if (eventType === "session.btw_sidechat") {
+    const conversationId = data.conversation_id;
+    const question = data.question;
+    const answer = data.answer;
+    const truncated = data.truncated;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (typeof question !== "string") return null;
+    if (typeof answer !== "string") return null;
+    if (typeof truncated !== "boolean") return null;
+    return {
+      type: "session_btw_sidechat",
+      conversationId,
+      question,
+      answer,
+      truncated,
+    } satisfies SessionBtwSidechatEvent;
+  }
   if (eventType === "session.resource.created") {
     const resource = parseSessionResource(data.resource);
     if (resource === null) return null;
@@ -841,6 +1036,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // offers the "Accept & allow all edits" button (switches the
     // session to acceptEdits mode on accept).
     const allowAllEdits = p.allow_all_edits === true;
+    const allowAutoMode = p.allow_auto_mode === true;
     // claude-native non-edit tool prompts stamp this so the ApprovalCard
     // offers the persistent "don't ask again" button (installs a
     // session-scoped allow rule on accept). `tool` is the gated tool;
@@ -860,6 +1056,23 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 : undefined,
           }
         : null;
+    const codexMetaRaw = p["_meta"];
+    const codexMeta =
+      codexMetaRaw && typeof codexMetaRaw === "object" && !Array.isArray(codexMetaRaw)
+        ? (codexMetaRaw as Record<string, unknown>)
+        : null;
+    const codexPersistRaw =
+      codexMeta?.codex_approval_kind === "mcp_tool_call" ? codexMeta.persist : null;
+    const codexPersistCandidates = Array.isArray(codexPersistRaw)
+      ? codexPersistRaw
+      : [codexPersistRaw];
+    const codexPersistModes = [
+      ...new Set(
+        codexPersistCandidates.filter(
+          (value): value is CodexPersistMode => value === "session" || value === "always",
+        ),
+      ),
+    ];
     return {
       type: "elicitation_request",
       elicitationId,
@@ -899,16 +1112,26 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
             }
           : null,
       allowAllEdits,
+      allowAutoMode,
       rememberScope,
+      codexPersistModes,
     } satisfies ElicitationRequest;
   }
 
   if (eventType === "response.elicitation_resolved") {
     const elicitationId = data.elicitation_id;
     if (typeof elicitationId !== "string" || !elicitationId) return null;
+    const action = data.action;
+    const hasVerdict = action === "accept" || action === "decline" || action === "cancel";
     return {
       type: "elicitation_resolved",
       elicitationId,
+      // Keep the verdict when present so the card can show it instead
+      // of the ambiguous "Resolved elsewhere" pill.
+      ...(hasVerdict ? { action } : {}),
+      // Only a verdict-less clear may say why: "unanswered" means the
+      // prompt expired, so the card can tell the user what to do next.
+      ...(!hasVerdict && data.reason === "unanswered" ? { reason: data.reason } : {}),
     } satisfies ElicitationResolved;
   }
 
@@ -956,6 +1179,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   const itemType = String(rec.type ?? "");
   const itemId = String(rec.id ?? "");
   const responseId = String(rec.response_id ?? "");
+  const messageId = typeof data.message_id === "string" ? data.message_id : undefined;
 
   if (itemType === "function_call") {
     const argsStr = String(rec.arguments ?? "{}");
@@ -992,10 +1216,28 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     const content = rec.content;
     return {
       type: "message_done",
-      content: Array.isArray(content) ? (content as Array<Record<string, unknown>>) : [],
+      content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
+      ...(messageId !== undefined ? { messageId } : {}),
     } satisfies MessageDone;
+  }
+
+  if (itemType === "reasoning") {
+    // Same join as the history path (`itemsToBlocks.reasoningToBlock`)
+    // so live and reloaded transcripts render the thought identically.
+    const text = joinedBlockText(rec.content);
+    const summary = joinedBlockText(rec.summary);
+    // Redacted/empty reasoning has no readable text anywhere — nothing
+    // to render, so don't emit a dead reasoning section.
+    if (!text && !summary) return null;
+    return {
+      type: "reasoning_done",
+      text,
+      summary,
+      itemId,
+      responseId,
+    } satisfies ReasoningDone;
   }
 
   if (itemType === "error") {
@@ -1006,6 +1248,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       error: {
         code: String(rec.code ?? ""),
         message: String(rec.message ?? ""),
+        ...(rec.level === "info" ? { level: "info" as const } : {}),
       },
       itemId,
       responseId,
@@ -1046,6 +1289,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
       ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),
+      routing: routingExtrasFromWire(rec),
       itemId,
       responseId,
     } satisfies RoutingDecision;
@@ -1073,8 +1317,21 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies NativeToolCall;
   }
 
-  // Compaction items, reasoning items, etc. — skip.
+  // Compaction items, etc. — skip.
   return null;
+}
+
+/** Join `{text}` blocks the way `itemsToBlocks` does (`"\n\n"`). */
+function joinedBlockText(raw: unknown): string {
+  if (!Array.isArray(raw)) return "";
+  return raw
+    .map((b) =>
+      b && typeof b === "object" && !Array.isArray(b)
+        ? String((b as Record<string, unknown>).text ?? "")
+        : "",
+    )
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function parseResponse(data: Record<string, unknown>): Response {
@@ -1125,7 +1382,7 @@ function responseFromJson(d: Record<string, unknown>): Response {
     id: String(d.id ?? ""),
     status: String(d.status ?? ""),
     model: String(d.model ?? ""),
-    output: Array.isArray(d.output) ? (d.output as Array<Record<string, unknown>>) : [],
+    output: Array.isArray(d.output) ? (d.output as Record<string, unknown>[]) : [],
     createdAt: Number(d.created_at ?? 0),
     completedAt: d.completed_at != null ? Number(d.completed_at) : null,
     previousResponseId: d.previous_response_id != null ? String(d.previous_response_id) : null,
@@ -1141,7 +1398,12 @@ function responseFromJson(d: Record<string, unknown>): Response {
 function parseErrorInfo(raw: unknown): ErrorInfo {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const r = raw as Record<string, unknown>;
-    return { code: String(r.code ?? ""), message: String(r.message ?? "") };
+    const info: ErrorInfo = { code: String(r.code ?? ""), message: String(r.message ?? "") };
+    if (typeof r.title === "string" && r.title) info.title = r.title;
+    if (typeof r.cause === "string" && r.cause) info.cause = r.cause;
+    if (typeof r.remediation === "string" && r.remediation) info.remediation = r.remediation;
+    if (r.level === "info") info.level = "info";
+    return info;
   }
   return { code: "", message: String(raw ?? "") };
 }

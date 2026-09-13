@@ -10,6 +10,7 @@ ground here would just duplicate.
 from __future__ import annotations
 
 import pytest
+from fastapi import FastAPI
 
 from omnigent.runtime.harnesses import _runner
 
@@ -148,3 +149,99 @@ def test_load_harness_app_loads_test_fixture() -> None:
     # The harness name is also stashed for introspection /
     # logging — verifies the second app.state plumbing.
     assert app.state.harness == "test"
+
+
+def test_create_uvicorn_config_for_unix_socket() -> None:
+    config = _runner._create_uvicorn_config(FastAPI(), "/tmp/runner.sock", None)
+
+    assert config.uds == "/tmp/runner.sock"
+    assert config.timeout_graceful_shutdown == _runner._GRACEFUL_SHUTDOWN_TIMEOUT_S
+    assert config.log_level == _runner._UVICORN_LOG_LEVEL
+
+
+def test_create_uvicorn_config_for_tcp_bind() -> None:
+    config = _runner._create_uvicorn_config(FastAPI(), None, "127.0.0.1:8765")
+
+    assert config.host == "127.0.0.1"
+    assert config.port == 8765
+    assert config.timeout_graceful_shutdown == _runner._GRACEFUL_SHUTDOWN_TIMEOUT_S
+    assert config.log_level == _runner._UVICORN_LOG_LEVEL
+
+
+def test_create_uvicorn_config_requires_endpoint() -> None:
+    with pytest.raises(SystemExit, match="exactly one of --socket or --bind"):
+        _runner._create_uvicorn_config(FastAPI(), None, None)
+
+
+# ---------------------------------------------------------------------------
+# Log destination: a harness child's logs must land in a readable file
+# ---------------------------------------------------------------------------
+
+
+def test_configure_logging_writes_to_the_parents_log_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the runner published a log path, harness lines join that file.
+
+    Keeps a harness line next to the spawn that caused it, instead of in a
+    separate file an operator has to know to look for.
+    """
+    import logging
+
+    from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+
+    parent_log = tmp_path / "runner.log"
+    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(parent_log))
+    _reset_omnigent_log_handlers()
+
+    _runner._configure_logging("acp", "conv_abc")
+    logging.getLogger("omnigent.inner.acp_executor").warning("acp[Grok] boom")
+
+    assert "acp[Grok] boom" in parent_log.read_text()
+
+
+def test_configure_logging_falls_back_to_a_per_conversation_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no parent log path, the child still gets its own file."""
+    import logging
+
+    from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+
+    monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    _reset_omnigent_log_handlers()
+
+    _runner._configure_logging("acp", "conv_xyz")
+    logging.getLogger("omnigent.inner.acp_executor").warning("acp[Grok] boom")
+
+    written = list((tmp_path / "logs" / "harness").glob("acp-conv_xyz-*.log"))
+    assert written, "expected a per-conversation harness log"
+    assert "acp[Grok] boom" in written[0].read_text()
+
+
+def test_configure_logging_survives_an_unwritable_log_dir(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Logging is diagnostics: a bad log dir must not stop a harness serving."""
+    from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+
+    monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
+    # A file where the logs/ directory needs to be: mkdir raises underneath.
+    blocked = tmp_path / "data"
+    blocked.write_text("not a directory")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(blocked))
+    _reset_omnigent_log_handlers()
+
+    _runner._configure_logging("acp", "conv_bad")  # must not raise
+
+
+def _reset_omnigent_log_handlers() -> None:
+    """Drop handlers a previous test attached, so each case asserts its own file."""
+    import logging
+
+    for name in ("", "omnigent", "uvicorn"):
+        logger = logging.getLogger(name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()

@@ -80,6 +80,13 @@ _runner_router: RunnerRouter | None = None
 # terminal-attach proxy to bridge xterm.js frames to the runner WS.
 _runner_ws_factory: Any | None = None  # Callable[[str], AsyncContextManager[ClientConnection]]
 
+# Resolver from conversation id to the pinned runner's advertised
+# loopback direct-attach endpoint (see
+# ``omnigent.server._runner_ws_tunnel.make_direct_attach_resolver``).
+# Lets the terminals API hand a same-machine browser a relay-free
+# attach URL; ``None`` outside tunnel-serving deployments.
+_runner_direct_attach_resolver: Any | None = None  # Callable[[str], DirectAttachEndpoint | None]
+
 # Optional fixed runner id for the legacy/test direct runner-client
 # path. Production dispatch uses _runner_router and conversation
 # affinity instead of this process-wide id.

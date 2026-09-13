@@ -17,7 +17,10 @@ importing ``cli.py`` to keep that dependency direction clean.
 from __future__ import annotations
 
 import contextlib
+import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,17 +29,52 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
-import psutil
+import psutil  # type: ignore[import-untyped]
 
+from omnigent.config import global_config_path
 from omnigent.inner import _proc
+from omnigent.process_logging import (
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    open_process_log_file,
+)
+
+_logger = logging.getLogger(__name__)
 
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
+
+# Hard cap on waiting for a server that outlived the ready timeout with its
+# process still alive. A first boot (cold imports + DB migrations) has taken
+# ~40s in the wild; adopting a slow boot beats failing a server that is
+# seconds from healthy — and then leaking it.
+_LOCAL_SERVER_BOOT_CEILING_SECONDS = 120.0
 
 # Max seconds to wait for a bind-race-doomed server child's natural
 # EADDRINUSE exit before the terminate backstop. Matches the readiness
 # budget, which a full child boot (cold imports + DB migrations + bind)
 # is known to fit inside.
 _DOOMED_CHILD_EXIT_GRACE_S = _LOCAL_SERVER_READY_TIMEOUT_SECONDS
+
+
+class LocalServerStartupError(click.ClickException):
+    """
+    The background local Omnigent server failed to start or become ready.
+
+    A dedicated :class:`click.ClickException` subclass so the top-level CLI
+    can tell a server-startup failure apart from a stale-host tunnel
+    rejection: the real cause (a missing dependency, a port conflict, a
+    schema mismatch) lives in the server log, and ``omnigent stop`` cannot
+    fix it. The class-level marker (read by
+    :func:`omnigent.cli_diagnostics.suppresses_recovery_hint`) suppresses
+    the otherwise-misleading stale-host recovery hint. Kept a
+    ``ClickException`` so existing ``except click.ClickException`` handlers
+    (e.g. in :func:`ensure_local_omnigent_server`) still catch it and its
+    exit-code / ``show()`` behavior is unchanged.
+    """
+
+    #: Read duck-typed by ``cli_diagnostics.suppresses_recovery_hint`` — see
+    #: ``cli_diagnostics.SUPPRESS_RECOVERY_HINT_ATTR``.
+    omnigent_suppress_recovery_hint = True
 
 
 def _local_data_dir() -> Path:
@@ -75,14 +113,14 @@ _LOCAL_SERVER_PID_PATH = _local_data_dir() / "local_server.pid"
 _LOCAL_SERVER_SIG_PATH = _local_data_dir() / "local_server.sig"
 
 # Sidecar carrying the absolute path of the background server's captured
-# stdout/stderr log file (one line). Lets `server start` / `server status`
-# point at the exact ``logs/server/local-server-*.log`` even when reusing a
+# stdout/stderr log file (one line). Lets `server --background` / `server status`
+# point at the exact ``logs/server/server-*.log`` even when reusing a
 # server this invocation didn't spawn. Absent for a foreground
 # ``omnigent server`` (its logs stream to the terminal, not a file).
 _LOCAL_SERVER_LOG_REF_PATH = _local_data_dir() / "local_server.logpath"
 
 
-def server_config_signature() -> str:
+def server_config_signature(*, include_features: bool = True) -> str:
     """
     Compute a signature of the server-affecting config for one invocation.
 
@@ -96,7 +134,10 @@ def server_config_signature() -> str:
     Covers the inputs that change server behavior at spawn time:
 
     * the resolved auth source — auth mode is baked at boot and cannot be
-      reconfigured in place; and
+      reconfigured in place;
+    * the enabled release-feature set — features are snapshotted at boot; and
+    * custom session-title instructions — title metadata is configured at boot;
+      and
     * the installed package version — a running server holds its code in
       memory, so after ``omni upgrade`` (or a manual ``uv tool upgrade``)
       the old process keeps serving pre-upgrade code until it is cycled.
@@ -108,13 +149,23 @@ def server_config_signature() -> str:
     Deliberately narrow otherwise, so unrelated env churn does not force
     needless restarts.
 
+    :param include_features: Include server release features. Remote host
+        daemons connect to a separately managed server, so their signatures
+        exclude local server features.
     :returns: A short hex digest, e.g. ``"3f9a1c2b4d5e6f70"``.
     """
     import hashlib
     import importlib.metadata
-    import json
 
     from omnigent.server.auth import resolve_auth_source
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.server.server_config import session_title_instructions
+
+    title_instructions = None
+    if include_features:
+        from omnigent.config import load_global_config
+
+        title_instructions = session_title_instructions(load_global_config())
 
     try:
         version = importlib.metadata.version("omnigent")
@@ -123,7 +174,15 @@ def server_config_signature() -> str:
         # nothing to key version-drift on, so leave it out of the payload.
         version = ""
 
-    payload = json.dumps({"auth": resolve_auth_source(), "version": version}, sort_keys=True)
+    payload = json.dumps(
+        {
+            "auth": resolve_auth_source(),
+            "features": (resolve_feature_flags().enabled_names() if include_features else ()),
+            "session_title_instructions": title_instructions,
+            "version": version,
+        },
+        sort_keys=True,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -140,7 +199,7 @@ def _pid_alive(pid: int) -> bool:
     :returns: ``True`` if the process exists and is not a zombie.
     """
     try:
-        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        return bool(psutil.Process(pid).status() != psutil.STATUS_ZOMBIE)
     except psutil.NoSuchProcess:
         # Includes psutil.ZombieProcess (a NoSuchProcess subclass), raised
         # on platforms where a zombie's status cannot be queried at all.
@@ -189,7 +248,7 @@ def local_server_url_if_healthy() -> str | None:
         return None
     base_url = f"http://127.0.0.1:{port}"
     try:
-        resp = httpx.get(f"{base_url}/health", timeout=2.0)
+        resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
     except httpx.HTTPError:
         return None
     if resp.status_code == 200:
@@ -213,7 +272,7 @@ def _write_local_server_record(
     :param port: Loopback port the server bound, e.g. ``6767``.
     :param sig: Config signature from :func:`server_config_signature`.
     :param log_path: Absolute path of the spawned server's captured log file,
-        e.g. ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``.
+        e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``.
         ``None`` for a foreground server whose logs stream to the terminal —
         any stale log-ref sidecar is then removed so status never reports a
         log file that doesn't apply to the running server.
@@ -237,7 +296,7 @@ def _read_local_server_log_path() -> Path | None:
     """Read the running local server's captured-log path from its sidecar.
 
     :returns: The absolute log path the background server writes to, e.g.
-        ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``, or
+        ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``, or
         ``None`` when the sidecar is absent (foreground server, legacy
         record, or no server) or unreadable.
     """
@@ -374,7 +433,7 @@ class LocalServerInfo:
     :param url: Base URL when running, e.g. ``"http://127.0.0.1:8123"``;
         ``None`` when not running.
     :param log_path: Absolute path of the background server's captured log
-        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``.
+        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``.
         ``None`` for a foreground server (logs stream to its terminal) or a
         legacy record without the log-path sidecar.
     """
@@ -421,8 +480,8 @@ class LocalServerStartup:
         offer to stop a server they actually brought up, never one the user
         started independently.
     :param log_path: Absolute path of the background server's captured log
-        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``
-        — surfaced so callers (``server start``) can point the user at the
+        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``
+        — surfaced so callers (``server --background``) can point the user at the
         exact log. For a spawned server this is the freshly created log; for
         a reused one it is read back from the log-path sidecar, and may be
         ``None`` when the running server is a foreground ``omnigent server``
@@ -511,7 +570,8 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
         # free port, which concurrent spawners never prefer.
         _await_doomed_child_exit(spawned.proc)
         if retried:
-            raise click.ClickException(
+            _record_server_startup_failure(spawned.log_path)
+            raise LocalServerStartupError(
                 f"Local server port contention persists: port {port} is owned by "
                 f"pid {foreign_owner} even after a free-port respawn. "
                 f"Server log: {spawned.log_path}"
@@ -526,7 +586,7 @@ class _SpawnedLocalServer:
 
     :param proc: The ``omnigent server`` subprocess handle.
     :param log_path: File capturing the child's stdout/stderr, e.g.
-        ``Path("~/.omnigent/logs/server/local-server-ab12cd.log")``.
+        ``Path("~/.omnigent/logs/server/server-ab12cd.log")``.
     :param base_url: Loopback URL the child was asked to bind, e.g.
         ``"http://127.0.0.1:6767"``.
     """
@@ -597,12 +657,15 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # file (e.g. to point a worktree at its own Postgres). Defaults to the
     # isolated sqlite db under the runtime data dir.
     db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or f"sqlite:///{db_path}"
+    if db_uri.startswith(("postgres://", "postgresql://")):
+        # Canonicalize to the psycopg 3 dialect like the Docker entrypoint
+        # does; an explicit +psycopg2 dialect is respected as user intent.
+        # Imported lazily: db.utils pulls SQLAlchemy onto the CLI path.
+        from omnigent.db.utils import normalize_database_url
 
-    log_dir = data_dir / "logs" / "server"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_fd, log_name = tempfile.mkstemp(prefix="local-server-", suffix=".log", dir=log_dir)
-    log_path = Path(log_name)
-    log_fh = os.fdopen(log_fd, "wb")
+        db_uri = normalize_database_url(db_uri)
+
+    log_path, log_fh = open_process_log_file("server", root=data_dir / "logs")
 
     # Pass the full parent env: this server IS the local runtime —
     # loopback-only, same single user, and it needs the LLM creds to
@@ -617,7 +680,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # POV, `omnigent run` (no --server) in accounts mode gets
     # "browser auto-opens signed in + TUI auto-signed in" once
     # the spawned server's bootstrap fires.
-    child_env = {**os.environ}
+    child_env = {**os.environ, PROCESS_LOG_FILE_ENV_VAR: str(log_path)}
     # Mirror create_auth_provider's resolution via the shared helper so the
     # daemon-owned server agrees with the server's own auth wiring: header is
     # the env-unset default; OMNIGENT_AUTH_ENABLED=1 opts into accounts (or
@@ -645,26 +708,29 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
         child_env["OMNIGENT_ACCOUNTS_BASE_URL"] = f"http://127.0.0.1:{port}"
 
     try:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                db_uri,
-                "--artifact-location",
-                str(artifact_path),
-            ],
-            env=child_env,
-            stdout=log_fh,
-            stderr=log_fh,
-            **_proc.spawn_kwargs(),
-        )
+        with child_logging_popen_kwargs(child_env) as logging_kwargs:
+            proc: subprocess.Popen[bytes] = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "omnigent.cli",
+                    "server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--database-uri",
+                    db_uri,
+                    "--artifact-location",
+                    str(artifact_path),
+                    *(["--config", str(p)] if (p := global_config_path()).exists() else []),
+                ],
+                env=child_env,
+                stdout=log_fh,
+                stderr=log_fh,
+                **_proc.spawn_kwargs(),
+                **logging_kwargs,
+            )
     finally:
         log_fh.close()
 
@@ -760,7 +826,7 @@ def _local_server_health_ok(base_url: str) -> bool:
     import httpx
 
     try:
-        resp = httpx.get(f"{base_url}/health", timeout=2.0)
+        resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
     except httpx.HTTPError:
         return False
     if resp.status_code != 200:
@@ -843,8 +909,16 @@ def _wait_for_local_omnigent_server(
     proc: subprocess.Popen[bytes],
     log_path: Path,
     timeout: float = _LOCAL_SERVER_READY_TIMEOUT_SECONDS,
+    boot_ceiling: float = _LOCAL_SERVER_BOOT_CEILING_SECONDS,
 ) -> None:
     """Poll the background local server's ``/health`` until ready.
+
+    A server that outlives *timeout* with its process still alive is treated
+    as a slow boot and adopted by waiting up to *boot_ceiling* total, instead
+    of failing a server that is seconds from healthy. On final failure the
+    spawned child is stopped before raising — a raise here must never leave a
+    running server behind that nothing tracks anymore (the failure path
+    clears the pidfile record).
 
     :param base_url: Loopback server URL, e.g. ``"http://127.0.0.1:8123"``.
     :param proc: The server subprocess; early exit is detected via
@@ -852,7 +926,8 @@ def _wait_for_local_omnigent_server(
     :param log_path: Captured stdout/stderr log surfaced on failure so the
         underlying traceback (spec parse error, port clash, import failure)
         is visible.
-    :param timeout: Max seconds to wait for readiness.
+    :param timeout: Seconds to wait before considering the boot slow.
+    :param boot_ceiling: Cap on the total wait for a slow-but-alive boot.
     :raises click.ClickException: If the server exits or never answers.
     """
     import time
@@ -860,11 +935,22 @@ def _wait_for_local_omnigent_server(
     import httpx
 
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    ceiling = time.monotonic() + max(timeout, boot_ceiling)
+    slow_boot_logged = False
+    while time.monotonic() < ceiling:
         if proc.poll() is not None:
             _raise_local_server_failed(base_url, log_path)
+        if not slow_boot_logged and time.monotonic() >= deadline:
+            slow_boot_logged = True
+            _logger.info(
+                "Local server (pid %d) not ready after %.0fs but still "
+                "running — likely a slow boot; waiting up to %.0fs total",
+                proc.pid,
+                timeout,
+                max(timeout, boot_ceiling),
+            )
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=2.0)
+            resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
             if resp.status_code == 200:
                 return
         except httpx.TransportError:
@@ -875,29 +961,178 @@ def _wait_for_local_omnigent_server(
             # rather than crash on.
             pass
         time.sleep(0.2)
+    # The child never became healthy: stop it before reporting failure so the
+    # raise does not strand a running, untracked server. Popen-reap it too —
+    # this process spawned it, so an unreaped kill would leave a zombie.
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=_STOP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5.0)
     _raise_local_server_failed(base_url, log_path)
 
 
 def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
     """Raise a descriptive error for a failed background-server startup.
 
+    Also records the failing log's path in a sidecar (see
+    :func:`consume_failed_server_log_tail`): this function usually runs inside
+    the *daemon*, whose exception never reaches the user's terminal — the
+    sidecar is how the foreground CLI later finds the exact log of the spawn
+    that just failed, rather than guessing by mtime.
+
     :param base_url: The loopback URL the server was meant to bind.
     :param log_path: Captured stdout/stderr log file.
-    :raises click.ClickException: Always.
+    :raises LocalServerStartupError: Always.
     """
-    try:
-        lines = log_path.read_text(errors="replace").splitlines()
-        tail = "\n".join(lines[-50:]) if lines else "(empty log file)"
-    except OSError as exc:
-        tail = f"(could not read log file: {exc})"
+    tail = _read_log_tail(log_path)
+    _record_server_startup_failure(log_path)
     # A failed spawn leaves a misleading pidfile; clear it (and the sig
     # sidecar) so the next invocation does not try to reuse a dead entry.
     with contextlib.suppress(OSError):
         _LOCAL_SERVER_PID_PATH.unlink()
     with contextlib.suppress(OSError):
         _LOCAL_SERVER_SIG_PATH.unlink()
-    raise click.ClickException(
+    raise LocalServerStartupError(
         f"Background local server failed to start ({base_url}).\n"
         f"  Server log: {log_path}\n"
         f"\n  Last 50 lines:\n{tail}"
     )
+
+
+# ANSI escapes (CSI + lone ESC-<final>) and C0 controls except newline/tab:
+# stripped before terminal display so logs cannot inject terminal control.
+_ANSI_OR_CONTROL = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f]")
+
+# Max age (seconds) for a failure record's log: the failing spawn happened
+# within this CLI invocation's discovery window, so older ones are stale.
+_SERVER_LOG_FRESHNESS_S = 300.0
+
+# Tail reads take the last block only — server logs can be hundreds of MB.
+_TAIL_MAX_BYTES = 65536
+
+
+def _server_failure_record_path() -> Path:
+    """Return the sidecar path recording the last failed server spawn's log.
+
+    Counterpart to ``_LOCAL_SERVER_LOG_REF_PATH`` (which records a *running*
+    server's log): that sidecar is only written once a spawn is healthy, so a
+    failed spawn's log path would otherwise be known solely to the daemon
+    that just died.
+    """
+    return _local_data_dir() / "local_server_failed.logpath"
+
+
+def _record_server_startup_failure(log_path: Path) -> None:
+    """Best-effort: persist which server log the failing spawn wrote.
+
+    Two lines: the log path and this process's PID. The PID is what lets
+    :func:`consume_failed_server_log_tail` attribute the record to the exact
+    daemon attempt the reading CLI was waiting on — the writer is the daemon
+    (or a foreground ``ensure_local_omnigent_server`` caller), so a record
+    from any other attempt fails the match and is dropped, never displayed.
+
+    :param log_path: The failed spawn's captured stdout/stderr log.
+    """
+    with contextlib.suppress(OSError):
+        _atomic_write(_server_failure_record_path(), f"{log_path}\n{os.getpid()}\n")
+
+
+def _read_log_tail(log_path: Path, max_lines: int = 50) -> str:
+    """Return the sanitized last *max_lines* lines of *log_path*.
+
+    Reads at most :data:`_TAIL_MAX_BYTES` from the end of the file (never the
+    whole log), strips terminal escape/control sequences, and redacts
+    secret-shaped substrings — including URL userinfo such as
+    ``postgresql+psycopg://user:password@host`` from a migration error's
+    copy-pasteable command — because this text is displayed on terminals and
+    routinely ends up pasted into bug reports.
+
+    When the byte window starts mid-file, the chopped first line is discarded
+    rather than surfaced: a fragment whose ``scheme://`` prefix fell outside
+    the window would evade the URL-userinfo redaction and could leak
+    ``user:password@host``.
+
+    :param log_path: Log file to tail.
+    :param max_lines: How many trailing lines to keep, e.g. ``50``.
+    :returns: The sanitized tail, or a short placeholder when the file is
+        empty/unreadable (never raises).
+    """
+    from omnigent.cli_diagnostics import redact_secrets
+
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            offset = max(0, size - _TAIL_MAX_BYTES)
+            fh.seek(offset)
+            raw = fh.read(_TAIL_MAX_BYTES).decode(errors="replace")
+    except OSError as exc:
+        return f"(could not read log file: {exc})"
+    lines = raw.splitlines()
+    if not lines:
+        return "(empty log file)"
+    if offset:
+        # The window starts mid-file, so the first decoded line is (almost
+        # always) the chopped remainder of a longer line. A fragment whose
+        # ``scheme://`` prefix fell outside the window would defeat the
+        # URL-userinfo redaction below and leak ``user:password@host`` —
+        # exactly what this tail promises to scrub — so drop the partial
+        # line entirely: better a missing line than a credential-bearing one.
+        del lines[0]
+        if not lines:
+            return "(log tail suppressed: last line exceeds the tail read window)"
+    tail = "\n".join(lines[-max_lines:])
+    return redact_secrets(_ANSI_OR_CONTROL.sub("", tail))
+
+
+def consume_failed_server_log_tail(
+    daemon_pid: int | None, max_lines: int = 50
+) -> tuple[Path, str] | None:
+    """Return (and clear) the failed server spawn's log tail, if attributable.
+
+    In the daemon-owned startup path the server crashes in a subprocess of
+    the daemon, so the CLI process never held the failing log's path — but
+    the daemon recorded it (with its own PID) via
+    :func:`_record_server_startup_failure` just before dying. The record is
+    surfaced only when it is *attributable to the attempt the caller was
+    waiting on*: the recorded PID must equal *daemon_pid*, and the log's own
+    mtime must fall within :data:`_SERVER_LOG_FRESHNESS_S`. Freshness alone
+    is not correlation — a record from an earlier failure or a concurrent
+    foreground ``omnigent server`` must never be presented as this attempt's
+    cause. The record is consumed on read regardless of match, so it can
+    never resurface later.
+
+    :param daemon_pid: PID of the daemon this CLI attempt was waiting on,
+        or ``None`` when unknown — then nothing can be attributed and the
+        result is always ``None``.
+    :param max_lines: How many trailing lines to return, e.g. ``50``.
+    :returns: ``(log_path, sanitized_tail)``, or ``None`` when there is no
+        attributable fresh record (never raises).
+    """
+    record_path = _server_failure_record_path()
+    try:
+        lines = record_path.read_text().splitlines()
+    except OSError:
+        return None
+    with contextlib.suppress(OSError):
+        record_path.unlink()
+    if daemon_pid is None or len(lines) < 2:
+        return None
+    try:
+        recorded_pid = int(lines[1].strip())
+    except ValueError:
+        return None
+    if recorded_pid != daemon_pid or not lines[0].strip():
+        return None
+    log_path = Path(lines[0].strip())
+    try:
+        mtime = log_path.stat().st_mtime
+    except OSError:
+        return None
+    if time.time() - mtime > _SERVER_LOG_FRESHNESS_S:
+        return None
+    return log_path, _read_log_tail(log_path, max_lines)

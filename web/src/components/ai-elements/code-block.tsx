@@ -23,7 +23,6 @@ import {
   useState,
 } from "react";
 import type { BundledLanguage, BundledTheme, HighlighterGeneric, ThemedToken } from "shiki";
-import { createHighlighter } from "shiki";
 
 // Shiki uses bitflags for font styles: 1=italic, 2=bold, 4=underline
 // oxlint-disable-next-line eslint(no-bitwise)
@@ -106,6 +105,8 @@ type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   code: string;
   language: BundledLanguage;
   showLineNumbers?: boolean;
+  /** Soft-wrap long lines instead of horizontal scrolling. */
+  wrap?: boolean;
 };
 
 interface TokenizedCode {
@@ -149,10 +150,14 @@ const getHighlighter = (
     return cached;
   }
 
-  const highlighterPromise = createHighlighter({
-    langs: [language],
-    themes: ["github-light", "github-dark"],
-  });
+  // Import Shiki's engine lazily so its core (incl. the WASM regex engine)
+  // stays out of the main bundle and only loads when a code block renders.
+  const highlighterPromise = import("shiki").then(({ createHighlighter }) =>
+    createHighlighter({
+      langs: [language],
+      themes: ["github-light", "github-dark"],
+    }),
+  );
 
   highlighterCache.set(language, highlighterPromise);
   return highlighterPromise;
@@ -262,14 +267,14 @@ const CodeBlockBody = memo(
     return (
       <pre
         className={cn(
-          "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)] m-0 p-4 text-sm",
+          "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)] m-0 p-4 text-ui",
           className,
         )}
         style={preStyle}
       >
         <code
           className={cn(
-            "font-mono text-sm",
+            "font-mono text-ui",
             showLineNumbers && "[counter-increment:line_0] [counter-reset:line]",
           )}
         >
@@ -300,11 +305,7 @@ export const CodeBlockContainer = ({
       className,
     )}
     data-language={language}
-    style={{
-      containIntrinsicSize: "auto 200px",
-      contentVisibility: "auto",
-      ...style,
-    }}
+    style={style}
     {...props}
   />
 );
@@ -316,7 +317,7 @@ export const CodeBlockHeader = ({
 }: HTMLAttributes<HTMLDivElement>) => (
   <div
     className={cn(
-      "flex items-center justify-between border-b bg-muted/80 px-3 py-2 text-muted-foreground text-xs",
+      "flex items-center justify-between border-b bg-muted/80 px-3 py-2 text-muted-foreground text-sm",
       className,
     )}
     {...props}
@@ -359,10 +360,13 @@ export const CodeBlockContent = ({
   code,
   language,
   showLineNumbers = false,
+  wrap = false,
 }: {
   code: string;
   language: BundledLanguage;
   showLineNumbers?: boolean;
+  /** Soft-wrap long lines instead of horizontal scrolling. */
+  wrap?: boolean;
 }) => {
   // Memoized raw tokens for immediate display
   const rawTokens = useMemo(() => createRawTokens(code), [code]);
@@ -400,8 +404,15 @@ export const CodeBlockContent = ({
   const tokenized = asyncTokens ?? syncTokens;
 
   return (
-    <div className="relative overflow-auto">
-      <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} />
+    <div
+      className="relative overflow-auto"
+      data-code-highlighted={tokenized === rawTokens ? "false" : "true"}
+    >
+      <CodeBlockBody
+        className={wrap ? "whitespace-pre-wrap wrap-anywhere" : undefined}
+        showLineNumbers={showLineNumbers}
+        tokenized={tokenized}
+      />
     </div>
   );
 };
@@ -410,6 +421,7 @@ export const CodeBlock = ({
   code,
   language,
   showLineNumbers = false,
+  wrap = false,
   className,
   children,
   ...props
@@ -420,7 +432,12 @@ export const CodeBlock = ({
     <CodeBlockContext.Provider value={contextValue}>
       <CodeBlockContainer className={className} language={language} {...props}>
         {children}
-        <CodeBlockContent code={code} language={language} showLineNumbers={showLineNumbers} />
+        <CodeBlockContent
+          code={code}
+          language={language}
+          showLineNumbers={showLineNumbers}
+          wrap={wrap}
+        />
       </CodeBlockContainer>
     </CodeBlockContext.Provider>
   );
@@ -492,7 +509,7 @@ export const CodeBlockLanguageSelectorTrigger = ({
   ...props
 }: CodeBlockLanguageSelectorTriggerProps) => (
   <SelectTrigger
-    className={cn("h-7 border-none bg-transparent px-2 text-xs shadow-none", className)}
+    className={cn("h-7 border-none bg-transparent px-2 text-sm shadow-none", className)}
     size="sm"
     {...props}
   />

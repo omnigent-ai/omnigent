@@ -41,6 +41,8 @@ import {
 } from "@/hooks/useChildSessions";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useSessionItems, type RawSessionItem } from "@/hooks/useSessionItems";
+import { useSseEventLog } from "@/hooks/useSseEventLog";
+import type { SseLogEntry } from "@/lib/sseEventLog";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 
@@ -128,6 +130,7 @@ export function ExecutionLogsPanel({
 
   const entries = buildLogEntries(conversationId, children);
   const activeEntry = entries.find((e) => e.key === activeKey) ?? entries[0] ?? null;
+  const [view, setView] = useState<"items" | "sse">("items");
 
   return (
     <aside
@@ -152,7 +155,7 @@ export function ExecutionLogsPanel({
         />
       )}
       <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-3">
-        <h2 className="font-medium text-sm">Execution logs</h2>
+        <h2 className="font-medium text-ui">Execution logs</h2>
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
           <XIcon className="size-4" />
         </Button>
@@ -163,34 +166,67 @@ export function ExecutionLogsPanel({
           <div className="flex-1" />
         ) : (
           <>
-            <Select value={activeEntry.key} onValueChange={setActiveKey}>
-              {/* The trigger already has `w-fit` by default. We add
-                  `self-start` so the flex column doesn't stretch it
-                  across the panel's cross-axis — without this, the
-                  trigger fills the full panel width regardless of
-                  content. */}
-              <SelectTrigger className="self-start">
-                <SelectValue>
-                  <span className="inline-flex items-center gap-2">
-                    <activeEntry.icon className="size-3.5 shrink-0 text-muted-foreground" />
-                    {activeEntry.label}
-                  </span>
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {entries.map((e) => (
-                  <SelectItem key={e.key} value={e.key}>
+            <div className="flex items-center gap-2">
+              <Select value={activeEntry.key} onValueChange={setActiveKey}>
+                {/* The trigger already has `w-fit` by default. We add
+                    `self-start` so the flex column doesn't stretch it
+                    across the panel's cross-axis — without this, the
+                    trigger fills the full panel width regardless of
+                    content. */}
+                <SelectTrigger className="self-start">
+                  <SelectValue>
                     <span className="inline-flex items-center gap-2">
-                      <e.icon className="size-3.5 shrink-0 text-muted-foreground" />
-                      {e.label}
+                      <activeEntry.icon className="size-3.5 shrink-0 text-muted-foreground" />
+                      {activeEntry.label}
                     </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {/* Remount the items list when the session changes so the
-                expand/collapse state resets between selections. */}
-            <SessionItemsList key={activeEntry.sessionId} sessionId={activeEntry.sessionId} />
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {entries.map((e) => (
+                    <SelectItem key={e.key} value={e.key}>
+                      <span className="inline-flex items-center gap-2">
+                        <e.icon className="size-3.5 shrink-0 text-muted-foreground" />
+                        {e.label}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {/* View toggle: conv items vs raw SSE events */}
+              <div className="ml-auto flex rounded-md border border-border text-sm">
+                <button
+                  type="button"
+                  className={cn(
+                    "px-2 py-1 rounded-l-md",
+                    view === "items"
+                      ? "bg-muted font-medium"
+                      : "text-muted-foreground hover:bg-muted/50",
+                  )}
+                  onClick={() => setView("items")}
+                >
+                  Items
+                </button>
+                <button
+                  type="button"
+                  className={cn(
+                    "px-2 py-1 rounded-r-md border-l border-border",
+                    view === "sse"
+                      ? "bg-muted font-medium"
+                      : "text-muted-foreground hover:bg-muted/50",
+                  )}
+                  onClick={() => setView("sse")}
+                >
+                  SSE
+                </button>
+              </div>
+            </div>
+            {view === "items" ? (
+              /* Remount the items list when the session changes so the
+                 expand/collapse state resets between selections. */
+              <SessionItemsList key={activeEntry.sessionId} sessionId={activeEntry.sessionId} />
+            ) : (
+              <SseEventsList key={activeEntry.sessionId} sessionId={activeEntry.sessionId} />
+            )}
           </>
         )}
       </div>
@@ -250,24 +286,24 @@ function SessionItemsList({ sessionId }: { sessionId: string }) {
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   if (isLoading) {
-    return <div className="text-muted-foreground text-xs">Loading…</div>;
+    return <div className="text-muted-foreground text-sm">Loading…</div>;
   }
   if (error) {
-    return <div className="text-destructive text-xs">Failed to load items: {error.message}</div>;
+    return <div className="text-destructive text-sm">Failed to load items: {error.message}</div>;
   }
   if (items.length === 0) {
-    return <div className="text-muted-foreground text-xs">No items</div>;
+    return <div className="text-muted-foreground text-sm">No items</div>;
   }
   return (
     <div
       ref={scrollRootRef}
-      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-xs"
+      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-sm"
     >
       {items.map((item, idx) => (
         <SessionItemEntry key={itemKey(item, idx)} item={item} index={idx + 1} />
       ))}
       {hasNextPage && (
-        <div ref={sentinelRef} className="py-2 text-center text-muted-foreground text-xs">
+        <div ref={sentinelRef} className="py-2 text-center text-muted-foreground text-sm">
           {isFetchingNextPage ? "Loading more…" : ""}
         </div>
       )}
@@ -316,4 +352,64 @@ function SessionItemEntry({ item, index }: { item: RawSessionItem; index: number
 function itemKey(item: RawSessionItem, idx: number): string {
   const id = item.id;
   return typeof id === "string" && id ? id : `idx-${idx}`;
+}
+
+function SseEventsList({ sessionId }: { sessionId: string }) {
+  const entries = useSseEventLog(sessionId);
+  const scrollRootRef = useRef<HTMLDivElement | null>(null);
+
+  // Auto-scroll to bottom as new events arrive.
+  useEffect(() => {
+    const el = scrollRootRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [entries.length]);
+
+  if (entries.length === 0) {
+    return (
+      <div className="text-muted-foreground text-sm">
+        No SSE events yet — events are captured while the agent runs.
+      </div>
+    );
+  }
+  return (
+    <div
+      ref={scrollRootRef}
+      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-sm"
+    >
+      {entries.map((entry) => (
+        <SseEventEntry key={entry.index} entry={entry} />
+      ))}
+    </div>
+  );
+}
+
+function SseEventEntry({ entry }: { entry: SseLogEntry }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const collapsed = JSON.stringify(entry.event);
+  const expanded = JSON.stringify(entry.event, null, 2);
+  const ts = new Date(entry.ts).toISOString().slice(11, 23); // HH:MM:SS.mmm
+  return (
+    <div className="rounded-md border border-border bg-muted/40">
+      <button
+        type="button"
+        aria-expanded={isExpanded}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-muted/60"
+        onClick={() => setIsExpanded((v) => !v)}
+      >
+        {isExpanded ? (
+          <ChevronDownIcon className="size-3 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground" />
+        )}
+        <span className="shrink-0 text-muted-foreground">#{entry.index + 1}</span>
+        <span className="shrink-0 text-muted-foreground">{ts}</span>
+        {!isExpanded && <span className="truncate text-foreground">{collapsed}</span>}
+      </button>
+      {isExpanded && (
+        <pre className="whitespace-pre-wrap break-words border-t border-border px-2 py-1.5 text-foreground">
+          {expanded}
+        </pre>
+      )}
+    </div>
+  );
 }

@@ -15,6 +15,7 @@ import importlib
 import sys
 from pathlib import Path
 from typing import NoReturn
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -85,6 +86,42 @@ def test_entrypoint_imports_without_side_effects(
         assert module_name not in sys.modules
 
 
+def test_run_migrations_uses_central_schema_initializer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deploy.docker.entrypoint import run_migrations
+    from omnigent.db import utils
+
+    engine = MagicMock()
+    create_engine = MagicMock(return_value=engine)
+    initialize = MagicMock()
+    monkeypatch.setattr(utils, "_create_engine", create_engine)
+    monkeypatch.setattr(utils, "_initialize_or_verify_schema", initialize)
+
+    run_migrations("cockroachdb://root@db/omnigent")
+
+    normalized = "cockroachdb+psycopg://root@db/omnigent"
+    create_engine.assert_called_once_with(normalized)
+    initialize.assert_called_once_with(engine, normalized)
+    engine.dispose.assert_called_once_with()
+
+
+def test_run_migrations_preserves_sqlite_startup(tmp_path: Path) -> None:
+    from sqlalchemy import create_engine
+
+    from deploy.docker.entrypoint import run_migrations
+    from omnigent.db.utils import _get_current_db_revision, _get_head_db_revision
+
+    database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
+    run_migrations(database_url)
+
+    engine = create_engine(database_url)
+    try:
+        assert _get_current_db_revision(engine) == _get_head_db_revision(database_url)
+    finally:
+        engine.dispose()
+
+
 # ── artifact-store resolution + selection ────────────────────────────────
 # OMNIGENT_ARTIFACT_URI=s3://… selects the remote S3ArtifactStore (durable on an
 # ephemeral/multi-replica deploy); anything else falls back to local. The URI is
@@ -153,3 +190,48 @@ def test_select_artifact_store(
         port=8000,
     )
     assert isinstance(_select_artifact_store(resolved), expected_type)
+
+
+# ── routing wiring ────────────────────────────────────────────────────────
+# A Docker deploy must honour its own `routing:` block rather than running on
+# all-default knobs, so the settings that reach RuntimeCaps are the parsed ones.
+
+
+def test_build_routing_carries_the_configured_settings() -> None:
+    from deploy.docker.entrypoint import _build_routing
+
+    cfg = {
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/ai-gateway/routing/v1",
+            "router_name": "task_v1",
+            "model_prefix": ["databricks-", "system.ai."],
+        }
+    }
+    client, settings = _build_routing(cfg, None)
+
+    assert settings.model_prefixes == ("databricks-", "system.ai.")
+    assert client is not None
+    assert client._model_prefixes == ["databricks-", "system.ai."]
+
+
+def test_build_routing_defaults_without_a_routing_block() -> None:
+    from deploy.docker.entrypoint import _build_routing
+    from omnigent.server.smart_routing import RoutingSettings
+
+    client, settings = _build_routing({}, None)
+    assert client is None
+    assert settings == RoutingSettings()
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected_timeout"),
+    [
+        ({"execution_timeout": 86_400}, 86_400),
+        ({}, 7_200),
+    ],
+)
+def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -> None:
+    from deploy.docker.entrypoint import _resolve_execution_timeout
+
+    assert _resolve_execution_timeout(cfg) == expected_timeout

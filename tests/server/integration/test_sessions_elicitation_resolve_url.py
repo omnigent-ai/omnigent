@@ -187,14 +187,14 @@ def _create_child_session(
     Create a child conversation under a parent session.
 
     :param db_uri: Test database URI.
-    :param parent_id: Parent session id, e.g. ``"conv_parent"``.
+    :param parent_id: Parent session id, e.g. ``"ead6d59a6b650d19dbdf61ec32426f4e"``.
     :param agent_id: Agent id inherited by the child.
     :param title: Sub-agent title in ``"<agent>:<name>"`` form, e.g.
         ``"codex-child:approval"``. Must be unique per parent — the DB
         enforces ``(parent_conversation_id, title)`` uniqueness, so a
         fan-out test creating multiple children under one parent must
         pass distinct titles.
-    :returns: Child session id, e.g. ``"conv_child"``.
+    :returns: Child session id, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
     """
     store = SqlAlchemyConversationStore(db_uri)
     child = store.create_conversation(
@@ -608,6 +608,7 @@ async def test_child_codex_elicitation_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
 
         resp = await hook_task
@@ -687,6 +688,7 @@ async def test_child_policy_elicitation_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
 
         resp = await evaluate
@@ -704,6 +706,103 @@ async def test_child_policy_elicitation_bubbles_to_parent_stream(
             parent_resolved.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await parent_resolved
+        pending_elicitations.reset_for_tests()
+
+
+async def test_decline_verdict_rides_resolved_events_to_parent(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A declined child gate publishes ``action: "decline"`` on the resolve fan-out.
+
+    Regression for the fabricated-approval transcript bug: resolving a
+    parked sub-agent approval with ``action == "decline"`` via the
+    generic approval event (the exact POST a web card sends) must carry
+    the verdict on both the session's and every ancestor's resolved
+    event. A bare "resolved" left parent agents narrating an approval
+    that did not happen.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
+    agent = await create_test_agent(client, "test-child-decline-verdict")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    parent_subscribed = asyncio.Event()
+    parent_drain = asyncio.create_task(
+        _drain_until_elicitation_event(parent_id, subscribed=parent_subscribed)
+    )
+    await parent_subscribed.wait()
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{child_id}/policies/evaluate",
+            json=_tool_call_request("Bash", {"command": "date"}),
+        )
+    )
+    child_resolved: asyncio.Task[dict[str, Any]] | None = None
+    parent_resolved: asyncio.Task[dict[str, Any]] | None = None
+
+    try:
+        event = await parent_drain
+        elicitation_id = event.get("elicitation_id")
+        assert isinstance(elicitation_id, str) and elicitation_id
+
+        child_subscribed = asyncio.Event()
+        child_resolved = asyncio.create_task(
+            _drain_until_elicitation_resolved(
+                child_id,
+                elicitation_id,
+                subscribed=child_subscribed,
+            )
+        )
+        await child_subscribed.wait()
+        parent_resolved_subscribed = asyncio.Event()
+        parent_resolved = asyncio.create_task(
+            _drain_until_elicitation_resolved(
+                parent_id,
+                elicitation_id,
+                subscribed=parent_resolved_subscribed,
+            )
+        )
+        await parent_resolved_subscribed.wait()
+
+        # The exact POST shape from the repro: generic approval event,
+        # payload nested under ``data``, action decline.
+        verdict = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "approval",
+                "data": {"elicitation_id": elicitation_id, "action": "decline"},
+            },
+        )
+        assert verdict.status_code == 202, verdict.text
+
+        assert await child_resolved == {
+            "type": "response.elicitation_resolved",
+            "elicitation_id": elicitation_id,
+            "action": "decline",
+        }
+        assert await parent_resolved == {
+            "type": "response.elicitation_resolved",
+            "elicitation_id": elicitation_id,
+            "action": "decline",
+        }
+
+        resp = await evaluate
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    finally:
+        if not evaluate.done():
+            evaluate.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await evaluate
+        for task in (child_resolved, parent_resolved):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         pending_elicitations.reset_for_tests()
 
 
@@ -797,6 +896,7 @@ async def test_child_mcp_elicitation_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
     finally:
         for task in [parent_drain, parent_resolved]:
@@ -872,6 +972,7 @@ async def test_child_claude_ask_user_question_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
 
         resp = await hook_task
@@ -973,7 +1074,7 @@ class _InputRequiredRunnerClient:
         Record the execute payload and return the scripted response.
 
         :param url: Runner path, e.g.
-            ``"/v1/sessions/conv_child/mcp/execute"``.
+            ``"/v1/sessions/ff5cac23d0beb79fad914046049f32ff/mcp/execute"``.
         :param json: The request body.
         :param timeout: Forward timeout (ignored by the stub).
         :returns: A real ``httpx.Response`` with the scripted JSON.
@@ -1268,7 +1369,7 @@ async def test_resolve_url_unknown_session_returns_404(
     URL fails loud rather than silently no-op'ing.
     """
     resp = await client.post(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope/resolve",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope/resolve",
         json={"action": "accept"},
     )
     assert resp.status_code == 404, resp.text
@@ -1417,7 +1518,7 @@ async def test_elicitation_page_unknown_session_returns_404(
     Requesting the page for a nonexistent session returns 404.
     """
     resp = await client.get(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope",
     )
     assert resp.status_code == 404, resp.text
 
@@ -1456,13 +1557,13 @@ def test_mrtr_response_url_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         rpc_id=1,
         elicitation_id="elicit_abc",
         message="Approve?",
-        request_state='{"elicitation_id":"elicit_abc","session_id":"conv_123"}',
-        session_id="conv_123",
+        request_state='{"elicitation_id":"elicit_abc","session_id":"0099dc8be6d82871e2e450424d46d1b7"}',
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]
     assert params["mode"] == "url"
-    assert params["url"] == "/approve/conv_123/elicit_abc"
+    assert params["url"] == "/approve/0099dc8be6d82871e2e450424d46d1b7/elicit_abc"
     assert params["message"] == "Approve?"
 
 
@@ -1481,7 +1582,7 @@ def test_mrtr_response_form_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         elicitation_id="elicit_abc",
         message="Approve?",
         request_state="{}",
-        session_id="conv_123",
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]

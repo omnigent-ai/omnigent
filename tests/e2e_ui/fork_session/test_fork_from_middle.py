@@ -77,7 +77,7 @@ def test_fork_from_middle_truncates_history(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
 
     # Turn 1 (KEPT): plant the first code word and wait for its reply so the
@@ -113,7 +113,7 @@ def test_fork_from_middle_truncates_history(
     # Land in a DIFFERENT session — a URL still on the source means
     # navigation never fired; a visible dialog means the fork call failed.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     expect(dialog).not_to_be_visible()
@@ -142,7 +142,7 @@ def test_fork_from_middle_truncates_history(
     # (2) Recall: ask the clone what it was told to remember. The reply must
     # echo the kept word and never the dropped one. The copied OK reply is
     # the only assistant bubble so far; the recall answer is the second.
-    fork_composer = page.get_by_placeholder("Ask the agent anything…")
+    fork_composer = page.get_by_placeholder("Send a message…")
     expect(fork_composer).to_be_visible()
     fork_composer.fill("What code word did I ask you to remember? Reply with the code word only.")
     page.get_by_role("button", name="Send", exact=True).click()

@@ -39,44 +39,126 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Release features
+
+Release features are deployment-wide and off by default. Enable one or more
+with the comma-separated `OMNIGENT_FEATURES` variable in `.env`, then recreate
+the server container:
+
+```dotenv
+OMNIGENT_FEATURES=usage_page
+```
+
+```bash
+docker compose up -d
+curl -s http://localhost:8000/v1/info | jq '.features'
+```
+
+Known keys and their lifecycle are documented in
+[`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
+server startup so a typo cannot silently produce the wrong rollout. To roll
+back, remove the key (or empty the variable), run `docker compose up -d` again,
+and reload the web app.
+
+## Extra built-in agents
+
+`OMNIGENT_BUILTIN_AGENT_DIRS` seeds extra agents that are always available
+to every user. They are registered after the server's packaged native agents,
+configured or locally available ACP agents, Debby, and Polly. It's a
+colon-separated (`os.pathsep`) list of paths; each entry is either a
+single-file agent spec (`some-agent.yaml`) or a bundle directory, and the
+resulting agent's name is that path's file stem or directory name.
+
+The path is resolved INSIDE the container, so bind-mount the host
+directory that holds your spec(s) and point the env var at the mounted
+path, not the host path. Neither the mount nor the env var is wired into
+`docker-compose.yaml` by default — add both yourself:
+
+```yaml
+# In docker-compose.yaml, on the omnigent service:
+    environment:
+      OMNIGENT_BUILTIN_AGENT_DIRS: "${OMNIGENT_BUILTIN_AGENT_DIRS:-}"
+    volumes:
+      - artifact-data:/data
+      - ./agents:/agents:ro    # host directory holding your agent spec(s)
+```
+
+```dotenv
+# In .env:
+OMNIGENT_BUILTIN_AGENT_DIRS=/agents/my-agent.yaml
+```
+
+```bash
+docker compose up -d
+docker compose logs omnigent | grep "built-in agent"
+```
+
+A bad or missing path is logged and skipped rather than failing startup —
+the packaged built-ins still seed. Registration runs once, at startup only
+(there's no live reload). After editing a spec in an existing bind mount,
+restart the service so startup seeding runs again:
+
+```bash
+docker compose restart omnigent
+```
+
+After adding or changing the mount, environment variable, or other Compose
+configuration, recreate the service instead:
+
+```bash
+docker compose up -d --force-recreate omnigent
+```
+
+Built-ins are keyed by name. If an extra's file stem or directory name matches
+an existing built-in, startup refreshes that stable row with the extra bundle;
+it does not create a second agent. Use a distinct name unless that override is
+intentional.
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.
 This is the default — `docker compose up -d` brings it up with no
-extra env wiring. First boot creates an admin user (named after the
-operator's OS user, falling back to `admin` in headless containers)
-with a random password that lands in the container logs and on the
-persistent volume at `/data/admin-credentials`.
+extra env wiring. No credentials are auto-generated. On first boot,
+when no admin exists yet and none was pre-seeded, the server creates
+nothing and prints:
+
+```
+→ No admin yet. Open <base_url> to create the first admin account (choose a username + password).
+```
+
+You then open the web UI's **Create admin** form (it appears while no
+admin exists) and pick your own username + password.
 
 For any deploy reachable through a public domain, also set the
-external URL so invite links resolve correctly:
+external URL so the printed link and invite links resolve correctly:
 
 ```bash
 # Add to .env (bootstrap.sh already minted the cookie secret for you):
 OMNIGENT_ACCOUNTS_BASE_URL=https://omnigent.example.com
 
 docker compose up -d
-docker compose logs omnigent | grep -A4 "Created initial admin"
+docker compose logs omnigent      # shows the "No admin yet" line with your base URL
 ```
 
-Copy the random `password` from the log line into the web UI's
-login form, then:
+Once you've created the admin and signed in:
 
 - Click your username in the top-right → **Members** → **Invite member**.
 - Share the single-use URL with the teammate; they pick their own
   username and password when they redeem it.
 - Sign-out lives in the same account menu.
 
-Headless deploy (CI, Cloud Run, etc.) where you can't read the
-logs? Pre-seed the password:
+Headless deploy (CI, Cloud Run, etc.) where you can't reach the
+Create-admin form? Pre-seed the admin password so first boot creates
+the admin directly:
 
 ```bash
 OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<your-strong-password>
 ```
 
-The persistent password file is at `/data/admin-credentials` on
-the `artifact-data` volume — survives `docker compose restart`,
-deleted by `docker compose down -v`.
+`OMNIGENT_ADMIN_CREDENTIALS_PATH` (set to `/data/admin-credentials`
+in `docker-compose.yaml`) anchors the persistent state directory on
+the `artifact-data` volume — it survives `docker compose restart` and
+is deleted by `docker compose down -v`.
 
 ## Multi-user mode (OIDC)
 
@@ -228,6 +310,7 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_HEADER` | `X-Forwarded-Email` | Header-mode only: name of the trusted identity header. Set for proxies that use another name, e.g. `Cf-Access-Authenticated-User-Email` (Cloudflare Access). |
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
+| `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and
@@ -260,6 +343,34 @@ Build it locally from the repo root:
 docker build -t omnigent-host:latest --target host \
              -f deploy/docker/Dockerfile .
 ```
+
+### Baking in extra harness CLIs
+
+A harness whose CLI isn't in the image fails closed with
+`harness_not_configured` when a managed-sandbox session tries to launch
+it. To bake in additional harness CLIs without forking the Dockerfile,
+pass `EXTRA_HARNESS_CLIS` at build time — space-separated harness names
+with an optional `@version` pin, whether the CLI ships on npm or via a
+vendor installer:
+
+```bash
+docker build -t omnigent-host:latest --target host \
+             -f deploy/docker/Dockerfile \
+             --build-arg EXTRA_HARNESS_CLIS="goose jcode opencode" .
+```
+
+Supported names (`opencode`, `qwen`, `goose`, `agy`, `jcode`, `cursor`,
+`kimi`), the install method behind each, and the `npm:<pkg-spec>` escape
+hatch live in [`install-harness-cli.sh`](./install-harness-cli.sh). Empty by
+default — the shipped CLI set is unchanged.
+
+Supply-chain note: the `agy` row is pinned to an immutable per-arch release
+asset with a sha256 check (the same control kiro-cli gets in the default
+image); the other vendor-installer rows run the harness's own `curl | bash`
+off mutable refs and are verified only with a `--version` check (cursor's
+installer cannot be pinned at all). `npm:<pkg-spec>` entries get no binary
+smoke check — confirm the binary yourself. UBI has no baked `agy`; use
+`EXTRA_HARNESS_CLIS=agy` there.
 
 ### Using it with the Modal sandbox provider
 

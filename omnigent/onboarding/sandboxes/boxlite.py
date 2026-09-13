@@ -52,6 +52,7 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxLauncher,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -193,6 +194,19 @@ class BoxliteSandboxLauncher(SandboxLauncher):
     # keep the base class's raising defaults.
     supports_cli_bootstrap: ClassVar[bool] = False
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=False,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=False,
+            streaming_exec=False,
+            foreground_exec=False,
+        )
+
     def __init__(
         self,
         *,
@@ -201,6 +215,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         env: Sequence[str] | None = None,
         home_dir: str | None = None,
         registry: Mapping[str, object] | None = None,
+        disk_size_gb: int | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -230,6 +245,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             ``password_env`` / ``token_env``. The ``*_env`` keys NAME server
             environment variables holding the credentials (12-factor; values
             never live in config). ``None`` uses anonymous pulls.
+        :param disk_size_gb: Box disk size in GB — the server's
+            ``sandbox.boxlite.disk_size_gb`` config. ``None`` uses the SDK's
+            own default.
 
         When ``home_dir`` or ``registry`` is set the launcher builds a
         customized ``Boxlite(Options(...))`` runtime; otherwise it uses the
@@ -240,6 +258,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         self._env_names = tuple(env) if env is not None else None
         self._home_dir = home_dir
         self._registry = dict(registry) if registry is not None else None
+        self._disk_size_gb = disk_size_gb
         self._runtime: boxlite_sdk.Boxlite | None = None
 
     async def _aruntime(self) -> boxlite_sdk.Boxlite:
@@ -372,8 +391,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         """
         Create a new BoxLite box from the host image.
 
-        The box is persistent (``auto_remove=False``); the managed-session
-        machinery owns its teardown (session delete / relaunch → ``terminate``).
+        The box is detached and persistent (``detach=True``,
+        ``auto_remove=False``); the managed-session machinery owns its teardown
+        (session delete / relaunch → ``terminate``).
         Network defaults to full egress (boxlite ``NetworkSpec`` default
         ``Enabled``) so the in-box host can reach ``server_url``.
 
@@ -396,8 +416,10 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 image=resolved_ref,
                 cpus=_SANDBOX_CPU,
                 memory_mib=_SANDBOX_MEMORY_MIB,
+                disk_size_gb=self._disk_size_gb,
                 env=env,
                 auto_remove=False,
+                detach=True,
             )
             box = await runtime.create(options, name=name)
             return str(box.id)

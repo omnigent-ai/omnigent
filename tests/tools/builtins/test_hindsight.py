@@ -224,3 +224,46 @@ def test_client_exception_is_caught(tool_ctx: ToolContext) -> None:
     with patch("hindsight_client.Hindsight", return_value=client):
         result = tool.invoke(json.dumps({"query": "q"}), tool_ctx)
     assert result.startswith("Hindsight recall failed:")
+
+
+# ---------------------------------------------------------------------------
+# Optional-extra gating
+# ---------------------------------------------------------------------------
+
+
+def test_hindsight_tools_absent_from_registry_when_sdk_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the ``hindsight-client`` SDK the Hindsight tools are not
+    registered — absent from ``BUILTIN_NAMES`` / ``INSTANTIABLE_BUILTINS`` and
+    not instantiable — so they never appear as available builtins on an
+    install without the ``hindsight`` extra.
+
+    ``_hindsight_available`` probes via :func:`importlib.util.find_spec` (no
+    import), so the package is hidden from the finder and the registry module
+    reloaded to observe the gated rebuild.
+    """
+    import importlib
+    import importlib.util
+    from importlib.machinery import ModuleSpec
+
+    import omnigent.tools.builtins as builtins_mod
+
+    real_find_spec = importlib.util.find_spec
+
+    def hide_hindsight(name: str, package: str | None = None) -> ModuleSpec | None:
+        if name == "hindsight_client":
+            return None
+        return real_find_spec(name, package)
+
+    monkeypatch.setattr(importlib.util, "find_spec", hide_hindsight)
+    importlib.reload(builtins_mod)
+    try:
+        assert "hindsight_retain" not in builtins_mod.BUILTIN_NAMES
+        assert "hindsight_recall" not in builtins_mod.BUILTIN_NAMES
+        assert "hindsight_reflect" not in builtins_mod.BUILTIN_NAMES
+        assert "hindsight_retain" not in builtins_mod.INSTANTIABLE_BUILTINS
+        assert builtins_mod.get_builtin_tool("hindsight_retain", _cfg()) is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(builtins_mod)

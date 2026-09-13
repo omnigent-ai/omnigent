@@ -10,11 +10,18 @@
 // "where did the user input come from").
 
 import {
+  type AskUserQuestionPayload,
+  castAskUserQuestionPayload,
+  exitPlanModePlan,
+} from "./askUserQuestion";
+import {
   type AnyBlock,
   type BlockContext,
   type CompactionBlock,
+  type ElicitationBlock,
   type ErrorBlock,
   type NativeToolBlock,
+  type ReasoningBlock,
   type RoutingDecisionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
@@ -23,8 +30,10 @@ import {
   type ToolGroup,
   type ToolResultBlock,
   type UserMessageBlock,
+  answeredElicitationItemId,
   slashCommandEchoItemId,
   slashCommandEchoText,
+  structuredErrorFields,
 } from "./blocks";
 import { formatNativeLabel, formatToolArgsBrief } from "./blockStream";
 import {
@@ -35,6 +44,7 @@ import {
   type FunctionCallOutputItem,
   type MessageItem,
   type NativeToolItem,
+  type ReasoningItem,
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
@@ -44,10 +54,28 @@ import {
   isFunctionCallOutputItem,
   isMessageItem,
   isNativeToolItem,
+  isReasoningItem,
   isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
 } from "./conversationItems";
+import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
+import { routingExtrasFromWire } from "./routingDecision";
+import { taskNotificationMarkerContent } from "./systemMessage";
+
+// Claude built-ins whose call is a question TO the user rather than work
+// the agent did on its own. The elicitation that carried the card is
+// never persisted, so history rebuilds it from the call and its result.
+const ASK_USER_QUESTION_TOOL = "AskUserQuestion";
+const EXIT_PLAN_MODE_TOOL = "ExitPlanMode";
+
+// Claude Code's ExitPlanMode result opens with this when the user
+// approved; a rejection returns the feedback they typed instead.
+const PLAN_APPROVED_PREFIX = "User has approved your plan";
+
+// Each answer in an AskUserQuestion result is quoted against its question:
+// `Your questions have been answered: "<question>"="<answer>", ...`.
+const ANSWER_SEPARATOR = '"="';
 
 /**
  * Walk persisted items in arrival order and emit a flat block list.
@@ -62,11 +90,16 @@ import {
  */
 export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
+  const outputs = toolOutputsByCallId(items);
   for (const item of items) {
     if (!item.response_id) continue;
     if (isSlashCommandItem(item)) {
       const echo = skillEchoBlock(item);
       if (echo !== null) blocks.push(echo);
+    }
+    if (isFunctionCallItem(item)) {
+      const card = answeredElicitationBlock(item, outputs.get(item.call_id));
+      if (card !== null) blocks.push(card);
     }
     const block = itemToBlock(item);
     if (block !== null) blocks.push(block);
@@ -74,7 +107,125 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   return blocks;
 }
 
+function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
+  const outputs = new Map<string, string>();
+  for (const item of items) {
+    if (isFunctionCallOutputItem(item)) outputs.set(item.call_id, item.output);
+  }
+  return outputs;
+}
+
+/**
+ * Rebuild the answered question / plan card for a gated Claude built-in.
+ *
+ * The card the user answered rode an elicitation, which is never
+ * persisted — so on reload the only trace of the exchange is the tool
+ * call and the result carrying what the user picked. Reconstructing a
+ * responded card from that pair puts the question and the answer back
+ * in the transcript, alongside the tool row the live stream also shows.
+ *
+ * @param item - The persisted ``AskUserQuestion`` / ``ExitPlanMode`` call.
+ * @param output - The paired tool result, or undefined when this batch of
+ *   items doesn't hold it (still outstanding, or split across history
+ *   pages). Without it the answer is unknown, so no card is rebuilt.
+ * @returns The responded card, or ``null`` when this isn't a gated
+ *   question / plan call or its answer can't be recovered.
+ */
+function answeredElicitationBlock(
+  item: FunctionCallItem,
+  output: string | undefined,
+): ElicitationBlock | null {
+  if (output === undefined) return null;
+  if (item.name !== ASK_USER_QUESTION_TOOL && item.name !== EXIT_PLAN_MODE_TOOL) return null;
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(item.arguments) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (item.name === EXIT_PLAN_MODE_TOOL) {
+    if (exitPlanModePlan(args) === null) return null;
+    return {
+      ...elicitationShell(item),
+      exitPlanMode: args,
+      response: output.startsWith(PLAN_APPROVED_PREFIX)
+        ? { action: "accept" }
+        : { action: "decline", content: { feedback: output } },
+    };
+  }
+  const payload = castAskUserQuestionPayload(args);
+  if (payload === null) return null;
+  const answers = answersFromToolResult(payload, output);
+  if (Object.keys(answers).length === 0) return null;
+  return {
+    ...elicitationShell(item),
+    askUserQuestion: args,
+    response: { action: "accept", content: answers },
+  };
+}
+
+/**
+ * The fields a rebuilt card shares regardless of which built-in it came
+ * from. The elicitation id is deliberately unresolvable — a responded
+ * card renders no buttons, and the live id it was answered through is
+ * long gone. ``policyName`` names the vendor so the card reads "Claude
+ * Code" like the live one did.
+ */
+function elicitationShell(item: FunctionCallItem): Omit<ElicitationBlock, "response"> {
+  const ctx = ctxFor(item);
+  return {
+    type: "elicitation",
+    ctx: { ...ctx, itemId: answeredElicitationItemId(item.id) },
+    elicitationId: `answered:${item.call_id}`,
+    message: "",
+    phase: "pre_tool_use",
+    policyName: nativePolicyNameForAgentName(ctx.agent),
+    contentPreview: "",
+    requestedSchema: {},
+    status: "responded",
+  };
+}
+
+/**
+ * Recover the answer the user picked for each question from Claude
+ * Code's ``AskUserQuestion`` result text.
+ *
+ * The result quotes every answer against its question —
+ * ``"<question>"="<answer>"`` — but neither side is escaped, so a
+ * question containing a quote defeats generic parsing. Searching for
+ * each known question verbatim sidesteps that: the questions come from
+ * the call's own arguments, so they match exactly.
+ *
+ * @returns Question text → answer, keyed the way ``ApprovalCard``
+ *   reads submitted answers. Empty when the result names no question.
+ */
+function answersFromToolResult(
+  payload: AskUserQuestionPayload,
+  output: string,
+): Record<string, string> {
+  const answers: Record<string, string> = {};
+  for (const question of payload.questions) {
+    const at = output.indexOf(`"${question.question}${ANSWER_SEPARATOR}`);
+    if (at === -1) continue;
+    const from = at + question.question.length + 1 + ANSWER_SEPARATOR.length;
+    const end = output.indexOf('"', from);
+    answers[question.question] = end === -1 ? output.slice(from) : output.slice(from, end);
+  }
+  return answers;
+}
+
 function itemToBlock(item: ConversationItem): AnyBlock | null {
+  if (isMessageItem(item) && item.role === "user") {
+    // Claude Code's background-task wake: the CLI injects a
+    // `<task-notification>` user entry (mirrored with `is_meta`) and
+    // starts a new turn on it. Render it as a muted system marker so the
+    // answer it interrupts keeps its own bubble instead of folding into
+    // the follow-up work's "Worked for" row.
+    const marker = taskNotificationMarkerContent(item.content);
+    if (marker !== null) {
+      return { ...userMessageToBlock(item), content: marker };
+    }
+  }
   if (isMessageItem(item) && item.is_meta === true) {
     return null;
   }
@@ -99,6 +250,9 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   }
   if (isErrorItem(item)) {
     return errorToBlock(item);
+  }
+  if (isReasoningItem(item)) {
+    return reasoningToBlock(item);
   }
   if (isNativeToolItem(item)) {
     return nativeToolToBlock(item);
@@ -171,7 +325,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
 }
 
 function functionCallToBlock(item: FunctionCallItem): ToolGroup {
-  let args: Record<string, unknown> = {};
+  let args: Record<string, unknown>;
   try {
     args = JSON.parse(item.arguments) as Record<string, unknown>;
   } catch {
@@ -213,6 +367,17 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     source: item.source,
     code: item.code,
     message: item.message,
+    ...(item.level ? { level: item.level } : {}),
+    ...structuredErrorFields(item),
+  };
+}
+
+function reasoningToBlock(item: ReasoningItem): ReasoningBlock {
+  return {
+    type: "reasoning_block",
+    ctx: ctxFor(item),
+    reasoningText: (item.content ?? []).map((block) => block.text).join("\n\n"),
+    summaryText: item.summary.map((block) => block.text).join("\n\n"),
   };
 }
 
@@ -277,6 +442,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
     applied: item.applied,
     rationale: typeof item.rationale === "string" ? item.rationale : "",
     ...(item.agent !== undefined && { agent: item.agent }),
+    routing: routingExtrasFromWire(item as unknown as Record<string, unknown>),
   };
 }
 
@@ -292,11 +458,11 @@ function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock
 }
 
 function ctxFor(item: ConversationItem): BlockContext {
-  // Items don't carry timestamps in the API surface — use 0 as a
-  // stable sentinel. `BlockContext.timestamp` is only meaningful for
-  // live streaming (drives the reasoning timer); historical blocks
-  // render without that affordance. `agent` comes from the item's
-  // `model` field when present.
+  // `BlockContext.timestamp` is the page-relative live-streaming clock —
+  // use 0 as a stable sentinel for historical items so timer affordances
+  // stay live-only. The server's epoch `created_at` travels separately as
+  // `createdAtS` (drives the completed-turn "Worked for" duration).
+  // `agent` comes from the item's `model` field when present.
   const agent = "model" in item && typeof item.model === "string" ? item.model : null;
   const depth = agent ? (agent.match(/\./g)?.length ?? 0) : 0;
   // Preserve human authorship only when the server sent it.
@@ -310,5 +476,8 @@ function ctxFor(item: ConversationItem): BlockContext {
     responseId: item.response_id,
     itemId: item.id,
     ...(createdBy !== undefined ? { createdBy } : {}),
+    ...(typeof item.created_at === "number" && item.created_at > 0
+      ? { createdAtS: item.created_at }
+      : {}),
   };
 }

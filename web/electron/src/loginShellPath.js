@@ -23,7 +23,7 @@ function stripAnsi(value) {
 // launched from a GUI, where $SHELL is typically unset — the whole premise of
 // this bug). Fall back to $SHELL, then the macOS default.
 function pickShell(os, env) {
-  let shell = null;
+  let shell;
   try {
     shell = os.userInfo().shell;
   } catch {
@@ -43,16 +43,12 @@ function extractPath(stdout) {
   return cleaned || null;
 }
 
-// On macOS the stripped launchd PATH is /usr/bin:/bin:/usr/sbin:/sbin — Homebrew
-// dirs only appear once a login shell has run. Their presence means PATH is
-// already complete, so we can skip the shell spawn entirely (e.g. launched from
-// a terminal). Conservative by design: when unsure we do the work rather than
-// risk skipping and reintroducing the stripped-PATH bug.
+// On Apple Silicon, /opt/homebrew/bin only appears once a login shell has run,
+// so its presence lets terminal launches skip the shell spawn. Do not use
+// /usr/local/bin here: some stripped GUI PATHs already include it.
 function isLikelyLoginPath(env, platform) {
   if (platform !== "darwin") return false;
-  return (env.PATH || "")
-    .split(":")
-    .some((dir) => dir === "/opt/homebrew/bin" || dir === "/usr/local/bin");
+  return (env.PATH || "").split(":").some((dir) => dir === "/opt/homebrew/bin");
 }
 
 /**

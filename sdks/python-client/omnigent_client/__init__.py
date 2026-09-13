@@ -52,12 +52,12 @@ from ._child_status import (
     child_summary_busy,
 )
 from ._client import OmnigentClient
-from ._errors import OmnigentError, ToolCallDenied
+from ._errors import OmnigentError, RateLimitedError, ToolCallDenied
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
 from ._query import QueryResult, QueryStream
 from ._server import LocalServer
 from ._session import Session
-from ._sessions import SessionsNamespace
+from ._sessions import RegisteredAgent, SessionsNamespace
 from ._sessions_chat import SessionsChat, SessionToolCallInfo, ToolCallable
 from ._stream import BlockStream, format_tool_args_brief
 from ._tool_handler import (
@@ -94,9 +94,11 @@ __all__ = [
     "OmnigentError",
     "QueryResult",
     "QueryStream",
+    "RateLimitedError",
     "ReasoningBlock",
     "ReasoningChunk",
     "ReasoningStartBlock",
+    "RegisteredAgent",
     "ResponseEndBlock",
     "ResponseStartBlock",
     "RetryBlock",

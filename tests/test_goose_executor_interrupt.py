@@ -47,12 +47,19 @@ async def test_interrupt_no_session_id_sends_sigterm() -> None:
     """Without a session_id, interrupt falls back to SIGTERM immediately."""
     ex = _make_executor()
     ex._proc = _live_proc()  # returncode=None → live
+    ex._system_prompt_sent = True
+    ex._initialized = True
+    ex._image_supported = True
     ex._session_id = None  # no ACP session established yet
 
     result = await ex.interrupt_session("s1")
 
     assert result is True
     ex._proc.terminate.assert_called_once()
+    assert ex._session_id is None
+    assert ex._system_prompt_sent is False
+    assert ex._initialized is False
+    assert ex._image_supported is False
 
 
 async def test_interrupt_with_session_sends_cancel_notification() -> None:
@@ -85,6 +92,9 @@ async def test_interrupt_cancel_send_error_falls_back_to_sigterm() -> None:
     ex = _make_executor()
     ex._proc = _live_proc()
     ex._session_id = "goose_session_99"
+    ex._system_prompt_sent = True
+    ex._initialized = True
+    ex._image_supported = True
 
     with patch.object(
         ex, "_send", new_callable=AsyncMock, side_effect=RuntimeError("broken pipe")
@@ -93,6 +103,10 @@ async def test_interrupt_cancel_send_error_falls_back_to_sigterm() -> None:
 
     assert result is True
     ex._proc.terminate.assert_called_once()
+    assert ex._session_id is None
+    assert ex._system_prompt_sent is False
+    assert ex._initialized is False
+    assert ex._image_supported is False
 
 
 async def test_interrupt_process_lookup_error_returns_false() -> None:
@@ -101,8 +115,14 @@ async def test_interrupt_process_lookup_error_returns_false() -> None:
     proc = _live_proc()
     proc.terminate.side_effect = ProcessLookupError
     ex._proc = proc
-    ex._session_id = None
+    ex._session_id = "stale-session"
+    ex._system_prompt_sent = True
+    ex._initialized = True
+    ex._image_supported = True
 
     result = await ex.interrupt_session("s1")
-    # suppress(ProcessLookupError) means we fall through to `return False`
     assert result is False
+    assert ex._session_id is None
+    assert ex._system_prompt_sent is False
+    assert ex._initialized is False
+    assert ex._image_supported is False

@@ -132,3 +132,83 @@ def test_no_android_tag_or_fold_in_plain_browser(
     # The web app never injects --omnigent-android-safe-area-*, so with
     # env(safe-area-inset-top) also 0 here the shared inset stays 0.
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
+
+
+# Bridge stub that also CAPTURES the notification-activation callback the SPA
+# registers (``useIdleNotifications`` -> ``onNativeNotificationActivated``), so a
+# test can fire it the way the Android shell does when its badge notification is
+# tapped. The real shell calls the callback with the notification's stored
+# ``navigatePath``.
+_ANDROID_ACTIVATION_INIT_SCRIPT = """
+window.__omnigentActivations = [];
+window.omnigentNative = {
+  kind: "android",
+  setBadgeCount: function () {},
+  notify: function () { return Promise.resolve(false); },
+  onNotificationActivated: function (cb) {
+    window.__omnigentActivate = cb;
+    return function () { delete window.__omnigentActivate; };
+  },
+  onNativeInsets: function () { return function () {}; },
+};
+"""
+
+
+def test_badge_notification_activation_navigates_to_target(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Tapping the Android badge notification routes the SPA to its target.
+
+    The chain under test is the one the unit tests can't reach end to end: the
+    shell's ``onNotificationActivated`` callback (registered by
+    ``useIdleNotifications``) receives the badge's ``navigatePath`` and the SPA
+    navigates there in place — no reload, sidebar-closed mobile layout intact.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.add_init_script(_ANDROID_ACTIVATION_INIT_SCRIPT)
+    page.goto(f"{base_url}/")
+
+    # The SPA registers its activation callback on mount.
+    page.wait_for_function("() => typeof window.__omnigentActivate === 'function'")
+
+    # Fire the callback the way the shell does for a single-unread badge tap.
+    page.evaluate("path => window.__omnigentActivate(path)", f"/c/{session_id}")
+    page.wait_for_url(f"**/c/{session_id}")
+    expect(page.locator(".app-shell")).to_have_attribute("data-android-native", "true")
+
+
+def test_sidebar_open_param_reveals_drawer_and_strips_itself(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """``?sidebar=open`` (the multi-unread badge target) opens the drawer once.
+
+    A multi-unread badge notification targets ``/?sidebar=open`` so the tap
+    lands on the session list instead of a bare composer. The param must open
+    the phone-width drawer and then strip itself from the URL (one-shot,
+    ``replace``), so a later in-app navigation doesn't re-trigger it.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, _session_id = seeded_session
+
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+    drawer = page.locator('aside[aria-label="Conversations"]')
+
+    # Control: without the param the phone-width drawer starts closed
+    # (data-collapsed; CSS keeps the off-canvas box technically "visible",
+    # so the attribute is the reliable open/closed signal).
+    page.goto(f"{base_url}/")
+    expect(drawer).to_have_attribute("data-collapsed", "true")
+
+    page.goto(f"{base_url}/?sidebar=open")
+    expect(drawer).not_to_have_attribute("data-collapsed", "true")
+    page.wait_for_function("() => !window.location.search.includes('sidebar')")

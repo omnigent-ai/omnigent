@@ -33,7 +33,11 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     _handle_tunnel_frame,
     _RunnerWSChannel,
 )
-from omnigent.server._runner_ws_tunnel import _TunneledWSConn
+from omnigent.server._runner_ws_tunnel import (
+    DirectAttachEndpoint,
+    _TunneledWSConn,
+    make_direct_attach_resolver,
+)
 
 
 class _FakeWS:
@@ -280,3 +284,65 @@ async def test_open_ws_channel_session_guard_rejects_stale_session() -> None:
         registry.open_ws_channel("runner-replace", "stale01", session=session_old)
     with contextlib.suppress(KeyError):
         registry.deregister("runner-replace")
+
+
+# ── Direct-attach resolver (hello advert → terminals API) ─────────────
+
+
+class _StubRoutedClient:
+    def __init__(self, runner_id: str) -> None:
+        self.runner_id = runner_id
+
+
+class _StubRouter:
+    """Router stub returning a fixed runner id for any conversation."""
+
+    def __init__(self, runner_id: str | None) -> None:
+        self._runner_id = runner_id
+
+    def client_for_existing_conversation(self, conversation_id: str) -> _StubRoutedClient | None:
+        del conversation_id
+        if self._runner_id is None:
+            return None
+        return _StubRoutedClient(self._runner_id)
+
+
+@pytest.mark.asyncio
+async def test_direct_attach_resolver_reads_hello_advert() -> None:
+    """A registered runner's hello advert resolves to its endpoint."""
+    registry = TunnelRegistry()
+    server_ws, _runner_ws = _make_pair()
+    hello = HelloFrame(
+        runner_version="0.1.0-test",
+        frame_protocol_version=1,
+        direct_attach_port=54321,
+        direct_attach_token="tok_abc",
+    )
+    registry.register("runner-direct-1", server_ws, hello)
+    try:
+        resolver = make_direct_attach_resolver(_StubRouter("runner-direct-1"), registry)
+
+        endpoint = resolver("conv1")
+
+        assert endpoint == DirectAttachEndpoint(port=54321, token="tok_abc")
+    finally:
+        registry.deregister("runner-direct-1")
+
+
+@pytest.mark.asyncio
+async def test_direct_attach_resolver_misses_resolve_to_none() -> None:
+    """No pinned runner, offline runner, or advert-less hello → None."""
+    registry = TunnelRegistry()
+    server_ws, _runner_ws = _make_pair()
+    no_advert_hello = HelloFrame(runner_version="0.1.0-test", frame_protocol_version=1)
+    registry.register("runner-direct-2", server_ws, no_advert_hello)
+    try:
+        assert make_direct_attach_resolver(_StubRouter(None), registry)("conv1") is None
+        assert (
+            make_direct_attach_resolver(_StubRouter("runner-offline"), registry)("conv1") is None
+        )
+        assert (
+            make_direct_attach_resolver(_StubRouter("runner-direct-2"), registry)("conv1") is None
+        )
+    finally:
+        registry.deregister("runner-direct-2")

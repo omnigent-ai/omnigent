@@ -190,6 +190,7 @@ def _wait_for_gate_pending(mock_llm_server_url: str, timeout: float = 30) -> Non
     raise AssertionError(f"No gate pending within {timeout}s")
 
 
+@pytest.mark.compat_smoke
 def test_cancel_appends_history_marker_and_followup_sees_it(
     http_client: httpx.Client,
     live_runner_id: str,
@@ -283,6 +284,7 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     )
 
 
+@pytest.mark.compat_smoke
 def test_cancel_mid_response_followup_succeeds(
     http_client: httpx.Client,
     live_runner_id: str,

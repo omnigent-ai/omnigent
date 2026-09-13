@@ -28,6 +28,7 @@ vi.mock("@/lib/permissionsApi", () => ({
 }));
 
 import * as api from "@/lib/permissionsApi";
+
 const listMock = vi.mocked(api.listPermissions);
 
 // The unsafe (no-sandbox) primary-environment resource, exactly as the backend

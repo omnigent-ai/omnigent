@@ -22,6 +22,7 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id,
     require_access,
 )
+from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.permission_store import PermissionStore
@@ -165,7 +166,7 @@ def create_comments_router(
         if conversation_store is not None:
             conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conversation is None:
-                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+                raise session_not_found()
 
     async def _require_comment_author(
         user_id: str | None, comment_id: str, session_id: str

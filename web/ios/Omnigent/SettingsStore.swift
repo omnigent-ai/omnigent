@@ -16,6 +16,14 @@ final class SettingsStore: ObservableObject {
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     #if DEBUG
+      // UI tests pass `--omnigent-reset-state` to start each case with NO
+      // saved/recent server, so a deep link to `localhost:8000` always hits the
+      // unknown-server consent path (not the in-place route for a known server).
+      if ProcessInfo.processInfo.arguments.contains("--omnigent-reset-state") {
+        for key in [Keys.serverURL, Keys.recentServers, Keys.allowedProtocols] {
+          defaults.removeObject(forKey: key)
+        }
+      }
       serverURL =
         ProcessInfo.processInfo.omnigentArgumentValue(after: "--omnigent-server-url")
         ?? ProcessInfo.processInfo.environment["OMNIGENT_SCREENSHOT_APP_URL"]
@@ -30,6 +38,20 @@ final class SettingsStore: ObservableObject {
     let value = url.absoluteString
     let deduped: [String] = [value] + recentServers.filter { $0 != value }
     recentServers = Array(deduped.prefix(maxRecentServers))
+  }
+
+  /// The full server URL (origin, or origin + workspace mount) of a server the
+  /// user previously connected to whose origin matches `origin`; nil when none.
+  /// Reusing the recorded URL means a deep link to a KNOWN workspace server opens
+  /// WITHOUT the network probe — the mount is already in the saved URL. Mirrors
+  /// the desktop shell's `findKnownServerUrl` (web/electron/src/main.js).
+  func knownServerURL(forOrigin origin: String) -> URL? {
+    let candidates = (serverURL.map { [$0] } ?? []) + recentServers
+    for value in candidates {
+      guard let url = URL(string: value), url.omnigentOrigin == origin else { continue }
+      return url
+    }
+    return nil
   }
 
   func isProtocolAllowed(_ scheme: String, from origin: String) -> Bool {
@@ -60,7 +82,7 @@ final class SettingsStore: ObservableObject {
 
 #if DEBUG
   extension ProcessInfo {
-    fileprivate func omnigentArgumentValue(after argumentName: String) -> String? {
+    func omnigentArgumentValue(after argumentName: String) -> String? {
       guard let index = arguments.firstIndex(of: argumentName) else { return nil }
       let valueIndex = arguments.index(after: index)
       guard arguments.indices.contains(valueIndex) else { return nil }

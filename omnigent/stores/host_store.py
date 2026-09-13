@@ -2,7 +2,7 @@
 Persistent store for host registrations.
 
 Hosts are machines connected via ``omnigent host``. The store
-tracks which hosts have ever connected, their names, owners, and
+tracks which hosts have ever connected, their names, user_ids, and
 online/offline status. The ``hosts`` table is the source of truth
 for ``GET /v1/hosts`` — all server replicas query it. Live WebSocket
 connection state is tracked separately in the in-memory
@@ -12,18 +12,31 @@ connection state is tracked separately in the in-memory
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 from dataclasses import dataclass
+from typing import cast
 
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, or_, select, tuple_, update
 from sqlalchemy import delete as sql_delete
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlConversation, SqlHost, current_workspace_id
+from omnigent.db.db_models import (
+    SqlConversationMetadata,
+    SqlHost,
+    current_workspace_id,
+)
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
-from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    now_epoch,
+    run_write_transaction,
+)
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -35,7 +48,6 @@ from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, 
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
-HarnessAvailability = bool | str
 
 
 @dataclass
@@ -46,7 +58,7 @@ class Host:
     :param host_id: Stable identifier from the host's local
         ``~/.omnigent/config.yaml``, e.g. ``"host_a1b2c3d4..."``.
     :param name: Human-readable name, e.g. ``"corey-laptop"``.
-    :param owner: User ID from the Databricks auth Bearer token,
+    :param user_id: User ID from the Databricks auth Bearer token,
         e.g. ``"corey.zumar@databricks.com"``.
     :param status: ``"online"`` or ``"offline"``.
     :param created_at: Unix epoch seconds of first registration.
@@ -58,9 +70,16 @@ class Host:
         host (``host_type="managed"`` sessions), e.g. ``"modal"``.
         ``None`` for external (user-connected) hosts — non-``None``
         marks the host as server-managed.
-    :param sandbox_id: Provider-assigned id of the sandbox currently
-        backing a managed host, e.g. ``"sb-a1b2c3"`` — what
-        termination is issued against. ``None`` for external hosts.
+    :param sandbox_id: Provider-assigned id of the sandbox generation
+        currently backing a managed host, e.g. ``"sb-a1b2c3"`` — what
+        termination is issued against. ``None`` for external hosts and
+        managed hosts whose prior generation was reaped while the durable
+        host/session binding remains available for relaunch.
+    :param terminating_sandbox_id: Provider-assigned id detached from the
+        active generation and awaiting provider termination. A newly launched
+        generation may coexist in ``sandbox_id`` while this cleanup retries.
+    :param deleted_at: Logical deletion timestamp. A managed host with pending
+        provider cleanup keeps an internal tombstone row until cleanup succeeds.
     :param configured_harnesses: Per-harness readiness reported in the
         host's last ``host.hello`` frame, e.g.
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
@@ -70,13 +89,19 @@ class Host:
 
     host_id: str
     name: str
-    owner: str
+    user_id: str
     status: str
     created_at: int
     updated_at: int
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    terminating_sandbox_id: str | None = None
+    deleted_at: int | None = None
+
+
+ManagedSandboxScanCursor = tuple[str, int, str]
+ManagedSandboxScanRow = tuple[int, Host]
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -110,7 +135,7 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
     Tolerant: ``NULL``, malformed JSON, or a non-object payload all
     map to ``None`` ("unknown") — a corrupt column value must degrade
     to no-warning in the UI, never break host listing. Entries with a
-    non-bool/string value are dropped for the same reason.
+    unsupported readiness value are dropped for the same reason.
 
     :param raw: The raw column value, e.g.
         ``'{"claude-sdk": true, "codex": false}'`` or ``None``.
@@ -125,7 +150,7 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
         return None
     if not isinstance(parsed, dict):
         return None
-    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, (bool, str))}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
 def _row_to_host(row: SqlHost) -> Host:
@@ -138,12 +163,14 @@ def _row_to_host(row: SqlHost) -> Host:
     return Host(
         host_id=row.host_id,
         name=row.name,
-        owner=row.owner,
+        user_id=row.user_id,
         status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
+        terminating_sandbox_id=row.terminating_sandbox_id,
+        deleted_at=row.deleted_at,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -180,31 +207,47 @@ class HostStore:
             ``"sqlite:///hosts.db"``.
         """
         self._engine: Engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.host_store",
+        )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.host_store",
+            immediate=True,
+        )
+        # Same immediate maker kept under its own name: lifecycle transitions
+        # (sandbox replacement / deletion) serialize on row locks through it.
+        self._lifecycle_session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.host_store",
+            immediate=True,
+        )
 
     def upsert_on_connect(
         self,
         host_id: str,
         name: str,
-        owner: str,
+        user_id: str,
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
+        managed_token: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
 
         Inserts a new row if ``host_id`` does not exist, otherwise
-        updates ``name``, ``owner``, ``status``, and ``updated_at``.
+        updates ``name``, ``user_id``, ``status``, and ``updated_at``.
         Called by the host tunnel endpoint when a host sends its
         ``host.hello`` frame.
 
-        The upsert keys on the ``(owner, name)`` primary key, but
+        The upsert keys on the ``(user_id, name)`` primary key, but
         ``host_id`` carries its own UNIQUE constraint. When the same
-        physical host re-registers under a *different* owner (e.g. a
+        physical host re-registers under a *different* user_id (e.g. a
         local server respawned with a flipped auth posture changes the
-        owner between an accounts user and the reserved ``local`` user),
-        the ``(owner, name)`` lookup misses and a plain INSERT would
+        user_id between an accounts user and the reserved ``local`` user),
+        the ``(user_id, name)`` lookup misses and a plain INSERT would
         collide on ``host_id``. That collision is a deliberate W2-class
         boundary in shared deployments — a different user must not be
         able to claim another user's host_id — so re-owning is gated
@@ -217,10 +260,10 @@ class HostStore:
             ``"host_a1b2c3d4..."``.
         :param name: Human-readable name from ``config.yaml``, e.g.
             ``"corey-laptop"``.
-        :param owner: Authenticated user ID from the Bearer token,
+        :param user_id: Authenticated user ID from the Bearer token,
             e.g. ``"corey.zumar@databricks.com"``.
         :param allow_host_id_reown: When ``True`` and a row already
-            exists for *host_id* under a different ``(owner, name)``,
+            exists for *host_id* under a different ``(user_id, name)``,
             re-own that row in place (preserving the ``host_id`` and its
             conversation bindings) instead of inserting. Intended solely
             for the single-user loopback local server.
@@ -229,45 +272,82 @@ class HostStore:
             Written on every connect — including ``None`` from an older
             host that doesn't report it, which correctly resets any
             stale value back to "unknown".
+        :param managed_token: Raw launch token for a managed host. When set,
+            registration atomically revalidates the current credential instead
+            of performing the external-host upsert path.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
-        with self._session() as session:
+
+        def write(session: Session) -> Host:
+            if managed_token is not None:
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        update(SqlHost)
+                        .where(
+                            SqlHost.workspace_id == current_workspace_id(),
+                            SqlHost.host_id == host_id,
+                            SqlHost.user_id == user_id,
+                            SqlHost.token_hash == hash_host_launch_token(managed_token),
+                            SqlHost.token_expires_at.is_not(None),
+                            SqlHost.token_expires_at >= now,
+                            SqlHost.sandbox_id.is_not(None),
+                            SqlHost.deleted_at.is_(None),
+                        )
+                        .values(
+                            name=name,
+                            status=encode_host_status("online"),
+                            updated_at=now,
+                            configured_harnesses=harnesses_json,
+                        )
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise ValueError("managed host launch token is no longer valid")
+                managed_row = session.get(SqlHost, (current_workspace_id(), host_id))
+                if managed_row is None:
+                    raise ValueError("managed host registration disappeared")
+                return _row_to_host(managed_row)
+
             # Primary lookup: by (workspace_id, host_id) — the new PK.
             row = session.get(SqlHost, (current_workspace_id(), host_id))
             if row is not None:
+                if row.deleted_at is not None:
+                    raise ValueError("host has been deleted")
                 # W2-class boundary: a different user must not claim another
                 # user's host_id. Raise the same IntegrityError the old UNIQUE
                 # constraint produced so the tunnel handler rejects the hijack.
-                if row.owner != owner and not allow_host_id_reown:
+                if row.user_id != user_id and not allow_host_id_reown:
                     raise IntegrityError(
                         "host_id already owned by a different user",
-                        params={"host_id": host_id, "owner": owner},
+                        params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
                     )
-                # Known host_id (same owner, or reown opted in): update
-                # owner/name in case they changed, then refresh status and timestamp.
-                row.owner = owner
+                # Known host_id (same user_id, or reown opted in): update
+                # user_id/name in case they changed, then refresh status and timestamp.
+                row.user_id = user_id
                 row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
                 return _row_to_host(row)
 
-            # host_id is new — check whether (workspace_id, owner, name)
+            # host_id is new — check whether (workspace_id, user_id, name)
             # already exists. If it does, the same machine regenerated its
             # identity file: this is a host_id rotation. If allow_host_id_reown
             # is set, also check if any row holds this host_id under a different
-            # owner and re-own it instead of inserting.
+            # user_id and re-own it instead of inserting.
             if allow_host_id_reown:
                 reowned = self._reown_host_id(
                     session,
                     host_id=host_id,
                     name=name,
-                    owner=owner,
+                    user_id=user_id,
+                    now=now,
                     configured_harnesses_json=harnesses_json,
                 )
                 if reowned is not None:
@@ -276,21 +356,28 @@ class HostStore:
             existing_by_name = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.owner == owner,
+                    SqlHost.user_id == user_id,
                     SqlHost.name == name,
+                    SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if existing_by_name is not None:
-                # Same (owner, name), different host_id: identity rotation.
+                # Same (user_id, name), different host_id: identity rotation.
                 # host_id is now part of the PK, so we can't UPDATE it via the
                 # ORM — delete the old row and insert a fresh one that carries
                 # the new host_id while preserving created_at.
-                row = self._rotate_host_id(session, existing_by_name, host_id, now, harnesses_json)
+                row = self._rotate_host_id(
+                    session,
+                    existing_by_name,
+                    host_id,
+                    now,
+                    harnesses_json,
+                )
                 return _row_to_host(row)
 
             # Genuinely new host: plain INSERT.
             row = SqlHost(
-                owner=owner,
+                user_id=user_id,
                 name=name,
                 host_id=host_id,
                 status=encode_host_status("online"),
@@ -300,6 +387,8 @@ class HostStore:
             )
             session.add(row)
             return _row_to_host(row)
+
+        return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
 
     @staticmethod
     def _rotate_host_id(
@@ -333,27 +422,28 @@ class HostStore:
         old_host_id = row.host_id
         # Preserve durable fields from the outgoing row before deletion.
         created_at = row.created_at
-        owner = row.owner
+        user_id = row.user_id
         name = row.name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
+        terminating_sandbox_id = row.terminating_sandbox_id
 
         bound_ids = list(
             session.execute(
-                select(SqlConversation.id).where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == old_host_id,
+                select(SqlConversationMetadata.id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == old_host_id,
                 )
             ).scalars()
         )
         if bound_ids:
             session.execute(
-                update(SqlConversation)
+                update(SqlConversationMetadata)
                 .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == old_host_id,
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == old_host_id,
                 )
                 .values(host_id=None)
             )
@@ -371,7 +461,7 @@ class HostStore:
         new_row = SqlHost(
             workspace_id=current_workspace_id(),
             host_id=new_host_id,
-            owner=owner,
+            user_id=user_id,
             name=name,
             status=encode_host_status("online"),
             created_at=created_at,
@@ -380,6 +470,7 @@ class HostStore:
             token_expires_at=token_expires_at,
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
+            terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
         )
         session.add(new_row)
@@ -387,10 +478,10 @@ class HostStore:
 
         if bound_ids:
             session.execute(
-                update(SqlConversation)
+                update(SqlConversationMetadata)
                 .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.id.in_(bound_ids),
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(bound_ids),
                 )
                 .values(host_id=new_host_id)
             )
@@ -404,25 +495,27 @@ class HostStore:
         *,
         host_id: str,
         name: str,
-        owner: str,
+        user_id: str,
+        now: int,
         configured_harnesses_json: str | None = None,
     ) -> Host | None:
-        """Re-own an existing host_id row under a new ``(owner, name)``.
+        """Re-own an existing host_id row under a new ``(user_id, name)``.
 
         Used only when ``upsert_on_connect`` opts in via
         ``allow_host_id_reown`` (the single-user loopback local server).
-        Updates ``owner``, ``name``, ``status``, and ``updated_at`` on the
+        Updates ``user_id``, ``name``, ``status``, and ``updated_at`` on the
         row that already holds *host_id*, leaving ``host_id`` itself
         unchanged so the ``conversations.host_id`` foreign-key bindings
-        survive the owner change. ``owner`` / ``name`` are the table's
-        primary key, so the change is issued as a Core ``UPDATE`` rather
-        than mutating the ORM object's PK in place.
+        survive the user_id change. ``(workspace_id, user_id, name)`` is a
+        unique constraint (the PK is ``(workspace_id, host_id)``), so the
+        change is issued as a Core ``UPDATE`` rather than loading and
+        mutating the ORM object in place.
 
         :param session: The active SQLAlchemy session.
         :param host_id: Host identifier whose row should be re-owned,
             e.g. ``"host_a1b2c3d4..."``.
         :param name: New host name to record, e.g. ``"corey-laptop"``.
-        :param owner: New owner to record, e.g. ``"local"`` or
+        :param user_id: New user_id to record, e.g. ``"local"`` or
             ``"corey.zumar@databricks.com"``.
         :param configured_harnesses_json: JSON-encoded readiness map from
             the connecting host's hello, e.g.
@@ -434,21 +527,23 @@ class HostStore:
         """
         existing = session.execute(
             select(SqlHost).where(
-                SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+                SqlHost.deleted_at.is_(None),
             )
         ).scalar_one_or_none()
         if existing is None:
             return None
         created_at = existing.created_at
-        now = now_epoch()
         session.execute(
             update(SqlHost)
             .where(
                 SqlHost.workspace_id == current_workspace_id(),
                 SqlHost.host_id == host_id,
+                SqlHost.deleted_at.is_(None),
             )
             .values(
-                owner=owner,
+                user_id=user_id,
                 name=name,
                 status=encode_host_status("online"),
                 updated_at=now,
@@ -458,7 +553,7 @@ class HostStore:
         return Host(
             host_id=host_id,
             name=name,
-            owner=owner,
+            user_id=user_id,
             status="online",
             created_at=created_at,
             updated_at=now,
@@ -477,15 +572,50 @@ class HostStore:
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         """
-        with self._session() as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
             row = session.execute(
                 select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if row is not None:
                 row.status = encode_host_status("offline")
-                row.updated_at = now_epoch()
+                row.updated_at = updated_at
+
+        run_write_transaction(self._session_immediate, "set_host_offline", write)
+
+    def update_harness_readiness(
+        self,
+        host_id: str,
+        configured_harnesses: dict[str, HarnessAvailability],
+    ) -> None:
+        """Replace a connected host's live per-harness readiness map.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param configured_harnesses: Current readiness keyed by harness spelling.
+        """
+        harnesses_json = json.dumps(configured_harnesses)
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
+                )
+                .values(
+                    configured_harnesses=harnesses_json,
+                    updated_at=updated_at,
+                )
+            )
+
+        run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
     def heartbeat(self, host_id: str) -> None:
         """
@@ -505,15 +635,20 @@ class HostStore:
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
         # pure overhead. A missing host simply matches no rows (a no-op).
-        with self._session() as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlHost)
                 .where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
                 )
-                .values(updated_at=now_epoch())
+                .values(updated_at=updated_at)
             )
+
+        run_write_transaction(self._session_immediate, "update_host_heartbeat", write)
 
     def is_online(self, host_id: str) -> bool:
         """
@@ -556,11 +691,12 @@ class HostStore:
             return set()
         unique_ids = list(set(host_ids))
         ref = now_epoch()
-        with self._session() as session:
+        with self._session("select_online_host_ids") as session:
             rows = session.execute(
                 select(SqlHost.host_id, SqlHost.status, SqlHost.updated_at).where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id.in_(unique_ids),
+                    SqlHost.deleted_at.is_(None),
                 )
             ).all()
         online_code = encode_host_status("online")
@@ -570,28 +706,107 @@ class HostStore:
             if row.status == online_code and row.updated_at >= ref - HOST_LIVENESS_TTL_S
         }
 
-    def list_hosts(self, owner: str) -> list[Host]:
+    def list_hosts(self, user_id: str) -> list[Host]:
         """
         List all hosts owned by a specific user.
 
         Returns both online and offline hosts, ordered by
         ``updated_at`` descending (most recently active first).
 
-        :param owner: User ID to filter by, e.g.
+        :param user_id: User ID to filter by, e.g.
             ``"corey.zumar@databricks.com"``.
         :returns: List of :class:`Host` entities.
         """
-        with self._session() as session:
+        with self._session("list_hosts") as session:
             rows = (
                 session.query(SqlHost)
                 .filter(
                     SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.owner == owner,
+                    SqlHost.user_id == user_id,
+                    SqlHost.deleted_at.is_(None),
                 )
                 .order_by(SqlHost.updated_at.desc())
                 .all()
             )
             return [_row_to_host(row) for row in rows]
+
+    def list_current_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        """Page through hosts whose current sandbox-id slot is populated.
+
+        This privileged reaper scan intentionally spans workspaces. Ordering by
+        the indexed ``(sandbox_id, workspace_id, host_id)`` tuple makes every
+        query bounded while allowing a complete deterministic traversal.
+
+        :param after: Exclusive keyset cursor from the prior page.
+        :param limit: Maximum rows returned by this query.
+        :returns: ``(workspace_id, host)`` rows in cursor order.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._session("list_current_managed_sandbox_hosts_page") as session:
+            stmt = (
+                select(SqlHost)
+                .where(SqlHost.sandbox_id.is_not(None))
+                .order_by(
+                    SqlHost.sandbox_id.asc(),
+                    SqlHost.workspace_id.asc(),
+                    SqlHost.host_id.asc(),
+                )
+                .limit(limit)
+            )
+            if after is not None:
+                stmt = stmt.where(
+                    tuple_(SqlHost.sandbox_id, SqlHost.workspace_id, SqlHost.host_id) > after
+                )
+            rows = session.execute(stmt).scalars().all()
+            return [(row.workspace_id, _row_to_host(row)) for row in rows]
+
+    def list_terminating_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        """Page through hosts whose terminating sandbox-id slot is populated.
+
+        This privileged reaper scan intentionally spans workspaces. Ordering by
+        the indexed ``(terminating_sandbox_id, workspace_id, host_id)`` tuple
+        makes every query bounded while allowing a complete deterministic
+        traversal.
+
+        :param after: Exclusive keyset cursor from the prior page.
+        :param limit: Maximum rows returned by this query.
+        :returns: ``(workspace_id, host)`` rows in cursor order.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._session("list_terminating_managed_sandbox_hosts_page") as session:
+            stmt = (
+                select(SqlHost)
+                .where(SqlHost.terminating_sandbox_id.is_not(None))
+                .order_by(
+                    SqlHost.terminating_sandbox_id.asc(),
+                    SqlHost.workspace_id.asc(),
+                    SqlHost.host_id.asc(),
+                )
+                .limit(limit)
+            )
+            if after is not None:
+                stmt = stmt.where(
+                    tuple_(
+                        SqlHost.terminating_sandbox_id,
+                        SqlHost.workspace_id,
+                        SqlHost.host_id,
+                    )
+                    > after
+                )
+            rows = session.execute(stmt).scalars().all()
+            return [(row.workspace_id, _row_to_host(row)) for row in rows]
 
     def get_host(self, host_id: str) -> Host | None:
         """
@@ -601,10 +816,12 @@ class HostStore:
             ``"host_a1b2c3d4..."``.
         :returns: The :class:`Host` if found, otherwise ``None``.
         """
-        with self._session() as session:
+        with self._session("select_host_by_id") as session:
             row = session.execute(
                 select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if row is None:
@@ -616,14 +833,14 @@ class HostStore:
         *,
         host_id: str,
         name: str,
-        owner: str,
+        user_id: str,
         token: str,
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
     ) -> Host:
         """
-        Pre-register a server-managed sandbox host with its credential.
+        Create a server-managed sandbox host with its credential.
 
         Called by the managed-launch orchestration after the sandbox is
         provisioned and BEFORE the in-sandbox host process starts, so
@@ -632,19 +849,12 @@ class HostStore:
         normal ``upsert_on_connect`` flips it online when the host
         registers.
 
-        If a row already exists for *host_id* (a RELAUNCH: the host
-        identity is durable across sandbox generations so session
-        bindings survive a dead sandbox), the credential and sandbox
-        columns are overwritten in place — which atomically revokes the
-        previous generation's token, since its digest no longer matches
-        anything.
-
         :param host_id: Server-generated host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         :param name: Display name for the host picker, e.g.
             ``"managed-a1b2c3d4"``. Part of the table's
-            ``(owner, name)`` primary key.
-        :param owner: User the managed host acts for, e.g.
+            ``(user_id, name)`` primary key.
+        :param user_id: User the managed host acts for, e.g.
             ``"alice@example.com"``.
         :param token: The RAW launch token (hashed here, never stored),
             e.g. the value of ``secrets.token_urlsafe(32)``.
@@ -654,38 +864,13 @@ class HostStore:
         :param token_expires_at: Unix epoch seconds after which the
             token no longer authenticates.
         :returns: The registered :class:`Host`.
-        :raises ValueError: If a row for *host_id* exists under a
-            DIFFERENT owner — a relaunch may only re-credential a host
-            the same user owns.
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
-        with self._session() as session:
-            existing = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                if existing.owner != owner:
-                    # Fail closed (W2-class boundary): re-crediting a host
-                    # row hands its launch token holder the row owner's
-                    # identity, so a cross-owner overwrite would be a host
-                    # hijack. host_id is server-generated today (uuid4 per
-                    # launch), so this can only fire on a bug or a forged
-                    # id — refuse rather than re-own.
-                    raise ValueError(
-                        f"host {host_id!r} is registered to a different owner; "
-                        "refusing to re-credential it"
-                    )
-                existing.token_hash = token_hash
-                existing.token_expires_at = token_expires_at
-                existing.sandbox_provider = provider
-                existing.sandbox_id = sandbox_id
-                existing.updated_at = now
-                return _row_to_host(existing)
+
+        def write(session: Session) -> Host:
             row = SqlHost(
-                owner=owner,
+                user_id=user_id,
                 name=name,
                 host_id=host_id,
                 status=encode_host_status("offline"),
@@ -699,64 +884,285 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
-    def resolve_launch_token(self, token: str) -> Host | None:
+        return run_write_transaction(self._session_immediate, "register_managed_host", write)
+
+    def replace_managed_host_sandbox(
+        self,
+        *,
+        host_id: str,
+        user_id: str,
+        token: str,
+        provider: str,
+        sandbox_id: str,
+        token_expires_at: int,
+    ) -> Host | None:
+        """Replace the sandbox generation backing an existing managed host.
+
+        The row lock serializes replacement with :meth:`delete_host`. A missing
+        result means full teardown already removed the durable host, so the
+        caller must clean up the unregistered sandbox instead of recreating it.
         """
-        Resolve a presented launch token to its managed host, if valid.
+        now = now_epoch()
+        token_hash = hash_host_launch_token(token)
+        with self._lifecycle_session("replace_managed_host_sandbox") as session:
+            existing = session.execute(
+                select(SqlHost)
+                .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if existing is None:
+                return None
+            if existing.deleted_at is not None:
+                return None
+            if existing.user_id != user_id:
+                raise ValueError(
+                    f"host {host_id!r} is registered to a different user; "
+                    "refusing to re-credential it"
+                )
+            if (
+                existing.terminating_sandbox_id is not None
+                and existing.sandbox_provider != provider
+            ):
+                raise ValueError(
+                    "cannot change managed sandbox provider while termination is pending"
+                )
+            if existing.terminating_sandbox_id == sandbox_id:
+                raise ValueError(
+                    f"sandbox {sandbox_id!r} is still pending termination; refusing to re-arm it"
+                )
+            existing.token_hash = token_hash
+            existing.token_expires_at = token_expires_at
+            existing.sandbox_provider = provider
+            existing.sandbox_id = sandbox_id
+            existing.updated_at = now
+            return _row_to_host(existing)
 
-        The host tunnel's auth path for managed hosts. Lookup is by
-        SHA-256 digest — the comparison happens inside an indexed
-        equality query on a uniformly distributed hash, which is not
-        byte-by-byte comparable from the network (the standard
-        reset-token pattern; no timing oracle on the raw token).
-        Expired tokens do not authenticate; the expiry is checked
-        atomically with the lookup.
+    def rearm_managed_host(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+        expected_updated_at: int,
+        token: str,
+        token_expires_at: int,
+    ) -> Host | None:
+        """Atomically re-arm the exact active generation before resuming it.
 
-        :param token: The raw token presented by a connecting host.
+        The compare-and-update races against reaper detachment and tunnel
+        heartbeats. Cleanup of a different, older generation does not block the
+        active generation. A missing result means the caller's snapshot is no
+        longer current and the provider must not be asked to resume that sandbox id.
+        """
+        now = now_epoch()
+        with self._session("rearm_managed_host") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.sandbox_id == sandbox_id,
+                        SqlHost.updated_at == expected_updated_at,
+                        SqlHost.sandbox_provider.is_not(None),
+                        SqlHost.deleted_at.is_(None),
+                        or_(
+                            SqlHost.terminating_sandbox_id.is_(None),
+                            SqlHost.terminating_sandbox_id != sandbox_id,
+                        ),
+                    )
+                    .values(
+                        token_hash=hash_host_launch_token(token),
+                        token_expires_at=token_expires_at,
+                        status=encode_host_status("offline"),
+                        updated_at=now,
+                    )
+                ),
+            )
+            if result.rowcount != 1:
+                return None
+            row = session.get(SqlHost, (current_workspace_id(), host_id))
+            return _row_to_host(row) if row is not None else None
+
+    def resolve_launch_token(self, host_id: str, token: str) -> Host | None:
+        """
+        Resolve a launch token presented for *host_id* to its managed host.
+
+        The host tunnel's auth path for managed hosts, whose endpoint is
+        ``/hosts/{host_id}/tunnel`` — so the connecting peer names the
+        host it claims to be, and the token proves the claim. The row is
+        fetched by its ``(workspace_id, host_id)`` primary key and the
+        stored SHA-256 digest is compared to the presented token's digest
+        with :func:`hmac.compare_digest`, so the equality is constant-time
+        and leaks no timing oracle on the raw token. Presenting a token
+        for the wrong ``host_id`` fails closed: the named row's digest
+        won't match. Expired tokens do not authenticate.
+
+        :param host_id: The host the peer claims to be, from the tunnel
+            path, e.g. ``"host_a1b2c3d4..."``.
+        :param token: The raw token presented by the connecting host.
         :returns: The matching :class:`Host` whose token is unexpired,
-            or ``None`` when the token is unknown or expired.
+            or ``None`` when the host is unknown, the token does not match,
+            or the token is expired.
         """
-        with self._session() as session:
+        with self._session("resolve_launch_token") as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.token_hash == hash_host_launch_token(token),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             # token_expires_at is written together with token_hash, so a
-            # matched row always carries it; the None arm is mypy
-            # narrowing that doubles as fail-closed.
-            if row is None or row.token_expires_at is None or row.token_expires_at < now_epoch():
+            # credentialled row always carries both; a row with either
+            # cleared (external host, or a revoked credential) never
+            # authenticates.
+            if row is None or row.token_hash is None or row.token_expires_at is None:
+                return None
+            if not hmac.compare_digest(row.token_hash, hash_host_launch_token(token)):
+                return None
+            if row.token_expires_at < now_epoch():
                 return None
             return _row_to_host(row)
 
-    def delete_host(self, host_id: str) -> None:
+    def delete_host(self, host_id: str) -> Host | None:
         """
-        Delete a host row entirely.
+        Logically delete a host and retain pending sandbox cleanup.
 
-        Managed-host teardown: removes the host from the picker AND
-        revokes its launch token in one operation (the row IS the
-        credential). Explicitly nulls ``conversations.host_id`` for any
-        sessions still bound to this host — the DB no longer cascades
-        this via FK. No-op when the row does not exist — deletion is
-        invoked from best-effort cleanup paths that may race.
+        The row is immediately hidden, its credential is revoked, and bound
+        sessions are detached. Managed hosts with recorded sandbox ids remain
+        as internal tombstones until provider cleanup succeeds; rows without
+        cleanup work are physically deleted immediately. The row lock serializes
+        deletion with managed-host generation replacement.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The latest host snapshot, or ``None`` when already absent.
         """
-        with self._session() as session:
-            session.execute(
-                update(SqlConversation)
+
+        def write(session: Session) -> Host | None:
+            row = session.execute(
+                select(SqlHost)
                 .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == host_id,
-                )
-                .values(host_id=None)
-            )
-            session.execute(
-                sql_delete(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                 )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            deleted = _row_to_host(row)
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == host_id,
+                )
+                .values(host_id=None)
             )
+            if row.sandbox_provider is None or (
+                row.sandbox_id is None and row.terminating_sandbox_id is None
+            ):
+                session.execute(
+                    sql_delete(SqlHost).where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                    )
+                )
+                return deleted
+            row.token_hash = None
+            row.token_expires_at = None
+            row.status = encode_host_status("offline")
+            row.deleted_at = row.deleted_at or now_epoch()
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "delete_host", write)
+
+    def detach_stale_managed_sandbox(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+        expected_updated_at: int,
+    ) -> bool:
+        """Atomically detach one stale generation before provider termination.
+
+        The sandbox id and heartbeat timestamp form the stale snapshot. A
+        reconnect, resume, or relaunch changes one of them and wins the race.
+        Detachment revokes the old token immediately and leaves the cleanup id
+        persisted for later retries.
+
+        :param host_id: Durable managed host identifier.
+        :param sandbox_id: Provider id of the stale active generation.
+        :param expected_updated_at: Heartbeat timestamp observed by the sweep.
+        :returns: ``True`` when that exact stale generation was detached.
+        """
+        with self._session("detach_stale_managed_sandbox") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.sandbox_id == sandbox_id,
+                        SqlHost.updated_at == expected_updated_at,
+                        SqlHost.sandbox_provider.is_not(None),
+                        SqlHost.deleted_at.is_(None),
+                        SqlHost.terminating_sandbox_id.is_(None),
+                    )
+                    .values(
+                        token_hash=None,
+                        token_expires_at=None,
+                        sandbox_id=None,
+                        terminating_sandbox_id=sandbox_id,
+                        status=encode_host_status("offline"),
+                    )
+                ),
+            )
+            return result.rowcount == 1
+
+    def mark_sandbox_terminated(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+    ) -> bool:
+        """Clear one terminated sandbox id and remove an empty tombstone.
+
+        Active ids may be cleared only after the host is logically deleted.
+        Otherwise, the id must already be detached into the pending slot.
+
+        :param host_id: Durable managed host identifier.
+        :param sandbox_id: Exact provider id that was terminated.
+        :returns: ``True`` when that recorded id was cleared.
+        """
+        with self._lifecycle_session("mark_sandbox_terminated") as session:
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+
+            if row.deleted_at is None:
+                if row.terminating_sandbox_id != sandbox_id:
+                    return False
+                row.terminating_sandbox_id = None
+                return True
+
+            if sandbox_id not in {row.sandbox_id, row.terminating_sandbox_id}:
+                return False
+            if row.sandbox_id == sandbox_id:
+                row.sandbox_id = None
+            if row.terminating_sandbox_id == sandbox_id:
+                row.terminating_sandbox_id = None
+            if row.sandbox_id is None and row.terminating_sandbox_id is None:
+                session.delete(row)
+            return True
 
     def revoke_launch_token(self, host_id: str) -> None:
         """
@@ -766,19 +1172,26 @@ class HostStore:
         the token it armed (the new sandbox never came up to use it)
         without deleting the durable host row — the session binding
         survives, and the next relaunch attempt re-arms a fresh token
-        via :meth:`register_managed_host`. Contrast :meth:`delete_host`,
-        which is full teardown. No-op when the row does not exist.
+        via :meth:`replace_managed_host_sandbox`. Contrast
+        :meth:`delete_host`, which is full teardown. No-op when the row
+        does not exist.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session() as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
             row = session.execute(
                 select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if row is None:
                 return
             row.token_hash = None
             row.token_expires_at = None
-            row.updated_at = now_epoch()
+            row.updated_at = updated_at
+
+        run_write_transaction(self._session_immediate, "revoke_launch_token", write)

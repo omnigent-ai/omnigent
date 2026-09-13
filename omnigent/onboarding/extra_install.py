@@ -9,8 +9,12 @@ install command depends on *how* omnigent itself was installed:
   git-source install (``uv tool install git+…``) instead reinstalls from that
   same source (``uv tool install --force "omnigent[extra] @ git+…"``) so the
   tool is not silently re-pulled from PyPI.
-* **``uv`` (non-tool)** — ``uv pip install "omnigent[extra]"`` targets the
-  active virtualenv.
+* **``uv`` (non-tool)** — ``uv pip install --python <sys.executable>
+  "omnigent[extra]"`` pins the install to the running interpreter.  The bare
+  form instead resolves the *active* virtualenv, which fails outright on a
+  Homebrew/pipx/system install that merely has ``uv`` on ``PATH`` ("No virtual
+  environment found") and can silently target an unrelated venv when one is
+  active.
 * **``pip`` / fallback** — ``<sys.executable> -m pip install "omnigent[extra]"``
   pins to the running interpreter.
 """
@@ -64,7 +68,8 @@ def extra_install_command(extra: str) -> list[str]:
        "omnigent[extra] @ git+…"`` (keeps the tool on its original source)
     2. ``uv tool`` install, registry → ``uv tool install --with ...
        omnigent --force``
-    3. ``uv`` on PATH (non-tool) → ``uv pip install "omnigent[extra]"``
+    3. ``uv`` on PATH (non-tool) → ``uv pip install --python <sys.executable>
+       "omnigent[extra]"``
     4. fallback → ``<sys.executable> -m pip install "omnigent[extra]"``
 
     :param extra: The pip extra name, e.g. ``"cursor"``.
@@ -81,7 +86,11 @@ def extra_install_command(extra: str) -> list[str]:
         return ["uv", "tool", "install", "--with", target, "omnigent", "--force"]
 
     if shutil.which("uv") is not None:
-        return ["uv", "pip", "install", target]
+        # ``--python`` pins the install to the interpreter that will import the
+        # extra.  Without it ``uv pip install`` requires an active virtualenv
+        # and errors out on Homebrew/pipx/system installs that merely have uv
+        # on PATH.
+        return ["uv", "pip", "install", "--python", sys.executable, target]
 
     return [sys.executable, "-m", "pip", "install", target]
 

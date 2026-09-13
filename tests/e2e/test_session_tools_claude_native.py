@@ -38,7 +38,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     augment_claude_args,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
@@ -524,4 +524,13 @@ def test_claude_native_relay_advertises_broadened_orchestrator_surface(
             f"tool_relay.json leaked spawn-write tools {sorted(leaked)} for an agent "
             f"without any spawn opt-in — native relay gating diverged from the "
             f"ToolManager gate."
+        )
+
+        # ``load_skill`` is what discovers host-scope skills, and the relay is
+        # this session's only tool surface — without it, a skill dropped in
+        # ~/.agents/skills is invisible here however the docs describe it.
+        assert "load_skill" in relay_tools, (
+            f"tool_relay.json does not advertise load_skill. "
+            f"Relay advertised: {sorted(relay_tools)}. Host-scope skill discovery "
+            f"is unreachable from this session."
         )

@@ -13,6 +13,7 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
+from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
@@ -29,11 +30,16 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysReadInboxTool,
+    SysScheduledTaskCreateTool,
+    SysScheduledTaskDeleteTool,
+    SysScheduledTaskListTool,
+    SysScheduledTaskUpdateTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
+    SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
     SysTimerCancelTool,
@@ -151,6 +157,7 @@ class ToolManager:
         self._register_skill_tools()
         self._register_builtin_tools()
         self._register_sub_agent_tools()
+        self._register_session_tools()
         self._register_agent_mgmt_tools()
         self._register_os_env_tools()
         self._register_terminal_tools()
@@ -182,6 +189,9 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        # Scheduled-task tools are always auto-registered so agents can
+        # manage recurring runs at runtime without the spec opting in.
+        self._register_scheduled_task_tools()
         # Embedded-browser tools are always auto-registered so any agent
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
@@ -200,6 +210,23 @@ class ToolManager:
 
         self._tools[SysAddPolicyTool.name()] = SysAddPolicyTool()
         self._tools[SysPolicyRegistryTool.name()] = SysPolicyRegistryTool()
+
+    def _register_scheduled_task_tools(self) -> None:
+        """
+        Auto-register the scheduled-task management builtins.
+
+        Always available so an agent can create, list, update, and delete
+        recurring scheduled tasks at runtime without the spec opting in. The
+        runner dispatches all four via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
+        """
+        for tool in (
+            SysScheduledTaskCreateTool(),
+            SysScheduledTaskListTool(),
+            SysScheduledTaskUpdateTool(),
+            SysScheduledTaskDeleteTool(),
+        ):
+            self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
         """
@@ -344,25 +371,21 @@ class ToolManager:
         """
         Build a :class:`WebSearchTool` for the parent's LLM.
 
-        Uses ``parse_model_string`` to infer the provider, except for
-        ``databricks-*`` models which don't support the native
-        ``web_search_preview`` schema and fall back to function-tool mode.
+        The OpenAI-native ``web_search_preview`` passthrough is only used
+        on OpenAI Responses-compatible harnesses; everywhere else the tool
+        gets a function schema — see
+        :func:`~omnigent.llms.routing.web_search_native_passthrough_provider`.
 
         :param config: Spec-level tool config dict, e.g.
             ``{"api_key": "...", "engine_id": "..."}``.
         :returns: A configured :class:`WebSearchTool`.
         """
+        from omnigent.llms.routing import web_search_native_passthrough_provider
         from omnigent.tools.builtins.web_search import WebSearchTool
 
-        llm_provider = None
-        if self._spec.executor.model:
-            model = self._spec.executor.model
-            # Databricks doesn't support web_search_preview; skip
-            # OpenAI provider inference for all databricks-* models.
-            if not model.startswith("databricks-"):
-                from omnigent.llms.routing import parse_model_string
-
-                llm_provider = parse_model_string(model).provider
+        llm_provider = web_search_native_passthrough_provider(
+            self._spec.executor.model, self._spec.executor.harness_kind
+        )
         return WebSearchTool(config=config, llm_provider=llm_provider)
 
     def _create_web_fetch(self) -> Tool:
@@ -459,11 +482,13 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
-        # Advise-models is registered unconditionally alongside the
-        # dispatch grant — same pattern as sys_list_models. The server's
-        # MCP intercept returns router_on:false when routing is off,
-        # giving the model a clear signal without hiding the tool.
-        self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
+        # Advise-models is capability-gated: expose it only when some router can
+        # answer. Hiding the tool prevents agents from probing router_on via a
+        # no-op call when routing is disabled.
+        from omnigent.server.routing_backend import routing_available
+
+        if routing_available(get_caps()):
+            self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents
         # by id, or custom bundles via config_path) requires the
@@ -471,6 +496,10 @@ class ToolManager:
         # alone only permits the specified sub-agent types.
         if self._spec.spawn:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
+
+    def _register_session_tools(self) -> None:
+        """Register framework-owned tools for the current session."""
+        self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
 
     def _register_agent_mgmt_tools(self) -> None:
         """

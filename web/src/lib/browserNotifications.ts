@@ -65,7 +65,8 @@ export interface ShowNotificationParams {
 }
 
 /**
- * Show a notification, or no-op when unsupported or not yet granted.
+ * Show a notification, or no-op when unsupported, not yet granted, or the
+ * constructor is unusable on this platform.
  *
  * Clicking focuses the originating window, runs `onClick` (navigation),
  * and closes the toast. Returns the created Notification (for tests) or
@@ -89,7 +90,15 @@ export function showNotification({
     return null;
   }
   if (!isNotificationSupported() || Notification.permission !== "granted") return null;
-  const notification = new Notification(title, { body, tag });
+  // Some platforms (e.g. mobile Chrome) expose the constructor and report
+  // permission "granted" but still throw on `new Notification()`. Degrade to a
+  // no-op rather than let it escape into the caller.
+  let notification: Notification;
+  try {
+    notification = new Notification(title, { body, tag });
+  } catch {
+    return null;
+  }
   notification.onclick = () => {
     window.focus();
     onClick?.();

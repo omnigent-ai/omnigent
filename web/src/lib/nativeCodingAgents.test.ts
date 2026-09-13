@@ -1,9 +1,19 @@
 import { describe, it, expect } from "vitest";
+import type { NativeCodingAgentSpec } from "./nativeCodingAgents";
 import {
+  NATIVE_CODING_AGENTS,
   UI_MODE_LABEL_KEY,
   UI_MODE_TERMINAL_VALUE,
   WRAPPER_LABEL_KEY,
+  isFullySupportedNativeCodingAgent,
+  isNativePolicyName,
+  isNativeTerminalSession,
+  isNativeWrapper,
+  isRecentHarness,
+  nativeAgentHasCapability,
   nativeCodingAgentForHarness,
+  nativeCodingAgentForPolicyName,
+  nativeCodingAgentForSubagentWrapper,
   nativeWrapperLabelsForAgent,
 } from "./nativeCodingAgents";
 
@@ -56,12 +66,27 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("antigravity-native")?.key).toBe("antigravity");
   });
 
-  // Same reversed-alias contract as native-pi: `native-antigravity` must
-  // fold to the canonical antigravity-native spec.
-  it("folds the reversed native-antigravity alias to the antigravity-native spec", () => {
-    expect(nativeCodingAgentForHarness("native-antigravity")).toBe(
-      nativeCodingAgentForHarness("antigravity-native"),
-    );
+  // Same reversed-alias and shortcut contract: `native-antigravity`, `agy-native`,
+  // and `native-agy` must fold to the canonical antigravity-native spec.
+  it("folds antigravity native aliases to the antigravity-native spec", () => {
+    const canonical = nativeCodingAgentForHarness("antigravity-native");
+    expect(nativeCodingAgentForHarness("native-antigravity")).toBe(canonical);
+    expect(nativeCodingAgentForHarness("agy-native")).toBe(canonical);
+    expect(nativeCodingAgentForHarness("native-agy")).toBe(canonical);
+  });
+
+  // agy's only pre-emptive control is the all-or-nothing bypass, so it must
+  // declare `skipPermissions` and NOT Claude's graded `permissionMode` — the
+  // latter would emit `--permission-mode <mode>`, a flag agy does not accept.
+  it("gives antigravity-native the skipPermissions capability, not permissionMode", () => {
+    const agy = nativeCodingAgentForHarness("antigravity-native");
+    expect(agy?.capabilities).toEqual(["skipPermissions"]);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "skipPermissions"),
+    ).toBe(true);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "permissionMode"),
+    ).toBe(false);
   });
 
   it("leaves unknown / non-native harnesses unresolved", () => {
@@ -81,7 +106,11 @@ describe("nativeWrapperLabelsForAgent", () => {
     });
   });
 
-  it("stamps terminal-first labels for a native-antigravity agent", () => {
+  it("stamps terminal-first labels for an agy-native / native-antigravity agent", () => {
+    expect(nativeWrapperLabelsForAgent({ name: "my-agy", harness: "agy-native" })).toEqual({
+      [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
+      [WRAPPER_LABEL_KEY]: "antigravity-native-ui",
+    });
     expect(nativeWrapperLabelsForAgent({ name: "my-agy", harness: "native-antigravity" })).toEqual({
       [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
       [WRAPPER_LABEL_KEY]: "antigravity-native-ui",
@@ -95,5 +124,165 @@ describe("nativeWrapperLabelsForAgent", () => {
       [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
       [WRAPPER_LABEL_KEY]: "opencode-native-ui",
     });
+  });
+});
+
+describe("nativeCodingAgentForSubagentWrapper", () => {
+  it("resolves the vendor that spawned a native sub-agent child", () => {
+    expect(nativeCodingAgentForSubagentWrapper("claude-code-native-ui-subagent")?.displayName).toBe(
+      "Claude Code",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("codex-native-ui-subagent")?.displayName).toBe(
+      "Codex",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("opencode-native-ui-subagent")?.displayName).toBe(
+      "OpenCode",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("antigravity-native-ui-subagent")?.displayName).toBe(
+      "Antigravity",
+    );
+  });
+
+  it("does not resolve parent wrappers or unknown labels", () => {
+    expect(nativeCodingAgentForSubagentWrapper("claude-code-native-ui")).toBeUndefined();
+    expect(nativeCodingAgentForSubagentWrapper("pi-native-ui-subagent")).toBeUndefined();
+    expect(nativeCodingAgentForSubagentWrapper(null)).toBeUndefined();
+  });
+
+  // The two lookups stay disjoint: a sub-agent child owns no PTY and takes no
+  // input, so it must not read as a native-terminal session (which would, for
+  // one, hide Smart Routing's eligibility check behind the wrong branch).
+  it("keeps sub-agent wrappers out of the native-terminal wrapper lookup", () => {
+    expect(isNativeWrapper("claude-code-native-ui-subagent")).toBe(false);
+    expect(
+      isNativeTerminalSession({
+        labels: { [WRAPPER_LABEL_KEY]: "claude-code-native-ui-subagent" },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isNativeTerminalSession", () => {
+  it("detects a native session by its wrapper label", () => {
+    expect(
+      isNativeTerminalSession({
+        labels: { [WRAPPER_LABEL_KEY]: "claude-code-native-ui" },
+      }),
+    ).toBe(true);
+  });
+
+  it("detects a native session by its resolved harness (no label)", () => {
+    expect(isNativeTerminalSession({ harness: "codex-native" })).toBe(true);
+    expect(isNativeTerminalSession({ harness: "pi-native" })).toBe(true);
+  });
+
+  it("is false for a brain-harness session (Smart Routing stays eligible)", () => {
+    expect(isNativeTerminalSession({ harness: "claude-sdk" })).toBe(false);
+    expect(isNativeTerminalSession({ harness: "codex" })).toBe(false);
+    expect(isNativeTerminalSession({ harness: "pi" })).toBe(false);
+  });
+
+  it("is false for null / empty sessions", () => {
+    expect(isNativeTerminalSession(null)).toBe(false);
+    expect(isNativeTerminalSession(undefined)).toBe(false);
+    expect(isNativeTerminalSession({})).toBe(false);
+  });
+});
+
+describe("isFullySupportedNativeCodingAgent", () => {
+  it("is true for exactly Claude Code and Codex", () => {
+    const supported = (NATIVE_CODING_AGENTS as readonly NativeCodingAgentSpec[])
+      .filter((a) => a.fullySupported === true)
+      .map((a) => a.key);
+    expect(supported).toEqual(["claude", "codex"]);
+  });
+
+  it("resolves the flag by harness and by agent name", () => {
+    expect(
+      isFullySupportedNativeCodingAgent({ name: "claude-native-ui", harness: "claude-native" }),
+    ).toBe(true);
+    expect(
+      isFullySupportedNativeCodingAgent({ name: "codex-native-ui", harness: "codex-native" }),
+    ).toBe(true);
+  });
+
+  it("is false for every other harness (they fold into 'More')", () => {
+    expect(isFullySupportedNativeCodingAgent({ name: "pi-native-ui", harness: "pi-native" })).toBe(
+      false,
+    );
+    expect(
+      isFullySupportedNativeCodingAgent({ name: "cursor-native-ui", harness: "cursor-native" }),
+    ).toBe(false);
+    expect(
+      isFullySupportedNativeCodingAgent({ name: "opencode-native-ui", harness: "opencode-native" }),
+    ).toBe(false);
+  });
+
+  it("is false for non-native agents and null", () => {
+    expect(isFullySupportedNativeCodingAgent({ name: "polly", harness: "claude-sdk" })).toBe(false);
+    expect(isFullySupportedNativeCodingAgent(null)).toBe(false);
+  });
+});
+
+describe("isRecentHarness", () => {
+  const pi = { name: "pi-native-ui", harness: "pi-native" };
+
+  it("matches a stored canonical harness id", () => {
+    expect(isRecentHarness(pi, ["pi-native"])).toBe(true);
+  });
+
+  it("folds a stored reversed alias to the canonical spec", () => {
+    expect(isRecentHarness(pi, ["native-pi"])).toBe(true);
+  });
+
+  it("is false for a harness that isn't in the list", () => {
+    expect(isRecentHarness(pi, ["cursor-native"])).toBe(false);
+    expect(isRecentHarness(pi, [])).toBe(false);
+  });
+
+  it("is false for non-native agents, null, and unknown stored ids", () => {
+    expect(isRecentHarness({ name: "polly", harness: "claude-sdk" }, ["claude-sdk"])).toBe(false);
+    expect(isRecentHarness(null, ["pi-native"])).toBe(false);
+    expect(isRecentHarness(pi, ["not-a-harness"])).toBe(false);
+  });
+});
+
+describe("nativeCodingAgentForPolicyName", () => {
+  // Every synthetic stamp the server bridges currently emit, so a renamed
+  // prefix on either side fails here rather than leaking the id to the UI.
+  it.each([
+    ["claude_native_permission", "Claude Code"],
+    ["codex_native_command_approval", "Codex"],
+    ["codex_native_apply_patch_approval", "Codex"],
+    ["cursor_native_permission", "Cursor"],
+    ["agy_native_permission", "Antigravity"],
+    ["agy_native_ask_question", "Antigravity"],
+    ["kiro_native_permission", "Kiro"],
+    ["goose_native_permission", "Goose"],
+    ["qwen_native_permission", "Qwen Code"],
+    ["hermes_native_permission", "Hermes"],
+  ])("maps %s to %s", (policyName, displayName) => {
+    expect(nativeCodingAgentForPolicyName(policyName)?.displayName).toBe(displayName);
+  });
+
+  it("has no vendor for user-authored policy names", () => {
+    expect(nativeCodingAgentForPolicyName("approve_shell_commands")).toBeUndefined();
+    expect(nativeCodingAgentForPolicyName("native_permission")).toBeUndefined();
+  });
+});
+
+describe("isNativePolicyName", () => {
+  it("is true for vendor stamps and the vendor-less fallback", () => {
+    expect(isNativePolicyName("claude_native_permission")).toBe(true);
+    expect(isNativePolicyName("agy_native_permission")).toBe(true);
+    expect(isNativePolicyName("native_permission")).toBe(true);
+  });
+
+  it("is false for user-authored policy names", () => {
+    expect(isNativePolicyName("approve_shell_commands")).toBe(false);
+    // A policy of one's own may still mention a vendor; only the bridges'
+    // `<vendor>_native_` shape counts as provenance.
+    expect(isNativePolicyName("codex_review_gate")).toBe(false);
+    expect(isNativePolicyName("")).toBe(false);
   });
 });

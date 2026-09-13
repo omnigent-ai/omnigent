@@ -211,6 +211,9 @@ class _FakeAgent:
         self.closed = True
 
 
+_MODEL_NOT_PROVIDED = object()
+
+
 class _FakeLocalAgentConfig:
     """Mirror of ``LocalAgentConfig`` — accepts exactly the fields the executor sets."""
 
@@ -218,7 +221,7 @@ class _FakeLocalAgentConfig:
         self,
         *,
         system_instructions: str | None = None,
-        model: str | None = None,
+        model: str | None | object = _MODEL_NOT_PROVIDED,
         api_key: str | None = None,
         vertex: bool | None = None,
         project: str | None = None,
@@ -227,7 +230,8 @@ class _FakeLocalAgentConfig:
         hooks: Any = None,
     ) -> None:
         self.system_instructions = system_instructions
-        self.model = model
+        self.model = model if isinstance(model, str) else None
+        self.model_provided = model is not _MODEL_NOT_PROVIDED
         self.api_key = api_key
         self.vertex = vertex
         self.project = project
@@ -352,13 +356,65 @@ async def test_streaming_maps_text_reasoning_and_usage(monkeypatch: pytest.Monke
     assert completes[0].response == "Hello world"
     # Usage maps the SDK's UsageMetadata field names onto Omnigent's keys and
     # stamps the resolved model so the scaffold can price the turn.
+    # input_tokens is the NON-cached portion: Gemini's prompt_token_count (11)
+    # is inclusive of cached_content_token_count (2), and compute_llm_cost
+    # prices cache_read_input_tokens additively, so input must be 11 - 2 = 9 to
+    # avoid double-billing the cached tokens.
     assert completes[0].usage == {
-        "input_tokens": 11,
+        "input_tokens": 9,
         "output_tokens": 7,
         "total_tokens": 18,
         "cache_read_input_tokens": 2,
         "model": "gemini-3-pro",
     }
+
+
+def test_extract_usage_subtracts_cached_to_avoid_double_billing() -> None:
+    """``input_tokens`` excludes cached tokens so cache reads aren't billed twice.
+
+    Gemini's ``prompt_token_count`` is inclusive of
+    ``cached_content_token_count``, and ``compute_llm_cost`` prices
+    ``cache_read_input_tokens`` additively while requiring ``input_tokens`` to
+    be the NON-cached portion. Passing the full prompt count as ``input_tokens``
+    while also reporting ``cache_read_input_tokens`` bills the cached tokens
+    twice — once at the full input rate, once at the cache-read rate.
+
+    Regression guard: pre-fix ``input_tokens`` was the full 1000 here.
+    """
+    meta = SimpleNamespace(
+        prompt_token_count=1000,
+        candidates_token_count=200,
+        total_token_count=1200,
+        cached_content_token_count=800,
+    )
+    usage = AntigravityExecutor._extract_usage(meta)
+    assert usage is not None
+    # 1000 prompt - 800 cached = 200 non-cached input.
+    assert usage["input_tokens"] == 200, (
+        f"input_tokens {usage['input_tokens']} != 200 — the cached portion must be "
+        "subtracted from the Gemini prompt count so compute_llm_cost does not "
+        "double-bill it against the additive cache_read bucket."
+    )
+    assert usage["cache_read_input_tokens"] == 800
+    assert usage["output_tokens"] == 200
+    assert usage["total_tokens"] == 1200
+    # input + cache_read reconstructs the original prompt count, proving the
+    # cached tokens are counted exactly once across the two buckets.
+    assert usage["input_tokens"] + usage["cache_read_input_tokens"] == 1000
+
+
+def test_extract_usage_clamps_when_cached_exceeds_prompt() -> None:
+    """A malformed cached > prompt count clamps ``input_tokens`` to 0, not negative."""
+    meta = SimpleNamespace(
+        prompt_token_count=100,
+        candidates_token_count=50,
+        total_token_count=150,
+        cached_content_token_count=999,
+    )
+    usage = AntigravityExecutor._extract_usage(meta)
+    assert usage is not None
+    assert usage["input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 999
 
 
 @pytest.mark.asyncio
@@ -904,11 +960,14 @@ async def test_usage_observer_notified_on_turn_complete(monkeypatch: pytest.Monk
         remove()
 
     # Exactly one notification, carrying the model and the mapped token counts
-    # from the turn's UsageMetadata (_FakeUsage: prompt=11, candidates=7, total=18).
+    # from the turn's UsageMetadata (_FakeUsage: prompt=11, candidates=7,
+    # total=18, cached=2). input_tokens is the non-cached portion (11 - 2 = 9)
+    # so cached tokens are not double-billed against the additive cache_read
+    # bucket.
     assert len(seen) == 1
     assert seen[0] == {
         "model": "gemini-3-pro",
-        "input_tokens": 11,
+        "input_tokens": 9,
         "output_tokens": 7,
         "total_tokens": 18,
     }
@@ -934,18 +993,19 @@ async def test_model_switch_rebuilds_agent(monkeypatch: pytest.MonkeyPatch) -> N
     assert len(captured["agents"]) == 2
     assert captured["configs"][0].model == "gemini-3-pro"
     assert captured["configs"][1].model == "gemini-3-flash"
+    assert all(config.model_provided for config in captured["configs"])
 
 
 @pytest.mark.asyncio
-async def test_default_model_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no model on the executor or per-turn config, the built-in default is pinned."""
+async def test_sdk_default_model_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no explicit model, model selection remains owned by the SDK."""
     captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
     executor = AntigravityExecutor()  # no model anywhere
 
     await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
 
-    # Pins _ANTIGRAVITY_DEFAULT_MODEL; changing the default must update this.
-    assert captured["configs"][0].model == "gemini-3.5-flash"
+    assert captured["configs"][0].model is None
+    assert captured["configs"][0].model_provided is False
 
 
 @pytest.mark.asyncio
@@ -975,6 +1035,8 @@ async def test_api_key_and_vertex_threaded_to_config(monkeypatch: pytest.MonkeyP
     await _drain(key_exec, [{"role": "user", "content": "hi", "session_id": "s1"}])
     cfg = captured["configs"][0]
     assert cfg.api_key == "gem-key"
+    assert cfg.model is None
+    assert cfg.model_provided is False
     # Vertex left unset on the API-key path.
     assert cfg.vertex is None
 
@@ -984,6 +1046,8 @@ async def test_api_key_and_vertex_threaded_to_config(monkeypatch: pytest.MonkeyP
     assert vcfg.vertex is True
     assert vcfg.project == "my-proj"
     assert vcfg.location == "us-central1"
+    assert vcfg.model is None
+    assert vcfg.model_provided is False
     # The SDK config has no base_url field — the executor must never set one.
     assert not hasattr(vcfg, "base_url")
 

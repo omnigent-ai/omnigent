@@ -9,13 +9,66 @@ import httpx
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
+from ._errors import OmnigentError
 from ._files import FilesNamespace
+from ._http import is_loopback_url
 from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
 from ._session import Session
 from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
+
+
+def _port_or_default(url: httpx.URL) -> int | None:
+    """The URL's explicit port, or its scheme's default (80/443)."""
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+
+def _redirect_stays_on_origin(request_url: httpx.URL, location: str) -> bool:
+    """True when a redirect target keeps the request's origin.
+
+    Same scheme/host/port (default ports normalized), or the default-port
+    http→https upgrade (80→443) on the same host — the same rule httpx's
+    ``_is_https_redirect`` uses to keep auth headers across a redirect.
+    """
+    try:
+        target = request_url.join(location)
+    except httpx.InvalidURL:
+        return False
+    if target.host != request_url.host:
+        return False
+    if target.scheme == request_url.scheme and _port_or_default(target) == _port_or_default(
+        request_url
+    ):
+        return True
+    return (
+        request_url.scheme == "http"
+        and target.scheme == "https"
+        and _port_or_default(request_url) == 80
+        and _port_or_default(target) == 443
+    )
+
+
+async def _refuse_cross_origin_redirects(response: httpx.Response) -> None:
+    """Response hook: only follow redirects on the request's own origin.
+
+    Keeps caller-supplied auth headers and request bodies from being
+    forwarded to a foreign host by a redirecting gateway, and blocks
+    https→http downgrades. Cross-origin hops fail loud instead.
+    """
+    if not response.has_redirect_location:
+        return
+    location = response.headers["location"]
+    if _redirect_stays_on_origin(response.request.url, location):
+        return
+    raise OmnigentError(
+        f"refusing to follow a cross-origin redirect (status {response.status_code}) "
+        f"to {location}",
+        response.status_code,
+    )
 
 
 class OmnigentClient:
@@ -51,7 +104,14 @@ class OmnigentClient:
         authentication. When set, the auth handler runs on every
         request, allowing transparent token refresh for OAuth
         flows. ``None`` (default) relies on static ``headers``.
-    :param timeout: Default timeout for HTTP requests in seconds.
+    :param timeout: Default timeout for non-streaming HTTP requests in
+        seconds. SSE streams use a 600-second read timeout so server-side
+        tool execution can pause the stream for several minutes.
+
+    The client follows 3xx redirects on the configured origin (including
+    http→https upgrades on the same host) and refuses cross-origin hops
+    with :class:`OmnigentError`, so headers and bodies never leave the
+    host the caller configured.
     """
 
     def __init__(
@@ -60,23 +120,9 @@ class OmnigentClient:
         *,
         headers: dict[str, str] | None = None,
         auth: httpx.Auth | None = None,
-        # Public SDK API surface. Removing would be a breaking
-        # change for downstream consumers; leaving it
-        # accepted-but-ignored preserves compatibility while the
-        # SSE client internally uses a fixed 600s read timeout
-        # (tool calls can legitimately hold the stream open for
-        # minutes).
         timeout: float = 30.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        # Long read timeout for SSE streams (tool execution can
-        # pause the stream for minutes).
-        sse_timeout = httpx.Timeout(
-            connect=30.0,
-            read=600.0,
-            write=30.0,
-            pool=30.0,
-        )
         # Announce this as a first-party non-browser client via the sentinel
         # Origin. The server's require_trusted_origin CSRF guard on the
         # multipart routes (POST /v1/sessions bundle create, file upload)
@@ -89,7 +135,18 @@ class OmnigentClient:
         self._http = httpx.AsyncClient(
             headers=default_headers,
             auth=auth,
-            timeout=sse_timeout,
+            timeout=httpx.Timeout(timeout),
+            # Follow proxy/gateway redirects (3xx) transparently, streams
+            # included, but only on the configured origin: the response hook
+            # refuses cross-origin hops so headers and bodies never leave
+            # the host the caller configured. httpx raises TooManyRedirects
+            # on loops.
+            follow_redirects=True,
+            event_hooks={"response": [_refuse_cross_origin_redirects]},
+            # A proxy cannot reach our loopback server, so bypass the
+            # environment for local targets. Loopback is plain HTTP with
+            # explicit headers, so losing netrc/CA env with it costs nothing.
+            trust_env=not is_loopback_url(self._base_url),
         )
 
         self.sessions = SessionsNamespace(self._http, self._base_url)

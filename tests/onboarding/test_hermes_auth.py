@@ -75,6 +75,19 @@ def test_summary_accepts_model_alternate_key(tmp_path: Path, monkeypatch) -> Non
     assert summary.describe() == "openrouter / moonshot/kimi-k2"
 
 
+def test_summary_ignores_non_string_model_keys(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_auth, "hermes_cli_installed", lambda: True)
+    _write_config(
+        tmp_path,
+        {1: "irrelevant", "default": "z-ai/glm-5.2", "provider": "openrouter"},
+    )
+
+    summary = hermes_config_summary()
+    assert summary.provider == "openrouter"
+    assert summary.model == "z-ai/glm-5.2"
+
+
 def test_summary_missing_config_is_not_configured(tmp_path: Path, monkeypatch) -> None:
     """No ``~/.hermes/config.yaml`` at all → installed but not configured."""
     monkeypatch.setenv("HOME", str(tmp_path))

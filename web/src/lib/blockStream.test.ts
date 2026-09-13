@@ -418,6 +418,91 @@ describe("BlockStream — reasoning", () => {
     expect(startIdx).toBeLessThan(chunkIdx);
   });
 
+  it("reasoning_done with no prior deltas renders a settled reasoning block", () => {
+    // A native transcript mirror (claude-native thinking blocks) persists
+    // the thought as a reasoning item with NO reasoning deltas ever
+    // streamed. The item must render as one settled ReasoningBlock, under
+    // the item's own response id, before the answer that follows.
+    const blocks = reduce([
+      {
+        type: "reasoning_done",
+        text: "the user wants the token verbatim",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_native_1",
+      },
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "TOKEN" }],
+        itemId: "it_m1",
+        responseId: "resp_native_1",
+      },
+    ]);
+
+    const types = blockTypes(blocks);
+    const blockIdx = types.indexOf("reasoning_block");
+    const doneIdx = types.indexOf("text_done");
+    expect(blockIdx).toBeGreaterThanOrEqual(0);
+    expect(doneIdx).toBeGreaterThan(blockIdx);
+
+    const block = blocks[blockIdx] as ReasoningBlock;
+    expect(block.reasoningText).toBe("the user wants the token verbatim");
+    expect(block.ctx.itemId).toBe("it_r1");
+    expect(block.ctx.responseId).toBe("resp_native_1");
+  });
+
+  it("reasoning_done after streamed deltas is deduped (no double render)", () => {
+    // Delta-streaming harnesses may publish the persisted reasoning item
+    // after the deltas already painted the thought. The item must not
+    // re-render the same text as a trailing ReasoningBlock — mirrors
+    // message_done's "deltas already produced the text" dedup.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "plan the answer\n" },
+      { type: "text_delta", delta: "Answer" },
+      {
+        type: "reasoning_done",
+        text: "plan the answer\n",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_1",
+      },
+      { type: "message_done", content: [], itemId: "", responseId: "" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const types = blockTypes(blocks);
+    expect(types).toContain("reasoning_chunk");
+    expect(types).not.toContain("reasoning_block");
+  });
+
+  it("reasoning_done while a streamed section is open closes it without re-rendering", () => {
+    // The item arrives before any text closed the section: it marks the
+    // section's end. Chunks streamed, so no trailing ReasoningBlock.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "thinking hard\n" },
+      {
+        type: "reasoning_done",
+        text: "thinking hard\n",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_1",
+      },
+      { type: "text_delta", delta: "Answer" },
+      { type: "message_done", content: [], itemId: "", responseId: "" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const types = blockTypes(blocks);
+    expect(types).toContain("reasoning_chunk");
+    expect(types).not.toContain("reasoning_block");
+    const chunks = blocks.filter((b): b is ReasoningChunk => b.type === "reasoning_chunk");
+    expect(chunks.map((c) => c.text).join("")).toContain("thinking hard");
+  });
+
   it("interleaved text→reasoning→text closes each text section (no orphan, no concatenation)", () => {
     // think→speak→think→speak in one response: reasoning must close text
     // or the pre-reasoning text orphans and the final text_done concatenates.
@@ -1375,6 +1460,23 @@ describe("BlockStream — status events", () => {
     expect(blockTypes(blocks)).not.toContain("compaction");
   });
 
+  it("compaction_in_progress threads the server start time onto the block", () => {
+    // The server anchors started_at to the FIRST progress report of a
+    // compaction, so the spinner's elapsed counter can survive
+    // re-announcements and page reloads.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "compaction_in_progress", startedAtS: 1_700_000_000 },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const loading = blocks.find((b) => b.type === "compaction_loading");
+    expect(loading).toBeDefined();
+    if (loading && loading.type === "compaction_loading") {
+      expect(loading.startedAtS).toBe(1_700_000_000);
+    }
+  });
+
   it("compaction_completed event → CompactionBlock (done marker)", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },
@@ -1653,5 +1755,101 @@ describe("BlockStream — interrupt (Stop) finalizes in-flight content", () => {
     );
     expect(done1).toBeGreaterThanOrEqual(0);
     expect(start2).toBeGreaterThan(done1);
+  });
+});
+
+describe("BlockStream — native turn start (session.status running)", () => {
+  it("stamps reducer blocks with the turn id from a running status edge", () => {
+    // A native harness emits no `response.created`, so without this the
+    // reasoning block carries an empty response id and groups into its own
+    // bubble — splitting the turn away from its committed items, which is
+    // what kept the "Worked for" fold from forming live on codex.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "Planning the run" },
+      { type: "text_delta", delta: "Answer" },
+    ]);
+
+    expect(blocks.length).toBeGreaterThan(0);
+    for (const b of blocks) {
+      expect(b.ctx.responseId).toBe("codex_t1");
+    }
+  });
+
+  it("re-stamps on the next turn's running edge", () => {
+    // The id must track the CURRENT turn: adopt-if-unset would leave turn
+    // 2's reasoning under turn 1's id, splitting it into the wrong bubble.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "first turn" },
+      { type: "session_status", conversationId: "conv_1", status: "idle", responseId: "codex_t1" },
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t2",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "second turn" },
+    ]);
+
+    const t2 = blocks.filter((b) => b.ctx.responseId === "codex_t2");
+    expect(t2.length).toBeGreaterThan(0);
+    const secondTurnText = t2
+      .filter((b): b is ReasoningChunk => b.type === "reasoning_chunk")
+      .map((c) => c.text)
+      .join("");
+    // (Chunks flush on a size threshold, so compare on the leading word.)
+    expect(secondTurnText).toContain("second");
+    expect(secondTurnText).not.toContain("first");
+  });
+
+  it("ignores a bare running edge with no turn id", () => {
+    // The PTY-activity relay publishes running/idle with no response id;
+    // adopting that would wipe the turn id mid-stream.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "session_status", conversationId: "conv_1", status: "running" },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "still turn one" },
+    ]);
+
+    for (const b of blocks) {
+      expect(b.ctx.responseId).toBe("codex_t1");
+    }
+  });
+});
+
+describe("BlockStream — naming a turn already in flight", () => {
+  it("adopts the id without sealing an already-open reasoning section", () => {
+    // Codex opens reasoning ~2s BEFORE the running edge names the turn.
+    // Closing on adopt would split one thought into two reasoning panels.
+    const blocks = reduce([
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "weighing options" },
+      { type: "session_status", conversationId: "c", status: "running", responseId: "codex_t1" },
+      { type: "reasoning_delta", delta: " and continuing" },
+      { type: "text_delta", delta: "Answer" },
+    ]);
+
+    // Exactly one reasoning section was opened for the whole thought.
+    expect(blocks.filter((b) => b.type === "reasoning_start")).toHaveLength(1);
   });
 });

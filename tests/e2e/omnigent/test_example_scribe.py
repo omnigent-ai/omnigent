@@ -71,7 +71,7 @@ def test_scribe_sub_agents_are_unpinned(scribe_spec: AgentSpec) -> None:
 
 
 def test_scribe_doc_skills_present(scribe_spec: AgentSpec) -> None:
-    """The three doc skills are discovered from skills/<name>/SKILL.md."""
+    """The three doc skills are discovered from skills/<dir>/SKILL.md."""
     assert sorted(s.name for s in scribe_spec.skills) == [
         "api-docs",
         "changelog",

@@ -1,6 +1,6 @@
 """Tests for the agy interaction bridge (detect → elicit → deliver loop).
 
-These exercise :func:`omnigent.antigravity_native_interactions.bridge_interaction`
+These exercise :func:`omnigent.harnesses.antigravity_native.interactions.bridge_interaction`
 with fakes for its three injectable seams (``get_steps``,
 ``request_elicitation``, ``deliver``) so the timeout/re-read logic is unit-tested
 WITHOUT a live agy server.
@@ -34,13 +34,13 @@ from typing import Any
 
 import pytest
 
-from omnigent.antigravity_native_interactions import (
+from omnigent.harnesses.antigravity_native.interactions import (
     _freshest_waiting,
     agy_elicitation_id,
     bridge_interaction,
 )
-from omnigent.antigravity_native_rpc import AntigravityRpcError
-from omnigent.antigravity_native_steps import PendingInteraction
+from omnigent.harnesses.antigravity_native.rpc import AntigravityRpcError
+from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _CASCADE = "test-cascade-id"
@@ -59,7 +59,7 @@ def _question_step(
     Build a WAITING ask_question step dict at a given trajectory index.
 
     Mirrors the live RPC shape consumed by
-    :func:`omnigent.antigravity_native_steps.pending_interaction`:
+    :func:`omnigent.harnesses.antigravity_native.steps.pending_interaction`:
     ``status``, ``requestedInteraction.askQuestion``, and the
     ``metadata.sourceTrajectoryStepInfo`` ids.
 
@@ -708,3 +708,39 @@ def test_elicitation_id_is_deterministic_and_index_sensitive() -> None:
     assert a == b
     assert a != c
     assert a.startswith("elicit_agy_")
+
+
+# ---------------------------------------------------------------------------
+# TUI injector binding (runner-hosted reader)
+# ---------------------------------------------------------------------------
+
+
+def test_tui_injector_for_binds_an_explicit_bridge_dir(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The injector takes its bridge dir as an argument, not from the spawn env.
+
+    The reader runs INSIDE the runner process, which never carries
+    ``HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR`` — that variable is set only for the
+    harness subprocess. Resolving it from the env therefore failed every single
+    web approval with "... is required", leaving agy's own permission prompt open
+    in the pane while the backend step had already been answered.
+    """
+    import asyncio
+
+    import omnigent.harnesses.antigravity_native.bridge as bridge_mod
+    from omnigent.harnesses.antigravity_native.interactions import tui_injector_for
+
+    monkeypatch.delenv("HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR", raising=False)
+    calls: list[tuple[Any, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        bridge_mod,
+        "send_interaction_keys_via_tui",
+        lambda bridge_dir, *keys: calls.append((bridge_dir, keys)),
+    )
+
+    bridge_dir = tmp_path / "bridge"
+    asyncio.run(tui_injector_for(bridge_dir)(["1", "Enter"]))
+
+    assert calls == [(bridge_dir, ("1", "Enter"))]

@@ -23,7 +23,10 @@ const EYE_CENTERS = [
   { cx: 413.8, cy: 520.6 },
 ];
 
-type ScreenPoint = { x: number; y: number };
+interface ScreenPoint {
+  x: number;
+  y: number;
+}
 type TextField = HTMLTextAreaElement | HTMLInputElement;
 
 // <input> types that hold text a caret moves through. Buttons, checkboxes,

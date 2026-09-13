@@ -2,11 +2,11 @@ import { CheckCircle2Icon, CircleIcon, CircleDotIcon } from "lucide-react";
 import { useChatStore } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
 
-type TodoItem = {
+interface TodoItem {
   content: string;
   status: "pending" | "in_progress" | "completed";
   activeForm: string;
-};
+}
 
 interface TodoPanelProps {
   frameless?: boolean;
@@ -23,16 +23,10 @@ function TodoIcon({ status }: { status: TodoItem["status"] }) {
 }
 
 /**
- * Displays Claude Code's active todo list for `omnigent claude` sessions.
+ * Displays the active task list published by any harness.
  *
- * Reads from `useChatStore.todos` which is populated by:
- * - the session snapshot on bind (from `_session_todos_cache` on the server)
- * - `session.todos` SSE events emitted whenever the forwarder detects a
- *   change in Claude's `~/.claude/todos/{session_id}-agent-{session_id}.json`
- *
- * Renders nothing when the todo list is empty, so the panel occupies no
- * space for sessions that have never had todos (non-claude-native, or
- * claude-native before the first turn creates any todos).
+ * Reads from `useChatStore.todos`, populated by the session snapshot and
+ * `session.todos` SSE updates. Renders nothing while the list is empty.
  */
 export function TodoPanel({ frameless = false }: TodoPanelProps) {
   const todos = useChatStore((s) => s.todos);
@@ -52,7 +46,7 @@ export function TodoPanel({ frameless = false }: TodoPanelProps) {
             // eslint-disable-next-line react/no-array-index-key
             key={i}
             className={cn(
-              "flex items-center gap-2 rounded px-1.5 py-1 text-xs",
+              "flex items-center gap-2 rounded px-1.5 py-1 text-sm",
               todo.status === "completed" && "opacity-50",
             )}
           >

@@ -27,30 +27,150 @@ export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   copilot: "Copilot",
 };
 
-interface HarnessCatalogWire {
-  data?: { id?: string; label?: string }[];
+/** One raw setup step from the server's ``/v1/harnesses`` catalog. */
+export interface SetupStepWire {
+  kind: string;
+  title: string;
+  detail: string;
+  action: string;
+  command: string | null;
+  status_key: string | null;
 }
 
-async function fetchHarnessLabels(): Promise<Record<string, string>> {
+interface HarnessCatalogRow {
+  id?: string;
+  label?: string;
+  // Declared capability profile. Only ``integration_mode`` is read here, to
+  // recognize the generic-ACP family without hardcoding vendor ids.
+  capabilities?: { integration_mode?: string | null } | null;
+}
+
+/** ``capabilities.integration_mode`` of every generic-ACP harness. */
+const ACP_INTEGRATION_MODE = "acp-subprocess";
+
+interface HarnessCatalogWire {
+  data?: HarnessCatalogRow[];
+  // Setup steps keyed by EVERY harness spelling a session may declare (native
+  // wrappers + installable non-picker ids), not just the picker rows in `data`.
+  setup_steps?: Record<string, SetupStepWire[]>;
+}
+
+interface HarnessCatalog {
+  /** harness id → picker label, merged over the built-in defaults. */
+  labels: Record<string, string>;
+  /** harness spelling → ordered setup steps (install/auth) the server describes. */
+  setupSteps: Record<string, SetupStepWire[]>;
+  /** ids the server declares generic-ACP — see {@link useAcpHarnessIds}. */
+  acpHarnesses: ReadonlySet<string>;
+}
+
+async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   const res = await authenticatedFetch("/v1/harnesses");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HarnessCatalogWire;
   const labels: Record<string, string> = { ...BRAIN_HARNESS_LABELS };
+  const acpHarnesses = new Set<string>();
   for (const row of body.data ?? []) {
-    if (typeof row.id === "string" && typeof row.label === "string") {
-      labels[row.id] = row.label;
-    }
+    if (typeof row.id !== "string") continue;
+    if (typeof row.label === "string") labels[row.id] = row.label;
+    if (row.capabilities?.integration_mode === ACP_INTEGRATION_MODE) acpHarnesses.add(row.id);
   }
-  return labels;
+  // The server keys setup_steps by every spelling (codex-native, opencode, …)
+  // so the dialog resolves whatever harness the session declares.
+  const setupSteps =
+    body.setup_steps && typeof body.setup_steps === "object" ? body.setup_steps : {};
+  return { labels, setupSteps, acpHarnesses };
 }
 
-export function useBrainHarnessLabels(): Record<string, string> {
+// Every hook below shares one request + cache entry, each selecting its own
+// slice. ``enabled`` lets a caller that is itself disabled avoid provoking the
+// request (the agent picker keeps its catalog read in step with its own fetch).
+function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T, enabled = true): T {
   const { data } = useQuery({
     queryKey: ["harness-labels"],
-    queryFn: fetchHarnessLabels,
+    queryFn: fetchHarnessCatalog,
     staleTime: 30_000,
+    enabled,
+    select,
   });
-  return data ?? BRAIN_HARNESS_LABELS;
+  return data ?? fallback;
+}
+
+/**
+ * Sentinel value sent as ``harness_override`` when the user picks "auto".
+ * The server resolves it to a real harness + model via the intelligent router
+ * and never persists this string literal.
+ */
+export const AUTO_HARNESS_ID = "auto";
+
+/**
+ * Picker sentinel for Smart Routing as a top-level harness — the landing
+ * dropdown's "Harnesses" row, with no bundle agent behind it. Client-side only:
+ * the create request sends {@link AUTO_HARNESS_ID} as ``harness_override`` with
+ * a native wrapper ``agent_id`` as a placeholder, and the server rebinds the
+ * session to whichever native wrapper (Claude Code / Codex) the router picks
+ * from the first message. Kept distinct from {@link AUTO_HARNESS_ID} so the
+ * bundle-agent auto path (a brain-harness override on Polly / Debby) and this
+ * one can't be confused in picker state.
+ */
+export const AUTO_NATIVE_HARNESS_ID = "auto-native";
+
+/**
+ * User-facing name for smart routing, covering both the per-harness Model
+ * option (the ``__smart__`` sentinel, router picks the model per turn) and the
+ * fully-auto harness ({@link AUTO_HARNESS_ID}, router picks harness AND model).
+ */
+export const SMART_ROUTING_LABEL = "Smart Routing";
+
+/**
+ * Whether a harness id is one of the fully-auto sentinels, i.e. the router owns
+ * the harness pick. Use the individual ids where the two flavors differ.
+ *
+ * @param harness - Harness id from picker state, or null/undefined when unset.
+ * @returns True for {@link AUTO_HARNESS_ID} or {@link AUTO_NATIVE_HARNESS_ID}.
+ */
+export function isAutoHarness(harness: string | null | undefined): boolean {
+  return harness === AUTO_HARNESS_ID || harness === AUTO_NATIVE_HARNESS_ID;
+}
+
+/** One-line behavior blurb for {@link SMART_ROUTING_LABEL}, shown next to the
+ *  config modal's Agent Harness row and as the composer chip's hover text. */
+export const AUTO_HARNESS_DESCRIPTION = "Harness and model picked per task by smart routing";
+
+export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<string, string> {
+  const base = useHarnessCatalog((c) => c.labels, BRAIN_HARNESS_LABELS);
+  if (!smartRoutingEnabled) return base;
+  // Prepend the "auto" sentinel so it appears first in the picker.
+  return { [AUTO_HARNESS_ID]: SMART_ROUTING_LABEL, ...base };
+}
+
+const NO_SETUP_STEPS: Record<string, SetupStepWire[]> = {};
+
+/** harness id → the server's ordered setup steps (for the setup dialog). */
+export function useHarnessSetupSteps(): Record<string, SetupStepWire[]> {
+  return useHarnessCatalog((c) => c.setupSteps, NO_SETUP_STEPS);
+}
+
+/** harness id → picker label, exactly as the server names it. */
+export function useHarnessLabels(enabled = true): Record<string, string> {
+  return useHarnessCatalog((c) => c.labels, BRAIN_HARNESS_LABELS, enabled);
+}
+
+const NO_ACP_HARNESSES: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Harness ids the server declares generic-ACP (``integration_mode ===
+ * "acp-subprocess"``) — builtin ACP CLI rows (``devin``, ``grok``) and
+ * user-configured ``acp:<slug>`` agents alike.
+ *
+ * Server-derived on purpose: a new builtin ACP row is one data entry in
+ * ``omnigent/acp_cli_harnesses.py``, and the picker recognizes it (grouping +
+ * label) with no frontend change. Empty until the catalog loads, and on a
+ * server too old to report capabilities — callers fall back to the id
+ * heuristic in ``agentGrouping``.
+ */
+export function useAcpHarnessIds(enabled = true): ReadonlySet<string> {
+  return useHarnessCatalog((c) => c.acpHarnesses, NO_ACP_HARNESSES, enabled);
 }
 
 /**

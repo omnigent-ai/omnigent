@@ -10,14 +10,18 @@ import pytest
 from omnigent.errors import OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
+    BuiltinToolConfig,
     ExecutorSpec,
     LLMConfig,
     ProviderAuth,
+    ToolsConfig,
 )
 from omnigent.tools.builtins.web_fetch import (
     RESEARCHER_NAME,
     WebFetchTool,
     build_researcher_spec,
+    find_web_fetch_owner,
+    reconstruct_researcher_spec,
 )
 
 # ── Helpers ──────────────────────────────────────────
@@ -554,3 +558,101 @@ def test_web_fetch_is_sync_in_sessions_native_mode() -> None:
     # ``Tool.dispatch_async`` raises ``NotImplementedError``.
     # Calling it would be a routing bug because ``is_async`` is
     # False; we don't exercise that path here.
+
+
+# ── web_fetch owner walk + researcher reconstruction ─────────────────
+#
+# The synthesized ``__web_researcher`` is appended to the owner's live
+# ``sub_agents`` in memory by ``WebFetchTool.__init__`` and never
+# serialized, so every layer that resolves sub-agent names from the
+# persisted / re-parsed bundle reconstructs it from its owner instead.
+# These cover the shared owner walk + reconstruction both the runtime
+# resolver (``workflow.py``) and the runner dispatch gate now use.
+
+
+def _owner_spec(model: str = "openai/gpt-5.4") -> AgentSpec:
+    """A parent that declares the ``web_fetch`` builtin (owns the researcher)."""
+    return AgentSpec(
+        spec_version=1,
+        name="owner",
+        llm=LLMConfig(model=model),
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
+    )
+
+
+def _plain_spec() -> AgentSpec:
+    """A parent that never enabled ``web_fetch`` -- no researcher child."""
+    return AgentSpec(
+        spec_version=1,
+        name="plain",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[]),
+    )
+
+
+def test_find_web_fetch_owner_returns_root_when_root_owns() -> None:
+    spec = _owner_spec()
+    assert find_web_fetch_owner(spec) is spec
+
+
+def test_find_web_fetch_owner_walks_to_nested_owner() -> None:
+    owner = _owner_spec(model="anthropic/claude-nested-7")
+    owner.name = "nested-owner"
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[]),
+        sub_agents=[owner],
+    )
+    assert find_web_fetch_owner(root) is owner
+
+
+def test_find_web_fetch_owner_none_without_builtin() -> None:
+    assert find_web_fetch_owner(_plain_spec()) is None
+
+
+def test_reconstruct_researcher_spec_from_owner() -> None:
+    researcher = reconstruct_researcher_spec(_owner_spec())
+    assert researcher is not None
+    assert researcher.name == RESEARCHER_NAME
+    assert researcher.executor.max_iterations == 5
+    assert researcher.interaction.conversational is False
+    assert researcher.llm is not None
+    assert researcher.llm.model == "openai/gpt-5.4"
+
+
+def test_reconstruct_researcher_spec_inherits_nested_owner_llm() -> None:
+    owner = _owner_spec(model="anthropic/claude-nested-7")
+    owner.name = "nested-owner"
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[]),
+        sub_agents=[owner],
+    )
+    researcher = reconstruct_researcher_spec(root)
+    assert researcher is not None
+    assert researcher.llm is not None
+    assert researcher.llm.model == "anthropic/claude-nested-7"
+
+
+def test_reconstruct_researcher_spec_none_without_web_fetch() -> None:
+    assert reconstruct_researcher_spec(_plain_spec()) is None
+
+
+def test_reconstruct_matches_what_webfetchtool_appends() -> None:
+    """The reconstruction equals the spec WebFetchTool synthesizes in memory."""
+    spec = _owner_spec()
+    tool = WebFetchTool(spec)  # appends the researcher to spec.sub_agents
+    rebuilt = reconstruct_researcher_spec(spec)
+    assert rebuilt is not None
+    assert rebuilt.name == tool.researcher_spec.name
+    assert rebuilt.executor.max_iterations == tool.researcher_spec.executor.max_iterations
+    assert rebuilt.instructions == tool.researcher_spec.instructions
+    assert rebuilt.interaction.conversational is tool.researcher_spec.interaction.conversational
