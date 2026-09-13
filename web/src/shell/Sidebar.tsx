@@ -332,6 +332,8 @@ import {
   sessionNumberShortcutKeys,
 } from "@/components/KeyboardShortcut";
 
+export { isMobileViewport };
+
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
 // + kebab take its place; on mobile those controls are gone, so the badge holds
