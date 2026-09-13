@@ -156,6 +156,7 @@ def main() -> None:
     print(
         f"Scored {len(run.ranked)} issues; "
         f"refreshed {run.classifications_updated} classifications; "
+        f"skipped {len(run.classification_failures)} malformed classifications; "
         f"artifacts: {args.artifact_dir}/{run.run_id}"
     )
 

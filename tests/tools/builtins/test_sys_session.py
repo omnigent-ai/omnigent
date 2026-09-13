@@ -21,7 +21,7 @@ import pytest
 
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_elicitations
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -31,11 +31,13 @@ from omnigent.tools.builtins.spawn import (
     _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
     _HISTORY_MAX_TAIL,
+    _HISTORY_MAX_TOTAL_CHARS,
     SysSessionCloseTool,
     SysSessionGetHistoryTool,
     SysSessionListTool,
     SysSessionSendTool,
 )
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 
 @dataclass
@@ -304,6 +306,20 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
     }
 
 
+def test_send_description_announces_wake_notice() -> None:
+    """
+    The dispatch tool tells the model the exact wake notice the runtime
+    posts when a child finishes, so the notice is recognised as
+    runtime-originated instead of read as a user-typed instruction.
+    """
+    tool = SysSessionSendTool(
+        {"claude": AgentSpec(spec_version=1, name="claude", description="Review helper.")}
+    )
+    desc = tool.get_schema()["function"]["description"]
+    assert SUBAGENT_WAKE_NOTICE_SHAPE in desc
+    assert "not from a person" in desc
+
+
 def test_peek_schema_required_fields_and_no_extra_props() -> None:
     """
     The ``sys_session_get_history`` schema requires ``conversation_id``
@@ -323,6 +339,7 @@ def test_peek_schema_required_fields_and_no_extra_props() -> None:
         "conversation_id",
         "tail_items",
         "content_max_chars",
+        "content_offset_chars",
     }
 
 
@@ -350,7 +367,20 @@ def test_peek_schema_content_limit_is_bounded() -> None:
     ]["content_max_chars"]
     assert content_schema["type"] == "integer"
     assert content_schema["minimum"] == 1
-    assert content_schema["maximum"] == 12000
+    # A narrow read may spend the whole prompt budget on one item so a
+    # long sub-agent result stays reachable in full.
+    assert content_schema["maximum"] == _HISTORY_MAX_TOTAL_CHARS
+
+
+def test_peek_schema_content_offset_is_non_negative() -> None:
+    """The paging offset accepts any non-negative integer."""
+    offset_schema = SysSessionGetHistoryTool().get_schema()["function"]["parameters"][
+        "properties"
+    ]["content_offset_chars"]
+    assert offset_schema["type"] == "integer"
+    assert offset_schema["minimum"] == 0
+    # No maximum: an offset past the end just yields an empty field.
+    assert "maximum" not in offset_schema
 
 
 def test_close_schema_required_fields_and_no_extra_props() -> None:
@@ -409,7 +439,16 @@ def test_peek_returns_items_chronological(session_fixture: _Fixture) -> None:
 _HISTORY_CONTENT_SCENARIOS = [
     pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
     pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
-    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # An explicit limit recovers one long item in full (a sub-agent
+    # handoff longer than the inbox delivery cap stays reachable).
+    pytest.param(13000, 50000, "R" * 13000, id="explicit-limit-recovers-long-item"),
+    # The total prompt budget still bounds a single read.
+    pytest.param(
+        _HISTORY_MAX_TOTAL_CHARS + 50,
+        _HISTORY_MAX_TOTAL_CHARS * 2,
+        "R" * _HISTORY_MAX_TOTAL_CHARS + " [truncated]",
+        id="budget-ceiling",
+    ),
     # No stored item is needed because validation rejects before projection.
     pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
 ]
@@ -454,6 +493,116 @@ def test_peek_content_limit_scenario(
     )
     actual = payload["error"] if "error" in payload else payload["items"][0]["content"]
     assert actual == expected
+
+
+def _append_assistant_text(session_fixture: _Fixture, text: str) -> None:
+    """Persist one assistant message with ``text`` on the child conversation."""
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_offset_paging",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": text}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+
+def _peek_last_content(
+    session_fixture: _Fixture,
+    *,
+    content_max_chars: int,
+    content_offset_chars: int,
+) -> str:
+    """Read the child's last item content through the in-process tool."""
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "tail_items": 1,
+                    "content_max_chars": content_max_chars,
+                    "content_offset_chars": content_offset_chars,
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+    if "error" in payload:
+        return str(payload["error"])
+    return str(payload["items"][0]["content"])
+
+
+def test_peek_offset_pages_through_long_item(session_fixture: _Fixture) -> None:
+    """
+    Stepping ``content_offset_chars`` by the window size reconstructs a
+    content field longer than one window — the tail of a long sub-agent
+    handoff is reachable, not permanently cut off.
+    """
+    text = "BEGIN|" + ("0123456789" * 2000) + "|END"
+    _append_assistant_text(session_fixture, text)
+
+    window = 12000
+    first = _peek_last_content(session_fixture, content_max_chars=window, content_offset_chars=0)
+    second = _peek_last_content(
+        session_fixture, content_max_chars=window, content_offset_chars=window
+    )
+
+    assert first == text[:window] + " [truncated]"
+    # The second window reaches the true end: no marker, tail present.
+    assert second == text[window:]
+    assert second.endswith("|END")
+    assert first.removesuffix(" [truncated]") + second == text
+
+
+def test_peek_offset_window_ending_at_text_end_has_no_marker(
+    session_fixture: _Fixture,
+) -> None:
+    """A window that ends exactly at the end of the content adds no marker."""
+    _append_assistant_text(session_fixture, "A" * 200 + "B" * 100)
+    content = _peek_last_content(session_fixture, content_max_chars=100, content_offset_chars=200)
+    assert content == "B" * 100
+
+
+def test_peek_offset_past_end_returns_empty_content(session_fixture: _Fixture) -> None:
+    """An offset at or past the end of the content yields an empty field."""
+    _append_assistant_text(session_fixture, "short text")
+    content = _peek_last_content(session_fixture, content_max_chars=100, content_offset_chars=5000)
+    assert content == ""
+
+
+@pytest.mark.parametrize(
+    ("raw_offset", "expected_error"),
+    [
+        pytest.param(-1, "content_offset_chars must be >= 0", id="negative"),
+        pytest.param(True, "content_offset_chars must be a whole number, got True", id="boolean"),
+        pytest.param(1.5, "content_offset_chars must be a whole number, got 1.5", id="fractional"),
+        pytest.param(
+            "abc", "content_offset_chars must be a whole number, got 'abc'", id="non-numeric"
+        ),
+    ],
+)
+def test_peek_rejects_invalid_offset(
+    session_fixture: _Fixture,
+    raw_offset: object,
+    expected_error: str,
+) -> None:
+    """Invalid offsets are rejected with a model-readable error."""
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "content_offset_chars": raw_offset,
+            }
+        ),
+        session_fixture.ctx,
+    )
+    assert json.loads(raw)["error"] == expected_error
 
 
 # These coercion cases cover the helper imported by the runner REST dispatcher.

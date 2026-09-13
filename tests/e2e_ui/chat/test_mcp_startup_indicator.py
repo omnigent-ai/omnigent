@@ -17,9 +17,22 @@ import time
 from collections.abc import Callable
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 _BAND = '[data-testid="mcp-startup-indicator"]'
+
+
+def _publish_event(
+    base_url: str, session_id: str, event_type: str, data: dict[str, object]
+) -> None:
+    """Send a native event through the real session stream."""
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={"type": event_type, "data": data},
+        timeout=10.0,
+    )
+    response.raise_for_status()
 
 
 def _publish_mcp_startup(
@@ -83,7 +96,7 @@ def test_mcp_startup_band_lifecycle(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Band tracks starting → progress → settled-with-failure → cleared.
+    """Band tracks starting → progress → cleared once the round settles.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server
@@ -125,8 +138,9 @@ def test_mcp_startup_band_lifecycle(
         ),
     )
 
-    # 3. The round settles with a failure: the spinner flips to the
-    #    warning naming the server that never came up.
+    # 3. The round settles with a failure: the band clears entirely.
+    #    Startup failures are setup diagnostics (host logs), not
+    #    conversation content — no inline notice may join the chat.
     _publish_until(
         base_url,
         session_id,
@@ -135,32 +149,21 @@ def test_mcp_startup_band_lifecycle(
             "jira": {"status": "ready", "error": None},
             "safe": {"status": "failed", "error": "handshaking with MCP server failed"},
         },
-        lambda: expect(band).to_contain_text(
-            "MCP startup incomplete (failed: safe)", timeout=3_000
-        ),
-    )
-
-    # 4. A settled-empty map clears the band entirely (and evicts the
-    #    snapshot cache): the session reads as a normal idle chat again.
-    _publish_until(
-        base_url,
-        session_id,
-        {},
         lambda: expect(band).to_have_count(0, timeout=3_000),
     )
 
 
-def test_mcp_startup_band_shows_cancelled_after_stop(
+def test_mcp_startup_band_clears_after_stop_cancels_round(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A Stop-cancelled round renders the cancelled warning, not a spinner.
+    """A Stop-cancelled round clears the band — no stuck spinner, no notice.
 
     The runner's Stop path flips still-``starting`` servers to
     ``cancelled`` and publishes the flipped map (codex's own cancelled
-    edges are owner-only and never reach the web); this pins the rendering
-    of that published map so a user who stopped a slow MCP boot sees what
-    happened instead of a stuck "Starting…" spinner.
+    edges are owner-only and never reach the web); this pins that the
+    published map removes the spinner without adding a diagnostic notice
+    to the conversation.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server
@@ -185,7 +188,97 @@ def test_mcp_startup_band_shows_cancelled_after_stop(
         base_url,
         session_id,
         {"storage-console": {"status": "cancelled", "error": None}},
-        lambda: expect(band).to_contain_text(
-            "MCP startup incomplete (cancelled: storage-console)", timeout=3_000
-        ),
+        lambda: expect(band).to_have_count(0, timeout=3_000),
     )
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["new-session", "resumed-session"])
+def test_mcp_startup_band_clears_on_live_assistant_text(
+    page: Page,
+    seeded_session: tuple[str, str],
+    resumed: bool,
+) -> None:
+    """Live text hides MCP progress without waiting for startup to settle."""
+    base_url, session_id = seeded_session
+    band = page.locator(_BAND)
+    working = page.get_by_test_id("working-indicator")
+
+    if resumed:
+        _publish_event(
+            base_url,
+            session_id,
+            "external_assistant_message",
+            {
+                "agent": "codex-native-ui",
+                "text": "Previous answer from before this session was resumed.",
+            },
+        )
+
+    _publish_mcp_startup(
+        base_url,
+        session_id,
+        {
+            "safe": {"status": "starting", "error": None},
+            "storage-console": {"status": "starting", "error": None},
+        },
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(band).to_contain_text("Starting MCP servers (0/2)", timeout=15_000)
+    if resumed:
+        expect(
+            page.get_by_text("Previous answer from before this session was resumed.")
+        ).to_be_visible()
+
+    # Observed progress proves the live subscription is ready before text arrives.
+    pending: dict[str, dict[str, str | None]] = {
+        "safe": {"status": "ready", "error": None},
+        "storage-console": {"status": "starting", "error": None},
+    }
+    _publish_until(
+        base_url,
+        session_id,
+        pending,
+        lambda: expect(band).to_contain_text("Starting MCP servers (1/2)", timeout=3_000),
+    )
+    _publish_event(
+        base_url,
+        session_id,
+        "external_session_status",
+        {"status": "running", "response_id": "resp_mcp_current"},
+    )
+    expect(working).to_be_visible(timeout=15_000)
+
+    _publish_event(
+        base_url,
+        session_id,
+        "external_output_text_delta",
+        {"message_id": "mcp_live_text", "index": 0, "delta": "I am working on your request."},
+    )
+    expect(page.get_by_text("I am working on your request.")).to_be_visible(timeout=15_000)
+    expect(band).to_have_count(0, timeout=3_000)
+    expect(working).to_be_visible()
+
+    # The plan arrives on the same session stream after the late MCP update,
+    # without another assistant text event that could dismiss the band again.
+    _publish_mcp_startup(base_url, session_id, pending)
+    _publish_event(
+        base_url,
+        session_id,
+        "external_session_todos",
+        {
+            "todos": [
+                {
+                    "content": "Continue responding",
+                    "status": "in_progress",
+                    "activeForm": "Continuing response",
+                }
+            ]
+        },
+    )
+    expect(page.get_by_test_id("plan-tracker")).to_contain_text("(0/1)")
+    expect(band).to_have_count(0, timeout=3_000)
+    expect(working).to_be_visible()
+
+    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    snapshot.raise_for_status()
+    assert snapshot.json()["mcp_startup"] == pending

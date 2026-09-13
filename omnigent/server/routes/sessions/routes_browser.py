@@ -35,7 +35,9 @@ from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._sessions.common import (
+    _BROWSER_ACTION_NO_RENDERER_RESULT,
     _BROWSER_ACTION_TIMEOUT_RESULT,
+    _browser_action_claim_events,
     _browser_action_claims,
     _browser_action_owners,
     _browser_action_registry,
@@ -73,10 +75,11 @@ def register_browser_routes(
         Park one embedded-browser action and await the renderer result.
 
         Mints an ``action_id``, parks a Future owned by ``session_id``, publishes
-        a ``browser.action_request`` event, and awaits up to
-        ``_BROWSER_ACTION_AWAIT_S``; on timeout returns the timeout result (HTTP
-        200) so the runner gets a clean tool error. Called by the runner's
-        ``browser_*`` dispatch, not the LLM.
+        a ``browser.action_request`` event, gives a renderer a short claim grace,
+        and then awaits up to ``_BROWSER_ACTION_AWAIT_S`` for the claimed action.
+        An unclaimed request returns promptly so a non-renderer stream subscriber
+        cannot cause the full timeout. Called by the runner's ``browser_*``
+        dispatch, not the LLM.
 
         :param request: The inbound request, used for identity extraction.
         :param session_id: Session/conversation identifier, e.g.
@@ -102,7 +105,9 @@ def register_browser_routes(
 
         action_id = f"baction_{secrets.token_hex(16)}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        claimed = asyncio.Event()
         _browser_action_registry[action_id] = future
+        _browser_action_claim_events[action_id] = claimed
         _browser_action_owners[action_id] = session_id
         try:
             event = BrowserActionRequestEvent(
@@ -113,7 +118,28 @@ def register_browser_routes(
             )
             from omnigent.server.routes import sessions as _sessions_facade
 
-            _sessions_facade.session_stream.publish(session_id, event.model_dump())
+            delivered = _sessions_facade.session_stream.publish(session_id, event.model_dump())
+            if delivered == 0:
+                # Fail fast: the stream has no buffer or replay, so a
+                # request delivered to zero subscribers can never be
+                # answered — return immediately
+                # instead of holding the runner's POST for the full
+                # await budget. Checked on the publish return (not a
+                # separate pre-check) so a subscriber disconnecting
+                # between check and publish can't reintroduce the wait.
+                return _BROWSER_ACTION_NO_RENDERER_RESULT
+            try:
+                await asyncio.wait_for(
+                    claimed.wait(),
+                    timeout=_sessions_facade._BROWSER_ACTION_CLAIM_GRACE_S,
+                )
+            except TimeoutError:
+                # ``wait_for`` can time out in the same event-loop tick that
+                # the claim handler sets the event. Honor that accepted lease
+                # so the renderer cannot execute a side effect after we report
+                # that no renderer claimed it.
+                if not claimed.is_set():
+                    return _BROWSER_ACTION_NO_RENDERER_RESULT
             done, _pending = await asyncio.wait(
                 {future},
                 timeout=_sessions_facade._BROWSER_ACTION_AWAIT_S,
@@ -127,6 +153,7 @@ def register_browser_routes(
             # Drop registry entries so a resolved/timed-out action leaks nothing.
             if _browser_action_registry.get(action_id) is future:
                 _browser_action_registry.pop(action_id, None)
+            _browser_action_claim_events.pop(action_id, None)
             _browser_action_owners.pop(action_id, None)
             _browser_action_claims.pop(action_id, None)
 
@@ -170,6 +197,9 @@ def register_browser_routes(
         existing = _browser_action_claims.setdefault(action_id, claim_token)
         if existing != claim_token:
             return {"claimed": False}
+        claimed = _browser_action_claim_events.get(action_id)
+        if claimed is not None:
+            claimed.set()
         return {"claimed": True, "claim_token": claim_token}
 
     @router.post(

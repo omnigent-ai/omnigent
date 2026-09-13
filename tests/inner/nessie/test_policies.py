@@ -459,6 +459,12 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         ("MultiEdit", "file_path", "src/app.py", "ALLOW"),
         ("MultiEdit", "file_path", "/etc/passwd", "DENY"),
         ("MultiEdit", "file_path", "../escape.py", "DENY"),
+        # NotebookEdit carries its target under ``notebook_path``, so it needs
+        # both the tool name AND the arg key to be gated -- adding the name
+        # alone would leave the guard unable to see the path (silent ALLOW).
+        ("NotebookEdit", "notebook_path", "nb.ipynb", "ALLOW"),
+        ("NotebookEdit", "notebook_path", "/etc/x.ipynb", "DENY"),
+        ("NotebookEdit", "notebook_path", "../escape.ipynb", "DENY"),
         # Pi native write/edit (lowercase) use ``path`` (Omnigent convention).
         ("write", "path", "src/app.py", "ALLOW"),
         ("write", "path", "/etc/passwd", "DENY"),
@@ -473,6 +479,9 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         "MultiEdit-in-tree",
         "MultiEdit-absolute",
         "MultiEdit-escape",
+        "NotebookEdit-in-tree",
+        "NotebookEdit-absolute",
+        "NotebookEdit-escape",
         "pi-write-in-tree",
         "pi-write-absolute",
         "pi-edit-escape",
@@ -502,6 +511,32 @@ def test_worktree_guard_gates_native_write_edit(
     assert _result(evaluate(_tool_call(tool, **{path_key: path, "content": ""}), {})) == expected
 
 
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        # A decoy in-tree ``path`` must not shadow an escaping canonical key:
+        # the tool acts on its own key regardless of what else rides in the
+        # payload, so the guard must check every path-like argument present.
+        ("NotebookEdit", {"notebook_path": "/etc/x.ipynb", "path": "safe.ipynb"}),
+        ("Write", {"file_path": "/etc/passwd", "path": "safe.py", "content": ""}),
+        ("MultiEdit", {"file_path": "../escape.py", "path": "safe.py", "edits": []}),
+    ],
+    ids=["NotebookEdit-decoy-path", "Write-decoy-path", "MultiEdit-decoy-path"],
+)
+def test_worktree_guard_denies_escape_behind_decoy_path(
+    tool: str,
+    args: dict,
+) -> None:
+    """
+    An escaping path must DENY even when a benign in-tree path key is also
+    present. If the guard picked the first truthy key, a crafted payload
+    carrying a decoy relative ``path`` would smuggle an absolute
+    ``notebook_path``/``file_path`` past the confinement.
+    """
+    evaluate = worktree_guard()
+    assert _result(evaluate(_tool_call(tool, **args), {})) == "DENY"
+
+
 def test_worktree_guard_only_guards_writes() -> None:
     """
     Reads and shells pass through — the guard constrains only write/edit
@@ -522,6 +557,7 @@ def test_worktree_guard_only_guards_writes() -> None:
         ("Write", {"file_path": "a.py", "content": "x"}),
         ("Edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"}),
         ("MultiEdit", {"file_path": "a.py", "edits": []}),
+        ("NotebookEdit", {"notebook_path": "a.ipynb", "new_source": "x"}),
         # Pi native lowercase.
         ("write", {"path": "a.py", "content": "x"}),
         ("edit", {"path": "a.py"}),

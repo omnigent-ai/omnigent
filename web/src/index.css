@@ -195,6 +195,14 @@
     env(safe-area-inset-bottom, 0px),
     var(--omnigent-android-safe-area-bottom, 0px)
   );
+  --omnigent-safe-left: max(
+    env(safe-area-inset-left, 0px),
+    var(--omnigent-android-safe-area-left, 0px)
+  );
+  --omnigent-safe-right: max(
+    env(safe-area-inset-right, 0px),
+    var(--omnigent-android-safe-area-right, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
@@ -291,6 +299,120 @@
  * produces a natural 28px row without scaling layout geometry. */
 .sidebar-row {
   line-height: 20px;
+}
+
+.composer-add-menu,
+.composer-host-menu {
+  background-color: #fff;
+  background-image: none;
+}
+
+.composer-add-menu {
+  border-color: #e4e4e7;
+  box-shadow: 0 0 20px -6px rgb(0 0 0 / 12%);
+}
+
+.composer-host-menu {
+  box-shadow: 0 2px 16px rgb(0 0 0 / 12%);
+}
+
+.dark :is(.composer-add-menu, .composer-host-menu) {
+  --muted: rgb(248 248 248 / 12.7333%);
+  --muted-foreground: rgb(245 245 244 / 56%);
+  background-color: rgb(31 31 33 / 60%);
+  border-color: rgb(255 255 255 / 8%);
+  backdrop-filter: blur(24px) saturate(120%);
+}
+
+.dark .composer-add-menu {
+  box-shadow: 0 0 14px -8px rgb(0 0 0 / 90%);
+}
+
+.dark .composer-host-menu {
+  box-shadow: 0 2px 16px rgb(0 0 0 / 35%);
+}
+
+.composer-add-menu [role="menuitem"] {
+  min-height: 24px;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.composer-host-menu [role="menuitem"] {
+  min-height: 28px;
+  gap: 4px;
+  border-radius: 8px;
+  padding: 4px 12px 4px 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.composer-host-menu [role="menuitem"] [class~="text-sm"] {
+  font-size: inherit;
+}
+
+:is(.composer-add-menu, .composer-host-menu) [data-active="true"] {
+  background-color: var(--muted);
+  font-weight: 500;
+}
+
+:is(.composer-add-menu, .composer-host-menu) [data-highlighted] {
+  background-color: var(--muted);
+}
+
+:is(.composer-add-menu, .composer-host-menu) [data-highlighted] svg {
+  color: var(--foreground);
+}
+
+.composer-host-menu [role="menuitem"].composer-host-connect {
+  gap: 8px;
+  padding-right: 8px;
+}
+
+.composer-host-menu [role="separator"] {
+  margin: 4px 0;
+}
+
+.composer-agent-menu :is([role="menuitem"], [role="menuitemcheckbox"]) {
+  min-height: 32px;
+  align-items: center;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 4px 12px 4px 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.composer-agent-menu [role="menuitem"].composer-agent-row {
+  gap: 4px;
+  padding: 0 12px 0 0;
+}
+
+.composer-agent-menu [role="menuitemcheckbox"] {
+  padding-right: 32px;
+}
+
+.composer-agent-config-menu :is([role="menuitem"], [role="menuitemcheckbox"]) {
+  min-height: 28px;
+}
+
+.composer-agent-menu [role="menuitem"] > svg:last-child {
+  margin-left: 0;
+}
+
+.composer-reference-surface {
+  border-color: color(srgb 0.129412 0 0.0509804 / 0.1);
+  background-color: rgba(255, 255, 255, 0.8);
+  background-image: none;
+}
+
+.dark .composer-reference-surface {
+  border-width: 0.5px;
+  border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
+  background-color: rgba(255, 255, 255, 0.05);
 }
 
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
@@ -658,28 +780,30 @@ aside[aria-label="Workspace"][data-maximized] {
   display: none;
 }
 
-/* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
- * system status bar and home indicator. Keep the web app visually full-bleed,
- * but move interactive mobile chrome out of unsafe areas. Scoped to the native
- * bridge marker so normal iOS Safari keeps its existing browser-safe layout. */
-@media (width < 48rem) {
-  [data-ios-native].app-shell {
-    /* Lock the shell to the live visual viewport so the soft keyboard can never
-       pan the whole document (which hides the header). --omnigent-viewport-
-       height is published by useIOSViewportLock from visualViewport.height; it
-       shrinks when the keyboard opens so inputs stay above it and only inner
-       panes scroll. Falls back to the large viewport before JS runs / on older
-       WebKit. The two-line pattern keeps the lvh fallback for browsers without
-       the var. */
-    height: 100lvh;
-    height: var(--omnigent-viewport-height, 100lvh);
-    min-height: 100lvh;
-    min-height: var(--omnigent-viewport-height, 100lvh);
-    max-height: 100lvh;
-    max-height: var(--omnigent-viewport-height, 100lvh);
-    overflow: hidden;
-  }
+/* The iOS WKWebView runs full-screen under the keyboard at every responsive
+ * width. Lock the shell to the visual viewport published by
+ * useIOSViewportLock so flow content, including the composer, stays visible. */
+[data-ios-native].app-shell {
+  height: 100lvh;
+  height: var(--omnigent-viewport-height, 100lvh);
+  min-height: 100lvh;
+  min-height: var(--omnigent-viewport-height, 100lvh);
+  max-height: 100lvh;
+  max-height: var(--omnigent-viewport-height, 100lvh);
+  overflow: hidden;
+}
 
+/* Native shells render beneath the status bar at every width. Keep floating
+ * chat controls and the pinned Plan tracker below its safe area. */
+:is([data-ios-native], [data-android-native]) .chat-header {
+  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+}
+:is([data-ios-native], [data-android-native]) .chat-plan-accordion {
+  margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
+}
+
+/* Remaining native-shell adjustments are specific to the mobile layout. */
+@media (width < 48rem) {
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
@@ -715,15 +839,6 @@ aside[aria-label="Workspace"][data-maximized] {
     font-size: 16px;
   }
 
-  /* `--omnigent-safe-top` (not raw env()) so this works on Android too, where
-     env(safe-area-inset-top) is 0 in the WebView and the OS inset arrives via
-     the native-injected `--omnigent-android-safe-area-top`. On iOS the var folds
-     down to env(), so the iOS result is unchanged. */
-  [data-ios-native] .chat-header,
-  [data-android-native] .chat-header {
-    top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
-  }
-
   [data-ios-native] .chat-conversation-content,
   [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
@@ -734,6 +849,12 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-ios-native] .main-terminal-view,
   [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
+  }
+
+  /* With the bottom pill retired the terminal card is the lowest content in
+     the terminal view — keep it clear of the home indicator. */
+  [data-ios-native] .main-terminal-view {
+    padding-bottom: calc(0.375rem + var(--omnigent-safe-bottom));
   }
 
   [data-ios-native] .chat-scroll-fade {
@@ -777,35 +898,29 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-android-native] .chat-composer-form {
     padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
   }
+}
 
-  [data-ios-native] .chat-composer-form.terminal-first-composer-form {
-    padding-bottom: 0.25rem;
-  }
-
-  /* Reserve room for the native Liquid Glass switcher that floats over the web
-     view (the in-page pill is suppressed in the iOS shell). Height is the
-     shared bottom inset — the native bar footprint (sourced from the shell, see
-     nativeInsets.ts) plus the home-indicator safe area — so it can never drift
-     from the bar's real size. Chat reserves the same footprint: its composer
-     status line (host / harness / context ring) is content the bar must clear,
-     not spare cushion, so trimming the reserve here let the bar overlap it. */
-  [data-ios-native] .omnigent-native-bottom-spacer,
-  [data-ios-native] .omnigent-native-bottom-spacer--chat {
-    height: var(--omnigent-inset-bottom);
-    flex: none;
-  }
-
-  :is([data-ios-native], [data-android-native])
-    :is(
-      .conversations-sidebar,
-      [data-testid="file-viewer"],
-      [data-testid="files-panel-drawer"],
-      [data-testid="terminals-panel"],
-      .mobile-panel-drawer
-    ) {
-    padding-top: var(--omnigent-safe-top);
-    padding-bottom: var(--omnigent-safe-bottom);
-  }
+/* Full-height native surfaces touch screen edges at every width. Collapsed
+ * panels must remain zero-width, peeking sidebars are already inset, and
+ * panels inside the padded Workspace rail must not receive the inset twice. */
+:is([data-ios-native], [data-android-native])
+  :is(
+    aside[aria-label="Workspace"],
+    .conversations-sidebar,
+    [data-testid="execution-logs-panel"],
+    [data-testid="file-viewer"],
+    [data-testid="files-panel-drawer"],
+    [data-testid="terminals-panel"],
+    .mobile-panel-drawer
+  ):not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(.is-peek) {
+  /* Border-box floors the box at the padding sum, so each lateral inset is
+   * capped at half the surface's published reservation (the rail's inline
+   * --omnigent-reserved-width) — without the var the full inset holds. */
+  --omnigent-lateral-inset-cap: calc(var(--omnigent-reserved-width, 100000px) / 2);
+  padding-top: var(--omnigent-safe-top);
+  padding-bottom: var(--omnigent-safe-bottom);
+  padding-left: min(var(--omnigent-safe-left), var(--omnigent-lateral-inset-cap));
+  padding-right: min(var(--omnigent-safe-right), var(--omnigent-lateral-inset-cap));
 }
 
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
@@ -936,11 +1051,9 @@ aside[aria-label="Workspace"][data-maximized] {
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection mirrors the sidebar's active-item treatment in every
-   * palette and color mode. */
   ::selection {
-    background: var(--sidebar-active);
-    color: var(--sidebar-active-foreground);
+    background: var(--selection-background);
+    color: var(--selection-foreground);
   }
 }
 
@@ -975,11 +1088,21 @@ aside[aria-label="Workspace"][data-maximized] {
 /* Mobile-specific sidebar geometry. The root remains at the global 16px so
  * rem-based typography and controls keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile uses its own base size while preserving the desktop hierarchy. */
+  /* Mobile keeps its own touch-friendly base (14px at the default 13px
+   * preference) but scales it off the Appearance value, so the setting
+   * applies on phones instead of being a dead store. The 14/13 factor maps
+   * the default preference exactly onto the historical 14px mobile base. */
   :root {
-    --mobile-ui-font-size: 14px;
+    --mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13));
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
+  }
+
+  /* Keep draft text and its mirrors above Safari's input-focus zoom threshold.
+   * Native inputs must also preserve larger Appearance sizes. */
+  .composer-input-text,
+  [data-ios-native] textarea.composer-input-text {
+    font-size: max(16px, var(--text-ui));
   }
 
   /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
@@ -1045,15 +1168,21 @@ aside[aria-label="Workspace"][data-maximized] {
   font-size: 1em;
 }
 
+/* Keep download aligned with our header overlay; sticky controls otherwise
+ * drift into the code body and then underneath the transcript's header fade. */
+.chat-code-block > [data-streamdown="code-block"] > .sticky {
+  position: static;
+}
+
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
  * Streamdown renders the body with `overflow-x-auto` and the <code> with
  * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`
  * is set we soft-wrap instead so everything fits the column width. */
-.chat-code-wrap [data-streamdown="code-block-body"] {
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] {
   overflow-x: hidden;
 }
-.chat-code-wrap [data-streamdown="code-block-body"] pre,
-.chat-code-wrap [data-streamdown="code-block-body"] code {
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] pre,
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] code {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1061,9 +1190,17 @@ aside[aria-label="Workspace"][data-maximized] {
  * align with the code, not under the numbers. Gutter = before:w-6 (1.5rem) +
  * before:mr-4 (1rem) = 2.5rem; the negative text-indent pulls the first line
  * (and its ::before number) back to the left edge. */
-.chat-code-wrap [data-streamdown="code-block-body"] code > span {
+.chat-code-wrap > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] code > span {
   padding-left: 2.5rem;
   text-indent: -2.5rem;
+}
+
+/* Our own mermaid fullscreen button (see ChatMermaidBlock in message.tsx)
+ * sits in a pill at the block's top-right. Nudge Streamdown's mermaid action
+ * bar left by that pill's footprint so the two rows sit side by side rather
+ * than overlapping. */
+.chat-mermaid [data-streamdown="mermaid-block-actions"] {
+  margin-right: 2.75rem;
 }
 
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
@@ -1892,4 +2029,15 @@ aside[aria-label="Workspace"][data-maximized] {
 .emoji-picker-popover em-emoji-picker {
   height: var(--emoji-picker-height, 420px) !important;
   min-height: 0 !important;
+}
+
+/* Extension pages sit below the shell header overlay. When AppShell drops that
+ * header (sidebar open on an extension route), the page takes the full height.
+ * Unlayered on purpose so it beats the responsive inset utilities. */
+main[data-shell-header="hidden"] .extension-view-host {
+  padding-top: 0;
+}
+
+main[data-shell-header="hidden"] .extension-view-status {
+  top: 0;
 }
