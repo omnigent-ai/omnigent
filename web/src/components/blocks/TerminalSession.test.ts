@@ -9,12 +9,14 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CURSOR_LEFT_CSI,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
   decodeTerminalClipboardBase64,
   hadRecentTerminalInput,
+  imeInsertRealignment,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
@@ -254,6 +256,46 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+});
+
+describe("imeInsertRealignment", () => {
+  it("realigns an auto-inserted pair that left the caret inside", () => {
+    // The touch keyboard wrote "()" in one IME keystroke, caret between the
+    // pair: one cursor-left re-joins the PTY insertion point to the caret
+    // and the tail is unstaged so the next composition anchors correctly.
+    expect(imeInsertRealignment("()", 1, "()")).toEqual({
+      cursorLeft: CURSOR_LEFT_CSI,
+      stagedValue: "(",
+    });
+  });
+
+  it("is a no-op when the caret sits at the end of the value", () => {
+    // The overwhelmingly common IME insert (direct commit at the end)
+    // already satisfies CompositionHelper's caret==end assumption.
+    expect(imeInsertRealignment("你好", 2, "你好")).toBeNull();
+  });
+
+  it("moves one cell per code point, not per UTF-16 unit", () => {
+    // A tail of two astral-plane characters is four UTF-16 units but must
+    // yield exactly two cursor-lefts — line editors move per character.
+    expect(imeInsertRealignment("a😀😀", 1, "a😀😀")).toEqual({
+      cursorLeft: CURSOR_LEFT_CSI.repeat(2),
+      stagedValue: "a",
+    });
+  });
+
+  it("refuses to unstage a tail the event did not insert", () => {
+    // Caret inside the value, but the tail ")" predates this event's own
+    // insert ("b"): it was already forwarded to the PTY, so unstaging it
+    // would desync xterm's bookkeeping.
+    expect(imeInsertRealignment("(b)", 2, "b")).toBeNull();
+  });
+
+  it("is a no-op without a caret position or inserted data", () => {
+    expect(imeInsertRealignment("()", null, "()")).toBeNull();
+    expect(imeInsertRealignment("()", 1, null)).toBeNull();
+    expect(imeInsertRealignment("()", 1, "")).toBeNull();
   });
 });
 
@@ -758,6 +800,105 @@ describe("TerminalSession", () => {
     const { container, session } = makeSession();
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
+    session.dispose();
+  });
+
+  it("realigns the cursor and composition anchor after an IME auto-pair", async () => {
+    // WHY: a mobile IME writes an automatic punctuation pair in one
+    // 229-keystroke and parks the caret between the pair. xterm's
+    // caret-blind CompositionHelper forwards the pair with no cursor-left
+    // and anchors the next composition at the value end, so the PTY would
+    // receive `())` where the user composed `(你)`. The session must send
+    // the pair, then a realigning cursor-left, then the committed
+    // candidate — and never the uncommitted preedit.
+    const settle = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+
+    const fire229 = (type: string) => {
+      const ev = new KeyboardEvent(type, { key: "Process", bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 229 });
+      textarea.dispatchEvent(ev);
+    };
+    const compositionInput = (data: string) =>
+      textarea.dispatchEvent(
+        new InputEvent("input", {
+          data,
+          inputType: "insertCompositionText",
+          bubbles: true,
+          composed: true,
+        }),
+      );
+
+    // The touch keyboard auto-inserts the pair, caret left inside it.
+    fire229("keydown");
+    textarea.value = "()";
+    textarea.selectionStart = 1;
+    textarea.selectionEnd = 1;
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        data: "()",
+        inputType: "insertText",
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    fire229("keyup");
+    await settle();
+
+    // The tail is unstaged so the caret sits at the end of the value again
+    // — the invariant the CompositionHelper's anchor assumes.
+    expect(textarea.value).toBe("(");
+    expect(textarea.selectionStart).toBe(1);
+
+    // Compose "ni" at the in-pair caret…
+    fire229("keydown");
+    textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    textarea.value = "(n";
+    textarea.selectionStart = 2;
+    textarea.selectionEnd = 2;
+    textarea.dispatchEvent(new CompositionEvent("compositionupdate", { data: "n", bubbles: true }));
+    compositionInput("n");
+    fire229("keyup");
+    await settle();
+    fire229("keydown");
+    textarea.value = "(ni";
+    textarea.selectionStart = 3;
+    textarea.selectionEnd = 3;
+    textarea.dispatchEvent(
+      new CompositionEvent("compositionupdate", { data: "ni", bubbles: true }),
+    );
+    compositionInput("ni");
+    fire229("keyup");
+    await settle();
+
+    // …and select 你 from the candidate list (Chromium's commit stream).
+    textarea.value = "(你";
+    textarea.selectionStart = 2;
+    textarea.selectionEnd = 2;
+    textarea.dispatchEvent(
+      new CompositionEvent("compositionupdate", { data: "你", bubbles: true }),
+    );
+    textarea.dispatchEvent(new CompositionEvent("compositionend", { data: "你", bubbles: true }));
+    compositionInput("你");
+    await settle();
+
+    // Keystroke frames go up as Uint8Array — but from the source module's
+    // realm, so filter by "not a string" rather than instanceof (which
+    // fails cross-realm under jsdom; see the ArrayBuffer note above).
+    const sentBytes = socket.sent
+      .filter((frame) => typeof frame !== "string")
+      .map((frame) => new TextDecoder().decode(frame as Uint8Array))
+      .join("");
+    // Pair first (already user-visible), then the realigning cursor-left,
+    // then the committed candidate — a line editor renders `(你)`.
+    expect(sentBytes).toBe(`()${CURSOR_LEFT_CSI}你`);
     session.dispose();
   });
 });
