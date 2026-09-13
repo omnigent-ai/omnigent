@@ -33,6 +33,7 @@ import {
   toWorkspaceRelativePath,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
+  useWorkspaceDirectories,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
@@ -151,6 +152,11 @@ function DisabledEnvironmentProbe({ id }: { id: string | undefined }) {
 
 function DirectoryProbe({ id, path }: { id: string | undefined; path: string | null }) {
   useWorkspaceDirectory(id, path);
+  return null;
+}
+
+function DirectoriesProbe({ id, paths }: { id: string | undefined; paths: string[] }) {
+  useWorkspaceDirectories(id, paths);
   return null;
 }
 
@@ -663,6 +669,22 @@ describe("useWorkspaceDirectory gating", () => {
     );
   });
 
+  it("holds the batched directory listings until runner liveness resolves", async () => {
+    // The virtualized tree's batched form shares the singular hook's cache
+    // and must share its gate: expanded dirs on a fresh open must not fire
+    // before the first /health resolves.
+    onlineMock.mockReturnValue(undefined);
+
+    render(
+      <Wrap>
+        <DirectoriesProbe id="conv_unknown" paths={["src", "docs"]} />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("does not fetch when path is null (pre-existing gate)", async () => {
     onlineMock.mockReturnValue(true);
 
@@ -1153,10 +1175,14 @@ describe("runner-offline retry liveness gate", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("does not retry a 503 for an old session with unknown liveness", async () => {
+  it("does not retry a 503 for an old idle session served over the host tunnel", async () => {
+    // The runner is known-offline but the host can serve, so the query fires
+    // (queries never fire while liveness is unknown - the serveable gate
+    // holds them). An old idle session isn't recovering: one 503, no storm.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
-    onlineMock.mockReturnValue(undefined);
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
     stubSession({ createdAtSecondsAgo: 3600 });
     fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
 
@@ -1167,9 +1193,13 @@ describe("runner-offline retry liveness gate", () => {
   });
 
   it("retries while a fresh session is cold-booting", async () => {
+    // Cold boot: the server reports the runner offline until it registers,
+    // and the host tunnel serves meanwhile. The 503 is worth retrying - the
+    // runner is coming up.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
-    onlineMock.mockReturnValue(undefined);
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
     stubSession({ createdAtSecondsAgo: 1 });
     fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
 
@@ -1182,8 +1212,11 @@ describe("runner-offline retry liveness gate", () => {
   });
 
   it("retries while the session snapshot is loading", async () => {
+    // Session age unknown (snapshot still loading) -> assume recovering, so
+    // a 503 on a query that fired (runner offline, host serving) retries.
     vi.useFakeTimers();
-    onlineMock.mockReturnValue(undefined);
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
     sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
     fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
 

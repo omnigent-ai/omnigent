@@ -2,9 +2,9 @@
 
 A runner going offline (host reboot, idle-reap, tunnel drop) is a normal
 operational state: the transient 503 codes (``runner_unavailable``,
-``runner_capability_mismatch``) must be logged at INFO without a stack
-trace, while genuine 500-class errors keep ERROR + ``exc_info`` so real
-failures stay diagnosable.
+``runner_capability_mismatch``) must be logged below ERROR (a stateful
+WARN) without a stack trace, while genuine 500-class errors keep ERROR +
+``exc_info`` so real failures stay diagnosable.
 """
 
 from __future__ import annotations
@@ -50,12 +50,12 @@ def erroring_client(app: FastAPI) -> httpx.AsyncClient:
     "code",
     [ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.RUNNER_CAPABILITY_MISMATCH],
 )
-async def test_transient_runner_503_logs_info_without_traceback(
+async def test_transient_runner_503_logs_below_error_without_traceback(
     erroring_client: httpx.AsyncClient,
     caplog: pytest.LogCaptureFixture,
     code: str,
 ) -> None:
-    """An expected offline-runner 503 logs at INFO with no ``exc_info``.
+    """An expected offline-runner 503 logs below ERROR with no ``exc_info``.
 
     :param erroring_client: Client whose app raises the parametrized code.
     :param caplog: Pytest log capture.

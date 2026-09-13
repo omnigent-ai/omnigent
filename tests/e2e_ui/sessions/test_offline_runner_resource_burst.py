@@ -5,8 +5,8 @@ storm on an offline-runner session is tri-state: ``undefined`` (not yet
 polled) / ``true`` / ``false``, and consumers only block on ``=== false``. So
 while the first ``/health`` poll is still in flight after opening the session,
 the environment/terminal resource fetches fire anyway — and every one of them
-comes back 503 ``runner_unavailable`` (each also logged server-side as an
-ERROR + full traceback, the other facet of this bug).
+comes back 503 ``runner_unavailable``, hammering a runner the server already
+knows is offline (each hit also lands a per-request server-side WARN).
 
 This drives the real journey: bind a session to the live runner, SIGKILL the
 runner (host reboot / idle-reap), open ``/c/<id>`` in the browser, and record
@@ -137,8 +137,8 @@ def test_open_offline_session_no_resource_503_burst(
     timeline = "\n".join(f"  t={when:6.2f}s  {status}  {path}" for when, status, path in observed)
     assert not resource_503s, (
         f"opening an offline-runner session fired {len(resource_503s)} "
-        "runner-proxied resource request(s) that 503'd (each is also logged "
-        "server-side as ERROR + traceback). The runner-online gate must hold "
+        "runner-proxied resource request(s) that 503'd (each also lands a "
+        "per-request server-side WARN). The runner-online gate must hold "
         "these fetches until the runner is known online. Timeline of "
         f"session-scoped responses:\n{timeline}"
     )

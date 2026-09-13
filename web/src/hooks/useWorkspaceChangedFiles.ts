@@ -909,7 +909,7 @@ export function useWorkspaceDirectories(
   location = "",
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
-  const enabled = !!conversationId && serveable !== false;
+  const enabled = !!conversationId && serveable === true;
   // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
   // reference check on the combine fn (`combine !== lastCombine`), so the
   // callback must be stable — an inline closure is a fresh fn every render and
