@@ -16,7 +16,7 @@ describe("shared composer controls", () => {
   it("uses the same workspace header and host geometry in either context", () => {
     render(
       <>
-        <ComposerWorkspaceBar>
+        <ComposerWorkspaceBar data-testid="workspace-bar">
           <ComposerWorkspaceTrigger kind="directory" label="repo" />
           <ComposerWorkspaceTrigger kind="worktree" label="main" />
         </ComposerWorkspaceBar>
@@ -25,6 +25,14 @@ describe("shared composer controls", () => {
     );
     expect(screen.getByRole("button", { name: "repo" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "main" })).toBeInTheDocument();
+    expect(screen.getByTestId("workspace-bar")).toHaveClass(
+      "items-center",
+      "py-1.5",
+      "h-[37px]",
+      "gap-0.5",
+      "md:gap-2",
+    );
+    expect(screen.getByTestId("workspace-bar")).not.toHaveClass("items-start", "pt-1.5");
     expect(screen.getByRole("button", { name: "This machine" })).toHaveClass("w-11", "md:h-7");
   });
 
@@ -37,7 +45,13 @@ describe("shared composer controls", () => {
     );
 
     for (const trigger of screen.getAllByRole("button")) {
-      expect(trigger).toHaveClass("min-w-0", "max-w-[calc(50%-0.25rem)]");
+      expect(trigger).toHaveClass(
+        "min-w-10",
+        "md:min-w-11",
+        "px-0.5",
+        "md:px-1",
+        "max-w-[calc(50%-0.25rem)]",
+      );
       expect(trigger).not.toHaveClass("max-w-[180px]");
       expect(trigger.querySelector("span")).toHaveClass("min-w-0", "truncate");
       for (const icon of trigger.querySelectorAll("svg")) {
@@ -85,7 +99,7 @@ describe("shared composer controls", () => {
     const onSelect = vi.fn();
     render(
       <ComposerPermissionPicker
-        label="Permissions"
+        label="Permission mode"
         value="Bypass permissions"
         options={[
           { value: "manual", label: "Manual" },
@@ -94,7 +108,7 @@ describe("shared composer controls", () => {
         onSelect={onSelect}
       />,
     );
-    const trigger = screen.getByRole("button", { name: "Permissions: Bypass permissions" });
+    const trigger = screen.getByRole("button", { name: "Permission mode: Bypass permissions" });
     for (const forbidden of ["hidden", "max-w-20"]) {
       expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
     }

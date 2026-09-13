@@ -3067,7 +3067,7 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Model:");
     expect(tip.textContent).toContain("Effort:");
     // Effort is switchable in-session; permission mode is not, so it must be absent.
-    expect(tip.textContent).not.toContain("Permissions");
+    expect(tip.textContent).not.toContain("Permission mode");
   });
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
@@ -3421,10 +3421,7 @@ describe("Composer config gear", () => {
     // while Luna's own max stays.
     await waitFor(() => expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(null));
     act(() => useChatStore.setState({ llmModel: "gpt-5.6-luna", selectedEffort: null }));
-    expect(screen.getByTestId("composer-agent-effort-default")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    expect(screen.queryByTestId("composer-agent-effort-default")).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-ultra"]')).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-max"]')).not.toBeNull();
   });

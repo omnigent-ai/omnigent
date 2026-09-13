@@ -72,8 +72,6 @@ import {
   CLAUDE_NATIVE_EFFORTS,
   PI_NATIVE_EFFORTS,
   ConfigRow,
-  DescribedSelect,
-  EFFORT_SELECT_NONE,
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
@@ -207,7 +205,6 @@ import {
   AGY_NATIVE_SKIP_MODES,
   AGY_NATIVE_SKIP_VALUE,
   AUTO_PERMISSION_MODE,
-  AUTO_PERMISSION_MODE_OPTIONS,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
@@ -1271,27 +1268,35 @@ function visibleModelLabel(label: string): string {
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 
+function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
+  return (
+    nativeAgentHasCapability(agent, "modelPicker") ||
+    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
+  );
+}
+
+function agentHasAdvancedSettings(
+  agent: AvailableAgent | undefined,
+  brainHarnessLabels: Readonly<Record<string, string>>,
+): boolean {
+  return (
+    agent?.harness != null &&
+    agent.harness in brainHarnessLabels &&
+    !nativeAgentHasCapability(agent, "permissionMode") &&
+    !nativeAgentHasCapability(agent, "approvalMode") &&
+    !nativeAgentHasCapability(agent, "cursorMode") &&
+    !nativeAgentHasCapability(agent, "skipPermissions")
+  );
+}
+
 /**
  * Unified two-level agent/harness picker for the landing composer.
  *
- * **Level 1** groups every available agent under "Agents" (SDK / bundle
- * agents like Polly & Debby, plus custom user agents) and "Harnesses" (the
- * native terminal CLIs — Claude Code, Codex, Cursor, …). **Level 2** is a
- * per-entry submenu of that entry's run-config knobs: model / effort /
- * permission mode for Claude Code, approval mode (+ bypass) for Codex,
- * approval mode for OpenCode, execution mode for Cursor, and the brain-harness
- * override for bundle agents. Entries with no knobs are plain selectable rows.
- *
- * Holds no state of its own — the selected agent and every knob live in
- * {@link NewChatLandingScreen} and are threaded in. Replaces the old
- * left-side run-mode pills, the right-side model / harness controls, and the
- * footer-tray agent dropdown.
- *
- * Selecting a knob inside a not-yet-selected entry's submenu first selects
- * that entry (so the single shared knob state stays coherent), then applies
- * the value. For the mode knobs we persist the pick for the *entry's* harness
- * BEFORE selecting, so the harness-switch reseed effect in the screen reads it
- * back as the same value and doesn't clobber the choice.
+ * Groups harnesses and agents, with model/effort submenus and advanced
+ * brain-harness selection where supported. Entries without those settings
+ * are plain selectable rows; permissions live in the composer's hand menu.
+ * Selecting an editable entry opens its submenu and selects it first, keeping
+ * the shared configuration state in {@link NewChatLandingScreen} coherent.
  */
 export function AgentHarnessPicker({
   agentEntries,
@@ -1318,6 +1323,7 @@ export function AgentHarnessPicker({
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
   triggerIcon,
   selectedConfigContent,
+  isEntryConfigurable,
   entrySummaries,
   autoHarnessAvailable = false,
   autoHarnessActive = false,
@@ -1373,6 +1379,8 @@ export function AgentHarnessPicker({
   triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
   selectedConfigContent?: ReactNode;
+  /** Whether an entry has model settings or a configurable agent harness. */
+  isEntryConfigurable?: (agent: AvailableAgent) => boolean;
   entrySummaries?: Readonly<Record<string, string>>;
   /** Whether the top-level Smart Routing row is offered (routing enabled and
    *  both native CLIs ready). Defaults off, so an embedder that doesn't wire
@@ -1428,7 +1436,7 @@ export function AgentHarnessPicker({
           .join(" ")
       : "";
     const summary = details || entrySummaries?.[agent.id] || "Default";
-    const editable = selectedConfigContent !== undefined;
+    const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const unavailable = harnessUnconfiguredOnHost(agent.harness, host);
     const warning = harnessWarningBadgeText(
       harnessUnavailableReasonOnHost(agent.harness, host),
@@ -1796,17 +1804,7 @@ function HarnessConfigModal({
   brainHarnessLabels,
   host,
   hideUnconfigured,
-  permissionMode,
-  approvalMode,
-  cursorExecMode,
-  agySkipMode,
-  bypassSandbox,
   pickedHarness,
-  setPermissionMode,
-  setApprovalMode,
-  setCursorExecMode,
-  setAgySkipMode,
-  setBypassSandbox,
   setPickedHarness,
 }: {
   open: boolean;
@@ -1815,91 +1813,28 @@ function HarnessConfigModal({
   brainHarnessLabels: Record<string, string>;
   host: Host | undefined | null;
   hideUnconfigured: boolean;
-  permissionMode: string;
-  approvalMode: string;
-  cursorExecMode: string;
-  agySkipMode: string;
-  bypassSandbox: boolean;
   pickedHarness: string | null;
-  setPermissionMode: (mode: string) => void;
-  setApprovalMode: (mode: string) => void;
-  setCursorExecMode: (mode: string) => void;
-  setAgySkipMode: (mode: string) => void;
-  setBypassSandbox: (enabled: boolean) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
 }) {
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
-  const entryHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? null;
-  const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
-  const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
-  const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
-  const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
-  const isCodex = entryHarness === "codex-native";
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
   // Local draft — seeded from the live state each time the modal opens so
   // Cancel can discard and re-opening always reflects the committed state.
-  const [draftPermission, setDraftPermission] = useState(permissionMode);
-  const [draftApproval, setDraftApproval] = useState(approvalMode);
-  const [draftCursor, setDraftCursor] = useState(cursorExecMode);
-  const [draftAgySkip, setDraftAgySkip] = useState(agySkipMode);
-  const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
 
   useEffect(() => {
     if (!open) return;
-    setDraftPermission(permissionMode);
-    setDraftApproval(approvalMode);
-    setDraftCursor(cursorExecMode);
-    setDraftAgySkip(agySkipMode);
-    setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // Fully-auto: the router picks the harness AND the model, so the only knob
-  // left is what the picked harness may do without asking. Everything else is
-  // harness-specific and can't be decided before the pick.
-  // Both auto flavors land here: the brain-harness override on a bundle agent,
-  // and top-level Smart Routing (which rides a placeholder native wrapper, so
-  // it has no brainDefault of its own).
-  const autoNative = draftHarness === AUTO_NATIVE_HARNESS_ID;
-  const autoRouting = autoNative || (brainDefault != null && draftHarness === AUTO_HARNESS_ID);
-  // Only top-level Smart Routing replaces the agent's identity (it rides a
-  // placeholder wrapper, so naming that wrapper would misreport what runs). A
-  // bundle agent's routed brain is a knob on that agent, so the modal keeps its
-  // name: "Configure Debby", not "Configure Smart Routing".
-  const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const save = () => {
-    // Top-level Smart Routing has nothing to commit — the router owns the
-    // harness and model, and Permissions is locked to Default. Committing the
-    // placeholder wrapper's model/mode drafts would leak its knobs into the
-    // create call.
-    if (autoNative) {
-      onOpenChange(false);
-      return;
-    }
-    if (hasPermission) {
-      setPermissionMode(draftPermission);
-      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftPermission });
-    } else if (hasApproval) {
-      setApprovalMode(draftApproval);
-      setBypassSandbox(draftBypass);
-      if (entryHarness)
-        writeHarnessOption(entryHarness, {
-          mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
-        });
-    } else if (hasCursor) {
-      setCursorExecMode(draftCursor);
-      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
-    } else if (hasAgySkip) {
-      setAgySkipMode(draftAgySkip);
-      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftAgySkip });
-    } else if (brainDefault) {
+    if (brainDefault) {
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
     }
@@ -1917,105 +1852,19 @@ function HarnessConfigModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className={cn("sm:max-w-md", entryHarness === "pi-native" && "sm:max-w-xl")}
-        data-testid="new-chat-landing-config-modal"
-      >
+      <DialogContent className="sm:max-w-md" data-testid="new-chat-landing-config-modal">
         <DialogHeader>
-          <DialogTitle>Configure {configTitleName}</DialogTitle>
+          <DialogTitle>Configure {agent.display_name}</DialogTitle>
           <DialogDescription className="sr-only">
-            Configure how {configTitleName} runs for this session.
+            Configure how {agent.display_name} runs for this session.
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {!autoRouting && hasPermission && (
-            <ConfigRow label="Permissions" description="What the agent can do without asking">
-              <DescribedSelect
-                value={draftPermission}
-                onValueChange={setDraftPermission}
-                options={CLAUDE_NATIVE_PERMISSION_MODES}
-                testId="new-chat-landing-config-permission"
-                ariaLabel="Permissions"
-                componentId="new_chat.config.permission"
-              />
-            </ConfigRow>
-          )}
-
-          {!autoRouting && hasApproval && (
-            <ConfigRow label="Approval" description="What the agent can do without asking">
-              <DescribedSelect
-                // Codex adds the DANGEROUS full-bypass as a 4th option; when
-                // armed the select shows it (draftBypass wins over the preset).
-                value={isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval}
-                onValueChange={(v) => {
-                  if (v === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
-                    setDraftBypass(true);
-                  } else {
-                    setDraftBypass(false);
-                    setDraftApproval(v);
-                  }
-                }}
-                options={
-                  isCodex
-                    ? [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
-                    : CODEX_NATIVE_APPROVAL_MODES
-                }
-                testId="new-chat-landing-config-approval"
-                ariaLabel="Approval"
-                componentId="new_chat.config.approval"
-              />
-            </ConfigRow>
-          )}
-
-          {!autoRouting && hasCursor && (
-            <ConfigRow label="Mode" description="How Cursor runs commands">
-              <DescribedSelect
-                value={draftCursor}
-                onValueChange={setDraftCursor}
-                options={CURSOR_NATIVE_EXEC_MODES}
-                testId="new-chat-landing-config-cursor-mode"
-                ariaLabel="Mode"
-                componentId="new_chat.config.cursor_mode"
-              />
-            </ConfigRow>
-          )}
-
-          {!autoRouting && hasAgySkip && (
-            <>
-              <ConfigRow label="Permissions" description="What the agent can do without asking">
-                <DescribedSelect
-                  value={draftAgySkip}
-                  onValueChange={setDraftAgySkip}
-                  options={AGY_NATIVE_SKIP_MODES}
-                  testId="new-chat-landing-config-agy-skip"
-                  ariaLabel="Permissions"
-                  componentId="new_chat.config.permission"
-                />
-              </ConfigRow>
-              {/* Persistent danger banner while the bypass is selected. agy has
-                  no firing pre-tool hook, so Omnigent cannot re-gate individual
-                  tools once this is on — the warning is the only guardrail. */}
-              {draftAgySkip === AGY_NATIVE_SKIP_VALUE && (
-                <div
-                  role="alert"
-                  data-testid="new-chat-landing-agy-skip-banner"
-                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
-                >
-                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-                  <span>
-                    Danger: this session runs Antigravity with all tool permission prompts disabled.
-                    It can edit any file and run any command without asking.
-                  </span>
-                </div>
-              )}
-            </>
-          )}
-
           {/* Stays rendered while Smart Routing is the pick: it is the control
           that selected it, so hiding it would strand the choice with no way to
           read it back or switch away without cancelling. */}
-          {!hasPermission && !hasApproval && !hasCursor && !hasAgySkip && brainDefault && (
+          {brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select
                 value={draftHarness ?? brainDefault}
@@ -2064,26 +1913,6 @@ function HarnessConfigModal({
                   ))}
                 </SelectContent>
               </Select>
-            </ConfigRow>
-          )}
-
-          {/* Top-level Smart Routing: the router owns the model, so Permissions
-          is the last decidable row — and it is locked to Default until a
-          cross-harness permission mapping exists. Default means "send no
-          override", so the picked harness inherits the machine's own Claude Code
-          / Codex config. A bundle agent's routed brain gets no such row: its
-          create call (claude-sdk) never carries a permission field, so the row
-          would only be decoration on top of the Agent Harness pick. */}
-          {autoNative && (
-            <ConfigRow label="Permissions" description="What the agent can do without asking">
-              <DescribedSelect
-                value={CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE}
-                onValueChange={() => {}}
-                options={AUTO_PERMISSION_MODE_OPTIONS}
-                testId="new-chat-landing-config-permission"
-                ariaLabel="Permissions"
-                disabled
-              />
             </ConfigRow>
           )}
         </div>
@@ -2596,23 +2425,16 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setSelectedProject(projectParam);
   }, [projectParam]);
-  // Permission mode for Claude Code (claude --permission-mode). Only
-  // meaningful for the claude-native wrapper; ignored otherwise. Lives in
-  // the footer tray's Advanced settings menu.
+  // Claude Code permission mode, selected from the composer permissions menu.
   const [permissionMode, setPermissionMode] = useState<string>(
     () => restoredDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
-  // Approval mode for Codex (codex --approval-mode). Only meaningful for
-  // the codex-native wrapper; ignored otherwise. Lives in the footer
-  // tray's Advanced settings menu.
+  // Codex approval preset, selected from the composer permissions menu.
   const [approvalMode, setApprovalMode] = useState<string>(
     () => restoredDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
   );
-  // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
-  // flippable on after the user types the confirmation phrase, so it can
-  // never be enabled by an accidental click. Persisted as a conversation
-  // label so it survives reload. When on, a persistent red banner warns and
-  // the runner ignores the approval-mode preset's flags.
+  // Codex's full-bypass approval option uses a conversation label instead of
+  // preset CLI flags; the runner ignores the preset while bypass is enabled.
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
   );
@@ -2674,7 +2496,7 @@ export function NewChatLandingScreen() {
     harness: string | null;
     host: Host | undefined | null;
   } | null>(null);
-  // Harness-config modal, opened from the composer's gear icon.
+  // Advanced settings for agents with a configurable brain harness.
   const [configOpen, setConfigOpen] = useState(false);
 
   // Mirror the current draft fields into a ref every render so the unmount
@@ -3128,30 +2950,16 @@ export function NewChatLandingScreen() {
   // picks native Claude Code or Codex per task. It rides a placeholder wrapper
   // agent for the create call, so the pick lives in pickedHarness alone.
   const smartRoutingHarnessSelected = pickedHarness === AUTO_NATIVE_HARNESS_ID;
-  // Whether the gear config modal has anything to show for the selected agent
-  // (drives the gear icon's visibility). Bundle agents with an overridable
-  // brain harness qualify, as does any routing-eligible agent — Smart Routing
-  // lives only in the modal, so an agent with just that still needs the gear.
-  const selectedAgentHasKnobs =
-    supportsPermissionMode ||
-    supportsApprovalMode ||
-    supportsCursorMode ||
-    supportsAgySkipPermissions ||
-    supportsModelPicker ||
-    smartRoutingEligible ||
-    (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
-  // Label/value pairs summarizing the selected agent's current run-config, for
-  // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
-  // user can read the active settings without opening it. "Default" = an unset
-  // model/effort (Claude Code uses its own configured default).
-  // Gate on eligibility so a stale "on" (server flag off, or a non-routable
-  // agent) never shows misleading routing rows in the tooltip.
+  const selectedAgentHasAdvancedSettings = agentHasAdvancedSettings(
+    selectedAgent,
+    brainHarnessLabelsAll,
+  );
+  const isEntryConfigurable = (agent: AvailableAgent) =>
+    agentHasModelSettings(agent) || agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
+  // Only an eligible harness can display active per-turn Smart Routing.
   const routingOn = smartRoutingEligible && costControlMode === "on";
-  // Either fully-auto flavor is active: the router owns harness + model, so the
-  // per-turn routing rows don't apply. Row gating only — this says nothing about
-  // WHOSE session it is. Identity readers (the composer chip, its tooltip, the
-  // modal title) key on `smartRoutingHarnessSelected` instead, because a bundle
-  // agent's routed brain is a knob on that agent, not a different selection.
+  // Both fully-auto flavors own harness and model, but only top-level Smart
+  // Routing changes the composer identity; a bundle keeps its agent identity.
   const autoRoutingSelected =
     smartRoutingHarnessSelected ||
     (pickedHarness === AUTO_HARNESS_ID &&
@@ -3166,20 +2974,16 @@ export function NewChatLandingScreen() {
       return modelConfigurationSourceRows(source);
     };
     if (smartRoutingHarnessSelected) {
-      // Top-level Smart Routing's modal is the locked Permissions row alone, so
-      // mirror it. Report the constant — never a mode left over in state from a
-      // previously selected native harness.
-      return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
+      // Routing inherits the picked harness's defaults, not a previous selection's mode.
+      return [{ label: "Permission mode", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
-      const thinkingLevelValue = !pickedEffort
-        ? "Default"
-        : (PI_NATIVE_EFFORTS.find((effort) => effort.value === pickedEffort)?.label ?? "Default");
+      const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
       return [
         { label: "Model", value: modelValue },
-        ...(selectedNativeHarness === "pi-native"
+        ...(selectedNativeHarness === "pi-native" && thinkingLevelValue
           ? [{ label: "Thinking level", value: thinkingLevelValue }]
           : []),
         ...sourceRows(piModelOptions),
@@ -3192,20 +2996,17 @@ export function NewChatLandingScreen() {
           : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
               defaultModelLabel(claudeModelOptions)),
       );
-      // Routing picks the model + effort per turn, so mirror the modal's frozen
-      // Effort row: an em-dash when routing is on, else the picked level.
+      // Routing owns effort per turn, so the summary shows an em-dash.
       const effortValue = routingOn
         ? EFFORT_UNAVAILABLE_PLACEHOLDER
-        : !pickedEffort
-          ? "Default"
-          : (CLAUDE_NATIVE_EFFORTS.find((e) => e.value === pickedEffort)?.label ?? "Default");
+        : normalizeEffortLabel(pickedEffort);
       const permissionValue =
         CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ??
         permissionMode;
       return [
         { label: "Model", value: modelValue },
-        { label: "Effort", value: effortValue },
-        { label: "Permissions", value: permissionValue },
+        ...(effortValue ? [{ label: "Effort", value: effortValue }] : []),
+        { label: "Permission mode", value: permissionValue },
         ...sourceRows(claudeModelOptions),
       ];
     }
@@ -3216,10 +3017,7 @@ export function NewChatLandingScreen() {
       : [];
     if (supportsApprovalMode) {
       const isCodex = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness === "codex-native";
-      // Bypass is the most-permissive Approval choice, not a separate knob — so
-      // mirror the modal's single Approval control: when armed, the Approval row
-      // reads "Bypass approvals & sandbox" rather than the underlying preset
-      // (which would misleadingly imply approvals are still at e.g. "Default").
+      // Bypass takes precedence over the underlying approval preset in the hand menu.
       const approvalValue =
         isCodex && bypassSandbox
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
@@ -3239,20 +3037,21 @@ export function NewChatLandingScreen() {
                 ),
               },
             ];
-      const effortRows = !isCodex
-        ? []
-        : [
-            {
-              label: "Effort",
-              value: routingOn
-                ? EFFORT_UNAVAILABLE_PLACEHOLDER
-                : normalizeEffortLabel(pickedEffort) || "Default",
-            },
-          ];
+      const effortRows =
+        !isCodex || (!routingOn && !pickedEffort)
+          ? []
+          : [
+              {
+                label: "Effort",
+                value: routingOn
+                  ? EFFORT_UNAVAILABLE_PLACEHOLDER
+                  : normalizeEffortLabel(pickedEffort),
+              },
+            ];
       return [
         ...modelRows,
         ...effortRows,
-        { label: "Approval", value: approvalValue },
+        { label: "Permission mode", value: approvalValue },
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
     }
@@ -3264,7 +3063,7 @@ export function NewChatLandingScreen() {
     if (supportsAgySkipPermissions) {
       const skipValue =
         AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
-      return [{ label: "Permissions", value: skipValue }, ...routingRow];
+      return [{ label: "Permission mode", value: skipValue }, ...routingRow];
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
@@ -3301,7 +3100,7 @@ export function NewChatLandingScreen() {
     (row) => row.label === "Model" || row.label === "Effort" || row.label === "Thinking level",
   );
   const permissionConfigRow = configSummary.find(
-    (row) => row.label === "Permissions" || row.label === "Approval" || row.label === "Mode",
+    (row) => row.label === "Permission mode" || row.label === "Mode",
   );
   const pickerModelOptions: readonly NativeModelOption[] = supportsPermissionMode
     ? claudeModelOptions
@@ -3364,109 +3163,104 @@ export function NewChatLandingScreen() {
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectedNativeHarness) return;
-    const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
-    setPickedEffort(picked);
-    writeHarnessOption(selectedNativeHarness, { effort: picked });
+    setPickedEffort(effort);
+    writeHarnessOption(selectedNativeHarness, { effort });
   };
-  const selectedConfigContent = selectedAgentHasKnobs ? (
-    <>
-      {smartRoutingEligible && (
-        <>
-          <DropdownMenuCheckboxItem
-            checked={routingOn}
-            onCheckedChange={() => selectPickerModel(MODEL_SELECT_SMART)}
-            onSelect={(event) => event.preventDefault()}
-            data-testid="new-chat-landing-agent-model-smart-routing"
-          >
-            <WandSparklesIcon className="size-4" aria-hidden="true" />
-            {SMART_ROUTING_LABEL}
-          </DropdownMenuCheckboxItem>
-          <DropdownMenuSeparator />
-        </>
-      )}
-      <ComposerConfigSections
-        models={
-          supportsModelPicker || supportsPermissionMode || selectedNativeHarness === "codex-native"
-            ? {
-                testId: "new-chat-landing-agent-models",
-                header: "Models",
-                leading: (
-                  <>
-                    {selectedNativeHarness === "pi-native" && (
-                      <Input
-                        aria-label="Search models"
-                        placeholder="Search models…"
-                        value={pickerModelSearch}
-                        onChange={(event) => setPickerModelSearch(event.target.value)}
-                        onKeyDown={(event) => event.stopPropagation()}
-                        data-testid="new-chat-landing-agent-model-search"
-                      />
-                    )}
-                    {pickerModelsLoading && (
-                      <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
-                    )}
-                    {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                      <div className="px-2 py-1 text-xs text-muted-foreground">
-                        {pickerModelsError?.message ?? "Models unavailable"}
-                      </div>
-                    )}
-                  </>
-                ),
-                choices: [
-                  ...(pickerModelOptions.length > 0 &&
-                  !pickerModelOptions.some((option) => option.isDefault)
-                    ? [
-                        {
-                          key: "__default__",
-                          label: "Harness default",
-                          checked: !routingOn && pickedModel === "",
-                          onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
-                          testId: "new-chat-landing-agent-model-default",
-                        },
-                      ]
-                    : []),
-                  ...pickerModelOptions
-                    .filter((option) =>
-                      pickerModelSearch
-                        .toLowerCase()
-                        .trim()
-                        .split(/\s+/)
-                        .every((term) =>
-                          `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
-                        ),
-                    )
-                    .map((option) => ({
-                      key: option.id,
-                      label: visibleModelLabel(nativeModelLabel(option)),
-                      checked:
-                        !routingOn &&
-                        (pickedModel === option.id ||
-                          (pickedModel === "" && option.isDefault === true)),
-                      onSelect: () =>
-                        selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
-                      testId: `new-chat-landing-agent-model-${option.id}`,
-                      title: nativeModelLabel(option),
-                      className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
-                    })),
-                ],
-              }
-            : undefined
-        }
-        efforts={
-          pickerEffortOptions.length > 0
-            ? {
-                testId: "new-chat-landing-agent-efforts",
-                header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
-                choices: [
-                  {
-                    key: "__default__",
-                    label: "Default",
-                    checked: !routingOn && pickedEffort === "",
-                    disabled: routingOn,
-                    onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
-                    testId: "new-chat-landing-agent-effort-default",
-                  },
-                  ...pickerEffortOptions.map((option) => ({
+  const selectedConfigContent =
+    selectedAgent && isEntryConfigurable(selectedAgent) ? (
+      <>
+        {smartRoutingEligible && (
+          <>
+            <DropdownMenuCheckboxItem
+              checked={routingOn}
+              onCheckedChange={() => selectPickerModel(MODEL_SELECT_SMART)}
+              onSelect={(event) => event.preventDefault()}
+              data-testid="new-chat-landing-agent-model-smart-routing"
+            >
+              <WandSparklesIcon className="size-4" aria-hidden="true" />
+              {SMART_ROUTING_LABEL}
+            </DropdownMenuCheckboxItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
+        <ComposerConfigSections
+          models={
+            supportsModelPicker ||
+            supportsPermissionMode ||
+            selectedNativeHarness === "codex-native"
+              ? {
+                  testId: "new-chat-landing-agent-models",
+                  header: "Models",
+                  leading: (
+                    <>
+                      {selectedNativeHarness === "pi-native" && (
+                        <Input
+                          aria-label="Search models"
+                          placeholder="Search models…"
+                          value={pickerModelSearch}
+                          onChange={(event) => setPickerModelSearch(event.target.value)}
+                          onKeyDown={(event) => event.stopPropagation()}
+                          data-testid="new-chat-landing-agent-model-search"
+                        />
+                      )}
+                      {pickerModelsLoading && (
+                        <div className="px-2 py-1 text-xs text-muted-foreground">
+                          Loading models…
+                        </div>
+                      )}
+                      {!pickerModelsLoading && pickerModelOptions.length === 0 && (
+                        <div className="px-2 py-1 text-xs text-muted-foreground">
+                          {pickerModelsError?.message ?? "Models unavailable"}
+                        </div>
+                      )}
+                    </>
+                  ),
+                  choices: [
+                    ...(pickerModelOptions.length > 0 &&
+                    !pickerModelOptions.some((option) => option.isDefault)
+                      ? [
+                          {
+                            key: "__default__",
+                            label: "Harness default",
+                            checked: !routingOn && pickedModel === "",
+                            onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                            testId: "new-chat-landing-agent-model-default",
+                          },
+                        ]
+                      : []),
+                    ...pickerModelOptions
+                      .filter((option) =>
+                        pickerModelSearch
+                          .toLowerCase()
+                          .trim()
+                          .split(/\s+/)
+                          .every((term) =>
+                            `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
+                          ),
+                      )
+                      .map((option) => ({
+                        key: option.id,
+                        label: visibleModelLabel(nativeModelLabel(option)),
+                        checked:
+                          !routingOn &&
+                          (pickedModel === option.id ||
+                            (pickedModel === "" && option.isDefault === true)),
+                        onSelect: () =>
+                          selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+                        testId: `new-chat-landing-agent-model-${option.id}`,
+                        title: nativeModelLabel(option),
+                        className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+                      })),
+                  ],
+                }
+              : undefined
+          }
+          efforts={
+            pickerEffortOptions.length > 0
+              ? {
+                  testId: "new-chat-landing-agent-efforts",
+                  header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+                  choices: pickerEffortOptions.map((option) => ({
                     key: option.value,
                     label: option.label,
                     checked: !routingOn && pickedEffort === option.value,
@@ -3474,20 +3268,23 @@ export function NewChatLandingScreen() {
                     onSelect: () => selectPickerEffort(option.value),
                     testId: `new-chat-landing-agent-effort-${option.value}`,
                   })),
-                ],
-              }
-            : undefined
-        }
-      />
-      <DropdownMenuSeparator />
-      <DropdownMenuItem
-        data-testid="new-chat-landing-config-gear"
-        onSelect={() => setConfigOpen(true)}
-      >
-        Advanced settings
-      </DropdownMenuItem>
-    </>
-  ) : null;
+                }
+              : undefined
+          }
+        />
+        {selectedAgentHasAdvancedSettings && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              data-testid="new-chat-landing-config-gear"
+              onSelect={() => setConfigOpen(true)}
+            >
+              Advanced settings
+            </DropdownMenuItem>
+          </>
+        )}
+      </>
+    ) : null;
   const pickerEntrySummaries = Object.fromEntries(
     [...harnessEntries, ...agentEntries].map((agent) => {
       const native = nativeCodingAgentForAvailableAgent(agent);
@@ -3520,10 +3317,7 @@ export function NewChatLandingScreen() {
     : supportsPermissionMode
       ? CLAUDE_NATIVE_PERMISSION_MODES
       : supportsApprovalMode
-        ? // Codex's create-time quick picker offers the dangerous bypass choice
-          // (#7070), matching the Advanced modal; other approval harnesses keep
-          // their plain preset list.
-          selectedNativeHarness === "codex-native"
+        ? selectedNativeHarness === "codex-native"
           ? codexCreateApprovalOptions()
           : CODEX_NATIVE_APPROVAL_MODES
         : supportsCursorMode
@@ -3536,10 +3330,7 @@ export function NewChatLandingScreen() {
     if (supportsPermissionMode) setPermissionMode(mode);
     else if (supportsApprovalMode) {
       if (selectedNativeHarness === "codex-native") {
-        // Bypass is the most-permissive Approval choice, not a separate knob:
-        // arming it keeps the underlying preset and persists the bypass token
-        // exactly as the Advanced modal does (create-time only; runtime
-        // /permissions has no bypass row).
+        // Bypass is launch-only and preserves the underlying approval preset.
         const selection = applyCodexApprovalSelection(mode, approvalMode);
         setApprovalMode(selection.approvalMode);
         setBypassSandbox(selection.bypass);
@@ -3557,9 +3348,7 @@ export function NewChatLandingScreen() {
   // Reset per-agent-instance run-config that must not carry across an agent
   // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
   // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
-  // is instance-scoped). Smart routing likewise clears: switching to an agent
-  // whose modal has no routing control (or isn't routable) would otherwise
-  // leave it stuck "on" with no UI to turn it off.
+  // is instance-scoped). Clear routing too so a non-routable agent cannot inherit it.
   //
   // Only reset on an ACTUAL agent change — not the initial resolution (null →
   // first id, or a persisted/draft pick resolving on mount), which would wipe a
@@ -3567,7 +3356,7 @@ export function NewChatLandingScreen() {
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
   const suppressBypassSeedRef = useRef(false);
   // Tracks an explicit model pick the user committed in this composer visit
-  // (via the agent-config modal). Once set, an async project-config arrival or
+  // (via the model picker). Once set, an async project-config arrival or
   // cache refresh must not reseed the project default over the user's choice;
   // an agent switch starts a fresh visit and re-arms the seed.
   const userPickedModelRef = useRef(false);
@@ -4406,11 +4195,8 @@ export function NewChatLandingScreen() {
       if (remembered === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
       else setPickedHarness(remembered);
     }
-    // Re-picking the agent that top-level Smart Routing binds as its placeholder
-    // drops back to that wrapper's own harness — the only way out, since that
-    // modal has no harness row. A bundle agent's routed brain is deliberately
-    // NOT cleared here: it is a saved knob on the agent, and its modal's
-    // always-rendered Agent Harness row is how the user switches away.
+    // Re-picking the placeholder leaves top-level Smart Routing. A bundle's
+    // routed brain stays configured until changed through Agent Harness.
     else if (pickedHarness === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
     // An explicit pick — even of the value the config seeded — is the user's
     // own choice: send it with the create rather than default-filling.
@@ -6099,6 +5885,7 @@ export function NewChatLandingScreen() {
                           ) : null
                         }
                         selectedConfigContent={selectedConfigContent}
+                        isEntryConfigurable={isEntryConfigurable}
                         entrySummaries={pickerEntrySummaries}
                         autoHarnessAvailable={smartRoutingHarnessAvailable}
                         autoHarnessActive={smartRoutingHarnessSelected}
@@ -6107,7 +5894,7 @@ export function NewChatLandingScreen() {
                         triggerClassName="text-[13px] leading-5"
                       />
                     </div>
-                    {selectedAgent && selectedAgentHasKnobs && (
+                    {selectedAgent && selectedAgentHasAdvancedSettings && (
                       <HarnessConfigModal
                         open={configOpen}
                         onOpenChange={setConfigOpen}
@@ -6115,17 +5902,7 @@ export function NewChatLandingScreen() {
                         brainHarnessLabels={brainHarnessLabels}
                         host={harnessWarningHost}
                         hideUnconfigured={hideUnconfiguredHarnesses}
-                        permissionMode={permissionMode}
-                        approvalMode={approvalMode}
-                        cursorExecMode={cursorExecMode}
-                        agySkipMode={agySkipMode}
-                        bypassSandbox={bypassSandbox}
                         pickedHarness={pickedHarness}
-                        setPermissionMode={setPermissionMode}
-                        setApprovalMode={setApprovalMode}
-                        setCursorExecMode={setCursorExecMode}
-                        setAgySkipMode={setAgySkipMode}
-                        setBypassSandbox={setBypassSandbox}
                         setPickedHarness={handleSetPickedHarness}
                       />
                     )}
@@ -6140,9 +5917,6 @@ export function NewChatLandingScreen() {
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
-                    {/* Routing is not a standalone composer toggle — it folds into
-                  the gear modal's Model dropdown as an "Smart Routing"
-                  option (see HarnessConfigModal). */}
                     <TooltipProvider>
                       <Tooltip>
                         <TooltipTrigger asChild>
@@ -6203,6 +5977,21 @@ export function NewChatLandingScreen() {
           </Dialog>
         </div>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
+          {supportsAgySkipPermissions &&
+            !autoRoutingSelected &&
+            agySkipMode === AGY_NATIVE_SKIP_VALUE && (
+              <div
+                role="alert"
+                data-testid="new-chat-landing-agy-skip-banner"
+                className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
+              >
+                <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+                <span>
+                  Danger: this session runs Antigravity with all tool permission prompts disabled.
+                  It can edit any file and run any command without asking.
+                </span>
+              </div>
+            )}
           {/* Warn (don't block) when the selected agent's harness isn't
               configured on the selected host — the host re-checks at
               launch, so submitting surfaces a specific error if it

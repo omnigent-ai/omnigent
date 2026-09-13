@@ -25,6 +25,8 @@ export function ComposerPrLink({
 }) {
   if (prCount <= 0 || !onOpen) return null;
 
+  const label = prCount > 1 ? `${prCount} PRs` : `#${prNumber}`;
+
   return (
     <button
       type="button"
@@ -32,18 +34,20 @@ export function ComposerPrLink({
       onClick={() => onOpen()}
       title={prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"}
       className={cn(
-        "flex shrink-0 items-center gap-1.5 rounded text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        "flex min-w-0 items-center gap-1 rounded text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
         className,
       )}
     >
-      <GithubMono size={14} aria-hidden />
+      <GithubMono size={14} className="shrink-0" aria-hidden />
       <span
+        data-workspace-collapse-label=""
         className={cn(
-          "tabular-nums whitespace-nowrap underline underline-offset-2",
+          "truncate tabular-nums underline underline-offset-2",
           COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
         )}
+        title={label}
       >
-        {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
+        {label}
       </span>
     </button>
   );

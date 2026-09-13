@@ -1,7 +1,5 @@
-// Create-time Codex approval option source, shared by the composer permission
-// picker on landing (and available to the fork dialog). Always includes the
-// DANGEROUS full-bypass entry as a 4th option so the quick menu offers the same
-// explicit opt-in the Edit config modal does.
+// Create-time Codex approvals include an explicit full-bypass option in the
+// composer's permission picker, separate from runtime approval presets.
 //
 // SCOPE: create-time only. A running codex session switches approval through
 // Codex's `/permissions` popup, which has no bypass row (bypass is a launch

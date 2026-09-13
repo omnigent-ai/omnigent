@@ -29,7 +29,7 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
     <div
       ref={barRef}
       className={cn(
-        "group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-start gap-2 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 pt-1.5",
+        "group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 py-1.5 md:gap-2",
         className,
       )}
       {...props}
@@ -47,7 +47,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
       ref={ref}
       type="button"
       className={cn(
-        "relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50",
+        "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-0.5 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11 md:px-1",
         className,
       )}
       {...props}

@@ -3343,18 +3343,20 @@ function ComposerImpl(
             onRefreshBranch={composerGit.refresh}
             refreshing={composerGit.refreshing}
           />
-          {/* Trailing status cluster — the wrapper owns the right alignment so
-              it holds even when the self-nulling indicators render nothing. */}
-          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-            <ComposerPrLink
-              prCount={composerGit.prCount}
-              prNumber={composerGit.prNumber}
-              onOpen={openComposerGithubTab}
-            />
-            <ComposerContextRing
-              contextWindow={composerContextWindow}
-              tokensUsed={composerTokensUsed}
-            />
+          {/* Reserve two workspace triggers' icon-safe minima and two gaps;
+              only PR text truncates when the remaining status space runs out. */}
+          <div className="ml-auto flex min-w-0 max-w-[calc(100%-5.25rem)] shrink-0 items-center gap-1 md:max-w-[calc(100%-6.5rem)]">
+            <div className="flex min-w-0 items-center gap-2 empty:hidden">
+              <ComposerPrLink
+                prCount={composerGit.prCount}
+                prNumber={composerGit.prNumber}
+                onOpen={openComposerGithubTab}
+              />
+              <ComposerContextRing
+                contextWindow={composerContextWindow}
+                tokensUsed={composerTokensUsed}
+              />
+            </div>
             <BackgroundTaskIndicator />
             <SubagentTaskIndicator conversationId={composerSessionId} />
           </div>
@@ -3633,8 +3635,8 @@ function ComposerImpl(
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
                 <ComposerPermissionPicker
-                  label="Permissions"
-                  value={permissionLabel || "Permissions"}
+                  label="Permission mode"
+                  value={permissionLabel || "Permission mode"}
                   options={permissionOptions}
                   disabled={isReadOnly || unreachable || configBusy}
                   onSelect={(mode) => void changePermission(mode)}
@@ -4382,14 +4384,14 @@ function SessionHarnessPicker({
           ? {
               testId: "composer-agent-efforts",
               header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
-              choices: [null, ...availableEfforts].map((effort) => ({
-                key: effort ?? "default",
-                label: formatStatusEffortLabel(effort) ?? "Default",
+              choices: availableEfforts.map((effort) => ({
+                key: effort,
+                label: formatStatusEffortLabel(effort) ?? effort,
                 checked: !routingOn && effort === selectedEffort,
                 disabled: routingOn || busy || pendingModelChange !== null,
                 onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
-                testId: `composer-agent-effort-${effort ?? "default"}`,
-                data: { "data-effort-level": effort ?? "default" },
+                testId: `composer-agent-effort-${effort}`,
+                data: { "data-effort-level": effort },
               })),
             }
           : undefined
@@ -4527,7 +4529,7 @@ function useSessionConfigSummary({
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort);
-    rows.push({ label: "Effort", value: effortValue ?? "Default" });
+    if (effortValue) rows.push({ label: "Effort", value: effortValue });
   }
   if (!routingOn) {
     const source =
