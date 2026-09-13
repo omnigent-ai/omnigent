@@ -50,6 +50,7 @@ from omnigent.spec.types import (
     FunctionRef,
     GuardrailsSpec,
     Phase,
+    PhaseSelector,
     PolicyAction,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -138,6 +139,63 @@ async def test_spawn_bounds_survives_fresh_policy_engines(
     assert (
         await fresh_engine().evaluate(_tool_ctx("sys_session_send"))
     ).action == PolicyAction.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_spawn_bounds_deferred_ask_write_does_not_regress_count(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A dispatch approved after later dispatches adds to the count, never rewinds it."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="spawn-bounds-ask-test",
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="spawn_bounds",
+                    on=None,
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.orchestration.spawn_bounds",
+                        arguments={"max_dispatches_per_turn": 3},
+                    ),
+                ),
+                # Stands in for a default or session policy that gates dispatch
+                # behind approval, which defers spawn_bounds' write until accept.
+                FunctionPolicySpec(
+                    name="approve_dispatch",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name="sys_session_send")],
+                    function=FunctionRef(
+                        path="omnigent.policies.function.make_fixed_action_callable",
+                        arguments={"action": "ask", "reason": "approve dispatch"},
+                    ),
+                ),
+            ]
+        ),
+    )
+    conversation_id = conversation_store.create_conversation().id
+
+    def fresh_engine() -> PolicyEngine:
+        return build_policy_engine(
+            spec=spec,
+            conversation_id=conversation_id,
+            conversation_store=conversation_store,
+        )
+
+    await fresh_engine().evaluate(EvaluationContext(phase=Phase.REQUEST, content="go"))
+    # Dispatch A parks on approval: its write is withheld and stashed.
+    first = await fresh_engine().evaluate(_tool_ctx("sys_session_send"))
+    assert first.action == PolicyAction.ASK
+    # Two later dispatches are approved (the server applies each deferred
+    # write on accept) before the human gets to A.
+    for _ in range(2):
+        later = await fresh_engine().evaluate(_tool_ctx("sys_session_send"))
+        assert later.action == PolicyAction.ASK
+        fresh_engine().apply_state_updates(later.state_updates)
+    fresh_engine().apply_state_updates(first.state_updates)
+
+    # All three slots are consumed, so a fourth dispatch hits the cap.
+    fourth = await fresh_engine().evaluate(_tool_ctx("sys_session_send"))
+    assert fourth.action == PolicyAction.DENY
 
 
 # ──────────────────────────────────────────────────────────

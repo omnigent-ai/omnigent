@@ -433,8 +433,10 @@ def spawn_bounds(
     and DENIES once *max_dispatches_per_turn* is exceeded, forcing fan-out in
     bounded waves rather than an unbounded fleet. The count is persisted in
     ``session_state`` because the deployed server rebuilds its policy engine
-    for every tool call. The input phase resets the persisted count; the
-    closure remains the runner-local fallback.
+    for every tool call. Every request-phase event resets the persisted count
+    — that is each inbound user-role message, including a sub-agent wake
+    notice — so a wave collected by a wake gets a fresh budget. The closure
+    remains the runner-local fallback, reset through ``reset_turn``.
 
     :param max_dispatches_per_turn: Maximum worker dispatches allowed in one
         turn, e.g. ``5``.
@@ -467,8 +469,11 @@ def spawn_bounds(
         session_state = event.get("session_state") or {}
         persisted = session_state.get(_SPAWN_BOUNDS_STATE_KEY, 0)
         persisted_count = persisted if isinstance(persisted, int) else 0
+        # A fresh server engine starts the closure at 0 and reads the
+        # persisted count; the runner gate has no session_state and keeps
+        # counting in the closure. max() serves both without double counting.
         state["count"] = max(state["count"], persisted_count) + 1
-        result = (
+        result: _Json = (
             _decision(
                 "DENY",
                 f"Exceeded {max_dispatches_per_turn} worker dispatches this turn; "
@@ -477,14 +482,20 @@ def spawn_bounds(
             if state["count"] > max_dispatches_per_turn
             else {"result": "ALLOW"}
         )
+        # Increment rather than set: an ASK from another policy defers this
+        # write until approval, and replaying an absolute count would wind
+        # back the dispatches counted in between.
         result["state_updates"] = [
-            {"key": _SPAWN_BOUNDS_STATE_KEY, "action": "set", "value": state["count"]},
+            {"key": _SPAWN_BOUNDS_STATE_KEY, "action": "increment", "value": 1},
         ]
         return result
 
     def reset_turn() -> None:
         """
-        Reset the per-turn dispatch counter at each turn boundary.
+        Reset the closure's per-turn dispatch counter at each turn boundary.
+
+        Clears only the runner-local closure; the persisted count in
+        ``session_state`` is reset by the request-phase event instead.
 
         :returns: ``None``.
         """
