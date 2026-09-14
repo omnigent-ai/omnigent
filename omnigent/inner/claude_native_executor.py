@@ -8,6 +8,7 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
@@ -225,9 +226,26 @@ class ClaudeNativeExecutor(Executor):
                         content=text,
                     )
         except ClaudePromptTimeout as exc:
+            # The same timeout covers a blocked password prompt, an unfinished
+            # browser login, a launch script that never reached Claude Code, a
+            # modal waiting on a keypress — and screens nobody has named yet.
+            # The pane tail that distinguishes them rides in the message, but it
+            # is per-person text, so these three are what count them apart:
+            # ``blocked_on`` for a recognized cause, and the shape/fingerprint
+            # for any screen at all, so the unrecognized ones still group.
             _logger.exception(
-                "claude-native: prompt delivery to harness timed out",
-                extra={"session_id": self._request_session_id},
+                "claude-native: prompt delivery to harness timed out "
+                "(blocked_on=%s shape=%s pane=%s)",
+                exc.blocked_on,
+                ",".join(exc.pane_shape),
+                exc.pane_fingerprint,
+                extra=debug_event(
+                    "claude_native_prompt_timeout",
+                    session_id=self._request_session_id,
+                    blocked_on=exc.blocked_on,
+                    pane_shape=",".join(exc.pane_shape),
+                    pane_fingerprint=exc.pane_fingerprint,
+                ),
             )
             cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)

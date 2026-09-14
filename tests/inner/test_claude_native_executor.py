@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -1366,6 +1367,58 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_prompt_timeout_log_carries_the_blocking_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The timeout's ERROR names the cause as a structured attribute.
+
+    The pane tail that identifies the fault is per-person terminal text, so
+    the slug is what the failures can be grouped by.
+    """
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout(
+            "terminal did not become ready",
+            blocked_on="password-prompt",
+            pane_shape=("no-tui-frame", "awaiting-input"),
+            pane_fingerprint="ab12cd34",
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", lambda *args, **kwargs: None)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    with caplog.at_level(logging.ERROR, logger=claude_native_executor.__name__):
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    assert isinstance(events[0], ExecutorError)
+    timeouts = [
+        record
+        for record in caplog.records
+        if "prompt delivery to harness timed out" in record.getMessage()
+    ]
+    assert len(timeouts) == 1
+    message = timeouts[0].getMessage()
+    assert "blocked_on=password-prompt" in message
+    assert "shape=no-tui-frame,awaiting-input" in message
+    assert "pane=ab12cd34" in message
+    assert timeouts[0].attributes["blocked_on"] == "password-prompt"
+    assert timeouts[0].attributes["pane_shape"] == "no-tui-frame,awaiting-input"
+    assert timeouts[0].attributes["pane_fingerprint"] == "ab12cd34"
+    assert timeouts[0].event_name == "claude_native_prompt_timeout"
 
 
 @pytest.mark.asyncio
