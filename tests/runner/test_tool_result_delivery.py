@@ -159,10 +159,16 @@ async def test_proxy_recovers_tool_delivery(
     dead_interrupt: bool,
     execute: AsyncMock,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exercise real dispatch, parked harness futures, and runner recovery together."""
     conv = f"conv_delivery_{stream}_{failures}_{accept_before_drop}_{superseded}_{dead_interrupt}"
-    caplog.set_level(logging.DEBUG, logger="omnigent.runner.app")
+    # Capture expected teardown errors without rich traceback rendering,
+    # which can consume the recovery deadline on loaded CI workers.
+    logger = logging.getLogger("omnigent.runner.app")
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    caplog.set_level(logging.DEBUG, logger=logger.name)
     harness = _ToolHarness()
     deliveries: list[dict[str, Any]] = []
     interrupts: list[str] = []
