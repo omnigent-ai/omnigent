@@ -2114,6 +2114,8 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
+    :param skills_status: Skill discovery state. A ready catalog may be empty;
+        errors and disconnected runners must not leave clients loading.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
         each model's supported reasoning efforts. Empty while unavailable.
@@ -2200,6 +2202,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
+    skills_status: Literal["loading", "ready", "error", "unavailable"] = "unavailable"
     model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
@@ -3470,14 +3473,14 @@ class SessionMcpStartupEvent(_SSEEventBase):
 
 class SessionSkillsEvent(_SSEEventBase):
     """
-    Signal that a session's runner-owned skills have resolved.
+    Signal that a session's runner-owned skill discovery has settled.
 
     Skills are discovered against the bound runner's filesystem and
     fetched off the session-snapshot hot path: the snapshot kicks a
     single background fetch (``_load_runner_skills`` in
     ``omnigent/server/routes/sessions.py``) and serves ``[]`` until
     it lands. This event fires the moment that background fetch
-    populates the per-session skills cache, so a connected web client
+    populates the per-session skills cache or first fails, so a connected web client
     can re-read the snapshot and fill its slash-command menu instead
     of waiting for the next bind.
 
@@ -3485,7 +3488,7 @@ class SessionSkillsEvent(_SSEEventBase):
     are ready, re-read the snapshot" nudge, mirroring the
     invalidate-then-refetch shape used by
     :class:`SessionChangedFilesInvalidatedEvent`. The snapshot's
-    ``skills`` field (now cache-backed) stays the source of truth.
+    ``skills`` and ``skills_status`` fields stay the source of truth.
 
     :param type: Always ``"session.skills"``.
     :param conversation_id: Session identifier,

@@ -28,6 +28,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  SkillsStatus,
   SkillSummary,
 } from "./types";
 
@@ -245,6 +246,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
+  skills_status?: SkillsStatus;
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
   /**
@@ -358,6 +360,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    skillsStatus: wire.skills_status,
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,

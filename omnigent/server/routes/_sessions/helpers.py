@@ -204,6 +204,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_explicit_unread,
     _read_last_seen,
     _runner_skills_cache,
+    _runner_skills_failed,
     _runner_skills_inflight,
     _runner_skills_stale,
     _session_active_response_cache,
@@ -4859,13 +4860,9 @@ def _publish_runner_skills(session_id: str) -> None:
     """
     Publish a typed :class:`SessionSkillsEvent` to the live stream.
 
-    Fired the moment the background runner-skills fetch
-    (:func:`_load_runner_skills`) populates the per-session cache, so a
-    connected client can re-read the session snapshot and fill its
-    slash-command menu instead of waiting for the next bind. Carries no
-    payload beyond the conversation id — it is a "skills resolved,
-    re-read the snapshot" nudge; the snapshot's cache-backed ``skills``
-    field stays the source of truth.
+    Fired when background skill discovery succeeds or first fails, so a
+    connected client can re-read ``skills`` and ``skills_status`` from
+    the session snapshot. Carries only the conversation id.
 
     No-op when no client is subscribed (``session_stream`` has no
     buffer): a client binding later reads the now-warm snapshot directly.
@@ -4931,6 +4928,7 @@ def _invalidate_runner_backed_snapshot_state(
     """
     from omnigent.server.smart_routing import invalidate_runner_catalog
 
+    _runner_skills_failed.discard(session_id)
     # Only worth marking when there is something to keep serving: a session
     # with no cached skills already re-fetches on the next read, and marking
     # it would leave an id behind for every cold session ever opened.
@@ -10398,6 +10396,13 @@ async def _load_runner_skills(
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     """
+
+    def failed() -> None:
+        # Notify once per failure streak: the nudge's snapshot read may retry.
+        if session_id not in _runner_skills_failed:
+            _runner_skills_failed.add(session_id)
+            _publish_runner_skills(session_id)
+
     try:
         resp = await runner_client.get(
             f"/v1/sessions/{session_id}/skills",
@@ -10407,19 +10412,25 @@ async def _load_runner_skills(
         _logger.debug(
             "Runner skills query failed for %s", session_id, extra={"session_id": session_id}
         )
+        failed()
         return
     if resp.status_code != 200:
+        failed()
         return
     try:
-        raw = resp.json().get("skills", [])
+        raw = resp.json()["skills"]
+        if not isinstance(raw, list):
+            raise ValueError("Expected a skills list")
         skills = [SkillSummary(name=s["name"], description=s["description"]) for s in raw]
     except (ValueError, AttributeError, KeyError, TypeError):
         _logger.debug(
             "Runner skills payload malformed for %s", session_id, extra={"session_id": session_id}
         )
+        failed()
         return
     _runner_skills_cache[session_id] = skills
     _runner_skills_stale.discard(session_id)
+    _runner_skills_failed.discard(session_id)
     # Nudge any subscribed client to re-read the (now-warm) snapshot so
     # its slash-command menu fills without waiting for the next bind.
     _publish_runner_skills(session_id)

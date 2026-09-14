@@ -199,6 +199,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _RelayHandle,
     _runner_relay_tasks,
     _runner_skills_cache,
+    _runner_skills_failed,
     _runner_skills_inflight,
     _runner_skills_stale,
     _session_active_response_cache,
@@ -1030,6 +1031,7 @@ def _build_session_response(
     last_task_error: dict[str, str] | None = None,
     agent_name: str | None = None,
     skills: list[SkillSummary] | None = None,
+    skills_status: Literal["loading", "ready", "error", "unavailable"] = "unavailable",
     runner_online: bool | None = None,
     host_online: bool | None = None,
     host_resumable: bool = False,
@@ -1085,6 +1087,7 @@ def _build_session_response(
     :param skills: Merged skill summaries (bundled + host) for
         the bound agent. ``None`` is treated as the empty list,
         e.g. when the agent spec cannot be loaded.
+    :param skills_status: Discovery state, including a successful empty catalog.
     :param runner_online: Strict runner reachability — ``True`` iff a
         runner tunnel is currently registered for this session (see
         :class:`SessionLiveness`). ``None`` when the caller has no
@@ -1204,6 +1207,7 @@ def _build_session_response(
         # non-claude-native sessions or before the first poll tick.
         todos=_session_todos_cache.get(conv.id, []),
         skills=skills or [],
+        skills_status=skills_status,
         model_options=[
             NativeModelOption.model_validate(option) for option in (model_options or [])
         ],
@@ -9829,6 +9833,20 @@ async def _handle_mcp_tools_call(
     )
 
 
+def _runner_skills_status(
+    runner_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> Literal["loading", "ready", "error", "unavailable"]:
+    """Describe discovery independently of whether the catalog has entries."""
+    if runner_client is None:
+        return "unavailable"
+    if session_id in _runner_skills_failed:
+        return "error"
+    if session_id in _runner_skills_cache and session_id not in _runner_skills_stale:
+        return "ready"
+    return "loading"
+
+
 async def _fetch_runner_skills(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
@@ -10204,6 +10222,7 @@ async def _get_session_snapshot(
     # server only overlays the result; best-effort, empty when no runner
     # is bound or it can't be reached.
     skills = await _fetch_runner_skills(runner_client, session_id)
+    skills_status = _runner_skills_status(runner_client, session_id)
     # Codex model options are also runner-owned: they come from the
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed like skills so a snapshot poll cannot wedge the
@@ -10259,6 +10278,7 @@ async def _get_session_snapshot(
         last_task_error=last_task_error,
         agent_name=agent_name,
         skills=skills,
+        skills_status=skills_status,
         model_options=model_options,
         runner_online=runner_online,
         host_online=host_online,
