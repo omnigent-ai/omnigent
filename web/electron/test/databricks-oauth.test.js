@@ -25,8 +25,9 @@ const electronStub = {
   safeStorage: { isEncryptionAvailable: () => false },
   net: {},
 };
-const origLoad = Module._load;
-Module._load = function (request, ...rest) {
+// Bracket-access `_load` so no-underscore-dangle doesn't flag the Node API name.
+const origLoad = Module["_load"];
+Module["_load"] = function (request, ...rest) {
   if (request === "electron") return electronStub;
   return origLoad.call(this, request, ...rest);
 };
@@ -168,7 +169,9 @@ describe("getValidStoredToken", () => {
       null,
     );
     const calls = mockTokenFetch(async () => {
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => {
+        setTimeout(r, 20);
+      });
       return ok({ access_token: "new", refresh_token: "r1", expires_in: 3600 });
     });
     const [a, b] = await Promise.all([

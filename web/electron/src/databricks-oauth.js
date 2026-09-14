@@ -175,9 +175,10 @@ function loadTokens(origin) {
 }
 
 function deleteStoredToken(origin) {
+  const key = storeKey(origin);
   const store = readStore();
-  if (store[storeKey(origin)]) {
-    delete store[storeKey(origin)];
+  if (store[key]) {
+    Reflect.deleteProperty(store, key);
     writeStore(store);
   }
 }

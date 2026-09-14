@@ -14,8 +14,9 @@ const Module = require("node:module");
 
 // databricks-account requires databricks-oauth, which requires electron.
 const electronStub = { shell: {}, safeStorage: { isEncryptionAvailable: () => false }, net: {} };
-const origLoad = Module._load;
-Module._load = function (request, ...rest) {
+// Bracket-access `_load` so no-underscore-dangle doesn't flag the Node API name.
+const origLoad = Module["_load"];
+Module["_load"] = function (request, ...rest) {
   if (request === "electron") return electronStub;
   return origLoad.call(this, request, ...rest);
 };

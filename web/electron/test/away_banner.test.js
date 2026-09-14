@@ -97,7 +97,7 @@ describe("registerServerAwayWatch", () => {
   });
 
   it("fires onLeave once per away episode, immediately (before the delay)", () => {
-    const { webContents, timers, events } = makeWatch();
+    const { webContents, events } = makeWatch();
     webContents.emit("did-navigate", {}, `${ORIGIN}/omnigent`);
     webContents.url = `${FOREIGN}/login`;
     webContents.emit("did-navigate", {}, `${FOREIGN}/login`);
