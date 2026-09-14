@@ -166,6 +166,7 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    dictation_punctuation_available: bool
     branding: BrandingInfo
 
 
@@ -2406,7 +2407,8 @@ def create_app(
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
         ``managed_sandboxes_enabled``, ``dictation_available``,
-        ``single_user``), the short sandbox provider name
+        ``dictation_punctuation_available``, ``single_user``), the
+        short sandbox provider name
         (``sandbox_provider``) the web UI labels the new-session
         sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
@@ -2528,9 +2530,10 @@ def create_app(
         # speech-to-text fallback (designs/server-dictation.md). Checks
         # config presence only (extra installed + models on disk) — no
         # model is loaded here.
-        from omnigent.server.dictation import engine_availability
+        from omnigent.server.dictation import engine_availability, punctuation_availability
 
         dictation_available, _ = engine_availability()
+        dictation_punctuation_available, _ = punctuation_availability()
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -2552,6 +2555,7 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "dictation_punctuation_available": dictation_punctuation_available,
                 "branding": branding_snapshot.config(),
             }
         )
