@@ -5632,10 +5632,10 @@ async def _rename_current_session_via_rest(
             {"error": "sys_session_rename could not verify the session is top-level"}
         )
     try:
-        response = await server_client.patch(
-            f"/v1/sessions/{conversation_id}",
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/agent-title",
             json={"title": normalized_title},
-            timeout=30.0,
+            timeout=90.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_rename failed: {exc}"})
@@ -5652,6 +5652,8 @@ async def _rename_current_session_via_rest(
         return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
     if not isinstance(payload, dict):
         return json.dumps({"error": "sys_session_rename returned a non-object response"})
+    if payload.get("renamed") is False:
+        return json.dumps(payload)
     updated_title = payload.get("title")
     if not isinstance(updated_title, str):
         return json.dumps({"error": "sys_session_rename response omitted the updated title"})

@@ -172,7 +172,7 @@
       },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
-        "description": "Request body for the current-agent automatic rename endpoint.",
+        "description": "Proposed title for a framework or agent-initiated rename.",
         "properties": {
           "title": {
             "maxLength": 100,
@@ -196,7 +196,8 @@
                 "enum": [
                   "not_top_level",
                   "no_seed",
-                  "title_changed"
+                  "title_changed",
+                  "generation_failed"
                 ],
                 "type": "string"
               },
@@ -11206,6 +11207,59 @@
           }
         },
         "summary": "Update Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent-title": {
+      "post": {
+        "description": "Apply title requirements to an agent proposal before a guarded rename.",
+        "operationId": "rename_session_from_agent_v1_sessions__session_id__agent_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Session From Agent",
         "tags": [
           "sessions"
         ]

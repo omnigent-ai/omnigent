@@ -27,7 +27,12 @@ import pytest
 from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
-from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.acp_executor import (
+    AcpAgentConfig,
+    AcpExecutor,
+    _is_auth_required_error,
+    _unattended_auth_method_id,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorError,
@@ -72,6 +77,212 @@ def test_handles_tools_internally_and_streaming() -> None:
 # ---------------------------------------------------------------------------
 # session/new shapes (server- vs client-assigned id, optional model)
 # ---------------------------------------------------------------------------
+
+
+def test_unattended_auth_method_prefers_cached_token() -> None:
+    assert (
+        _unattended_auth_method_id(
+            {
+                "authMethods": [
+                    {"id": "cached_token"},
+                    {"id": "grok.com"},
+                ],
+                "_meta": {"defaultAuthMethodId": "cached_token"},
+            }
+        )
+        == "cached_token"
+    )
+
+
+def test_unattended_auth_method_none_when_only_browser_login() -> None:
+    assert _unattended_auth_method_id({"authMethods": [{"id": "grok.com"}]}) is None
+
+
+def test_unattended_auth_method_none_when_absent() -> None:
+    assert _unattended_auth_method_id({}) is None
+
+
+def test_unattended_auth_method_none_when_ids_malformed() -> None:
+    assert _unattended_auth_method_id({"authMethods": [{"name": "no id"}, "junk", 7]}) is None
+
+
+def test_unattended_auth_method_falls_back_when_default_interactive() -> None:
+    assert (
+        _unattended_auth_method_id(
+            {
+                "authMethods": [{"id": "grok.com"}, {"id": "cached_token"}],
+                "_meta": {"defaultAuthMethodId": "grok.com"},
+            }
+        )
+        == "cached_token"
+    )
+
+
+def test_is_auth_required_error_matches_code_and_message() -> None:
+    assert _is_auth_required_error({"code": -32000, "message": "nope"})
+    assert _is_auth_required_error({"code": -32603, "message": "Authentication required"})
+    assert not _is_auth_required_error({"code": -32603, "message": "boom"})
+    assert not _is_auth_required_error("Authentication required")
+
+
+def _grok_like_initialize_result() -> dict:
+    return {
+        "agentCapabilities": {"promptCapabilities": {"image": False}},
+        "authMethods": [{"id": "grok.com"}, {"id": "cached_token"}],
+        "_meta": {"defaultAuthMethodId": "cached_token"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_new_authenticates_after_auth_required_and_retries() -> None:
+    """Auth-required ``session/new`` triggers ``authenticate`` + one retry."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+    calls: list[tuple[str, dict]] = []
+    authenticated = False
+
+    async def fake_rpc(method, params, timeout=30.0):
+        nonlocal authenticated
+        calls.append((method, params))
+        if method == "initialize":
+            return {"result": _grok_like_initialize_result()}
+        if method == "authenticate":
+            authenticated = True
+            return {"result": {}}
+        if method == "session/new":
+            if not authenticated:
+                return {"error": {"code": -32000, "message": "Authentication required"}}
+            return {"result": {"sessionId": "sid-1"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert await ex._ensure_session() == "sid-1"
+    assert [c[0] for c in calls] == [
+        "initialize",
+        "session/new",
+        "authenticate",
+        "session/new",
+    ]
+    assert calls[2][1] == {"methodId": "cached_token"}
+
+
+@pytest.mark.asyncio
+async def test_session_new_success_skips_authenticate_despite_auth_methods() -> None:
+    """Advertised methods alone must not trigger an unsolicited authenticate."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+    calls: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        if method == "initialize":
+            # Gemini-CLI-shaped advertisement: interactive ids the executor's
+            # denylist does not know about.
+            return {
+                "result": {
+                    "agentCapabilities": {"promptCapabilities": {}},
+                    "authMethods": [
+                        {"id": "oauth-personal"},
+                        {"id": "gemini-api-key"},
+                        {"id": "vertex-ai"},
+                    ],
+                }
+            }
+        if method == "session/new":
+            return {"result": {"sessionId": "sid-2"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert await ex._ensure_session() == "sid-2"
+    assert calls == ["initialize", "session/new"]
+
+
+@pytest.mark.asyncio
+async def test_initialize_skips_authenticate_without_auth_methods() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    calls: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        return {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert calls == ["initialize"]
+
+
+@pytest.mark.asyncio
+async def test_session_new_auth_required_browser_only_raises_clear_error() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        if method == "initialize":
+            return {"result": {"authMethods": [{"id": "grok.com"}]}}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="no headless auth method"):
+        await ex._ensure_session()
+
+
+@pytest.mark.asyncio
+async def test_session_new_auth_required_malformed_methods_raises_clear_error() -> None:
+    """Id-less ``authMethods`` entries yield a diagnosis, not a crash."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        if method == "initialize":
+            return {"result": {"authMethods": [{"name": "missing id"}]}}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="no headless auth method"):
+        await ex._ensure_session()
+
+
+@pytest.mark.asyncio
+async def test_session_new_auth_required_without_methods_surfaces_raw_error() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+    calls: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        if method == "initialize":
+            return {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="ACP session/new failed: Authentication required"):
+        await ex._ensure_session()
+    assert "authenticate" not in calls
+
+
+@pytest.mark.asyncio
+async def test_authenticate_rpc_error_surfaces() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        if method == "initialize":
+            return {"result": _grok_like_initialize_result()}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        if method == "authenticate":
+            return {"error": {"code": -32603, "message": "token expired"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="ACP authenticate failed: token expired"):
+        await ex._ensure_session()
 
 
 @pytest.mark.asyncio

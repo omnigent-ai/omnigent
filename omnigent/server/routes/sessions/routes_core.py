@@ -69,6 +69,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
@@ -122,12 +123,12 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
-    _merge_claude_permission_launch_args,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
+    _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
     _prune_session_read_state,
     _publish_codex_approval_mode,
@@ -1827,6 +1828,55 @@ def register_core_routes(
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
     @router.post(
+        "/sessions/{session_id}/agent-title",
+        response_model=AutomaticSessionRenameResponse,
+    )
+    async def rename_session_from_agent(
+        request: Request,
+        session_id: str,
+        body: AutomaticSessionRenameRequest,
+    ) -> AutomaticSessionRenameResponse:
+        """Apply title requirements to an agent proposal before a guarded rename."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.parent_conversation_id is not None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="not_top_level")
+
+        title = " ".join(body.title.split())
+        if "\n" in body.title or "\r" in body.title or len(title) < 2:
+            raise OmnigentError(
+                "title must be a single non-empty line",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if background_title_coordinator is not None:
+            title = await background_title_coordinator.format_agent_title(
+                BackgroundTitleRequest(
+                    session_id=session_id,
+                    prompt=title,
+                    agent_id=conv.agent_id,
+                    harness_override=conv.harness_override,
+                    model_override=conv.model_override,
+                    sub_agent_name=conv.sub_agent_name,
+                )
+            )
+            if title is None:
+                return AutomaticSessionRenameResponse(renamed=False, reason="generation_failed")
+        updated = await asyncio.to_thread(
+            conversation_store.rename_conversation_if_title_matches,
+            session_id,
+            conv.title or "",
+            title,
+        )
+        if updated is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
+
+    @router.post(
         "/sessions/{session_id}/auto-title",
         response_model=AutomaticSessionRenameResponse,
     )
@@ -2403,12 +2453,13 @@ def register_core_routes(
             )
             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
             # The launcher restores the mode from terminal_launch_args, not the
-            # label above, so reflect the confirmed mode there too — otherwise a
-            # relaunch reverts to the launch --permission-mode. Merge against
-            # ``updated`` (the post-write row), not the pre-update snapshot, so a
-            # combined PATCH that also set terminal_launch_args keeps those. Only
-            # rewrites an existing --permission-mode; mirrors the shift+tab path.
-            _merged_permission_args = _merge_claude_permission_launch_args(
+            # label above, so pin the confirmed mode there too — otherwise a
+            # relaunch reopens in the launch mode, which is Claude's default
+            # (manual) for a session created without --permission-mode. Merge
+            # against ``updated`` (the post-write row), not the pre-update
+            # snapshot, so a combined PATCH that also set terminal_launch_args
+            # keeps those.
+            _merged_permission_args = _pin_claude_permission_launch_args(
                 updated.terminal_launch_args,
                 _confirmed_permission_mode,
             )

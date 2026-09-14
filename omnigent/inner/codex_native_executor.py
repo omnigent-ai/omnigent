@@ -60,6 +60,7 @@ _logger = logging.getLogger(__name__)
 
 _NO_ACTIVE_TURN_ERROR_CODE = -32600
 _NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
+_ACTIVE_TURN_MISMATCH_MARKERS = ("expected active turn id", "but found")
 
 
 def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
@@ -69,6 +70,30 @@ def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
         and error.message is not None
         and error.message.strip().casefold() == _NO_ACTIVE_TURN_ERROR_MESSAGE
     )
+
+
+def _is_active_turn_mismatch(error: CodexAppServerResponseError) -> bool:
+    """Return whether a newer turn replaced the one we recorded.
+
+    The app-server rejects a steer/interrupt with ``expected active turn id `X`
+    but found `Y``` (also code -32600) when a turn started after we read the
+    bridge's ``active_turn_id``. Match on the phrasing, not the ids, since the
+    message quotes them and the backtick formatting varies across builds.
+    """
+    if error.code != _NO_ACTIVE_TURN_ERROR_CODE or error.message is None:
+        return False
+    message = error.message.casefold()
+    return all(marker in message for marker in _ACTIVE_TURN_MISMATCH_MARKERS)
+
+
+def _is_stale_active_turn(error: CodexAppServerResponseError) -> bool:
+    """Return whether our recorded active turn is no longer the thread's active one.
+
+    Covers both -32600 shapes: the turn ended ("no active turn to steer") and a
+    newer turn replaced it ("expected active turn id X but found Y"). Both call
+    for the same recovery — re-read bridge state and retarget the live turn.
+    """
+    return _is_no_active_turn_to_steer(error) or _is_active_turn_mismatch(error)
 
 
 async def _start_codex_turn(
@@ -182,11 +207,12 @@ async def _inject_codex_turn(
         )
         return
     except CodexAppServerResponseError as error:
-        if not _is_no_active_turn_to_steer(error):
+        if not _is_stale_active_turn(error):
             raise
 
-    # Codex authoritatively says A ended. Clear A only if it is still the
-    # bridge's value; a concurrent turn/started(B) must survive this recovery.
+    # Codex authoritatively says A is no longer the active turn (it ended, or a
+    # newer turn B replaced it). Clear A only if it is still the bridge's value;
+    # a concurrent turn/started(B) must survive this recovery.
     clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
     recovered_state = read_bridge_state(bridge_dir)
     if recovered_state is None or recovered_state.session_id != state.session_id:
@@ -334,13 +360,25 @@ class CodexNativeExecutor(Executor):
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
-                await client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
-                )
+                try:
+                    await client.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                        },
+                    )
+                except CodexAppServerResponseError as error:
+                    # The recorded turn already ended or was replaced by a newer
+                    # one, so there is nothing left to interrupt — not a failure.
+                    # The local cancel map was already flipped above.
+                    if not _is_stale_active_turn(error):
+                        raise
+                    _logger.info(
+                        "Codex native interrupt: recorded turn already advanced; "
+                        "nothing to interrupt (turn_id=%s)",
+                        state.active_turn_id,
+                    )
         finally:
             await client.close()
         return True

@@ -4459,18 +4459,13 @@ async def _forward_available_items(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-    # Report the transcript's model verbatim. This transcript-derived
-    # observation only fires when a turn produces a fresh
-    # ``message.model``, so it lags an in-pane switch by one turn — the
-    # per-poll statusLine sync (:func:`_forward_model_from_status`) is the
-    # primary, low-latency source; this stays as a fallback for cold-resume
-    # before the first statusLine render. Both share ``dedupe`` so neither
-    # double-posts.
+    status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
+    status_model = concrete_reported_model(status_state.get("model")) if status_state else None
     await _post_model_change_if_new(
         client,
         session_id=session_id,
         dedupe=dedupe,
-        model=result.latest_model,
+        model=status_model or result.latest_model,
     )
     # Mirror a TUI-side `/rename` to the web session list. Claude writes the
     # operator's title as a `custom-title` metadata record, which renders no
