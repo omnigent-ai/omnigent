@@ -39,16 +39,18 @@ from pathlib import Path
 from playwright.sync_api import Page, Route, expect
 
 _COMPOSER = "Send a message…"
-# Composer accepts image/*,application/pdf,text/*,application/json (the hidden
-# input's accept attr); a .txt file is in-scope and keeps the fixture trivial.
+# Composer accepts image/*,application/pdf,text/*,application/json plus the
+# workspace-delivered extensions (the hidden input's accept attr); a .txt file
+# is in-scope, inlined rather than workspace-delivered, and keeps it trivial.
 # ``set_input_files`` bypasses the accept filter, but ``addFiles`` now validates
 # every file (type + size, via lib/attachments.ts) — a .txt passes both.
 _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
 
-# An unsupported binary type: ``addFiles`` rejects it (no chip) and shows an
-# inline error. Used by ``test_reject_unsupported_type``.
-_PPTX_NAME = "deck.pptx"
+# An unsupported type: ``addFiles`` rejects it (no chip) and shows an inline
+# error. Media is the remaining unsupported shape — office documents and
+# archives are now workspace-delivered rather than rejected.
+_MEDIA_NAME = "clip.mp4"
 
 # JSON is its own MIME (``application/json``), which is NOT covered by the
 # ``text/*`` wildcard, so it has to be listed in the ``accept`` attr explicitly
@@ -57,6 +59,8 @@ _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
 # A zip is the case users actually hit (dragging an iCloud Photos export).
+# It is now accepted and delivered to the session workspace rather than
+# inlined, so the chip carries a "workspace" label.
 _ZIP_NAME = "photos.zip"
 
 # The server's real 415 body for an unsupported upload, from
@@ -130,21 +134,84 @@ def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path:
     expect(page.get_by_text(_JSON_NAME, exact=True)).to_be_visible()
 
 
+def test_attach_zip_is_labelled_workspace_delivered(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A ``.zip`` attaches and its chip says the file goes to the workspace.
+
+    Archives are not inlined into the model context: the server stores them and
+    a filesystem-capable harness reads them out of
+    ``<workspace>/session-attachments/``. That difference is invisible unless
+    the chip says so, and the user needs it before sending, because it decides
+    whether the agent can open the file at all.
+
+    Two things need a real browser here. The ``accept`` attribute is what the
+    OS picker and the drag-drop ``matchesAccept`` validator read, and
+    ``set_input_files`` bypasses it, so it can only be asserted directly. And
+    the chip's label comes from ``classifyAttachment`` running against a real
+    ``File`` the input produced, not a hand-built fixture.
+    """
+    base_url, session_id = seeded_session
+    sample = tmp_path / _ZIP_NAME
+    sample.write_bytes(b"PK\x03\x04 a small but real-enough zip payload")
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    # Without .zip in the accept attr the OS picker hides the very files the
+    # server now accepts, so the feature is unreachable from the UI.
+    accept = file_input.get_attribute("accept")
+    assert accept is not None and ".zip" in accept, (
+        f"composer file input should accept .zip; got {accept!r}"
+    )
+
+    file_input.set_input_files(str(sample))
+
+    # Accepted: the chip and its remove control exist.
+    expect(page.get_by_role("button", name=f"Remove {_ZIP_NAME}")).to_be_visible(timeout=10_000)
+    # And the chip states the delivery mode.
+    chip = page.get_by_text(_ZIP_NAME, exact=True).locator("xpath=..")
+    expect(chip).to_contain_text("workspace")
+
+
+def test_attach_text_file_is_not_labelled_workspace_delivered(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """An inlined attachment carries no workspace label.
+
+    The negative half of the delivery-mode contract: if every chip were
+    labelled the label would tell the user nothing.
+    """
+    base_url, session_id = seeded_session
+    sample = tmp_path / _ATTACH_NAME
+    sample.write_text(_ATTACH_BODY)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(sample))
+
+    expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible(timeout=10_000)
+    chip = page.get_by_text(_ATTACH_NAME, exact=True).locator("xpath=..")
+    expect(chip).not_to_contain_text("workspace")
+
+
 def test_reject_unsupported_type(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    """An unsupported type (pptx) is rejected client-side: no chip, inline error.
+    """An unsupported type (mp4) is rejected client-side: no chip, inline error.
 
     Covers the validation ``addFiles`` gained (``validateAttachments`` in
-    lib/attachments.ts): only images, PDF, and text/code files attach; office /
-    binary formats are rejected before upload with a per-file message. Driving
-    the hidden input with a ``.pptx`` (``set_input_files`` bypasses the accept
-    filter, so the file reaches ``addFiles``) must yield NO chip and a visible
-    rejection error.
+    lib/attachments.ts). Office documents and archives are no longer rejected
+    here — they are delivered to the workspace instead — so this pins the shape
+    that is still refused: media no harness can open from disk. Driving the
+    hidden input directly (``set_input_files`` bypasses the accept filter, so
+    the file reaches ``addFiles``) must yield NO chip and a visible error.
     """
     base_url, session_id = seeded_session
-    sample = tmp_path / _PPTX_NAME
-    sample.write_bytes(b"PK\x03\x04 not a real pptx, just an unsupported binary")
+    sample = tmp_path / _MEDIA_NAME
+    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
 
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
@@ -153,7 +220,7 @@ def test_reject_unsupported_type(
     file_input.set_input_files(str(sample))
 
     # Rejected: no chip / remove control for the file.
-    expect(page.get_by_role("button", name=f"Remove {_PPTX_NAME}")).to_have_count(0)
+    expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
     # And the inline rejection error is shown.
     expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
 
@@ -161,7 +228,7 @@ def test_reject_unsupported_type(
 def test_landing_rejects_unsupported_type_and_keeps_message(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    """The new-chat landing composer rejects a zip without losing the typed message.
+    """The landing composer rejects an unsupported file without losing the message.
 
     The landing screen is the case that actually bit users: it used to append
     incoming files unchecked, so a zip only failed after the session had been
@@ -173,15 +240,15 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     because they depend on the real hidden input and on no session being
     created:
 
-    1. No chip appears — the zip never enters composer state.
+    1. No chip appears — the file never enters composer state.
     2. The typed message survives the rejection.
     3. The rejection notice clears on the next keystroke. A rejected file is
        never attached, so there is no chip to remove and nothing else would
        ever clear it; left sticky it reads as a hard blocker.
     """
     base_url, _session_id = seeded_session
-    sample = tmp_path / _ZIP_NAME
-    sample.write_bytes(b"PK\x03\x04 not a real zip, just an unsupported binary")
+    sample = tmp_path / _MEDIA_NAME
+    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
 
     page.goto(base_url)
     composer = page.get_by_test_id("new-chat-landing-input")
@@ -191,10 +258,10 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     page.get_by_test_id("new-chat-landing-file-input").set_input_files(str(sample))
 
     # Rejected: no chip, and the reason names the file.
-    expect(page.get_by_role("button", name=f"Remove {_ZIP_NAME}")).to_have_count(0)
+    expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
     error = page.get_by_test_id("new-chat-landing-attachment-error")
     expect(error).to_be_visible(timeout=10_000)
-    expect(error).to_contain_text(_ZIP_NAME)
+    expect(error).to_contain_text(_MEDIA_NAME)
 
     # The message the user typed is untouched, and no session was created —
     # still on the landing screen, not redirected into /c/<id>.

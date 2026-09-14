@@ -301,19 +301,25 @@ def extract_text_attachments(
     message. Attachments arrive as ``input_file`` blocks that are base64-
     inlined straight to the model (see :func:`resolve_content_references`),
     so without this an attached CSV of card numbers reaches the LLM
-    unscanned. Non-text attachments (images, PDFs, binaries) are skipped;
-    text files are decoded in full (uploads are already bounded — text ≤
-    :data:`MAX_TEXT_UPLOAD_BYTES`, 10 MB). Best-effort: a missing/foreign file
-    or a fetch error is skipped, never raised, so a scan failure can't break
-    message delivery.
+    unscanned. Images and PDFs are skipped; text files are decoded in full
+    (uploads are already bounded — text ≤ :data:`MAX_TEXT_UPLOAD_BYTES`,
+    10 MB). Workspace-delivered files carry no scannable text but are listed by
+    name, since they reach the agent's filesystem and a policy may want to
+    refuse one on its extension. Best-effort: a missing/foreign file or a fetch
+    error is skipped, never raised, so a scan failure can't break message
+    delivery.
 
     :param content: The message's content blocks (``body.data["content"]``).
     :param file_store: Store for file metadata (``content_type`` / ``filename``).
     :param artifact_store: Store for the file's binary content.
     :param session_id: Owning session id, to enforce file ownership.
-    :returns: A list of ``{"filename", "content_type", "text"}`` entries — one
-        per scannable text attachment, in order — or ``[]`` when there are none.
+    :returns: A list of ``{"filename", "content_type", "delivery", "text"}``
+        entries, in order, where ``delivery`` is ``"inline"`` or
+        ``"workspace"`` and workspace entries carry an empty ``text`` — or
+        ``[]`` when there are none.
     """
+    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+
     attachments: list[dict[str, str]] = []
     for block in content:
         if not isinstance(block, dict) or block.get("type") != "input_file":
@@ -335,6 +341,20 @@ def extract_text_attachments(
             continue
         content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
         if not _is_text_like_attachment(content_type, file_meta.filename):
+            # Workspace-delivered files (archives, office documents, databases)
+            # hold no scannable text, but they do reach the agent's filesystem.
+            # Announce them by name so a policy can still refuse one on its
+            # filename or extension; skipping them entirely would make the
+            # request look like it carried no attachment at all.
+            if workspace_materialize_upload_limit(file_meta.filename) is not None:
+                attachments.append(
+                    {
+                        "filename": file_meta.filename or "",
+                        "content_type": content_type,
+                        "delivery": "workspace",
+                        "text": "",
+                    }
+                )
             continue
         try:
             raw = artifact_store.get(file_id)
@@ -346,6 +366,7 @@ def extract_text_attachments(
             {
                 "filename": file_meta.filename or "",
                 "content_type": content_type,
+                "delivery": "inline",
                 "text": raw.decode("utf-8", errors="replace"),
             }
         )
@@ -507,7 +528,8 @@ def _resolve_file_id_block(
         content. All other fields are preserved.
     :raises ValueError: If ``file_id`` is not found in the file
         store — the file was deleted between request validation
-        and agent loop execution.
+        and agent loop execution — or if the referenced file is a
+        workspace-materialize type this (non-native) adapter can't inline.
     """
     file_id = block["file_id"]
     owner_session_id = session_id or _session_id_from_block(block)
@@ -518,6 +540,16 @@ def _resolve_file_id_block(
         raise ValueError(
             f"Referenced file '{file_id}' no longer exists — "
             f"it may have been deleted after the request was accepted"
+        )
+    # Workspace-materialize types never reach a model as bytes — a native
+    # harness reads them off disk instead — so inlining one here would send
+    # a payload the provider can't interpret. Fail with an actionable error.
+    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+
+    if workspace_materialize_upload_limit(file_meta.filename) is not None:
+        raise ValueError(
+            f"Attachment '{file_meta.filename}' requires a filesystem-capable "
+            "harness (e.g. Claude Code, Codex) and cannot be used with this model."
         )
 
     # Use cached base64 if available; otherwise fetch, encode, and cache.

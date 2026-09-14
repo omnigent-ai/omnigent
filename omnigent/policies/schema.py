@@ -182,12 +182,16 @@ class PolicyEvent(TypedDict, total=False):
     Shape varies by ``type``:
 
     - ``"request"``: ``data`` is ``{"user_content": <str>,
-      "attachments": [{"filename", "content_type", "text"}, ...]}``
-      — the user's typed message plus the decoded text of any
-      uploaded text attachments (e.g. a CSV). Read it with
-      :func:`request_user_text` / :func:`request_attachments`
-      rather than assuming a bare string; those helpers also accept
-      a plain string for backward compatibility.
+      "attachments": [{"filename", "content_type", "delivery", "text"},
+      ...]}`` — the user's typed message plus any uploaded attachments.
+      ``delivery`` is ``"inline"`` for a file decoded into the model
+      context (e.g. a CSV, whose ``text`` carries its content) or
+      ``"workspace"`` for one written to the agent's filesystem instead
+      (an archive or database), which carries an empty ``text`` because
+      its bytes are not scannable but is listed so a policy can still
+      refuse it by name. Read it with :func:`request_user_text` /
+      :func:`request_attachments` rather than assuming a bare string;
+      those helpers also accept a plain string for backward compatibility.
     - ``"tool_call"``: ``data`` is ``{"name": "<tool-name>",
       "arguments": {...}}``. ``target`` is the tool name.
     - ``"tool_result"``: ``data`` is ``{"result": <tool-output>}``.
