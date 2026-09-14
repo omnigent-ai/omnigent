@@ -76,7 +76,8 @@ export function TurnRail({
   const [previewTop, setPreviewTop] = useState(0);
   // Re-arm active-tick correction after pointer interaction suppresses it.
   const [correctionNonce, setCorrectionNonce] = useState(0);
-  // Ignore response-preview churn; only tick identity changes affect geometry.
+  // Prepending history changes tick IDs and re-arms correction;
+  // response-preview churn does not.
   const turnIdsKey = turns.map((turn) => turn.itemId).join("\u0000");
 
   // Keep the active tick reachable in the rail's own viewport as the transcript
@@ -91,9 +92,10 @@ export function TurnRail({
     if (interactingRef.current) return;
     const tick = tickRefs.current.get(activeId);
     if (!tick) return;
+    let cancelled = false;
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (!entry?.rootBounds || interactingRef.current) return;
+        if (cancelled || !entry?.rootBounds || interactingRef.current) return;
         observer.disconnect();
         const usableTop = entry.rootBounds.top + FADE;
         const usableBottom = entry.rootBounds.bottom - FADE;
@@ -108,7 +110,10 @@ export function TurnRail({
       { root: rail, threshold: 1 },
     );
     observer.observe(tick);
-    return () => observer.disconnect();
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
   }, [activeId, turnIdsKey, correctionNonce]);
 
   // Page in older history when the rail nears its own top. Two triggers:

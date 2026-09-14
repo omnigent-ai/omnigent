@@ -95,8 +95,8 @@ function emitIntersection(
         {
           target,
           time: 0,
-          isIntersecting: false,
-          intersectionRatio: 0,
+          isIntersecting: true,
+          intersectionRatio: 1,
           boundingClientRect: {
             top: bounds.targetTop,
             bottom: bounds.targetBottom,
@@ -195,6 +195,25 @@ describe("TurnRail", () => {
     });
 
     expect(scrollBy).toHaveBeenCalledWith({ top: 22, behavior: "smooth" });
+  });
+
+  it("ignores an observer callback queued before cleanup", () => {
+    const { container, unmount } = renderRail(makeTurns(3), "turn_1");
+    const rail = container.querySelector(".turn-rail-fade") as HTMLDivElement;
+    const activeTick = screen.getByLabelText("Jump to: prompt number 1");
+    const scrollBy = vi.fn();
+    Object.defineProperty(rail, "scrollBy", { configurable: true, value: scrollBy });
+    const staleObserver = observers[0]!;
+
+    unmount();
+    emitIntersection(staleObserver, activeTick, {
+      rootTop: 0,
+      rootBottom: 100,
+      targetTop: 80,
+      targetBottom: 90,
+    });
+
+    expect(scrollBy).not.toHaveBeenCalled();
   });
 
   it("retries active-tick correction after the user stops interacting", () => {
