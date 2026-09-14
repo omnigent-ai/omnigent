@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_LINUX, IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
@@ -61,12 +61,22 @@ _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
 
 _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # Each terminal instance lives in a private tmpdir with this prefix
-# (see ``create_terminal_instance``). The owner-pid marker inside it
-# records the process that launched the instance so a later startup
-# can reap tmux servers whose owner died without graceful shutdown
+# (see ``create_terminal_instance``). The owner marker inside it records
+# the process that launched the instance so a later startup can reap
+# tmux servers whose owner died without graceful shutdown
 # (``reap_orphaned_terminals``).
 _TERMINAL_DIR_PREFIX = "omnigent-terminal-"
 _OWNER_PID_FILENAME = "owner.pid"
+# Marker keys written after the pid line (see ``_write_owner_claim``).
+# They record WHICH pid domain the pid belongs to: a pid only names a
+# process within one pid namespace and one boot, while the instance
+# dirs live in a shared temp root that outlives both.
+_OWNER_CLAIM_PID_NS_KEY = "pid_ns"
+_OWNER_CLAIM_BOOT_KEY = "boot"
+# Recorded as the pid namespace on platforms that have none (macOS,
+# Windows): every process there shares one pid domain, so the claim is
+# still placeable and the pid still decides.
+_OWNER_CLAIM_NO_PID_NS = "none"
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
@@ -733,20 +743,143 @@ def _terminals_tmp_root() -> Path:
     return Path(tempfile.gettempdir())
 
 
+@dataclass(frozen=True)
+class _OwnerClaim:
+    """
+    An instance dir's recorded owner, and the pid domain it belongs to.
+
+    :ivar pid: The pid recorded at instance creation, e.g. ``48213``.
+    :ivar pid_ns: Identity of the pid namespace that minted *pid*
+        (``/proc/self/ns/pid``, e.g. ``"pid:[4026531836]"``), or
+        :data:`_OWNER_CLAIM_NO_PID_NS` on platforms without them.
+    :ivar boot_id: Identity of the boot that minted *pid*
+        (``/proc/sys/kernel/random/boot_id``), or ``None`` where the
+        kernel does not publish one.
+    """
+
+    pid: int
+    pid_ns: str
+    boot_id: str | None
+
+
+def _read_text_or_none(path: str) -> str | None:
+    """
+    Read a small kernel file, returning ``None`` when unavailable.
+
+    :param path: Absolute path, e.g.
+        ``"/proc/sys/kernel/random/boot_id"``.
+    :returns: The stripped contents, or ``None`` off Linux / when
+        the path is masked.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _current_pid_ns() -> str | None:
+    """
+    Return this process's pid-namespace identity.
+
+    :returns: The Linux namespace identity, ``None`` if unreadable,
+        or :data:`_OWNER_CLAIM_NO_PID_NS` on other platforms.
+    """
+    if not IS_LINUX:
+        return _OWNER_CLAIM_NO_PID_NS
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
+def _current_boot_id() -> str | None:
+    """
+    Return this boot's identity.
+
+    :returns: The kernel's boot id, or ``None`` where unpublished.
+    """
+    return _read_text_or_none("/proc/sys/kernel/random/boot_id")
+
+
+def _write_owner_claim(instance_dir: Path) -> None:
+    """
+    Record this process as the instance dir's owner.
+
+    Namespace and boot fields qualify the pid. Older builds parse the
+    entire marker as an integer, so they safely skip these multiline claims.
+
+    :param instance_dir: The instance's private dir.
+    :returns: None.
+    """
+    lines = [str(os.getpid()), f"{_OWNER_CLAIM_PID_NS_KEY}={_current_pid_ns() or ''}"]
+    boot_id = _current_boot_id()
+    if boot_id is not None:
+        lines.append(f"{_OWNER_CLAIM_BOOT_KEY}={boot_id}")
+    (instance_dir / _OWNER_PID_FILENAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _read_owner_claim(instance_dir: Path) -> _OwnerClaim | None:
+    """
+    Parse an instance dir's owner marker.
+
+    :param instance_dir: Candidate instance dir under the sweep root.
+    :returns: The claim, or ``None`` when there is no marker, it is
+        unreadable, or it predates the pid-domain fields (a bare pid
+        this process cannot place in a namespace, so it cannot judge
+        whether the owner is alive).
+    """
+    try:
+        raw = (instance_dir / _OWNER_PID_FILENAME).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        pid = int(lines[0])
+    except ValueError:
+        return None
+    fields = dict(line.split("=", 1) for line in lines[1:] if "=" in line)
+    pid_ns = fields.get(_OWNER_CLAIM_PID_NS_KEY)
+    if pid <= 0 or not pid_ns:
+        # Missing or invalid ownership information cannot justify cleanup.
+        return None
+    return _OwnerClaim(pid=pid, pid_ns=pid_ns, boot_id=fields.get(_OWNER_CLAIM_BOOT_KEY))
+
+
+def _owner_is_gone(claim: _OwnerClaim) -> bool:
+    """
+    Decide whether an instance dir's owner definitively no longer exists.
+
+    Shared terminal directories can outlive a boot or cross pid namespaces.
+    A local process probe is meaningful only for a matching namespace.
+
+    :param claim: The dir's recorded owner (see :func:`_read_owner_claim`).
+    :returns: ``True`` only on positive evidence of abandonment: the
+        marker is from an earlier boot (nothing it named can still be
+        running), or the pid is resolvable here and gone.
+    """
+    boot_id = _current_boot_id()
+    if claim.boot_id is not None and boot_id is not None and claim.boot_id != boot_id:
+        # Written before this boot, so neither the owner nor the tmux
+        # server it launched survived; the dir is pure garbage.
+        return True
+    pid_ns = _current_pid_ns()
+    if pid_ns is None or claim.pid_ns != pid_ns:
+        # A pid from another namespace names an unrelated process here
+        # (or nothing at all) — no conclusion is available.
+        return False
+    return not _process_alive(claim.pid)
+
+
 def reap_orphaned_terminals() -> int:
     """
     Kill terminal tmux servers whose owning process is gone.
 
-    Terminal tmux servers are deliberately detached so they survive
-    transient client disconnects; graceful shutdown closes them
-    (``TerminalRegistry.shutdown``), but a SIGKILL'd runner — or one
-    whose whole process group is torn down by a test harness — leaks
-    them forever, one per session now that runner-bound SDK sessions
-    auto-create the embedded REPL terminal. Each instance dir records
-    its owner pid at creation; this sweep (run at runner startup) kills
-    the tmux server of every instance whose owner no longer exists and
-    removes the instance dir. Dirs without an owner-pid marker are left
-    untouched — they are either from an older version or not ours.
+    Detached tmux servers can outlive an abruptly stopped runner.
+    The startup sweep removes only terminals with proven owner death;
+    unknown ownership must not interrupt another runner's live session.
 
     :returns: The number of orphaned instance dirs reaped.
     """
@@ -754,11 +887,8 @@ def reap_orphaned_terminals() -> int:
         return 0
     reaped = 0
     for entry in _terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"):
-        try:
-            pid = int((entry / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            continue
-        if _process_alive(pid):
+        claim = _read_owner_claim(entry)
+        if claim is None or not _owner_is_gone(claim):
             continue
         socket_path = entry / "tmux.sock"
         if socket_path.exists():
@@ -2212,7 +2342,7 @@ def create_terminal_instance(
     # Record the owning process so a later startup can reap this tmux
     # server if we die without graceful shutdown (SIGKILL, harness
     # teardown) — see ``reap_orphaned_terminals``.
-    (private_dir / _OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
+    _write_owner_claim(private_dir)
 
     # Resolve os_env spec.  If none specified, inherit from parent.
     effective_os_env_spec = build_terminal_os_env_spec(
