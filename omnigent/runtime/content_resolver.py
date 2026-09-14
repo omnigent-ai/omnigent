@@ -157,9 +157,12 @@ IMAGE_MODEL_BUDGET_BYTES: int = 3_500_000
 # down to this first.
 IMAGE_MAX_EDGE_PX: int = 8000
 
-# Decompression-bomb guard: refuse to decode images whose pixel area is
-# implausibly large for a real screenshot/photo.
-IMAGE_MAX_DECODED_PIXELS: int = 64 * 1024 * 1024
+# Decompression-bomb / memory guard: refuse to decode images whose pixel area is
+# implausibly large for a real screenshot/photo. Kept modest because a decoded
+# RGBA frame is 4 bytes/px (40 MP ≈ 160 MB) and several copies are live at once;
+# the supported deployments cap the server around 1 GiB. 40 MP still covers 5K/6K
+# screenshots and up to ~24 MP camera photos at full resolution.
+IMAGE_MAX_DECODED_PIXELS: int = 40 * 1024 * 1024
 
 # Copy-at-spawn limits (see the ``files:copy`` endpoint). A parent forwarding
 # files to a subagent copies them through the server, which reads each source
@@ -329,19 +332,23 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     if not image_needs_compression(len(content), content_type):
         return content, content_type
 
+    import struct
     from io import BytesIO
 
     from PIL import Image, ImageOps, UnidentifiedImageError
 
+    # Restrict Pillow to the plugins that legitimately back the declared MIME, so
+    # a spoofed TIFF/BMP-as-png can't invoke an unintended decoder's parser at all
+    # (formats= is applied before any plugin runs). An empty list would let Pillow
+    # try every plugin, so fall back to rejecting an unrecognised type outright.
+    allowed_formats = sorted(_ALLOWED_PIL_FORMATS.get(content_type, frozenset()))
+    if not allowed_formats:
+        raise ImageCompressionError(
+            "this image format can't be resized; upload a PNG, JPEG, WebP, or GIF"
+        )
+
     try:
-        with Image.open(BytesIO(content)) as probe:
-            # Reject a spoofed extension before decoding: the real container
-            # (probe.format, from the header) must match the declared MIME,
-            # so a TIFF/BMP-as-png can't select an unintended 50 MB decoder.
-            if probe.format not in _ALLOWED_PIL_FORMATS.get(content_type, frozenset()):
-                raise ImageCompressionError(
-                    "this image format can't be resized; upload a PNG, JPEG, WebP, or GIF"
-                )
+        with Image.open(BytesIO(content), formats=allowed_formats) as probe:
             # Cheap header dimensions first — bail before walking frames
             # (n_frames enumerates every GIF frame). This deterministic area
             # check is the decompression-bomb guard (fires below Pillow's own
@@ -359,7 +366,7 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
                 "this animated image is too large to attach; upload a smaller "
                 "or static image instead"
             )
-        with Image.open(BytesIO(content)) as opened:
+        with Image.open(BytesIO(content), formats=allowed_formats) as opened:
             image = ImageOps.exif_transpose(opened)
             image.load()
     except ImageCompressionError:
@@ -370,6 +377,11 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
         OSError,
         SyntaxError,
         ValueError,
+        # Truncated/malformed frames: enumerating n_frames or load() on corrupt
+        # bytes can raise these instead of OSError — still a clean 413, not a 500.
+        IndexError,
+        EOFError,
+        struct.error,
     ) as exc:
         raise ImageCompressionError("the file is not a readable image") from exc
 

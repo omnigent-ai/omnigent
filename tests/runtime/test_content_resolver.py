@@ -1198,6 +1198,40 @@ def test_compress_image_flattens_mpo_to_primary_frame() -> None:
     assert content_type in ("image/webp", "image/jpeg")
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [IndexError("frame"), EOFError("truncated"), __import__("struct").error("unpack")],
+)
+def test_compress_image_maps_decoder_errors_to_clean_error(
+    raised: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decoder errors on corrupt/truncated bytes become ImageCompressionError.
+
+    Enumerating n_frames or loading a truncated multi-frame image can raise
+    IndexError/EOFError/struct.error from a Pillow plugin (Pillow-version
+    dependent) — these must be caught so the upload route returns 413, never a
+    500. Injected directly since the exact bytes that trigger them vary by
+    Pillow version.
+    """
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        ImageCompressionError,
+        compress_image_attachment,
+    )
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(Image, "open", _boom)
+    # Over budget + compressible so we get past the fast-path short-circuit.
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * (IMAGE_MODEL_BUDGET_BYTES + 1)
+
+    with pytest.raises(ImageCompressionError):
+        compress_image_attachment(payload, "image/png")
+
+
 def test_compress_image_rejects_oversized_animated(monkeypatch: pytest.MonkeyPatch) -> None:
     """An animated image over the budget is rejected (can't be re-encoded)."""
     from io import BytesIO

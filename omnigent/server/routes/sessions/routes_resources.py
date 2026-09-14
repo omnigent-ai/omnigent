@@ -124,7 +124,10 @@ class _RunnerStreamResponse(StreamingResponse):
 # Each decodes/re-encodes a raster (up to IMAGE_MAX_DECODED_PIXELS, several
 # full buffers live at once), so an unbounded burst of large uploads could
 # spike peak memory even with the to_thread offload keeping the loop responsive.
-_IMAGE_COMPRESSION_CONCURRENCY = asyncio.Semaphore(4)
+# Kept low: the supported deployments cap the server around 1 GiB, and image
+# compression is fast, so 2 concurrent decodes bound peak memory with negligible
+# throughput cost.
+_IMAGE_COMPRESSION_CONCURRENCY = asyncio.Semaphore(2)
 
 
 def register_resources_routes(
