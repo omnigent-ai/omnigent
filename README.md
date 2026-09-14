@@ -45,6 +45,7 @@ Omnigent lets you:
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [Gensee](https://gensee.ai),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
   [Boxlite](https://github.com/boxlite-ai/boxlite),
@@ -383,8 +384,10 @@ limited to 100 characters; custom title requirements may use up to 200.
 Default titles over 100 characters are rejected, leaving the first-message
 fallback title in place. Custom titles over 200 characters are truncated with
 a trailing ellipsis. Manually assigned titles are also limited to 200
-characters. The setting applies to new sessions after the local Omnigent
-server restarts.
+characters. The setting applies after the local Omnigent server restarts, both
+to new sessions and to later agent-initiated renames through `sys_session_rename`.
+Agent proposals are formatted using the same title requirements; if formatting
+fails, the existing title is preserved. Manual renames remain unchanged.
 For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
 block scalar:
 

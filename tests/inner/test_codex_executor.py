@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
     _build_initial_prompt,
+    _clean_codex_env,
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
@@ -3464,6 +3466,50 @@ def test_clean_codex_env_excludes_openai_api_key(monkeypatch) -> None:
     # Other OPENAI_* vars (retry/timeout knobs) must still pass through.
     assert env.get("OPENAI_MAX_RETRIES") == "3"
     assert env.get("OPENAI_TIMEOUT") == "60"
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [
+        (None, "launch_mode=omni"),
+        ("", "launch_mode=omni"),
+        (" , ", "launch_mode=omni"),
+        ("deployment=example,user=alice", "deployment=example,user=alice,launch_mode=omni"),
+        ("launch_mode=direct,user=alice", "user=alice,launch_mode=omni"),
+        ("user=alice,launch_mode=omni", "user=alice,launch_mode=omni"),
+        (
+            "launch_mode=direct,user=al%2Cice, launch_mode =other",
+            "user=al%2Cice,launch_mode=omni",
+        ),
+    ],
+)
+def test_clean_codex_env_tags_omni_launch(
+    monkeypatch: pytest.MonkeyPatch, inherited: str | None, expected: str
+) -> None:
+    if inherited is None:
+        monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
+    else:
+        monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", inherited)
+
+    env = _clean_codex_env()
+
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == expected
+    assert os.environ.get("OTEL_RESOURCE_ATTRIBUTES") == inherited
+
+
+def test_clean_codex_env_keeps_otel_exporter_settings_filtered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment=example")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer test-token")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example.com")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "Authorization=Bearer log-token")
+
+    env = _clean_codex_env()
+
+    assert {key: value for key, value in env.items() if key.startswith("OTEL_")} == {
+        "OTEL_RESOURCE_ATTRIBUTES": "deployment=example,launch_mode=omni"
+    }
 
 
 def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:

@@ -4995,6 +4995,66 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_codex_c
     assert error["message"] == "You've hit your usage limit."
 
 
+@pytest.mark.parametrize("wire_output", [False, True])
+async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_output: bool,
+) -> None:
+    """Native 429 reports retain a retryable code on the stream and snapshot."""
+    detail = (
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
+        "workspace input tokens per minute rate limit for databricks-test-model. "
+        "Work with your Databricks account team to request a higher FMAPI rate limit tier."
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    response_id = "resp_native_rate_limit"
+    item_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": "src_native_rate_limit",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": detail}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if wire_output:
+        data["output"] = detail
+    status_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [event for event in published if event.get("status") == "failed"]
+    assert len(failed_events) == 1
+    expected = {"code": "rate_limit_exceeded", "message": detail}
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected["code"]
+    assert error["message"] == expected["message"]
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    assert snapshot_resp.json()["last_task_error"] == expected
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -7866,6 +7926,31 @@ async def test_post_external_permission_mode_change_rewrites_launch_arg(
     ]
 
 
+async def test_post_external_permission_mode_change_rewrites_standalone_bypass_flag(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A pane switch away from bypass replaces ``--dangerously-skip-permissions``.
+
+    The standalone flag is the other spelling of a bypass launch, so a TUI
+    shift+tab to another mode must rewrite it like an explicit
+    ``--permission-mode``; otherwise a cold resume silently reopens in bypass.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--dangerously-skip-permissions", "--model", "opus"],
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": "plan"}},
+    )
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == ["--model", "opus", "--permission-mode", "plan"]
+
+
 async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -7903,7 +7988,7 @@ async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
 @pytest.mark.parametrize(
     "mode",
     [
-        "bypassPermissions",  # real CLI mode, but not one shift+tab can reach
+        "dontAsk",  # real CLI mode, but never rendered as a pane footer
         "turbo",  # not a mode at all
         "",
     ],
@@ -7931,6 +8016,49 @@ async def test_post_external_permission_mode_change_rejects_unsupported_modes(
 
     assert resp.status_code == 400, resp.text
     assert "external_permission_mode_change" in resp.text
+
+
+async def test_post_external_permission_mode_change_accepts_bypass_read_back(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane reporting bypass lands on the label and rewrites the launch arg.
+
+    Bypass is launch-only and stays rejected as a PATCH target, but a session
+    launched into it (or cycled back to it inside the TUI) must read back as
+    bypass, or the picker shows a stale mode and a relaunch reopens in the
+    mode last recorded instead of the one the pane is in.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--model", "opus", "--permission-mode", "auto"],
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "bypassPermissions"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.permission_mode"]
+    assert published[0][1]["permission_mode"] == "bypassPermissions"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "bypassPermissions"
+    assert snapshot["terminal_launch_args"] == [
+        "--model",
+        "opus",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
 
 
 async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
@@ -9878,9 +10006,11 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
-    # No launch --permission-mode to rewrite, so none is fabricated (see the
-    # rewrite-existing test below for the persist-to-launch-args case).
-    assert resp.json()["terminal_launch_args"] is None
+    # The session launched without --permission-mode, so the confirmed switch
+    # is pinned into the launch args: the launcher rebuilds Claude's args from
+    # them alone, and without the flag a cold resume would reopen in Claude's
+    # default (manual) mode while the label still claimed "auto".
+    assert resp.json()["terminal_launch_args"] == ["--permission-mode", "auto"]
     forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert forwards[0].body == {"type": "permission_mode_change", "permission_mode": "auto"}
@@ -9945,6 +10075,115 @@ async def test_patch_permission_mode_rewrites_launch_arg_and_keeps_other_args(
         "acceptEdits",
     ]
     assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "acceptEdits"
+
+
+async def test_patch_permission_mode_pins_launch_arg_once_for_flagless_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A confirmed switch on a flag-less session appends --permission-mode once.
+
+    A session created with the default preset carries no ``--permission-mode``;
+    switching it to Auto in the web picker used to land only on the label, so
+    every relaunch after the idle pane reaper or a runner restart reopened it in
+    manual mode. The first PATCH must append the flag after the caller's other
+    args, and a later PATCH must rewrite that flag rather than stack a second.
+    """
+    from omnigent.runtime import set_runner_client
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Confirm whatever mode was requested, like the claude-native runner."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body = json.loads(request.content) if request.content else {}
+        return httpx.Response(200, json={"permission_mode": body.get("permission_mode")})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+            terminal_launch_args=["--model", "opus"],
+        )
+        first = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+        second = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "plan"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert first.status_code == 200, first.text
+    assert first.json()["terminal_launch_args"] == ["--model", "opus", "--permission-mode", "auto"]
+    assert second.status_code == 200, second.text
+    assert second.json()["terminal_launch_args"] == [
+        "--model",
+        "opus",
+        "--permission-mode",
+        "plan",
+    ]
+    assert second.json()["labels"]["omnigent.claude_native.permission_mode"] == "plan"
+
+
+async def test_patch_permission_mode_replaces_standalone_bypass_flag(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Leaving bypass drops ``--dangerously-skip-permissions`` from the launch args.
+
+    Claude treats that standalone flag as ``--permission-mode bypassPermissions``,
+    so keeping it next to the pinned mode would make a cold resume reopen
+    unrestricted while the label claims the restricted mode the user chose.
+    """
+    from omnigent.runtime import set_runner_client
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Confirm whatever mode was requested, like the claude-native runner."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body = json.loads(request.content) if request.content else {}
+        return httpx.Response(200, json={"permission_mode": body.get("permission_mode")})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+            terminal_launch_args=["--model", "opus", "--dangerously-skip-permissions"],
+        )
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["terminal_launch_args"] == ["--model", "opus", "--permission-mode", "auto"]
+    assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])

@@ -81,7 +81,7 @@ export function BackgroundTaskIndicator() {
             size="xs"
             data-testid="background-task-pill"
             aria-label={`${countLabel} still running`}
-            className="ml-auto shrink-0"
+            className="ml-auto shrink-0 px-0 md:px-2"
           >
             <SquareTerminalIcon className="size-3.5" aria-hidden="true" />
             {bgCount}

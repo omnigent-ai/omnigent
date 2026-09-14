@@ -4781,6 +4781,96 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     assert calls[0]["agent_id"] == builtin.id
 
 
+# ── Gensee sandbox provider ─────────────────────────────────
+
+
+def test_parse_gensee_builds_core_launcher() -> None:
+    """The built-in Gensee provider receives its validated server config."""
+    from omnigent.onboarding.sandboxes.gensee import GenseeSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "gensee",
+            "server_url": "https://omnigent.example.com",
+            "gensee": {
+                "endpoint": "https://sandbox.example.com/control/",
+                "api_token_env": "CUSTOM_GENSEE_TOKEN",
+                "workspace_root": "/srv/gensee/workspaces",
+                "operation_timeout_s": 600,
+                "poll_interval_s": 1,
+                "request_timeout_s": 30,
+                "retry_timeout_s": 0,
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+            },
+        }
+    )
+
+    assert deployment is not None
+    config = deployment.default
+    assert config.provider == "gensee"
+    assert config.managed_launch_supported is True
+    assert config.token_ttl_s == 7 * 24 * 3600
+    launcher = config.launcher_factory()
+    assert isinstance(launcher, GenseeSandboxLauncher)
+    assert launcher.endpoint == "https://sandbox.example.com/control"
+    assert launcher.api_token_env == "CUSTOM_GENSEE_TOKEN"
+    assert str(launcher.workspace_root) == "/srv/gensee/workspaces"
+    assert launcher.retry_timeout_s == 0
+    assert launcher.env == ("OPENAI_API_KEY", "GIT_TOKEN")
+
+
+def test_parse_gensee_uses_safe_defaults() -> None:
+    """A minimal Gensee block targets the production control endpoint."""
+    from omnigent.onboarding.sandboxes.gensee import GenseeSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "gensee",
+            "server_url": "https://omnigent.example.com",
+        }
+    )
+
+    assert deployment is not None
+    launcher = deployment.default.launcher_factory()
+    assert isinstance(launcher, GenseeSandboxLauncher)
+    assert launcher.endpoint == "https://sandbox.gensee.ai"
+    assert launcher.api_token_env == "GENSEE_CONTROLLER_API_TOKEN"
+
+
+def test_parse_gensee_rejects_unknown_config_key() -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.gensee.*unknown"):
+        parse_sandbox_config(
+            {
+                "provider": "gensee",
+                "server_url": "https://omnigent.example.com",
+                "gensee": {"project": "not-a-public-provider-setting"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "gensee",
+    [
+        {"endpoint": "http://sandbox.example.com"},
+        {"api_token_env": "NOT-AN-ENV"},
+        {"workspace_root": "relative"},
+        {"operation_timeout_s": 0},
+        {"retry_timeout_s": -1},
+        {"env": ["NOT-AN-ENV"]},
+        {"env": ["DUPLICATE", "DUPLICATE"]},
+    ],
+)
+def test_parse_gensee_rejects_invalid_config(gensee: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.gensee"):
+        parse_sandbox_config(
+            {
+                "provider": "gensee",
+                "server_url": "https://omnigent.example.com",
+                "gensee": gensee,
+            }
+        )
+
+
 # ── contributed sandbox providers ───────────────────────────
 
 

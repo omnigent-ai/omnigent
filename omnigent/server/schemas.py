@@ -2349,7 +2349,7 @@ class UpdateSessionRequest(BaseModel):
 
 
 class AutomaticSessionRenameRequest(BaseModel):
-    """Request body for the current-agent automatic rename endpoint."""
+    """Proposed title for a framework or agent-initiated rename."""
 
     title: str = Field(min_length=2, max_length=DEFAULT_GENERATED_TITLE_MAX_CHARS)
 
@@ -2361,7 +2361,7 @@ class AutomaticSessionRenameResponse(BaseModel):
 
     renamed: bool
     title: str | None = None
-    reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
+    reason: Literal["not_top_level", "no_seed", "title_changed", "generation_failed"] | None = None
 
 
 class ResetSessionModelOverrideRequest(BaseModel):
