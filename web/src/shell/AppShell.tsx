@@ -1536,16 +1536,20 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // A `/side` fork the user just opened: reveal it in the Agents rail so the
-  // move out of the main chat is visible. `ChatPage` does the navigation off
-  // `redirectToConversationId`; this only owns the rail, which lives here.
+  // A `/side` fork the user just opened: reveal it in the Agents rail on the
+  // SIDE CHAT itself, and leave the main chat's rail untouched. `ChatPage`
+  // navigates off `redirectToConversationId`; the rail tab is per-conversation,
+  // so we wait until the router has actually landed on the child
+  // (`conversationId === sideChatRailRequest`) before switching the tab —
+  // otherwise the tab would persist onto the main chat we're leaving.
   const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
   const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
   useEffect(() => {
     if (sideChatRailRequest === null) return;
+    if (conversationId !== sideChatRailRequest) return;
     handleRightRailTabChange("subagents");
     clearSideChatRailRequest();
-  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange]);
+  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange, conversationId]);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
