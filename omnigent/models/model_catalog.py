@@ -649,21 +649,21 @@ def _provider_from_legacy_auth(
 
 
 def _databricks_prefix_provider(spec: AgentSpec) -> ResolvedModelProvider | None:
-    """Map a ``databricks-*`` spec model to the runner-env-profile gateway.
+    """Map a Databricks model id to the runner-env-profile gateway.
 
     Mirrors the builders' shared model-prefix heuristic; the native
     launch paths read the same ``DATABRICKS_CONFIG_PROFILE`` fallback.
 
     :param spec: The worker's (sub-)agent spec.
-    :returns: A databricks provider, or ``None`` when the model carries
-        no ``databricks-`` / ``databricks/`` prefix.
+    :returns: A databricks provider, or ``None`` when the model carries no
+        legacy Databricks or Unity Catalog model prefix.
     """
     model = spec.executor.model
-    if isinstance(model, str) and model.startswith(("databricks-", "databricks/")):
+    if isinstance(model, str) and model.startswith(("databricks-", "databricks/", "system.ai.")):
         return ResolvedModelProvider(
             kind=DATABRICKS_KIND,
             profile=os.environ.get("DATABRICKS_CONFIG_PROFILE"),
-            detail="databricks-* model prefix",
+            detail="Databricks model prefix",
         )
     return None
 
@@ -866,13 +866,7 @@ def list_models_for_worker(
     :returns: The worker's :class:`ModelListing`.
     """
     provider = resolve_model_provider(spec, harness)
-    # Pi harnesses use system.ai.* ids (via the Unity Catalog model-services API)
-    # so supervisors see the ids Pi can actually route. Other harnesses use the
-    # serving-endpoints listing which returns databricks-* ids.
-    _pi_harnesses = frozenset({"pi", "pi-native", "native-pi"})
-    canonical = (harness or "").lower().replace("-", "").replace("_", "")
-    use_uc = canonical in {h.replace("-", "").replace("_", "") for h in _pi_harnesses}
-    if use_uc and provider.kind == DATABRICKS_KIND:
+    if provider.kind == DATABRICKS_KIND:
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
             cached = cast(ModelListing | None, _listing_cache.get(uc_key))
@@ -885,11 +879,20 @@ def list_models_for_worker(
                     _listing_cache[uc_key] = listing
             except (httpx.HTTPError, OSError):
                 _logger.debug(
-                    "UC model listing failed for pi harness, falling back", exc_info=True
+                    "UC model listing failed for Databricks provider, falling back",
+                    exc_info=True,
                 )
                 listing = _listing_for_provider(provider, transport=transport)
     else:
         listing = _listing_for_provider(provider, transport=transport)
+    canonical_harness = (harness or "").lower().replace("-", "").replace("_", "")
+    if canonical_harness in {"pi", "pinative", "nativepi"}:
+        listing = replace(
+            listing,
+            models=tuple(
+                model for model in listing.models if not unsupported_in_pi(model.id.lower())
+            ),
+        )
     if harness is None:
         return listing
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
@@ -1241,6 +1244,8 @@ def _fetch_databricks_listing(
         # state field stays included (the API may omit it).
         if isinstance(ready, str) and ready and ready.upper() != "READY":
             continue
+        if name.startswith("databricks-"):
+            name = f"system.ai.{name.removeprefix('databricks-')}"
         models.append(ModelEntry(id=name, family=model_family_token(name)))
     return ModelListing(
         source="gateway",
@@ -1270,14 +1275,10 @@ def _fetch_databricks_uc_listing(
     :raises OSError: When the profile resolves no credentials.
     """
     creds = resolve_databricks_workspace(provider.profile)
-    models = tuple(
-        model
-        for model in fetch_databricks_model_service_entries(
-            creds.host,
-            creds.token,
-            transport=transport,
-        )
-        if not unsupported_in_pi(model.id.lower())
+    models = fetch_databricks_model_service_entries(
+        creds.host,
+        creds.token,
+        transport=transport,
     )
     return ModelListing(
         source="gateway",

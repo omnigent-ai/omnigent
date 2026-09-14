@@ -2267,9 +2267,9 @@ async def route_turn(
         AI-Gateway-backed inference on its host. ``False`` takes the external
         router out of play and the built-in judge answers instead.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
-        may supply candidates. Callers pass ``gateway_backed``: that table is
-        all ``databricks-*`` ids, so off the gateway it would route the turn
-        onto a model the pane cannot switch to. ``False`` declines instead.
+        may supply candidates. Callers pass ``gateway_backed`` because those
+        Unity Catalog ids are unreachable off the gateway. ``False`` declines
+        instead.
     """
     try:
         from omnigent.runtime._globals import _caps
@@ -2315,9 +2315,9 @@ async def route_turn(
             if in_family:
                 available = {harness or "self": in_family}
     if not available:
-        # The static table is every ``databricks-*`` id, so off the gateway it
-        # names models this pane cannot be switched to. Decline the turn rather
-        # than route it onto an unreachable endpoint.
+        # The static table contains Unity Catalog model-service ids, so off the
+        # gateway it names models this pane cannot be switched to. Decline the
+        # turn rather than route it onto an unreachable endpoint.
         models = infer_models(harness) if allow_static_fallback else None
         if models is None:
             _logger.info(
@@ -2374,8 +2374,18 @@ async def route_turn(
     # accepts. Nothing servable means no routing: the turn keeps its model.
     model = result.model
     raw_model = result.raw_model
+    candidates = available.get(harness or "", [])
+    catalog_model = next(
+        (
+            candidate
+            for candidate in candidates
+            if _bare_id(candidate, prefixes) == _bare_id(model, prefixes)
+        ),
+        None,
+    )
+    if catalog_model is not None:
+        model = apply_servable_alias(catalog_model, prefixes)
     if harness_bars_model(harness, model, prefixes=prefixes):
-        candidates = available.get(harness or "", [])
         substitute = substitute_model(
             raw_model or model,
             candidates,
