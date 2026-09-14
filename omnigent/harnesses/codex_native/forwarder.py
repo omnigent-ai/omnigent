@@ -2105,7 +2105,9 @@ async def supervise_forwarder(
             name="codex-native-forwarder-subscribe",
         )
         side_chat_task = asyncio.create_task(
-            _drive_side_chat_requests(client, bridge_dir=bridge_dir, target=target),
+            _drive_side_chat_requests(
+                client, ap_client=ap_client, bridge_dir=bridge_dir, target=target
+            ),
             name="codex-native-forwarder-side-chat",
         )
         await _sleep(0)
@@ -2192,6 +2194,7 @@ async def supervise_forwarder(
 async def _drive_side_chat_requests(
     codex_client: CodexAppServerClient,
     *,
+    ap_client: httpx.AsyncClient,
     bridge_dir: Path,
     target: _ForwarderTarget,
 ) -> None:
@@ -2204,27 +2207,89 @@ async def _drive_side_chat_requests(
     fork's ``thread/started`` then registers the rail child through the normal
     event path.
 
+    A request is removed only after it has been handled (:func:`peek` +
+    :func:`discard`), never on read, so a fork failure or a not-yet-ready parent
+    thread can't silently swallow a ``/side`` question:
+
+    * Parent thread not ready yet: leave every request in place and retry next
+      cycle, rather than consuming into the void.
+    * Fork/turn failure: isolate per request (one bad question can't drop its
+      siblings), post a visible notice so the loss is never silent, then discard
+      the request so the same failure isn't retried forever.
+
     :param codex_client: The forwarder's long-lived app-server client.
+    :param ap_client: HTTP client for Omnigent event posts (failure notices).
     :param bridge_dir: Native Codex bridge directory holding the requests.
     :param target: Live forwarder target, read for the current parent thread id.
     :returns: None. Runs until cancelled.
     """
     while True:
         try:
-            for question in side_chat.take_side_chat_requests(bridge_dir):
-                parent_thread_id = target.thread_id
-                if parent_thread_id is None:
-                    continue
-                child_thread_id = await side_chat.open_side_chat_on_client(
-                    codex_client,
-                    parent_thread_id=parent_thread_id,
-                    question=question,
-                )
-                if child_thread_id is None:
-                    _logger.warning("Codex /side fork returned no thread id")
-        except Exception:  # noqa: BLE001 - a bad request must not kill the loop.
-            _logger.warning("Codex /side fork failed", exc_info=True)
+            parent_thread_id = target.thread_id
+            # Only claim once the parent thread exists — a request read before
+            # then can't fork, and consuming it would lose the question (#3).
+            if parent_thread_id is not None:
+                for request in side_chat.peek_side_chat_requests(bridge_dir):
+                    try:
+                        child_thread_id = await side_chat.open_side_chat_on_client(
+                            codex_client,
+                            parent_thread_id=parent_thread_id,
+                            question=request.question,
+                        )
+                        if child_thread_id is None:
+                            raise RuntimeError("thread/fork returned no thread id")
+                    except Exception:  # noqa: BLE001 - one bad request must not drop the rest.
+                        _logger.warning(
+                            "Codex /side fork failed for %s", request.path, exc_info=True
+                        )
+                        await _post_side_chat_failed_notice(
+                            ap_client, target.session_id, request.path.stem
+                        )
+                    # Remove whether it forked or failed: a forked request is
+                    # done, and a failed one has surfaced a notice — keeping it
+                    # would retry the same failure forever.
+                    side_chat.discard_side_chat_request(request.path)
+        except Exception:  # noqa: BLE001 - keep the drain loop alive.
+            _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
+
+
+async def _post_side_chat_failed_notice(
+    client: httpx.AsyncClient, session_id: str, request_key: str
+) -> None:
+    """
+    Surface a visible notice when a ``/side`` chat could not be opened.
+
+    Best-effort: a failed notice must not itself break the drain loop. The
+    request key (the request file's stem) makes the notice idempotent so a
+    retry can't double-post.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Parent Omnigent conversation id.
+    :param request_key: Stable per-request id for idempotency.
+    :returns: None.
+    """
+    marker = f"side-chat-error-{request_key}"
+    try:
+        await _post_external_item(
+            client,
+            session_id,
+            item_type="message",
+            item_data={
+                "role": "assistant",
+                "agent": _AGENT_NAME,
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Couldn't open a side chat for that /side request. Try again.",
+                    }
+                ],
+            },
+            response_id=marker,
+            source_id=marker,
+        )
+    except Exception:  # noqa: BLE001 - the notice is best-effort.
+        _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
 
 
 async def _maybe_rotate_session_on_thread_started(

@@ -32,11 +32,12 @@ deliberately do NOT pin a ``prompt_cache_key``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:  # runtime imports are lazy to avoid a forwarder<->side_chat cycle
     import httpx
@@ -305,29 +306,54 @@ def request_side_chat(bridge_dir: Path, question: str) -> None:
     tmp.replace(path)  # atomic publish, so the drainer never reads a partial file
 
 
-def take_side_chat_requests(bridge_dir: Path) -> list[str]:
+class SideChatRequest(NamedTuple):
+    """A pending ``/side`` question and the file backing it."""
+
+    path: Path
+    question: str
+
+
+def peek_side_chat_requests(bridge_dir: Path) -> list[SideChatRequest]:
     """
-    Claim every pending ``/side`` question, removing each as it is read.
+    Return pending ``/side`` requests WITHOUT consuming them.
+
+    The drainer removes each only after it has actually opened the side chat
+    (:func:`discard_side_chat_request`), so a request is never lost to a fork
+    failure or a not-yet-ready parent thread — it just waits for the next drain.
+    A corrupt (unparseable) request IS discarded here, since it can never
+    succeed; a vanished/transient read is left for the next cycle.
 
     :param bridge_dir: Native Codex bridge directory.
-    :returns: The claimed questions, oldest first; empty when none are pending.
+    :returns: The pending requests, oldest first; empty when none are pending.
     """
     request_dir = bridge_dir / _SIDE_REQUEST_DIRNAME
     try:
         paths = sorted(request_dir.glob("*.json"))
     except OSError:
         return []
-    questions: list[str] = []
+    requests: list[SideChatRequest] = []
     for path in paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            path.unlink()
-        except (OSError, ValueError):
-            # A half-written or vanished request is dropped rather than retried
-            # forever; the user can re-issue /side.
-            _logger.warning("Codex side-chat request unreadable: %s", path, exc_info=True)
+        except OSError:
+            continue  # vanished or transiently unreadable — retry next cycle
+        except ValueError:
+            _logger.warning("Codex side-chat request corrupt, discarding: %s", path)
+            _unlink_quietly(path)
             continue
         question = payload.get("question") if isinstance(payload, dict) else None
         if isinstance(question, str) and question:
-            questions.append(question)
-    return questions
+            requests.append(SideChatRequest(path, question))
+        else:
+            _unlink_quietly(path)  # malformed content that can never fork
+    return requests
+
+
+def discard_side_chat_request(path: Path) -> None:
+    """Remove a handled ``/side`` request file; best-effort."""
+    _unlink_quietly(path)
+
+
+def _unlink_quietly(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()

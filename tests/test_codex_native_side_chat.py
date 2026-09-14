@@ -329,26 +329,33 @@ def test_side_fork_thread_started_is_rotation_ignored() -> None:
 # --------------------------------------------------------------------------- #
 # bridge-dir handoff: the executor records, the forwarder forks
 # --------------------------------------------------------------------------- #
-def test_side_chat_requests_round_trip_and_are_claimed_once(tmp_path: Path) -> None:
-    assert side_chat.take_side_chat_requests(tmp_path) == []  # nothing pending
+def test_side_chat_requests_peek_does_not_consume_until_discarded(tmp_path: Path) -> None:
+    assert side_chat.peek_side_chat_requests(tmp_path) == []  # nothing pending
 
     side_chat.request_side_chat(tmp_path, "why is the sky blue?")
     side_chat.request_side_chat(tmp_path, "and the sea?")
 
-    assert sorted(side_chat.take_side_chat_requests(tmp_path)) == [
-        "and the sea?",
-        "why is the sky blue?",
-    ]
-    # claimed, so a second drain (or a second forwarder pass) never re-forks
-    assert side_chat.take_side_chat_requests(tmp_path) == []
+    pending = side_chat.peek_side_chat_requests(tmp_path)
+    assert sorted(r.question for r in pending) == ["and the sea?", "why is the sky blue?"]
+    # Peek does NOT consume — a re-peek still sees them, so a fork failure or a
+    # not-yet-ready parent thread can retry instead of losing the question.
+    assert len(side_chat.peek_side_chat_requests(tmp_path)) == 2
+
+    for request in pending:
+        side_chat.discard_side_chat_request(request.path)
+    # Discarded, so a later drain never re-forks them.
+    assert side_chat.peek_side_chat_requests(tmp_path) == []
 
 
-def test_take_side_chat_requests_skips_unreadable_payloads(tmp_path: Path) -> None:
+def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path) -> None:
     (tmp_path / "side_chat_requests").mkdir()
     (tmp_path / "side_chat_requests" / "bad.json").write_text("{not json", encoding="utf-8")
     side_chat.request_side_chat(tmp_path, "good one")
 
-    assert side_chat.take_side_chat_requests(tmp_path) == ["good one"]
+    pending = side_chat.peek_side_chat_requests(tmp_path)
+    assert [r.question for r in pending] == ["good one"]
+    # A corrupt request can never fork, so it is removed rather than retried forever.
+    assert not (tmp_path / "side_chat_requests" / "bad.json").exists()
 
 
 @pytest.mark.asyncio
@@ -374,20 +381,25 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     monkeypatch.setattr(fwd, "_sleep", _stop)
     with pytest.raises(asyncio.CancelledError):
         await fwd._drive_side_chat_requests(
-            client, bridge_dir=tmp_path, target=SimpleNamespace(thread_id="thread_parent")
+            client,
+            ap_client=AsyncMock(),
+            bridge_dir=tmp_path,
+            target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
         )
 
     assert [m for m, _ in client.calls] == ["thread/fork", "turn/start"]
     assert client.calls[0][1]["threadId"] == "thread_parent"
     assert client.calls[0][1]["ephemeral"] is True
     assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
-    assert side_chat.take_side_chat_requests(tmp_path) == []  # request consumed
+    assert side_chat.peek_side_chat_requests(tmp_path) == []  # request consumed after forking
 
 
 @pytest.mark.asyncio
-async def test_drive_side_chat_requests_waits_for_a_parent_thread(
+async def test_drive_side_chat_requests_keeps_the_request_until_the_parent_thread_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Regression for the "dropped when the thread isn't ready yet" bug: the
+    # request must SURVIVE (not be consumed) so a later cycle forks it.
     client = _FakeCodexClient({})
     side_chat.request_side_chat(tmp_path, "q")
 
@@ -397,10 +409,46 @@ async def test_drive_side_chat_requests_waits_for_a_parent_thread(
     monkeypatch.setattr(fwd, "_sleep", _stop)
     with pytest.raises(asyncio.CancelledError):
         await fwd._drive_side_chat_requests(
-            client, bridge_dir=tmp_path, target=SimpleNamespace(thread_id=None)
+            client,
+            ap_client=AsyncMock(),
+            bridge_dir=tmp_path,
+            target=SimpleNamespace(thread_id=None, session_id="conv_parent"),
         )
 
     assert client.calls == []  # no thread to fork from yet
+    # The question is NOT lost — it waits for a cycle where the thread is ready.
+    assert [r.question for r in side_chat.peek_side_chat_requests(tmp_path)] == ["q"]
+
+
+@pytest.mark.asyncio
+async def test_drive_side_chat_requests_surfaces_a_notice_and_discards_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A fork that fails must not vanish silently: surface a visible notice, then
+    # discard the request so the same failure isn't retried forever.
+    client = _FakeCodexClient({"thread/fork": {"result": {}}})  # no thread id -> failure
+    side_chat.request_side_chat(tmp_path, "doomed")
+
+    notices: list[tuple[str, str]] = []
+
+    async def _fake_notice(_ap: object, session_id: str, key: str) -> None:
+        notices.append((session_id, key))
+
+    async def _stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_post_side_chat_failed_notice", _fake_notice)
+    monkeypatch.setattr(fwd, "_sleep", _stop)
+    with pytest.raises(asyncio.CancelledError):
+        await fwd._drive_side_chat_requests(
+            client,
+            ap_client=AsyncMock(),
+            bridge_dir=tmp_path,
+            target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
+        )
+
+    assert notices and notices[0][0] == "conv_parent"  # user-visible failure notice
+    assert side_chat.peek_side_chat_requests(tmp_path) == []  # discarded, not retried forever
 
 
 # --------------------------------------------------------------------------- #
