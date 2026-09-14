@@ -725,23 +725,6 @@ export async function describeCreateError(res: Response): Promise<string> {
 }
 
 /**
- * Surface a project-aware create's non-fatal consistency `warnings` (explicit
- * value differs from the project config) as toasts. The session was created,
- * so this must never block or fail the flow — unrecognized shapes are ignored.
- */
-export function surfaceProjectCreateWarnings(warnings: unknown): void {
-  if (!Array.isArray(warnings)) return;
-  try {
-    for (const warning of warnings) {
-      const message = (warning as { message?: unknown } | null)?.message;
-      if (typeof message === "string" && message !== "") showToast(message);
-    }
-  } catch {
-    // A toast failure must never fail the create that already succeeded.
-  }
-}
-
-/**
  * The pre-feature "run omni setup" guidance (ReactNode), shown under the
  * composer when the UI-driven setup feature is OFF.
  *
@@ -4553,7 +4536,6 @@ export function NewChatLandingScreen() {
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
         );
-        surfaceProjectCreateWarnings(bundled.warnings);
         data = { id: bundled.id };
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
@@ -4707,12 +4689,7 @@ export function NewChatLandingScreen() {
           if (!response.ok) return { error: await describeCreateError(response) };
           const created = (await response.json()) as {
             id: string;
-            warnings?: { code?: string; message?: string }[];
           };
-          // Non-fatal project-consistency warnings from a `project_id` create
-          // (explicit value differs from the project config) — surfaced even
-          // when the pushed row won the navigation race below.
-          surfaceProjectCreateWarnings(created.warnings);
           return { id: created.id };
         })();
         // Once the create answers, its id is authoritative — stop listening.
