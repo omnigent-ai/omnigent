@@ -6,13 +6,18 @@ import {
   isElectronShell,
   isIOSShell,
   isNativeShell,
+  actionBridge,
+  clearDesktopActionBindings,
   nativeNotify,
+  onDesktopActionInvoked,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
   type ServerManifest,
   serverManifestOf,
+  reportDesktopActionResult,
   setBadgeCount as bridgeSetBadge,
+  setDesktopActionBindings,
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsNativeServerPicker,
@@ -26,6 +31,10 @@ const electronNotify = vi.fn().mockResolvedValue(true);
 const electronUnsubscribe = vi.fn();
 const electronOnNotificationActivated = vi.fn().mockReturnValue(electronUnsubscribe);
 const electronSetColorScheme = vi.fn();
+const electronSetActionBindings = vi.fn();
+const electronOnActionInvokeUnsubscribe = vi.fn();
+const electronOnActionInvoke = vi.fn().mockReturnValue(electronOnActionInvokeUnsubscribe);
+const electronReportActionResult = vi.fn();
 
 // The iOS WKWebView bridge mock, installed on window.omnigentNative.
 const iosSetBadge = vi.fn();
@@ -63,6 +72,11 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
       setBadgeCount: (...args: unknown[]) => electronSetBadge(...args),
       setColorScheme: (...args: unknown[]) => electronSetColorScheme(...args),
       notify: (...args: unknown[]) => electronNotify(...args),
+      actions: {
+        setBindings: (...args: unknown[]) => electronSetActionBindings(...args),
+        onInvoke: (...args: unknown[]) => electronOnActionInvoke(...args),
+        reportResult: (...args: unknown[]) => electronReportActionResult(...args),
+      },
       ...(withClickRouting
         ? {
             onNotificationActivated: (...args: unknown[]) =>
@@ -591,5 +605,59 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("Electron action bridge", () => {
+  const snapshot = {
+    version: 1 as const,
+    bindings: [{ action: "session.action.new", accelerator: "CmdOrCtrl+N" }],
+  };
+
+  it("probes the complete bridge and forwards snapshots", () => {
+    setElectron(true);
+    expect(actionBridge()).toBeDefined();
+    setDesktopActionBindings(snapshot);
+    expect(electronSetActionBindings).toHaveBeenCalledWith(snapshot);
+  });
+
+  it("degrades safely when the shell predates action synchronization", () => {
+    setElectron(true);
+    delete (window as unknown as { omnigentDesktop: { actions?: unknown } }).omnigentDesktop
+      .actions;
+    expect(actionBridge()).toBeUndefined();
+    expect(() => setDesktopActionBindings(snapshot)).not.toThrow();
+    expect(onDesktopActionInvoked(() => {})).toEqual(expect.any(Function));
+    expect(() => reportDesktopActionResult("request", false)).not.toThrow();
+    expect(() => clearDesktopActionBindings()).not.toThrow();
+  });
+
+  it("subscribes, reports results, and returns the exact unsubscribe", () => {
+    setElectron(true);
+    const callback = vi.fn();
+    const unsubscribe = onDesktopActionInvoked(callback);
+    expect(electronOnActionInvoke).toHaveBeenCalledWith(callback);
+    unsubscribe();
+    expect(electronOnActionInvokeUnsubscribe).toHaveBeenCalledOnce();
+    reportDesktopActionResult("request", true);
+    expect(electronReportActionResult).toHaveBeenCalledWith("request", true);
+    clearDesktopActionBindings();
+    expect(electronSetActionBindings).toHaveBeenLastCalledWith({ version: 1, bindings: [] });
+  });
+
+  it("contains bridge failures", () => {
+    setElectron(true);
+    electronSetActionBindings.mockImplementationOnce(() => {
+      throw new Error("old shell");
+    });
+    electronOnActionInvoke.mockImplementationOnce(() => {
+      throw new Error("old shell");
+    });
+    electronReportActionResult.mockImplementationOnce(() => {
+      throw new Error("old shell");
+    });
+    expect(() => setDesktopActionBindings(snapshot)).not.toThrow();
+    expect(onDesktopActionInvoked(() => {})).toEqual(expect.any(Function));
+    expect(() => reportDesktopActionResult("request", true)).not.toThrow();
   });
 });

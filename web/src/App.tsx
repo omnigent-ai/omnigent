@@ -8,7 +8,7 @@ import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
-import { ActionsProvider, KeybindingDispatcher } from "@/actions";
+import { ActionsProvider, DesktopActionSync, KeybindingDispatcher } from "@/actions";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
 // beside the component, keeps the route table clean and means no route ships
@@ -87,6 +87,7 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
 function ActionShell() {
   return (
     <ActionsProvider>
+      <DesktopActionSync />
       <KeybindingDispatcher />
       <AppShell />
     </ActionsProvider>

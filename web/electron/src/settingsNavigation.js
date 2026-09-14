@@ -26,13 +26,14 @@ function focusedConnectedWindow(focused, windows) {
  * Build the shared native Settings menu item.
  *
  * @param {() => void} openSettings
+ * @param {string | null | undefined} [accelerator]
  * @returns {Electron.MenuItemConstructorOptions}
  */
-function settingsMenuItem(openSettings) {
+function settingsMenuItem(openSettings, accelerator = SETTINGS_ACCELERATOR) {
   return {
     id: "open_settings",
     label: "Settings…",
-    accelerator: SETTINGS_ACCELERATOR,
+    accelerator,
     click: openSettings,
   };
 }
