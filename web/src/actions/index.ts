@@ -8,6 +8,7 @@ export {
   useActions,
   useAvailableActions,
   usePaletteActions,
+  useSuspendKeybindingDispatch,
 } from "./ActionProvider";
 export type { ActionScopeHandle, ActionScopeOptions, ActionsApi } from "./ActionProvider";
 export { KeybindingDispatcher } from "./KeybindingDispatcher";
@@ -17,6 +18,7 @@ export {
   replaceAllUserKeybindings,
   resetAllUserKeybindings,
   resetUserKeybindingRule,
+  setUserKeybindingCandidate,
   setUserKeybindingRule,
   unbindDefaultKeybinding,
   useKeybindingSnapshot,
@@ -26,6 +28,7 @@ export {
   analyzeKeybindingConflicts,
   isUserKeybindingRuleUsable,
   keybindingModesMayOverlap,
+  logicalKeyForCode,
   resolveEffectiveKeymap,
 } from "./effectiveKeymap";
 export type {
@@ -43,8 +46,11 @@ export {
 export type { KnownUserKeybindingRule, UserKeybindingRule } from "./keybindingPreferences";
 export { useRegisterAction } from "./useRegisterAction";
 export type { ActionInvalidationKey } from "./useRegisterAction";
-export { and, equals, not, or, when } from "./context";
-export { formatKeybinding, formatKeyStroke, keybindingParts } from "./keybindingFormatter";
+export { and, contextsMayOverlap, equals, not, or, when } from "./context";
+export { formatKeybinding, formatKeybindingForAria, formatKeyStroke } from "./keybindingFormatter";
+export { isMacKeyboardPlatform, keybindingEnvironmentExpression } from "./keybindingEnvironment";
+export { parseKeybinding, serializeKeybinding } from "./keybindingParser";
+export { isReservedEscapeSequence } from "./keybindingPolicy";
 export type {
   ActionHandlerContext,
   ActionHandlerRegistration,
@@ -69,5 +75,7 @@ export type {
   JsonValue,
   KeybindingMode,
   KeybindingRule,
+  KeyModifier,
+  KeyStroke,
 } from "./types";
-export { HANDLED, NOT_HANDLED } from "./types";
+export { HANDLED, KEYBINDING_MODES, NOT_HANDLED } from "./types";

@@ -102,7 +102,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { MOD_KEY } from "@/components/KeyboardShortcut";
-import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
+import { KeybindingEditor } from "@/components/keybindings/KeybindingEditor";
 import { changePassword, logout } from "@/lib/accountsApi";
 import {
   beginGithubConnect,
@@ -301,7 +301,11 @@ export function SettingsPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll
+      contentClassName="px-4 sm:px-8"
+      maxWidthClassName={section === "shortcuts" ? "max-w-5xl" : "max-w-3xl"}
+      extraBottom="2.5rem"
+    >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
@@ -1961,7 +1965,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList />
+      <KeybindingEditor />
     </Section>
   );
 }

@@ -155,6 +155,11 @@ export function setUserKeybindingRule(rule: KnownUserKeybindingRule): Keybinding
   return applyUserKeybindingRule(rule);
 }
 
+/** Runtime-validated counterpart for catalog-driven editors with a dynamic action id. */
+export function setUserKeybindingCandidate(rule: UserKeybindingRule): KeybindingMutationResult {
+  return applyUserKeybindingRule(rule);
+}
+
 /**
  * Replace all structurally valid overrides for import flows. Future actions and
  * semantically unusable known rows remain dormant so round-trips are lossless.

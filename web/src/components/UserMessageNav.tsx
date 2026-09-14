@@ -5,6 +5,7 @@ import { ChevronDownIcon, ChevronUpIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useFormattedActionKeybinding } from "@/hooks/useFormattedActionKeybinding";
 
 export interface UserMessageNavProps {
   goPrev: () => void;
@@ -24,6 +25,8 @@ export function UserMessageNav({
   hidden,
   className,
 }: UserMessageNavProps) {
+  const previousKey = useFormattedActionKeybinding("chat.action.openPreviousMessage");
+  const nextKey = useFormattedActionKeybinding("chat.action.openNextMessage");
   if (hidden) return null;
   return (
     <TooltipProvider>
@@ -47,7 +50,9 @@ export function UserMessageNav({
               <ChevronUpIcon className="size-4" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent side="left">Previous message (⌘⌥↑)</TooltipContent>
+          <TooltipContent side="left">
+            Previous message{previousKey ? ` (${previousKey})` : ""}
+          </TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -63,7 +68,7 @@ export function UserMessageNav({
               <ChevronDownIcon className="size-4" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent side="left">Next message (⌘⌥↓)</TooltipContent>
+          <TooltipContent side="left">Next message{nextKey ? ` (${nextKey})` : ""}</TooltipContent>
         </Tooltip>
       </div>
     </TooltipProvider>

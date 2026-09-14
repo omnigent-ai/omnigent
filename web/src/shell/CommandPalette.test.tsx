@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useState, type ComponentProps } from "react";
-import { ActionsProvider, HANDLED, useRegisterAction } from "@/actions";
+import { ActionsProvider, HANDLED, setUserKeybindingRule, useRegisterAction } from "@/actions";
+import { resetKeybindingStoreForTesting } from "@/actions/KeybindingStore";
+import { EmbeddedProvider } from "@/lib/embedded";
 
 import { CommandPalette } from "./CommandPalette";
 
@@ -40,6 +42,7 @@ interface RenderPaletteOptions extends Partial<ComponentProps<typeof CommandPale
   settingsEnabled?: boolean;
   inboxVisible?: boolean;
   onInvocation?: (source: string) => void;
+  embedded?: boolean;
 }
 
 const NOOP = () => {};
@@ -96,7 +99,7 @@ function renderPalette(overrides: RenderPaletteOptions = {}) {
   };
   const onToggleLeftSidebar = overrides.onToggleLeftSidebar ?? vi.fn();
   const onToggleRightSidebar = overrides.onToggleRightSidebar ?? vi.fn();
-  render(
+  const content = (
     <ActionsProvider>
       <PaletteActions
         onToggleLeftSidebar={onToggleLeftSidebar}
@@ -106,8 +109,9 @@ function renderPalette(overrides: RenderPaletteOptions = {}) {
         onInvocation={overrides.onInvocation}
       />
       <CommandPalette {...props} />
-    </ActionsProvider>,
+    </ActionsProvider>
   );
+  render(overrides.embedded ? <EmbeddedProvider>{content}</EmbeddedProvider> : content);
   return { ...props, onToggleLeftSidebar, onToggleRightSidebar };
 }
 
@@ -115,8 +119,14 @@ beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   setSessions([]);
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
+});
 
 describe("CommandPalette — sessions", () => {
   it("fuzzy-matches session names without showing unrelated actions", () => {
@@ -493,7 +503,7 @@ describe("CommandPalette — actions", () => {
     const group = screen.getByText("Actions").closest("[cmdk-group]");
     const labels = within(group as HTMLElement)
       .getAllByRole("option")
-      .map((item) => item.textContent);
+      .map((item) => item.querySelector("[data-action-title]")?.textContent);
     expect(labels).toEqual([
       "New chat",
       "Go to Inbox",
@@ -512,6 +522,29 @@ describe("CommandPalette — actions", () => {
     renderPalette();
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: query } });
     expect(screen.getByText(label)).toBeTruthy();
+  });
+
+  it("shows effective shortcuts and updates them live", () => {
+    renderPalette();
+    const newChat = screen.getByText("New chat").closest("[data-slot=command-item]") as HTMLElement;
+    expect(within(newChat).getByText("Ctrl+N")).toBeInTheDocument();
+    act(() => {
+      expect(
+        setUserKeybindingRule({
+          id: "session.new",
+          action: "session.action.new",
+          sequence: "ctrl+shift+n",
+          mode: "global",
+        }),
+      ).toEqual({ ok: true, changed: true });
+    });
+    expect(within(newChat).getByText("Ctrl+Shift+N")).toBeInTheDocument();
+  });
+
+  it("hides standalone-only hints in embedded mode", () => {
+    renderPalette({ embedded: true });
+    const newChat = screen.getByText("New chat").closest("[data-slot=command-item]") as HTMLElement;
+    expect(within(newChat).queryByText("Ctrl+N")).toBeNull();
   });
 
   it("runs a navigation action with palette source and closes", () => {

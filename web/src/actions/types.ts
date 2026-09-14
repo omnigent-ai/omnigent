@@ -91,6 +91,8 @@ export interface ActionDefinition {
   palette?: boolean;
   /** Stable command-palette order; lower values render first. */
   paletteOrder?: number;
+  /** Include this action in the compact shortcut-reference dialog. */
+  shortcutReference?: boolean;
 }
 
 export type ActionSource = "api" | "button" | "keyboard" | "menu" | "native" | "palette";
@@ -117,11 +119,7 @@ export const KEYBINDING_MODES = [
   "global",
   "composer",
   "terminal",
-  "codeEditor",
-  "markdownEditor",
   "fileViewer",
-  "commandPalette",
-  "dialog",
   "filesPanel",
   "terminalsPanel",
   "executionLogs",
@@ -142,7 +140,7 @@ export interface KeyStroke {
   key: { kind: "key"; value: string } | { kind: "code"; value: string };
 }
 
-export type KeySequence = readonly KeyStroke[];
+export type KeySequence = readonly [KeyStroke];
 
 export interface ActionContextValues {
   isMac: boolean;

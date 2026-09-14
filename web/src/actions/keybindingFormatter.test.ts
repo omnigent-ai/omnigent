@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatKeybinding, keybindingParts } from "./keybindingFormatter";
+import { formatKeybinding, formatKeybindingForAria } from "./keybindingFormatter";
 import { parseKeybinding } from "./keybindingParser";
 
 describe("keybinding formatter", () => {
@@ -23,12 +23,9 @@ describe("keybinding formatter", () => {
     expect(formatKeybinding(parseKeybinding("primary+[Digit1]"), { isMac: false })).toBe("Ctrl+1");
   });
 
-  it("formats chord strokes separately", () => {
-    const sequence = parseKeybinding("mod+k mod+s");
-    expect(formatKeybinding(sequence, { isMac: false })).toBe("Ctrl+K Ctrl+S");
-    expect(keybindingParts(sequence, { isMac: true })).toEqual([
-      ["⌘", "K"],
-      ["⌘", "S"],
-    ]);
+  it("formats a spoken macOS label for assistive technology", () => {
+    expect(formatKeybindingForAria(parseKeybinding("mod+alt+[BracketLeft]"), { isMac: true })).toBe(
+      "Command + Option + Left bracket",
+    );
   });
 });

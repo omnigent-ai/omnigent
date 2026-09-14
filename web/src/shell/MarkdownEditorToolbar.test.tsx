@@ -9,8 +9,14 @@
 // call on save are exercised.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { ActionScope, ActionsProvider, KeybindingDispatcher } from "@/actions";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  ActionScope,
+  ActionsProvider,
+  KeybindingDispatcher,
+  setUserKeybindingRule,
+} from "@/actions";
+import { resetKeybindingStoreForTesting } from "@/actions/KeybindingStore";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tiptap/react", () => ({
   // Return every badge flag false; the toolbar's formatting buttons are
@@ -70,9 +76,16 @@ function renderToolbar(
   return { onSave };
 }
 
+beforeEach(() => {
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   cleanup();
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
 });
 
 describe("MarkdownEditorToolbar auto-save status", () => {
@@ -91,6 +104,22 @@ describe("MarkdownEditorToolbar auto-save status", () => {
     expect(screen.queryByText("Saving…")).toBeNull();
     fireEvent.click(screen.getByText("Unsaved"));
     expect(onSave).toHaveBeenCalledWith(MARKDOWN);
+  });
+
+  it("shows the live customized save hint", () => {
+    expect(
+      setUserKeybindingRule({
+        id: "file.save",
+        action: "file.action.save",
+        sequence: "ctrl+shift+s",
+        mode: "fileViewer",
+      }),
+    ).toEqual({ ok: true, changed: true });
+    renderToolbar({ isDirty: true });
+    expect(screen.getByText("Unsaved").closest("button")).toHaveAttribute(
+      "title",
+      "Unsaved changes — Ctrl+Shift+S to save now",
+    );
   });
 
   it("shows 'Saving…' only once a write is in flight", () => {

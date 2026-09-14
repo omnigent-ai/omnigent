@@ -71,15 +71,41 @@ export function formatKeyStroke(stroke: KeyStroke, { isMac }: KeybindingFormatOp
 }
 
 export function formatKeybinding(sequence: KeySequence, options: KeybindingFormatOptions): string {
-  return sequence.map((stroke) => formatKeyStroke(stroke, options)).join(" ");
+  return formatKeyStroke(sequence[0], options);
 }
 
-export function keybindingParts(
+function spokenKeyLabel(stroke: KeyStroke): string {
+  const label = keyLabel(stroke);
+  return (
+    {
+      "↑": "Up arrow",
+      "↓": "Down arrow",
+      "←": "Left arrow",
+      "→": "Right arrow",
+      "↵": "Enter",
+      "⇥": "Tab",
+      "⌫": "Backspace",
+      "⌦": "Delete",
+      "[": "Left bracket",
+      "]": "Right bracket",
+    }[label] ?? label
+  );
+}
+
+export function formatKeybindingForAria(
   sequence: KeySequence,
-  options: KeybindingFormatOptions,
-): string[][] {
-  return sequence.map((stroke) => {
-    const modifierMap = options.isMac ? MAC_MODIFIERS : OTHER_MODIFIERS;
-    return [...stroke.modifiers.map((modifier) => modifierMap[modifier]), keyLabel(stroke)];
-  });
+  { isMac }: KeybindingFormatOptions,
+): string {
+  const modifiers: Readonly<Record<KeyModifier, string>> = {
+    mod: isMac ? "Command" : "Control",
+    primary: isMac ? "Command or Control" : "Control or Command",
+    ctrl: "Control",
+    meta: isMac ? "Command" : "Meta",
+    alt: isMac ? "Option" : "Alt",
+    shift: "Shift",
+  };
+  const stroke = sequence[0];
+  return [...stroke.modifiers.map((modifier) => modifiers[modifier]), spokenKeyLabel(stroke)].join(
+    " + ",
+  );
 }

@@ -151,13 +151,13 @@ function parseStroke(source: string): KeyStroke {
   };
 }
 
-/** Parse one key stroke or a whitespace-separated chord sequence. */
+/** Parse one key combination. Multi-stroke chords are intentionally unsupported. */
 export function parseKeybinding(source: string): KeySequence {
   const trimmed = source.trim();
   if (!trimmed) throw new Error("Keybinding cannot be empty");
   const strokes = trimmed.split(/\s+/).map(parseStroke);
-  if (strokes.length > 2) throw new Error("Keybindings support at most two strokes");
-  return strokes;
+  if (strokes.length !== 1) throw new Error("Keybindings support one key combination");
+  return [strokes[0]!];
 }
 
 function serializeLogicalKey(value: string): string {
@@ -168,9 +168,6 @@ function serializeLogicalKey(value: string): string {
 }
 
 export function serializeKeybinding(sequence: KeySequence): string {
-  if (sequence.length === 0 || sequence.length > 2) {
-    throw new Error("Keybindings must contain one or two strokes");
-  }
   return sequence
     .map((stroke) => {
       const modifierSet = new Set(stroke.modifiers);
