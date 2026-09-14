@@ -21,6 +21,7 @@ through session creation.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
 
@@ -54,6 +55,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     skills: list[SkillSummary] = []
     terminals: list[str] = []
     harness: str | None = None
+    workspace_hint: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -91,6 +93,9 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        spec_cwd = getattr(getattr(loaded.spec, "os_env", None), "cwd", None)
+        if isinstance(spec_cwd, str) and Path(spec_cwd).is_absolute():
+            workspace_hint = spec_cwd
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
@@ -115,6 +120,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # by a same-named ``omnigent run`` upload, but lets a newer
         # upload supersede the latter.
         builtin=agent.session_id is None and agent.id == builtin_agent_id(agent.name),
+        workspace_hint=workspace_hint,
     )
 
 
