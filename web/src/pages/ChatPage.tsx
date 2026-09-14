@@ -26,6 +26,7 @@ import {
   FolderIcon,
   ImageIcon,
   Loader2Icon,
+  MessagesSquareIcon,
   XIcon,
 } from "lucide-react";
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -100,7 +101,7 @@ import {
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
-import { isSideChatCommand } from "@/lib/sideChat";
+import { isSideChatCommand, SIDE_CHAT_COMMAND_PREFIX, supportsSideChat } from "@/lib/sideChat";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -942,8 +943,7 @@ export function ChatPage() {
       // A codex /side command opens its own side chat off the parent thread, so
       // it must POST now even mid-turn rather than park in the queue (see the
       // matching gate in the store's send()). Mirror that harness gate here.
-      const opensSideChat =
-        chat.sessionHarness === "codex-native" && isSideChatCommand(text.trim());
+      const opensSideChat = supportsSideChat(chat.sessionHarness) && isSideChatCommand(text.trim());
       if (
         shouldQueueSend(
           chat.conversationId,
@@ -1231,9 +1231,13 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 function SelectionPopup({
   containerRef,
   onReply,
+  onAskInSideChat,
 }: {
   containerRef: React.RefObject<HTMLElement | null>;
   onReply: (text: string) => void;
+  // Present only when the session's harness supports side chat; renders the
+  // "Ask in side chat" action beside Reply.
+  onAskInSideChat?: (text: string) => void;
 }) {
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
   const selectedTextRef = useRef<string>("");
@@ -1323,6 +1327,29 @@ function SelectionPopup({
         <CornerUpLeftIcon className="size-3.5" />
         Reply ↵
       </Button>
+      {onAskInSideChat ? (
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
+          onMouseDown={(e) => {
+            e.preventDefault();
+          }}
+          onClick={() => {
+            const text = selectedTextRef.current;
+            if (text) {
+              onAskInSideChat(text);
+              window.getSelection()?.removeAllRanges();
+              setPopupPos(null);
+              selectedTextRef.current = "";
+            }
+          }}
+        >
+          <MessagesSquareIcon className="size-3.5" />
+          Ask in side chat
+        </Button>
+      ) : null}
     </div>
   );
 }
@@ -1568,6 +1595,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // out of streaming-frame re-renders.
 
   const composerRef = useRef<ComposerHandle>(null);
+  // Cold selector (harness rarely changes) — gates the selection popup's "Ask
+  // in side chat" action to harnesses that support side chat.
+  const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1803,6 +1833,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           <SelectionPopup
             containerRef={conversationRef}
             onReply={(text) => composerRef.current?.appendReplyQuote(text)}
+            onAskInSideChat={
+              supportsSideChat(selectionSessionHarness)
+                ? (text) => composerRef.current?.startSideChat(text)
+                : undefined
+            }
           />
 
           <Composer
@@ -1903,6 +1938,7 @@ function ConversationLoadError({
 
 interface ComposerHandle {
   appendReplyQuote: (text: string) => void;
+  startSideChat: (selectedText: string) => void;
 }
 
 interface ComposerProps {
@@ -2623,7 +2659,7 @@ function ComposerImpl(
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
-  const showSide = sessionHarness === "codex-native";
+  const showSide = supportsSideChat(sessionHarness);
   const slashCommands = useMemo(
     () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw, showSide),
     [skills, showEffort, showModel, showCompact, showBtw, showSide],
@@ -2999,6 +3035,21 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+    },
+    startSideChat(selectedText) {
+      // Seed the composer with the /side command carrying the selection, then
+      // focus so the user can add their question before sending. Reuses the
+      // whole /side pipeline (send → fork → rail child); nothing side-chat
+      // specific happens here beyond the prefill.
+      if (disabled || isReadOnly || unreachable || composerLockedByBtw || !selectedText.trim()) {
+        return;
+      }
+      setValue(SIDE_CHAT_COMMAND_PREFIX + selectedText.trim());
+      dirtyRef.current = true;
+      setCommandError(null);
+      dismissMention();
+      recallingRef.current = false;
+      textareaRef.current?.focus();
     },
   }));
 

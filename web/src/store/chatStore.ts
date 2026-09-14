@@ -106,7 +106,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { isSideChatCommand } from "@/lib/sideChat";
+import { isSideChatCommand, supportsSideChat } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
 // ids without an import cycle back to the store.
@@ -2052,7 +2052,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // A codex `/side` command is forked into its own side chat: it gets no
     // bubble here, and this session must not latch into "Working…" either —
     // nothing runs here, so nothing would ever arrive to clear it.
-    const opensSideChat = get().sessionHarness === "codex-native" && isSideChatCommand(text.trim());
+    const opensSideChat = supportsSideChat(get().sessionHarness) && isSideChatCommand(text.trim());
     if (opensSideChat) {
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }
