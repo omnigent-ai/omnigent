@@ -4704,7 +4704,7 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
-def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool:
+def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
     """
     Report whether the Claude pane's process is still running.
 
@@ -4714,14 +4714,21 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool:
     means the pane's process is running (e.g. a slow boot still in
     progress), ``1`` means it exited.
 
-    Errs toward "not alive": an unreachable tmux
-    server, an unknown target, or a torn probe reads as dead, so callers
-    extend a wait only on an affirmative liveness signal.
+    Only a responsive tmux server gets to decide: an affirmed
+    ``#{pane_dead}`` ``1`` or a failed query (unknown target, dead
+    server) reads as dead. A probe that gets no answer within its budget
+    is inconclusive — a tmux server starved by parallel worker boots is
+    the same condition that makes a boot slow, so treating an unanswered
+    probe as death would end a slow-boot wait exactly when the extension
+    matters. The probe shares :data:`_TMUX_SEND_TIMEOUT_S` for the same
+    reason that budget exists for sends.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :returns: ``True`` only when tmux reports the pane's process alive.
+    :returns: ``True`` when tmux affirms the pane's process is alive,
+        ``False`` when tmux affirms it exited or rejects the query, and
+        ``None`` when the probe went unanswered.
     """
     import subprocess
 
@@ -4741,11 +4748,13 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool:
             check=False,
             capture_output=True,
             text=True,
-            timeout=1.0,
+            timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
         return False
-    return proc.returncode == 0 and proc.stdout.strip() == "0"
+    return proc.stdout.strip() == "0"
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -5136,12 +5145,14 @@ def _wait_for_claude_prompt_ready(
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Seconds to wait for the prompt while the terminal
-        cannot be confirmed alive, e.g. ``30.0``. While ``#{pane_dead}``
-        affirms the pane's process is running — a slow boot in progress,
-        e.g. a slow host connect — the wait extends past this budget, up
-        to :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`, so the first message
-        of a session is delivered late rather than silently dropped.
+    :param timeout_s: Seconds to wait for the prompt when the terminal
+        is affirmed dead, e.g. ``30.0``. Until ``#{pane_dead}`` affirms
+        the pane's process exited — so during a slow boot in progress,
+        e.g. a slow host connect, and also while a starved tmux server
+        leaves the liveness probe unanswered — the wait extends past
+        this budget, up to :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`, so
+        the first message of a session is delivered late rather than
+        silently dropped.
     :returns: None.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
@@ -5178,7 +5189,9 @@ def _wait_for_claude_prompt_ready(
             return
         now = time.monotonic()
         if now >= deadline:
-            if now >= hard_deadline or not _claude_pane_alive(socket_path, tmux_target):
+            # Only an affirmative "dead" ends the extension early: an
+            # unanswered probe (starved server) keeps waiting to the cap.
+            if now >= hard_deadline or _claude_pane_alive(socket_path, tmux_target) is False:
                 break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
