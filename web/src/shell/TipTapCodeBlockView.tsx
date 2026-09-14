@@ -27,14 +27,20 @@ export function TipTapCodeBlockView({ node, editor, getPos }: NodeViewProps) {
   // picker must not offer to mutate the doc in that case.
   const editable = editor.isEditable;
 
-  // Surface a language not in the quick-pick list (e.g. ```rust) as the current
-  // option so the picker shows it selected instead of falling back to the first
-  // entry. (Switching away rewrites the fence, as with any language.)
-  const options = useMemo(() => {
-    if (language && !CODE_BLOCK_LANGUAGES.some((l) => l.value === language)) {
-      return [...CODE_BLOCK_LANGUAGES, { value: language, label: language }];
+  // Match a known language case-insensitively so a cased fence (```Mermaid) maps
+  // to the canonical option; a truly unknown language (e.g. ```rust) is appended
+  // so the picker still shows it selected instead of the first entry.
+  const { options, selectValue } = useMemo(() => {
+    const known = CODE_BLOCK_LANGUAGES.find(
+      (l) => l.value.toLowerCase() === language.toLowerCase(),
+    );
+    if (language && !known) {
+      return {
+        options: [...CODE_BLOCK_LANGUAGES, { value: language, label: language }],
+        selectValue: language,
+      };
     }
-    return CODE_BLOCK_LANGUAGES;
+    return { options: CODE_BLOCK_LANGUAGES, selectValue: known?.value ?? language };
   }, [language]);
 
   const onLanguageChange = useCallback(
@@ -62,7 +68,7 @@ export function TipTapCodeBlockView({ node, editor, getPos }: NodeViewProps) {
         contentEditable={false}
         aria-label="Code block language"
         className="tiptap-code-block-lang absolute right-2 top-2 z-10 rounded border border-border bg-popover px-1.5 py-0.5 text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
-        value={language}
+        value={selectValue}
         disabled={!editable}
         onChange={onLanguageChange}
       >

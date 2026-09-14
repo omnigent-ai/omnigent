@@ -92,6 +92,13 @@ describe("TipTapCodeBlockView", () => {
     expect(screen.getByRole("option", { name: "haskell" }).getAttribute("value")).toBe("haskell");
   });
 
+  it("maps a cased fence to the canonical option without duplicating it", () => {
+    renderView({ language: "Mermaid", textContent: "graph TD" });
+    const mermaidOptions = screen.getAllByRole("option").filter((o) => o.textContent === "Mermaid");
+    expect(mermaidOptions).toHaveLength(1);
+    expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("mermaid");
+  });
+
   it("disables the language picker when the editor is read-only", () => {
     renderView({ language: "mermaid", textContent: "graph TD", editable: false });
     expect(screen.getByRole("combobox")).toBeDisabled();
