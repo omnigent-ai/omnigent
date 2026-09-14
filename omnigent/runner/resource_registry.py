@@ -70,6 +70,29 @@ QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 DEVIN_NATIVE_TERMINAL_ROLE = "devin-native"
+
+#: Terminal roles whose PTY-activity watcher drives the session's working
+#: status (pane activity → ``running``, quiescence → ``idle``), not just the
+#: activity badge. These are the native agent terminals whose ``run_turn``
+#: injects and returns immediately, so the PTY watcher is their only (or, for
+#: harnesses with a hook forwarder, their only *top-level*) running/idle status
+#: source — without membership here the web "Working…" badge never clears and
+#: the turn times out. A generic shell's role is absent so its output can't move
+#: the session status. Every native TUI harness that injects-and-returns must be
+#: listed; ``tests/runner/test_native_terminal_lock_coverage.py`` guards this.
+_STATUS_EMITTING_TERMINAL_ROLES: frozenset[str] = frozenset(
+    {
+        CLAUDE_NATIVE_TERMINAL_ROLE,
+        PI_NATIVE_TERMINAL_ROLE,
+        CURSOR_NATIVE_TERMINAL_ROLE,
+        KIRO_NATIVE_TERMINAL_ROLE,
+        GOOSE_NATIVE_TERMINAL_ROLE,
+        QWEN_NATIVE_TERMINAL_ROLE,
+        KIMI_NATIVE_TERMINAL_ROLE,
+        HERMES_NATIVE_TERMINAL_ROLE,
+        DEVIN_NATIVE_TERMINAL_ROLE,
+    }
+)
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -1160,30 +1183,9 @@ class SessionResourceRegistry:
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
-        emit_status = status_publisher is not None and resource_role in {
-            CLAUDE_NATIVE_TERMINAL_ROLE,
-            PI_NATIVE_TERMINAL_ROLE,
-            # cursor-native has no forwarder/hook (run_turn returns immediately
-            # after the paste), so — like pi/claude — the PTY watcher is its only
-            # status source. Without this the web "Working…" badge never clears.
-            CURSOR_NATIVE_TERMINAL_ROLE,
-            KIRO_NATIVE_TERMINAL_ROLE,
-            # goose-native injects then returns (its forwarder only mirrors the
-            # transcript, not status), so the PTY watcher is its status source too.
-            GOOSE_NATIVE_TERMINAL_ROLE,
-            # qwen-native appends then returns (its forwarder only mirrors the
-            # JSON event transcript, not status), so the PTY watcher is its
-            # status source too.
-            QWEN_NATIVE_TERMINAL_ROLE,
-            # kimi-native also has no forwarder/hook (the injection run_turn
-            # returns right after the tmux paste), so the PTY watcher is its
-            # only running/idle status source — same as cursor/pi/claude.
-            KIMI_NATIVE_TERMINAL_ROLE,
-            # hermes-native injects then returns (its forwarder only mirrors the
-            # SQLite transcript, not status), so the PTY watcher is its status
-            # source too.
-            HERMES_NATIVE_TERMINAL_ROLE,
-        }
+        emit_status = (
+            status_publisher is not None and resource_role in _STATUS_EMITTING_TERMINAL_ROLES
+        )
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
         resource_id = terminal_resource_id(terminal_name, session_key)

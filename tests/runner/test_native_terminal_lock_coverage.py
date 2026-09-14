@@ -54,6 +54,19 @@ def test_extra_community_key_does_not_trip_the_guard() -> None:
     assert _require_full_native_lock_coverage(dispatch) is dispatch
 
 
+def test_devin_drives_web_status_from_the_pty_watcher() -> None:
+    # devin-native's run_turn injects and returns, so the runner's PTY-activity
+    # watcher is its only top-level running/idle status source. Absent from this
+    # set, the web "Working…" spinner never clears and the turn times out (the
+    # class of bug that left devin turns stuck on "Starting up…").
+    from omnigent.runner.resource_registry import (
+        _STATUS_EMITTING_TERMINAL_ROLES,
+        DEVIN_NATIVE_TERMINAL_ROLE,
+    )
+
+    assert DEVIN_NATIVE_TERMINAL_ROLE in _STATUS_EMITTING_TERMINAL_ROLES
+
+
 def test_devin_is_wired_into_interrupt_and_stop() -> None:
     # devin's Stop/interrupt route through the uniform bridge-inject maps; absent
     # entries make the web Stop button a silent no-op (`_UNIFORM_*.get` -> None).
