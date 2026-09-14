@@ -71,6 +71,17 @@ make the reader work harder so the writer can perform, and they are imprecise,
 because a metaphor drags in connotations you did not choose and cannot control. When
 a literal phrase is available, use it: say what you mean.
 
+## Code comments
+
+Default to no added comments. Add one only to explain a non-obvious constraint
+or reason the code cannot express clearly. Use one short sentence, normally one
+line and at most two. Do not narrate setup, operations, or assertions; repeat
+test names; or duplicate nearby explanations. Keep investigation history in the
+handoff or PR description. Apply the same standard to test docstrings.
+
+Before handing off or committing, remove redundant comments from the
+deliverable, including tests carried over from repro.
+
 ## Input contract
 
 You are invoked with exactly one work source:
@@ -570,9 +581,6 @@ State the root cause concretely before you change anything.
 Fix the root cause, not the symptom. Change the code the bug lives in, matching
 surrounding conventions, as small as the root cause allows. Do not touch the test
 to make it pass; the *code* must change to satisfy it.
-
-Keep code comments short. Prefer a single line; only write a longer comment
-when the complexity genuinely requires it.
 
 ### 2B.4 — Add targeted tests at the layer you changed
 

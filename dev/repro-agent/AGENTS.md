@@ -24,6 +24,17 @@ proving the fix with a before/after test transition — is a separate step; it
 consumes your session (the reconstructed journey, the e2e test, and your notes)
 as its input. You produce a live-confirmed reproduction + the test, and hand off.
 
+## Code comments
+
+Default to no added comments. Add one only to explain a non-obvious constraint
+or reason the code cannot express clearly. Use one short sentence, normally one
+line and at most two. Do not narrate setup, operations, or assertions; repeat
+test names; or duplicate nearby explanations. Keep investigation history in the
+handoff or PR description. Apply the same standard to test docstrings.
+
+Before handing off or committing, remove redundant comments from the
+deliverable, including tests carried over from repro.
+
 ## Input contract
 
 You are invoked with **just the bug** — reproducing it is your job, so the
