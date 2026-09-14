@@ -1184,17 +1184,21 @@ def test_compress_image_format_aware_pixel_cap() -> None:
 
 
 @pytest.mark.parametrize(("w", "h"), [(24000, 1200), (1200, 24000)])
-def test_compress_image_extreme_aspect_jpeg_is_draft_reduced(w: int, h: int) -> None:
-    """A wide/tall JPEG (short side < edge cap) is draft-reduced, not full-decoded.
+def test_compress_image_extreme_aspect_jpeg_is_draft_reduced(
+    w: int, h: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wide/tall JPEG (short side < edge cap) is draft-reduced *before* decode.
 
     A square draft target won't downscale an extreme aspect ratio, so without an
-    aspect-preserving target these would decode at full source size (28 MP here).
+    aspect-preserving target these decode at full source size (28.8 MP here) even
+    though the final output is still resized to the edge cap. So assert the
+    dimensions *at decode time* (post-draft, pre-load) — the final-output size
+    alone doesn't catch the full-decode regression.
     """
     import os
-    import warnings
     from io import BytesIO
 
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     from omnigent.runtime.content_resolver import (
         IMAGE_MAX_EDGE_PX,
@@ -1207,10 +1211,24 @@ def test_compress_image_extreme_aspect_jpeg_is_draft_reduced(w: int, h: int) -> 
     data = buffer.getvalue()
     assert len(data) > IMAGE_MODEL_BUDGET_BYTES
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", Image.DecompressionBombWarning)
-        result, _ = compress_image_attachment(data, "image/jpeg")
+    # exif_transpose runs after draft() and before load(), so the image size it
+    # sees is the size the decoder will actually materialize. Capture it.
+    decode_sizes: list[tuple[int, int]] = []
+    real_transpose = ImageOps.exif_transpose
 
+    def _spy(image: Image.Image, **kwargs: object) -> Image.Image | None:
+        decode_sizes.append(image.size)
+        return real_transpose(image, **kwargs)
+
+    monkeypatch.setattr(ImageOps, "exif_transpose", _spy)
+
+    result, _ = compress_image_attachment(data, "image/jpeg")
+
+    # draft() must reduce the long edge toward the cap (its result lands in
+    # [cap, 2*cap)); a full decode of the 24000 px source would blow past this.
+    assert decode_sizes, "exif_transpose was not called"
+    assert max(decode_sizes[0]) < 2 * IMAGE_MAX_EDGE_PX
+    # …and the final output is still within the edge cap.
     with Image.open(BytesIO(result)) as out:
         assert max(out.width, out.height) <= IMAGE_MAX_EDGE_PX
 
