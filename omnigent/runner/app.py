@@ -6146,6 +6146,44 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_devin_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+
+        # Devin has no `/effort`: effort is a suffix on the model id, so an effort
+        # switch is a `/model <family+effort>` re-inject. Re-compose the session's
+        # pinned model with the new effort. With no pinned model there is nothing
+        # to re-inject now — the executor still composes it on the next turn.
+        model = await _fetch_session_model_override(conv_id)
+        if not model or not model.strip():
+            return Response(status_code=204)
+        composed = await asyncio.to_thread(resolve_devin_launch_model, model.strip(), effort)
+        if not composed:
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=composed,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_effort_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native effort change"),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
@@ -9191,7 +9229,7 @@ def create_runner_app(
                 _session_reasoning_effort[conversation_id] = effort
             else:
                 _session_reasoning_effort.pop(conversation_id, None)
-            if harness in ("claude-native", "codex-native", "pi-native"):
+            if harness in ("claude-native", "codex-native", "pi-native", "devin-native"):
                 if harness == "codex-native":
                     return await _handle_codex_native_settings_update(
                         conversation_id,
@@ -9199,6 +9237,11 @@ def create_runner_app(
                     )
                 if harness == "pi-native":
                     return await _handle_pi_native_effort_change(
+                        conversation_id,
+                        effort,
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_effort_change(
                         conversation_id,
                         effort,
                     )
