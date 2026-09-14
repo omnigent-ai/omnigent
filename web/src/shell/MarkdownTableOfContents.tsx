@@ -1,6 +1,13 @@
 // Table of contents for markdown files, extracted from rendered heading elements.
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  useRegisterAction,
+} from "@/actions";
 import { SearchIcon, XIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -134,17 +141,19 @@ export function MarkdownTableOfContents({
     }
   }, [open]);
 
-  // Close on Escape key
-  useEffect(() => {
-    if (!open || !onClose) return;
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", handleEscape);
-    return () => window.removeEventListener("keydown", handleEscape);
-  }, [open, onClose]);
+  const actionScope = useActionScopeRegistration({
+    mode: "markdownToc",
+    active: open && headings.length > 0 && Boolean(onClose),
+  });
+  useRegisterAction("panel.action.closeMarkdownToc", {
+    scope: actionScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open || !onClose || headings.length === 0) return NOT_HANDLED;
+      onClose();
+      return HANDLED;
+    },
+  });
 
   // Filter headings based on search text
   const filteredHeadings = useMemo(() => {
@@ -180,70 +189,73 @@ export function MarkdownTableOfContents({
 
   return (
     <nav
+      {...actionScope.rootProps}
       className={cn(
         "sticky top-0 h-screen border-l border-border bg-card flex flex-col overflow-hidden",
       )}
       aria-label="Table of contents"
     >
-      {/* Header with search */}
-      <div className="shrink-0 border-b border-border p-4">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold text-foreground">On this page</h2>
-          {onClose && (
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded p-1 hover:bg-muted transition-colors"
-              aria-label="Close table of contents"
-            >
-              <XIcon className="size-4" />
-            </button>
+      <ActionScopeProvider scope={actionScope}>
+        {/* Header with search */}
+        <div className="shrink-0 border-b border-border p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-foreground">On this page</h2>
+            {onClose && (
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded p-1 hover:bg-muted transition-colors"
+                aria-label="Close table of contents"
+              >
+                <XIcon className="size-4" />
+              </button>
+            )}
+          </div>
+
+          {/* Filter input */}
+          <div className="relative">
+            <SearchIcon className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+            <input
+              ref={searchInputRef}
+              type="text"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+              placeholder="Filter headings"
+              className="w-full rounded-md border border-border bg-background pl-9 pr-3 py-1.5 text-sm outline-none focus:border-primary focus:ring-1 focus:ring-primary"
+            />
+          </div>
+        </div>
+
+        {/* Scrollable headings list */}
+        <div className="flex-1 overflow-y-auto px-4 py-2">
+          {filteredHeadings.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No matching headings</p>
+          ) : (
+            <ul className="space-y-1.5 text-sm">
+              {filteredHeadings.map((heading) => (
+                <li
+                  key={heading.id}
+                  style={{ paddingLeft: `${(heading.level - 1) * 0.75}rem` }}
+                  className="leading-snug"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleClick(heading.id)}
+                    className={cn(
+                      "block w-full text-left transition-colors hover:text-foreground rounded px-2 py-1",
+                      activeId === heading.id
+                        ? "font-medium text-foreground bg-muted"
+                        : "text-muted-foreground",
+                    )}
+                  >
+                    {heading.text}
+                  </button>
+                </li>
+              ))}
+            </ul>
           )}
         </div>
-
-        {/* Filter input */}
-        <div className="relative">
-          <SearchIcon className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
-          <input
-            ref={searchInputRef}
-            type="text"
-            value={filterText}
-            onChange={(e) => setFilterText(e.target.value)}
-            placeholder="Filter headings"
-            className="w-full rounded-md border border-border bg-background pl-9 pr-3 py-1.5 text-sm outline-none focus:border-primary focus:ring-1 focus:ring-primary"
-          />
-        </div>
-      </div>
-
-      {/* Scrollable headings list */}
-      <div className="flex-1 overflow-y-auto px-4 py-2">
-        {filteredHeadings.length === 0 ? (
-          <p className="text-sm text-muted-foreground py-4 text-center">No matching headings</p>
-        ) : (
-          <ul className="space-y-1.5 text-sm">
-            {filteredHeadings.map((heading) => (
-              <li
-                key={heading.id}
-                style={{ paddingLeft: `${(heading.level - 1) * 0.75}rem` }}
-                className="leading-snug"
-              >
-                <button
-                  type="button"
-                  onClick={() => handleClick(heading.id)}
-                  className={cn(
-                    "block w-full text-left transition-colors hover:text-foreground rounded px-2 py-1",
-                    activeId === heading.id
-                      ? "font-medium text-foreground bg-muted"
-                      : "text-muted-foreground",
-                  )}
-                >
-                  {heading.text}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+      </ActionScopeProvider>
     </nav>
   );
 }

@@ -226,6 +226,12 @@ const definitions = [
     palette: false,
   },
   {
+    id: "terminal.action.new",
+    title: "New shell",
+    category: "Terminal",
+    palette: false,
+  },
+  {
     id: "terminal.action.sendSequence",
     title: "Send terminal sequence",
     category: "Terminal",
@@ -235,25 +241,25 @@ const definitions = [
     id: "panel.action.closeFiles",
     title: "Close files panel",
     category: "View",
-    palette: true,
+    palette: false,
   },
   {
     id: "panel.action.closeTerminals",
     title: "Close terminals panel",
     category: "View",
-    palette: true,
+    palette: false,
   },
   {
     id: "panel.action.closeExecutionLogs",
     title: "Close execution logs",
     category: "View",
-    palette: true,
+    palette: false,
   },
   {
     id: "panel.action.closeMarkdownToc",
     title: "Close table of contents",
     category: "View",
-    palette: true,
+    palette: false,
   },
 ] as const satisfies readonly ActionDefinition[];
 

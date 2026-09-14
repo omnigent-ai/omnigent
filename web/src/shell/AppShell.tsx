@@ -9,7 +9,7 @@ import {
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
+import { useNewShellAction } from "@/hooks/useNewShellAction";
 import { useApprovalAction } from "@/hooks/useApprovalAction";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
@@ -1633,7 +1633,7 @@ export function AppShell() {
     clearShellCreatePending,
     openTerminalTab,
   ]);
-  useNewShellHotkey(launchDefaultShell, shellLaunchable);
+  useNewShellAction(launchDefaultShell, shellLaunchable);
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, waitFor, fireEvent, act } from "@testing-library/react";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 import { useRef, useEffect } from "react";
 
@@ -36,7 +37,7 @@ function installControllableObserver() {
 }
 
 // Renders the TOC over a DOM with three headings and a scrollable container.
-function renderThreeHeadingToc() {
+function renderThreeHeadingToc(onClose?: () => void) {
   function Wrapper() {
     const ref = useRef<HTMLDivElement>(null);
     useEffect(() => {
@@ -52,10 +53,17 @@ function renderThreeHeadingToc() {
       }
     }, []);
     return (
-      <div>
-        <div ref={ref} />
-        <MarkdownTableOfContents content="# Alpha\n## Beta\n## Gamma" containerRef={ref} />
-      </div>
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        <div>
+          <div ref={ref} />
+          <MarkdownTableOfContents
+            content="# Alpha\n## Beta\n## Gamma"
+            containerRef={ref}
+            onClose={onClose}
+          />
+        </div>
+      </ActionsProvider>
     );
   }
   return render(<Wrapper />);
@@ -68,6 +76,14 @@ function isActive(container: HTMLElement, text: string): boolean {
 }
 
 describe("MarkdownTableOfContents", () => {
+  it("closes through the centralized Escape action", async () => {
+    const onClose = vi.fn();
+    const { container } = renderThreeHeadingToc(onClose);
+    await waitFor(() => expect(container.querySelector("nav")).toBeInTheDocument());
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it("should extract headings from rendered DOM", async () => {
     const content = `# Main Title
 Some content here.

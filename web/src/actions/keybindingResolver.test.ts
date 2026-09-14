@@ -118,6 +118,31 @@ describe("keybinding resolver", () => {
     ).toEqual(["focused-composer", "global", "active-file"]);
   });
 
+  it("ranks a focused active mode ahead of global and background active rules", () => {
+    const rules = [
+      testRule("focused-panel", "escape", {
+        mode: "terminalsPanel",
+        activation: "active",
+      }),
+      testRule("global-active", "escape", { activation: "active" }),
+      testRule("background-panel", "escape", {
+        mode: "filesPanel",
+        activation: "active",
+      }),
+    ];
+    expect(
+      matchingKeybindingRules(rules, event("Escape"), 0, "bubble", {
+        ...environment,
+        focusedModes: new Set(["global", "terminalsPanel"]),
+        activeModes: new Set(["global", "filesPanel", "terminalsPanel"]),
+        focusedModeRanks: new Map([
+          ["global", 0],
+          ["terminalsPanel", 1],
+        ]),
+      }).map((rule) => rule.id),
+    ).toEqual(["focused-panel", "global-active", "background-panel"]);
+  });
+
   it("sorts by priority, context specificity, then later rule", () => {
     const context = { ...EMPTY_ACTION_CONTEXT, terminalFocus: true };
     const rules = [

@@ -36,6 +36,7 @@ export const ACTION_IDS = [
   "file.action.closeSearch",
   "file.action.close",
   "terminal.action.sendSequence",
+  "terminal.action.new",
   "panel.action.closeFiles",
   "panel.action.closeTerminals",
   "panel.action.closeExecutionLogs",

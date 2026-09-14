@@ -101,6 +101,7 @@ describe("default keybindings", () => {
         "session.action.new",
         "session.action.openPinned",
         "workbench.action.openKeyboardShortcuts",
+        "terminal.action.new",
         "workbench.action.toggleConversationsSidebar",
         "workbench.action.toggleWorkspaceSidebar",
         "composer.action.toggleDictation",

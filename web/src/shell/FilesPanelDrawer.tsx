@@ -13,6 +13,13 @@
 // drawer doesn't duplicate the panel's header chrome.
 
 import { useEffect, useRef } from "react";
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  useRegisterAction,
+} from "@/actions";
 
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { cn } from "@/lib/utils";
@@ -60,15 +67,16 @@ export function FilesPanelDrawer({
 }: FilesPanelDrawerProps) {
   const { panelWidth, handleProps, isDesktop } = useResizablePanel(open);
   const ref = useRef<HTMLElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  const actionScope = useActionScopeRegistration({ mode: "filesPanel", active: open });
+  useRegisterAction("panel.action.closeFiles", {
+    scope: actionScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open) return NOT_HANDLED;
+      onClose();
+      return HANDLED;
+    },
+  });
 
   useEffect(() => {
     if (ref.current) {
@@ -82,6 +90,7 @@ export function FilesPanelDrawer({
 
   return (
     <aside
+      {...actionScope.rootProps}
       ref={ref}
       data-testid="files-panel-drawer"
       data-state={open ? "open" : "closed"}
@@ -96,27 +105,29 @@ export function FilesPanelDrawer({
       aria-hidden={!open}
       data-collapsed={!open || undefined}
     >
-      {isDesktop && (
-        <div
-          {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
-        />
-      )}
-      {/* FilesPanel switches to its full-screen layout when `onClose`
+      <ActionScopeProvider scope={actionScope}>
+        {isDesktop && (
+          <div
+            {...handleProps}
+            className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          />
+        )}
+        {/* FilesPanel switches to its full-screen layout when `onClose`
           is set: it owns the header (title + X close button) and
           fills the parent's height. Mount it only while open so the
           folder tree initializes from the latest inline-panel state. */}
-      {open && (
-        <FilesPanel
-          onFileSelect={onFileSelect}
-          flatView={flatView}
-          showHidden={showHidden}
-          onShowHiddenChange={onShowHiddenChange}
-          sort={sort}
-          onSortChange={onSortChange}
-          onClose={onClose}
-        />
-      )}
+        {open && (
+          <FilesPanel
+            onFileSelect={onFileSelect}
+            flatView={flatView}
+            showHidden={showHidden}
+            onShowHiddenChange={onShowHiddenChange}
+            sort={sort}
+            onSortChange={onSortChange}
+            onClose={onClose}
+          />
+        )}
+      </ActionScopeProvider>
     </aside>
   );
 }

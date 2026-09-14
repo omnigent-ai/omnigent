@@ -9,7 +9,6 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
@@ -21,7 +20,6 @@ import {
   parseTerminalClipboardMessage,
   sgrWheelReports,
   terminalTheme,
-  terminalKeyEventPayload,
   type ConnectionState,
   wheelReportPayload,
   type WheelMouseState,
@@ -202,87 +200,6 @@ describe("terminalTheme", () => {
     expect(theme.background).toBe("#131517");
     expect(theme.foreground).toBe("#e4e4e7");
     expect(theme.brightBlack).toBe("#71717a");
-  });
-});
-
-describe("terminalKeyEventPayload", () => {
-  function keyEvent(init: KeyboardEventInit): KeyboardEvent {
-    return new KeyboardEvent("keydown", init);
-  }
-
-  it("encodes Shift+Enter as Kitty CSI-u", () => {
-    const payload = terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true }));
-
-    // This is the byte sequence prompt-toolkit maps to F20, which the
-    // REPL binds to "insert newline". Returning "\x1b\r" here would be
-    // the old Alt+Enter fallback, not Kitty/CSI-u support.
-    expect(payload).toBe(SHIFT_ENTER_CSI_U);
-    expect(payload).toBe("\x1b[13;2u");
-  });
-
-  it("maps macOS Cmd line shortcuts to their readline control bytes", () => {
-    // WHY: Option+key works because xterm encodes Alt as ESC-prefixes, but
-    // Cmd (metaKey) combos reach neither xterm nor the PTY — native-terminal
-    // line editing (delete to start / home / end) silently did nothing.
-    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true }))).toBe("\x15");
-    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true }))).toBe("\x01");
-    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowRight", metaKey: true }))).toBe("\x05");
-  });
-
-  it("keeps browser-owned Cmd combos off the mapping", () => {
-    // Cmd+C/V/K/R (copy/paste/clear/reload) and every Cmd combo with another
-    // modifier must keep their browser meaning — only the bare three
-    // line-editing combos are synthesized.
-    expect(terminalKeyEventPayload(keyEvent({ key: "c", metaKey: true }))).toBeNull();
-    expect(terminalKeyEventPayload(keyEvent({ key: "v", metaKey: true }))).toBeNull();
-    expect(terminalKeyEventPayload(keyEvent({ key: "k", metaKey: true }))).toBeNull();
-    expect(terminalKeyEventPayload(keyEvent({ key: "r", metaKey: true }))).toBeNull();
-    // Meta combined with another modifier (e.g. Cmd+Shift+Backspace, or a
-    // Windows-flag AltGr-adjacent event) stays on the default path.
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true, shiftKey: true })),
-    ).toBeNull();
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true, altKey: true })),
-    ).toBeNull();
-    // Plain, unmodified keys never hit the mapping either.
-    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace" }))).toBeNull();
-  });
-
-  it("leaves plain Enter on xterm's default path", () => {
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter" }))).toBeNull();
-  });
-
-  it("releases Shift+Enter to xterm during an IME composition", () => {
-    // xterm consults the custom handler BEFORE its CompositionHelper; claiming
-    // the key mid-conversion skips the helper's finalize path and the composed
-    // text is dropped. The payload must be null so xterm runs composition
-    // handling instead of us sending CSI-u bytes to the PTY.
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, isComposing: true })),
-    ).toBeNull();
-    // The 229 keyCode path (Safari/legacy) cannot be set through the
-    // constructor init dict, so exercise it with a stub.
-    expect(
-      terminalKeyEventPayload({
-        key: "Enter",
-        shiftKey: true,
-        keyCode: 229,
-      } as unknown as KeyboardEvent),
-    ).toBeNull();
-    // Without either composition signal the CSI-u payload still applies.
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true }))).toBe(
-      SHIFT_ENTER_CSI_U,
-    );
-  });
-
-  it("does not override other modified Enter combinations", () => {
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", altKey: true }))).toBeNull();
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", ctrlKey: true }))).toBeNull();
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", metaKey: true }))).toBeNull();
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
-    ).toBeNull();
   });
 });
 
@@ -742,6 +659,21 @@ describe("TerminalSession", () => {
     socket.open();
 
     expect(focusSpy).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("sends semantic action input through the normal activity path", () => {
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+    session.sendInput("before-open");
+    expect(onInput).toHaveBeenCalledOnce();
+    expect(socket.sent).toHaveLength(0);
+
+    socket.open();
+    session.sendInput("\x1b[13;2u");
+    expect(onInput).toHaveBeenCalledTimes(2);
+    const payload = socket.sent.find((message) => ArrayBuffer.isView(message));
+    expect(Array.from(payload as Uint8Array)).toEqual([27, 91, 49, 51, 59, 50, 117]);
     session.dispose();
   });
 

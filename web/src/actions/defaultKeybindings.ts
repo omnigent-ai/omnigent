@@ -42,6 +42,9 @@ function rule<A extends ActionId>(
   } as KeybindingRule<A>;
 }
 
+// prompt-toolkit maps CSI-u Shift+Enter to F20; ESC+CR is the old Alt+Enter fallback.
+const SHIFT_ENTER_CSI_U = "\u001b[13;2u";
+
 const composerEnterSends = not(when(CONTEXT_KEYS.composerEnterInserts));
 const composerSubmitWithModEnter = when(CONTEXT_KEYS.composerSubmitWithModEnter);
 const composerSubmitWithPlainEnter = not(composerSubmitWithModEnter);
@@ -300,13 +303,44 @@ export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
     when: and(not(when(CONTEXT_KEYS.fileSearchOpen)), notInputFocus),
   }),
 
-  rule("terminal.sendShiftEnter", "terminal.action.sendSequence", "shift+enter", {
+  rule("terminal.new", "terminal.action.new", "mod+alt+[KeyT]", {
+    when: and(notMonacoFocus, notTerminalFocus),
+    allowDefaultPrevented: true,
+    stopPropagation: true,
+  }),
+  rule("terminal.killLine", "terminal.action.sendSequence", "meta+backspace", {
     mode: "terminal",
-    args: { data: "\u001b[13;2u" },
+    args: { data: "\u0015" },
+    when: when(CONTEXT_KEYS.terminalFocus),
     phase: "capture",
     allowRepeat: true,
     stopPropagation: true,
   }),
+  rule("terminal.lineStart", "terminal.action.sendSequence", "meta+arrowleft", {
+    mode: "terminal",
+    args: { data: "\u0001" },
+    when: when(CONTEXT_KEYS.terminalFocus),
+    phase: "capture",
+    allowRepeat: true,
+    stopPropagation: true,
+  }),
+  rule("terminal.lineEnd", "terminal.action.sendSequence", "meta+arrowright", {
+    mode: "terminal",
+    args: { data: "\u0005" },
+    when: when(CONTEXT_KEYS.terminalFocus),
+    phase: "capture",
+    allowRepeat: true,
+    stopPropagation: true,
+  }),
+  rule("terminal.sendShiftEnter", "terminal.action.sendSequence", "shift+enter", {
+    mode: "terminal",
+    args: { data: SHIFT_ENTER_CSI_U },
+    when: when(CONTEXT_KEYS.terminalFocus),
+    phase: "capture",
+    allowRepeat: true,
+    stopPropagation: true,
+  }),
+  // Active panel ties intentionally resolve by this bottom-to-top layering order.
   rule("panel.closeFiles", "panel.action.closeFiles", "escape", {
     mode: "filesPanel",
     activation: "active",

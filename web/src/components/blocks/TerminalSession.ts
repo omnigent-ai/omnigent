@@ -186,62 +186,6 @@ export type TerminalActivityListener = () => void;
 /** Listener for user keyboard input sent to the terminal. */
 export type TerminalInputListener = () => void;
 
-/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
-export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
-
-/** Readline line-editing bytes for the macOS Cmd key mappings below. */
-export const CMD_BACKSPACE_LINE_KILL = "\x15"; // Ctrl-U: kill to line start
-export const CMD_LEFT_LINE_START = "\x01"; // Ctrl-A: cursor to line start
-export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
-
-/**
- * Return the terminal bytes to send for a browser key event.
- *
- * Two key families need synthesized bytes because neither xterm.js nor the
- * browser produces them:
- *
- * - **Shift+Enter** — xterm does not emit Kitty Keyboard Protocol sequences
- *   for it, so the browser attach path synthesizes the CSI-u sequence,
- *   mirroring native terminals that support CSI-u while keeping plain Enter
- *   and modified Enter variants on xterm's default path.
- * - **macOS Cmd+Backspace / Cmd+Left / Cmd+Right** — the standard
- *   readline-style line shortcuts. The Option (Alt) equivalents work because
- *   xterm encodes Alt-modified keys as ESC-prefixed sequences that
- *   readline/zsh read as word operations; Cmd (metaKey) combos get no
- *   encoding at all — the browser eats them and nothing reaches the PTY.
- *   Each maps to the Ctrl control character a native terminal sends. Only
- *   bare Cmd combos are mapped: Cmd+C/V/K/R and friends keep their
- *   browser/xterm meaning (copy/paste/clear/reload).
- *
- * :param event: Browser keyboard event from xterm's custom key handler.
- * :returns: Bytes to send instead of xterm's default handling, or ``null``
- *     to let xterm handle the event normally.
- */
-export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
-  // An in-flight IME composition owns the keyboard: xterm consults this
-  // handler BEFORE its CompositionHelper, so claiming a key mid-conversion
-  // would drop the composed text. Return null so xterm runs composition
-  // handling (keyCode 229 is the legacy composition signal).
-  if (event.isComposing || event.keyCode === 229) {
-    return null;
-  }
-  if (
-    event.key === "Enter" &&
-    event.shiftKey &&
-    !event.altKey &&
-    !event.ctrlKey &&
-    !event.metaKey
-  ) {
-    return SHIFT_ENTER_CSI_U;
-  }
-  if (event.metaKey && !event.altKey && !event.ctrlKey && !event.shiftKey) {
-    if (event.key === "Backspace") return CMD_BACKSPACE_LINE_KILL;
-    if (event.key === "ArrowLeft") return CMD_LEFT_LINE_START;
-    if (event.key === "ArrowRight") return CMD_RIGHT_LINE_END;
-  }
-  return null;
-}
-
 // Reused across keystrokes — allocating a fresh TextEncoder per keypress
 // is needless churn on the input hot path.
 const INPUT_ENCODER = new TextEncoder();
@@ -521,6 +465,7 @@ export class TerminalSession {
   private readonly osc52Dispose: { dispose: () => void };
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
+  private readonly onInput?: TerminalInputListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
   /**
@@ -578,6 +523,7 @@ export class TerminalSession {
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
+    this.onInput = onInput;
     // Read the user's code-font preference (Settings → Appearance) at
     // construction; a mid-session change is applied live via setFont(). The
     // xterm.js defaults (15px, no theme) feel out of place inside the app
@@ -691,31 +637,7 @@ export class TerminalSession {
       { signal },
     );
 
-    this.dataDispose = this.term.onData((d) => {
-      onInput?.();
-      // Stamp before the readyState guard so clipboard trust still reflects
-      // local input during a momentary WebSocket hiccup.
-      this.lastUserInputAt = performance.now();
-      if (this.ws.readyState !== WebSocket.OPEN) return;
-      this.ws.send(INPUT_ENCODER.encode(d));
-    });
-
-    this.term.attachCustomKeyEventHandler((e) => {
-      const payload = terminalKeyEventPayload(e);
-      if (payload === null) return true;
-      // xterm invokes this handler for keydown, keypress, and keyup.
-      // Suppress all three so xterm cannot also send a bare Enter; emit
-      // the CSI-u sequence once, on keydown.
-      if (e.type === "keydown") {
-        e.preventDefault();
-        onInput?.();
-        this.lastUserInputAt = performance.now();
-        if (this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(INPUT_ENCODER.encode(payload));
-        }
-      }
-      return false;
-    });
+    this.dataDispose = this.term.onData((data) => this.sendInput(data));
 
     // Replace xterm's lossy wheel→mouse-report conversion (trackpad deltas
     // are damped and capped to one report per event, which reads as
@@ -763,6 +685,16 @@ export class TerminalSession {
   /** Enable clipboard bridging only for the visible, interactive surface. */
   setClipboardEnabled(enabled: boolean): void {
     this.clipboardEnabled = enabled;
+  }
+
+  /** Send user input through the same activity and trust-accounting path. */
+  sendInput(data: string): void {
+    this.onInput?.();
+    this.lastUserInputAt = performance.now();
+    // Record intent before the transport gate so a brief disconnect preserves clipboard trust.
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(INPUT_ENCODER.encode(data));
+    }
   }
 
   /**
