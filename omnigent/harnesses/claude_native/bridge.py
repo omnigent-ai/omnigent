@@ -519,6 +519,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     if target.is_relative_to(cursor_root):
         return _absolute_syntactic_path(cursor_root.parent.parent)
 
+    from omnigent.harnesses.devin_native.bridge import bridge_root as devin_bridge_root
+
+    devin_root = _absolute_syntactic_path(devin_bridge_root())
+    if target.is_relative_to(devin_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/devin-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(devin_root.parent.parent)
+
     from omnigent.harnesses.antigravity_native.bridge import bridge_root as antigravity_bridge_root
 
     # antigravity-native keeps its bridge files below ``~/.omnigent/antigravity-native``,
@@ -592,8 +601,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s}, {acp_root!s}, {router_root!s})"
+        f"{devin_root!s}, {antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, "
+        f"{opencode_root!s}, {kiro_root!s}, {acp_root!s}, {router_root!s})"
     )
 
 

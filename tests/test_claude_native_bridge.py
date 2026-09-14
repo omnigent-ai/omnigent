@@ -612,6 +612,40 @@ def test_trusted_parent_accepts_kiro_native_bridge_dir(
     assert trusted == claude_native_bridge._absolute_syntactic_path(kiro_root.parent.parent)
 
 
+def test_trusted_parent_accepts_devin_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts devin-native bridge dirs.
+
+    devin-native keeps its bridge files under its own uid-scoped temp root
+    (``$TMPDIR/omnigent-<uid>/devin-native``), the same shape as cursor-native.
+    Without the devin branch, the comment/tool relay's
+    ``start_tool_relay`` -> ``_ensure_secure_dir`` ->
+    ``_trusted_parent_for_bridge_dir`` raises ``not under an allowed bridge
+    root`` and the relay never starts for devin sessions. This pins the
+    devin-native branch.
+    """
+    from omnigent.harnesses.devin_native import bridge as devin_native_bridge
+
+    # Distinct claude root so the devin target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    # devin root mirrors production shape: <uid-scoped temp>/devin-native.
+    devin_root = tmp_path / "omnigent-test" / "devin-native"
+    monkeypatch.setattr(devin_native_bridge, "_BRIDGE_ROOT", devin_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(devin_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(devin_root.parent.parent)
+
+
 def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
