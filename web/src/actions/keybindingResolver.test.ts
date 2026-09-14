@@ -143,6 +143,18 @@ describe("keybinding resolver", () => {
     ).toEqual(["focused-panel", "global-active", "background-panel"]);
   });
 
+  it("prefers a user rule over an otherwise-equal later default", () => {
+    const rules = [
+      testRule("user", "primary+k", { origin: "user" }),
+      testRule("default", "primary+k", { origin: "default" }),
+    ];
+    expect(
+      matchingKeybindingRules(rules, event("k", { ctrlKey: true }), 0, "bubble", environment).map(
+        (rule) => rule.id,
+      ),
+    ).toEqual(["user", "default"]);
+  });
+
   it("sorts by priority, context specificity, then later rule", () => {
     const context = { ...EMPTY_ACTION_CONTEXT, terminalFocus: true };
     const rules = [
