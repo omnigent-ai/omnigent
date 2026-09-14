@@ -13,12 +13,13 @@ import pytest
 
 import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.native import owner_claim
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
-@pytest.mark.parametrize("ownership", ["legacy", "foreign", "unreadable"])
+@pytest.mark.parametrize("ownership", ["legacy", "foreign", "unreadable", "dead-local"])
 @pytest.mark.asyncio
-async def test_orphan_sweep_preserves_live_terminal_with_unknown_ownership(
+async def test_orphan_sweep_uses_resolvable_ownership(
     monkeypatch: pytest.MonkeyPatch, ownership: str
 ) -> None:
     """Run the production sweep against an isolated, live terminal socket."""
@@ -59,16 +60,25 @@ async def test_orphan_sweep_preserves_live_terminal_with_unknown_ownership(
             child.wait(timeout=5)
             assert not terminal_mod._process_alive(child.pid)
             marker = str(child.pid)
-            if ownership == "foreign":
-                marker += "\npid_ns=pid:[foreign]\n"
-            elif ownership == "unreadable":
-                marker += "\npid_ns=none\n"
-                monkeypatch.setattr(terminal_mod, "_current_pid_ns", lambda: None)
+            if ownership != "legacy":
+                namespace = (
+                    "pid:[foreign]"
+                    if ownership == "foreign"
+                    else owner_claim.current_pid_namespace()
+                )
+                marker += f"\npid_ns={namespace}\nboot={owner_claim.current_boot_id() or ''}\n"
+            if ownership == "unreadable":
+                monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: None)
             (instance_dir / "owner.pid").write_text(marker, encoding="utf-8")
 
-            assert terminal_mod.reap_orphaned_terminals() == 0
-            assert reachable()
-            assert instance_dir.exists()
+            if ownership == "dead-local":
+                assert terminal_mod.reap_orphaned_terminals() == 1
+                assert not reachable()
+                assert not instance_dir.exists()
+            else:
+                assert terminal_mod.reap_orphaned_terminals() == 0
+                assert reachable()
+                assert instance_dir.exists()
         finally:
             with contextlib.suppress(Exception):
                 await instance.close()

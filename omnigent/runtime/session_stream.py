@@ -163,6 +163,8 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         if isinstance(item.get("type"), str):
             attrs["item_type"] = item["type"]
     error = event.get("error")
+    if not isinstance(error, dict) and isinstance(response, dict):
+        error = response.get("error")
     if isinstance(error, dict):
         if error.get("code") is not None:
             attrs["error_code"] = error["code"]
@@ -209,6 +211,8 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
         if isinstance(response, dict) and isinstance(response.get("id"), str):
             attributes["response_id"] = response["id"]
         error = event.get("error")
+        if not isinstance(error, dict) and isinstance(response, dict):
+            error = response.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
         impact = _TURN_OUTCOME_IMPACT.get(outcome)

@@ -1398,6 +1398,7 @@ export function AppShell() {
   // embedded build we claim the chord ahead of any host-page ⌘K listener.
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState(false);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -1409,9 +1410,23 @@ export function AppShell() {
     setSidebarOpen(true);
     setSidebarPeek(false);
   }, []);
-  const handleOpenSearch = useCallback(() => setCommandPaletteOpen(true), []);
+  const handleOpenSearch = useCallback(() => {
+    setSessionSearch(false);
+    setCommandPaletteOpen(true);
+  }, []);
   const isEmbedded = useIsEmbedded();
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
+  useCommandPaletteHotkey(
+    () => {
+      setSessionSearch(false);
+      setCommandPaletteOpen((prev) => sessionSearch || !prev);
+    },
+    true,
+    undefined,
+    () => {
+      setSessionSearch(true);
+      setCommandPaletteOpen((prev) => !sessionSearch || !prev);
+    },
+  );
   useNewSessionHotkey(!isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes
@@ -1964,7 +1979,7 @@ export function AppShell() {
                     }
                     setSidebarPeek(false);
                   }}
-                  onOpenSearch={() => setCommandPaletteOpen(true)}
+                  onOpenSearch={handleOpenSearch}
                   // Dwell-to-peek moves here with the button: on mac this cluster
                   // replaces ChatHeader's collapsed-state toggle, which is where
                   // peek was armed, so without this the affordance would vanish.
@@ -2321,6 +2336,8 @@ export function AppShell() {
               there even though the ⌘K hotkey is disabled (it belongs to the
               host page). */}
           <CommandPalette
+            key={sessionSearch ? "sessions" : "commands"}
+            sessionsOnly={sessionSearch}
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}

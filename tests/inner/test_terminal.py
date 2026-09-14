@@ -25,6 +25,7 @@ from omnigent.inner.terminal import (
     _is_utf8_locale_value,
     create_terminal_instance,
 )
+from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
@@ -1854,10 +1855,10 @@ def _write_instance_dir(
         (instance_dir / "owner.pid").write_text(str(owner_pid), encoding="utf-8")
         return instance_dir
     lines = [str(owner_pid)]
-    effective_ns = pid_ns if pid_ns is not None else terminal_mod._current_pid_ns()
+    effective_ns = pid_ns if pid_ns is not None else owner_claim.current_pid_namespace()
     if effective_ns is not None:
         lines.append(f"pid_ns={effective_ns}")
-    effective_boot = boot_id if boot_id is not None else terminal_mod._current_boot_id()
+    effective_boot = boot_id if boot_id is not None else owner_claim.current_boot_id()
     if effective_boot is not None:
         lines.append(f"boot={effective_boot}")
     (instance_dir / "owner.pid").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2044,22 +2045,11 @@ def test_reap_orphaned_terminals_keeps_legacy_bare_pid_dirs(
     assert legacy_dir.exists()
 
 
-def test_reap_orphaned_terminals_reaps_dirs_from_a_previous_boot(
+def test_reap_orphaned_terminals_preserves_dirs_from_another_boot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A dir stamped with an earlier boot is garbage regardless of its pid.
-
-    Nothing the marker named survived the reboot — the tmux server
-    included — so the dir is collectable even though the recorded pid
-    is live in this boot (pids are reused across boots, which would
-    otherwise pin the leak forever).
-
-    :param tmp_path: Fake temp root the sweep scans.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
+    """A different boot may belong to a live kernel sharing the scratch root."""
     import os
 
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
@@ -2071,17 +2061,15 @@ def test_reap_orphaned_terminals_reaps_dirs_from_a_previous_boot(
             run=lambda *a, **k: SimpleNamespace(returncode=0), TimeoutExpired=TimeoutError
         ),
     )
-    # A boot id is only published on Linux; elsewhere the marker carries
-    # none and the pid stays the only signal (see _owner_is_gone).
-    monkeypatch.setattr(terminal_mod, "_current_boot_id", lambda: "boot-now")
+    monkeypatch.setattr(owner_claim, "current_boot_id", lambda: "boot-now")
     stale_dir = _write_instance_dir(
         tmp_path, "omnigent-terminal-prevboot", os.getpid(), boot_id="boot-before"
     )
 
     reaped = terminal_mod.reap_orphaned_terminals()
 
-    assert reaped == 1
-    assert not stale_dir.exists()
+    assert reaped == 0
+    assert stale_dir.exists()
 
 
 @pytest.mark.parametrize("marker_namespace", ["none", "pid:[4026599999]"])
@@ -2096,7 +2084,7 @@ def test_orphan_sweep_preserves_terminals_when_linux_namespace_is_unreadable(
     )
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
-    monkeypatch.setattr(terminal_mod, "IS_LINUX", True, raising=False)
+    monkeypatch.setattr(owner_claim, "IS_LINUX", True, raising=False)
 
     def unreadable(path: str) -> str:
         raise PermissionError(path)
@@ -2119,9 +2107,9 @@ def test_orphan_sweep_ignores_malformed_owner_claim(
     (instance_dir / "owner.pid").write_bytes(marker)
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
-    monkeypatch.setattr(terminal_mod, "_current_pid_ns", lambda: "none")
+    monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: "none")
 
-    assert terminal_mod._read_owner_claim(instance_dir) is None
+    assert owner_claim.read_owner_claim(instance_dir) is None
     assert terminal_mod.reap_orphaned_terminals() == 0
     assert instance_dir.exists()
 
@@ -2154,14 +2142,14 @@ def test_create_terminal_instance_records_a_placeable_owner_claim(
             command="bash", os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path))
         ),
     )
-    claim = terminal_mod._read_owner_claim(result.instance.private_dir)
+    claim = owner_claim.read_owner_claim(result.instance.private_dir)
 
     assert claim is not None, "the writer must produce a marker the sweep can parse"
     assert claim.pid == os.getpid()
-    assert claim.pid_ns == terminal_mod._current_pid_ns()
-    assert claim.boot_id == terminal_mod._current_boot_id()
+    assert claim.pid_ns == owner_claim.current_pid_namespace()
+    assert claim.boot_id == owner_claim.current_boot_id()
     # This process owns it and is alive, so it is not collectable.
-    assert terminal_mod._owner_is_gone(claim) is False
+    assert owner_claim.owner_is_gone(claim, process_alive=terminal_mod._process_alive) is False
 
 
 @pytest.mark.skipif(

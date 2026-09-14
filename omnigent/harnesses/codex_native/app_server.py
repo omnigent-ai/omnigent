@@ -723,7 +723,9 @@ class CodexAppServerClient:
         response = await future
         error = response.get("error")
         if error:
-            raise CodexAppServerResponseError(error)
+            exc = CodexAppServerResponseError(error)
+            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            raise exc
         return response
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:

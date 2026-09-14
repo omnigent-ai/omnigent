@@ -8795,7 +8795,14 @@ def create_runner_app(
                     "proxy stream connection error for %s: %s",
                     conv_id,
                     exc,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "harness_stream_failed",
+                        "attributes": {
+                            "harness": harness_name,
+                            "response_id": _response_id,
+                        },
+                    },
                 )
                 _error = {
                     "code": "connection_error",
