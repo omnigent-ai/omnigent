@@ -934,3 +934,47 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
         "error_impact": "blocking",
         "error_phase": "turn",
     }
+
+
+@pytest.mark.parametrize("legacy_error", [False, True])
+def test_failed_event_logs_nested_error_code_without_content(
+    monkeypatch: pytest.MonkeyPatch, legacy_error: bool
+) -> None:
+    """Typed harness failures retain their code in both diagnostic streams."""
+    from omnigent.server.schemas import ErrorDetail, FailedEvent, ResponseObject
+
+    event = FailedEvent(
+        type="response.failed",
+        source="harness",
+        response=ResponseObject(
+            id="resp_failed",
+            status="failed",
+            model="test-agent",
+            created_at=1,
+            error=ErrorDetail(code="runner_error", message="private failure detail"),
+            output=[{"text": "private assistant output"}],
+        ),
+    ).model_dump(mode="json", exclude_none=True)
+    if legacy_error:
+        event["error"] = {"code": "legacy_error", "message": "private legacy detail"}
+    expected_code = "legacy_error" if legacy_error else "runner_error"
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
+        session_stream._log_sse_event("conv_failed", event)
+
+    assert len(sse_records) == len(audit_records) == 1
+    assert sse_records[0].attributes == {
+        "response_id": "resp_failed",
+        "error_code": expected_code,
+    }
+    assert audit_records[0].attributes == {
+        "outcome": "failed",
+        "response_id": "resp_failed",
+        "error_code": expected_code,
+        "error_impact": "blocking",
+        "error_phase": "turn",
+    }
+    for record in [*sse_records, *audit_records]:
+        assert record.session_id == "conv_failed"
+        assert record.levelno == logging.WARNING
+        assert "private" not in record.getMessage()
