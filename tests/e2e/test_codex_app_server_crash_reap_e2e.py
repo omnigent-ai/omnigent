@@ -262,7 +262,7 @@ async def test_session_app_server_reaped_after_host_crash(
 
     server = CodexNativeAppServer(
         codex_path=codex,
-        socket_path=str(root / "app.sock"),
+        socket_path=root / "app.sock",
         codex_home=codex_home,
         env={**os.environ, "CODEX_HOME": str(codex_home)},
         config_overrides=[],
@@ -283,8 +283,7 @@ async def test_session_app_server_reaped_after_host_crash(
         registry_path = codex_native_process_registry_path()
         raw = registry_path.read_text(encoding="utf-8")
         assert f'"pid":{pid}' in raw or f'"pid": {pid}' in raw, (
-            f"session codex app-server (pid={pid}) was not registered. "
-            f"Registry: {raw!r}"
+            f"session codex app-server (pid={pid}) was not registered. Registry: {raw!r}"
         )
 
         # The reap tag must be findable on the REAL running process. Through the
@@ -319,9 +318,8 @@ async def test_session_app_server_reaped_after_host_crash(
         survivors = await _wait_group_terminated(tag)
         assert not survivors, (
             "orphaned codex app-server tree survived reconcile after the owning "
-            f"Host died — it should have been reaped by process group. Still "
-            f"alive (pid -> cmdline): "
-            + repr({p: registry._process_cmdline(p) for p in survivors})
+            "Host died — it should have been reaped by process group. Still "
+            "alive (pid -> cmdline): " + repr({p: registry._process_cmdline(p) for p in survivors})
         )
         reaped = True
     finally:
