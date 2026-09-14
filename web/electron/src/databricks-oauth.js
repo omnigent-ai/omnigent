@@ -12,6 +12,9 @@
 //   OMNIGENT_DATABRICKS_OAUTH_REDIRECT  (default http://localhost; must match the app's registered
 //                                        loopback redirect. Databricks ignores the port per RFC 8252,
 //                                        so an ephemeral free port is bound unless one is pinned.)
+//   OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID      (default "omnigent"; override for a custom test app)
+//   OMNIGENT_DATABRICKS_OAUTH_CLIENT_SECRET  (only for a CONFIDENTIAL test app; unset for the public
+//                                        "omnigent" client, which authenticates with PKCE alone)
 //   OMNIGENT_DATABRICKS_OAUTH_SCOPES    (default "all-apis offline_access")
 //   OMNIGENT_DATABRICKS_OAUTH_FORCE_REFRESH=1  (testing: treat the stored access token as always
 //                                        expired, so the refresh path runs on every connect/reload)
@@ -37,6 +40,10 @@ const DEFAULT_SCOPES = "all-apis offline_access";
 // connector. Overridable via env so a custom app integration can be used for
 // testing before the published "omnigent" connector exists.
 const OAUTH_CLIENT_ID = (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID || "omnigent").trim();
+// The shipped "omnigent" client is public (PKCE, no secret). A confidential
+// custom app used for testing needs its secret sent on token/refresh; unset for
+// a public client, so this is omitted and PKCE alone authenticates.
+const OAUTH_CLIENT_SECRET = (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_SECRET || "").trim();
 // Bound on how long we wait for the human to finish logging in in the browser.
 const AUTH_TIMEOUT_MS = 300_000;
 // Per-request network timeout for the token endpoint (and other back-channel
@@ -242,6 +249,7 @@ async function exchangeCode(issuerOrigin, code, verifier, redirectUri) {
     client_id: OAUTH_CLIENT_ID,
     code_verifier: verifier,
   });
+  if (OAUTH_CLIENT_SECRET) body.set("client_secret", OAUTH_CLIENT_SECRET);
   return postToken(`${issuerOrigin}/oidc/v1/token`, body);
 }
 
@@ -271,6 +279,7 @@ async function doRefresh(workspaceOrigin, entry) {
     refresh_token: entry.refresh_token,
     client_id: OAUTH_CLIENT_ID,
   });
+  if (OAUTH_CLIENT_SECRET) body.set("client_secret", OAUTH_CLIENT_SECRET);
   console.log(
     `[omnigent] databricks oauth: refreshing token for ${workspaceOrigin} at ${endpoint}`,
   );
