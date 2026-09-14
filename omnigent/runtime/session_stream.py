@@ -104,6 +104,7 @@ _TURN_OUTCOME_BY_EVENT_TYPE = {
     "response.cancelled": "cancelled",
     "response.incomplete": "incomplete",
 }
+_FAILED_EVENT_SOURCES = ("llm", "execution", "tool", "harness")
 # The authoritative progress-impact per turn outcome: this is where "the task
 # actually stopped" is known, so it overrides any per-error code default (a
 # nominally-transient retry that ultimately failed the turn lands here as
@@ -170,6 +171,8 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             attrs["error_code"] = error["code"]
         if error.get("source") is not None:
             attrs["error_source"] = error["source"]
+    if event.get("type") == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
+        attrs["error_source"] = event["source"]
     return attrs
 
 
@@ -215,6 +218,8 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
             error = response.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
+        if event_type == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
+            attributes["error_source"] = event["source"]
         impact = _TURN_OUTCOME_IMPACT.get(outcome)
         if impact is not None:
             attributes["error_impact"] = impact.value
