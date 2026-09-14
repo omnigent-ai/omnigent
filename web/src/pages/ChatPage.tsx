@@ -2359,6 +2359,8 @@ function ComposerImpl(
     editText,
     replaceText,
     appendQuote,
+    beginSideChatQuote,
+    sideChat,
     removeQuote,
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -3037,19 +3039,20 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     startSideChat(selectedText) {
-      // Seed the composer with the /side command carrying the selection, then
-      // focus so the user can add their question before sending. Reuses the
-      // whole /side pipeline (send → fork → rail child); nothing side-chat
-      // specific happens here beyond the prefill.
+      // Add the selection as a quote card (exactly like Reply) and mark the
+      // draft as opening a side chat. The user types their question below it;
+      // submit prefixes /side so it forks instead of replying inline.
       if (disabled || isReadOnly || unreachable || composerLockedByBtw || !selectedText.trim()) {
         return;
       }
-      setValue(SIDE_CHAT_COMMAND_PREFIX + selectedText.trim());
+      beginSideChatQuote(selectedText);
+      textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
+      replyQuoteInsertedRef.current = true;
       setCommandError(null);
       dismissMention();
+      resetCursor();
       recallingRef.current = false;
-      textareaRef.current?.focus();
     },
   }));
 
@@ -3221,7 +3224,15 @@ function ComposerImpl(
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
-      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
+      const serialized = serializeReplyDraft(outgoing);
+      if (sideChat && supportsSideChat(sessionHarness)) {
+        // Route the quoted selection + question to a side chat: the /side
+        // pipeline keys off the leading command and forks. No main-chat bubble
+        // is kept for a side chat, so no reply-draft snapshot is persisted.
+        onSend(SIDE_CHAT_COMMAND_PREFIX + serialized, sendFiles);
+      } else {
+        onSend(serialized, sendFiles, snapshotReplyDraft(outgoing));
+      }
     } else {
       onSend(mentionPreamble + trimmed, sendFiles);
     }
@@ -3556,29 +3567,40 @@ function ComposerImpl(
         slots={{
           inputPrefix:
             draft.quotes.length > 0 ? (
-              <ReplyDraftBlocks
-                quotes={draft.quotes}
-                activeTextId={activeTextId}
-                keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
-                onGrowth={onViewportShrinkPinScroll}
-                onRemove={(id) => {
-                  removeQuote(id);
-                  resetCursor();
-                  recallingRef.current = false;
-                  textareaRef.current = tailTextareaRef.current;
-                  dirtyRef.current = true;
-                  dismissMention();
-                }}
-                inputFor={(quote) => ({
-                  onChange: (e) => handleTextChange(quote.id, e),
-                  onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
-                  onBlur: dismissMention,
-                  onKeyDown: handleKeyDown,
-                  onPaste: handlePaste,
-                  "data-has-draft": hasDraft ? "true" : undefined,
-                })}
-              />
+              <>
+                {sideChat ? (
+                  <div
+                    data-testid="composer-side-chat-hint"
+                    className="mb-1 flex items-center gap-1 text-xs font-medium text-brand-accent"
+                  >
+                    <MessagesSquareIcon className="size-3" />
+                    Ask in side chat — forks a separate chat, kept out of this conversation
+                  </div>
+                ) : null}
+                <ReplyDraftBlocks
+                  quotes={draft.quotes}
+                  activeTextId={activeTextId}
+                  keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+                  disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
+                  onGrowth={onViewportShrinkPinScroll}
+                  onRemove={(id) => {
+                    removeQuote(id);
+                    resetCursor();
+                    recallingRef.current = false;
+                    textareaRef.current = tailTextareaRef.current;
+                    dirtyRef.current = true;
+                    dismissMention();
+                  }}
+                  inputFor={(quote) => ({
+                    onChange: (e) => handleTextChange(quote.id, e),
+                    onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
+                    onBlur: dismissMention,
+                    onKeyDown: handleKeyDown,
+                    onPaste: handlePaste,
+                    "data-has-draft": hasDraft ? "true" : undefined,
+                  })}
+                />
+              </>
             ) : undefined,
           beforeInput: (
             <>
