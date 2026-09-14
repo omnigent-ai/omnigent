@@ -67,6 +67,8 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   pendingRetryStableId: true,
   sendLatchedAt: true,
   historyGeneration: true,
+  awaitingSideChatFor: true,
+  sideChatRailRequest: true,
 };
 
 const CONVERSATION_STATE_KEYS = new Set<string>(Object.keys(CONVERSATION_STATE_KEY_MAP));
@@ -136,5 +138,7 @@ export function createInitialConversationState(): ConversationState {
     pendingRetryStableId: null,
     sendLatchedAt: null,
     historyGeneration: 0,
+    awaitingSideChatFor: null,
+    sideChatRailRequest: null,
   };
 }

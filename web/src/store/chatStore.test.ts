@@ -6695,24 +6695,25 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
 
     it("does not move the user for an agent-spawned sub-agent", () => {
-      useChatStore.setState({
-        conversationId: "conv_parent",
+      // Bind a fresh conversation so the conversation-scoped side-chat fields
+      // start clean (not inherited from a prior test's entry), and assert on
+      // that entry directly.
+      const parent = bindConversationForTest("conv_agent_spawn", {
         awaitingSideChatFor: null,
-        redirectToConversationId: null,
         sideChatRailRequest: null,
       });
+      useChatStore.setState({ redirectToConversationId: null });
 
       handleSessionEvent({
         type: "session_created",
-        conversationId: "conv_parent",
+        conversationId: "conv_agent_spawn",
         childSessionId: "conv_child",
         agentId: "ag_xyz",
-        parentSessionId: "conv_parent",
+        parentSessionId: "conv_agent_spawn",
       } as SessionCreatedEvent);
 
-      const after = useChatStore.getState();
-      expect(after.redirectToConversationId).toBeNull();
-      expect(after.sideChatRailRequest).toBeNull();
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      expect(parent.get().sideChatRailRequest).toBeNull();
     });
 
     it("is a no-op (sub-agent rendering is future work — R8)", () => {
