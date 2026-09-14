@@ -159,7 +159,9 @@ const MARKDOWN_COMPONENTS: Components = {
     const child = isValidElement(children) ? children : null;
     if (
       isValidElement<{ className?: string; children?: ReactNode }>(child) &&
-      child.props.className?.split(/\s+/).includes("language-mermaid")
+      // Match case-insensitively so a cased fence (```Mermaid) renders a diagram
+      // in the read-only preview too, matching the editor's detection.
+      child.props.className?.split(/\s+/).some((c) => c.toLowerCase() === "language-mermaid")
     ) {
       return <MermaidPreview source={String(child.props.children ?? "")} />;
     }

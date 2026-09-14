@@ -11,4 +11,16 @@ export const CodeBlockWithLanguage = CodeBlock.extend({
   addNodeView() {
     return ReactNodeViewRenderer(TipTapCodeBlockView);
   },
+
+  // The base serializer emits a fixed ``` fence, which corrupts a code block
+  // whose body contains a ``` line (only representable with a longer outer
+  // fence). Emit a fence longer than any backtick run in the body instead;
+  // this is byte-identical to the base for backtick-free content.
+  renderMarkdown(node, helpers) {
+    const language = (node.attrs?.language as string | null) ?? "";
+    const body = helpers.renderChildren(node.content ?? []);
+    const ticks = [...body.matchAll(/`+/g)].reduce((n, m) => Math.max(n, m[0].length), 2) + 1;
+    const fence = "`".repeat(ticks);
+    return `${fence}${language}\n${body}\n${fence}`;
+  },
 });

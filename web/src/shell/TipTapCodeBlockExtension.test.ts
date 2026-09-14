@@ -93,6 +93,28 @@ describe("CodeBlockWithLanguage", () => {
     expect(editor.getMarkdown()).toContain("```haskell");
   });
 
+  it("serializes a normal block with a plain three-backtick fence", () => {
+    editor = makeEditor("```python\nprint(1)\n```");
+    expect(editor.getMarkdown()).toBe("```python\nprint(1)\n```");
+  });
+
+  it("round-trips a block whose body contains a fence line with a longer fence", () => {
+    // A 4-backtick fence lets the body hold a ``` line; the serializer must emit
+    // a fence longer than that run or the saved markdown corrupts on reload.
+    const md = "````markdown\nexample:\n```\ncode\n```\n````";
+    editor = makeEditor(md);
+    const body = editor.state.doc.child(0).textContent;
+    expect(body).toContain("```");
+
+    const out = editor.getMarkdown();
+    expect(out.startsWith("````markdown")).toBe(true);
+
+    // Re-parse the serialized output; the body must survive unchanged.
+    const reopened = makeEditor(out);
+    expect(reopened.state.doc.child(0).textContent).toBe(body);
+    reopened.destroy();
+  });
+
   it("registers a node view for the code block (edit-mode rendering)", () => {
     editor = makeEditor("```mermaid\ngraph TD\nA-->B\n```");
     // The node view is what mounts the language picker + mermaid preview; if the
