@@ -108,6 +108,32 @@ def test_native_codex_inline_api_key_routes_to_declared_endpoint(
     assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
 
 
+@pytest.mark.parametrize("fragment", [None, "wrong-key"])
+def test_native_codex_resolved_api_key_preserves_literal_dollars(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch, fragment: str | None
+) -> None:
+    """Literal dollars must neither change the bearer nor trigger login fallback."""
+    monkeypatch.delenv("OMNIGENT_KEY_FRAGMENT", raising=False)
+    if fragment is None:
+        monkeypatch.delenv("KEY_FRAGMENT", raising=False)
+    else:
+        monkeypatch.setenv("KEY_FRAGMENT", fragment)
+    api_key = "test-$KEY_FRAGMENT-'quoted'"
+    spec = AgentSpec(
+        spec_version=1,
+        name="literal-key",
+        instructions="Test literal credentials.",
+        executor=ExecutorSpec(type="omnigent", auth=ApiKeyAuth(api_key=api_key)),
+    )
+
+    launch = resolve_native_codex_launch(model="test-model", spec=spec)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+    assert not launch.login_required
+
+
 def test_provider_codex_overrides_coerce_chat_wire_to_responses() -> None:
     """A ``chat`` provider wire is coerced to ``responses`` in the override.
 

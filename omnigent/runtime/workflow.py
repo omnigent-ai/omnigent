@@ -1016,7 +1016,9 @@ def _synthesize_codex_api_key_provider(auth: ApiKeyAuth) -> ProviderEntry:
         families={
             OPENAI_FAMILY: FamilyConfig(
                 base_url=auth.base_url or "https://api.openai.com/v1",
-                api_key=auth.api_key,
+                # ApiKeyAuth is already resolved; family lookup must not
+                # expand literal dollar signs in the secret a second time.
+                auth_command=f"printf %s {shlex.quote(auth.api_key)}",
                 wire_api=RESPONSES_WIRE_API,
             )
         },

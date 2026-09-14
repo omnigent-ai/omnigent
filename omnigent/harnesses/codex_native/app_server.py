@@ -3191,14 +3191,9 @@ def resolve_native_codex_launch(
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
 
     if entry is None and not api_key_auth_precludes_broker(spec):
-        # Managed connect host: no spec/global/ambient provider, but the owner
-        # linked Databricks via the connect flow (host-only [omnigent] profile +
-        # broker sidecar). Route Codex through the workspace gateway, minting the
-        # bearer via the broker — the Codex counterpart to
-        # _connect_broker_claude_config. ucode configure (host boot) populated
-        # ucode state, so the model resolves to a served id. An explicit spec
-        # ApiKeyAuth resolves to None above too, but Codex threads that key
-        # itself, so it must not be rerouted through the owner's gateway.
+        # Use the managed host's Databricks broker only when no provider or
+        # explicit API-key auth selected a route. Host boot populated ucode
+        # state so the model resolves to a served id.
         from omnigent.host.databricks_credential import (
             HOST_DATABRICKS_PROFILE,
             broker_token_command,

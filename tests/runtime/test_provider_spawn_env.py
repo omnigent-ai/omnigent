@@ -394,6 +394,25 @@ def test_codex_inline_api_key_routes_to_declared_endpoint(
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
 
 
+@pytest.mark.parametrize("fragment", [None, "wrong-key"])
+def test_codex_resolved_api_key_preserves_literal_dollars(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, fragment: str | None
+) -> None:
+    """Provider synthesis must not interpret an already-resolved secret as config."""
+    _write_config(config_home, {})
+    monkeypatch.delenv("OMNIGENT_KEY_FRAGMENT", raising=False)
+    if fragment is None:
+        monkeypatch.delenv("KEY_FRAGMENT", raising=False)
+    else:
+        monkeypatch.setenv("KEY_FRAGMENT", fragment)
+    api_key = "test-$KEY_FRAGMENT-'quoted'"
+    spec = _make_spec(harness="codex", model="test-model", auth=ApiKeyAuth(api_key=api_key))
+
+    env = _build_codex_spawn_env(spec)
+
+    assert shlex.split(env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]) == ["printf", "%s", api_key]
+
+
 def test_codex_rejects_chat_only_openrouter_before_harness_spawn(config_home: Path) -> None:
     """A chat-only OpenRouter route fails before Codex can make a bad request."""
     _write_config(
