@@ -6542,7 +6542,7 @@ async def dispatch_tool_locally(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
 ) -> str:
-    """Execute a tool locally and PATCH the result to the harness.
+    """Execute a tool once and POST its result to the harness.
 
     :param runner_workspace: Optional CLI launch workspace used to
         resolve placeholder cwd values for runner-owned filesystem
@@ -6564,6 +6564,11 @@ async def dispatch_tool_locally(
         observe tool-launched terminals.
     :returns: The tool output string.
     """
+    if not conversation_id:
+        raise ValueError(
+            "dispatch_tool_locally requires conversation_id to POST the "
+            "harness session-keyed URL; got None/empty"
+        )
     output = await execute_tool(
         tool_name=tool_name,
         arguments=arguments,
@@ -6594,39 +6599,38 @@ async def dispatch_tool_locally(
             now=asyncio.get_running_loop().time(),
         )
 
-    # POST the result back to the harness as a ``tool_result``
-    # event on the session-keyed events endpoint. ``conversation_id``
-    # is required: the harness validates the URL segment against
-    # its own runner-stamped value and fails 404 on mismatch —
-    # without an id we'd be unable to form a valid URL. Fail loud
-    # per ``designs/DESIGN_PRINCIPLES.md`` rather than substituting
-    # a synthetic default. ``response_id`` is unused at the URL /
-    # body level (the harness has at most one in-flight turn so the
-    # ``call_id`` alone keys the parked Future) — kept on the
-    # function signature for symmetry with callers that track it.
-    del response_id  # see comment above — intentionally unused
-    if not conversation_id:
-        raise ValueError(
-            "dispatch_tool_locally requires conversation_id to POST the "
-            "harness session-keyed URL; got None/empty"
-        )
-    try:
-        resp = await harness_client.post(
-            f"/v1/sessions/{conversation_id}/events",
-            json={"type": "tool_result", "call_id": call_id, "output": output},
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning(
-            "Runner local dispatch tool_result event failed for %s (call_id=%s): %s",
-            tool_name,
-            call_id,
-            exc,
-            extra={"session_id": conversation_id},
-        )
+    # Retry only delivery: tools can have side effects. The harness ignores
+    # duplicate call_ids, including when the first acknowledgement was lost.
+    for attempt in range(2):
+        try:
+            resp = await harness_client.post(
+                f"/v1/sessions/{conversation_id}/events",
+                json={"type": "tool_result", "call_id": call_id, "output": output},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return output
+        except Exception as exc:
+            retryable = isinstance(exc, httpx.TransportError) or (
+                isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+            )
+            retry = attempt == 0 and retryable
+            _logger.warning(
+                "Runner local dispatch tool_result event failed for %s "
+                "(call_id=%s, response_id=%s, attempt=%s, retry=%s): %s",
+                tool_name,
+                call_id,
+                response_id,
+                attempt + 1,
+                retry,
+                exc,
+                extra={"session_id": conversation_id},
+            )
+            if retry:
+                continue
+            raise
 
-    return output
+    raise AssertionError("tool result delivery attempts exhausted")
 
 
 # ── OS env tools (OSEnvironment-backed) ──────────────────
