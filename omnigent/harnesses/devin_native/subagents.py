@@ -247,9 +247,13 @@ def transcript_items(
                     items.append(
                         (
                             "reasoning",
+                            # ReasoningData requires `summary`; posting only
+                            # `content` 400s the child's /events POST and aborts
+                            # the sub-agent mirror, leaving the child with just the
+                            # (repeated) task and no real transcript.
                             {
                                 "agent": agent_name,
-                                "content": [{"type": "reasoning_text", "text": reasoning}],
+                                "summary": [{"type": "summary_text", "text": reasoning}],
                             },
                         )
                     )

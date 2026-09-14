@@ -137,6 +137,31 @@ class TestTranscriptItems:
     def test_empty_chain_yields_no_items(self) -> None:
         assert transcript_items([], "devin-native-ui") == []
 
+    def test_every_emitted_item_validates_for_the_events_api(self) -> None:
+        # The child mirror POSTs each item to /events, which validates it against
+        # its ItemData model; an invalid item 400s and aborts the transcript,
+        # leaving the child with only the (repeated) task. A reasoning node is
+        # included because ReasoningData requires `summary` — a content-only
+        # reasoning item is exactly the bug this guards.
+        from omnigent.entities.conversation import parse_item_data
+
+        chain = [
+            {"chat_message": {"role": "user", "content": "do the thing"}},
+            {
+                "chat_message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "thinking": {"thinking": "let me reason about it"},
+                    "tool_calls": [{"id": "c1", "name": "write", "arguments": {"file_path": "x"}}],
+                }
+            },
+            {"chat_message": {"role": "tool", "tool_call_id": "c1", "content": "ok"}},
+        ]
+        items = transcript_items(chain, "devin-native-ui")
+        assert any(kind == "reasoning" for kind, _ in items)
+        for kind, data in items:
+            parse_item_data(kind, {"type": kind, **data})  # raises if the shape is invalid
+
 
 class TestLoadMessageNodes:
     """The only I/O: read one session's forest, read-only, failing soft."""
