@@ -82,7 +82,7 @@ class _StubResourceRegistry:
 
     def set_session_status_publisher(
         self,
-        publisher: Callable[[str, str], None],
+        publisher: Callable[[str, str, str | None], None],
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -90,7 +90,7 @@ class _StubResourceRegistry:
         The stub never launches a real terminal, so it just retains the
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
-        :param publisher: Callable ``(session_id, status) -> None``.
+        :param publisher: Callable ``(session_id, status, blocked_on) -> None``.
         :returns: None.
         """
         self._session_status_publisher = publisher
