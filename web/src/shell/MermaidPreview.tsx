@@ -6,6 +6,7 @@
 import { mermaid } from "@streamdown/mermaid";
 import { Streamdown } from "streamdown";
 import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
+import { fenceForBody } from "./markdownFence";
 
 const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
 
@@ -14,12 +15,13 @@ export function MermaidPreview({ source }: { source: string }) {
   const trimmed = source.replace(/\n$/, "");
   // Fence with more backticks than any run in the source, so a ``` line inside
   // the diagram can't close the wrapper early and spill out as plain markdown.
-  const ticks = (trimmed.match(/`+/g) ?? []).reduce((n, run) => Math.max(n, run.length), 2) + 1;
-  const fence = "`".repeat(ticks);
+  const fence = fenceForBody(trimmed);
   return (
     <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
       <MarkdownErrorBoundary source={source}>
-        <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
+        {/* key by source: mermaid renders async with no cancellation, so remount
+            on each settled source to discard a superseded in-flight render. */}
+        <Streamdown key={trimmed} plugins={MERMAID_STREAMDOWN_PLUGINS}>
           {`${fence}mermaid\n${trimmed}\n${fence}`}
         </Streamdown>
       </MarkdownErrorBoundary>

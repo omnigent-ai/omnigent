@@ -418,6 +418,9 @@ function MarkdownRichTextViewerInner({
     // language change is a user edit (flagged on its transaction), so schedule
     // it too — otherwise the picker's change never persists.
     const onUpdate = (props?: { transaction?: Transaction }) => {
+      // Mirror the onUpdate-config guard: a no-op transaction changed no markdown,
+      // so there is nothing to save — never schedule a write for it.
+      if (props?.transaction && !props.transaction.docChanged) return;
       if (isUserEditUpdate(editor.isFocused, props?.transaction)) autoSave.schedule();
     };
     const onBlur = () => autoSave.flush();

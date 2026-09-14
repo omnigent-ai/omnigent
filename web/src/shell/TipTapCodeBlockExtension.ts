@@ -6,6 +6,7 @@
 import { CodeBlock } from "@tiptap/extension-code-block";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import { TipTapCodeBlockView } from "./TipTapCodeBlockView";
+import { fenceForBody } from "./markdownFence";
 
 export const CodeBlockWithLanguage = CodeBlock.extend({
   addNodeView() {
@@ -19,8 +20,7 @@ export const CodeBlockWithLanguage = CodeBlock.extend({
   renderMarkdown(node, helpers) {
     const language = (node.attrs?.language as string | null) ?? "";
     const body = helpers.renderChildren(node.content ?? []);
-    const ticks = [...body.matchAll(/`+/g)].reduce((n, m) => Math.max(n, m[0].length), 2) + 1;
-    const fence = "`".repeat(ticks);
+    const fence = fenceForBody(body);
     return `${fence}${language}\n${body}\n${fence}`;
   },
 });
