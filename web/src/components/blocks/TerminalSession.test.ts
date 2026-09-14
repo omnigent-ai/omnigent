@@ -8,6 +8,7 @@
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { writeTerminalRendererMode } from "@/lib/terminalRendererPreferences";
 import {
   SHIFT_ENTER_CSI_U,
   TerminalSession,
@@ -898,6 +899,85 @@ describe("TerminalSession", () => {
     // Same socket instance, still open — a re-font never reconnects.
     expect(socket).toBe(before);
     expect(socket.closed).toBe(false);
+    session.dispose();
+  });
+
+  it("honors the persisted renderer preference and swaps renderers in place", () => {
+    // WHY: WebGL's glyph atlas is shared across every mounted terminal, so a
+    // corrupt atlas garbles all of them at once. The preference is the user's
+    // escape hatch, and it has to work on a live session — reaching for it
+    // means the terminal is already unreadable.
+    const contexts: string[] = [];
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (
+      this: HTMLCanvasElement,
+      id: string,
+    ) {
+      contexts.push(id);
+      return null;
+    } as typeof HTMLCanvasElement.prototype.getContext);
+
+    // "dom" pinned: construction must not even ask for a GL context.
+    writeTerminalRendererMode("dom");
+    const pinned = makeSession();
+    expect(contexts).not.toContain("webgl2");
+    // Already on the DOM renderer, so re-selecting it is a no-op.
+    pinned.socket.open();
+    const framesBefore = pinned.socket.sent.length;
+    pinned.session.setRenderer("dom");
+    expect(pinned.socket.sent).toHaveLength(framesBefore);
+    // Asking for WebGL back retries the load; jsdom has no GL context, so the
+    // DOM renderer stays and nothing throws.
+    pinned.session.setRenderer("auto");
+    expect(contexts).toContain("webgl2");
+    expect((pinned.session as unknown as { webgl: unknown }).webgl).toBeNull();
+    expect(pinned.socket.closed).toBe(false);
+    pinned.session.dispose();
+
+    // A disposed session ignores a late notification from the pref pub/sub.
+    expect(() => pinned.session.setRenderer("auto")).not.toThrow();
+
+    // Default "auto": construction loads the addon (and falls back here).
+    contexts.length = 0;
+    writeTerminalRendererMode("auto");
+    const auto = makeSession();
+    expect(contexts).toContain("webgl2");
+    auto.session.dispose();
+  });
+
+  it("silences the cursor blink while releasing the WebGL addon", async () => {
+    // WHY: the addon never disposes its own blink manager, so releasing it on a
+    // focused terminal leaves a 600ms timer redrawing a dead renderer. The pane's
+    // DECSCUSR override outranks the option, so both have to be off across it.
+    writeTerminalRendererMode("auto");
+    const { session } = makeSession();
+    const { term } = session as unknown as { term: Terminal };
+    interface CoreModes {
+      _core: { coreService: { decPrivateModes: { cursorBlink?: boolean } } };
+    }
+    // eslint-disable-next-line no-underscore-dangle
+    const modes = (term as unknown as CoreModes)._core.coreService.decPrivateModes;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[1 q", resolve); // DECSCUSR blinking block
+    });
+    expect(term.options.cursorBlink).toBe(true);
+    expect(modes.cursorBlink).toBe(true);
+
+    const seen: { option?: boolean; dec?: boolean } = {};
+    (session as unknown as { webgl: { dispose: () => void } | null }).webgl = {
+      dispose: () => {
+        seen.option = term.options.cursorBlink;
+        seen.dec = modes.cursorBlink;
+      },
+    };
+
+    session.setRenderer("dom");
+
+    expect(seen).toEqual({ option: false, dec: false });
+    // The field clears, so a WebGL context loss can't wedge a later switch.
+    expect((session as unknown as { webgl: unknown }).webgl).toBeNull();
+    // Restored, so the DOM renderer that takes over still blinks the cursor.
+    expect(term.options.cursorBlink).toBe(true);
+    expect(modes.cursorBlink).toBe(true);
     session.dispose();
   });
 
