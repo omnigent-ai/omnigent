@@ -393,9 +393,22 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "permission_args", "retain_subscription"),
+    [
+        ((0, 153, 1), ["--config", "approval_policy=on-request"], False),
+        ((0, 154, 0), [], True),
+        (None, [], True),
+    ],
+)
+@pytest.mark.parametrize("cancel_launch", [False, True])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int, int] | None,
+    permission_args: list[str],
+    retain_subscription: bool,
+    cancel_launch: bool,
 ) -> None:
     """
     Runner-owned Codex launch consumes persisted args and thread id.
@@ -481,7 +494,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
-        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+        codex_cli_version = version
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -489,6 +502,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
             self.started = False
+            self.closed = False
             # Provider/model -c overrides the runner forwards to the
             # --remote TUI; empty here (no profile in this test).
             self.config_overrides: list[str] = []
@@ -503,6 +517,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         async def close(self) -> None:
             """:returns: None."""
+            self.closed = True
 
     app_server = _FakeCodexAppServer()
     build_calls: list[dict[str, Any]] = []
@@ -546,6 +561,13 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         async def close(self) -> None:
             """:returns: None."""
 
+    class _RetainedClient:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    retained_client = _RetainedClient()
     launched_specs: list[Any] = []
 
     class _FakeResourceRegistry:
@@ -575,7 +597,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert terminal_name == "codex"
             assert session_key == "main"
             assert resource_role == CODEX_NATIVE_TERMINAL_ROLE
+            assert not retained_client.closed
             launched_specs.append(spec)
+            if cancel_launch:
+                raise asyncio.CancelledError
             return SessionResourceView(
                 id="terminal_codex_main",
                 type="terminal",
@@ -592,7 +617,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
-    ) -> None:
+        retain_client: bool = False,
+    ) -> Any:
         """
         Record preloading of the known Codex thread.
 
@@ -605,6 +631,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "loaded the resume thread"
         )
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
+        assert retain_client is retain_subscription
+        return retained_client if retain_client else None
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """
@@ -635,6 +663,20 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
 
     try:
+        if cancel_launch:
+            with pytest.raises(asyncio.CancelledError):
+                await _auto_create_codex_terminal(
+                    session_id,
+                    _FakeResourceRegistry(),  # type: ignore[arg-type]
+                    lambda _sid, event: published_events.append(event),
+                    agent_spec=agent_spec,
+                    server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+                )
+            assert retained_client.closed is retain_subscription
+            assert app_server.closed
+            assert not forward_calls
+            assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            return
         terminal_view = await _auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -659,15 +701,17 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
-    assert launched.args[0] == "--dangerously-bypass-hook-trust"
-    assert launched.args[1:4] == [
-        "--config",
-        "approval_policy=on-request",
+    # Older TUIs still need permission flags; Codex 0.154+ rejects them.
+    assert launched.args == [
+        "--dangerously-bypass-hook-trust",
+        *permission_args,
         "resume",
+        "--remote",
+        app_server.listen_url,
+        thread_id,
     ]
-    assert launched.args[4] == "--remote"
-    assert launched.args[5].startswith("ws://127.0.0.1:")
-    assert launched.args[6] == thread_id
+    assert app_server.listen_url is not None
+    assert app_server.listen_url.startswith("ws://127.0.0.1:")
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
@@ -694,6 +738,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
+            "client": retained_client if retain_subscription else None,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
@@ -908,6 +953,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1182,6 +1228,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -3106,6 +3153,63 @@ async def test_codex_session_needs_runner_terminal_false_without_client() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "setup_error", "forward_error", "cancelled"])
+async def test_codex_known_thread_forwarder_closes_retained_subscription(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """Ownership transfer must close the preload client on every forwarder exit."""
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.runner import _entry
+    from omnigent.runner.native import orchestration
+
+    closed: list[str] = []
+
+    class _Client:
+        async def close(self) -> None:
+            closed.append("client")
+
+    class _AppServer:
+        async def close(self) -> None:
+            closed.append("server")
+
+    client = _Client()
+
+    def server_url(_name: str) -> str:
+        if outcome == "setup_error":
+            raise RuntimeError("setup failed")
+        return "http://127.0.0.1:8000"
+
+    async def forward(**kwargs: Any) -> None:
+        assert kwargs["client"] is client
+        assert not closed
+        if outcome == "forward_error":
+            raise RuntimeError("forward failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(orchestration, "_required_runner_env", server_url)
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", forward)
+    session_id = "conv_test_retained_preload"
+    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()  # type: ignore[assignment]
+    operation = orchestration._codex_forward_known_thread(
+        session_id=session_id,
+        bridge_dir=tmp_path,
+        codex_ws_url="ws://127.0.0.1:9876",
+        thread_id="thread_test",
+        client=client,  # type: ignore[arg-type]
+    )
+    if outcome == "success":
+        await operation
+    else:
+        error = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+        with pytest.raises(error):
+            await operation
+    assert closed == ["client", "server"]
+    assert session_id not in orchestration._AUTO_CODEX_APP_SERVERS
+
+
+@pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3553,6 +3657,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -3790,6 +3895,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

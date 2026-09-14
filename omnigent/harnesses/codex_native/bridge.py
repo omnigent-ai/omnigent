@@ -6,11 +6,12 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import secrets
+import stat
 import sys
 import tempfile
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -41,9 +42,6 @@ MCP_STARTUP_CANCELLED = "cancelled"
 MCP_STARTUP_STATES = frozenset(
     {MCP_STARTUP_STARTING, MCP_STARTUP_READY, MCP_STARTUP_FAILED, MCP_STARTUP_CANCELLED}
 )
-# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
-# a model switch can clamp it to one the new model accepts (GLM has no xhigh).
-_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 # Must match ``_CONFIG_FILE`` in ``claude_native_bridge.py`` because
 # ``serve-mcp`` reads this filename for the token.
 _MCP_CONFIG_FILE = "bridge.json"
@@ -55,6 +53,7 @@ _MCP_CONFIG_FILE = "bridge.json"
 # whereas ``state.json`` mutates on every turn/thread change.
 _POLICY_HOOK_FILE = "policy_hook.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 def bridge_root() -> Path:
@@ -149,16 +148,68 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove codex-native bridge dirs whose owner process is provably dead.
+    Remove inactive codex-native bridge dirs whose owner is provably dead.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    A runner restart is a normal Codex resume boundary, so owner death alone
+    cannot imply that the local rollout is disposable. Keep the whole bridge
+    for 7 days after its latest bridge preparation or rollout activity, then
+    remove it intact.
+    Explicit session deletion remains immediate. The runner calls this via
+    ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
-    :returns: The number of orphaned bridge dirs removed.
+    :returns: The number of orphaned bridge dirs pruned.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(),
+        should_prune=_codex_orphan_retention_expired,
+    )
+
+
+def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner Codex bridge has been inactive for 7 days."""
+    activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+    owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+    try:
+        if owner_marker.stat().st_mtime > activity_cutoff:
+            return False
+    except OSError:
+        return False
+
+    sessions_dir = bridge_dir / "codex-home" / "sessions"
+    try:
+        sessions_mode = sessions_dir.stat().st_mode
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISDIR(sessions_mode):
+        return False
+
+    scan_failed = False
+
+    def _record_scan_failure(_error: OSError) -> None:
+        nonlocal scan_failed
+        scan_failed = True
+
+    try:
+        for directory, _subdirs, filenames in os.walk(
+            sessions_dir,
+            onerror=_record_scan_failure,
+        ):
+            for filename in filenames:
+                if not filename.startswith("rollout-") or not filename.endswith(".jsonl"):
+                    continue
+                rollout = Path(directory) / filename
+                try:
+                    if rollout.stat().st_mtime > activity_cutoff:
+                        return False
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return False
+    except OSError:
+        return False
+    return not scan_failed
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
@@ -395,6 +446,43 @@ def read_codex_home_config_model(codex_home: Path) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def read_codex_config_effort(bridge_dir: Path) -> str | None:
+    """
+    Read the active reasoning effort from this session's Codex ``config.toml``.
+
+    The top-level ``model_reasoning_effort`` key is what an in-TUI ``/model``
+    writes alongside ``model``, so it is the source of truth for the effort the
+    terminal is running at. Same fail-safe contract as
+    :func:`read_codex_config_model`: a missing / unreadable / unparsable file
+    (or a config with no effort key) returns ``None``.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :returns: The top-level ``model_reasoning_effort`` from ``config.toml``
+        (e.g. ``"high"``), or ``None`` when undeterminable.
+    """
+    return read_codex_home_config_effort(codex_home_for_bridge_dir(bridge_dir))
+
+
+def read_codex_home_config_effort(codex_home: Path) -> str | None:
+    """
+    Read the active reasoning effort straight from a session's ``CODEX_HOME``.
+
+    Same value and fail-safe behaviour as :func:`read_codex_config_effort`,
+    for callers that hold the ``CODEX_HOME`` path rather than the bridge
+    directory.
+
+    :param codex_home: The session's private ``CODEX_HOME`` directory.
+    :returns: The top-level ``model_reasoning_effort`` from ``config.toml``
+        (e.g. ``"high"``), or ``None`` when undeterminable.
+    """
+    try:
+        data = tomllib.loads((codex_home / "config.toml").read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    effort = data.get("model_reasoning_effort")
+    return effort if isinstance(effort, str) and effort else None
+
+
 class DeveloperInstructionsReadState(str, Enum):
     """Tri-state result of reading ``developer_instructions`` from ``config.toml``.
 
@@ -548,34 +636,116 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
     """
     from omnigent.util.reasoning_effort import clamp_effort_for_model
 
-    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
-    pin_line = f"model = {json.dumps(model)}"
+    def _clamp_stale_effort(document: MutableMapping[str, object]) -> None:
+        # The config keeps the launch model's effort (e.g. the user's xhigh
+        # default), which the switched-to model may reject (GLM has no xhigh).
+        # Clamp it to a value the new model accepts so the next turn does not
+        # 400 on reasoning.effort.
+        effort = document.get("model_reasoning_effort")
+        if isinstance(effort, str):
+            clamped = clamp_effort_for_model(effort, model)
+            if clamped and clamped != effort:
+                document["model_reasoning_effort"] = clamped
+
+    return _upsert_top_level_config_key(
+        codex_home_for_bridge_dir(bridge_dir) / "config.toml",
+        "model",
+        model,
+        mutate_document=_clamp_stale_effort,
+    )
+
+
+def write_codex_config_effort(bridge_dir: Path, effort: str) -> bool:
+    """
+    Upsert the top-level ``model_reasoning_effort`` key in this session's
+    Codex ``config.toml``.
+
+    Companion writer to :func:`read_codex_config_effort` and the effort
+    counterpart of :func:`write_codex_config_model`, used when Omnigent itself
+    changes the running thread's reasoning effort (web composer gear via
+    ``thread/settings/update``). That RPC changes the live thread but does NOT
+    touch ``config.toml`` — while the forwarder's effort mirror treats
+    ``config.toml`` as the source of truth. Without this write, a fresh
+    forwarder state (thread resume / reconnect) re-reads the stale launch
+    effort and mirrors it back as an ``external_reasoning_effort_change``,
+    silently reverting the composer's pick. Writing the same top-level key an
+    in-TUI ``/model`` writes keeps every reader consistent; a later in-TUI
+    change simply overwrites it (last-wins, as for user switches).
+
+    Best-effort: an unreadable/unwritable file returns ``False`` — the live
+    thread already runs the new effort, so failing the turn over a mirror
+    file would be worse than a temporarily stale mirror.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param effort: Reasoning effort to record, e.g. ``"high"``.
+    :returns: ``True`` when the file was updated.
+    """
+    return _upsert_top_level_config_key(
+        codex_home_for_bridge_dir(bridge_dir) / "config.toml",
+        "model_reasoning_effort",
+        effort,
+    )
+
+
+def _upsert_top_level_config_key(
+    config_path: Path,
+    key: str,
+    value: str,
+    *,
+    mutate_document: Callable[[MutableMapping[str, object]], None] | None = None,
+) -> bool:
+    """
+    Upsert one top-level key in a ``config.toml``, best-effort.
+
+    Shared engine of :func:`write_codex_config_model` /
+    :func:`write_codex_config_effort`. The file is parsed with ``tomlkit``
+    (style-preserving) rather than scanned line-by-line: hand-rolled scans
+    mis-handle valid TOML (multiline arrays whose column-0 continuation lines
+    start with ``[``, brackets inside strings/comments, quoted keys), and a
+    missed existing key means inserting a duplicate — invalid TOML that every
+    reader (``tomllib`` and codex itself) rejects, corrupting the mirror
+    rather than staling it. An existing top-level ``key`` (bare or quoted) is
+    replaced in place; a missing one is prepended above the existing content,
+    so it can never land under a ``[table]`` header.
+
+    :param config_path: The ``config.toml`` to rewrite (created if missing).
+    :param key: Top-level key to upsert, e.g. ``"model"``.
+    :param value: String value to record, e.g. ``"gpt-5.6-luna"``.
+    :param mutate_document: Optional extra mutation of the parsed document,
+        applied before serializing; used by the model writer to clamp a stale
+        effort. Only top-level keys are visible to it.
+    :returns: ``True`` when the file was updated; ``False`` when it could not
+        be read, parsed (malformed/undecodable — never made worse), or
+        written.
+    """
+    import tomlkit
+    from tomlkit.exceptions import TOMLKitError
+
     try:
         existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-        lines = existing.splitlines()
-        replaced = False
-        for i, line in enumerate(lines):
-            # Only the top-level table: stop at the first [section] header.
-            if line.startswith("["):
-                break
-            if re.match(r"^model\s*=", line):
-                lines[i] = pin_line
-                replaced = True
-                continue
-            # The config keeps the launch model's effort (e.g. the user's
-            # xhigh default), which the switched-to model may reject (GLM has
-            # no xhigh). Clamp it to a value the new model accepts so the next
-            # turn does not 400 on reasoning.effort.
-            effort_match = _EFFORT_KEY_RE.match(line)
-            if effort_match:
-                clamped = clamp_effort_for_model(effort_match.group(2), model)
-                if clamped and clamped != effort_match.group(2):
-                    lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
-        if not replaced:
-            lines.insert(0, pin_line)
+        document = tomlkit.parse(existing)
+        if key in document:
+            document[key] = value
+            output = tomlkit.dumps(document)
+        else:
+            # Prepend: the first line is always top-level, never in a table.
+            output = f"{key} = {json.dumps(value)}\n{existing}"
+            document = tomlkit.parse(output)
+        if mutate_document is not None:
+            mutate_document(document)
+            output = tomlkit.dumps(document)
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except OSError:
+        # Atomic replace, like this file's other writers: codex itself reads
+        # this config, and a torn write would hand it malformed TOML.
+        fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(config_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(output)
+            os.replace(tmp_name, config_path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except (OSError, UnicodeDecodeError, TOMLKitError):
         return False
     return True
 

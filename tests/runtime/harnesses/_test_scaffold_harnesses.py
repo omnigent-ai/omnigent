@@ -425,6 +425,26 @@ class _WedgedFastHeartbeatHarness(HarnessApp):
         await asyncio.Event().wait()  # never set; hang until the watchdog fires
 
 
+class _WedgeOnceThenCompleteHarness(HarnessApp):
+    """
+    Wedges on the first ``run_turn`` invocation, completes on the second.
+
+    The first invocation emits no output, so replay cannot duplicate prior
+    progress. The retry finds a healthy call and completes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._attempts = 0
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        del request
+        self._attempts += 1
+        if self._attempts == 1:
+            await asyncio.Event().wait()  # the wedged call: emits nothing more
+        ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="recovered-done"))
+
+
 class _ParkingElicitFastHeartbeatHarness(HarnessApp):
     """
     Parks on ``ctx.elicit`` while fast heartbeats fire, then echoes
@@ -478,6 +498,7 @@ _FIXTURES: dict[str, type[HarnessApp]] = {
     "slow_stream": _SlowStreamHarness,
     "shutdown_tracking": _ShutdownTrackingHarness,
     "parking_elicit_fast_heartbeat": _ParkingElicitFastHeartbeatHarness,
+    "wedge_once_then_complete": _WedgeOnceThenCompleteHarness,
 }
 
 

@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING
 from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
+    from databricks.sdk.core import Config
+
     from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
@@ -345,7 +347,7 @@ def resolve_databricks_gateway(
     )
 
 
-def _list_gateway_models(config: object) -> tuple[str, ...]:
+def _list_gateway_models(config: Config) -> tuple[str, ...]:
     """
     List the workspace's chat-capable ``databricks-*`` serving endpoints.
 

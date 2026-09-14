@@ -191,27 +191,30 @@ def test_custom_codex_native_session_shows_model_and_effort_controls(
         gear = page.get_by_test_id("composer-config-gear")
         expect(gear).to_be_visible(timeout=15_000)
         gear.click()
-        expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+        page.get_by_test_id("composer-agent-edit").click()
+        expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
 
         # The Codex model picker is selected and lists Codex's raw catalog.
-        model_trigger = page.get_by_test_id("composer-config-model")
+        model_trigger = page.get_by_test_id("composer-agent-models")
         expect(model_trigger).to_be_visible()
-        model_trigger.click()
-        model_row = page.locator(f'[role="option"][data-model-id="{_MODEL_ID}"]')
+
+        model_row = page.locator(f'[role="menuitemcheckbox"][data-model-id="{_MODEL_ID}"]')
         expect(model_row).to_be_visible()
         expect(model_row).to_contain_text(_MODEL_DISPLAY_NAME)
         # Re-select the current model to close the listbox without sending
         # Escape to the surrounding dialog.
-        model_row.click()
-        expect(model_row).to_be_hidden()
+
+        expect(model_row).to_be_visible()
 
         # The effort control is enabled and derives its ladder from the
         # selected Codex model's supportedReasoningEfforts.
-        effort_trigger = page.get_by_test_id("composer-config-effort")
+        effort_trigger = page.get_by_test_id("composer-agent-efforts")
         expect(effort_trigger).to_be_visible()
-        effort_trigger.click()
+
         for effort in ("low", "medium", "high", "xhigh"):
-            expect(page.locator(f'[role="option"][data-effort-level="{effort}"]')).to_be_visible()
+            expect(
+                page.locator(f'[role="menuitemcheckbox"][data-effort-level="{effort}"]')
+            ).to_be_visible()
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         if respawned is not None:

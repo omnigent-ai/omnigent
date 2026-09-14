@@ -50,11 +50,11 @@ _ACTIVITY_MAX_CHARS = 2000
 # response without sending another turn.
 _HISTORY_DEFAULT_TAIL = 10
 _HISTORY_MAX_TAIL = 50
-# Enough for one substantive child result while staying below the ~100k
-# aggregate bound. Wide tails automatically reduce the per-item limit.
-_HISTORY_MAX_CHARS_PER_ITEM = 12000
 # The total budget intentionally follows the default preview and tail cap;
-# changing either value above also changes this budget.
+# changing either value above also changes this budget. An explicit
+# ``content_max_chars`` is honored up to this budget (divided across the
+# requested tail), so a narrow read can recover one long child result in
+# full; ``content_offset_chars`` pages beyond it for even longer items.
 _HISTORY_MAX_TOTAL_CHARS = _HISTORY_MAX_TAIL * _ACTIVITY_MAX_CHARS
 
 # sys_session_close still rewrites the stored title internally to free
@@ -1040,6 +1040,7 @@ def _project_activity_item(
     item: ConversationItem,
     *,
     max_chars: int = _ACTIVITY_MAX_CHARS,
+    offset_chars: int = 0,
 ) -> dict[str, str | None]:
     """
     Project a conversation item into a compact dict.
@@ -1047,11 +1048,15 @@ def _project_activity_item(
     Handles three item types: messages (user/assistant text),
     function calls (tool name + args), and function call
     outputs (tool name + result). Content fields are truncated
-    to ``max_chars``, which defaults to ``_ACTIVITY_MAX_CHARS``.
+    to ``max_chars``, which defaults to ``_ACTIVITY_MAX_CHARS``;
+    ``offset_chars`` skips that many leading characters first so
+    callers can page through one long field window by window.
 
     :param item: A conversation item from the sub-agent's
         conversation.
     :param max_chars: Maximum characters retained in each content field.
+    :param offset_chars: Characters skipped from the start of each
+        content field before the window is taken.
     :returns: A compact dict with ``role``, ``type``, and
         content fields.
     """
@@ -1066,6 +1071,7 @@ def _project_activity_item(
             "args": _truncate(
                 data.get("arguments", ""),
                 max_chars=max_chars,
+                offset_chars=offset_chars,
             ),
         }
     if item.type == "function_call_output":
@@ -1076,6 +1082,7 @@ def _project_activity_item(
             "content": _truncate(
                 data.get("output", ""),
                 max_chars=max_chars,
+                offset_chars=offset_chars,
             ),
         }
     # Message item — extract role and text content.
@@ -1091,22 +1098,33 @@ def _project_activity_item(
     return {
         "role": role,
         "type": "text",
-        "content": _truncate("\n".join(text_parts), max_chars=max_chars),
+        "content": _truncate(
+            "\n".join(text_parts),
+            max_chars=max_chars,
+            offset_chars=offset_chars,
+        ),
     }
 
 
-def _truncate(text: str, *, max_chars: int = _ACTIVITY_MAX_CHARS) -> str:
+def _truncate(
+    text: str,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+    offset_chars: int = 0,
+) -> str:
     """
-    Truncate text to ``max_chars``.
+    Return a bounded window of ``text``.
 
     :param text: The input string.
     :param max_chars: Maximum characters retained before the marker.
-    :returns: The original string if short enough, or a
-        truncated version with ``" [truncated]"`` suffix.
+    :param offset_chars: Characters skipped before the window.
+    :returns: ``text[offset_chars : offset_chars + max_chars]``, with a
+        ``" [truncated]"`` suffix when content remains past the window.
     """
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + " [truncated]"
+    window = text[offset_chars : offset_chars + max_chars]
+    if offset_chars + max_chars >= len(text):
+        return window
+    return window + " [truncated]"
 
 
 # ── 13a: sys_session_get_history / sys_session_close ─────────
@@ -1413,7 +1431,7 @@ def _clamp_history_content_chars(raw: Any) -> int | str:
 
     :param raw: Provider-supplied value that may not have passed JSON schema
         validation.
-    :returns: An integer in ``[1, _HISTORY_MAX_CHARS_PER_ITEM]`` or a
+    :returns: An integer in ``[1, _HISTORY_MAX_TOTAL_CHARS]`` or a
         JSON error string suitable for returning to the model.
     """
     error = json.dumps({"error": f"content_max_chars must be a whole number, got {raw!r}"})
@@ -1432,7 +1450,39 @@ def _clamp_history_content_chars(raw: Any) -> int | str:
             return error
     if max_chars < 1:
         return json.dumps({"error": "content_max_chars must be >= 1"})
-    return min(max_chars, _HISTORY_MAX_CHARS_PER_ITEM)
+    return min(max_chars, _HISTORY_MAX_TOTAL_CHARS)
+
+
+def _clamp_history_offset_chars(raw: Any) -> int | str:
+    """
+    Validate the per-item history content offset.
+
+    Same coercion rules as :func:`_clamp_history_content_chars` with a
+    floor of 0. No upper bound: an offset at or past the end of a
+    content field simply yields an empty field.
+
+    :param raw: Provider-supplied value that may not have passed JSON schema
+        validation.
+    :returns: A non-negative integer or a JSON error string suitable for
+        returning to the model.
+    """
+    error = json.dumps({"error": f"content_offset_chars must be a whole number, got {raw!r}"})
+    if isinstance(raw, bool):
+        return error
+    if isinstance(raw, int):
+        offset = raw
+    elif isinstance(raw, float):
+        if not raw.is_integer():
+            return error
+        offset = int(raw)
+    else:
+        try:
+            offset = int(raw)
+        except (TypeError, ValueError):
+            return error
+    if offset < 0:
+        return json.dumps({"error": "content_offset_chars must be >= 0"})
+    return offset
 
 
 def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) -> int:
@@ -1459,7 +1509,11 @@ class SysSessionGetHistoryTool(Tool):
     Item content uses the same compact activity format as
     ``check_task``. It defaults to ``_ACTIVITY_MAX_CHARS`` per field;
     callers may request a larger bounded field through
-    ``content_max_chars`` when they need a substantive response.
+    ``content_max_chars`` when they need a substantive response (up
+    to the total prompt budget divided across the tail), and page
+    through a field longer than one window with
+    ``content_offset_chars``, so long sub-agent handoffs stay fully
+    reachable.
 
     Returns ``session_not_found`` when the conversation_id does
     not exist, ``session_out_of_tree`` when the server denies the read
@@ -1525,15 +1579,26 @@ class SysSessionGetHistoryTool(Tool):
                         "content_max_chars": {
                             "type": "integer",
                             "minimum": 1,
-                            "maximum": _HISTORY_MAX_CHARS_PER_ITEM,
+                            "maximum": _HISTORY_MAX_TOTAL_CHARS,
                             "description": (
                                 "Maximum characters returned per message, tool call, "
                                 "or tool result. Defaults to the compact activity "
-                                f"preview limit ({_ACTIVITY_MAX_CHARS}); clamped to "
-                                f"{_HISTORY_MAX_CHARS_PER_ITEM} and scaled down when "
-                                "needed to keep stored content near the existing "
-                                f"~{_HISTORY_MAX_TOTAL_CHARS}-character budget. "
+                                f"preview limit ({_ACTIVITY_MAX_CHARS}); scaled down "
+                                "when needed to keep the whole read near the "
+                                f"~{_HISTORY_MAX_TOTAL_CHARS}-character budget "
+                                "(use tail_items=1 to spend it on one item). "
                                 "Truncation markers and pending prompts are extra."
+                            ),
+                        },
+                        "content_offset_chars": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": (
+                                "Characters to skip from the start of each content "
+                                "field before applying content_max_chars. Defaults "
+                                "to 0. To page through one long item, use "
+                                "tail_items=1 and step this by content_max_chars "
+                                "until the ' [truncated]' suffix disappears."
                             ),
                         },
                     },
@@ -1575,6 +1640,11 @@ class SysSessionGetHistoryTool(Tool):
             tail_items=tail_items,
             content_max_chars=content_max_chars,
         )
+        content_offset_chars = _clamp_history_offset_chars(
+            resolution.args.get("content_offset_chars", 0),
+        )
+        if isinstance(content_offset_chars, str):
+            return content_offset_chars
         page = resolution.conv_store.list_items(
             resolution.child.id,
             limit=tail_items,
@@ -1583,7 +1653,11 @@ class SysSessionGetHistoryTool(Tool):
         # ``list_items(order="desc")`` returns newest-first; reverse
         # to chronological order so the LLM reads top-to-bottom.
         items: list[dict[str, Any]] = [
-            _project_activity_item(item, max_chars=content_max_chars)
+            _project_activity_item(
+                item,
+                max_chars=content_max_chars,
+                offset_chars=content_offset_chars,
+            )
             for item in reversed(page.data)
         ]
         # A parked elicitation never lands in the conversation store

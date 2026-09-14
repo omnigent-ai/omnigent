@@ -238,6 +238,7 @@ async def _drive_focus_ring(base_url: str) -> None:
 
             # Open the agent picker and click "Create custom agent".
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await page.get_by_test_id("new-chat-landing-create-agent").click()
 
             dialog = page.get_by_test_id("create-agent-dialog")

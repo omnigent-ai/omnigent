@@ -1514,6 +1514,10 @@ async def test_runner_disconnect_grace_defers_failed_marking(
     # Bind via the store (no relay) to a runner whose WS this test owns.
     runner_id = "runner-grace-timer"
     get_conversation_store().replace_runner_id(session_id, runner_id)
+    cleared_runners: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.clear_runner_liveness", cleared_runners.append
+    )
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -1526,6 +1530,7 @@ async def test_runner_disconnect_grace_defers_failed_marking(
         # failed flip must not have happened yet.
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         await communicator.wait(timeout=2.0)
+        assert runner_id in cleared_runners
         assert sessions_module._session_status_cache.get(session_id) != "failed", (
             "session failed immediately on disconnect — the grace window "
             "is not deferring the failed-marking"
@@ -1577,10 +1582,12 @@ async def test_server_initiated_close_never_fails_the_turn(
     close code 1012 and stops listening, so no runner can re-register inside
     the grace even though all of them are alive. The grace timer must read
     that close as the server's own shutdown and skip the offline-marking —
-    no ``failed`` status, no ``runner_disconnected`` labels.
+    no ``failed`` status, no ``runner_disconnected`` labels. The heartbeat
+    remains fresh so a replacement server cannot settle the turn as orphaned
+    while its surviving runner reconnects.
     """
     from omnigent.runtime import get_conversation_store
-    from omnigent.server import shutdown_state
+    from omnigent.server import session_live_state, shutdown_state
     from omnigent.server.routes import sessions as sessions_module
 
     ap_client = tunnel_three_layer_stack.ap_client
@@ -1606,14 +1613,21 @@ async def test_server_initiated_close_never_fails_the_turn(
     runner_id = "runner-server-close"
     store = get_conversation_store()
     store.replace_runner_id(session_id, runner_id)
+    cleared_runners: list[str] = []
+    monkeypatch.setattr(session_live_state, "clear_runner_liveness", cleared_runners.append)
+    touched_runners: list[str] = []
+    monkeypatch.setattr(session_live_state, "touch_runner_liveness", touched_runners.extend)
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
     sessions_module._session_status_cache[session_id] = "running"
+    touched_runners.clear()
     try:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1012})
         await communicator.wait(timeout=2.0)
         assert shutdown_state.server_shutting_down(), "a 1012 close did not mark server shutdown"
+        assert runner_id not in cleared_runners
+        assert runner_id in touched_runners
 
         # Well past the grace: the timer has fired and must have skipped the marking.
         await asyncio.sleep(grace * 3)

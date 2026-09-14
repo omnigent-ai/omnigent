@@ -57,6 +57,7 @@ import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -141,10 +142,13 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
-import { isSystemUserContent } from "@/lib/systemMessage";
+import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import type { StoredReplyDraft } from "@/lib/replyDraft";
 
 export interface SendOptions {
+  /** Client-only quote provenance, retained if the composer needs to retry. */
+  replyDraft?: StoredReplyDraft;
   /**
    * Fires synchronously after `createSession` returns for a brand-new
    * session (before the first message is posted). Callers use this
@@ -262,11 +266,45 @@ function removeConvRow(tempId: string): void {
  * Returns the temp id + the bubble's `pendingMsgTempId` for
  * `hydrateLocalConversation`, or `null` with no query cache (tests).
  */
+/**
+ * The model/agent identity the optimistic conversation should show while
+ * `createSession` is in flight. Every field mirrors the SAME normalized create
+ * request the POST sends — NOT raw picker state — so the temp view matches the
+ * session that binds. When cost-control routing is on the composer renders the
+ * routing label over any model, so the model fields stay `null` there.
+ */
+export interface OptimisticSessionModel {
+  /** The `model_override` the create POSTs, or `null` when none (default/routing). */
+  modelOverride: string | null;
+  /** The agent's resolved default model id, shown when there's no override. Omit
+   *  to leave `llmModel` unset (composer reads "agent default"). */
+  llmModel?: string | null;
+  /** The `reasoning_effort` the create POSTs, or `null`. */
+  reasoningEffort?: string | null;
+  /** Normalized brain/session harness (e.g. `"claude-sdk"`), NOT the picker's
+   *  `*-native` id. Omit when unknown; the composer tolerates a null harness. */
+  harness?: string | null;
+  /** Model context window, when known up front. Omit to leave unset. */
+  contextWindow?: number | null;
+  /** The `cost_control_mode_override` the create POSTs. `"on"` makes the
+   *  composer render the routing label instead of a model. */
+  costControlModeOverride?: "on" | "off" | null;
+  /** The `subagent_routing_override` the create POSTs, when set. */
+  subagentRoutingOverride?: "on" | "off" | null;
+  /** Bound agent identity for the composer, when resolved. */
+  boundAgentId?: string | null;
+  boundAgentName?: string | null;
+  /** Selected host id, so the temp composer can evaluate routing's per-family
+   *  gateway guard against the real chosen host during the pre-session window. */
+  hostId?: string | null;
+}
+
 export function beginLocalConversation(
   text: string,
   files: File[] | undefined,
   provisional = newTempConversation(),
   project?: LocalConversationProject,
+  model?: OptimisticSessionModel,
 ): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {
   if (queryClient === null) return null;
   const { id: tempConvId, token: createToken } = provisional;
@@ -296,8 +334,39 @@ export function beginLocalConversation(
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
 
+  // Seed the model/agent identity so the optimistic composer shows the selected
+  // model (with the caller's pending spinner) instead of the previous session's
+  // or a blank one. Every field mirrors the normalized create request; when
+  // cost-control routing is on the composer renders the routing label over any
+  // model, so a routing create simply leaves the model fields null.
+  const modelSeed: Partial<ConversationState> =
+    model === undefined
+      ? {}
+      : {
+          sessionModelOverride: model.modelOverride,
+          sessionModelSeeded: true,
+          sessionReasoningEffort: model.reasoningEffort ?? null,
+          // Authoritative only when the caller actually supplied an effort
+          // (a value or an intentional null) — an omitted effort stays a
+          // sticky-fallback, never a claimed "no effort".
+          sessionEffortSeeded: model.reasoningEffort !== undefined,
+          boundAgentId: model.boundAgentId ?? null,
+          boundAgentName: model.boundAgentName ?? null,
+          sessionHostId: model.hostId ?? null,
+          ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
+          ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
+          ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+          ...(model.costControlModeOverride !== undefined
+            ? { costControlModeOverride: model.costControlModeOverride }
+            : {}),
+          ...(model.subagentRoutingOverride !== undefined
+            ? { subagentRoutingOverride: model.subagentRoutingOverride }
+            : {}),
+        };
+
   const entry = conversationRegistry.acquire(tempConvId);
   entry.setState({
+    ...modelSeed,
     pendingUserMessages: [bubble],
     loadingConversation: false,
     status: "streaming",
@@ -443,6 +512,7 @@ export interface QueuedMessage {
   queueId: string;
   /** Fully-assembled message text (mentions/quotes already applied). */
   text: string;
+  replyDraft?: StoredReplyDraft;
   /** Attachments to send with the message. */
   files?: File[];
   /** Owning conversation, so a switch/idle only flushes its own queue. */
@@ -615,6 +685,23 @@ export interface ConversationState {
    */
   sessionReasoningEffort: string | null;
   /**
+   * True when ``sessionReasoningEffort`` is AUTHORITATIVE for this conversation
+   * — set by the optimistic create seed (incl. an intentional ``null``) and by a
+   * live ``session_reasoning_effort`` report (also incl. null) — so the composer
+   * must NOT fall back to the app-global sticky pick. Distinguishes a
+   * deliberately-seeded / live-reported null from an unhydrated null. Cold
+   * hydration (bind) deliberately leaves this false: it folds the sticky pref
+   * into the value itself.
+   */
+  sessionEffortSeeded: boolean;
+  sessionModelSeeded: boolean;
+  /**
+   * Selected host id seeded at optimistic create, so the temp composer can run
+   * routing's per-family gateway guard against the real chosen host before the
+   * server session (which then owns ``hostId``) exists. ``null`` when unknown.
+   */
+  sessionHostId: string | null;
+  /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
    * disables cost control, ``null`` defers to the spec default.
@@ -690,6 +777,7 @@ export interface ConversationState {
     text: string;
     files: File[];
     stableId?: string;
+    replyDraft?: StoredReplyDraft;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -832,15 +920,22 @@ export interface ConversationState {
    */
   sandboxStatus: SandboxStatus | null;
   /**
-   * Per-MCP-server startup map for the bound session (codex-native).
-   * Updated by `session.mcp_startup` SSE events while the harness boots
-   * its MCP servers; cleared back to `null` once no server is still
-   * `starting`. Settled failures/cancellations are setup diagnostics
-   * (host logs), never conversation content, so they are dropped rather
-   * than retained. Always `null` for sessions whose harness reports no
-   * MCP startup.
+   * Native MCP startup progress, cleared when startup settles or live
+   * assistant text arrives. Failures/cancellations stay in host diagnostics,
+   * not the conversation. Null for harnesses that report no MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
+  /**
+   * Only native harnesses report MCP startup. Track launch pending separately
+   * from the terminal pill so metadata cannot consume its rearm signal.
+   */
+  mcpStartupLaunch: { pending: boolean; dismissed: boolean };
+  /**
+   * Transient /btw sidechat overlay state (question + answer from `/btw`).
+   * Set by `session_btw_sidechat` SSE events, cleared on Escape or dismiss.
+   * Not persisted across page reloads. `null` when no overlay is open.
+   */
+  btwSidechat: { question: string; answer: string; truncated: boolean } | null;
 
   // Internal mutable bookkeeping. NOT meant to be subscribed to.
   abortController: AbortController | null;
@@ -930,7 +1025,7 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[]) => void;
+  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1093,6 +1188,11 @@ export interface ChatActions {
   refreshSessionState: (conversationId?: string) => Promise<void>;
   /** Dismiss the too-many-tabs banner for the current over-budget episode. */
   dismissStreamBudgetBanner: () => void;
+  /**
+   * Dismiss the /btw sidechat overlay.
+   * TODO: reconcile with terminal Escape on native sessions.
+   */
+  dismissBtwSidechat: () => void;
 }
 
 /**
@@ -1111,6 +1211,10 @@ let queryClient: QueryClient | null = null;
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+
+// Snapshot reconciliation must teach the already-running stream pump which
+// native preview messages have finalized, including warm session revisits.
+const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
 
 /**
  * Evict a conversation from the live registry.
@@ -1604,6 +1708,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
   interruptedResponseIds: [],
@@ -1622,6 +1727,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
   sessionReasoningEffort: null,
+  sessionEffortSeeded: false,
+  sessionModelSeeded: false,
+  sessionHostId: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
@@ -1654,10 +1762,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
+  mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files) => {
+  enqueueMessage: (text, files, replyDraft) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
@@ -1673,6 +1782,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
+          ...(replyDraft ? { replyDraft } : {}),
         },
       ],
     }));
@@ -1724,7 +1834,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files);
+    void s.send(target.text, agentId, target.files, { replyDraft: target.replyDraft });
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -1771,7 +1881,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (head === undefined) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, {
+      replyDraft: head.replyDraft,
+    });
   },
 
   flushBackgroundQueues: () => {
@@ -2094,7 +2206,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [], stableId },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text,
+            files: files ?? [],
+            stableId,
+            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          },
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -2410,7 +2528,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // controller too. Verify the instantly-painted transcript against the
       // committed snapshot in the background; item-id dedupe makes this a
       // no-op when the entry really is current.
-      void reconcileOnReconnect(conversationId, entrySetter(entry), entryGetter(entry));
+      const controller = entry.getState().abortController;
+      void reconcileOnReconnect(
+        conversationId,
+        entrySetter(entry),
+        entryGetter(entry),
+        controller === null ? undefined : nativePreviewTombstonesByController.get(controller),
+      );
       return;
     }
 
@@ -2514,6 +2638,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
 
+  dismissBtwSidechat: () => {
+    const { conversationId } = get();
+    setActive({ btwSidechat: null });
+    // Mirror the close to the terminal so its own /btw overlay (a separate
+    // surface) shuts in lockstep. Best-effort and fire-and-forget: the pane
+    // overlay also auto-dismisses on the next injected message, so a failed
+    // or no-op forward changes nothing the user sees.
+    if (conversationId) {
+      void postEvent(conversationId, { type: "external_btw_dismiss", data: {} }).catch(() => {});
+    }
+  },
+
   markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
@@ -2550,7 +2686,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Harness has no effort control: undo the optimistic session-scoped write
       // so this conversation doesn't claim an effort the server will never hold.
       if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
+        setterFor(conversationId)({ sessionReasoningEffort: null, sessionEffortSeeded: false });
         return;
       }
       await updateSession(conversationId, { reasoningEffort: effort });
@@ -3342,20 +3478,51 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
 }
 
 /**
- * An MCP startup map reduced to what the chat surface may show: the map
- * while any server is still `starting`, else `null`. A settled round —
- * all ready, or ended with failures/cancellations — renders nothing:
- * failure notices are setup diagnostics that belong in host logs, not
- * items in the conversation viewport. Applied at both intake points
- * (SSE event and session snapshot) so a reload can't resurrect a notice
- * the live handler would have dropped.
+ * Show pending MCP startup only until live assistant text supersedes it.
+ * Shared by SSE and snapshots so late progress cannot resurrect the band.
+ * Settled failures/cancellations remain setup diagnostics, not chat content.
  */
 function activeMcpStartup(
   servers: Record<string, McpServerStartup> | null | undefined,
+  dismissed: boolean,
 ): Record<string, McpServerStartup> | null {
-  if (!servers) return null;
+  if (dismissed || !servers) return null;
   const anyStarting = Object.values(servers).some((r) => r.status === "starting");
   return anyStarting ? servers : null;
+}
+
+function updateMcpStartupLaunch(
+  launch: ConversationState["mcpStartupLaunch"],
+  pending: boolean,
+): ConversationState["mcpStartupLaunch"] {
+  return pending === launch.pending
+    ? launch
+    : { pending, dismissed: pending ? false : launch.dismissed };
+}
+
+/** Joined requests may predate live text, so they cannot prove a new launch. */
+function mcpStartupBeforeSnapshot(
+  id: string,
+  state: Pick<ConversationState, "mcpStartupLaunch"> | null,
+): ConversationState["mcpStartupLaunch"] | undefined {
+  if (queryClient?.getQueryState(["session", id])?.fetchStatus === "fetching") return undefined;
+  return state?.mcpStartupLaunch;
+}
+
+function mcpStartupSnapshotPatch(
+  session: Session,
+  state: Pick<ConversationState, "mcpStartupLaunch">,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+): Pick<ConversationState, "mcpStartup" | "mcpStartupLaunch"> {
+  // Fresh text creates a new latch object; older snapshots cannot rearm it.
+  const launch =
+    state.mcpStartupLaunch === launchBeforeFetch
+      ? updateMcpStartupLaunch(state.mcpStartupLaunch, session.terminalPending ?? false)
+      : state.mcpStartupLaunch;
+  return {
+    mcpStartupLaunch: launch,
+    mcpStartup: activeMcpStartup(session.mcpStartup, launch.dismissed),
+  };
 }
 
 /**
@@ -3378,10 +3545,16 @@ function activeMcpStartup(
  */
 function sessionBindingPatch(
   session: Session,
+  state: Pick<
+    ConversationState,
+    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+  >,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
   | "nativeVendorOwnsModel"
+  | "sessionModelSeeded"
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
@@ -3401,7 +3574,9 @@ function sessionBindingPatch(
   | "terminalPending"
   | "sandboxStatus"
   | "mcpStartup"
+  | "mcpStartupLaunch"
 > {
+  const retainModelSeed = state.sessionModelSeeded && session.llmModel == null;
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
@@ -3411,9 +3586,12 @@ function sessionBindingPatch(
       isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
-    llmModel: session.llmModel ?? null,
+    llmModel: retainModelSeed ? state.llmModel : (session.llmModel ?? null),
+    sessionModelSeeded: retainModelSeed,
     pendingModelChange: null,
-    sessionModelOverride: session.modelOverride ?? null,
+    sessionModelOverride: retainModelSeed
+      ? state.sessionModelOverride
+      : (session.modelOverride ?? null),
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
@@ -3431,7 +3609,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    mcpStartup: activeMcpStartup(session.mcpStartup),
+    ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
 }
 
@@ -3452,6 +3630,7 @@ function sessionBindingPatch(
  */
 async function refreshSessionBinding(id: string): Promise<void> {
   if (queryClient === null) return;
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
   let session: Session;
   try {
     session = await queryClient.fetchQuery({
@@ -3467,7 +3646,7 @@ async function refreshSessionBinding(id: string): Promise<void> {
   // an agent switch in a backgrounded conversation must still re-derive its
   // binding (most importantly `isNativeTerminalSession`, which gates the
   // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
-  setterFor(id)(sessionBindingPatch(session));
+  setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
 }
 
 /**
@@ -3492,6 +3671,8 @@ async function bindStream(
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
+  const ignoredNativeMessageIds = new Set<string>();
+  nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
@@ -3533,7 +3714,9 @@ async function bindStream(
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction).
-  void startStreamPump(id, controller, set, get).finally(() => releaseStreamSlot(id));
+  void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
+    releaseStreamSlot(id),
+  );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
   // (browser throttling), so a pending ApprovalCard that was answered on
@@ -3564,6 +3747,7 @@ async function bindStream(
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -3579,12 +3763,10 @@ async function bindStream(
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
+    const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
+    snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
     // Sticky-pref handoff for CLI-created sessions with no override.
-    // Binding-derived fields (isNativeTerminalSession, bound agent,
-    // model/skills metadata) — shared with the session.agent_changed
-    // refresh path; see sessionBindingPatch.
-    const bindingPatch = sessionBindingPatch(session);
     // Sub-agents inherit orchestrator choices.
     const isSubAgentSession = session.parentSessionId != null;
     const canApplyEffort = supportsEffortControl(session);
@@ -3624,6 +3806,8 @@ async function bindStream(
     // inside the updater because it depends on the catalog bind race.
     let resolvedStickyModel: string | null = null;
     set((state) => {
+      const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
+      const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
         bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
@@ -3631,14 +3815,14 @@ async function bindStream(
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
       const seenItemIds = new Set(
-        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
       // Dedupe against any elicitation blocks already produced by
       // the live pump (the snapshot may race ahead of or behind
       // the SSE event — match by elicitationId).
       const seenElicitationIds = new Set(
-        state.blocks
+        currentBlocks
           .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
           .map((b) => b.elicitationId),
       );
@@ -3663,7 +3847,7 @@ async function bindStream(
       // re-binds.)
       const allBlocks = [
         ...unique,
-        ...withoutRebuiltUserInputCards(state.blocks, unique),
+        ...withoutRebuiltUserInputCards(currentBlocks, unique),
         ...uniquePendingElicitations,
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
@@ -3793,10 +3977,8 @@ async function bindStream(
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
-        // Session truth for the `/model` readout — overrides the snapshot
-        // value spread via `...bindingPatch` so the claude-native sticky
-        // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: session.modelOverride ?? null,
+        // Server hydration supersedes any optimistic effort seed.
+        sessionEffortSeeded: false,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -3935,16 +4117,19 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  * already-running native session) would leave the turn's bubble non-streaming
  * and its tool cards static for the rest of the turn.
  */
-function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState> {
-  const patch: Partial<ChatState> = { sessionStatus: session.status };
+function reconnectStatusPatch(
+  session: Session,
+  s: ChatState,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+): Partial<ChatState> {
+  const patch: Partial<ChatState> = {
+    sessionStatus: session.status,
+    ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
+  };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
-  // Re-derive the MCP startup band from the snapshot: a settle (or update)
-  // `session.mcp_startup` event that fired into the gap is never replayed,
-  // so a stale band would otherwise stay stuck until a full reload.
-  patch.mcpStartup = activeMcpStartup(session.mcpStartup);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -4059,7 +4244,7 @@ async function reconcileActiveSessionStatus(
   ) {
     return;
   }
-  set((s) => reconnectStatusPatch(session, s));
+  set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
 }
 
 /**
@@ -4253,6 +4438,8 @@ async function rehydrateWindowOnReconnect(
   preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
   set: Setter,
   get: Getter,
+  ignoredNativeMessageIds: Set<string>,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -4263,11 +4450,14 @@ async function rehydrateWindowOnReconnect(
     return;
   }
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
+  snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    const tail = s.blocks.filter((b) => {
+    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
+    const tail = currentBlocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
       // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
       if (b.type === "elicitation" || b.type === "error") return true;
@@ -4282,7 +4472,7 @@ async function rehydrateWindowOnReconnect(
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
     return {
-      ...reconnectStatusPatch(session, s),
+      ...reconnectStatusPatch(session, s, launchBeforeFetch),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -4326,8 +4516,14 @@ async function rehydrateWindowOnReconnect(
  * failure just means the next reconnect retries. All writes are
  * `historyGeneration`-guarded so a window reset mid-fetch voids them.
  */
-async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promise<void> {
+async function reconcileOnReconnect(
+  id: string,
+  set: Setter,
+  get: Getter,
+  ignoredNativeMessageIds: Set<string> = new Set<string>(),
+): Promise<void> {
   if (queryClient === null) return;
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -4386,19 +4582,31 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     if (older.items.length === 0) break; // no progress; avoid refetching the same cursor
   }
   /* oxlint-enable no-await-in-loop */
+  const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
+  snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   if (!covered) {
-    await rehydrateWindowOnReconnect(id, session, preGapIds, preGapElicitations, set, get);
+    await rehydrateWindowOnReconnect(
+      id,
+      session,
+      preGapIds,
+      preGapElicitations,
+      set,
+      get,
+      ignoredNativeMessageIds,
+      launchBeforeFetch,
+    );
     return;
   }
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
+    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
-      s.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+      currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
-    const patch: Partial<ChatState> = reconnectStatusPatch(session, s);
+    const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
@@ -4407,7 +4615,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
-    let nextBlocks = s.blocks;
+    let nextBlocks = currentBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
@@ -4418,7 +4626,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(s.blocks, unseen);
+      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
@@ -4535,7 +4743,9 @@ export async function startStreamPump(
   controller: AbortController,
   set: Setter,
   get: Getter,
+  ignoredNativeMessageIds: Set<string> = new Set<string>(),
 ): Promise<void> {
+  nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
   let statusReconcileInFlight = false;
   const statusReconcileTimer =
@@ -4695,9 +4905,17 @@ export async function startStreamPump(
         });
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
-        const pumpPromise = pumpStreamEvents(id, guardedBody, controller, set, get);
+        const pumpPromise = pumpStreamEvents(
+          id,
+          guardedBody,
+          controller,
+          set,
+          get,
+          undefined,
+          ignoredNativeMessageIds,
+        );
         if (reconnecting) {
-          await reconcileOnReconnect(id, set, get);
+          await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
         }
         let reason = await pumpPromise;
 
@@ -4829,6 +5047,40 @@ function isLiveProvisionalBlock(b: AnyBlock): boolean {
   return b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false;
 }
 
+/** Suppress future chunks for a provisional preview that is no longer valid. */
+function ignoreLivePreview(block: AnyBlock | undefined, ignoredMessageIds: Set<string>): void {
+  const itemId = block?.ctx.itemId;
+  if (!itemId?.startsWith(LIVE_ITEM_PREFIX)) return;
+  ignoredMessageIds.add(itemId.slice(LIVE_ITEM_PREFIX.length));
+}
+
+/** Return persisted native preview ids finalized by assistant messages. */
+function nativeCompletedMessageIds(items: ConversationItem[]): Set<string> {
+  return new Set(
+    items
+      .filter(
+        (item): item is MessageItem =>
+          isMessageItem(item) &&
+          item.role === "assistant" &&
+          typeof item.stream_message_id === "string" &&
+          item.stream_message_id.length > 0,
+      )
+      .map((item) => item.stream_message_id!),
+  );
+}
+
+/** Remove provisional previews whose authoritative snapshot item is present. */
+function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): AnyBlock[] {
+  if (messageIds.size === 0) return blocks;
+  return blocks.filter((block) => {
+    const itemId = block.ctx.itemId;
+    return (
+      !itemId?.startsWith(LIVE_ITEM_PREFIX) ||
+      !messageIds.has(itemId.slice(LIVE_ITEM_PREFIX.length))
+    );
+  });
+}
+
 /**
  * Build a provisional in-flight assistant-text block for live streaming.
  *
@@ -4889,18 +5141,28 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
 function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
+    const startupPatch =
+      delta.length > 0
+        ? {
+            mcpStartup: null,
+            mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
+          }
+        : {};
     const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
     if (at === -1) {
       const live = s.activeResponse;
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
-      return { blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)] };
+      return {
+        ...startupPatch,
+        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)],
+      };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
     const fullText = existing.fullText + delta;
     const next = s.blocks.slice();
     next[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
-    return { blocks: next };
+    return { ...startupPatch, blocks: next };
   });
 }
 
@@ -4973,6 +5235,9 @@ async function* tapLiveDeltas(
   get: Getter,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
+    if (ev.type === "message_done" && ev.messageId !== undefined) {
+      ignored.add(ev.messageId);
+    }
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (!isConversationDisposed(id) && !ignored.has(ev.messageId)) {
         // A scheduled wake streams its first deltas ahead of the batch
@@ -5090,6 +5355,7 @@ export async function pumpStreamEvents(
   set: Setter,
   get: Getter,
   scheduler: FrameScheduler = createRafScheduler(),
+  ignoredMessages: Set<string> = new Set<string>(),
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
@@ -5104,9 +5370,8 @@ export async function pumpStreamEvents(
   // to the BlockStream reducer. The reducer is intentionally pure
   // (block factory) — session-scoped state lives on the store, not in
   // the reducer's internal state. See migration plan §5.3.
-  // A scheduled wake can stream before its new turn id arrives. Ignore the
-  // rest of that message so it cannot attach to the completed prior turn.
-  const ignoredWakeMessages = new Set<string>();
+  // Ignore the rest of messages whose previews are stale or already replaced
+  // by authoritative items, so late transport delivery cannot recreate them.
   const events = tapLiveDeltas(
     tapSessionEvents(rawEvents, id, (elicitationId) => {
       // A fast native approval can resolve in the few milliseconds between
@@ -5128,7 +5393,7 @@ export async function pumpStreamEvents(
       };
     }),
     id,
-    ignoredWakeMessages,
+    ignoredMessages,
     set,
     get,
   );
@@ -5177,7 +5442,22 @@ export async function pumpStreamEvents(
         );
       }
       if (fresh.length === 0) return extra ?? {};
-      return { ...(extra ?? {}), blocks: [...s.blocks, ...fresh] };
+      // Only newly accepted text counts, not snapshot hydration or duplicates.
+      const hasAssistantText = fresh.some((b) =>
+        b.type === "text_chunk"
+          ? b.text.length > 0
+          : b.type === "text_done" && b.fullText.length > 0,
+      );
+      return {
+        ...(extra ?? {}),
+        ...(hasAssistantText
+          ? {
+              mcpStartup: null,
+              mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
+            }
+          : {}),
+        blocks: [...s.blocks, ...fresh],
+      };
     });
   };
 
@@ -5216,6 +5496,7 @@ export async function pumpStreamEvents(
       ) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
+          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
           flush();
           set((s) => {
             const at = s.blocks.findIndex(isLiveProvisionalBlock);
@@ -5299,6 +5580,7 @@ export async function pumpStreamEvents(
       if (block.type === "text_done" && get().isNativeTerminalSession) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
+          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
           // The done item has no message id. Native messages are sequential,
           // so remove the oldest preview and let the committed item follow
           // the normal reducer path.
@@ -5346,6 +5628,7 @@ export async function pumpStreamEvents(
         // after this event, or a stream drop). Normal messages already
         // had their preview replaced when their `text_done` committed, so
         // this is usually a no-op.
+        get().blocks.forEach((candidate) => ignoreLivePreview(candidate, ignoredMessages));
         set((s) => ({
           status: "idle",
           blocks: s.blocks.some(isLiveProvisionalBlock)
@@ -5411,18 +5694,24 @@ export async function pumpStreamEvents(
  * Returns `null` if the event does not describe a user message.
  */
 function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentBlock[] | null {
-  if (event.isMeta === true) return null;
   if (event.itemType !== "message") return null;
   if (event.data.role !== "user") return null;
   const raw = event.data.content;
   if (!Array.isArray(raw)) return null;
-  return raw.filter(
+  const content = raw.filter(
     (b): b is MessageContentBlock =>
       typeof b === "object" &&
       b !== null &&
       "type" in b &&
       (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
   );
+  // A Claude background-task wake is hidden context (`is_meta`) that still
+  // has to start a new turn on screen: render it as a system marker. Every
+  // other meta message (injected skill text) stays hidden.
+  const marker = taskNotificationMarkerContent(content);
+  if (marker !== null) return marker;
+  if (event.isMeta === true) return null;
+  return content;
 }
 
 function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
@@ -5537,6 +5826,10 @@ async function refetchRunnerBackedSessionState(
   // re-bound on return — dropping the nudge here would leave its slash menu and
   // model catalog empty for as long as the entry stays live.
   if (isConversationDisposed(conversationId)) return;
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(
+    conversationId,
+    setterForState(conversationId),
+  );
   let session: Session;
   try {
     if (queryClient !== null) {
@@ -5574,7 +5867,7 @@ async function refetchRunnerBackedSessionState(
   // the reported-model semantics, so a delayed catalog only hydrates state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
-      ? sessionBindingPatch(session)
+      ? sessionBindingPatch(session, currentState, launchBeforeFetch)
       : {
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
@@ -5728,7 +6021,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Toggle the Terminal-pill spinner. The runner sets pending=true
       // before auto-creating the terminal and clears it once the
       // terminal lands or auto-create fails.
-      applyToConversation({ terminalPending: event.pending });
+      applyToConversation((s) => ({
+        terminalPending: event.pending,
+        mcpStartupLaunch: updateMcpStartupLaunch(s.mcpStartupLaunch, event.pending),
+      }));
       return;
     case "session_sandbox_status":
       // Advance the managed-sandbox provisioning indicator. `ready`
@@ -5745,7 +6041,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Failures/cancellations are setup diagnostics (host logs), not
       // conversation content — retaining them rendered an inline notice
       // in the chat viewport and pinned the message-flow branch open.
-      applyToConversation({ mcpStartup: activeMcpStartup(event.servers) });
+      applyToConversation((s) => ({
+        mcpStartup: activeMcpStartup(event.servers, s.mcpStartupLaunch.dismissed),
+      }));
       return;
     }
     case "session_usage": {
@@ -5787,6 +6085,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // outcome of the ask.
       applyToNamedConversation(event.conversationId, {
         llmModel: event.model,
+        sessionModelSeeded: false,
         pendingModelChange: null,
       });
       return;
@@ -5821,6 +6120,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // wrong until a refresh.
       applyToNamedConversation(event.conversationId, {
         sessionReasoningEffort: event.reasoningEffort,
+        // The live report is the AUTHORITATIVE per-session effort — including an
+        // explicit null ("reset to agent default"). Keep the authority flag set
+        // so a background reset-to-null is retained through a warm A→B→A switch
+        // (never falling back to another session's sticky pick). Cold hydration
+        // is different: bind folds the sticky pref into the value on purpose.
+        sessionEffortSeeded: true,
       });
       // `selectedEffort` is the app-global sticky pick, so only adopt a value
       // reported by the conversation the user is actually looking at.
@@ -6164,7 +6469,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed":
-      if (event.isMeta === true) return;
+      // Hidden meta inputs stay hidden — except a background-task wake,
+      // which `userContentFromEvent` re-labels as a system marker.
+      if (event.isMeta === true && userContentFromEvent(event) === null) return;
       // Promote the matching optimistic bubble into committed history.
       // Three ways to find it, in order of precision:
       //   1. By id — the server tells us which pending-input entry this
@@ -6351,6 +6658,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // spin forever. Drop it; resuming starts a fresh turn.
       applyToNamedConversation(event.conversationId, { pendingUserMessages: [] });
       return;
+    case "session_btw_sidechat":
+      // Transient /btw sidechat overlay: show the question + answer in a
+      // dismissable panel. Guard on active conversation so late events from
+      // switched-away streams don't hijack the UI. Clear pendingUserMessages
+      // and activeResponse (mirroring superseded behavior) to reset state.
+      applyToNamedConversation(event.conversationId, {
+        btwSidechat: {
+          question: event.question,
+          answer: event.answer,
+          truncated: event.truncated,
+        },
+        pendingUserMessages: [],
+        activeResponse: null,
+      });
+      return;
     case "session_resource_created":
       if (event.resource.type === "terminal") {
         applyTerminalCreated(event.resource as unknown as Record<string, unknown>);
@@ -6430,7 +6752,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const updated: ElicitationBlock = {
           ...target,
           status: "responded",
-          response: { action: "auto_resolved" },
+          // Carry the verdict when the event delivers one so an approval
+          // answered on another surface reads "Approved"/"Rejected";
+          // fall back to the neutral pill only when it is truly unknown.
+          // "unanswered" refines that pill: nobody answered before the
+          // agent stopped waiting, so the card can say what to do next.
+          response: {
+            action: event.action ?? "auto_resolved",
+            ...(event.reason ? { reason: event.reason } : {}),
+          },
         };
         return {
           blocks: [...s.blocks.slice(0, matchIdx), updated, ...s.blocks.slice(matchIdx + 1)],

@@ -667,7 +667,7 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     # The list-of-errors shape with a human-readable msg is what
     # describeCreateError picks the message from.
     assert isinstance(detail, list) and len(detail) == 1
-    assert "takes a git repository URL" in detail[0]["msg"]
+    assert "git repository URL" in detail[0]["msg"]
 
 
 async def test_managed_session_create_rejects_unconfigured_provider(

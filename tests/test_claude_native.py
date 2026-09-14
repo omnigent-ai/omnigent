@@ -2564,6 +2564,77 @@ async def test_find_running_claude_terminal_miss_statuses_relaunch(
     assert found is None
 
 
+@pytest.mark.asyncio
+async def test_terminal_ready_wait_surfaces_recorded_launch_failure() -> None:
+    """
+    A dead launch fails the wait fast with the runner's recorded cause.
+
+    When ``claude`` exits at startup (e.g. it rejects its argv), the
+    terminal never comes up but the runner persists an error item with
+    the captured pane output. The wait must raise that real cause
+    promptly instead of burning the full timeout and reporting only a
+    generic "did not create the Claude terminal" message — the failure
+    mode where the user's TTY hides the actual error in the runner log.
+    """
+    items_calls = 0
+    recorded_cause = (
+        "Claude Code exited during startup.\n\nLast captured terminal output:\n"
+        "Error: Invalid MCP configuration:\nMCP config file not found: /work/hello"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal items_calls
+        if request.url.path.endswith("/items"):
+            items_calls += 1
+            if items_calls == 1:
+                # Baseline read before the launch failure lands.
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "item_err_1", "type": "error", "message": recorded_cause}]},
+            )
+        # The terminal resource never appears.
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    transport = httpx.MockTransport(handler)
+    started = asyncio.get_event_loop().time()
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException) as excinfo:
+            await claude_native._wait_for_claude_terminal_ready(client, "conv_abc", timeout_s=5.0)
+    elapsed = asyncio.get_event_loop().time() - started
+
+    assert "could not start the Claude terminal" in excinfo.value.message
+    assert "MCP config file not found" in excinfo.value.message
+    # Fail-fast, not at the deadline: the cause was visible on the first
+    # polls, so the wait must not sit out the timeout.
+    assert elapsed < 2.0
+
+
+@pytest.mark.asyncio
+async def test_terminal_ready_wait_ignores_stale_error_items() -> None:
+    """
+    An error persisted before the wait began does not abort the launch.
+
+    A resumed session may carry an old failure item; that is not this
+    launch's outcome, so the wait keeps polling and times out with the
+    generic message rather than blaming the stale error.
+    """
+    stale = {"id": "item_err_old", "type": "error", "message": "an earlier failure"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/items"):
+            return httpx.Response(200, json={"data": [stale]})
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException) as excinfo:
+            await claude_native._wait_for_claude_terminal_ready(client, "conv_abc", timeout_s=0.3)
+
+    assert "did not create the Claude terminal" in excinfo.value.message
+    assert "an earlier failure" not in excinfo.value.message
+
+
 # ── same-machine tmux attach (Phase 4) ─────────────────────
 
 

@@ -290,6 +290,20 @@ export interface ElicitationRequest {
 export interface ElicitationResolved {
   type: "elicitation_resolved";
   elicitationId: string;
+  /**
+   * Verdict the prompt was resolved with, when the server knows it
+   * (answered on another surface: native terminal popup, another tab,
+   * the approve page). Absent when the resolution carried no verdict,
+   * e.g. a tool-result auto-resolve.
+   */
+  action?: "accept" | "decline" | "cancel";
+  /**
+   * Why the prompt resolved without a verdict, when the server knows:
+   * `"unanswered"` means the hook stopped waiting (a severed poll never
+   * re-parked, the ask timed out) before anyone answered, so the prompt
+   * is gone rather than decided. Never present alongside `action`.
+   */
+  reason?: "unanswered";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */
@@ -308,6 +322,8 @@ export interface MessageDone {
   content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
+  /** Native live-preview stream finalized by this item. */
+  messageId?: string;
 }
 
 /**
@@ -936,6 +952,25 @@ export interface SessionSupersededEvent {
 }
 
 /**
+ * `session.btw_sidechat` — a transient side-chat answer from `/btw` command.
+ *
+ * Broadcast-only (never persisted, no SSE replay). The answer appears in a
+ * dismissable overlay near the composer — not as a persisted message — and
+ * Escape closes it. Nothing persists; a reload drops it.
+ */
+export interface SessionBtwSidechatEvent {
+  type: "session_btw_sidechat";
+  /** The conversation this side-chat was spawned in. */
+  conversationId: string;
+  /** The original `/btw` question text. */
+  question: string;
+  /** The assistant's answer. */
+  answer: string;
+  /** True when the answer was truncated (user should check the terminal for full response). */
+  truncated: boolean;
+}
+
+/**
  * `browser.action_request` — the agent's `browser_*` tool asks the desktop shell
  * to run a browser action against this conversation's WebContentsView. Every
  * renderer sees the event, but the relay (`useBrowserAgentRelay`) claims it first
@@ -1009,4 +1044,5 @@ export type StreamEvent =
   | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
+  | SessionBtwSidechatEvent
   | BrowserActionRequestEvent;

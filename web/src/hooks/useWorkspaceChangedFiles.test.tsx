@@ -11,9 +11,14 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/store/chatStore", () => ({
   useChatStore: vi.fn(),
 }));
+vi.mock("@/hooks/useSession", () => ({
+  useSession: vi.fn(),
+}));
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSession } from "@/hooks/useSession";
 import { useChatStore } from "@/store/chatStore";
+import type { Session } from "@/lib/types";
 import {
   type WorkspaceEnvironment,
   MAX_RUNNER_OFFLINE_RETRIES,
@@ -36,8 +41,26 @@ import {
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
+const sessionMock = vi.mocked(useSession);
 const chatStoreMock = vi.mocked(useChatStore);
 const fetchMock = vi.fn();
+
+function stubSession(opts: { hostId?: string | null; createdAtSecondsAgo?: number } | null) {
+  if (opts === null) {
+    sessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+    return;
+  }
+  const createdAt = Math.floor(Date.now() / 1000) - (opts.createdAtSecondsAgo ?? 0);
+  sessionMock.mockReturnValue({
+    session: {
+      hostId: opts.hostId ?? "host_1",
+      permissionLevel: null,
+      createdAt,
+    } as Session,
+    isLoading: false,
+    error: null,
+  });
+}
 
 type StubStatus = "idle" | "running" | "waiting" | "failed";
 
@@ -199,6 +222,8 @@ beforeEach(() => {
   // assume sessionActive is false (initial fetch from `enabled`, no
   // polling). The trailing-invalidate test overrides per-call.
   stubChatStore();
+  hostOnlineMock.mockReturnValue(null);
+  stubSession(null);
 });
 
 afterEach(() => {
@@ -760,6 +785,16 @@ describe("isRunnerUnavailable503", () => {
     } as unknown as Response;
     expect(await isRunnerUnavailable503(res)).toBe(false);
   });
+
+  it("does not consume a non-503 response body", async () => {
+    const json = vi.fn(async () => {
+      throw new Error("body must not be read");
+    });
+    const res = { ok: true, status: 200, statusText: "OK", json } as unknown as Response;
+
+    expect(await isRunnerUnavailable503(res)).toBe(false);
+    expect(json).not.toHaveBeenCalled();
+  });
 });
 
 describe("looksLikeWorkspaceFilePath", () => {
@@ -964,6 +999,22 @@ describe("useWorkspaceFileExists", () => {
     expect(results.at(-1)).toBe(false);
   });
 
+  it("reports false without retrying when the runner is offline", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+    const results: boolean[] = [];
+    render(
+      <Wrap>
+        <FileExistsProbe id="conv_1" path="projects/out/foo.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(results).not.toContain(true);
+    expect(results.at(-1)).toBe(false);
+  });
+
   it("checks a trusted root-level basename against the workspace root listing", async () => {
     // A path resolved from an absolute/"~" form can be a bare basename
     // ("foo.md", no slash) that looksLikeWorkspaceFilePath rejects. With
@@ -1056,6 +1107,86 @@ describe("runnerOfflineRetryDelay", () => {
     expect(runnerOfflineRetryDelay(3)).toBe(8000);
     expect(runnerOfflineRetryDelay(4)).toBe(15_000);
     expect(runnerOfflineRetryDelay(10)).toBe(15_000);
+  });
+});
+
+describe("runner-offline retry liveness gate", () => {
+  function renderEnvironment(id: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { staleTime: 0 } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <EnvironmentProbe id={id} />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("does not retry a 503 from a stale-online runner", async () => {
+    vi.useFakeTimers();
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_stuck");
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a 503 for an old session with unknown liveness", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
+    onlineMock.mockReturnValue(undefined);
+    stubSession({ createdAtSecondsAgo: 3600 });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_old");
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries while a fresh session is cold-booting", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
+    onlineMock.mockReturnValue(undefined);
+    stubSession({ createdAtSecondsAgo: 1 });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_fresh");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("retries while the session snapshot is loading", async () => {
+    vi.useFakeTimers();
+    onlineMock.mockReturnValue(undefined);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_loading");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("retries while an active turn relaunches an offline runner", async () => {
+    vi.useFakeTimers();
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    stubSession({ createdAtSecondsAgo: 3600 });
+    stubChatStore("conv_relaunch", "running");
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    renderEnvironment("conv_relaunch");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 });
 

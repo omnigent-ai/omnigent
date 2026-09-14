@@ -1686,6 +1686,8 @@ async def test_permission_request_hook_timeout_clears_pending_index(
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload()
 
+    resolved_events: list[dict[str, object]] = []
+
     async def _drain_until_resolved() -> None:
         """
         Wait for the deferred ``response.elicitation_resolved`` publish.
@@ -1695,6 +1697,7 @@ async def test_permission_request_hook_timeout_clears_pending_index(
         async with asyncio.timeout(3.0):
             async for event in session_stream.subscribe(session_id):
                 if event.get("type") == "response.elicitation_resolved":
+                    resolved_events.append(event)
                     return
 
     drain_task = asyncio.create_task(_drain_until_resolved())
@@ -1715,6 +1718,11 @@ async def test_permission_request_hook_timeout_clears_pending_index(
     # The deferred clear fires only after the re-park grace; waiting
     # for the resolved event (not sleeping) keeps this event-driven.
     await drain_task
+    # Nobody answered, so the clear must say why there is no verdict; a
+    # bare clear rendered as "Resolved elsewhere" and left the reporter's
+    # session looking ambiguously stuck.
+    assert resolved_events and resolved_events[0].get("reason") == "unanswered", resolved_events
+    assert "action" not in resolved_events[0]
     # 0 = the deferred clear decremented the index even though no UI
     # verdict arrived. If > 0, the sidebar would show a stuck badge
     # for every claude-native session whose owner answered in the
@@ -1726,6 +1734,50 @@ async def test_permission_request_hook_timeout_clears_pending_index(
         f"response.elicitation_resolved when no re-park arrives."
     )
     pending_elicitations.reset_for_tests()
+
+
+async def test_publish_elicitation_resolved_keeps_verdict_and_reason_exclusive(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A verdict wins over a no-verdict reason; only a verdict-less clear carries one.
+
+    The card reads ``reason`` only on the neutral pill, so a stray reason
+    beside a real verdict would be ignored anyway; dropping it at the
+    publisher keeps the wire contract self-enforcing for every consumer.
+    """
+    agent = await create_test_agent(client, "test-publish-resolved-exclusive")
+    session_id = await _create_session(client, agent["id"])
+    captured: list[dict[str, object]] = []
+
+    async def _drain_three() -> None:
+        """
+        Collect the three resolved events published below.
+
+        :returns: None.
+        """
+        async with asyncio.timeout(3.0):
+            async for event in session_stream.subscribe(session_id):
+                if event.get("type") == "response.elicitation_resolved":
+                    captured.append(event)
+                    if len(captured) == 3:
+                        return
+
+    drain_task = asyncio.create_task(_drain_three())
+    await asyncio.sleep(0.05)
+    sessions_route._publish_elicitation_resolved(
+        session_id, "elicit_a", action="decline", reason="unanswered"
+    )
+    sessions_route._publish_elicitation_resolved(session_id, "elicit_b", reason="unanswered")
+    sessions_route._publish_elicitation_resolved(session_id, "elicit_c", reason="because")
+    await drain_task
+
+    assert captured[0]["action"] == "decline"
+    assert "reason" not in captured[0]
+    assert "action" not in captured[1]
+    assert captured[1]["reason"] == "unanswered"
+    assert "action" not in captured[2]
+    assert "reason" not in captured[2]
 
 
 async def test_pre_resolved_elicitation_tombstone_expires_before_hook_registration(
