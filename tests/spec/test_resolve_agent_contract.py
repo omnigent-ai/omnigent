@@ -43,36 +43,31 @@ def _normalized_resolve_instructions() -> str:
     return " ".join(text.split())
 
 
-def test_textual_carveout_scoped_to_api_and_test_asserted_values() -> None:
+def test_written_evidence_is_limited_to_results_without_visible_interaction() -> None:
     normalized = _normalized_resolve_instructions()
 
     assert (
-        "The no-footage carve-out applies **only** to `api` facets and to "
-        "values only a test asserts" in normalized
+        "For internal/API-only results with no visible user interaction, "
+        "written evidence is enough" in normalized
     )
     assert "just a static line, value, or the absence of an error" not in normalized
     assert "For purely textual evidence" not in normalized
 
 
-def test_cli_console_output_is_always_filmed() -> None:
+def test_cli_recording_covers_message_only_changes() -> None:
     normalized = _normalized_resolve_instructions()
 
     assert (
-        "A `cli`/`terminal` facet whose fixed outcome is what a command prints "
-        "on its console is **always filmed**" in normalized
+        "record the real command and its output, even if only an error message changes"
+        in normalized
     )
-    assert "expired-login `omnigent host` example" in normalized
+    assert "run `omnigent host` with an expired login" in normalized
+    assert "A missing before-clip is not a reason to skip the after-clip" in normalized
 
 
-def test_unavailable_reason_rejects_purely_textual_on_cli_facets() -> None:
+def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     normalized = _normalized_resolve_instructions()
 
-    assert (
-        "On a `cli`/`terminal` facet the reason must name a concrete tooling "
-        "or reachability blocker (`vhs`/`ttyd` missing, the host/server won't "
-        "boot)" in normalized
-    )
-    assert (
-        '"the outcome is purely textual" and "the repro handoff carried no '
-        'recordings" are not accepted reasons on those facets' in normalized
-    )
+    assert "name the specific blocker in `recording_unavailable_reason`" in normalized
+    assert "Text-only CLI output is not a reason to skip recording" in normalized
+    assert "Do not block the fix or PR because footage is missing or rejected" in normalized

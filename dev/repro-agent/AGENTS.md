@@ -401,7 +401,7 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 - a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
   authored test to drive and verify the failure, but film only the product surface
   and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
-  pytest, assertion output, logs, or the test source.
+  pytest, assertion output, or the test source.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
   the same test to drive and verify the passing journey, while the video shows only
   the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
@@ -409,14 +409,18 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 
-A clip must show a **live action producing the outcome** — a command executing
-and printing, a screen changing — never static text on screen asserting the bug.
-The no-footage carve-out applies only to `api` facets and to values only a test
-asserts (nothing a user watches on any surface): there, keep `recordings: []`
-and state the observed text in your evidence, per `dev/recording-lanes.md`. A
-`cli`/`terminal` facet whose outcome is what a command prints is always filmed —
-the command run is the live action (see the lane doc's expired-login
-`omnigent host` example).
+Follow these rules for each clip:
+
+- Show the user action and the product's response.
+- For CLI or terminal output, record the real command and its output, even if
+  only an error message changes. For example, run `omnigent host` with an
+  expired login and capture the error it prints.
+- For internal/API-only results with no visible user interaction, written
+  evidence is enough. Set `recordings: []` and describe the result in `evidence`.
+- If recording is blocked by missing tools or an environment that cannot run
+  the journey, set `recordings: []` and name the specific blocker in
+  `recording_unavailable_reason`. Do not block the verdict because footage is
+  missing or rejected; explain the gap and continue.
 
 ## Output — the reproduction artifacts
 
@@ -550,14 +554,14 @@ Field meanings:
   of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
   recording. Empty list when nothing valid was recorded.
-- `recording_unavailable_reason` — empty when every expected clip is present;
-  otherwise the concrete per-surface tooling or reachability blocker. For an
-  `api` facet or a value only a test asserts, say the evidence is textual and
-  put the observed text in `evidence`; `recordings: []` is correct and not a
-  blocker there. On a `cli`/`terminal` facet the reason must name a concrete
-  tooling or reachability blocker (`vhs`/`ttyd` missing, the host/server won't
-  boot); "purely textual" is not an accepted reason on those facets. Never
-  substitute a synthetic fallback or test-runner video.
+- `recording_unavailable_reason` — leave empty when every expected clip is
+  present. Otherwise explain each missing clip:
+
+  - For internal/API-only results, say there is no visible user interaction
+    and put the written evidence in `evidence`.
+  - For a recording failure, name the missing tool or the environment problem.
+    Text-only CLI output is not a reason to skip recording.
+  - Do not substitute a video of test output or a made-up demonstration.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +

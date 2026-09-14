@@ -1,4 +1,4 @@
-"""The recording docs' textual carve-out must not cover CLI console output."""
+"""Recording rules distinguish CLI output from internal results."""
 
 from pathlib import Path
 
@@ -9,40 +9,37 @@ def _normalized(path: Path) -> str:
     return " ".join(path.read_text(encoding="utf-8").split())
 
 
-def test_lane_carveout_excludes_command_console_output() -> None:
+def test_lane_rules_distinguish_cli_output_from_internal_results() -> None:
     lanes = _normalized(_DEV / "recording-lanes.md")
 
-    assert "Text a command prints to its console is never that carve-out" in lanes
-    assert "its expired-login `omnigent host` example is exactly this shape" in lanes
-    assert (
-        '"The outcome is just a log line" never exempts a runnable command from footage.' in lanes
-    )
+    assert "record the real command and its output" in lanes
+    assert "output is only an error message, hint, or status line" in lanes
+    assert "`omnigent host` prints the wrong error after login expires" in lanes
+    assert "written evidence is enough when no user interface shows the result" in lanes
     assert "an error string, a value, a log line" not in lanes
 
 
-def test_lane_unavailable_reason_requires_concrete_blocker_on_cli() -> None:
+def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     lanes = _normalized(_DEV / "recording-lanes.md")
 
-    assert (
-        "On a `cli`/`terminal` facet the reason must name a concrete tooling "
-        "or reachability blocker (`vhs`/`ttyd` missing, the host/server won't "
-        "boot)" in lanes
-    )
-    assert (
-        '"the outcome is purely textual" and "the upstream handoff carried no '
-        'recordings" are not accepted reasons there' in lanes
-    )
+    assert "required tool is missing" in lanes
+    assert "Name the specific blocker in `recording_unavailable_reason`" in lanes
+    assert "Text-only CLI output is not a reason to skip recording" in lanes
+    assert "A missing recording from an earlier run is not a reason either" in lanes
+    assert "Do not block the verdict, fix, or PR" in lanes
 
 
-def test_repro_carveout_scoped_like_the_lane_doc() -> None:
+def test_repro_recording_rules_match_the_shared_guide() -> None:
     instructions = _normalized(_DEV / "repro-agent" / "AGENTS.md")
 
     assert (
-        "The no-footage carve-out applies only to `api` facets and to values "
-        "only a test asserts" in instructions
+        "For internal/API-only results with no visible user interaction, "
+        "written evidence is enough" in instructions
     )
     assert (
-        "A `cli`/`terminal` facet whose outcome is what a command prints is "
-        "always filmed" in instructions
+        "record the real command and its output, even if only an error message changes"
+        in instructions
     )
-    assert '"purely textual" is not an accepted reason on those facets' in instructions
+    assert "Text-only CLI output is not a reason to skip recording" in instructions
+    assert "name the specific blocker in `recording_unavailable_reason`" in instructions
+    assert "Do not block the verdict because footage is missing or rejected" in instructions
