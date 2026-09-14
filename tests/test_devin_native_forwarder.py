@@ -235,7 +235,16 @@ async def test_reasoning_and_usage_come_from_the_atif_export(tmp_path: Path) -> 
     state, _turn = await _drive(client, [_USER_PROMPT, _STOP], tmp_path)
 
     reasoning = client.items("reasoning")[0]
-    assert reasoning["content"][0]["text"] == "The user wants the command run."
+    assert reasoning["summary"][0]["text"] == "The user wants the command run."
+    # The posted reasoning item MUST satisfy ReasoningData (its `summary` field is
+    # required). Posting only `content` 400s the /events POST and kills the
+    # forwarder mid-turn — no text mirrored, no sub-agent child. Validate the exact
+    # payload the way the server's post_event does so that regression fails here.
+    from omnigent.entities.conversation import ReasoningData, parse_item_data
+
+    assert isinstance(
+        parse_item_data("reasoning", {"type": "reasoning", **reasoning}), ReasoningData
+    )
 
     usage = client.events("external_session_usage")[0]
     assert usage == {

@@ -604,9 +604,13 @@ async def _handle_event(
                 client,
                 session_id=session_id,
                 item_type="reasoning",
+                # ReasoningData requires `summary` (a list of summary_text
+                # blocks — the field the reasoning UI renders); posting only
+                # `content` fails server validation, 400s the /events POST, and
+                # kills the forwarder mid-turn (no text, no sub-agent mirror).
                 item_data={
                     "agent": agent_name,
-                    "content": [{"type": "reasoning_text", "text": reasoning}],
+                    "summary": [{"type": "summary_text", "text": reasoning}],
                 },
                 response_id=turn.response_id,
             )
