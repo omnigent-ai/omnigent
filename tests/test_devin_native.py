@@ -44,6 +44,19 @@ _BUSY_PANE = _IDLE_PANE.replace(
     "Guide Devin while it works",
 )
 _BOOT_PANE = "Devin CLI\nv3000.10.21\n"
+# A narrow pane (e.g. the web sidebar terminal) hard-wraps the idle placeholder
+# onto two lines, so a naive single-line substring match never trips and the
+# turn fails with "composer did not become ready".
+_WRAPPED_IDLE_PANE = """\
+Pro · 100% remaining (resets in 11h
+21m)
+────────────────────────────────
+❭ Ask Devin to build features, fix
+  bugs, or work on your code
+────────────────────────────────
+Claude Opus 5              Context: 25k / 1.0M
+Low                        tokens (2%)
+"""
 
 
 class TestComposeModel:
@@ -326,6 +339,11 @@ class TestPaneReadiness:
 
     def test_booting_pane_is_not_ready(self) -> None:
         assert devin_input_ready(_BOOT_PANE) is False
+
+    def test_wrapped_placeholder_is_still_ready(self) -> None:
+        # A narrow pane hard-wraps the placeholder across lines; readiness must
+        # collapse whitespace before matching or the turn hangs to timeout.
+        assert devin_input_ready(_WRAPPED_IDLE_PANE) is True
 
 
 class TestSpawnEnv:

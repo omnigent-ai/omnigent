@@ -626,8 +626,14 @@ def devin_input_ready(pane: str) -> bool:
     True for both the idle and the mid-turn placeholder: Devin takes input
     while a turn runs (it steers the running turn), so a busy composer is still
     injectable.
+
+    Whitespace is collapsed before matching so a placeholder Devin hard-wraps in
+    a narrow pane (e.g. the sidebar terminal, which wraps the idle placeholder
+    onto two lines) is still recognized — otherwise readiness never trips and the
+    turn fails with "composer did not become ready".
     """
-    return any(marker in pane for marker in _DEVIN_INPUT_READY_MARKERS)
+    normalized = " ".join(pane.split())
+    return any(marker in normalized for marker in _DEVIN_INPUT_READY_MARKERS)
 
 
 def _devin_still_booting(pane: str) -> bool:
