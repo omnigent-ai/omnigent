@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
@@ -1366,6 +1368,94 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["message", "steering", "model"])
+@pytest.mark.parametrize("watchdog", [False, True])
+async def test_cancelled_delivery_drains_worker_before_unlocking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    delivery: str,
+    watchdog: bool,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    commands: list[tuple[str, ...]] = []
+    reaped: list[Path] = []
+
+    def capture(socket_path: str, tmux_target: str) -> str:
+        started.set()
+        assert release.wait(5), "test did not release the in-flight capture"
+        return "────────────────\n❯ \n────────────────\n"
+
+    def inject(*args: Any, **kwargs: Any) -> None:
+        try:
+            claude_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30)
+            claude_bridge._run_tmux("/tmp/sock", "send-keys", "late message", "Enter")
+        finally:
+            finished.set()
+
+    def reap(bridge_dir: Path, *, timeout_s: float) -> None:
+        assert finished.is_set()
+        claude_bridge._check_injection_cancelled()
+        reaped.append(bridge_dir)
+
+    def run(cmd: list[str], **kwargs: Any) -> Any:
+        commands.append(tuple(cmd))
+        raise AssertionError("cancelled delivery sent keystrokes")
+
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", reap)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    monkeypatch.setattr(
+        executor, "_model_command_arg", lambda model: "sonnet" if delivery == "model" else None
+    )
+
+    async def deliver() -> None:
+        async with asyncio.timeout(0.1 if watchdog else 5):
+            if delivery == "steering":
+                await executor.enqueue_session_message("session", "hello")
+            else:
+                async for _event in executor.run_turn(
+                    messages=[{"role": "user", "content": "hello"}],
+                    tools=[],
+                    system_prompt="",
+                ):
+                    raise AssertionError("cancelled turn emitted a completion")
+
+    task = asyncio.create_task(deliver())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if not watchdog:
+            task.cancel()
+        async with asyncio.timeout(2):
+            while not task.cancelling():
+                await asyncio.sleep(0.005)
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert executor._inject_lock.locked()
+        if not watchdog:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        with pytest.raises(TimeoutError if watchdog else asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        assert not executor._inject_lock.locked()
+        assert reaped == [tmp_path / "bridge"]
+        assert commands == []
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            await task
 
 
 @pytest.mark.asyncio

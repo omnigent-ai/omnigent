@@ -46,6 +46,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -78,6 +79,9 @@ from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 _logger = logging.getLogger(__name__)
+_INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
+    "claude_native_injection_cancel_event", default=None
+)
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
@@ -172,14 +176,7 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
 # Hard cap on waiting for a slow-booting terminal whose process is still
-# alive. A flat readiness budget drops the first prompt on hosts where
-# connecting/booting Claude Code legitimately takes longer than
-# ``_TMUX_READY_TIMEOUT_S`` (e.g. a slow remote-sandbox host connect): the
-# terminal would have become ready moments later, but the gate gave up, the
-# pane was reaped, and the message was silently lost. While ``#{pane_dead}``
-# affirms the pane's process is alive, the readiness gate keeps waiting up
-# to this cap; a dead (or unobservable) pane still fails at the base budget
-# so genuine boot crashes surface as fast as before.
+# alive.
 _TMUX_READY_SLOW_BOOT_TIMEOUT_S = 180.0
 # Per-command tmux budget. 10s matches every other native bridge: a tmux
 # server starved by parallel worker boots on a large worktree can stall
@@ -430,6 +427,26 @@ def validate_claude_hook_interpreter_compatibility(
 
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
+
+
+class ClaudeInjectionCancelled(RuntimeError):
+    """The caller cancelled delivery before the injection worker finished."""
+
+
+@contextlib.contextmanager
+def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
+    """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
+    token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    try:
+        yield
+    finally:
+        _INJECTION_CANCEL_EVENT.reset(token)
+
+
+def _check_injection_cancelled() -> None:
+    cancel_event = _INJECTION_CANCEL_EVENT.get()
+    if cancel_event is not None and cancel_event.is_set():
+        raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -4641,6 +4658,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     """
     import subprocess
 
+    _check_injection_cancelled()
     cmd = ["tmux", "-S", socket_path, *args]
     try:
         proc = subprocess.run(
@@ -4672,6 +4690,7 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     """
     import subprocess
 
+    _check_injection_cancelled()
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"],
@@ -4695,7 +4714,7 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool:
     means the pane's process is running (e.g. a slow boot still in
     progress), ``1`` means it exited.
 
-    Never raises, and errs toward "not alive": an unreachable tmux
+    Errs toward "not alive": an unreachable tmux
     server, an unknown target, or a torn probe reads as dead, so callers
     extend a wait only on an affirmative liveness signal.
 
@@ -4706,6 +4725,7 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool:
     """
     import subprocess
 
+    _check_injection_cancelled()
     try:
         proc = subprocess.run(
             [
@@ -4721,7 +4741,7 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=1.0,
         )
     except (subprocess.SubprocessError, OSError):
         return False
@@ -5147,6 +5167,7 @@ def _wait_for_claude_prompt_ready(
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
+        _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         if pane.strip():
@@ -5157,11 +5178,6 @@ def _wait_for_claude_prompt_ready(
             return
         now = time.monotonic()
         if now >= deadline:
-            # Past the base budget, a slow boot is only distinguishable
-            # from a dead one by the pane's process: keep waiting while
-            # tmux affirms it is alive (the boot is still in progress),
-            # bounded by the hard cap. A dead or unobservable pane stops
-            # here, exactly as fast as the base budget always did.
             if now >= hard_deadline or not _claude_pane_alive(socket_path, tmux_target):
                 break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -5233,6 +5249,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _TMUX_FILE
     while time.monotonic() < deadline:
+        _check_injection_cancelled()
         payload = _read_json_file(path)
         socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
         tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None

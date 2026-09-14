@@ -8317,11 +8317,11 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
     """
     frames = iter([_BOOTING_PANE, _BOOTING_PANE, _READY_PANE])
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: next(frames, _READY_PANE),
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._claude_pane_alive",
+        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
         lambda socket_path, tmux_target: True,
     )
     # timeout_s=0.0 exhausts the base budget on the first poll, so any
@@ -8346,11 +8346,11 @@ def test_wait_for_claude_prompt_ready_fails_at_base_budget_when_pane_dead(
     attached — rather than stalling to the slow-boot cap.
     """
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: _BOOTING_PANE,
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._claude_pane_alive",
+        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
         lambda socket_path, tmux_target: False,
     )
     started = time.monotonic()
@@ -8379,11 +8379,11 @@ def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
     waited so the extension is visible in diagnostics.
     """
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: _BOOTING_PANE,
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._claude_pane_alive",
+        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
         lambda socket_path, tmux_target: True,
     )
     monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.4)
@@ -8412,6 +8412,7 @@ def test_claude_pane_alive_requires_affirmative_pane_dead_flag(
     responses: dict[str, Any] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs["timeout"] == 1.0
         outcome = responses["outcome"]
         if isinstance(outcome, Exception):
             raise outcome
@@ -8430,6 +8431,30 @@ def test_claude_pane_alive_requires_affirmative_pane_dead_flag(
 
     responses["outcome"] = subprocess.TimeoutExpired(cmd="tmux", timeout=1.0)
     assert claude_native_bridge._claude_pane_alive("/tmp/sock", "claude:0.0") is False
+
+
+@pytest.mark.parametrize("operation", ["advertisement", "readiness", "capture", "send"])
+def test_cancelled_injection_stops_before_polling_or_typing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    cancelled = threading.Event()
+    cancelled.set()
+    run = Mock(side_effect=AssertionError("cancelled injection invoked tmux"))
+    monkeypatch.setattr("subprocess.run", run)
+    with claude_native_bridge.cancellable_injection(cancelled):
+        with pytest.raises(claude_native_bridge.ClaudeInjectionCancelled):
+            if operation == "advertisement":
+                claude_native_bridge._wait_for_tmux_info(tmp_path, timeout_s=30)
+            elif operation == "readiness":
+                claude_native_bridge._wait_for_claude_prompt_ready(
+                    "/tmp/sock", "main", timeout_s=30
+                )
+            elif operation == "capture":
+                claude_native_bridge._capture_pane("/tmp/sock", "main")
+            else:
+                claude_native_bridge._run_tmux("/tmp/sock", "send-keys", "Enter")
+    run.assert_not_called()
+    claude_native_bridge._check_injection_cancelled()
 
 
 # ── _hook_record_from_jsonl_record: background_task_count ────────────────────
