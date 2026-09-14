@@ -31,6 +31,7 @@ import {
   resetLandingDraft,
 } from "./NewChatDialog";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
@@ -1184,13 +1185,16 @@ function renderLanding(
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
-            {onRender ? (
-              <Profiler id="landing" onRender={onRender}>
+            <ActionsProvider>
+              <KeybindingDispatcher />
+              {onRender ? (
+                <Profiler id="landing" onRender={onRender}>
+                  <NewChatLandingScreen />
+                </Profiler>
+              ) : (
                 <NewChatLandingScreen />
-              </Profiler>
-            ) : (
-              <NewChatLandingScreen />
-            )}
+              )}
+            </ActionsProvider>
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>

@@ -96,6 +96,14 @@ import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/ide
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { randomUUID } from "@/lib/randomUUID";
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  type ActionSource,
+} from "@/actions";
+import { ComposerActionBindings } from "@/components/ComposerActionBindings";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -2256,6 +2264,7 @@ export function NewChatLandingScreen() {
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
@@ -4305,7 +4314,9 @@ export function NewChatLandingScreen() {
     attachMention,
     openMentionDir,
     removeMentionedItem,
-    handleKeyDown: handleMentionKeyDown,
+    selectPrevious: selectPreviousMention,
+    selectNext: selectNextMention,
+    accept: acceptMention,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
@@ -5244,6 +5255,51 @@ export function NewChatLandingScreen() {
     }
   }
 
+  const selectPreviousSuggestion = () => {
+    if (selectPreviousMention()) return HANDLED;
+    if (!slashMenuOpen || slashMenuMatches.length === 0) return NOT_HANDLED;
+    setSlashMenuIndex((index) => (index <= 0 ? slashMenuMatches.length - 1 : index - 1));
+    return HANDLED;
+  };
+  const selectNextSuggestion = () => {
+    if (selectNextMention()) return HANDLED;
+    if (!slashMenuOpen || slashMenuMatches.length === 0) return NOT_HANDLED;
+    setSlashMenuIndex((index) => (index + 1) % slashMenuMatches.length);
+    return HANDLED;
+  };
+  const acceptSuggestion = (behavior: "openOrAttach" | "attach") => {
+    if (behavior === "openOrAttach" && preventsKeyboardSubmit) return NOT_HANDLED;
+    if (acceptMention(behavior)) return HANDLED;
+    if (!slashMenuOpen || slashMenuIndex < 0) return NOT_HANDLED;
+    const match = slashMenuMatches[slashMenuIndex];
+    if (!match) return NOT_HANDLED;
+    applySlashSelection(match);
+    return HANDLED;
+  };
+  const dismissSuggestions = () => {
+    if (dismissMention()) return HANDLED;
+    if (!slashMenuOpen || slashMenuMatches.length === 0) return NOT_HANDLED;
+    setMessage("");
+    setSlashMenuIndex(-1);
+    return HANDLED;
+  };
+  const createAction = (source: ActionSource) => {
+    // Touch-primary Enter stays a newline even if a custom keymap invokes send.
+    if (source === "keyboard" && preventsKeyboardSubmit) return NOT_HANDLED;
+    if (mentionListingPending) return HANDLED;
+    void handleCreate();
+    return HANDLED;
+  };
+  const composerScope = useActionScopeRegistration({
+    mode: "composer",
+    context: {
+      composerStreaming: false,
+      composerSuggestionsOpen: mentionOpen || (slashMenuOpen && slashMenuMatches.length > 0),
+      composerEnterInserts: preventsKeyboardSubmit,
+      composerSubmitWithModEnter: submitWithModEnter,
+    },
+  });
+
   const placeholderText = selectedProject
     ? `Start a new session in ${selectedProject}`
     : "Describe a task to start a new session…";
@@ -5585,769 +5641,753 @@ export function NewChatLandingScreen() {
             </ComposerWorkspaceBar>
           )}
           <form
+            {...composerScope.rootProps}
             onSubmit={(e) => {
               e.preventDefault();
               void handleCreate();
             }}
             className="relative z-10"
           >
-            <ChatComposer
-              keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-              className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
-              data-testid="new-chat-landing-composer"
-              input={{
-                ref: textareaRef,
-                value: message,
-                onChange: (e) => {
-                  setMessage(e.target.value);
-                  // A rejected attachment is never added, so there's no chip to
-                  // remove and nothing else would ever clear this. Left sticky it
-                  // reads as a blocker on a composer the user can actually submit.
-                  if (attachmentError !== null) setAttachmentError(null);
-                  // Recompute the active "@"-mention from the caret each keystroke
-                  // (native terminal agents with a workspace — ``mentionEnabled``).
-                  setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
-                  );
-                },
-                onFocus: () => {
-                  // From here the textarea's caret is one the user placed, so
-                  // dictation inserts there instead of at the end of the draft.
-                  dictation.noteFocus();
-                },
-                onBlur: () => {
-                  // Dismiss the mention menu when focus leaves the textarea; menu
-                  // rows preventDefault on mousedown so selecting one doesn't blur.
-                  dismissMention();
-                },
-                onKeyDown: (e, { shouldSubmitFromKeyboard, shouldPreferSendOverCompletion }) => {
-                  // "@"-mention menu navigation (shared useMentionBrowser) —
-                  // mutually exclusive with the slash menu (a token can't be both)
-                  // and takes priority over submission.
-                  if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
-
-                  // While the skills menu is open, ArrowUp/Down navigate it and
-                  // Enter/Tab complete the highlighted item — these take
-                  // priority over submission (same UX as the in-session
-                  // composer).
-                  if (slashMenuOpen && slashMenuMatches.length > 0) {
-                    if (e.key === "ArrowDown") {
+            <ActionScopeProvider scope={composerScope}>
+              <ComposerActionBindings
+                textareaRef={textareaRef}
+                isComposing={() => isComposingRef.current}
+                onSend={createAction}
+                onStop={() => NOT_HANDLED}
+                onRecallPrevious={() => NOT_HANDLED}
+                onRecallNext={() => NOT_HANDLED}
+                onSelectPreviousSuggestion={selectPreviousSuggestion}
+                onSelectNextSuggestion={selectNextSuggestion}
+                onAcceptSuggestion={acceptSuggestion}
+                onDismissSuggestions={dismissSuggestions}
+              />
+              <ChatComposer
+                keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+                className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
+                data-testid="new-chat-landing-composer"
+                input={{
+                  ref: textareaRef,
+                  value: message,
+                  onChange: (e) => {
+                    setMessage(e.target.value);
+                    // A rejected attachment is never added, so there's no chip to
+                    // remove and nothing else would ever clear this. Left sticky it
+                    // reads as a blocker on a composer the user can actually submit.
+                    if (attachmentError !== null) setAttachmentError(null);
+                    // Recompute the active "@"-mention from the caret each keystroke
+                    // (native terminal agents with a workspace — ``mentionEnabled``).
+                    setMention(
+                      mentionEnabled
+                        ? detectMentionAt(
+                            e.target.value,
+                            e.target.selectionStart ?? e.target.value.length,
+                          )
+                        : null,
+                    );
+                  },
+                  onFocus: () => {
+                    // From here the textarea's caret is one the user placed, so
+                    // dictation inserts there instead of at the end of the draft.
+                    dictation.noteFocus();
+                  },
+                  onBlur: () => {
+                    // Dismiss the mention menu when focus leaves the textarea; menu
+                    // rows preventDefault on mousedown so selecting one doesn't blur.
+                    dismissMention();
+                    isComposingRef.current = false;
+                  },
+                  onCompositionStart: () => {
+                    isComposingRef.current = true;
+                  },
+                  onCompositionEnd: () => {
+                    isComposingRef.current = false;
+                  },
+                  onPaste: (e) => {
+                    // Pasted images/files attach instead of inserting as text,
+                    // mirroring the in-session composer.
+                    const pasted = Array.from(e.clipboardData.items)
+                      .filter((item) => item.kind === "file")
+                      .map((item) => item.getAsFile())
+                      .filter((f): f is File => f !== null);
+                    if (pasted.length > 0) {
                       e.preventDefault();
-                      setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
-                      return;
+                      addFiles(pasted);
                     }
-                    if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
-                      return;
-                    }
-                    if (
-                      !shouldPreferSendOverCompletion &&
-                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
-                      slashMenuIndex >= 0
-                    ) {
-                      e.preventDefault();
-                      applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                      return;
-                    }
-                    if (e.key === "Escape") {
-                      e.preventDefault();
-                      // Dismiss the menu by clearing the draft so the user can
-                      // start fresh.
-                      setMessage("");
-                      setSlashMenuIndex(-1);
-                      return;
-                    }
-                  }
-                  if (shouldSubmitFromKeyboard) {
-                    e.preventDefault();
-                    // The mention menu is briefly closed while its listing loads;
-                    // swallow Enter so the in-progress "@dir/" token isn't sent.
-                    if (mentionListingPending) return;
-                    void handleCreate();
-                  }
-                },
-                onPaste: (e) => {
-                  // Pasted images/files attach instead of inserting as text,
-                  // mirroring the in-session composer.
-                  const pasted = Array.from(e.clipboardData.items)
-                    .filter((item) => item.kind === "file")
-                    .map((item) => item.getAsFile())
-                    .filter((f): f is File => f !== null);
-                  if (pasted.length > 0) {
-                    e.preventDefault();
-                    addFiles(pasted);
-                  }
-                },
-                placeholder: pillSkills.length > 0 ? "" : placeholderText,
-                "aria-label": placeholderText,
-                rows: 1,
-                autoFocus: !isMobileViewport,
-                "data-testid": "new-chat-landing-input",
-              }}
-              slots={{
-                beforeInput: (
-                  <>
-                    {/* Skill suggestions — floats above the composer box. */}
-                    {slashMenuOpen && (
-                      <SlashCommandMenu
-                        query={slashMenuQuery}
-                        activeIndex={slashMenuIndex}
-                        onSelect={applySlashSelection}
-                        commands={skillCommands}
-                      />
-                    )}
-                    {/* "@"-file-mention browser — native terminal agents with a workspace */}
-                    {(mentionOpen || mentionListingPending) && (
-                      <FileMentionMenu
-                        currentDir={mentionDir}
-                        activeIndex={mentionIndex}
-                        entries={mentionEntries}
-                        loading={mentionListingPending}
-                        onOpenDir={openMentionDir}
-                        onAttach={attachMention}
-                      />
-                    )}
-                  </>
-                ),
-                inputHint: (
-                  <>
-                    {/* Gated on an empty draft so it reads as the placeholder.
+                  },
+                  placeholder: pillSkills.length > 0 ? "" : placeholderText,
+                  "aria-label": placeholderText,
+                  rows: 1,
+                  autoFocus: !isMobileViewport,
+                  "data-testid": "new-chat-landing-input",
+                }}
+                slots={{
+                  beforeInput: (
+                    <>
+                      {/* Skill suggestions — floats above the composer box. */}
+                      {slashMenuOpen && (
+                        <SlashCommandMenu
+                          query={slashMenuQuery}
+                          activeIndex={slashMenuIndex}
+                          onSelect={applySlashSelection}
+                          commands={skillCommands}
+                        />
+                      )}
+                      {/* "@"-file-mention browser — native terminal agents with a workspace */}
+                      {(mentionOpen || mentionListingPending) && (
+                        <FileMentionMenu
+                          currentDir={mentionDir}
+                          activeIndex={mentionIndex}
+                          entries={mentionEntries}
+                          loading={mentionListingPending}
+                          onOpenDir={openMentionDir}
+                          onAttach={attachMention}
+                        />
+                      )}
+                    </>
+                  ),
+                  inputHint: (
+                    <>
+                      {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
                   textarea; the pills themselves opt back in. */}
-                    {pillSkills.length > 0 && message.length === 0 && (
-                      <div className="pointer-events-none absolute inset-x-3 top-3 flex flex-wrap items-center gap-2">
-                        <span className="composer-input-text text-ui text-muted-foreground">
-                          Describe a task, or try a skill
-                        </span>
-                        <SkillPills skills={pillSkills} onPick={applySkillPill} />
-                      </div>
-                    )}
-                  </>
-                ),
-                attachments: (
-                  <>
-                    {/* Hidden file input for the attach button. */}
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      accept="image/*,application/pdf,text/*,application/json"
-                      className="hidden"
-                      data-testid="new-chat-landing-file-input"
-                      onChange={(e) => {
-                        if (e.target.files) {
-                          addFiles(Array.from(e.target.files));
-                          // Reset so the same file can be re-selected.
-                          e.target.value = "";
-                        }
-                      }}
-                    />
-                    {/* "@"-mention chips — one per tagged workspace file/folder. Each is
-                delivered as an "[Attached: <path>]" marker prepended to the
-                first message at create time. */}
-                    {mentionedItems.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                        {mentionedItems.map((item, i) => (
-                          <span
-                            key={mentionItemPath(item)}
-                            className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                          >
-                            {item.isDir ? (
-                              <FolderIcon className="size-3 shrink-0" />
-                            ) : (
-                              <FileTextIcon className="size-3 shrink-0" />
-                            )}
-                            <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
-                              @{item.path}
-                              {item.isDir ? "/" : ""}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => removeMentionedItem(i)}
-                              className="ml-0.5 rounded-full hover:text-foreground"
-                              aria-label={`Remove ${item.path}`}
-                            >
-                              <XIcon className="size-3" />
-                            </button>
+                      {pillSkills.length > 0 && message.length === 0 && (
+                        <div className="pointer-events-none absolute inset-x-3 top-3 flex flex-wrap items-center gap-2">
+                          <span className="composer-input-text text-ui text-muted-foreground">
+                            Describe a task, or try a skill
                           </span>
-                        ))}
-                      </div>
-                    )}
-                    {/* File chips — shown below the textarea when files are attached. */}
-                    {files.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                        {files.map((file, i) => (
-                          <span
-                            key={attachmentKey(file)}
-                            className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                          >
-                            {file.type.startsWith("image/") ? (
-                              <ImageIcon className="size-3 shrink-0" />
-                            ) : (
-                              <FileTextIcon className="size-3 shrink-0" />
-                            )}
-                            <span className="max-w-[140px] truncate">
-                              {file.name || "image.png"}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => removeFile(i)}
-                              className="ml-0.5 rounded-full hover:text-foreground"
-                              aria-label={`Remove ${file.name || "image.png"}`}
-                            >
-                              <XIcon className="size-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                    {/* Rejected-attachment feedback: unsupported type or too large */}
-                    {attachmentError !== null && (
-                      <div
-                        className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap"
-                        data-testid="new-chat-landing-attachment-error"
-                      >
-                        {attachmentError}
-                      </div>
-                    )}
-                    {/* No own bg — the pill paints the surface. An explicit bg-card
-                here would also catch the .dark .bg-card glass rule (border +
-                shadow) and visually split the pill in half. */}
-                  </>
-                ),
-              }}
-              actions={{
-                leading: (
-                  <>
-                    <div className="flex shrink-0 items-center">
-                      <ComposerAddMenu
-                        testIdPrefix="new-chat-landing"
-                        disabled={creating}
-                        onAttach={() => fileInputRef.current?.click()}
-                        onPlan={
-                          directModeOptions.some((mode) => mode.value === "plan")
-                            ? () => selectDirectMode("plan")
-                            : undefined
-                        }
-                        planActive={
-                          (supportsPermissionMode && permissionMode === "plan") ||
-                          (supportsCursorMode && cursorExecMode === "plan")
-                        }
-                        projects={projectList ?? []}
-                        onProjectSelect={(name) => {
-                          const params = new URLSearchParams(searchParams);
-                          params.set("project", name);
-                          navigate(`/?${params.toString()}`);
-                          requestAnimationFrame(() => textareaRef.current?.focus());
+                          <SkillPills skills={pillSkills} onPick={applySkillPill} />
+                        </div>
+                      )}
+                    </>
+                  ),
+                  attachments: (
+                    <>
+                      {/* Hidden file input for the attach button. */}
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        accept="image/*,application/pdf,text/*,application/json"
+                        className="hidden"
+                        data-testid="new-chat-landing-file-input"
+                        onChange={(e) => {
+                          if (e.target.files) {
+                            addFiles(Array.from(e.target.files));
+                            // Reset so the same file can be re-selected.
+                            e.target.value = "";
+                          }
                         }}
                       />
-                    </div>
-                    {/* Host chip */}
-                    <DropdownMenu
-                      onOpenChange={(open) => {
-                        // Run a requested "connect this machine" only once the menu
-                        // has closed.
-                        if (!open && pendingConnectRef.current) {
-                          pendingConnectRef.current = false;
-                          void connectThisMachine();
-                        }
-                        if (!open && pendingArcaConnectRef.current) {
-                          pendingArcaConnectRef.current = false;
-                          void connectArca();
-                        }
-                      }}
-                    >
-                      <DropdownMenuTrigger asChild>
-                        <ComposerHostTrigger
-                          label={`Host: ${hostLabel}, ${selectedHost?.status === "online" && !sandboxSelected ? "Online" : "Offline"}`}
-                          status={
-                            selectedHost?.status === "online" && !sandboxSelected
-                              ? "online"
-                              : "offline"
-                          }
-                          cloud={isCloudHost}
+                      {/* "@"-mention chips — one per tagged workspace file/folder. Each is
+                delivered as an "[Attached: <path>]" marker prepended to the
+                first message at create time. */}
+                      {mentionedItems.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                          {mentionedItems.map((item, i) => (
+                            <span
+                              key={mentionItemPath(item)}
+                              className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                            >
+                              {item.isDir ? (
+                                <FolderIcon className="size-3 shrink-0" />
+                              ) : (
+                                <FileTextIcon className="size-3 shrink-0" />
+                              )}
+                              <span
+                                className="max-w-[200px] truncate"
+                                title={mentionItemPath(item)}
+                              >
+                                @{item.path}
+                                {item.isDir ? "/" : ""}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => removeMentionedItem(i)}
+                                className="ml-0.5 rounded-full hover:text-foreground"
+                                aria-label={`Remove ${item.path}`}
+                              >
+                                <XIcon className="size-3" />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {/* File chips — shown below the textarea when files are attached. */}
+                      {files.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                          {files.map((file, i) => (
+                            <span
+                              key={attachmentKey(file)}
+                              className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                            >
+                              {file.type.startsWith("image/") ? (
+                                <ImageIcon className="size-3 shrink-0" />
+                              ) : (
+                                <FileTextIcon className="size-3 shrink-0" />
+                              )}
+                              <span className="max-w-[140px] truncate">
+                                {file.name || "image.png"}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => removeFile(i)}
+                                className="ml-0.5 rounded-full hover:text-foreground"
+                                aria-label={`Remove ${file.name || "image.png"}`}
+                              >
+                                <XIcon className="size-3" />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {/* Rejected-attachment feedback: unsupported type or too large */}
+                      {attachmentError !== null && (
+                        <div
+                          className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap"
+                          data-testid="new-chat-landing-attachment-error"
+                        >
+                          {attachmentError}
+                        </div>
+                      )}
+                      {/* No own bg — the pill paints the surface. An explicit bg-card
+                here would also catch the .dark .bg-card glass rule (border +
+                shadow) and visually split the pill in half. */}
+                    </>
+                  ),
+                }}
+                actions={{
+                  leading: (
+                    <>
+                      <div className="flex shrink-0 items-center">
+                        <ComposerAddMenu
                           testIdPrefix="new-chat-landing"
-                          data-testid="new-chat-landing-host-chip"
+                          disabled={creating}
+                          onAttach={() => fileInputRef.current?.click()}
+                          onPlan={
+                            directModeOptions.some((mode) => mode.value === "plan")
+                              ? () => selectDirectMode("plan")
+                              : undefined
+                          }
+                          planActive={
+                            (supportsPermissionMode && permissionMode === "plan") ||
+                            (supportsCursorMode && cursorExecMode === "plan")
+                          }
+                          projects={projectList ?? []}
+                          onProjectSelect={(name) => {
+                            const params = new URLSearchParams(searchParams);
+                            params.set("project", name);
+                            navigate(`/?${params.toString()}`);
+                            requestAnimationFrame(() => textareaRef.current?.focus());
+                          }}
                         />
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent
-                        align="start"
-                        sideOffset={6}
-                        className="composer-host-menu min-w-[220px] max-w-[min(360px,calc(100vw-24px))]"
-                        data-testid="new-chat-landing-host-menu"
+                      </div>
+                      {/* Host chip */}
+                      <DropdownMenu
+                        onOpenChange={(open) => {
+                          // Run a requested "connect this machine" only once the menu
+                          // has closed.
+                          if (!open && pendingConnectRef.current) {
+                            pendingConnectRef.current = false;
+                            void connectThisMachine();
+                          }
+                          if (!open && pendingArcaConnectRef.current) {
+                            pendingArcaConnectRef.current = false;
+                            void connectArca();
+                          }
+                        }}
                       >
-                        {hasCloudOptions && (
-                          <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                            Cloud
-                          </div>
-                        )}
-                        {/* Server-provisioned sandbox — only advertised when
+                        <DropdownMenuTrigger asChild>
+                          <ComposerHostTrigger
+                            label={`Host: ${hostLabel}, ${selectedHost?.status === "online" && !sandboxSelected ? "Online" : "Offline"}`}
+                            status={
+                              selectedHost?.status === "online" && !sandboxSelected
+                                ? "online"
+                                : "offline"
+                            }
+                            cloud={isCloudHost}
+                            testIdPrefix="new-chat-landing"
+                            data-testid="new-chat-landing-host-chip"
+                          />
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          align="start"
+                          sideOffset={6}
+                          className="composer-host-menu min-w-[220px] max-w-[min(360px,calc(100vw-24px))]"
+                          data-testid="new-chat-landing-host-menu"
+                        >
+                          {hasCloudOptions && (
+                            <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
+                              Cloud
+                            </div>
+                          )}
+                          {/* Server-provisioned sandbox — only advertised when
                     /v1/info reports managed_sandboxes_enabled. Pinned
                     first, above the connected-host list. */}
-                        {(managedSandboxesEnabled || showDisabledSandboxWithDocs) &&
-                          (managedSandboxesEnabled ? (
-                            sandboxProviderRows.map((provider, index) => (
+                          {(managedSandboxesEnabled || showDisabledSandboxWithDocs) &&
+                            (managedSandboxesEnabled ? (
+                              sandboxProviderRows.map((provider, index) => (
+                                <DropdownMenuItem
+                                  key={provider ?? "default"}
+                                  onSelect={() => selectSandbox(provider)}
+                                  // First row keeps the original testid; later
+                                  // rows get a scoped one.
+                                  data-testid={
+                                    index === 0
+                                      ? "new-chat-landing-sandbox-option"
+                                      : `new-chat-landing-sandbox-option-${provider}`
+                                  }
+                                  data-active={
+                                    sandboxSelected && sandboxProvider === provider
+                                      ? "true"
+                                      : undefined
+                                  }
+                                  className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                                >
+                                  <span className="flex items-center gap-1">
+                                    <span className="flex size-4 shrink-0 items-center justify-center">
+                                      <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
+                                    </span>
+                                    <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                                  </span>
+                                </DropdownMenuItem>
+                              ))
+                            ) : (
                               <DropdownMenuItem
-                                key={provider ?? "default"}
-                                onSelect={() => selectSandbox(provider)}
-                                // First row keeps the original testid; later
-                                // rows get a scoped one.
-                                data-testid={
-                                  index === 0
-                                    ? "new-chat-landing-sandbox-option"
-                                    : `new-chat-landing-sandbox-option-${provider}`
-                                }
-                                data-active={
-                                  sandboxSelected && sandboxProvider === provider
-                                    ? "true"
-                                    : undefined
-                                }
-                                className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                                aria-disabled="true"
+                                onSelect={(e) => e.preventDefault()}
+                                className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
+                                data-testid="new-chat-landing-sandbox-option-disabled"
                               >
                                 <span className="flex items-center gap-1">
                                   <span className="flex size-4 shrink-0 items-center justify-center">
                                     <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                                   </span>
-                                  <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                                  <span className="text-sm">New Sandbox</span>
                                 </span>
-                              </DropdownMenuItem>
-                            ))
-                          ) : (
-                            <DropdownMenuItem
-                              aria-disabled="true"
-                              onSelect={(e) => e.preventDefault()}
-                              className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
-                              data-testid="new-chat-landing-sandbox-option-disabled"
-                            >
-                              <span className="flex items-center gap-1">
-                                <span className="flex size-4 shrink-0 items-center justify-center">
-                                  <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
-                                </span>
-                                <span className="text-sm">New Sandbox</span>
-                              </span>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <button
-                                    type="button"
-                                    className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
-                                    aria-label="Why New Sandbox is unavailable"
-                                    onClick={(e) => e.stopPropagation()}
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Enter" || e.key === " ") e.stopPropagation();
-                                    }}
-                                  >
-                                    <CircleHelpIcon className="size-3.5" />
-                                  </button>
-                                </TooltipTrigger>
-                                <TooltipContent className="max-w-64">
-                                  {newSandboxTooltipContent}
-                                </TooltipContent>
-                              </Tooltip>
-                            </DropdownMenuItem>
-                          ))}
-                        {cloudHosts.map(renderHostMenuItem)}
-                        {showArcaOption && (
-                          <DropdownMenuItem
-                            onSelect={() => {
-                              pendingArcaConnectRef.current = true;
-                            }}
-                            disabled={connectingArca}
-                            data-testid="new-chat-landing-run-on-arca"
-                          >
-                            <span className="flex size-4 shrink-0 items-center justify-center">
-                              <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
-                            </span>
-                            <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
-                          </DropdownMenuItem>
-                        )}
-                        {hasCloudOptions && <DropdownMenuSeparator />}
-                        <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                          Local
-                        </div>
-                        {allHosts.length === 0 && !showConnectThisMachine && (
-                          <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                            No hosts connected yet.
-                          </div>
-                        )}
-                        {localHosts.map(renderHostMenuItem)}
-                        {/* Desktop shell, machine not in the list yet: offer to connect
-                    it in one click. */}
-                        {showConnectThisMachine && (
-                          <DropdownMenuItem
-                            onSelect={() => {
-                              pendingConnectRef.current = true;
-                            }}
-                            disabled={connectingThisMachine}
-                            data-testid="new-chat-landing-run-on-this-machine"
-                            className="gap-2 text-sm"
-                          >
-                            <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
-                            <span className="text-sm">
-                              {connectingThisMachine
-                                ? "Connecting this machine…"
-                                : "Run on this machine"}
-                            </span>
-                          </DropdownMenuItem>
-                        )}
-                        <DropdownMenuSeparator />
-                        {/* Persistent escape hatch: open the connect-a-host
-                    instructions. Present even with zero hosts so a fresh user
-                    is never stuck. */}
-                        <DropdownMenuItem
-                          onSelect={() => setConnectOpen(true)}
-                          data-testid="new-chat-landing-connect-host"
-                          className="composer-host-connect text-muted-foreground"
-                        >
-                          <PlusIcon className="size-4" />
-                          Connect new host
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-
-                    {pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
-                      <NewChatPickerLoading
-                        label="Loading permissions"
-                        testId="new-chat-landing-permission-loading"
-                      />
-                    ) : visiblePermissionRow ? (
-                      <ComposerPermissionPicker
-                        label={visiblePermissionRow.label}
-                        value={visiblePermissionRow.value}
-                        loading={pickerLoading}
-                        interactiveWhileLoading={interactiveWhileLoading}
-                        options={directModeOptions}
-                        onSelect={selectDirectMode}
-                        testIdPrefix="new-chat-landing"
-                      />
-                    ) : null}
-
-                    {/* Sandbox repository chip — the sandbox counterpart of the
-                working-directory chip. There is no filesystem to browse
-                before the sandbox exists, so the workspace is specified as
-                a git repository URL (+ optional branch) the server clones
-                at create time. Blank = empty server-created workspace. */}
-                    {sandboxSelected && (
-                      <Popover>
-                        <PopoverTrigger asChild>
-                          <button
-                            type="button"
-                            aria-label={`Sandbox repositories: ${
-                              sandboxRepoSelections.length > 0 ? sandboxRepoLabel : "None selected"
-                            }`}
-                            className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
-                            data-testid="new-chat-landing-repo-chip"
-                          >
-                            <GitBranchIcon className="ui-icon" />
-                            <span className="hidden max-w-40 truncate text-sm lg:block">
-                              {sandboxRepoLabel}
-                            </span>
-                            <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
-                          </button>
-                        </PopoverTrigger>
-                        <PopoverContent align="start" className="w-96 p-3">
-                          <div className="flex flex-col gap-2">
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-sm font-medium text-foreground">
-                                Repositories (optional)
-                              </span>
-                              {databricksGitCredentialsTooltipContent && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
                                     <button
                                       type="button"
-                                      className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
-                                      aria-label="How to set up Databricks git credentials"
+                                      className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
+                                      aria-label="Why New Sandbox is unavailable"
+                                      onClick={(e) => e.stopPropagation()}
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+                                      }}
                                     >
                                       <CircleHelpIcon className="size-3.5" />
                                     </button>
                                   </TooltipTrigger>
                                   <TooltipContent className="max-w-64">
-                                    {databricksGitCredentialsTooltipContent}
+                                    {newSandboxTooltipContent}
                                   </TooltipContent>
                                 </Tooltip>
-                              )}
+                              </DropdownMenuItem>
+                            ))}
+                          {cloudHosts.map(renderHostMenuItem)}
+                          {showArcaOption && (
+                            <DropdownMenuItem
+                              onSelect={() => {
+                                pendingArcaConnectRef.current = true;
+                              }}
+                              disabled={connectingArca}
+                              data-testid="new-chat-landing-run-on-arca"
+                            >
+                              <span className="flex size-4 shrink-0 items-center justify-center">
+                                <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
+                              </span>
+                              <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
+                            </DropdownMenuItem>
+                          )}
+                          {hasCloudOptions && <DropdownMenuSeparator />}
+                          <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
+                            Local
+                          </div>
+                          {allHosts.length === 0 && !showConnectThisMachine && (
+                            <div className="px-2 py-1.5 text-sm text-muted-foreground">
+                              No hosts connected yet.
                             </div>
-                            {/* Stale over-cap selection (repos remembered/added under
+                          )}
+                          {localHosts.map(renderHostMenuItem)}
+                          {/* Desktop shell, machine not in the list yet: offer to connect
+                    it in one click. */}
+                          {showConnectThisMachine && (
+                            <DropdownMenuItem
+                              onSelect={() => {
+                                pendingConnectRef.current = true;
+                              }}
+                              disabled={connectingThisMachine}
+                              data-testid="new-chat-landing-run-on-this-machine"
+                              className="gap-2 text-sm"
+                            >
+                              <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
+                              <span className="text-sm">
+                                {connectingThisMachine
+                                  ? "Connecting this machine…"
+                                  : "Run on this machine"}
+                              </span>
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuSeparator />
+                          {/* Persistent escape hatch: open the connect-a-host
+                    instructions. Present even with zero hosts so a fresh user
+                    is never stuck. */}
+                          <DropdownMenuItem
+                            onSelect={() => setConnectOpen(true)}
+                            data-testid="new-chat-landing-connect-host"
+                            className="composer-host-connect text-muted-foreground"
+                          >
+                            <PlusIcon className="size-4" />
+                            Connect new host
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+
+                      {pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
+                        <NewChatPickerLoading
+                          label="Loading permissions"
+                          testId="new-chat-landing-permission-loading"
+                        />
+                      ) : visiblePermissionRow ? (
+                        <ComposerPermissionPicker
+                          label={visiblePermissionRow.label}
+                          value={visiblePermissionRow.value}
+                          loading={pickerLoading}
+                          interactiveWhileLoading={interactiveWhileLoading}
+                          options={directModeOptions}
+                          onSelect={selectDirectMode}
+                          testIdPrefix="new-chat-landing"
+                        />
+                      ) : null}
+
+                      {/* Sandbox repository chip — the sandbox counterpart of the
+                working-directory chip. There is no filesystem to browse
+                before the sandbox exists, so the workspace is specified as
+                a git repository URL (+ optional branch) the server clones
+                at create time. Blank = empty server-created workspace. */}
+                      {sandboxSelected && (
+                        <Popover>
+                          <PopoverTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={`Sandbox repositories: ${
+                                sandboxRepoSelections.length > 0
+                                  ? sandboxRepoLabel
+                                  : "None selected"
+                              }`}
+                              className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                              data-testid="new-chat-landing-repo-chip"
+                            >
+                              <GitBranchIcon className="ui-icon" />
+                              <span className="hidden max-w-40 truncate text-sm lg:block">
+                                {sandboxRepoLabel}
+                              </span>
+                              <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                            </button>
+                          </PopoverTrigger>
+                          <PopoverContent align="start" className="w-96 p-3">
+                            <div className="flex flex-col gap-2">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-sm font-medium text-foreground">
+                                  Repositories (optional)
+                                </span>
+                                {databricksGitCredentialsTooltipContent && (
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <button
+                                        type="button"
+                                        className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
+                                        aria-label="How to set up Databricks git credentials"
+                                      >
+                                        <CircleHelpIcon className="size-3.5" />
+                                      </button>
+                                    </TooltipTrigger>
+                                    <TooltipContent className="max-w-64">
+                                      {databricksGitCredentialsTooltipContent}
+                                    </TooltipContent>
+                                  </Tooltip>
+                                )}
+                              </div>
+                              {/* Stale over-cap selection (repos remembered/added under
                           a multi-repo provider, then switched to a single-repo one):
                           warn and block submit rather than 422 after the session row
                           is created. */}
-                            {sandboxRepoOverCap && (
-                              <p
-                                className="text-sm text-warning"
-                                data-testid="new-chat-landing-repo-overcap"
-                              >
-                                This sandbox provider clones at most {maxSandboxRepos}{" "}
-                                {maxSandboxRepos === 1 ? "repository" : "repositories"}. Remove the
-                                extra {maxSandboxRepos === 1 ? "repositories" : "ones"} to continue.
-                              </p>
-                            )}
-                            {/* Selected repos: each clones into its own sibling dir.
+                              {sandboxRepoOverCap && (
+                                <p
+                                  className="text-sm text-warning"
+                                  data-testid="new-chat-landing-repo-overcap"
+                                >
+                                  This sandbox provider clones at most {maxSandboxRepos}{" "}
+                                  {maxSandboxRepos === 1 ? "repository" : "repositories"}. Remove
+                                  the extra {maxSandboxRepos === 1 ? "repositories" : "ones"} to
+                                  continue.
+                                </p>
+                              )}
+                              {/* Selected repos: each clones into its own sibling dir.
                           A connected repo gets its branch combobox; a pasted URL a
                           free-text branch. The remove button drops it. */}
-                            {sandboxRepoSelections.map((sel) => {
-                              const repo = repoForUrl(sel.url);
-                              const name = repo?.full_name ?? deriveRepoName(sel.url) ?? sel.url;
-                              return (
-                                <div
-                                  key={sel.url}
-                                  className="flex items-center gap-2"
-                                  data-testid="new-chat-landing-repo-row"
-                                >
-                                  <span className="min-w-0 flex-1 truncate text-sm" title={sel.url}>
-                                    {name}
-                                  </span>
-                                  {repo ? (
-                                    <div className="w-36 shrink-0">
-                                      <SandboxRepoBranchSelect
-                                        fullName={repo.full_name}
-                                        value={sel.branch}
-                                        defaultBranch={repo.default_branch}
-                                        onChange={(b) => setSandboxRepoBranch(sel.url, b)}
-                                      />
-                                    </div>
-                                  ) : (
-                                    <input
-                                      type="text"
-                                      value={sel.branch}
-                                      onChange={(e) =>
-                                        setSandboxRepoBranch(sel.url, e.target.value)
-                                      }
-                                      placeholder="branch"
-                                      aria-label={`Branch for ${name}`}
-                                      className="w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-xs outline-none transition-colors focus-visible:border-ring"
-                                    />
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => removeSandboxRepo(sel.url)}
-                                    aria-label={`Remove ${name}`}
-                                    className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
-                                    data-testid="new-chat-landing-repo-remove"
+                              {sandboxRepoSelections.map((sel) => {
+                                const repo = repoForUrl(sel.url);
+                                const name = repo?.full_name ?? deriveRepoName(sel.url) ?? sel.url;
+                                return (
+                                  <div
+                                    key={sel.url}
+                                    className="flex items-center gap-2"
+                                    data-testid="new-chat-landing-repo-row"
                                   >
-                                    <XIcon className="size-3.5" />
-                                  </button>
-                                </div>
-                              );
-                            })}
-                            {sandboxRepoSelections.length > 0 && (
-                              <div className="my-0.5 border-t border-border" />
-                            )}
-                            {/* Add-repository controls, hidden once the provider's
+                                    <span
+                                      className="min-w-0 flex-1 truncate text-sm"
+                                      title={sel.url}
+                                    >
+                                      {name}
+                                    </span>
+                                    {repo ? (
+                                      <div className="w-36 shrink-0">
+                                        <SandboxRepoBranchSelect
+                                          fullName={repo.full_name}
+                                          value={sel.branch}
+                                          defaultBranch={repo.default_branch}
+                                          onChange={(b) => setSandboxRepoBranch(sel.url, b)}
+                                        />
+                                      </div>
+                                    ) : (
+                                      <input
+                                        type="text"
+                                        value={sel.branch}
+                                        onChange={(e) =>
+                                          setSandboxRepoBranch(sel.url, e.target.value)
+                                        }
+                                        placeholder="branch"
+                                        aria-label={`Branch for ${name}`}
+                                        className="w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-xs outline-none transition-colors focus-visible:border-ring"
+                                      />
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => removeSandboxRepo(sel.url)}
+                                      aria-label={`Remove ${name}`}
+                                      className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
+                                      data-testid="new-chat-landing-repo-remove"
+                                    >
+                                      <XIcon className="size-3.5" />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                              {sandboxRepoSelections.length > 0 && (
+                                <div className="my-0.5 border-t border-border" />
+                              )}
+                              {/* Add-repository controls, hidden once the provider's
                           repo cap is reached — so a single-repo provider shows one
                           slot and no multi-repo affordance. */}
-                            {sandboxRepoSelections.length < maxSandboxRepos && (
-                              <>
-                                {/* Add from the connected account's repos (only those
+                              {sandboxRepoSelections.length < maxSandboxRepos && (
+                                <>
+                                  {/* Add from the connected account's repos (only those
                               not already picked); the free-text URL below is the
                               fallback for a repo not in the list or no GitHub link. */}
-                                {showGithubRepoPicker && (
-                                  <>
-                                    <SandboxRepoCombobox
-                                      repos={unselectedRepos}
-                                      value=""
-                                      onSelect={(repo) => {
-                                        if (repo) {
-                                          addSandboxRepo(
-                                            repo.clone_url ??
-                                              `https://github.com/${repo.full_name}.git`,
-                                          );
-                                        }
-                                      }}
-                                    />
-                                    {sandboxReposTruncated && (
-                                      <p
-                                        className="text-sm text-muted-foreground"
-                                        data-testid="new-chat-landing-repo-truncated"
-                                      >
-                                        Showing your most recently pushed repositories. Don't see
-                                        one? Paste its URL below.
+                                  {showGithubRepoPicker && (
+                                    <>
+                                      <SandboxRepoCombobox
+                                        repos={unselectedRepos}
+                                        value=""
+                                        onSelect={(repo) => {
+                                          if (repo) {
+                                            addSandboxRepo(
+                                              repo.clone_url ??
+                                                `https://github.com/${repo.full_name}.git`,
+                                            );
+                                          }
+                                        }}
+                                      />
+                                      {sandboxReposTruncated && (
+                                        <p
+                                          className="text-sm text-muted-foreground"
+                                          data-testid="new-chat-landing-repo-truncated"
+                                        >
+                                          Showing your most recently pushed repositories. Don't see
+                                          one? Paste its URL below.
+                                        </p>
+                                      )}
+                                      <p className="text-sm text-muted-foreground">
+                                        or paste a repository URL:
                                       </p>
-                                    )}
-                                    <p className="text-sm text-muted-foreground">
-                                      or paste a repository URL:
-                                    </p>
-                                  </>
-                                )}
-                                {/* Connected but the repo list failed to load: say so
+                                    </>
+                                  )}
+                                  {/* Connected but the repo list failed to load: say so
                               explicitly, so a transient error isn't mistaken for
                               "GitHub not connected" (the picker just wouldn't render). */}
-                                {githubReposEnabled &&
-                                  sandboxReposErrored &&
-                                  !showGithubRepoPicker && (
-                                    <p
-                                      className="text-sm text-destructive"
-                                      data-testid="new-chat-landing-repo-error"
-                                    >
-                                      Couldn't load your GitHub repositories. Paste a repository URL
-                                      below.
-                                    </p>
-                                  )}
-                                <div className="flex items-center gap-2">
-                                  <input
-                                    id="landing-repo-url"
-                                    type="text"
-                                    value={pendingRepoUrl}
-                                    onChange={(e) => setPendingRepoUrl(e.target.value)}
-                                    onKeyDown={(e) => {
-                                      // Enter adds the repo (same as the Add button), so a
-                                      // paste-then-Enter flow never needs the mouse.
-                                      if (
-                                        e.key === "Enter" &&
-                                        isValidSandboxRepoUrl(pendingRepoUrl)
-                                      ) {
-                                        e.preventDefault();
+                                  {githubReposEnabled &&
+                                    sandboxReposErrored &&
+                                    !showGithubRepoPicker && (
+                                      <p
+                                        className="text-sm text-destructive"
+                                        data-testid="new-chat-landing-repo-error"
+                                      >
+                                        Couldn't load your GitHub repositories. Paste a repository
+                                        URL below.
+                                      </p>
+                                    )}
+                                  <div className="flex items-center gap-2">
+                                    <input
+                                      id="landing-repo-url"
+                                      type="text"
+                                      value={pendingRepoUrl}
+                                      onChange={(e) => setPendingRepoUrl(e.target.value)}
+                                      onKeyDown={(e) => {
+                                        // Enter adds the repo (same as the Add button), so a
+                                        // paste-then-Enter flow never needs the mouse.
+                                        if (
+                                          e.key === "Enter" &&
+                                          isValidSandboxRepoUrl(pendingRepoUrl)
+                                        ) {
+                                          e.preventDefault();
+                                          addSandboxRepo(pendingRepoUrl);
+                                          setPendingRepoUrl("");
+                                        }
+                                      }}
+                                      placeholder="https://github.com/org/repo"
+                                      aria-label="Repository URL"
+                                      className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                                      data-testid="new-chat-landing-repo-input"
+                                    />
+                                    <button
+                                      type="button"
+                                      disabled={!isValidSandboxRepoUrl(pendingRepoUrl)}
+                                      onClick={() => {
                                         addSandboxRepo(pendingRepoUrl);
                                         setPendingRepoUrl("");
-                                      }
-                                    }}
-                                    placeholder="https://github.com/org/repo"
-                                    aria-label="Repository URL"
-                                    className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                                    data-testid="new-chat-landing-repo-input"
-                                  />
-                                  <button
-                                    type="button"
-                                    disabled={!isValidSandboxRepoUrl(pendingRepoUrl)}
-                                    onClick={() => {
-                                      addSandboxRepo(pendingRepoUrl);
-                                      setPendingRepoUrl("");
-                                    }}
-                                    className="flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-                                    data-testid="new-chat-landing-repo-add"
-                                  >
-                                    <PlusIcon className="size-3.5" />
-                                    Add
-                                  </button>
-                                </div>
-                              </>
-                            )}
-                            <p className="text-sm text-muted-foreground">
-                              {maxSandboxRepos > 1
-                                ? "Cloned into the sandbox at startup. Several repos are cloned side by side and the agent starts in the parent that holds them; pick one and it starts directly inside it. Leave empty for a blank workspace."
-                                : "Cloned into the sandbox at startup as the working directory. Leave empty for a blank workspace."}
-                            </p>
-                          </div>
-                        </PopoverContent>
-                      </Popover>
-                    )}
+                                      }}
+                                      className="flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+                                      data-testid="new-chat-landing-repo-add"
+                                    >
+                                      <PlusIcon className="size-3.5" />
+                                      Add
+                                    </button>
+                                  </div>
+                                </>
+                              )}
+                              <p className="text-sm text-muted-foreground">
+                                {maxSandboxRepos > 1
+                                  ? "Cloned into the sandbox at startup. Several repos are cloned side by side and the agent starts in the parent that holds them; pick one and it starts directly inside it. Leave empty for a blank workspace."
+                                  : "Cloned into the sandbox at startup as the working directory. Leave empty for a blank workspace."}
+                              </p>
+                            </div>
+                          </PopoverContent>
+                        </Popover>
+                      )}
 
-                    {/* The session's project membership (from a `?project=` landing)
+                      {/* The session's project membership (from a `?project=` landing)
                 is shown in the hero heading instead of a tray chip; filing on
                 create still uses `selectedProject`. */}
-                  </>
-                ),
-                trailing: (
-                  <>
-                    <div className="flex min-w-0 items-center rounded-lg">
-                      {/* One trigger combines the harness glyph with model / effort;
+                    </>
+                  ),
+                  trailing: (
+                    <>
+                      <div className="flex min-w-0 items-center rounded-lg">
+                        {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}
-                      <AgentHarnessPicker
-                        agentEntries={agentEntries}
-                        harnessEntries={harnessEntries}
-                        effectiveAgentId={effectiveAgentId}
-                        agentLabel={agentLabel}
-                        hasAgents={agentList.length > 0}
-                        loading={pickerLoading}
-                        interactiveWhileLoading={interactiveWhileLoading}
-                        cacheKey={pickerCacheKey}
-                        host={harnessWarningHost}
-                        onSelectAgent={handleSelectAgent}
-                        pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
-                        pendingAgentId={PENDING_AGENT_ID}
-                        onSelectPending={handleSelectPending}
-                        onCreateCustomAgent={() => setCreateAgentOpen(true)}
-                        sandboxSelected={sandboxSelected}
-                        triggerTooltip={
-                          smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
-                        }
-                        triggerTooltipRows={
-                          !smartRoutingHarnessSelected && harnessTriggerDetails.length > 0
-                            ? harnessTriggerTooltipRows
-                            : undefined
-                        }
-                        triggerDetails={harnessTriggerDetails}
-                        triggerIcon={
-                          selectedAgent ? (
-                            <span
-                              className="flex size-4 shrink-0 items-center justify-center"
-                              data-testid="new-chat-landing-agent-icon"
-                            >
-                              {smartRoutingHarnessSelected ? (
-                                <WandSparklesIcon className="size-4" aria-hidden="true" />
-                              ) : (
-                                <ComposerAgentIcon agent={selectedAgent} />
-                              )}
+                        <AgentHarnessPicker
+                          agentEntries={agentEntries}
+                          harnessEntries={harnessEntries}
+                          effectiveAgentId={effectiveAgentId}
+                          agentLabel={agentLabel}
+                          hasAgents={agentList.length > 0}
+                          loading={pickerLoading}
+                          interactiveWhileLoading={interactiveWhileLoading}
+                          cacheKey={pickerCacheKey}
+                          host={harnessWarningHost}
+                          onSelectAgent={handleSelectAgent}
+                          pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
+                          pendingAgentId={PENDING_AGENT_ID}
+                          onSelectPending={handleSelectPending}
+                          onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                          sandboxSelected={sandboxSelected}
+                          triggerTooltip={
+                            smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
+                          }
+                          triggerTooltipRows={
+                            !smartRoutingHarnessSelected && harnessTriggerDetails.length > 0
+                              ? harnessTriggerTooltipRows
+                              : undefined
+                          }
+                          triggerDetails={harnessTriggerDetails}
+                          triggerIcon={
+                            selectedAgent ? (
+                              <span
+                                className="flex size-4 shrink-0 items-center justify-center"
+                                data-testid="new-chat-landing-agent-icon"
+                              >
+                                {smartRoutingHarnessSelected ? (
+                                  <WandSparklesIcon className="size-4" aria-hidden="true" />
+                                ) : (
+                                  <ComposerAgentIcon agent={selectedAgent} />
+                                )}
+                              </span>
+                            ) : null
+                          }
+                          selectedConfigContent={selectedConfigContent}
+                          isEntryConfigurable={isEntryConfigurable}
+                          entrySummaries={pickerEntrySummaries}
+                          autoHarnessAvailable={smartRoutingHarnessAvailable}
+                          autoHarnessActive={smartRoutingHarnessSelected}
+                          onSelectAutoHarness={handleSelectSmartRoutingHarness}
+                          contentClassName={COMPOSER_HARNESS_MENU_SIZE}
+                          triggerClassName="text-[13px] leading-5"
+                        />
+                      </div>
+                      {selectedAgent && selectedAgentHasAdvancedSettings && (
+                        <HarnessConfigModal
+                          open={configOpen}
+                          onOpenChange={setConfigOpen}
+                          agent={selectedAgent}
+                          brainHarnessLabels={brainHarnessLabels}
+                          host={harnessWarningHost}
+                          hideUnconfigured={hideUnconfiguredHarnesses}
+                          pickedHarness={pickedHarness}
+                          setPickedHarness={handleSetPickedHarness}
+                        />
+                      )}
+                      <ComposerMicButton
+                        className="size-8 md:size-7"
+                        enableHotkey
+                        disabled={creating}
+                        onVoiceStart={() => {
+                          voiceSnapshotRef.current = message;
+                        }}
+                        onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                        onTranscript={dictation.appendFinal}
+                        onInterim={dictation.replaceInterim}
+                      />
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="inline-flex shrink-0">
+                              <ComposerSendButton
+                                disabled={!canSubmit}
+                                label={creating ? "Starting session" : "Start session"}
+                                busy={creating}
+                                data-testid="new-chat-landing-submit"
+                              />
                             </span>
-                          ) : null
-                        }
-                        selectedConfigContent={selectedConfigContent}
-                        isEntryConfigurable={isEntryConfigurable}
-                        entrySummaries={pickerEntrySummaries}
-                        autoHarnessAvailable={smartRoutingHarnessAvailable}
-                        autoHarnessActive={smartRoutingHarnessSelected}
-                        onSelectAutoHarness={handleSelectSmartRoutingHarness}
-                        contentClassName={COMPOSER_HARNESS_MENU_SIZE}
-                        triggerClassName="text-[13px] leading-5"
-                      />
-                    </div>
-                    {selectedAgent && selectedAgentHasAdvancedSettings && (
-                      <HarnessConfigModal
-                        open={configOpen}
-                        onOpenChange={setConfigOpen}
-                        agent={selectedAgent}
-                        brainHarnessLabels={brainHarnessLabels}
-                        host={harnessWarningHost}
-                        hideUnconfigured={hideUnconfiguredHarnesses}
-                        pickedHarness={pickedHarness}
-                        setPickedHarness={handleSetPickedHarness}
-                      />
-                    )}
-                    <ComposerMicButton
-                      className="size-8 md:size-7"
-                      enableHotkey
-                      disabled={creating}
-                      onVoiceStart={() => {
-                        voiceSnapshotRef.current = message;
-                      }}
-                      onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
-                      onTranscript={dictation.appendFinal}
-                      onInterim={dictation.replaceInterim}
-                    />
-                    <TooltipProvider>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <span className="inline-flex shrink-0">
-                            <ComposerSendButton
-                              disabled={!canSubmit}
-                              label={creating ? "Starting session" : "Start session"}
-                              busy={creating}
-                              data-testid="new-chat-landing-submit"
+                          </TooltipTrigger>
+                          {submitDisabledReason != null ? (
+                            <TooltipContent>{submitDisabledReason}</TooltipContent>
+                          ) : !creating && !preventsKeyboardSubmit ? (
+                            <KeyboardShortcutTooltipContent
+                              label="Start session"
+                              keys={composerSendShortcutKeys(submitWithModEnter)}
                             />
-                          </span>
-                        </TooltipTrigger>
-                        {submitDisabledReason != null ? (
-                          <TooltipContent>{submitDisabledReason}</TooltipContent>
-                        ) : !creating && !preventsKeyboardSubmit ? (
-                          <KeyboardShortcutTooltipContent
-                            label="Start session"
-                            keys={composerSendShortcutKeys(submitWithModEnter)}
-                          />
-                        ) : null}
-                      </Tooltip>
-                    </TooltipProvider>
-                  </>
-                ),
-                testId: "new-chat-landing-actions",
-                leadingTestId: "new-chat-landing-left-controls",
-                trailingTestId: "new-chat-landing-right-controls",
-              }}
-            />
+                          ) : null}
+                        </Tooltip>
+                      </TooltipProvider>
+                    </>
+                  ),
+                  testId: "new-chat-landing-actions",
+                  leadingTestId: "new-chat-landing-left-controls",
+                  trailingTestId: "new-chat-landing-right-controls",
+                }}
+              />
+            </ActionScopeProvider>
           </form>
           <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
             <DialogContent

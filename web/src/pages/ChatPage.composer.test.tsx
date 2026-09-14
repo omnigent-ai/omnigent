@@ -6,9 +6,18 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as renderTestingLibrary,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { useChatStore } from "@/store/chatStore";
 import {
   clearSessionDrafts,
@@ -16,6 +25,7 @@ import {
   hasSessionDraft,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
+import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { setOmnigentHostConfig } from "@/lib/host";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
@@ -127,6 +137,17 @@ import {
 // scrolled into view as the user navigates. Both regressed because the menu
 // previously opened with nothing pre-selected (menuIndex === -1), so Tab fell
 // through to the browser's default focus move and Enter sent the message.
+
+function render(ui: ReactElement) {
+  const wrap = (child: ReactElement) => (
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      {child}
+    </ActionsProvider>
+  );
+  const result = renderTestingLibrary(wrap(ui));
+  return { ...result, rerender: (next: ReactElement) => result.rerender(wrap(next)) };
+}
 
 /** Minimal ComposerProps for an interactive (writable, idle) composer. */
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
@@ -635,6 +656,61 @@ describe("Composer slash-command menu", () => {
       componentId: "chat.composer.send",
       componentKind: "button",
     });
+  });
+
+  it("keeps Enter as a newline on a mobile viewport", () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width: 767"),
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    try {
+      const onSend = vi.fn();
+      render(<Composer {...composerProps({ onSend })} />);
+      const ta = textarea();
+      fireEvent.change(ta, { target: { value: "mobile draft" } });
+      expect(fireEvent.keyDown(ta, { key: "Enter" })).toBe(true);
+      expect(onSend).not.toHaveBeenCalled();
+      fireEvent.change(ta, { target: { value: "/des" } });
+      expect(fireEvent.keyDown(ta, { key: "Enter" })).toBe(true);
+      expect(ta.value).toBe("/des");
+    } finally {
+      cleanup();
+      clearSessionDrafts();
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  it("uses isWorking rather than local streaming status for Escape", () => {
+    const onStop = vi.fn();
+    const view = render(
+      <Composer {...composerProps({ status: "streaming", isWorking: false, onStop })} />,
+    );
+    expect(fireEvent.keyDown(textarea(), { key: "Escape" })).toBe(true);
+    expect(onStop).not.toHaveBeenCalled();
+    view.rerender(<Composer {...composerProps({ status: "idle", isWorking: true, onStop })} />);
+    expect(fireEvent.keyDown(textarea(), { key: "Escape" })).toBe(false);
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
+  it("recalls only when the caret is at the absolute text boundary", () => {
+    useChatStore.setState({ conversationId: "conv_recall" });
+    appendPromptHistoryEntry("previous prompt", "conv_recall");
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "draft" } });
+    ta.setSelectionRange(2, 2);
+    expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(true);
+    expect(ta.value).toBe("draft");
+    ta.setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(false);
+    expect(ta.value).toBe("previous prompt");
   });
 
   it("Enter on an empty composer neither sends nor reports a send", () => {
@@ -2558,6 +2634,33 @@ describe("Composer pending elicitation", () => {
 });
 
 describe("Composer reply quotes", () => {
+  it("centrally owns earlier reply inputs and their composition state", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...props} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "Introduction" } });
+    act(() => ref.current?.appendReplyQuote("Actual card"));
+    fireEvent.change(textarea(), { target: { value: "Answer" } });
+    const earlier = screen.getByLabelText("Reply text before quote 1") as HTMLTextAreaElement;
+    act(() => earlier.focus());
+    expect(earlier.closest("[data-action-scope]")).toBe(earlier.closest("form"));
+    fireEvent.compositionStart(earlier);
+    fireEvent.keyDown(earlier, { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    fireEvent.compositionEnd(earlier);
+    fireEvent.keyDown(earlier, { key: "Enter" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Introduction", text: "Actual card" }],
+      text: "Answer",
+    };
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
+      serializeReplyDraft(replyDraft),
+      undefined,
+      replyDraft,
+    );
+  });
+
   beforeEach(() => {
     clearSessionDrafts();
     localStorage.clear();

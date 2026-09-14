@@ -362,6 +362,9 @@ export class ActionRegistry {
 export type ActionRegistrationFor<A extends ActionId> = Omit<
   ActionHandlerRegistration<A>,
   "action" | "scopeId"
->;
+> & {
+  /** Force app-wide ownership even when rendered under a focused scope. */
+  scope?: "global";
+};
 
 export type ActionArgsFor<A extends ActionId> = ActionArgs<A>;

@@ -7,6 +7,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { authenticatedFetch } from "@/lib/identity";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { Host } from "@/hooks/useHosts";
@@ -226,7 +227,12 @@ function renderLanding(
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <ActionsProvider>
+            <KeybindingDispatcher />
+            {children}
+          </ActionsProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }

@@ -20,7 +20,8 @@ export const CONTEXT_KEYS = {
   eventMeta: "eventMeta",
   composerStreaming: "composerStreaming",
   composerSuggestionsOpen: "composerSuggestionsOpen",
-  dictationListening: "dictationListening",
+  composerEnterInserts: "composerEnterInserts",
+  composerSubmitWithModEnter: "composerSubmitWithModEnter",
   fileSearchOpen: "fileSearchOpen",
   shikiSourceView: "shikiSourceView",
 } as const satisfies Record<ContextKey, ContextKey>;
@@ -39,7 +40,8 @@ export const EMPTY_ACTION_CONTEXT: ContextSnapshot = {
   eventMeta: false,
   composerStreaming: false,
   composerSuggestionsOpen: false,
-  dictationListening: false,
+  composerEnterInserts: false,
+  composerSubmitWithModEnter: false,
   fileSearchOpen: false,
   shikiSourceView: false,
 };
