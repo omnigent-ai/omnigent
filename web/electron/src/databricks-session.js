@@ -42,15 +42,17 @@ const NETWORK_TIMEOUT_MS = 20_000;
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin The entered/pinned origin (account or workspace host).
- * @param {{ interactive?: boolean, nextPath?: string,
+ * @param {{ interactive?: boolean, nextPath?: string, workspaceId?: string,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
+ *   ``workspaceId`` (from a ``?o=`` hint) auto-selects that workspace for an
+ *   account-scoped login, skipping the picker.
  * @returns {Promise<string>} The workspace origin the session was created for.
  */
 async function ensureDatabricksSession(
   ses,
   origin,
-  { interactive = true, nextPath = "/omnigent", pickWorkspace } = {},
+  { interactive = true, nextPath = "/omnigent", pickWorkspace, workspaceId } = {},
 ) {
   let bridgeOrigin;
   let accessToken;
@@ -75,10 +77,25 @@ async function ensureDatabricksSession(
       if (workspaces.length === 0) {
         throw new Error("no running workspaces available for this account");
       }
-      if (typeof pickWorkspace !== "function") {
-        throw new Error("account-scoped login requires a workspace picker");
+      // A `?o=<workspace_id>` hint from the entered URL names the workspace, so
+      // auto-select it and skip the picker. Fall back to the picker when there's
+      // no hint, or the hint doesn't match a workspace the user can access.
+      let picked = workspaceId
+        ? workspaces.find((w) => w.workspaceId === String(workspaceId))
+        : undefined;
+      if (picked) {
+        console.log(`[omnigent] databricks session: auto-selected workspace o=${workspaceId}`);
+      } else {
+        if (workspaceId) {
+          console.warn(
+            `[omnigent] databricks session: o=${workspaceId} not in the account's workspaces; showing picker`,
+          );
+        }
+        if (typeof pickWorkspace !== "function") {
+          throw new Error("account-scoped login requires a workspace picker");
+        }
+        picked = await pickWorkspace(workspaces);
       }
-      const picked = await pickWorkspace(workspaces);
       if (!picked) throw new Error("workspace selection cancelled");
       bridgeOrigin = `https://${picked.fqdn}`;
       saveWorkspaceToken(bridgeOrigin, tokens, {

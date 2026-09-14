@@ -2635,8 +2635,13 @@ function registerIpc() {
       // failure fall through to a plain load and let the SSO gate handle it.
       if (databricksOAuthConfigured() && isDatabricksManagedServerUrl(target)) {
         const dbxOrigin = new URL(target).origin;
+        // `?o=<workspace_id>` on the entered URL names the workspace explicitly
+        // (Databricks' workspace selector), so an account-scoped login can
+        // auto-select it and skip the picker.
+        const workspaceId = new URL(target).searchParams.get("o") || undefined;
         try {
           const resolvedOrigin = await ensureDatabricksSession(session.defaultSession, dbxOrigin, {
+            workspaceId,
             pickWorkspace: (workspaces) => pickWorkspaceForBridge(win, workspaces),
           });
           // SPOG: the picked workspace differs from the entered SPOG/account
