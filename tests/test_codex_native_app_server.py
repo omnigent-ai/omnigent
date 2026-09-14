@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -25,6 +26,7 @@ from omnigent.harnesses.codex_native.app_server import (
     _FRAMEWORK_APPROVED_TOOLS,
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexAppServerClient,
+    CodexAppServerResponseError,
     CodexNativeAppServer,
     NativeCodexLaunch,
     _build_native_codex_app_server_argv,
@@ -46,6 +48,35 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
+
+
+@pytest.mark.parametrize("method", ["turn/start", "turn/steer"])
+async def test_rejected_request_traceback_identifies_rpc(method: str) -> None:
+    """RPC errors keep their structured payload and add only request identity."""
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    client._ws = cast(ClientConnection, websocket)
+    error = {"code": -32600, "message": "invalid turn id"}
+
+    async def reject_request(raw: str) -> None:
+        envelope = json.loads(raw)
+        request_id = envelope["id"]
+        client._pending_requests.pop(request_id).set_result({"id": request_id, "error": error})
+
+    websocket.send.side_effect = reject_request
+    params = {"input": [{"text": "private prompt"}]}
+    with pytest.raises(CodexAppServerResponseError) as caught:
+        await client.request(method, params)
+
+    exc = caught.value
+    assert exc.error is error
+    assert exc.code == -32600
+    assert exc.message == "invalid turn id"
+    assert str(exc) == str(error)
+    assert exc.__notes__ == [f"Codex app-server RPC: method={method} request_id=1"]
+    rendered = "".join(traceback.format_exception(exc))
+    assert exc.__notes__[0] in rendered
+    assert "private prompt" not in rendered
 
 
 @pytest.mark.parametrize(
