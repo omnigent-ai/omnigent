@@ -5,25 +5,14 @@ import Security
 /// Transient material for one authorization-code flow; never persisted or sent to JavaScript.
 struct DatabricksOAuthAttempt: Sendable {
   let configuration: DatabricksOAuthConfiguration
-  let workspaceOrigin: URL
+  let credentialScope: DatabricksCredentialScope
+  var workspaceOrigin: URL { credentialScope.workspaceOrigin }
   let state: String
   let verifier: String
 
   init(workspaceURL: URL, configuration: DatabricksOAuthConfiguration) throws {
-    guard var origin = URLComponents(url: workspaceURL, resolvingAgainstBaseURL: false),
-      origin.scheme?.lowercased() == "https",
-      ServerAuthentication(host: origin.host) == .databricksWorkspace,
-      origin.user == nil, origin.password == nil,
-      origin.port == nil || origin.port == 443
-    else { throw DatabricksOAuthError.invalidWorkspace }
-    origin.scheme = "https"
-    origin.host = origin.host?.lowercased()
-    origin.port = nil
-    origin.path = ""
-    origin.query = nil
-    origin.fragment = nil
-    guard let url = origin.url else { throw DatabricksOAuthError.invalidWorkspace }
-    workspaceOrigin = url
+    credentialScope = try DatabricksCredentialScope(
+      workspaceURL: workspaceURL, configuration: configuration)
     self.configuration = configuration
     state = try Self.randomValue()
     verifier = try Self.randomValue()
@@ -71,20 +60,13 @@ struct DatabricksOAuthAttempt: Sendable {
   }
 
   func tokenRequest(code: String) -> URLRequest {
-    var request = URLRequest(url: workspaceOrigin.appendingPathComponent("oidc/v1/token"))
-    request.httpMethod = "POST"
-    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.timeoutInterval = 30
-    let fields = [
-      ("grant_type", "authorization_code"), ("client_id", configuration.clientID),
-      ("redirect_uri", configuration.redirectURL.absoluteString), ("scope", Self.scope),
-      ("code_verifier", verifier), ("code", code),
-    ]
-    request.httpBody = Data(
-      fields.map { "\(Self.formEncode($0.0))=\(Self.formEncode($0.1))" }.joined(separator: "&").utf8
-    )
-    return request
+    DatabricksOAuthClient.tokenRequest(
+      for: credentialScope,
+      fields: [
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", configuration.redirectURL.absoluteString), ("scope", Self.scope),
+        ("code_verifier", verifier), ("code", code),
+      ])
   }
 
   static func challenge(for verifier: String) -> String {
@@ -106,9 +88,4 @@ struct DatabricksOAuthAttempt: Sendable {
       .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
   }
 
-  private static func formEncode(_ value: String) -> String {
-    let unreserved = CharacterSet(
-      charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-    return value.addingPercentEncoding(withAllowedCharacters: unreserved)!
-  }
 }

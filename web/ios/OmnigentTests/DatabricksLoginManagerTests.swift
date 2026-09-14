@@ -1,4 +1,5 @@
 import AuthenticationServices
+import Security
 import UIKit
 import XCTest
 
@@ -28,6 +29,9 @@ final class DatabricksLoginManagerTests: XCTestCase {
     let tokens = try await task.value
     await fulfillment(of: [requested], timeout: 2)
     XCTAssertEqual(tokens.accessToken, "opaque-access")
+    let scope = try DatabricksCredentialScope(
+      workspaceURL: harness.server.workspaceURL, configuration: harness.configuration)
+    XCTAssertEqual(harness.credentials.snapshot(for: scope), tokens)
     XCTAssertFalse(harness.manager.isInFlight)
   }
 
@@ -162,6 +166,60 @@ final class DatabricksLoginManagerTests: XCTestCase {
     XCTAssertTrue(harness.browsers.isEmpty)
   }
 
+  func testPersistenceFailureIsNotReportedAsSuccessfulLogin() async throws {
+    let harness = try Harness()
+    harness.credentials.fail(.save)
+    let started = expectation(description: "browser started")
+    harness.onStart = { started.fulfill() }
+    let task = harness.signIn()
+    await fulfillment(of: [started], timeout: 2)
+    harness.browsers[0].succeed(redirect: harness.configuration.redirectURL)
+    do {
+      _ = try await task.value
+      XCTFail("Expected persistence failure")
+    } catch {
+      XCTAssertEqual(error as? DatabricksCredentialError, .keychain(errSecInteractionNotAllowed))
+    }
+    XCTAssertFalse(harness.manager.isInFlight)
+  }
+
+  func testClearOrNewerLoginRejectsOldLoginCommit() async throws {
+    for replaceWithLogin in [false, true] {
+      let harness = try Harness()
+      let scope = try DatabricksCredentialScope(
+        workspaceURL: harness.server.workspaceURL, configuration: harness.configuration)
+      let started = expectation(description: "browser started")
+      harness.onStart = { started.fulfill() }
+      let task = harness.signIn()
+      await fulfillment(of: [started], timeout: 2)
+      let newer = credentialTokens(access: "new-login", refresh: "new-login-refresh")
+      if replaceWithLogin {
+        let signIn = try await harness.tokenManager.beginSignIn(for: scope)
+        try await harness.tokenManager.save(newer, for: signIn)
+      } else {
+        try await harness.tokenManager.clear(for: scope)
+      }
+      harness.browsers[0].succeed(redirect: harness.configuration.redirectURL)
+      await assertCancelled(task)
+      XCTAssertEqual(harness.credentials.snapshot(for: scope), replaceWithLogin ? newer : nil)
+    }
+  }
+
+  func testCancelledReplacementPreservesSavedCredentials() async throws {
+    let harness = try Harness()
+    let scope = try DatabricksCredentialScope(
+      workspaceURL: harness.server.workspaceURL, configuration: harness.configuration)
+    let original = credentialTokens()
+    try await harness.tokenManager.save(original, for: scope)
+    let started = expectation(description: "browser started")
+    harness.onStart = { started.fulfill() }
+    let task = harness.signIn()
+    await fulfillment(of: [started], timeout: 2)
+    harness.manager.cancel()
+    await assertCancelled(task)
+    XCTAssertEqual(harness.credentials.snapshot(for: scope), original)
+  }
+
   private func assertCancelled(_ task: Task<DatabricksOAuthTokens, Error>) async {
     do {
       _ = try await task.value
@@ -177,11 +235,15 @@ private final class Harness {
   let server: OAuthTestServer
   let configuration: DatabricksOAuthConfiguration
   let anchor: ASPresentationAnchor
+  let credentials = MemoryDatabricksCredentialStore()
   var browsers: [FakeAuthenticationSession] = []
   var startResult = true
   var onStart: (() -> Void)?
-  lazy var manager = DatabricksLoginManager(client: DatabricksOAuthClient(session: server.session))
-  {
+  lazy var tokenManager = DatabricksTokenManager(store: credentials)
+  lazy var manager = DatabricksLoginManager(
+    client: DatabricksOAuthClient(session: server.session),
+    tokenManager: tokenManager
+  ) {
     [unowned self] url, callback, _, completion in
     let browser = FakeAuthenticationSession(url: url, callback: callback, completion: completion)
     browser.startResult = startResult
