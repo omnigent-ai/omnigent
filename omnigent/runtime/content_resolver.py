@@ -286,10 +286,12 @@ def image_filename_for_content_type(filename: str, content_type: str) -> str:
 def image_needs_compression(size: int, content_type: str) -> bool:
     """Whether an image upload would actually be re-encoded by compression.
 
-    Lets the upload route skip the worker-thread hop and the compression
-    semaphore for images that pass through untouched — a small image (``<=``
-    :data:`IMAGE_MODEL_BUDGET_BYTES`) or a type we don't compress (SVG, …).
-    Mirrors the fast-path short-circuit in :func:`compress_image_attachment`.
+    Lets the upload route skip the worker-thread decode hop for an already
+    small image (``<=`` :data:`IMAGE_MODEL_BUDGET_BYTES`) that a compressible
+    type would pass through untouched. (A compressible type still enters the
+    admission gate before its size is known, since the size needs the read; the
+    gate is only skipped entirely for non-compressible types like SVG.) Mirrors
+    the fast-path short-circuit in :func:`compress_image_attachment`.
 
     :param size: The image's byte length.
     :param content_type: The resolved image MIME.
