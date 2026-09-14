@@ -219,6 +219,7 @@ _MIN_TITLED_RULE_WIDTH = 20
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
+_CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -5135,7 +5136,7 @@ def _wait_for_claude_prompt_ready(
     :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
         unanswered liveness probe extends the wait to
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
-        query ends it at the base budget.
+        query ends the wait at the next liveness check.
     :returns: None.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
@@ -5147,7 +5148,7 @@ def _wait_for_claude_prompt_ready(
         a box that never appeared — is diagnosable from the error alone.
     """
     started = time.monotonic()
-    deadline = started + timeout_s
+    next_liveness_probe = started + timeout_s
     hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
@@ -5171,11 +5172,12 @@ def _wait_for_claude_prompt_ready(
         if _claude_prompt_rendered(pane):
             return
         now = time.monotonic()
-        if now >= deadline:
-            # Only an affirmative "dead" ends the extension early: an
-            # unanswered probe (starved server) keeps waiting to the cap.
-            if now >= hard_deadline or _claude_pane_alive(socket_path, tmux_target) is False:
+        if now >= hard_deadline:
+            break
+        if now >= next_liveness_probe:
+            if _claude_pane_alive(socket_path, tmux_target) is False:
                 break
+            next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the

@@ -17,6 +17,7 @@ import time
 from collections.abc import Iterator
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
@@ -8397,6 +8398,77 @@ def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
     waited = time.monotonic() - started
     assert 0.4 <= waited < 5.0
     assert "did not become ready" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("alive", [True, None])
+@pytest.mark.parametrize("probe_duration", [0.0, 2.0])
+def test_readiness_throttles_liveness_without_delaying_ready_composer(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None, probe_duration: float
+) -> None:
+    clock = _VirtualClock()
+    captures: list[float] = []
+    probes: list[tuple[float, float]] = []
+
+    def capture(socket_path: str, tmux_target: str) -> str:
+        captures.append(clock.monotonic())
+        return _READY_PANE if clock.monotonic() >= 6.5 else _BOOTING_PANE
+
+    def probe(socket_path: str, tmux_target: str) -> bool | None:
+        started = clock.monotonic()
+        clock.sleep(probe_duration)
+        probes.append((started, clock.monotonic()))
+        return alive
+
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_alive", probe)
+
+    claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=1.0)
+
+    assert len(probes) >= 2
+    assert probes[0][0] == 1.0
+    assert all(
+        started - previous_end >= 1.0 for (_, previous_end), (started, _) in pairwise(probes)
+    )
+    assert captures[-2:] == [6.25, 6.5]
+
+
+@pytest.mark.parametrize("alive", [True, None])
+def test_readiness_stops_at_deadline_between_liveness_probes(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None
+) -> None:
+    clock = _VirtualClock()
+    probe = Mock(return_value=alive)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.75)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_alive", probe)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.0)
+
+    assert clock.monotonic() == 0.75
+    probe.assert_called_once()
+
+
+@pytest.mark.parametrize("alive", [True, None])
+def test_readiness_detects_dead_pane_on_next_liveness_probe(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None
+) -> None:
+    clock = _VirtualClock()
+    probe = Mock(side_effect=[alive, False])
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_alive", probe)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.5)
+
+    assert clock.monotonic() == 1.5
+    assert probe.call_count == 2
 
 
 def test_claude_pane_alive_distinguishes_dead_pane_from_unanswered_probe(

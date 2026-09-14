@@ -37,9 +37,10 @@ delivered and answered once the terminal is ready.
 
 Making the failure deterministic
 --------------------------------
-The wrapper's boot delay (:data:`_READY_DELAY_S`) is set comfortably past
-the 30s gate, so the buggy path is hit on every run — no timing races. The
-real ``claude`` CLI runs against the mock LLM (a mock anthropic provider is
+The wrapper waits for a marker written at readiness-gate entry before
+starting its boot delay (:data:`_READY_DELAY_S`). Browser setup cannot
+consume the delay, which exceeds the 30s base budget. The real ``claude``
+CLI runs against the mock LLM (a mock anthropic provider is
 written into the rig's isolated ``OMNIGENT_CONFIG_HOME``), so no live
 Anthropic credentials are needed and the delivered turn gets a mock reply.
 
@@ -55,6 +56,7 @@ import importlib.util
 import logging
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -138,7 +140,7 @@ def _no_proxy_env() -> dict[str, str]:
     return env
 
 
-def _write_slow_ready_claude_wrapper(bin_dir: Path, real_claude: str) -> Path:
+def _write_slow_ready_claude_wrapper(bin_dir: Path, real_claude: str, gate_started: Path) -> Path:
     """Write a ``claude`` wrapper that becomes ready only after a slow boot.
 
     The wrapper prints boot output (so ``capture-pane`` frames are non-empty,
@@ -148,6 +150,7 @@ def _write_slow_ready_claude_wrapper(bin_dir: Path, real_claude: str) -> Path:
 
     :param bin_dir: Directory to write the wrapper into.
     :param real_claude: Absolute path of the real ``claude`` binary to exec.
+    :param gate_started: Marker written when delivery enters the readiness gate.
     :returns: The absolute path of the wrapper executable.
     """
     wrapper = bin_dir / "claude"
@@ -157,14 +160,15 @@ def _write_slow_ready_claude_wrapper(bin_dir: Path, real_claude: str) -> Path:
         "# boot (past the executor's default readiness gate).\n"
         'echo "Claude Code — connecting to host..."\n'
         'echo "This is taking longer than usual."\n'
+        f"while [ ! -f {shlex.quote(str(gate_started))} ]; do sleep 0.05; done\n"
         f"sleep {_READY_DELAY_S}\n"
-        f'exec "{real_claude}" "$@"\n'
+        f'exec {shlex.quote(real_claude)} "$@"\n'
     )
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return wrapper
 
 
-def _rig_python(work: Path) -> str:
+def _rig_python(work: Path, gate_started: Path) -> str:
     """Build an interpreter whose isolated mode can import this checkout.
 
     The claude-native bridge invokes its hook scripts (the transcript
@@ -178,6 +182,7 @@ def _rig_python(work: Path) -> str:
     ``-I``, so the runner spawned from it produces working hooks.
 
     :param work: The rig's scratch directory.
+    :param gate_started: Marker for the test-only readiness observer, including under ``-I``.
     :returns: Absolute path of the rig venv's ``python``.
     """
     venv_dir = work / "rig-venv"
@@ -199,8 +204,69 @@ def _rig_python(work: Path) -> str:
             root = str(Path(spec.origin).resolve().parents[1])
             if root not in roots:
                 roots.append(root)
-    (site_packages / "omnigent_rig.pth").write_text("\n".join([*roots, parent_purelib]) + "\n")
+    (site_packages / "omnigent_slow_ready_gate.py").write_text(
+        "import time\n"
+        "from pathlib import Path\n"
+        "from omnigent.harnesses.claude_native import bridge\n"
+        f"gate_started = Path({str(gate_started)!r})\n"
+        "wait_for_prompt = bridge._wait_for_claude_prompt_ready\n"
+        "def observe_wait(socket_path, tmux_target, *, timeout_s):\n"
+        "    if not gate_started.exists():\n"
+        "        gate_started.write_text(str(time.monotonic()))\n"
+        "    wait_for_prompt(socket_path, tmux_target, timeout_s=timeout_s)\n"
+        "bridge._wait_for_claude_prompt_ready = observe_wait\n"
+    )
+    (site_packages / "omnigent_rig.pth").write_text(
+        "\n".join([*roots, parent_purelib, "import omnigent_slow_ready_gate"]) + "\n"
+    )
     return str(venv_dir / "bin" / "python")
+
+
+@pytest.mark.timeout(30)
+def test_slow_ready_wrapper_waits_for_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(f"{__name__}._READY_DELAY_S", 0.1)
+    gate_started = tmp_path / "gate started"
+    real_claude = tmp_path / "real claude"
+    real_claude.write_text("#!/usr/bin/env bash\necho READY\n")
+    real_claude.chmod(0o755)
+    wrapper = _write_slow_ready_claude_wrapper(tmp_path, str(real_claude), gate_started)
+    rig_python = _rig_python(tmp_path, gate_started)
+    process = subprocess.Popen(
+        [str(wrapper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        assert process.stdout is not None
+        assert "connecting to host" in process.stdout.readline()
+        assert "taking longer than usual" in process.stdout.readline()
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.communicate(timeout=0.3)
+        subprocess.run(
+            [
+                rig_python,
+                "-I",
+                "-c",
+                "from pathlib import Path\n"
+                "from omnigent.harnesses.claude_native import bridge\n"
+                f"assert not Path({str(gate_started)!r}).exists()\n"
+                "bridge._capture_pane = lambda *_: '────────────────\\n❯ \\n────────────────'\n"
+                "bridge._wait_for_claude_prompt_ready('/tmp/sock', 'main', timeout_s=0.0)\n"
+                f"assert Path({str(gate_started)!r}).exists()\n",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == "READY"
+        assert time.monotonic() - float(gate_started.read_text()) >= _READY_DELAY_S
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
 
 
 @pytest.fixture
@@ -208,7 +274,7 @@ def slow_ready_claude_session(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str]]:
+) -> Iterator[tuple[str, str, Path]]:
     """A claude-native wrapper session whose Claude terminal becomes ready late.
 
     Spawns a dedicated server + runner whose claude-native harness command
@@ -218,7 +284,7 @@ def slow_ready_claude_session(
     credentials), then creates and binds the same claude-native wrapper
     session ``omnigent claude`` ships.
 
-    :returns: ``(base_url, session_id)``.
+    :returns: ``(base_url, session_id, gate_started)``.
     """
     if shutil.which("tmux") is None:
         pytest.skip("tmux is required for the claude-native terminal rig")
@@ -233,8 +299,9 @@ def slow_ready_claude_session(
     artifacts = work / "artifacts"
     for path in (config_home, home_dir, wrapper_bin, artifacts):
         path.mkdir(parents=True, exist_ok=True)
-    wrapper = _write_slow_ready_claude_wrapper(wrapper_bin, real_claude)
-    rig_python = _rig_python(work)
+    gate_started = work / "readiness-gate-started"
+    wrapper = _write_slow_ready_claude_wrapper(wrapper_bin, real_claude, gate_started)
+    rig_python = _rig_python(work, gate_started)
 
     # Mock anthropic provider so the real ``claude`` boots against the mock
     # LLM (no live credentials) — mirrors ``native_claude_mock_session``.
@@ -336,7 +403,7 @@ def slow_ready_claude_session(
             )
 
         session_id = _create_native_claude_session(base_url, runner_id)
-        yield (base_url, session_id)
+        yield (base_url, session_id, gate_started)
     finally:
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
@@ -358,7 +425,7 @@ def slow_ready_claude_session(
 @pytest.mark.timeout(400)
 def test_claude_native_first_prompt_survives_slow_terminal_boot(
     page: Page,
-    slow_ready_claude_session: tuple[str, str],
+    slow_ready_claude_session: tuple[str, str, Path],
     mock_llm_server_url: str,
 ) -> None:
     """The first prompt must be delivered even when the terminal is slow to become ready.
@@ -374,7 +441,7 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
     """
     from tests.e2e_ui.conftest import set_fallback_mock_llm
 
-    base_url, session_id = slow_ready_claude_session
+    base_url, session_id, gate_started = slow_ready_claude_session
 
     # Make the mock LLM echo the token so a delivered turn is unmistakable.
     set_fallback_mock_llm(mock_llm_server_url, "default", _ECHO_TOKEN)
@@ -398,6 +465,7 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
     # booting (the racy path): the readiness gate must hold the message until
     # the terminal is ready rather than dropping it at the 30s cap.
     _ensure_chat_view(page)
+    assert not gate_started.exists(), "startup delay began before the first message"
     _send(page, _FIRST_PROMPT)
     sent_at = time.monotonic()
     _log.info("first prompt sent; waiting for the turn outcome")
@@ -409,6 +477,8 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
     expect(outcome.first).to_be_visible(timeout=int(_TURN_OUTCOME_TIMEOUT_S * 1000))
     elapsed = time.monotonic() - sent_at
     _log.info("turn reached a user-visible outcome after %.0fs", elapsed)
+    assert gate_started.exists(), "delivery never entered the readiness gate"
+    assert time.monotonic() - float(gate_started.read_text()) >= _READY_DELAY_S
 
     # Durable assertion against the canonical transcript: the first prompt
     # must have been delivered and answered (an assistant item echoing the
@@ -428,8 +498,7 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
     delivered = any(_ECHO_TOKEN in text for text in assistant_texts)
 
     assert delivered, (
-        "claude-native first prompt was NOT delivered: no assistant reply "
-        f"echoing {_ECHO_TOKEN!r} appeared (after {elapsed:.0f}s). The slow "
-        "terminal-readiness gate dropped the first prompt. Turn errors: "
-        f"{error_messages or '<none>'}"
+        f"No assistant reply echoed {_ECHO_TOKEN!r} after {elapsed:.0f}s. "
+        f"Turn errors: {error_messages or '<none>'}. "
+        f"Assistant text: {assistant_texts or '<none>'}"
     )
