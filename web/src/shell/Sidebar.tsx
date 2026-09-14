@@ -171,8 +171,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
-import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
-import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { useSessionActions } from "@/hooks/useSessionActions";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -2112,15 +2111,12 @@ function ConversationList({
     }
     return effectiveCollapsedSections.includes("Chats") ? [] : sections.sessions.map((c) => c.id);
   };
-  useSessionSwitchHotkey(orderedConversationIds, activeId);
-
-  // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
-  // see the hook). Empty when the Pinned section is collapsed.
+  // Numeric shortcuts target the first ten visible pinned sessions.
   const pinnedSessionIds = useMemo(
     () => (collapsedSections.includes("Pinned") ? [] : sections.pinned.map((c) => c.id)),
     [sections.pinned, collapsedSections],
   );
-  usePinnedSessionHotkeys(pinnedSessionIds, activeId);
+  useSessionActions(orderedConversationIds, pinnedSessionIds, activeId);
 
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
   // so there's no client-side list to normalize against the loaded window —
