@@ -1,3 +1,4 @@
+import { Terminal } from "@xterm/xterm";
 import { describe, expect, it } from "vitest";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 
@@ -7,6 +8,18 @@ const ESCAPE = "\x1b";
 const BELL = "\x07";
 const CANCEL = "\x18";
 const STRING_TERMINATOR = `${ESCAPE}\\`;
+const CONTROL_STRINGS = [
+  { name: "window title", prefix: `${ESCAPE}]0;title`, terminator: BELL },
+  { name: "hyperlink", prefix: `${ESCAPE}]8;;https://example.com/`, terminator: STRING_TERMINATOR },
+  {
+    name: "device control string",
+    prefix: `${ESCAPE}Pqpayload${BELL}`,
+    terminator: STRING_TERMINATOR,
+  },
+  { name: "application command", prefix: `${ESCAPE}_payload`, terminator: STRING_TERMINATOR },
+  { name: "privacy message", prefix: `${ESCAPE}^payload`, terminator: STRING_TERMINATOR },
+  { name: "start of string", prefix: `${ESCAPE}Xpayload`, terminator: STRING_TERMINATOR },
+];
 const CACHED_INPUT_RGB = {
   blackTerminal: [30, 30, 30],
   darkTerminal: [47, 49, 50],
@@ -36,6 +49,18 @@ function rewriteFrames(frames: Uint8Array[]): string {
   const palette = new CodexTerminalPalette();
   const output = frames.flatMap((frame) => Array.from(palette.write(frame)));
   return decoder.decode(Uint8Array.from(output));
+}
+
+async function renderCell(text: string) {
+  const terminal = new Terminal({ allowProposedApi: true });
+  try {
+    await new Promise<void>((resolve) => {
+      terminal.write(encoder.encode(text), resolve);
+    });
+    return terminal.buffer.active.getLine(0)!.getCell(0)!;
+  } finally {
+    terminal.dispose();
+  }
 }
 
 describe("Codex input backgrounds", () => {
@@ -159,6 +184,37 @@ describe("ANSI color syntax", () => {
   });
 });
 
+describe.each([";", ":"])("out-of-range palette indices with %s separators", (separator) => {
+  it.each([
+    { index: 509, gray: 218 },
+    { index: 510, gray: 228 },
+    { index: 511, gray: 238 },
+    { index: 2147483647, gray: 238 },
+    { index: 2147483648, gray: 238 },
+    { index: 4294967293, gray: 238 },
+    { index: "99999999999999999999", gray: 238 },
+  ])("preserves foreground and underline colors for index $index", ({ index, gray }) => {
+    const foreground = [38, 5, index].join(separator);
+    const underline = [58, 5, index].join(separator);
+    expect(rewrite(sgr(foreground, underline))).toBe(
+      sgr(38, 2, gray, gray, gray, 58, 2, gray, gray, gray),
+    );
+  });
+
+  it.each([
+    { index: 256, expected: indexedBackground(0) },
+    { index: 264, expected: indexedBackground(255) },
+    { index: 490, expected: indexedBackground(253) },
+    { index: 492, expected: indexedBackground(255) },
+    { index: 509, expected: rgbBackground([218, 218, 218]) },
+    { index: 510, expected: indexedBackground(254) },
+    { index: 511, expected: indexedBackground(255) },
+    { index: 2147483648, expected: indexedBackground(255) },
+  ])("normalizes background index $index before mapping it", ({ index, expected }) => {
+    expect(rewrite(sgr([48, 5, index].join(separator)))).toBe(expected);
+  });
+});
+
 describe("streaming terminal output", () => {
   const splitFrameInput = encoder.encode(
     `hello λ🐈${sgr(1, 48, 2, ...CACHED_INPUT_RGB.lightTerminal)}世界` +
@@ -178,29 +234,25 @@ describe("streaming terminal output", () => {
     expect(rewriteFrames(frames)).toBe(splitFrameExpected);
   });
 
-  const colorInsidePayload = rgbBackground(CACHED_INPUT_RGB.lightTerminal);
-  it.each([
-    { name: "window title", payload: `${ESCAPE}]0;title${colorInsidePayload}${BELL}` },
-    {
-      name: "hyperlink",
-      payload: `${ESCAPE}]8;;https://example.com/${colorInsidePayload}${STRING_TERMINATOR}`,
+  it.each(CONTROL_STRINGS)(
+    "preserves printable $name payloads, including UTF-8 continuation bytes",
+    ({ prefix, terminator }) => {
+      const payload = `${prefix}śŜ[48;2;244;244;244m${terminator}`;
+      const input = encoder.encode(
+        `${payload}${rgbBackground(CACHED_INPUT_RGB.lightTerminal)}text`,
+      );
+      const frames = Array.from(input, (byte) => Uint8Array.of(byte));
+      expect(rewriteFrames(frames)).toBe(`${payload}${THEMED_INPUT_BACKGROUND}text`);
     },
-    {
-      name: "device control string containing a bell",
-      payload: `${ESCAPE}Ppayload${BELL}${colorInsidePayload}${STRING_TERMINATOR}`,
-    },
-    {
-      name: "application command",
-      payload: `${ESCAPE}_payload${colorInsidePayload}${STRING_TERMINATOR}`,
-    },
-    {
-      name: "privacy message",
-      payload: `${ESCAPE}^payload${colorInsidePayload}${STRING_TERMINATOR}`,
-    },
-  ])("does not interpret a $name payload as screen colors", ({ payload }) => {
-    const input = encoder.encode(`${payload}${colorInsidePayload}text`);
-    const frames = Array.from(input, (byte) => Uint8Array.of(byte));
-    expect(rewriteFrames(frames)).toBe(`${payload}${THEMED_INPUT_BACKGROUND}text`);
+  );
+
+  it.each(CONTROL_STRINGS)("recovers from an ESC-interrupted $name", ({ prefix }) => {
+    const input = encoder.encode(`${prefix}${rgbBackground(CACHED_INPUT_RGB.lightTerminal)}text`);
+    const expected = `${prefix}${THEMED_INPUT_BACKGROUND}text`;
+    for (let boundary = 0; boundary <= input.length; boundary++) {
+      expect(rewriteFrames([input.slice(0, boundary), input.slice(boundary)])).toBe(expected);
+    }
+    expect(rewriteFrames(Array.from(input, (byte) => Uint8Array.of(byte)))).toBe(expected);
   });
 
   it("flushes overlong sequences instead of buffering without a limit", () => {
@@ -222,6 +274,40 @@ describe("streaming terminal output", () => {
     const input = Uint8Array.of(0, 1, 7, 8, 9, 13, 127, 200, 255);
     expect(new CodexTerminalPalette().write(input)).toBe(input);
   });
+});
+
+describe("xterm compatibility", () => {
+  it.each(CONTROL_STRINGS)(
+    "recolors visible cells after an ESC-interrupted $name",
+    async ({ prefix }) => {
+      const input = `${prefix}${rgbBackground(CACHED_INPUT_RGB.lightTerminal)}X`;
+      const original = await renderCell(input);
+      const adapted = await renderCell(rewrite(input));
+      expect(original.getChars()).toBe("X");
+      expect(original.isBgRGB()).toBe(true);
+      expect(original.getBgColor()).toBe(0xf4f4f4);
+      expect(adapted.getChars()).toBe("X");
+      expect(adapted.isBgPalette()).toBe(true);
+      expect(adapted.getBgColor()).toBe(255);
+    },
+  );
+
+  it.each([
+    { index: 509, paletteIndex: 253, rgb: 0xdadada },
+    { index: 2147483648, paletteIndex: 255, rgb: 0xeeeeee },
+    { index: 4294967293, paletteIndex: 255, rgb: 0xeeeeee },
+  ])(
+    "matches xterm's clamping and wrapping of foreground index $index",
+    async ({ index, paletteIndex, rgb }) => {
+      const input = `${sgr(38, 5, index)}X`;
+      const original = await renderCell(input);
+      const adapted = await renderCell(rewrite(input));
+      expect(original.isFgPalette()).toBe(true);
+      expect(original.getFgColor()).toBe(paletteIndex);
+      expect(adapted.isFgRGB()).toBe(true);
+      expect(adapted.getFgColor()).toBe(rgb);
+    },
+  );
 });
 
 describe("terminal theme", () => {

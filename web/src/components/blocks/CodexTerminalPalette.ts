@@ -46,7 +46,6 @@ const BELL = 0x07;
 const CANCEL = 0x18;
 const SUBSTITUTE = 0x1a;
 const CONTROL_SEQUENCE_START = "[".charCodeAt(0);
-const STRING_TERMINATOR = "\\".charCodeAt(0);
 const SET_GRAPHICS_RENDITION = "m".charCodeAt(0);
 const CONTROL_STRING_START = {
   operatingSystemCommand: "]".charCodeAt(0),
@@ -60,6 +59,7 @@ const COLOR_ATTRIBUTE = { foreground: 38, background: 48, underline: 58 };
 const BRIGHT_BLACK_BACKGROUND = 100;
 const COLOR_MODE = { rgb: "2", indexed: "5" };
 const MAX_CONTROL_SEQUENCE_LENGTH = 128;
+const MAX_XTERM_PARAMETER = 0x7fffffff;
 const encoder = new TextEncoder();
 
 export function codexTerminalTheme(theme: ITheme, isDark: boolean): ITheme {
@@ -90,7 +90,8 @@ function rewriteRgbColor(attribute: number, components: string[]): string | null
   return `${attribute};${COLOR_MODE.rgb};${components.join(";")}`;
 }
 
-function rewriteIndexedColor(attribute: number, paletteIndex: number): string {
+function rewriteIndexedColor(attribute: number, rawPaletteIndex: number): string {
+  const paletteIndex = Math.min(rawPaletteIndex, MAX_XTERM_PARAMETER) & 0xff;
   if (attribute === COLOR_ATTRIBUTE.background) {
     const targetIndex = INDEXED_BACKGROUND_INDICES.get(paletteIndex);
     if (targetIndex !== undefined) return `${attribute};${COLOR_MODE.indexed};${targetIndex}`;
@@ -163,8 +164,7 @@ function isCanceled(byte: number): boolean {
   return byte === CANCEL || byte === SUBSTITUTE;
 }
 
-type ParserState =
-  "text" | "escape" | "control-sequence" | "control-string" | "control-string-escape";
+type ParserState = "text" | "escape" | "control-sequence" | "control-string";
 
 /** Give Codex's cached input backgrounds a palette slot that can change without a repaint. */
 export class CodexTerminalPalette {
@@ -223,16 +223,14 @@ export class CodexTerminalPalette {
           }
           break;
         case "control-string":
-        case "control-string-escape":
-          output.push(byte);
-          if (
-            (this.state === "control-string-escape" && byte === STRING_TERMINATOR) ||
-            (this.controlStringAllowsBell && byte === BELL) ||
-            isCanceled(byte)
-          ) {
-            this.state = "text";
+          if (byte === ESCAPE) {
+            this.pendingSequence = [byte];
+            this.state = "escape";
           } else {
-            this.state = byte === ESCAPE ? "control-string-escape" : "control-string";
+            output.push(byte);
+            if ((this.controlStringAllowsBell && byte === BELL) || isCanceled(byte)) {
+              this.state = "text";
+            }
           }
           break;
       }
