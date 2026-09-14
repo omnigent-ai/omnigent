@@ -115,10 +115,13 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    note that and carry on — it is not a reproduction failure. When `public` is
    absent or false (the default), skip this — do not call `sys_session_share`.
 2. **Confirm the workspace** (see above) and that you can reach the app and your
-   tooling with one `sys_os_shell` / tool check: the browser tools
-   (`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`)
-   for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
-   can read the report: `gh` is available for a GitHub issue, or a Linear key
+   tooling with one `sys_os_shell` / tool check: Playwright for headless web UI
+   journeys (including CI), and `sys_session_*` / HTTP for backend journeys.
+   The `browser_*` tools control the Omnigent desktop app's embedded browser;
+   their presence in your tool list does not mean a desktop is connected.
+   In headless CI, do not call them, including as a preflight probe. A missing
+   desktop renderer is expected and does not block the Playwright lane.
+   Confirm you can read the report: `gh` is available for a GitHub issue, or a Linear key
    (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
    (if it isn't, stop and report an infrastructure/configuration failure without
    emitting a verdict handoff; the workflow must retry it). Also note — without failing —
@@ -277,17 +280,30 @@ Drive the running app through the journey and **observe the failure yourself**.
 Do this for **each** sub-symptom you enumerated in Step 1 — reproduce them
 independently, because a compound bug can be partly fixed:
 
-- **UI bugs** — use the browser tools to navigate the app, click/type through the
-  reconstructed steps, and `browser_snapshot` the state that shows the failure
-  (e.g. a missing picker, a wrong value, an error toast). The browser tools drive
-  the desktop app's embedded browser, so a UI-journey reproduction expects a
-  desktop / embedded-browser context; if you have no browser pane to drive, say
-  so and fall back to the backend path. If no valid lane is available, report an
-  operational failure without a verdict handoff so the workflow retries; missing
-  browser/tool access is not `needs_more_info`.
+- **UI bugs** — in headless runs, including CI, script and execute the user
+  journey with Playwright using `tests/e2e_ui/` fixtures. Navigate the real SPA,
+  click/type through the reported steps, and capture the visible failure with
+  assertions and screenshots. Follow the environment-fidelity rules above when
+  choosing fixtures; a desktop-only failure is not confirmed by a web stand-in.
+  For a local session with a connected Omnigent desktop browser, you may instead
+  use `browser_navigate`, `browser_snapshot`, `browser_click`, and `browser_type`.
+  If a call reports `no browser renderer is connected`, stop calling that tool
+  family and use Playwright; retrying cannot attach a desktop. Missing desktop
+  access alone is not a reason to replace a UI journey with a backend probe or
+  report an infrastructure failure. If no valid lane can reach the reported
+  surface, name the blocker and follow the verdict and environment-fidelity
+  rules above.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
+
+**Inspect screenshots as images.** Do not use `browser_navigate` with a
+`file://` URL to inspect CI artifacts: it targets the desktop browser, not the
+CI filesystem. Use an available image-capable tool to view the saved screenshot.
+If none is available, preserve the image for review, use Playwright DOM/layout
+assertions for what they can establish, and state that visual inspection was
+unavailable. Image dimensions, file metadata, and successful screenshot capture
+alone do not establish that the UI looks correct.
 
 Reach for the real trigger, not the internal function it flows into. If the
 journey depends on a precondition your environment lacks (an online host for a
