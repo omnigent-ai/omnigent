@@ -21,7 +21,7 @@ function Handler({
     | "panel.action.closeFiles";
   run: () => "handled" | "notHandled";
 }) {
-  useRegisterAction(action, { run });
+  useRegisterAction(action, { run, acceptsKeybindings: true });
   return null;
 }
 

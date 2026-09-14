@@ -9,11 +9,11 @@
 //     Capped to a few recent sessions while the query is empty (see
 //     IDLE_SESSION_LIMIT) so Actions stays visible without scrolling; typing
 //     lifts the cap.
-//   • Actions — static app commands (new chat, navigate, toggle panels).
-//     Filtered client-side against the live query.
+//   • Actions — live palette-visible commands from the centralized action
+//     registry (new chat, navigate, toggle panels), filtered client-side.
 //
 // cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
-// sessions, and we filter the (tiny, static) action list ourselves so both
+// sessions, and we filter the small registered action list ourselves so both
 // groups react to the same input.
 
 import type React from "react";
@@ -22,14 +22,17 @@ import { useEffect, useMemo, useState } from "react";
 import {
   CalendarClockIcon,
   InboxIcon,
+  KeyboardIcon,
   type LucideIcon,
   PanelLeftIcon,
   PanelRightIcon,
+  SearchIcon,
   SettingsIcon,
   SquarePenIcon,
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
+import { usePaletteActions, type ActionIconName, type AvailablePaletteAction } from "@/actions";
 import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
@@ -49,21 +52,18 @@ export interface CommandPaletteProps {
   sessionsOnly?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Flip the left (Conversations) sidebar — owned by AppShell. */
-  onToggleLeftSidebar: () => void;
-  /** Flip the right (Workspace) sidebar — owned by AppShell. */
-  onToggleRightSidebar: () => void;
 }
 
-interface ActionCommand {
-  id: string;
-  label: string;
-  /** Mirrors the icon on the equivalent button elsewhere in the UI. */
-  icon: LucideIcon;
-  /** Extra terms the client-side filter matches against (beyond the label). */
-  keywords: string[];
-  run: () => void;
-}
+const ACTION_ICONS: Readonly<Record<ActionIconName, LucideIcon>> = {
+  CalendarClock: CalendarClockIcon,
+  Inbox: InboxIcon,
+  Keyboard: KeyboardIcon,
+  PanelLeft: PanelLeftIcon,
+  PanelRight: PanelRightIcon,
+  Search: SearchIcon,
+  Settings: SettingsIcon,
+  SquarePen: SquarePenIcon,
+};
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
 const SEARCH_DEBOUNCE_MS = 300;
@@ -102,14 +102,9 @@ const IDLE_SESSION_LIMIT = 5;
 const SESSION_SEARCH_PAGE_BATCH = 10;
 const SESSION_SEARCH_RESULT_LIMIT = 50;
 
-export function CommandPalette({
-  sessionsOnly = false,
-  open,
-  onOpenChange,
-  onToggleLeftSidebar,
-  onToggleRightSidebar,
-}: CommandPaletteProps) {
+export function CommandPalette({ sessionsOnly = false, open, onOpenChange }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const { actions, executeAction } = usePaletteActions(open);
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
@@ -131,61 +126,14 @@ export function CommandPalette({
 
   const close = (): void => onOpenChange(false);
 
-  const actions = useMemo<ActionCommand[]>(
-    () => [
-      {
-        id: "new-chat",
-        label: "New chat",
-        icon: SquarePenIcon,
-        keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
-      },
-      {
-        id: "go-inbox",
-        label: "Go to Inbox",
-        icon: InboxIcon,
-        keywords: ["notifications", "comments", "needs response"],
-        run: () => navigate("/inbox"),
-      },
-      {
-        id: "go-tasks",
-        label: "Go to Automations",
-        icon: CalendarClockIcon,
-        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
-        run: () => navigate("/tasks"),
-      },
-      {
-        id: "go-settings",
-        label: "Go to Settings",
-        icon: SettingsIcon,
-        keywords: ["preferences", "configuration", "account"],
-        run: () => navigate("/settings"),
-      },
-      {
-        id: "toggle-left-sidebar",
-        label: "Toggle conversations sidebar",
-        icon: PanelLeftIcon,
-        keywords: ["panel", "left", "sessions list"],
-        run: onToggleLeftSidebar,
-      },
-      {
-        id: "toggle-right-sidebar",
-        label: "Toggle workspace sidebar",
-        icon: PanelRightIcon,
-        keywords: ["panel", "right", "files", "terminal"],
-        run: onToggleRightSidebar,
-      },
-    ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
-  );
-
   const filteredActions = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (sessionsOnly) return [];
     if (q === "") return actions;
     return actions.filter(
       (a) =>
-        a.label.toLowerCase().includes(q) || a.keywords.some((k) => k.toLowerCase().includes(q)),
+        a.title.toLowerCase().includes(q) ||
+        (a.keywords ?? []).some((keyword) => keyword.toLowerCase().includes(q)),
     );
   }, [actions, query, sessionsOnly]);
 
@@ -257,9 +205,9 @@ export function CommandPalette({
     ? "Search sessions by name…"
     : "Search sessions or run a command";
 
-  const runAction = (action: ActionCommand): void => {
+  const runAction = (action: AvailablePaletteAction): void => {
     close();
-    action.run();
+    executeAction(action.id);
   };
 
   const goToSession = (id: string): void => {
@@ -410,11 +358,16 @@ export function CommandPalette({
             {filteredActions.length > 0 && (
               <CommandGroup heading="Actions">
                 {filteredActions.map((a) => {
-                  const Icon = a.icon;
+                  const Icon = a.icon ? ACTION_ICONS[a.icon] : SquarePenIcon;
                   return (
-                    <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
+                    <CommandItem
+                      key={a.id}
+                      value={`action:${a.id}`}
+                      disabled={!a.enabled}
+                      onSelect={() => runAction(a)}
+                    >
                       <Icon />
-                      <span className="flex-1 truncate text-left">{a.label}</span>
+                      <span className="flex-1 truncate text-left">{a.title}</span>
                     </CommandItem>
                   );
                 })}
