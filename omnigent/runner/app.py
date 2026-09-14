@@ -2689,13 +2689,18 @@ def _require_full_native_lock_coverage(
     to the user as a "malformed runner response (HTTP 500)". Asserting coverage
     at app construction catches a newly-added native harness that was not wired
     here immediately, rather than only when someone starts that harness.
-    """
-    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
-    missing = {agent.key for agent in NATIVE_CODING_AGENTS} - set(dispatch)
+    Scoped to the BUILT-IN native providers, not the merged registry: a
+    community-contributed native harness wires its own launcher and must not be
+    forced into this built-in dispatch (that would turn a localized per-launch
+    failure into the whole runner failing to construct).
+    """
+    from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
+
+    missing = {provider.key for provider in _BUILTIN_NATIVE_PROVIDERS} - set(dispatch)
     if missing:
         raise RuntimeError(
-            f"native terminal lock dispatch is missing harness(es): {sorted(missing)}"
+            f"native terminal lock dispatch is missing built-in harness(es): {sorted(missing)}"
         )
     return dispatch
 
