@@ -959,19 +959,26 @@ describe("harnessUnconfiguredOnHost", () => {
     );
   });
 
-  it("never warns when readiness is unknown", () => {
-    // Older host build: no map at all → unknown, never warn.
+  it("never warns when readiness is genuinely unknown", () => {
+    // Older host build: no map at all → readiness unknown, never warn (fail open).
     expect(harnessUnconfiguredOnHost("codex", hostWith(null))).toBe(false);
     expect(harnessUnconfiguredOnHost("codex", hostWith(undefined))).toBe(false);
-    // Harness missing from the map → unknown spelling, never warn.
-    expect(harnessUnconfiguredOnHost("some-future-harness", hostWith({ codex: false }))).toBe(
-      false,
-    );
+    // Empty map (reported nothing) also fails open.
+    expect(harnessUnconfiguredOnHost("codex", hostWith({}))).toBe(false);
     // No host selected (sandbox / nothing picked) → no warning.
     expect(harnessUnconfiguredOnHost("codex", undefined)).toBe(false);
     expect(harnessUnconfiguredOnHost("codex", null)).toBe(false);
     // Agent without a harness → nothing to warn about.
     expect(harnessUnconfiguredOnHost(null, hostWith({ codex: false }))).toBe(false);
+  });
+
+  it("warns for a harness missing from a host that reports other harnesses", () => {
+    // A host that reports a non-empty readiness map but omits this harness can't
+    // launch it (its runner has no catalog row) — treat it as unconfigured so
+    // "hide unconfigured" hides it, rather than failing open. Regression for a
+    // pre-jcode host that reports devin/grok but omits jcode, leaking jcode into
+    // the picker despite the toggle.
+    expect(harnessUnconfiguredOnHost("jcode", hostWith({ devin: false, grok: false }))).toBe(true);
   });
 });
 

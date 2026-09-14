@@ -78,6 +78,16 @@ export function harnessUnavailableReasonOnHost(
   if (typeof availability === "string") {
     return "unconfigured";
   }
+  // Missing key on a host that DOES report readiness (a non-empty map): the host
+  // can't launch this harness — its runner has no catalog row for it, e.g. a host
+  // predating a newly-added harness (jcode on a pre-jcode host, which reports
+  // devin/grok but omits jcode). Treat it as unconfigured so "hide unconfigured"
+  // hides it, instead of failing open and offering a harness the host can't run.
+  // An absent/empty map still fails open (the guard above, plus the size check),
+  // so a host that reports no readiness at all is never emptied out.
+  if (availability === undefined && Object.keys(host.configured_harnesses).length > 0) {
+    return "unconfigured";
+  }
   return null;
 }
 
