@@ -279,6 +279,58 @@ describe("useIdleNotifications turn-end transitions", () => {
   });
 });
 
+describe("useIdleNotifications cross-device read-state suppression", () => {
+  // The server redistributes the per-viewer read baseline
+  // (`viewer_last_seen`) to every client of the same user; a device that
+  // actively watches the session keeps raising it past `updated_at`. A
+  // turn-end whose finish the user already watched on another device must
+  // stay quiet here.
+  it("does NOT notify a turn end the user already watched on another device", async () => {
+    setConversations([{ ...conv("a", "running"), updated_at: 90 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    // The finish arrives with the read state already caught up (the watching
+    // device marked the session seen before this client's diff tick).
+    setConversations([{ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 100 }]);
+    rerender();
+    await settle();
+
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("cancels a pending turn-end when the read state catches up during the settle window", async () => {
+    setConversations([{ ...conv("a", "running"), updated_at: 90 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    // The finish is observed while the read state still lags — a cue is
+    // scheduled.
+    setConversations([{ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 50 }]);
+    rerender();
+    await act(async () => {
+      vi.advanceTimersByTime(SETTLE_MS / 2);
+    });
+
+    // Mid-window, the watching device's mark-seen lands on this client.
+    setConversations([{ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 100 }]);
+    rerender();
+    await settle();
+
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("DOES notify when the read state lags the finish (nobody watched it)", async () => {
+    setConversations([{ ...conv("a", "running"), updated_at: 90 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([{ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 50 }]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+    expect(showMock.mock.calls[0][0]).toMatchObject({ tag: "omnigent:session:a" });
+  });
+});
+
 describe("useIdleNotifications elicitation transitions", () => {
   it("notifies when pending_elicitations_count increases (0 -> 1)", () => {
     setConversations([conv("a", "running", 0)]);
