@@ -1131,6 +1131,23 @@ describe("subAgentComposerLabel", () => {
     expect(subAgentComposerLabel(mkSession({ title: "researcher:auth:v2" }))).toBe("auth:v2");
   });
 
+  it("shows the Codex nickname label instead of the thread-UUID title suffix", () => {
+    // A Codex /side child titles as "codex-native-ui-subagent:<uuid>"; the tray
+    // must show the friendly nickname, never the raw thread UUID.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "codex-native-ui-subagent:01a0a211-5fa2-7922-8b5b-503d8c3dc1a1",
+          subAgentName: "Codex",
+          labels: {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+          },
+        }),
+      ),
+    ).toBe("Side chat");
+  });
+
   it("strips the user-added 'ui:' sentinel before taking the suffix", () => {
     expect(subAgentComposerLabel(mkSession({ title: "ui:claude_code:my-task" }))).toBe("my-task");
   });

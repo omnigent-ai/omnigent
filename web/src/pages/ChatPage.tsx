@@ -95,6 +95,7 @@ import {
 } from "@/store/chatStore";
 import {
   claudeNativeSubagentLabel,
+  codexNativeSubagentLabel,
   isNativeTerminalSession,
   nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
@@ -2242,6 +2243,10 @@ export function subAgentComposerLabel(
   if (!session || session.parentSessionId == null) return null;
   const claudeLabel = claudeNativeSubagentLabel(session.labels, session.subAgentName);
   if (claudeLabel) return claudeLabel;
+  // Codex children (incl. /side forks) title as "codex-native-ui-subagent:<uuid>";
+  // show the friendly nickname label ("Side chat") instead of that UUID suffix.
+  const codexLabel = codexNativeSubagentLabel(session.labels);
+  if (codexLabel) return codexLabel;
   // Strip the user-added "ui:" sentinel so its "agent:name" suffix reads
   // like an LLM-spawned title.
   let title = session.title ?? null;

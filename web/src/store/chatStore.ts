@@ -6733,12 +6733,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // the router).
       useChatStore.setState((s) => {
         if (!event.childSessionId || s.awaitingSideChatFor !== event.conversationId) return {};
-        // Only follow the actual side-chat fork. A concurrent ordinary sub-agent
-        // under the same parent arrives as `isSideChat === false` — leave the
-        // latch armed for the real side chat rather than opening the wrong child.
-        // `undefined` (an older server that doesn't classify) falls back to the
-        // parent-id match so the happy path still works.
-        if (event.isSideChat === false) return {};
+        // Open on the user's explicit /side latch: they just asked for a side
+        // chat on THIS parent, so the child arriving under it is the one to
+        // reveal and follow. The server also classifies the child (`isSideChat`)
+        // to fend off a concurrent ordinary sub-agent, but that marker's
+        // end-to-end delivery is not yet verified live — gating the open on it
+        // stranded real side chats, so reliability wins here until it is.
         return {
           awaitingSideChatFor: null,
           redirectToConversationId: event.childSessionId,
