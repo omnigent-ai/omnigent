@@ -1823,6 +1823,36 @@ function newWindow() {
 }
 
 /**
+ * Dev-only: clear the DBAUTH cookie for the focused window's pinned origin and
+ * reload, so the workspace bounces to its login page — exactly what a real
+ * cookie expiry looks like. That trips the session-expiry seam, which silently
+ * re-mints from the stored token (refreshing it when OMNIGENT_DATABRICKS_OAUTH_
+ * FORCE_REFRESH=1). Lets the whole refresh path be exercised on demand instead
+ * of waiting for the cookie to expire. Gated to unpackaged builds (see menu).
+ */
+async function simulateSessionExpiry() {
+  const win = activeWindow();
+  const origin = win ? pinnedOrigin(win) : null;
+  if (!origin) return;
+  const ses = session.defaultSession;
+  const cookies = await ses.cookies.get({ url: origin, name: "DBAUTH" });
+  await Promise.all(
+    cookies.map((c) => {
+      const scheme = c.secure ? "https" : "http";
+      const host =
+        c.domain && c.domain.startsWith(".")
+          ? c.domain.slice(1)
+          : c.domain || new URL(origin).hostname;
+      return ses.cookies.remove(`${scheme}://${host}${c.path || "/"}`, c.name);
+    }),
+  );
+  console.log(
+    `[omnigent] dev: cleared ${cookies.length} DBAUTH cookie(s) for ${origin}; reloading to trigger re-mint`,
+  );
+  win.webContents.reload();
+}
+
+/**
  * Ask the user before handing a non-web URL to an OS protocol handler
  * (vscode://, ssh://, …). Mirrors the external-protocol prompt every browser
  * shows: the dialog displays the requesting page's origin and the FULL,
@@ -2205,6 +2235,14 @@ function buildMenu() {
           });
         }
       },
+    },
+    // Dev-only: exercise the session-expiry re-mint/refresh path on demand.
+    // Hidden (and provably absent) in packaged builds.
+    {
+      id: "simulate_session_expiry",
+      label: "Simulate Session Expiry (dev)",
+      visible: !app.isPackaged,
+      click: () => void simulateSessionExpiry(),
     },
     { type: "separator" },
     // `role: "close"` carries the standard CmdOrCtrl+W shortcut and closes
