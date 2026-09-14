@@ -16,7 +16,6 @@ const {
   runInteractiveLogin,
   getValidStoredToken,
   saveWorkspaceToken,
-  loadTokens,
   isTrustedDatabricksOrigin,
 } = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
@@ -27,17 +26,19 @@ const NETWORK_TIMEOUT_MS = 20_000;
 
 /**
  * Ensure ``ses`` holds a live DBAUTH cookie for a workspace, and return that
- * workspace origin. Two entry points:
+ * workspace origin. Two entry points with deliberately different behavior:
  *
- * - Connect (``interactive: true``): reuse a stored token for ``origin`` if
- *   there is one (a relaunch to a workspace origin, or an unexpired session);
- *   otherwise run the browser login. An account-scoped (SPOG) login lists the
- *   account's workspaces, calls ``pickWorkspace``, and bridges the account token
- *   to the chosen one — persisting it keyed by that workspace origin so the
- *   expiry path can find it.
- * - Session expiry (``interactive: false``): ``origin`` is the (already
- *   resolved) workspace origin, so the stored token is found and refreshed and
- *   the cookie re-minted against the SAME workspace — no browser, no picker.
+ * - Explicit connect/login (``interactive: true``): ALWAYS authenticate fresh —
+ *   never silently reuse a stored token. So a new window connecting to a SPOG
+ *   URL re-runs the account flow + picker (choosing the workspace for THIS
+ *   window) instead of dropping into another window's workspace. A workspace URL
+ *   re-authenticates directly (usually a silent browser SSO round-trip). The
+ *   result is persisted keyed by the resolved workspace origin.
+ * - Session expiry (``interactive: false``): reuse the stored token for this
+ *   (already-resolved) workspace, refreshing if needed, and re-mint the cookie
+ *   against the SAME workspace — no browser, no picker. This is the ONLY path
+ *   that reads the cache. (Relaunch stays seamless via the persisted DBAUTH
+ *   cookie and doesn't come through here.)
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin The entered/pinned origin (account or workspace host).
@@ -54,24 +55,12 @@ async function ensureDatabricksSession(
   let bridgeOrigin;
   let accessToken;
 
-  // 1. Reuse a stored token bound to this origin — covers the expiry path (origin
-  //    is the resolved workspace) and a relaunch straight to a workspace origin.
-  //    The stored token already targets this origin, so no picker is needed.
-  if (loadTokens(origin)) {
-    try {
-      accessToken = await getValidStoredToken(origin);
-      bridgeOrigin = origin;
-    } catch (e) {
-      if (!interactive) throw e;
-      console.warn(`[omnigent] databricks: stored token unusable, re-authenticating: ${e.message}`);
-    }
-  }
-
-  // 2. Nothing usable stored → interactive browser login (connect only).
-  if (!accessToken) {
-    if (!interactive) {
-      throw new Error("no valid Databricks token and interactive login is disabled");
-    }
+  if (!interactive) {
+    // Silent expiry re-mint: reuse the stored token for this resolved workspace.
+    accessToken = await getValidStoredToken(origin);
+    bridgeOrigin = origin;
+  } else {
+    // Explicit login: authenticate fresh, never reusing the cache.
     const { tokens, issuerOrigin } = await runInteractiveLogin(origin);
     const account = parseAccountFromToken(tokens.access_token);
     if (account) {
