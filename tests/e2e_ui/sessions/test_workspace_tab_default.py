@@ -6,6 +6,7 @@ import json
 import re
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _build_hello_world_bundle
@@ -40,8 +41,20 @@ def test_default_workspace_tab_setting_opens_session_on_chosen_tab(
     expect(rail.get_by_role("list")).to_be_visible()
 
 
+@pytest.mark.parametrize(
+    ("default_tab", "default_label", "tab_order"),
+    [
+        ("changes", "Changes", ["Changes", "Files", "GitHub", "Agents"]),
+        ("github", "GitHub", ["GitHub", "Files", "Changes", "Agents"]),
+        ("subagents", "Agents", ["Agents", "Files", "Changes", "GitHub"]),
+    ],
+)
 def test_changed_default_applies_to_visited_session_after_reload(
-    page: Page, seeded_session: tuple[str, str]
+    page: Page,
+    seeded_session: tuple[str, str],
+    default_tab: str,
+    default_label: str,
+    tab_order: list[str],
 ) -> None:
     """A changed default replaces an old selection; later manual choices still persist."""
     base_url, session_id = seeded_session
@@ -56,23 +69,28 @@ def test_changed_default_applies_to_visited_session_after_reload(
     expect(options).to_have_count(4)
     for index, label in enumerate(["Files", "Changes", "GitHub", "Agents"]):
         expect(options.nth(index)).to_have_accessible_name(label)
-    github_default = page.get_by_test_id("workspace-tab-default-github")
-    github_default.click()
+    preference = page.get_by_test_id(f"workspace-tab-default-{default_tab}")
+    preference.click()
     page.reload()
-    expect(github_default).to_have_attribute("aria-checked", "true", timeout=30_000)
+    expect(preference).to_have_attribute("aria-checked", "true", timeout=30_000)
 
     page.goto(f"{base_url}/c/{session_id}")
-    github_tab = rail.get_by_role("tab", name="GitHub", exact=True)
-    expect(github_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+    chosen_tab = rail.get_by_role("tab", name=re.compile(f"^{default_label}"))
+    expect(chosen_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
     page.reload()
-    expect(github_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+    expect(chosen_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+    nav_tabs = rail.locator(".workspace-tab-strip").get_by_role("tab")
+    expect(nav_tabs).to_have_count(4)
+    for index, label in enumerate(tab_order):
+        expect(nav_tabs.nth(index)).to_have_accessible_name(re.compile(f"^{label}"))
 
     files_tab.click()
     page.reload()
     expect(files_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
-    github_tab.click()
+    expect(nav_tabs.first).to_have_accessible_name(re.compile(f"^{default_label}"))
+    chosen_tab.click()
     page.reload()
-    expect(github_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+    expect(chosen_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
 
 
 def test_agents_tab_survives_return_to_unvisited_root(

@@ -559,7 +559,7 @@ function WorkspaceTabDefaultControl() {
     <ThemeSubsection
       labelId={labelId}
       title="Default Workspace tab"
-      helper="Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+      helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
     >
       <CardRadioGroup<DefaultWorkspaceTab>
         labelledBy={labelId}
