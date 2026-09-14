@@ -58,6 +58,7 @@ import ipaddress
 import json
 import logging
 import os
+import secrets
 import struct
 import subprocess
 from collections.abc import AsyncIterator, Iterable
@@ -98,6 +99,22 @@ _LOOPBACK = "127.0.0.1"
 # Hostnames that are unconditionally loopback. Any other host is checked
 # numerically via :func:`ipaddress.ip_address` in :func:`_assert_loopback_url`.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+# agy >= 1.2 guards its connect-RPC endpoint with a CSRF check: an unauthenticated
+# call is rejected with HTTP 401 ``{"code":"unauthenticated","message":"missing CSRF
+# token"}``, and a wrong value with ``"invalid CSRF token"``. agy mints its own token
+# per launch and publishes it nowhere on disk (it reaches sidecars only through the
+# ``ANTIGRAVITY_CSRF_TOKEN`` env var it injects into children), so a client cannot
+# read it back. It does, however, accept a caller-supplied token via the hidden
+# ``--csrf_token`` flag — the same way Omnigent already pins ``--gemini_dir``.
+#
+# Omnigent therefore mints the token itself: one per Omnigent process, passed to
+# every agy it launches and sent on every RPC. A single process-wide value is
+# deliberate — all those agy instances belong to the same user, and the token
+# defends against a *browser* reaching the loopback port, not against other
+# sessions of the same user.
+_CSRF_HEADER = "x-codeium-csrf-token"
+_CSRF_TOKEN: str | None = None
 
 # Timeout for the liveness/validation probes used during discovery (Heartbeat +
 # GetConversationMetadata), kept tight so scanning several candidate ports stays
@@ -211,6 +228,35 @@ _HTTP_TRANSPORT: httpx.BaseTransport | None = None
 _ASYNC_HTTP_TRANSPORT: httpx.AsyncBaseTransport | None = None
 
 
+def agy_csrf_token() -> str:
+    """Return this process's agy CSRF token, minting it on first use.
+
+    The value is passed to every agy launched by this process via the hidden
+    ``--csrf_token`` flag (see :func:`omnigent.harnesses.antigravity_native.launch.
+    csrf_token_args`) and sent on every connect-RPC call as
+    :data:`_CSRF_HEADER`. agy rejects a call with no token (``missing CSRF
+    token``) or a mismatched one (``invalid CSRF token``), so the two must come
+    from here.
+
+    :returns: A 64-character hex token, stable for the life of the process.
+    """
+    global _CSRF_TOKEN
+    if _CSRF_TOKEN is None:
+        _CSRF_TOKEN = secrets.token_hex(32)
+    return _CSRF_TOKEN
+
+
+def csrf_headers() -> dict[str, str]:
+    """Return the CSRF header every agy connect-RPC request must carry.
+
+    Applied as a default header on both client factories so all call sites are
+    covered without threading the token through ~10 port-taking helpers.
+
+    :returns: A single-entry header mapping.
+    """
+    return {_CSRF_HEADER: agy_csrf_token()}
+
+
 def _sync_client(timeout: float) -> httpx.Client:
     """
     Build a sync httpx client for a connect-RPC probe.
@@ -224,7 +270,12 @@ def _sync_client(timeout: float) -> httpx.Client:
     :returns: An ``httpx.Client`` with cert verification disabled (loopback,
         self-signed) and the test transport when one is installed.
     """
-    return httpx.Client(verify=False, timeout=timeout, transport=_HTTP_TRANSPORT)
+    return httpx.Client(
+        verify=False,
+        timeout=timeout,
+        transport=_HTTP_TRANSPORT,
+        headers=csrf_headers(),
+    )
 
 
 def _async_client(timeout: httpx.Timeout | float) -> httpx.AsyncClient:
@@ -245,7 +296,12 @@ def _async_client(timeout: httpx.Timeout | float) -> httpx.AsyncClient:
     :returns: An ``httpx.AsyncClient`` with cert verification disabled
         (loopback, self-signed) and the test transport when one is installed.
     """
-    return httpx.AsyncClient(verify=False, timeout=timeout, transport=_ASYNC_HTTP_TRANSPORT)
+    return httpx.AsyncClient(
+        verify=False,
+        timeout=timeout,
+        transport=_ASYNC_HTTP_TRANSPORT,
+        headers=csrf_headers(),
+    )
 
 
 def _run_lsof_listen_ports(pid: int) -> str:

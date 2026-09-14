@@ -38,8 +38,11 @@ Key design points:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
@@ -57,6 +60,17 @@ _logger = logging.getLogger(__name__)
 _SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 # Omnigent permission mode that maps to agy's all-or-nothing bypass.
 _BYPASS_PERMISSION_MODE = "bypassPermissions"
+
+# agy's hidden CSRF flag, and the first version that defines it. agy >= 1.2
+# guards its connect-RPC endpoint with a CSRF check and mints a token that is
+# never written to disk, so Omnigent supplies its own here and sends the match
+# on every RPC (see :func:`omnigent.harnesses.antigravity_native.rpc.agy_csrf_token`).
+#
+# This MUST stay version-gated: agy aborts on an undefined flag ("flags provided
+# but not defined: -csrf_token") rather than ignoring it, so passing this to an
+# older agy would break the launch outright instead of degrading.
+_CSRF_TOKEN_FLAG = "--csrf_token"
+_CSRF_MIN_VERSION = (1, 2)
 # Fallback binary path when ``agy`` is not on PATH.
 _AGY_FALLBACK_PATH = Path.home() / ".local" / "bin" / "agy"
 # Install instructions surfaced in the RuntimeError when agy is missing.
@@ -189,6 +203,63 @@ def should_skip_permissions(
     if permission_mode == _BYPASS_PERMISSION_MODE:
         return True
     return headless
+
+
+@lru_cache(maxsize=4)
+def _agy_version(binary: str) -> tuple[int, ...] | None:
+    """Return *binary*'s version as a numeric tuple, or ``None`` if unreadable.
+
+    Cached per binary path: this shells out, and every agy launch consults it.
+
+    :param binary: Absolute path to the agy executable about to be launched.
+    :returns: e.g. ``(1, 2, 2)`` for agy 1.2.2, or ``None`` when the binary is
+        missing, times out, or prints something unparseable.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603  (fixed argv, no shell)
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", f"{proc.stdout}\n{proc.stderr}")
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups() if part is not None)
+
+
+def csrf_token_args(binary: str | None = None) -> list[str]:
+    """Return the ``--csrf_token`` argv fragment for this agy, or ``[]``.
+
+    agy >= 1.2 rejects every connect-RPC call that carries no CSRF token, which
+    leaves Omnigent's reader unable to bind and silently strands web-side
+    approvals in the TUI. agy never persists the token it mints, but it accepts
+    one from this hidden flag, so Omnigent supplies its own and sends the match
+    on each request.
+
+    Returns an empty list — and logs at debug — when agy predates the flag or
+    its version cannot be read, because agy **aborts** on an undefined flag
+    rather than ignoring it. Degrading to no flag keeps older agy working
+    exactly as before (it has no CSRF gate to satisfy).
+
+    :param binary: agy path; defaults to :func:`agy_binary_path`.
+    :returns: ``["--csrf_token", "<token>"]`` or ``[]``.
+    """
+    from omnigent.harnesses.antigravity_native.rpc import agy_csrf_token
+
+    resolved = binary or agy_binary_path()
+    version = _agy_version(str(resolved))
+    if version is None or version < _CSRF_MIN_VERSION:
+        _logger.debug(
+            "agy CSRF flag skipped: version=%s (needs >= %s)",
+            version,
+            ".".join(str(part) for part in _CSRF_MIN_VERSION),
+        )
+        return []
+    return [_CSRF_TOKEN_FLAG, agy_csrf_token()]
 
 
 def build_agy_launch(

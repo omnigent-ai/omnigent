@@ -369,3 +369,36 @@ class TestShouldSkipPermissions:
     def test_none_mode_headless_true(self) -> None:
         """``None`` mode + headless skips (headless wins regardless of mode)."""
         assert should_skip_permissions(permission_mode=None, headless=True) is True
+
+
+# ---------------------------------------------------------------------------
+# csrf_token_args (agy >= 1.2 gate)
+# ---------------------------------------------------------------------------
+
+
+def test_csrf_token_args_passes_flag_on_supported_agy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """agy >= 1.2 gets ``--csrf_token`` with this process's token."""
+    import omnigent.harnesses.antigravity_native.rpc as _rpc
+
+    monkeypatch.setattr(_mod, "_agy_version", lambda _binary: (1, 2, 2))
+    monkeypatch.setattr(_rpc, "_CSRF_TOKEN", "deadbeef")
+    assert _mod.csrf_token_args("/usr/local/bin/agy") == ["--csrf_token", "deadbeef"]
+
+
+def test_csrf_token_args_empty_on_older_agy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    agy < 1.2 gets no flag at all.
+
+    This is the backward-compatibility guard that matters: agy **aborts** on an
+    undefined flag ("flags provided but not defined: -csrf_token") rather than
+    ignoring it, so passing it to an older agy would break the launch outright.
+    Older agy also has no CSRF gate, so it needs nothing.
+    """
+    monkeypatch.setattr(_mod, "_agy_version", lambda _binary: (1, 1, 13))
+    assert _mod.csrf_token_args("/usr/local/bin/agy") == []
+
+
+def test_csrf_token_args_empty_when_version_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable ``--version`` degrades to no flag rather than risking an abort."""
+    monkeypatch.setattr(_mod, "_agy_version", lambda _binary: None)
+    assert _mod.csrf_token_args("/usr/local/bin/agy") == []

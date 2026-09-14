@@ -112,6 +112,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 from omnigent.harnesses.antigravity_native.launch import (
     agy_binary_path,
     build_agy_launch,
+    csrf_token_args,
     resolve_native_antigravity_launch,
 )
 from omnigent.harnesses.antigravity_native.reader import run_reader_with_bridge
@@ -1017,8 +1018,14 @@ async def _launch_and_record(
     # is up would be silently lost (#1494). Disable it in the isolated dir agy reads
     # under --gemini_dir, never the user's real ~/.gemini.
     await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
-    # Lead the args so the flag is never swallowed by a later positional.
-    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    # Lead the args so the flags are never swallowed by a later positional.
+    # ``csrf_token_args`` is empty on agy < 1.2, which has no CSRF gate.
+    argv = [
+        argv[0],
+        f"--gemini_dir={agy_gemini_dir(bridge_dir)}",
+        *csrf_token_args(argv[0]),
+        *argv[1:],
+    ]
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(
         client,

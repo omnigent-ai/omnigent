@@ -2219,3 +2219,43 @@ def test_pid_listen_ports_empty_when_neither_source_attributes(
     monkeypatch.setattr(rpc.psutil, "Process", _Proc)
     monkeypatch.setattr(rpc, "_run_lsof_listen_ports", lambda _pid: "")
     assert rpc._pid_listen_ports(72753) == []
+
+
+# ---------------------------------------------------------------------------
+# CSRF token (agy >= 1.2 connect-RPC gate)
+# ---------------------------------------------------------------------------
+
+
+def test_csrf_header_sent_on_every_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Every connect-RPC request carries ``x-codeium-csrf-token``.
+
+    agy >= 1.2 rejects a token-less call with HTTP 401 ``missing CSRF token``,
+    which strands the reader and leaves web-side approvals invisible. The header
+    is set as a client default so all call sites are covered; this pins that it
+    actually reaches the wire.
+    """
+    monkeypatch.setattr(rpc, "_CSRF_TOKEN", "deadbeef")
+    seen: dict[str, object] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen["csrf"] = request.headers.get("x-codeium-csrf-token")
+        return httpx.Response(200, json={"lastExtensionHeartbeat": "2026-06-15T00:00:00Z"})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(_handler))
+    assert rpc._heartbeat_ok(52548) is True
+    assert seen["csrf"] == "deadbeef"
+
+
+def test_agy_csrf_token_is_stable_and_nonempty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The token is minted once per process and reused.
+
+    The value handed to agy via ``--csrf_token`` and the value sent on each
+    request must match, so a second call must not mint a fresh token.
+    """
+    monkeypatch.setattr(rpc, "_CSRF_TOKEN", None)
+    first = rpc.agy_csrf_token()
+    assert first
+    assert rpc.agy_csrf_token() == first
+    assert rpc.csrf_headers() == {"x-codeium-csrf-token": first}
