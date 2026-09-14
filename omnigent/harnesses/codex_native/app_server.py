@@ -3035,10 +3035,8 @@ def resolve_native_codex_launch(
        legacy ``executor.profile`` / ``executor.config.profile`` — resolved
        through :func:`~omnigent.runtime.workflow._resolve_provider_for_build`
        itself, the same resolver the in-process harness uses, so a spec that
-       routes in-process routes natively too (a spec ``ApiKeyAuth`` resolves
-       to ``None`` for every harness — the resolver leaves bare keys to the
-       claude-sdk / openai-agents builders — so codex-native falls through
-       exactly as in-process codex does);
+       routes in-process routes natively too. A spec ``ApiKeyAuth`` routes
+       through a synthesized key provider with its declared endpoint;
 
     1. an explicit per-family default provider →
        - ``key`` / ``gateway`` / ``local`` → provider ``-c`` overrides
@@ -3049,7 +3047,8 @@ def resolve_native_codex_launch(
          ``auth.json``) fall through to the first other configured provider
          that can route, so a real credential is not shadowed by a dead
          subscription default;
-    2. else a global Databricks ``auth:`` block → ucode;
+    2. else a global ``auth:`` block → ucode for Databricks, or provider
+       overrides for an inline API key;
     3. else an ambient-detected provider (first run without configure);
     4. else the codex CLI's own login.
 
@@ -3075,7 +3074,11 @@ def resolve_native_codex_launch(
         default_provider_for_harness,
         load_config,
     )
-    from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
+    from omnigent.runtime.workflow import (
+        _load_global_auth,
+        _resolve_provider_for_build,
+        _synthesize_codex_api_key_provider,
+    )
     from omnigent.spec.types import DatabricksAuth
 
     explicit = load_config()
@@ -3095,17 +3098,8 @@ def resolve_native_codex_launch(
         or spec.executor.profile
         or spec.executor.config.get("profile")
     ):
-        # Spec-level credential (issue #2744): resolve it through the same
-        # resolver the in-process codex harness uses, so switching a working
-        # spec from ``harness: codex`` to ``codex-native`` keeps its auth
-        # working. A named provider that is undeclared raises loud here
-        # instead of parking the TUI on the sign-in screen for a 30s timeout.
-        # A spec ``ApiKeyAuth`` resolves to ``None`` for every harness (the
-        # shared resolver leaves bare keys to the claude-sdk / openai-agents
-        # builders; the in-process codex builder has no ApiKeyAuth branch
-        # either), so codex-native falls through to the machine-level chain
-        # below exactly as in-process codex does — as does a spec credential
-        # that cannot route openai.
+        # Share credential resolution with the in-process harness so spec
+        # auth, including inline keys, takes precedence over machine defaults.
         spec_entry = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
         if spec_entry is not None:
             if spec_entry.kind == SUBSCRIPTION_KIND:
@@ -3164,14 +3158,9 @@ def resolve_native_codex_launch(
                 summary=f"Databricks ucode profile {global_auth.profile!r} (global auth block)",
             )
         if global_auth is not None:
-            return NativeCodexLaunch(
-                config_overrides=[],
-                model=model,
-                profile=None,
-                summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
-                login_required=not _codex_login_usable(),
-            )
-        entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
+            entry = _synthesize_codex_api_key_provider(global_auth)
+        else:
+            entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
     if (
         entry is None

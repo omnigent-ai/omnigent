@@ -49,6 +49,7 @@ from omnigent.onboarding.provider_config import (
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
+    KEY_KIND,
     OPENAI_FAMILY,
     RESPONSES_WIRE_API,
     SUBSCRIPTION_KIND,
@@ -1003,6 +1004,25 @@ def _legacy_databricks_provider(
     return None
 
 
+def _synthesize_codex_api_key_provider(auth: ApiKeyAuth) -> ProviderEntry:
+    """Route a resolved inline key through Codex's provider transport.
+
+    :param auth: Spec or global API-key authentication, including its endpoint.
+    :returns: An in-memory OpenAI-compatible provider; never persisted.
+    """
+    return ProviderEntry(
+        name="api_key",
+        kind=KEY_KIND,
+        families={
+            OPENAI_FAMILY: FamilyConfig(
+                base_url=auth.base_url or "https://api.openai.com/v1",
+                api_key=auth.api_key,
+                wire_api=RESPONSES_WIRE_API,
+            )
+        },
+    )
+
+
 def _resolve_provider_for_build(
     spec: AgentSpec,
     *,
@@ -1025,8 +1045,9 @@ def _resolve_provider_for_build(
        (no per-builder ``else``). Folded only ``for_launch`` of a gateway-flag
        harness; elsewhere it returns ``None`` so the readout / native /
        openai-agents paths keep their own handling.
-    3. An :class:`ApiKeyAuth` (spec or global) → ``None`` (the claude-sdk /
-       openai-agents builders thread the key themselves).
+    3. An :class:`ApiKeyAuth` (spec or global) → a synthesized key provider
+       for a Codex launch; otherwise ``None`` (the claude-sdk / openai-agents
+       builders thread the key themselves).
     4. The per-family global default (``providers: … default: true``), then an
        ambient-detected default.
     5. (``for_launch`` only) the first credential that can serve the family even
@@ -1068,6 +1089,8 @@ def _resolve_provider_for_build(
             auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if auth is not None:
+        if isinstance(auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+            return _synthesize_codex_api_key_provider(auth)
         # ApiKeyAuth — threaded by the claude-sdk / openai-agents builders.
         return None
     legacy_profile = spec.executor.profile or spec.executor.config.get("profile")
@@ -1090,6 +1113,8 @@ def _resolve_provider_for_build(
             global_auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if global_auth is not None:
+        if isinstance(global_auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+            return _synthesize_codex_api_key_provider(global_auth)
         # Global ApiKeyAuth — threaded by the builder's global-auth branch.
         return None
     model = _resolve_spec_model(spec)
