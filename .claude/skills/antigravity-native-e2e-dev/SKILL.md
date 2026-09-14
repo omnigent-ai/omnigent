@@ -1,6 +1,6 @@
 ---
 name: antigravity-native-e2e-dev
-description: Spin up a live local Omnigent server + runner and exercise the native Antigravity (agy) TUI harness (antigravity-native) end-to-end — launch the real `agy` CLI via `omnigent antigravity`, drive turns through the web UI, smoke-test, and bug-bash. Load when developing, testing, or debugging the antigravity-native harness (omnigent/inner/antigravity_native_executor.py, omnigent/antigravity_native.py, antigravity_native_bridge.py, antigravity_native_rpc.py, antigravity_native_reader.py, antigravity_native_launch.py) or its agy launch / RPC mirror / tmux delivery / OAuth / MCP-relay behavior. NOT the in-process `antigravity` Gemini SDK harness.
+description: Spin up a live local Omnigent server + runner and exercise the native Antigravity (agy) TUI harness (antigravity-native) end-to-end — launch the real `agy` CLI via `omnigent antigravity`, drive turns through the web UI, smoke-test, and bug-bash. Load when developing, testing, or debugging the antigravity-native harness (omnigent/inner/antigravity_native_executor.py, omnigent/harnesses/antigravity_native/main.py, omnigent/harnesses/antigravity_native/) or its agy launch / RPC mirror / tmux delivery / OAuth / MCP-relay behavior. NOT the in-process `antigravity` Gemini SDK harness.
 ---
 
 # Antigravity native harness: end-to-end dev & testing (local server/runner)
@@ -10,8 +10,9 @@ The `antigravity-native` harness wraps the **real Antigravity `agy` TUI** (the
 antigravity` ensures a host daemon, the daemon-spawned **runner** launches `agy`
 in a runner-owned **tmux** terminal, and your TTY attaches to it. This is **not**
 the in-process `antigravity` Gemini-SDK harness — that one runs `google-antigravity`
-with a Gemini *API key*; this one drives the OAuth-only `agy` CLI and mirrors it
-over **connect-RPC**. This skill is the proven recipe for running it **for real
+with a Gemini *API key*; this one drives the native `agy` CLI and mirrors it
+as described by the [native compatibility contract](../../../docs/antigravity-native-rpc-core-design.md#current-reply-compatibility-contract).
+This skill is the proven recipe for running it **for real
 against a live local server + runner** — not just the unit tests.
 
 > Like the other native harnesses, the runner imports from your **current
@@ -31,23 +32,43 @@ your TTY ── (attach / pexpect) ──► omnigent antigravity (CLI, local)
                                         │                              │
                                         ├── write path: type web turns into the TUI
                                         │   (tmux bracketed paste → real USER_INPUT step)
-                                        └── read path: RPC read driver mirrors agy's
-                                            trajectory steps back into the session
+                                        └── read path: native reader mirrors output
+                                            back into the session
 ```
 
-Three transports, easy to confuse:
+For transport selection, transcript ownership, and Stop completion, see the
+[current compatibility contract](../../../docs/antigravity-native-rpc-core-design.md#current-reply-compatibility-contract).
+The [executor](../../../omnigent/inner/antigravity_native_executor.py) owns
+web/mobile delivery into the attended TUI.
 
-1. **Write path = typing into the TUI.** Every web/mobile turn is *typed* into the
-   agy pane via tmux (`inject_user_message_via_tui`), creating a real
-   `CORTEX_STEP_TYPE_USER_INPUT` step on the **same** cascade the TUI shows
-   (#1156/#1158). It is **not** delivered over `SendUserCascadeMessage` (that
-   headless RPC path was retired; the `antigravity_native.py` module header still
-   says "delivered via the RPC" — that's stale doc-lag, the executor is authoritative).
-2. **Read path = RPC.** `antigravity_native_reader` polls/streams agy's connect-RPC
-   trajectory steps and mirrors them into the Omnigent session.
-3. **Control = RPC.** Interrupt is `CancelCascadeSteps`; a tool/permission prompt
-   is answered via `HandleCascadeUserInteraction` (surfaced as an Omnigent
-   elicitation).
+## Reply compatibility checks
+
+Use a disposable workspace and a separate local server/host for these tests.
+Set `OMNIGENT_CONFIG_HOME` and `OMNIGENT_DATA_DIR` to disposable directories,
+`OMNIGENT_ADMIN_CREDENTIALS_PATH` inside that data directory, and
+`OMNIGENT_DISABLE_KEYRING=1` for Omnigent processes. The native CLI keeps its
+existing vendor-managed sign-in. Do not inspect credentials or change Keychain
+permissions to run tests. Automated fixtures should stub native CLI discovery,
+authentication seeding, and subprocesses instead of touching the user's login.
+
+Test the fallback separately from successful RPC mirroring:
+
+- Send two turns, reload Chat, and check each prompt/reply appears once in order.
+- Include literal `</USER_REQUEST>`, Unicode, and multiple lines in a prompt;
+  verify the complete original user text survives mirroring.
+- Send another message while generation is active. Check both inputs and the
+  final reply arrive and the session becomes idle after the native turn ends.
+- Interrupt an active generation, then send a new turn and verify it succeeds.
+- Exercise a failed turn and ensure Chat exposes an error rather than an empty
+  response. Use deterministic fixtures for failures that cannot be provoked
+  safely through the vendor CLI.
+- Resume a session and ensure previous messages are not replayed as new output.
+- Inject delayed transcript writes and failed HTTP delivery in unit tests; turn
+  completion must follow successful forwarding of the relevant records.
+
+When testing a new CLI version, verify the native ordering and direct Stop hook
+schema required by the compatibility contract above. Capture a Chat screenshot
+for review outside the repository. Keep live evidence separate from mocked tests.
 
 ## Prerequisites (check these first)
 
@@ -142,8 +163,7 @@ curl -s -X POST "$SERVER/v1/sessions/$CONV/events" \
   -d '{"type":"message","data":{"role":"user","content":[{"type":"input_text","text":"Reply with exactly the single word: PONG"}]}}'
 ```
 
-Then **observe** the mirrored transcript (the RPC read driver posts agy's steps
-back):
+Then **observe** the mirrored transcript:
 
 ```bash
 sleep 25
@@ -152,14 +172,15 @@ curl -s "$SERVER/v1/sessions/$CONV/items" | python -m json.tool | tail -40
 
 A healthy run shows your `user` message **and** a non-empty `assistant` reply
 (`PONG`) mirrored into the session — proving the full stack: server → runner →
-executor → tmux paste → agy turn → connect-RPC read driver → transcript mirror.
+executor → tmux paste → agy turn → native reader → transcript mirror.
+Check the active read transport separately.
 You'll also see the prompt + reply render in the attached agy TUI (parity is the
 whole point of the TUI-typing write path).
 
 - **Type-driven smoke:** instead of the POST, type a prompt directly in the
   attached agy TUI and confirm it answers + mirrors to `…/items`.
 - **Model:** select a model with agy's TUI `/model`; the next web turn echoes that
-  choice (the executor reads it from the latest `USER_INPUT` step).
+  choice in the native TUI.
 
 ## Inspect the bridge (debugging)
 
@@ -167,7 +188,7 @@ Per-session bridge state lives under a hashed dir (keyed by *bridge id*, which
 defaults to the Omnigent conversation id):
 
 ```bash
-.venv/bin/python -c "from omnigent.antigravity_native_bridge import bridge_dir_for_bridge_id as d; print(d('$CONV'))"
+.venv/bin/python -c "from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id as d; print(d('$CONV'))"
 # ~/.omnigent/antigravity-native/<sha256(bridge_id)[:32]>/
 #   state.json     <- {session_id, conversation_id (agy's real UUID once minted), active_turn_id}
 #   tmux.json      <- {socket_path, tmux_target} the executor types into (send-keys)
@@ -194,8 +215,8 @@ Key facts:
 | Web→TUI delivery | POST a message (Step 3); confirm it renders in the agy TUI AND mirrors to `…/items` |
 | Native tools (shell/edit/read) | prompt agy to create→read→edit a file + run a command; confirm it touches disk |
 | Omnigent MCP relay (`sys_*`) | in the agy TUI run `/mcp` → expect `✓ omnigent`; prompt agy to `sys_session_list` / spawn a sub-agent |
-| Permission elicitation | with a tool that needs approval, agy's `request-review` surfaces as an **Omnigent elicitation** (interaction bridge); answer it in the web UI and confirm the tool runs |
-| Interrupt | mid-turn, hit stop in the UI → `CancelCascadeSteps` (RUNNING cascades only; a step WAITING on an interaction is unblocked by a DENY, not cancel) |
+| Permission elicitation | With RPC, answer a tool approval in the web UI; in fallback, follow the chat notice and answer in Terminal. Confirm the tool runs. |
+| Interrupt | Mid-turn, hit Stop in the UI; confirm native generation stops, then send another turn and confirm it succeeds. Exercise RPC and fallback separately. |
 | Model echo | `/model` in the TUI, then a web turn — confirm the new model is used (latest `USER_INPUT` step's `planModel`) |
 | Resume | stop, `omnigent antigravity --server "$SERVER" --resume "$CONV"`; `--resume` (no value) opens the antigravity-native picker |
 | Concurrency / leaks | drive several sessions; sweep for orphaned `agy` / tmux after teardown |
@@ -209,13 +230,13 @@ Key facts:
    `--server "$SERVER"` (or `--server ""` for local). If a *local* server rejects
    `antigravity-native`, it's stale — restart it from your checkout
    (allowlist: `omnigent/spec/_omnigent_compat.py`).
-3. **OAuth-only.** agy ignores `GEMINI_API_KEY`; if `agy models` says "sign in",
-   no web turn will get a real answer. Run bare `agy` once first.
+3. **Authentication.** Follow the [README](../../../README.md) for native
+   authentication precedence; do not inspect credentials to debug replies.
 4. **tmux must be reachable from the CLI process** for the direct attach; the
    executor's send-keys run on the runner side against the advertised socket.
-5. **Isolated HOME.** Don't expect your real `~/.gemini` to change — agy runs
-   under `<bridge_dir>/agy-home`. Look there (and `~/.gemini/antigravity-cli` for
-   agy's own conversation store) when debugging.
+5. **Isolated Gemini state.** The bridge supplies `--gemini_dir` under
+   `<bridge_dir>/agy-home/.gemini`; transcript discovery is confined there.
+   The real `HOME` remains available to the native CLI for its existing login.
 6. **Don't double-launch agy** for a session — the runner owns the terminal (see
    Step 2). 
 7. **Turns take ~20–120s** — wrap scripted waits/`timeout` generously.
@@ -225,17 +246,16 @@ Key facts:
 
 - **Executor (write path — types into the TUI):** `omnigent/inner/antigravity_native_executor.py`
 - **Harness wrap (`harness: antigravity-native`):** `omnigent/inner/antigravity_native_harness.py`
-- **CLI launch / daemon-runner / tmux attach:** `omnigent/antigravity_native.py`
+- **CLI launch / daemon-runner / tmux attach:** `omnigent/harnesses/antigravity_native/main.py`
   (`run_antigravity_native`); CLI command `antigravity(...)` in `omnigent/cli.py`
-- **agy argv / auth-mode / permission flag:** `omnigent/antigravity_native_launch.py`
-- **Bridge (state, tmux delivery, isolated HOME, MCP relay):** `omnigent/antigravity_native_bridge.py`
-- **connect-RPC client (port discovery, send/cancel/interaction):** `omnigent/antigravity_native_rpc.py`
-- **RPC read driver (trajectory mirror):** `omnigent/antigravity_native_reader.py`
-- **Steps / interactions / audit:** `omnigent/antigravity_native_steps.py`,
-  `omnigent/antigravity_native_interactions.py`, `omnigent/antigravity_native_audit.py`
+- **agy argv / auth-mode / permission flag:** `omnigent/harnesses/antigravity_native/launch.py`
+- **Bridge (state, tmux delivery, isolated Gemini state, MCP relay):** `omnigent/harnesses/antigravity_native/bridge.py`
+- **connect-RPC client (port discovery, send/cancel/interaction):** `omnigent/harnesses/antigravity_native/rpc.py`
+- **Native reader:** `omnigent/harnesses/antigravity_native/reader.py`
+- **Steps / interactions / audit:** `omnigent/harnesses/antigravity_native/steps.py`,
+  `omnigent/harnesses/antigravity_native/interactions.py`, `omnigent/harnesses/antigravity_native/audit.py`
 - **OAuth detection:** `omnigent/onboarding/gemini_auth.py`
-- **Design/plan docs:** `docs/antigravity-native-rpc-core-design.md`,
-  `docs/antigravity-native-rpc-core-plan.md`
+- **Current contract:** [reply compatibility design](../../../docs/antigravity-native-rpc-core-design.md#current-reply-compatibility-contract)
 
 ```bash
 .venv/bin/python -m pytest \
@@ -253,10 +273,10 @@ Key facts:
 ## Bug-bash (fan out)
 
 Stress the harness against the same `$SERVER`: the web→TUI delivery path (lost /
-duplicated turns, the attended-TUI paste race), the RPC read mirror (does every
-agy step reach `…/items`? duplicates after a reader restart?), the MCP relay
+duplicated turns, the attended-TUI paste race), each read transport (does its
+supported output reach `…/items`? duplicates after a reader restart?), the MCP relay
 (`sys_*` reachable + gated), permission elicitations, interrupt
-(`CancelCascadeSteps`) vs. a WAITING-on-interaction step, model echo, resume, and
+(check both transports) vs. a WAITING-on-interaction step, model echo, resume, and
 orphaned `agy`/tmux after teardown. Cross-check the API — a start failure can
 leave the TUI empty while the session records an error.
 
@@ -265,13 +285,10 @@ leave the TUI empty while the session records an error.
 - **Placeholder until cold-start.** Before agy mints its real cascade id, bridge
   state holds an `agy_conv_*` placeholder and RPC is skipped; a turn fired too
   early just queues into the TUI.
-- **Permission gating is all-or-nothing + post-hoc.** agy honors only
-  `--dangerously-skip-permissions` (no firing pre-tool hook), so a headless launch
-  auto-bypasses and the genuine Omnigent gate is the elicitation + post-hoc audit
-  (`antigravity_native_audit`), not a per-tool pre-empt.
-- **Stale module header.** `antigravity_native.py`'s top docstring says web turns
-  go over `SendUserCascadeMessage` RPC — the live executor types into the TUI
-  instead (#1156/#1158). Trust `antigravity_native_executor.py`.
+- **Approval coverage depends on transport.** Use the permission-elicitation
+  scenario above; a passing RPC check does not establish fallback coverage.
+  For the native CLI's all-or-nothing permission flag and lack of a per-tool
+  pre-emptive hook, see the [launch module](../../../omnigent/harnesses/antigravity_native/launch.py).
 
 ## Teardown — non-negotiable
 
@@ -283,7 +300,7 @@ SIGTERM/SIGKILL) and separately `tmux -S <sock> kill-server`. Then verify:
 .venv/bin/omni server stop                 # stop the managed server + local daemon
 pgrep -af "(^|/)agy( |$)|harnesses\._runner|runner\._entry|tmux"   # confirm no orphans
 # clean a session's bridge dir (incl. its isolated agy HOME) if you want a reset:
-# rm -rf "$(.venv/bin/python -c "from omnigent.antigravity_native_bridge import bridge_dir_for_bridge_id as d; print(d('$CONV'))")"
+# rm -rf "$(.venv/bin/python -c "from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id as d; print(d('$CONV'))")"
 ```
 
 ## Honesty

@@ -6,34 +6,24 @@ It creates or binds an Omnigent session, launches ``agy`` in a runner-owned
 tmux terminal resource, then attaches the local TTY (directly to the
 runner's tmux when same-machine, else over the WebSocket terminal bridge).
 
-The RPC read driver (Task 12+) replaced the retired transcript-tail forwarder:
-the reader mirrors agy's steps over connect-RPC, and web turns are delivered via
-the ``SendUserCascadeMessage`` RPC, not by typing into the TUI over tmux
-send-keys. (Comments below that name those retired mechanisms only explain a
-specific current behaviour they were replaced by.)
+The reader prefers agy's connect-RPC steps and can mirror committed user/assistant
+text from the session-scoped transcript when the local RPC is unavailable.
+Attended web turns are typed into the same TUI that the user can see.
 
 Differences from the Codex / Claude wrappers (Phase 1 scope):
 
 * **No separate app-server.** agy self-hosts its local control surface, so
   there is no app-server process to start, no ``--remote`` transport, and no
   thread-init handshake.
-* **RPC mirroring (read path) and RPC web-turn delivery (write path).** agy's
-  conversation mirrors into the Omnigent chat view via the RPC read driver
-  (:mod:`omnigent.harnesses.antigravity_native.reader`), which polls/streams agy's
-  connect-RPC trajectory steps. Web-UI turns are delivered into the native agy
-  conversation (the write path) by the native executor
-  (:mod:`omnigent.inner.antigravity_native_executor`) over the connect-RPC
-  ``SendUserCascadeMessage`` method, which agy records as a real ``USER_INPUT``
-  turn — NOT ``SendAgentMessage`` (recorded as a ``SYSTEM_MESSAGE``, which would
-  never mirror as a user turn; see the executor module).
-* **Per-session identity is minted at cold-start, not assigned at launch.** agy
-  mints its own UUID conversation and ignores the launcher's
-  ``ANTIGRAVITY_CONVERSATION_ID`` (verified empirically). A fresh launch seeds an
-  ``agy_conv_*`` placeholder; the cold-start (:func:`_cold_start_agy_conversation`,
-  the runner's equivalent on the web path) then ``StartCascade``s a real id over
-  connect-RPC, writes it to bridge state (which the RPC reader binds), and PATCHes
-  it onto the session as ``external_session_id``. A resume reads that real id back
-  and passes ``--conversation <id>`` to continue agy's actual conversation (see
+* **Native TUI delivery and mirroring.** Web-UI turns reach the native terminal
+  through :mod:`omnigent.inner.antigravity_native_executor`. The reader mirrors
+  RPC trajectory steps when available; otherwise it uses the bridge-owned
+  transcript and Stop hook for committed text and turn completion.
+* **Per-session identity is minted by agy.** agy ignores the launcher's
+  ``ANTIGRAVITY_CONVERSATION_ID`` and gives the TUI its own UUID. A fresh launch
+  starts with an ``agy_conv_*`` placeholder; the reader adopts the TUI's real id
+  from a validated RPC session or the isolated transcript, then records it as
+  ``external_session_id``. Resume passes that id via ``--conversation`` (see
   :func:`omnigent.harnesses.antigravity_native.launch.build_agy_launch`).
 * **Workspace = the agy terminal cwd.** agy runs tools in its process working
   directory, so the terminal cwd is pinned to the session working dir; no

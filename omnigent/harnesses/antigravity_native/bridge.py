@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,13 @@ def is_placeholder_conversation_id(conversation_id: str) -> bool:
         not yet discovered agy's real UUID); ``False`` for a real agy id.
     """
     return conversation_id.startswith(AGY_PLACEHOLDER_CONVERSATION_PREFIX)
+
+
+def cascade_is_current(expected_cascade_id: str, cascade_id: str) -> bool:
+    return cascade_id == expected_cascade_id or (
+        is_placeholder_conversation_id(expected_cascade_id)
+        and not is_placeholder_conversation_id(cascade_id)
+    )
 
 
 # Canonical root of agy's per-user app-data tree (``~/.gemini/antigravity-cli``).
@@ -310,6 +318,8 @@ def prune_orphaned_bridge_dirs() -> int:
 # authenticating from the real-HOME keyring.
 _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
+_HOOKS_CONFIG_FILE = "hooks.json"
+_STOP_HOOK_NAME = "omnigent-transcript-stop"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_SERVER_NAME = "omnigent"
 # agy auto-approves a relay tool when it is named in the server's ``enabledTools``
@@ -519,6 +529,38 @@ def write_mcp_config(
     payload = build_mcp_config(bridge_dir, python_executable=python_executable)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    write_transcript_stop_hook(bridge_dir, python_executable=python_executable)
+    from omnigent.harnesses.antigravity_native.transcript import prepare_transcript_capture
+
+    prepare_transcript_capture(bridge_dir)
+    return path
+
+
+def write_transcript_stop_hook(bridge_dir: Path, *, python_executable: str | None = None) -> Path:
+    """Register a turn-completion signal inside this session's isolated agy config."""
+    config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
+    config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = config_dir / _HOOKS_CONFIG_FILE
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            raise ValueError(f"Antigravity hooks config is not an object: {path}")
+    else:
+        existing = {}
+    command = shlex.join(
+        [
+            python_executable or sys.executable,
+            "-I",
+            "-m",
+            "omnigent.harnesses.antigravity_native.stop_hook",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
+    )
+    existing[_STOP_HOOK_NAME] = {"Stop": [{"type": "command", "command": command}]}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
 
@@ -1760,3 +1802,113 @@ def send_interaction_keys_via_tui(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+
+
+def _agy_footer_state(pane: str) -> str | None:
+    """Classify agy's bottom footer, including its right-hand model column."""
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    if not lines:
+        return None
+    footer = lines[-1]
+    for marker, state in (
+        (_AGY_ACTIVE_MARKER, "active"),
+        (_AGY_IDLE_MARKER, "idle"),
+    ):
+        suffix = footer.removeprefix(marker) if footer.startswith(marker) else ""
+        if footer.strip() == marker or (
+            len(lines) >= 2
+            and _agy_separator_line(lines[-2])
+            and suffix.startswith("  ")
+            and suffix.strip()
+        ):
+            return state
+        if (
+            len(lines) >= 3
+            and _agy_separator_line(lines[-3])
+            and lines[-2] == marker
+            and footer.startswith(" " * (len(marker) + 2))
+        ):
+            return state
+    return None
+
+
+def _interrupt_owner_is_current(
+    bridge_dir: Path,
+    *,
+    expected_session_id: str | None,
+    expected_cascade_id: str | None,
+) -> bool:
+    if expected_session_id is None:
+        return True
+    state = read_bridge_state(bridge_dir)
+    if state is None or state.session_id != expected_session_id:
+        return False
+    if expected_cascade_id is None:
+        return True
+    if not cascade_is_current(expected_cascade_id, state.conversation_id):
+        return False
+    from omnigent.harnesses.antigravity_native.transcript import resolve_owned_transcript
+
+    binding = resolve_owned_transcript(bridge_dir)
+    if binding is None:
+        return is_placeholder_conversation_id(expected_cascade_id)
+    return cascade_is_current(expected_cascade_id, binding.conversation_id) and cascade_is_current(
+        state.conversation_id, binding.conversation_id
+    )
+
+
+def interrupt_turn_via_tui(
+    bridge_dir: Path,
+    *,
+    expected_session_id: str | None = None,
+    expected_cascade_id: str | None = None,
+) -> bool:
+    """Send agy's visible cancel key only while its TUI shows an active turn."""
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return False
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        return False
+    if _agy_footer_state(_capture_pane(socket_path, tmux_target)) != "active":
+        return False
+    if not _interrupt_owner_is_current(
+        bridge_dir,
+        expected_session_id=expected_session_id,
+        expected_cascade_id=expected_cascade_id,
+    ):
+        return False
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+    return True
+
+
+def turn_is_idle_via_tui(bridge_dir: Path) -> bool:
+    """Return true only when the owned live pane shows agy's idle footer."""
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return False
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        return False
+    pane = _capture_pane(socket_path, tmux_target)
+    return _agy_footer_state(pane) == "idle"
+
+
+def wait_for_turn_idle_via_tui(bridge_dir: Path, *, timeout_s: float = 5.0) -> bool:
+    """Confirm the runner-owned TUI returned to its idle input footer."""
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return False
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _session_alive(socket_path, tmux_target):
+            return False
+        pane = _capture_pane(socket_path, tmux_target)
+        if _agy_footer_state(pane) == "idle":
+            return True
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+    return False

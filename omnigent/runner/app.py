@@ -23,6 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -506,6 +507,7 @@ _DEAD_HARNESS_CHANNEL_ERRORS: tuple[type[BaseException], ...] = (
 
 # Not in the retryable-harness-error allowlist — desync is terminal, not transient.
 _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
+_ANTIGRAVITY_INTERRUPT_TIMEOUT_S = 3.0
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
 # delivery signal for the last child of a fan-out, and Omnigent routinely
 # returns a transient 503 RUNNER_UNAVAILABLE while the parent's runner tunnel
@@ -2918,6 +2920,10 @@ def create_runner_app(
     _ingest_cond: dict[str, asyncio.Condition] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
+    _antigravity_pending_stops: dict[str, bool] = {}
+    _antigravity_stop_tasks: dict[str, asyncio.Task[Response]] = {}
+    _antigravity_delivery_tasks: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
+    app.state.antigravity_delivery_tasks = _antigravity_delivery_tasks
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
@@ -4475,6 +4481,7 @@ def create_runner_app(
                 await turn_task
         await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
+        _antigravity_pending_stops.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
@@ -6770,6 +6777,8 @@ def create_runner_app(
         error: dict[str, Any] | None = None,
         owner_response_id: str | None = None,
     ) -> None:
+        if conv_id in _antigravity_pending_stops:
+            return
         # Stale-finalizer guard: when owner_response_id no longer matches the live response,
         # a newer turn has taken over — skip all conversation-state mutations.
         if owner_response_id is not None and _live_response_id.get(conv_id) != owner_response_id:
@@ -6963,6 +6972,94 @@ def create_runner_app(
         if isinstance(target, asyncio.Task):
             await _cancel_active_turn(conv_id, expected_task=target)
 
+    async def _interrupt_antigravity_turn(conv_id: str) -> Response:
+        task = _antigravity_stop_tasks.get(conv_id)
+        if task is None or task.done():
+            _antigravity_pending_stops[conv_id] = False
+            task = asyncio.create_task(_perform_antigravity_interrupt(conv_id))
+            _antigravity_stop_tasks[conv_id] = task
+
+            def finished(done: asyncio.Task[Response]) -> None:
+                if _antigravity_stop_tasks.get(conv_id) is done:
+                    _antigravity_stop_tasks.pop(conv_id, None)
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def _perform_antigravity_interrupt(conv_id: str) -> Response:
+        had_turn = conv_id in _active_turns
+        target = _active_turns.get(conv_id)
+        delivery_started = (
+            isinstance(target, asyncio.Task) and target in _antigravity_delivery_tasks
+        )
+        try:
+            if isinstance(target, asyncio.Task) and not target.done():
+                if not target.cancelling():
+                    target.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(target), timeout=_ANTIGRAVITY_INTERRUPT_TIMEOUT_S
+                    )
+                except asyncio.CancelledError:
+                    if not target.done():
+                        raise
+                except TimeoutError:
+                    if not target.done():
+                        raise
+                    # Cleanup can finish before the delayed timeout callback runs.
+                    with contextlib.suppress(asyncio.CancelledError):
+                        target.result()
+            harness_client = None
+            if process_manager is not None:
+                with contextlib.suppress(NoLiveHarnessError):
+                    harness_client = await asyncio.wait_for(
+                        process_manager.get_client(conv_id, "any"),
+                        timeout=_ANTIGRAVITY_INTERRUPT_TIMEOUT_S,
+                    )
+            if harness_client is not None:
+                coordinated = await asyncio.wait_for(
+                    harness_client.post(
+                        f"/v1/sessions/{conv_id}/events",
+                        json={"type": "interrupt"},
+                        timeout=_ANTIGRAVITY_INTERRUPT_TIMEOUT_S,
+                    ),
+                    timeout=_ANTIGRAVITY_INTERRUPT_TIMEOUT_S,
+                )
+                if coordinated.status_code != 204:
+                    raise RuntimeError("Antigravity cancellation was not confirmed")
+                _native_interrupt_runner._wake_parent_after_native_interrupt(conv_id)
+                response = Response(status_code=204)
+            else:
+                response = await _native_interrupt_runner.interrupt("antigravity-native", conv_id)
+        except (httpx.HTTPError, RuntimeError, OSError, TimeoutError):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_interrupt_failed",
+                    "detail": "Antigravity cancellation could not be confirmed.",
+                },
+            )
+        finally:
+            native_completed = _antigravity_pending_stops.pop(conv_id, False)
+            cancelled_before_delivery = (
+                isinstance(target, asyncio.Task) and target.done() and not delivery_started
+            )
+            if isinstance(target, asyncio.Task) and target.done():
+                if _active_turns.get(conv_id) is target:
+                    _active_turns[conv_id] = None
+            if native_completed or cancelled_before_delivery:
+                _on_proxy_stream_end(conv_id)
+        assert response is not None
+        if response.status_code == 204:
+            _interrupted_sessions.discard(conv_id)
+            if had_turn:
+                _append_cancellation_items(conv_id)
+            if not native_completed and not cancelled_before_delivery:
+                _on_proxy_stream_end(conv_id)
+        return response
+
     async def _resync_turn_state(
         conv_id: str, reason: str, *, owner_response_id: str | None = None
     ) -> None:
@@ -7143,7 +7240,7 @@ def create_runner_app(
             while _ingest_now_serving.get(session_id, 0) != _seq:
                 await _cond.wait()
         try:
-            if session_id in _active_turns:
+            if session_id in _active_turns or session_id in _antigravity_pending_stops:
                 return
 
             buf = _session_message_buffers.get(session_id)
@@ -8051,6 +8148,8 @@ def create_runner_app(
             async for _chunk in response.body_iterator:
                 pass
         except asyncio.CancelledError:
+            if session_id in _antigravity_pending_stops:
+                raise
             # Identity guard (same generation-ownership class as
             # _on_proxy_stream_end and the _run_turn_bg finally floor): the drain
             # runs INLINE in this turn's own _run_turn_bg task, so the slot should
@@ -8379,6 +8478,9 @@ def create_runner_app(
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             try:
+                _delivery_task = asyncio.current_task()
+                if harness_name == "antigravity-native" and _delivery_task is not None:
+                    _antigravity_delivery_tasks.add(_delivery_task)
                 async with client.stream(
                     "POST",
                     f"/v1/sessions/{conv_id}/events",
@@ -8912,7 +9014,10 @@ def create_runner_app(
                         server_client=server_client,
                     )
 
-                if conversation_id in _active_turns:
+                if (
+                    conversation_id in _active_turns
+                    or conversation_id in _antigravity_pending_stops
+                ):
                     _native = _is_native_harness(conversation_id)
                     _awaiting_approval = pending_approvals.has_pending(conversation_id)
                     _can_forward = (
@@ -8980,17 +9085,25 @@ def create_runner_app(
                     "role": message_body.get("role", "user"),
                     "content": message_body.get("content", []),
                 }
-                if conversation_id in _session_histories:
-                    _session_histories[conversation_id].append(new_item)
-                else:
+                if conversation_id not in _session_histories:
                     persisted_item_id = message_body.get("persisted_item_id")
                     loaded = await _load_history_as_input(
                         conversation_id,
                         drop_item_id=persisted_item_id,
                     )
-                    loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
+                if conversation_id in _antigravity_pending_stops:
+                    _session_message_buffers.setdefault(conversation_id, []).append(message_body)
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "status": "buffered",
+                            "detail": "Message buffered; active turn will process it.",
+                        },
+                    )
+
+                _session_histories[conversation_id].append(new_item)
                 _begin_turn_slot(conversation_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
@@ -9033,6 +9146,8 @@ def create_runner_app(
 
         if body_type == "interrupt":
             _harness = _session_harness_name(conversation_id)
+            if _harness == "antigravity-native":
+                return await _interrupt_antigravity_turn(conversation_id)
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
                 return _interrupt_resp
@@ -9059,7 +9174,13 @@ def create_runner_app(
             if status == "idle":
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
-                    status="completed",
+                    status=(
+                        "cancelled"
+                        if _session_harness_name(conversation_id) == "antigravity-native"
+                        and isinstance(data, dict)
+                        and data.get("cancelled") is True
+                        else "completed"
+                    ),
                     output=output if output is not None else "",
                 )
             elif status == "failed":
@@ -9068,6 +9189,19 @@ def create_runner_app(
                     status="failed",
                     output=output or "Error: native sub-agent turn failed",
                 )
+            if (
+                status in ("idle", "failed")
+                and _session_harness_name(conversation_id) == "antigravity-native"
+            ):
+                if conversation_id in _antigravity_pending_stops:
+                    _antigravity_pending_stops[conversation_id] = True
+                else:
+                    occupant = _active_turns.get(conversation_id)
+                    if (occupant is None or occupant.done()) and (
+                        conversation_id in _active_turns
+                        or _session_message_buffers.get(conversation_id)
+                    ):
+                        _on_proxy_stream_end(conversation_id)
             if delivery_ack is not None:
                 if (
                     delivery_ack.entry is not None
@@ -9091,6 +9225,8 @@ def create_runner_app(
 
         if body_type == "stop_session":
             _harness = _session_harness_name(conversation_id)
+            if _harness == "antigravity-native":
+                return await _interrupt_antigravity_turn(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
                 return _stop_resp

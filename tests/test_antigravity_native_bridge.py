@@ -631,15 +631,21 @@ def test_read_tmux_info_missing_returns_none(tmp_path: Path) -> None:
     assert read_tmux_info(tmp_path / "bridge") is None
 
 
-def test_read_tmux_info_rejects_malformed_json(tmp_path: Path) -> None:
+def test_read_tmux_info_rejects_malformed_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A corrupt ``tmux.json`` is treated as absent rather than raising."""
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = prepare_bridge_dir("bridge_malformed")
     (bridge_dir / "tmux.json").write_text("{not json", encoding="utf-8")
     assert read_tmux_info(bridge_dir) is None
 
 
-def test_read_tmux_info_rejects_missing_fields(tmp_path: Path) -> None:
+def test_read_tmux_info_rejects_missing_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A ``tmux.json`` lacking a non-empty target/socket is rejected."""
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = prepare_bridge_dir("bridge_partial")
     (bridge_dir / "tmux.json").write_text(json.dumps({"socket_path": "/s"}), encoding="utf-8")
     assert read_tmux_info(bridge_dir) is None
@@ -649,7 +655,9 @@ def test_read_tmux_info_rejects_missing_fields(tmp_path: Path) -> None:
     assert read_tmux_info(bridge_dir) is None
 
 
-def test_clear_bridge_state_removes_tmux_json(tmp_path: Path) -> None:
+def test_clear_bridge_state_removes_tmux_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     Clearing runtime state also drops the advertised tmux pane.
 
@@ -657,6 +665,7 @@ def test_clear_bridge_state_removes_tmux_json(tmp_path: Path) -> None:
     surviving ``tmux.json`` would let the executor bootstrap the first turn
     against the prior run's pane.
     """
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = prepare_bridge_dir("bridge_clear")
     write_bridge_state(
         bridge_dir,
@@ -667,6 +676,125 @@ def test_clear_bridge_state_removes_tmux_json(tmp_path: Path) -> None:
     clear_bridge_state(bridge_dir)
     assert read_bridge_state(bridge_dir) is None
     assert read_tmux_info(bridge_dir) is None
+
+
+def test_tui_footer_state_ignores_markers_quoted_in_prompt_and_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only an owned final footer controls idle detection and Escape eligibility."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    sent: list[tuple[str, ...]] = []
+    pane = {
+        "value": (
+            "> Explain the phrase esc to cancel\n"
+            "The completed answer quotes ? for shortcuts and esc to cancel.\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "? for shortcuts                                      Gemini 3.5 Flash (High)\n"
+        )
+    }
+    monkeypatch.setattr(_mod, "_session_alive", lambda *_args: True)
+    monkeypatch.setattr(_mod, "_capture_pane", lambda *_args: pane["value"])
+
+    def _send_escape(*args: str) -> None:
+        sent.append(args)
+        pane["value"] = (
+            "> Explain the phrase esc to cancel\n"
+            "The completed answer quotes ? for shortcuts and esc to cancel.\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "? for shortcuts                                      Gemini 3.5 Flash (High)\n"
+        )
+
+    monkeypatch.setattr(_mod, "_run_tmux", _send_escape)
+
+    assert _mod.turn_is_idle_via_tui(bridge_dir)
+    assert _mod.wait_for_turn_idle_via_tui(bridge_dir, timeout_s=0.01)
+    assert not _mod.interrupt_turn_via_tui(bridge_dir)
+    assert sent == []
+
+    pane["value"] = (
+        "> Explain the idle footer ? for shortcuts\n"
+        "The active footer is esc to cancel.\n"
+        "esc to cancel the requested deployment\n"
+    )
+    assert not _mod.turn_is_idle_via_tui(bridge_dir)
+    assert not _mod.interrupt_turn_via_tui(bridge_dir)
+    assert sent == []
+
+    pane["value"] = (
+        "> Explain the idle footer ? for shortcuts\n"
+        "The active footer is esc to cancel.\n"
+        "────────────────────────────────────────────────────────────────────────────────\n"
+        "esc to cancel                                      Gemini 3.5 Flash (High)\n"
+    )
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="current-session",
+            conversation_id="current-cascade",
+        ),
+    )
+    assert not _mod.interrupt_turn_via_tui(
+        bridge_dir,
+        expected_session_id="stale-session",
+    )
+    assert sent == []
+    assert _mod.interrupt_turn_via_tui(
+        bridge_dir,
+        expected_session_id="current-session",
+    )
+    assert sent == [(str(tmp_path / "tmux.sock"), "send-keys", "-t", "main", "Escape")]
+    assert _mod.wait_for_turn_idle_via_tui(bridge_dir, timeout_s=0.01)
+
+
+@pytest.mark.parametrize("marker", ["? for shortcuts", "esc to cancel"])
+@pytest.mark.parametrize("suffix", ["the requested deployment", "Gemini 3.8 Flash · high"])
+def test_tui_footer_rejects_double_spaced_marker_in_user_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str, suffix: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="current-session", conversation_id="cascade"),
+    )
+    sent: list[tuple[str, ...]] = []
+    pane = f"> Explain this quoted instruction\n{marker}  {suffix}\n"
+    monkeypatch.setattr(_mod, "_session_alive", lambda *_args: True)
+    monkeypatch.setattr(_mod, "_capture_pane", lambda *_args: pane)
+    monkeypatch.setattr(_mod, "_run_tmux", lambda *args: sent.append(args))
+
+    assert not _mod.interrupt_turn_via_tui(bridge_dir, expected_session_id="current-session")
+    assert sent == []
+    assert not _mod.turn_is_idle_via_tui(bridge_dir)
+
+
+@pytest.mark.parametrize("marker", ["? for shortcuts", "esc to cancel"])
+def test_tui_footer_model_on_separate_row_requires_footer_geometry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    sent: list[tuple[str, ...]] = []
+    model_row = " " * 40 + "Gemini 3.5 Flash (High)"
+    pane = {"value": f"> Quoted footer example\n{marker}\n{model_row}\n"}
+    monkeypatch.setattr(_mod, "_session_alive", lambda *_args: True)
+    monkeypatch.setattr(_mod, "_capture_pane", lambda *_args: pane["value"])
+    monkeypatch.setattr(_mod, "_run_tmux", lambda *args: sent.append(args))
+
+    assert not _mod.turn_is_idle_via_tui(bridge_dir)
+    assert not _mod.interrupt_turn_via_tui(bridge_dir)
+    assert sent == []
+
+    separator = "─" * 80
+    pane["value"] = f"{separator}\n>\n{separator}\n{marker}\n{model_row}\n"
+    assert _mod.turn_is_idle_via_tui(bridge_dir) is (marker == "? for shortcuts")
+    assert _mod.interrupt_turn_via_tui(bridge_dir) is (marker == "esc to cancel")
+    if marker == "esc to cancel":
+        assert sent == [(str(tmp_path / "tmux.sock"), "send-keys", "-t", "main", "Escape")]
+    else:
+        assert sent == []
+        assert _mod.wait_for_turn_idle_via_tui(bridge_dir, timeout_s=0.01)
 
 
 # ---------------------------------------------------------------------------

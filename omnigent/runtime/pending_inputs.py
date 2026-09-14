@@ -1,7 +1,7 @@
 """In-process index of un-consumed web-composer user messages.
 
 Backs the optimistic "queued message" bubble for native-terminal
-sessions (claude-native / codex-native) so it survives a client
+sessions so it survives a client
 re-bind. On those sessions the Omnigent server does NOT persist a web-typed
 user message at POST time — the message is forwarded into the vendor
 TUI and the transcript forwarder later mirrors it back as the single
@@ -22,7 +22,7 @@ uses for transient recovery state (:mod:`pending_elicitations`,
   :func:`snapshot_for`, so a (re)connecting client re-hydrates the
   bubble instead of showing nothing;
 * drained when the transcript forwarder persists the matching user
-  message (via :func:`resolve_oldest`), so the now-committed item
+  message at the persistence boundary, so the now-committed item
   doesn't double-render alongside a stale pending entry.
 
 Unlike :mod:`pending_elicitations` / :mod:`inflight_text`, this index
@@ -32,20 +32,18 @@ sender can adopt it and dedupe cleanly), and draining needs to run at
 the persist site so the ``session.input.consumed`` event can carry the
 cleared id. Both are caller-driven, so the access is explicit.
 
-Draining is by FIFO order (oldest first), NOT by text. Native gives no
-id channel back through the TUI to correlate the forwarded POST with the
-mirrored transcript item, and the transcript freely reformats the text
-(reply-quote ``>`` blockquotes, ``[Attached:]`` markers, whitespace), so
-matching on text is unreliable — it would leave a reformatted message
-stuck pending and double-rendered. Per-session SSE ordering guarantees
-the i-th persisted user message corresponds to the i-th queued one, so
-each persisted native user message drains the oldest pending entry.
+Most native harnesses drain by FIFO order (:func:`resolve_oldest`) because
+transcript formatting can change the forwarded text. A directly typed TUI
+message can therefore consume an unrelated web pending entry on those paths.
+Kiro instead uses :func:`resolve_matching_text` to match normalized prompt text
+and retire preceding unmatched entries.
 
-The one imperfect case is interleaving a web-composer message with a
-message typed directly in the TUI: the TUI message (which has no pending
-entry) drains the oldest web entry, so that web bubble briefly
-disappears and reappears once it persists. It self-heals; the committed
-bubble always renders the just-persisted content regardless.
+Antigravity uses :func:`resolve_matching_antigravity_text` to consume only the
+first matching queued input, preserving unmatched steering and ordering among
+identical prompts. :func:`set_matching_content` retains resolved attachment
+content for transport matching; the original content, author, and stable ID
+remain available for durable persistence. An idempotent replay restores a
+drained entry to its queue position via :func:`restore`.
 
 Limitations (identical to :mod:`pending_elicitations`):
 
@@ -65,18 +63,31 @@ evicted lazily on the next :func:`record` / :func:`snapshot_for` /
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
+import hashlib
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from omnigent.inner.native_attachments import (
+    MIME_TO_EXT,
+    parse_data_uri,
+    unresolved_attachment_marker,
+)
 
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
+_ANTIGRAVITY_ATTACHMENT_MARKER_RE = re.compile(r"\[Attached: (?P<path>.+)\]")
+_MARKER_UNSAFE_FILENAME_CHARACTERS = re.compile(r"[\[\]\r\n]")
 
 
 def _now() -> float:
@@ -121,6 +132,8 @@ class DrainedInput:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    matching_content: list[dict[str, Any]] | None = None
+    preceding_pending_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -158,6 +171,7 @@ class _Entry:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    matching_content: list[dict[str, Any]] | None = None
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
@@ -246,6 +260,15 @@ def record(
     return pending_id
 
 
+def set_matching_content(
+    conversation_id: str, pending_id: str, content: list[dict[str, Any]]
+) -> None:
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None:
+            entry.matching_content = copy.deepcopy(content)
+
+
 def resolve(conversation_id: str, pending_id: str) -> None:
     """
     Drop a pending entry by id.
@@ -302,23 +325,16 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
         entry = entries.pop(oldest_id)
         if not entries:
             _pending.pop(conversation_id, None)
-        return DrainedInput(
-            pending_id=entry.pending_id,
-            content=copy.deepcopy(entry.content),
-            created_by=entry.created_by,
-            stable_id=entry.stable_id,
-            background_titles_enabled=entry.background_titles_enabled,
-        )
+        return _drained_input(entry)
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:
     """
-    Put a drained entry back at the FRONT of the pending queue.
+    Restore a drained entry in its pending queue position.
 
     Compensation for a drain whose persist turned out to be a duplicate
     (an idempotent external-item append deduplicated the retry): the
-    entry belongs to the NEXT user message, and it was the oldest when
-    drained, so it returns to the head to keep FIFO intact.
+    entry belongs to the NEXT user message and retains its queue ordering.
 
     :param conversation_id: Conversation/session id, e.g.
         ``"conv_abc123"``.
@@ -331,13 +347,27 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         created_by=drained.created_by,
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
+        matching_content=copy.deepcopy(drained.matching_content),
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
-        _pending[conversation_id] = {drained.pending_id: entry, **entries}
+        preceding = {
+            pending_id: existing
+            for pending_id, existing in entries.items()
+            if pending_id in drained.preceding_pending_ids
+        }
+        following = {
+            pending_id: existing
+            for pending_id, existing in entries.items()
+            if pending_id not in preceding
+        }
+        _pending[conversation_id] = {**preceding, drained.pending_id: entry, **following}
 
 
-def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
+def resolve_matching_text(
+    conversation_id: str,
+    text: str,
+) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
 
@@ -385,6 +415,30 @@ def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
             matched=_drained_input(matched_entry),
             skipped=[_drained_input(entry) for _pending_id, entry in skipped_entries],
         )
+
+
+def resolve_matching_antigravity_text(conversation_id: str, text: str) -> DrainedInput | None:
+    """Drain the pending input whose Antigravity transport text equals ``text``."""
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return None
+        preceding_pending_ids: list[str] = []
+        for pending_id, entry in entries.items():
+            content = entry.matching_content
+            if not _matches_antigravity_transport(
+                content if content is not None else entry.content, text
+            ):
+                preceding_pending_ids.append(pending_id)
+                continue
+            entries.pop(pending_id)
+            if not entries:
+                _pending.pop(conversation_id, None)
+            drained = _drained_input(entry)
+            drained.preceding_pending_ids = tuple(preceding_pending_ids)
+            return drained
+        return None
 
 
 def has_pending(conversation_id: str) -> bool:
@@ -450,6 +504,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         created_by=entry.created_by,
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
+        matching_content=copy.deepcopy(entry.matching_content),
     )
 
 
@@ -464,6 +519,94 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             text = block.get("text")
             if isinstance(text, str):
                 parts.append(text)
+    return "\n".join(parts)
+
+
+def _matches_antigravity_transport(content: list[dict[str, Any]], text: str) -> bool:
+    attachments = _attachment_blocks(content)
+    content_text = _antigravity_content_text(content)
+    if not attachments:
+        return text == content_text.strip()
+    lines = text.split("\n")
+    if len(lines) < len(attachments) or not all(
+        _matches_antigravity_attachment_marker(block, line)
+        for block, line in zip(attachments, lines[: len(attachments)], strict=True)
+    ):
+        return False
+    return "\n".join(lines[len(attachments) :]) == content_text.rstrip()
+
+
+def _attachment_blocks(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") in {"input_image", "input_file"}
+    ]
+
+
+def _matches_antigravity_attachment_marker(block: dict[str, Any], line: str) -> bool:
+    if line == unresolved_attachment_marker(block):
+        return True
+    match = _ANTIGRAVITY_ATTACHMENT_MARKER_RE.fullmatch(line)
+    if match is None:
+        return False
+    filename = block.get("filename")
+    path = match.group("path")
+    parts = path.rsplit("/", 2)
+    if len(parts) != 3 or parts[1] != "uploads":
+        return False
+    actual_name = parts[2]
+    if isinstance(filename, str) and filename:
+        expected = _MARKER_UNSAFE_FILENAME_CHARACTERS.sub("_", filename.rsplit("/", 1)[-1])
+        if actual_name == expected:
+            return True
+        raw = _attachment_bytes(block)
+        expected_path = Path(expected)
+        collision_pattern = (
+            rf"{re.escape(expected_path.stem)}_[0-9a-f]{{12}}"
+            rf"{re.escape(expected_path.suffix)}"
+        )
+        if raw is None:
+            return re.fullmatch(collision_pattern, actual_name) is not None
+        return actual_name == (
+            f"{expected_path.stem}_{hashlib.sha256(raw).hexdigest()[:12]}{expected_path.suffix}"
+        )
+    extension = _attachment_extension(block)
+    return (
+        extension is not None
+        and re.fullmatch(rf"attachment_[0-9a-f]{{8}}{re.escape(extension)}", actual_name)
+        is not None
+    )
+
+
+def _attachment_bytes(block: dict[str, Any]) -> bytes | None:
+    data_uri = block.get("image_url") or block.get("file_data")
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    try:
+        return base64.b64decode(parse_data_uri(data_uri).base64_payload)
+    except (ValueError, binascii.Error):
+        return None
+
+
+def _attachment_extension(block: dict[str, Any]) -> str | None:
+    data_uri = block.get("image_url") or block.get("file_data")
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    try:
+        return MIME_TO_EXT.get(parse_data_uri(data_uri).mime_type, "")
+    except ValueError:
+        return None
+
+
+def _antigravity_content_text(content: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in {"input_text", "text"}:
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
     return "\n".join(parts)
 
 

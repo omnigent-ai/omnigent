@@ -6,16 +6,13 @@ pure functions and a frozen dataclass — no live agy calls are made here.
 
 Key design points:
 
-* **Auth inheritance** — agy shares ``~/.gemini`` with the user's interactive
-  login; no credential seeding is required.  :func:`resolve_native_antigravity_launch`
-  verifies (informational only) that a credential exists but always returns
-  ``subscription`` mode regardless.
+* **Session isolation** — the bridge prepares an isolated Gemini directory;
+  callers add ``--gemini_dir`` to these launch arguments. The native CLI retains
+  real ``HOME`` for its existing login. See
+  :mod:`omnigent.harnesses.antigravity_native.bridge` for state preparation.
 
-* **Per-session identity is discovered, not assigned** — agy mints its own UUID
-  conversation and ignores the ``ANTIGRAVITY_CONVERSATION_ID`` env var
-  (verified empirically; see ``docs/claude/antigravity-spike-findings.md``). A
-  fresh session therefore sets nothing for identity; the forwarder discovers
-  agy's real id from the newest ``brain/<uuid>`` dir and persists it. A resume
+* **Per-session identity is discovered, not assigned** — the reader discovers
+  agy's UUID from validated RPC ownership or the isolated transcript. A resume
   passes ``--conversation <id>`` with that discovered id on the command line.
 
 * **Workspace = the agy process cwd** — agy runs its tools in its own working
@@ -23,12 +20,6 @@ Key design points:
   project dir ran ``run_command`` with that ``Cwd``, never the default
   ``scratch`` dir). The launcher pins the terminal cwd to the session working
   directory, so no ``--add-dir`` flag is required.
-
-* **No usable env knobs** — agy also ignores ``ANTIGRAVITY_SIDECAR_WEB_PORT``
-  (it binds its own ephemeral ports) and ``ANTIGRAVITY_EXECUTABLE_DATA_DIR``
-  (its conversation store stays under the default ``~/.gemini/antigravity-cli``)
-  for the host process; both are sidecar-plugin-scoped no-ops. So
-  :func:`build_agy_launch` emits no env overrides for a fresh session.
 
 * **Auth is inherited** — current agy releases accept either their persisted
   Google OAuth login or ``GEMINI_API_KEY``. The isolated settings prepared by

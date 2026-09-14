@@ -288,6 +288,12 @@ omnigent pi                          # Pi
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 
+If agy's local RPC is unavailable, Chat mirrors committed user and assistant
+text from the session's isolated transcript. Streaming and tool cards are not
+available through this fallback; answer approval prompts in Terminal as the
+chat notice directs. See the [native compatibility contract](docs/antigravity-native-rpc-core-design.md#current-reply-compatibility-contract)
+for completion and cancellation details.
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 

@@ -11,19 +11,18 @@ Mirrors :class:`omnigent.runner.codex.goal.CodexGoalRunner`: app-scope state
 injected at construction so the class stays out of the already-large app module
 while preserving the exact behavior of the original closures.
 
-The seven uniform interrupt harnesses and six uniform stop harnesses differ
-only by bridge module, control-function name, and error label; they collapse to
+The uniform interrupt and stop harnesses differ only by bridge module,
+control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 :data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution) and codex
-interrupt (MCP-startup + app-server ``turn/interrupt``) keep dedicated methods
-(so nine interrupt handlers total); claude stop is likewise special-cased and
-codex/pi alias stop to their interrupt handler (so seven stop handlers total).
+interrupt (MCP-startup + app-server ``turn/interrupt``) and antigravity
+interrupt (RPC + active TUI fallback) keep dedicated methods; claude stop is
+likewise special-cased and codex/pi/antigravity alias stop to their interrupt
+handler.
 
-Coverage note: antigravity-native and opencode-native have no handler here and
-:meth:`interrupt` / :meth:`stop` return ``None`` for them, so the caller falls
-through to the in-process turn cancel — unchanged from before this seam. Wiring
-their native interrupt (agy ``interrupt_turn`` / opencode ``client.abort``) is a
-deferred follow-up.
+OpenCode-native has no handler here, so :meth:`interrupt` / :meth:`stop`
+return ``None`` and the caller falls through to the in-process turn cancel.
+Antigravity-native has a turn interrupt handler shared with its executor.
 """
 
 from __future__ import annotations
@@ -276,8 +275,8 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     wrapper label:
 
     * ``"stop"`` — Claude's dedicated stop, or a key in :data:`_UNIFORM_STOP`
-    * ``"best_effort"`` — remaining native agents (Codex/Pi alias stop to
-      interrupt; Antigravity/OpenCode have no stop handler)
+    * ``"best_effort"`` — remaining native agents (Codex/Pi/Antigravity alias
+      stop to interrupt; OpenCode has no stop handler)
     * ``"inprocess"`` — no native agent for this label
 
     :param wrapper_label: The work entry's ``omnigent.wrapper`` value.
@@ -320,7 +319,7 @@ class NativeInterruptRunner:
 
         :returns: A response when this harness has an interrupt handler, else
             ``None`` so the caller falls through to the in-process turn cancel
-            (antigravity/opencode).
+            (opencode).
         """
         agent = native_coding_agent_for_harness(harness_name)
         if agent is None:
@@ -330,6 +329,8 @@ class NativeInterruptRunner:
             return await self._claude_interrupt(conv_id)
         if key == "codex":
             return await self._codex_interrupt(conv_id)
+        if key == "antigravity":
+            return await self._antigravity_interrupt(conv_id)
         spec = _UNIFORM_INTERRUPT.get(key)
         if spec is None:
             return None
@@ -338,8 +339,8 @@ class NativeInterruptRunner:
     async def stop(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch a stop_session to the harness's bridge.
 
-        codex/pi have no distinct stop — they route to their interrupt handler,
-        exactly as the original dispatch chain did.
+        codex/pi/antigravity have no distinct stop — they route to their
+        interrupt handler.
 
         :returns: A response when this harness has a stop handler, else ``None``
             so the caller falls through to the in-process turn cancel.
@@ -350,7 +351,7 @@ class NativeInterruptRunner:
         key = agent.key
         if key == "claude":
             return await self._claude_stop(conv_id)
-        if key in ("codex", "pi"):
+        if key in ("codex", "pi", "antigravity"):
             return await self.interrupt(harness_name, conv_id)
         spec = _UNIFORM_STOP.get(key)
         if spec is None:
@@ -486,6 +487,48 @@ class NativeInterruptRunner:
                     ),
                 },
             )
+        self._wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _antigravity_interrupt(self, conv_id: str) -> Response:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            read_bridge_state,
+        )
+        from omnigent.inner.antigravity_native_executor import interrupt_bridge_turn
+
+        try:
+            labels = await _session_labels_for_runner_spawn(
+                server_client=self._server_client,
+                session_id=conv_id,
+                raise_on_error=True,
+            )
+            bridge_dir = bridge_dir_for_bridge_id(
+                labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+            )
+            cancelled = await interrupt_bridge_turn(bridge_dir, expected_session_id=conv_id)
+        except (RuntimeError, OSError, httpx.HTTPError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_interrupt_failed",
+                    "detail": self._client_safe_error_detail(
+                        exc, context="antigravity-native interrupt"
+                    ),
+                },
+            )
+        if not cancelled:
+            state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+            if state is not None and state.session_id == conv_id:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "antigravity_native_interrupt_failed",
+                        "detail": "Antigravity cancellation could not be confirmed.",
+                    },
+                )
+            return Response(status_code=204)
         self._wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 

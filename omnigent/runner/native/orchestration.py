@@ -4576,8 +4576,8 @@ async def _auto_create_codex_terminal(
         # isaac`` + ``args: ["codex", "--"]`` to run ``isaac codex -- <remote
         # args>``. Identity by default; the runner is the single args merge
         # point (the CLI persists raw pass-through, see cli_native).
-        from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-        from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+        from omnigent.config import load_effective_config
+        from omnigent.harness_startup_config import (
             resolve_harness_args,
             resolve_harness_config,
         )
@@ -7360,8 +7360,8 @@ async def _auto_create_claude_terminal(
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import (
         resolve_harness_args,
         resolve_harness_command,
     )
@@ -8538,6 +8538,7 @@ async def _session_labels_for_runner_spawn(
     *,
     server_client: httpx.AsyncClient,
     session_id: str,
+    raise_on_error: bool = False,
 ) -> dict[str, str]:
     """
     Fetch session labels for harness spawn-env construction.
@@ -8546,7 +8547,8 @@ async def _session_labels_for_runner_spawn(
         labels endpoint.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``.
-    :returns: String label mapping. Empty on lookup failure.
+    :param raise_on_error: Propagate lookup failures when labels are required.
+    :returns: String label mapping. Empty on best-effort lookup failure.
     """
     path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
     try:
@@ -8555,6 +8557,8 @@ async def _session_labels_for_runner_spawn(
             timeout=_SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS,
         )
     except httpx.TimeoutException as exc:
+        if raise_on_error:
+            raise
         _logger.debug(
             "Timed out resolving session labels; session=%s error=%s",
             session_id,
@@ -8563,6 +8567,8 @@ async def _session_labels_for_runner_spawn(
         )
         return {}
     except httpx.HTTPError as exc:
+        if raise_on_error:
+            raise
         _logger.warning(
             "Failed to resolve session labels; session=%s error=%s",
             session_id,
@@ -8571,6 +8577,8 @@ async def _session_labels_for_runner_spawn(
         )
         return {}
     if resp.status_code != 200:
+        if raise_on_error:
+            raise RuntimeError("Could not resolve session labels")
         _logger.warning(
             "Failed to resolve session labels; session=%s status=%s",
             session_id,
@@ -8579,8 +8587,13 @@ async def _session_labels_for_runner_spawn(
         )
         return {}
     try:
-        labels = resp.json().get("labels")
+        payload = resp.json()
+        if raise_on_error and not isinstance(payload, dict):
+            raise RuntimeError("Invalid session labels response")
+        labels = payload.get("labels")
     except ValueError:
+        if raise_on_error:
+            raise RuntimeError("Invalid session labels response") from None
         # A 200 with a non-JSON body (e.g. an empty response from the
         # Databricks Apps proxy when the server event loop is starved,
         # or an HTML login page on an auth edge) must not abort the
@@ -8594,6 +8607,8 @@ async def _session_labels_for_runner_spawn(
         )
         return {}
     if not isinstance(labels, dict):
+        if raise_on_error:
+            raise RuntimeError("Invalid session labels response")
         return {}
     return {str(key): str(value) for key, value in labels.items()}
 

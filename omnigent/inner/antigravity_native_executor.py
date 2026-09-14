@@ -1,56 +1,22 @@
-"""Executor that delivers Omnigent web/mobile turns into a native Antigravity agy.
+"""Deliver Omnigent web/mobile turns into the runner-owned Antigravity TUI.
 
-``omnigent antigravity`` runs the Antigravity ``agy`` CLI in a runner-owned tmux
-terminal and mirrors its transcript into the Omnigent session via the RPC read
-driver (the read path). This executor is the **write path**: when a turn is
-submitted from the Omnigent web/mobile UI it delivers the user's message by
-TYPING IT INTO the agy TUI pane over tmux
-(:func:`omnigent.harnesses.antigravity_native.bridge.inject_user_message_via_tui`), exactly
-like the **claude**/**codex** native bridges drive their vendor panes. agy then
-runs a real model turn and its reply flows back through the read driver.
+Web turns and mid-turn steering use the same tmux delivery path so they land
+on the cascade visible in Terminal. Headless ``SendUserCascadeMessage`` can
+address a separate cascade that the attended TUI never displays. Delivery uses
+:func:`omnigent.harnesses.antigravity_native.bridge.inject_user_message_via_tui`
+for draft clearing, bracketed paste, and footer-verified submission.
 
-**Why typing into the TUI, not headless ``SendUserCascadeMessage`` RPC
-(#1156/#1158).** Typing into the TUI gives true parity with claude/codex native:
-the turn RENDERS in the agy TUI AND lands on the SAME cascade the TUI displays,
-so the agy TUI and the Omnigent web mirror share ONE conversation in both
-directions. The prior headless RPC path delivered onto a separate
-``StartCascade`` cascade the TUI never showed — so the agy TUI never echoed web
-turns (#1156) and TUI-typed turns never mirrored to the web (#1158). agy records
-a TUI-typed turn as a real ``CORTEX_STEP_TYPE_USER_INPUT`` step (what the read
-driver keys on); the careful inject (draft-clear + bracketed paste +
-footer-verified submit) handles the attended-TUI race. RPC remains the
-read/control transport only (``StreamAgentStateUpdates`` /
-``GetAllCascadeTrajectories`` / ``CancelCascadeSteps`` /
-``HandleCascadeUserInteraction``). The same path serves mid-turn steering.
+The reader owns assistant output and native turn completion (see
+:mod:`omnigent.harnesses.antigravity_native.reader`). This executor yields
+:class:`TurnComplete` with ``response=None`` once injection succeeds; that
+acknowledges delivery, not completion of native generation.
 
-Because agy owns its own model loop and emits output via the read path, this
-executor:
+The TUI owns its selected model and thinking budget. ``ExecutorConfig.model``
+is unused; ``reasoning_effort`` is validated but does not override the TUI.
 
-* does NOT stream (``supports_streaming() -> False``) — the read driver posts the
-  assistant message;
-* yields a single :class:`TurnComplete` with ``response=None`` on a successful
-  send (fabricating text here would double the read driver's mirrored message);
-* supports a live message queue (``supports_live_message_queue() -> True``) — a
-  mid-turn web message is delivered over the same RPC, which is how web steering
-  works.
-
-**Per-turn model (the load-bearing detail).** ``SendUserCascadeMessage`` REQUIRES
-a ``planModel`` enum per turn (omitting it errors "neither PlanModel nor
-RequestedModel specified"), and the enum names are version-volatile so they are
-NEVER hardcoded. The executor resolves the model at runtime in two tiers
-(design §10.4): (1) echo agy's CURRENT model from the latest ``USER_INPUT`` step's
-``userInput.userConfig.plannerConfig.planModel`` (a string on the live wire, with
-the older ``requestedModel.model`` shape as a fallback) reflecting the user's TUI
-``/model`` choice without new plumbing; (2) on a first turn / when no
-prior model is observable, fall back to the ``recommended`` entry from
-``GetAvailableModels``. The Omnigent ``ExecutorConfig.model``/``reasoning_effort``
-stay informational on this write path — agy's own model selection determines the
-turn's model and thinking budget and cannot be overridden from here.
-
-Attachment note: the RPC turn text takes plain text, so an image/file attachment
-on a web turn is materialized to a file under the bridge dir and referenced by
-absolute path (``[Attached: <path>]``) so agy can open it with its Read tool —
-mirroring cursor-native. Any prose the user typed is sent alongside the marker.
+Attachments are materialized under the bridge directory and referenced by
+absolute path (``[Attached: <path>]``), alongside the user's text, so agy can
+open them with its Read tool.
 """
 
 from __future__ import annotations
@@ -65,14 +31,20 @@ from pathlib import Path
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    cascade_is_current,
     inject_user_message_via_tui,
+    interrupt_turn_via_tui,
     is_placeholder_conversation_id,
     read_bridge_state,
+    turn_is_idle_via_tui,
+    wait_for_turn_idle_via_tui,
 )
 from omnigent.harnesses.antigravity_native.rpc import (
     cancel_cascade_steps,
     resolve_language_server_port,
 )
+from omnigent.harnesses.antigravity_native.stop_hook import record_stop_event
+from omnigent.harnesses.antigravity_native.transcript import resolve_owned_transcript
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -113,9 +85,11 @@ class AntigravityNativeExecutor(Executor):
         # enqueue_session_message (mid-turn steer, live message queue) don't send
         # to agy at once or deliver out of order.
         self._send_lock = asyncio.Lock()
+        self._delivery_epoch = 0
+        self._interrupt_task: asyncio.Task[bool] | None = None
 
     def supports_streaming(self) -> bool:
-        """:returns: ``False`` — assistant output is emitted by the RPC read driver."""
+        """:returns: ``False`` — assistant output is emitted by the native reader."""
         return False
 
     def supports_live_message_queue(self) -> bool:
@@ -145,12 +119,11 @@ class AntigravityNativeExecutor(Executor):
 
     async def interrupt_session(self, session_key: str) -> bool:
         """
-        Interrupt the active native Antigravity turn via ``CancelCascadeSteps``.
+        Interrupt the active native Antigravity turn through RPC or the TUI.
 
-        Resolves the cascade id from bridge state (the cascade id IS the
-        conversation id), discovers agy's connect-RPC port, and asks agy to
-        cancel the running cascade
-        (:func:`omnigent.harnesses.antigravity_native.rpc.cancel_cascade_steps`).
+        Prefer ``CancelCascadeSteps`` for a validated RPC conversation. If the
+        port is unavailable or rejects cancellation, send the TUI's visible
+        Escape cancel key to the runner-owned active pane instead.
 
         .. note:: **Scope — RUNNING cascades only (live-verified, C3).**
            ``CancelCascadeSteps`` stops an in-flight (generating) cascade — the
@@ -164,34 +137,24 @@ class AntigravityNativeExecutor(Executor):
 
         :param session_key: Adapter session key. Unused; the native bridge is
             per conversation.
-        :returns: ``True`` when agy accepted the cancel; ``False`` when there is
-            no real conversation yet (placeholder / missing or inactive bridge
-            state), no agy connect-RPC port could be resolved, or the cancel RPC
-            failed.
+        :returns: ``True`` after native idle is confirmed; ``False`` when the
+            bridge is inactive or cancellation cannot be confirmed.
         """
         del session_key
-        state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
-        if state is None or not _session_is_active(state.session_id, self._request_session_id):
-            return False
-        cascade_id = state.conversation_id
-        # No live cascade exists before agy mints its real id, so never RPC the
-        # ``agy_conv_*`` placeholder.
-        if is_placeholder_conversation_id(cascade_id):
-            return False
-        port = await asyncio.to_thread(resolve_language_server_port, cascade_id)
-        if port is None:
-            _logger.warning(
-                "antigravity native interrupt: no connect-RPC port for conversation=%s",
-                cascade_id,
-            )
-            return False
-        cancelled = await asyncio.to_thread(cancel_cascade_steps, port, cascade_id)
-        _logger.info(
-            "antigravity native interrupt via CancelCascadeSteps: conversation=%s accepted=%s",
-            cascade_id,
-            cancelled,
-        )
-        return cancelled
+        self._delivery_epoch += 1
+        if self._interrupt_task is None or self._interrupt_task.done():
+            self._interrupt_task = asyncio.create_task(self._interrupt_under_send_lock())
+        return await asyncio.shield(self._interrupt_task)
+
+    async def _interrupt_under_send_lock(self) -> bool:
+        async with self._send_lock:
+            try:
+                return await interrupt_bridge_turn(
+                    self._bridge_dir, expected_session_id=self._request_session_id
+                )
+            except (OSError, RuntimeError):
+                _logger.exception("Antigravity native cancellation failed")
+                return False
 
     async def run_turn(
         self,
@@ -201,16 +164,11 @@ class AntigravityNativeExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """
-        Deliver the latest web/mobile user message to the running agy over RPC.
+        Deliver the latest web/mobile user message to the running agy TUI.
 
-        Resolves agy's conversation/cascade id (waiting briefly for the runner to
-        mint it on the first turn), discovers the connect-RPC port, resolves the
-        per-turn model, and delivers the message via ``SendUserCascadeMessage``
-        (:func:`omnigent.harnesses.antigravity_native.rpc.send_user_cascade_message`), which
-        agy records as a real ``USER_INPUT`` turn. The assistant reply is mirrored
-        back by the RPC read driver, so this yields a single :class:`TurnComplete`
-        with no text on success (never a fabricated reply). On any failure it
-        yields one :class:`ExecutorError`.
+        The reader mirrors the native reply independently. Successful injection
+        yields :class:`TurnComplete` without text; a delivery failure yields
+        :class:`ExecutorError`.
 
         :param messages: Conversation history in executor message shape; the
             latest user message is delivered.
@@ -254,44 +212,41 @@ class AntigravityNativeExecutor(Executor):
         :func:`omnigent.harnesses.antigravity_native.bridge.inject_user_message_via_tui`)
         rather than delivered over headless ``SendUserCascadeMessage`` RPC.
 
-        Typing into the TUI is what gives antigravity-native true parity with
-        claude/codex native (#1156/#1158): the turn renders in the agy TUI AND
-        lands on the SAME cascade the TUI displays, so the read driver mirrors a
-        single, unified conversation in both directions. The headless RPC path,
-        by contrast, delivered onto a separate ``StartCascade`` cascade the TUI
-        never showed — splitting the TUI and the web mirror into two cascades
-        (the agy TUI never echoed web turns; TUI-typed turns never mirrored).
-        agy records a TUI-typed turn as a real ``CORTEX_STEP_TYPE_USER_INPUT``
-        step, exactly what the read driver keys on; the careful inject
-        (draft-clear + bracketed paste + footer-verified submit) handles the
-        attended-TUI race. RPC remains the read/control transport
-        (``StreamAgentStateUpdates`` / ``GetAllCascadeTrajectories`` /
-        ``CancelCascadeSteps`` / ``HandleCascadeUserInteraction``).
-
-        Unlike the RPC path, this needs no cascade id, port, or per-turn model
-        resolution up front: the TUI owns its cascade and its selected model, and
-        agy mints the cascade on the first typed turn (which the read driver then
-        discovers/binds — see :mod:`omnigent.harnesses.antigravity_native.reader`).
+        The TUI owns its cascade and selected model, so delivery needs no RPC
+        discovery. The send lock serializes injection with native cancellation;
+        the delivery epoch rejects messages admitted before that cancellation.
 
         :param text: User message text to deliver.
         :returns: ``None`` on success, or a human-readable error string when the
             turn could not be delivered to the TUI (e.g. the agy pane exited).
         """
+        delivery_epoch = self._delivery_epoch
         async with self._send_lock:
+            if delivery_epoch != self._delivery_epoch:
+                return "Antigravity native delivery was cancelled before injection"
             # The runner seeds bridge state before launching the terminal, so a
             # missing file means broken wiring (not a first turn) and is surfaced
             # as such.
             state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
+            if delivery_epoch != self._delivery_epoch:
+                return "Antigravity native delivery was cancelled before injection"
             if state is None:
                 return "Antigravity native bridge state is missing"
             if not _session_is_active(state.session_id, self._request_session_id):
                 return "Antigravity native session is no longer active"
             try:
-                await asyncio.to_thread(
-                    inject_user_message_via_tui,
-                    self._bridge_dir,
-                    content=text,
+                injection = asyncio.create_task(
+                    asyncio.to_thread(
+                        inject_user_message_via_tui,
+                        self._bridge_dir,
+                        content=text,
+                    )
                 )
+                try:
+                    await asyncio.shield(injection)
+                except asyncio.CancelledError:
+                    await injection
+                    raise
             except RuntimeError as exc:
                 # The TUI pane is gone / never advertised / the submit never
                 # started a turn. Surface it so the UI can prompt a restart
@@ -302,6 +257,105 @@ class AntigravityNativeExecutor(Executor):
                 state.session_id,
             )
             return None
+
+
+async def interrupt_bridge_turn(
+    bridge_dir: Path, *, expected_session_id: str | None = None
+) -> bool:
+    """Cancel one active bridge turn using its validated RPC or visible TUI pane."""
+    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+    if state is None or not _session_is_active(state.session_id, expected_session_id):
+        return False
+    expected_session_id = state.session_id
+    expected_cascade_id = state.conversation_id
+    if await asyncio.to_thread(turn_is_idle_via_tui, bridge_dir):
+        return await _record_confirmed_interruption(
+            bridge_dir,
+            expected_session_id=expected_session_id,
+            expected_cascade_id=expected_cascade_id,
+        )
+    if not is_placeholder_conversation_id(expected_cascade_id):
+        port = await asyncio.to_thread(resolve_language_server_port, expected_cascade_id)
+        if port is not None:
+            cancelled = await asyncio.to_thread(cancel_cascade_steps, port, expected_cascade_id)
+            if cancelled:
+                _logger.info(
+                    "antigravity native interrupt via CancelCascadeSteps: conversation=%s",
+                    expected_cascade_id,
+                )
+                return await _record_confirmed_interruption(
+                    bridge_dir,
+                    expected_session_id=expected_session_id,
+                    expected_cascade_id=expected_cascade_id,
+                )
+    try:
+        cancelled = await asyncio.to_thread(
+            interrupt_turn_via_tui,
+            bridge_dir,
+            expected_session_id=expected_session_id,
+            expected_cascade_id=expected_cascade_id,
+        )
+    except RuntimeError as exc:
+        _logger.warning("antigravity native TUI interrupt failed: %s", exc)
+        return False
+    if cancelled:
+        _logger.info("antigravity native interrupt via TUI Escape: session=%s", state.session_id)
+        return await _record_confirmed_interruption(
+            bridge_dir,
+            expected_session_id=expected_session_id,
+            expected_cascade_id=expected_cascade_id,
+        )
+    return False
+
+
+async def _record_confirmed_interruption(
+    bridge_dir: Path, *, expected_session_id: str, expected_cascade_id: str
+) -> bool:
+    """Close a canceled transcript turn after agy's TUI confirms it is idle."""
+    try:
+        idle = await asyncio.to_thread(wait_for_turn_idle_via_tui, bridge_dir)
+        if not idle:
+            return False
+        return await asyncio.to_thread(
+            _record_confirmed_interruption_if_current,
+            bridge_dir,
+            expected_session_id=expected_session_id,
+            expected_cascade_id=expected_cascade_id,
+        )
+    except (OSError, RuntimeError) as exc:
+        _logger.warning("antigravity native interrupt completion not recorded: %s", exc)
+        return False
+
+
+def _record_confirmed_interruption_if_current(
+    bridge_dir: Path, *, expected_session_id: str, expected_cascade_id: str
+) -> bool:
+    state = read_bridge_state(bridge_dir)
+    if (
+        state is None
+        or state.session_id != expected_session_id
+        or not cascade_is_current(expected_cascade_id, state.conversation_id)
+    ):
+        return False
+    binding = resolve_owned_transcript(bridge_dir)
+    if binding is None:
+        return True
+    state = read_bridge_state(bridge_dir)
+    if (
+        state is None
+        or state.session_id != expected_session_id
+        or not cascade_is_current(expected_cascade_id, state.conversation_id)
+        or not cascade_is_current(state.conversation_id, binding.conversation_id)
+    ):
+        return False
+    return record_stop_event(
+        bridge_dir,
+        {
+            "conversationId": binding.conversation_id,
+            "fullyIdle": True,
+            "terminationReason": "USER_CANCELED",
+        },
+    )
 
 
 def _bridge_dir_from_env() -> Path:

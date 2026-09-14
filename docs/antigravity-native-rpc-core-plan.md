@@ -1,6 +1,8 @@
 # Antigravity-native RPC Core Rework — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical implementation plan.** For the current runtime contract, see the
+> [reply compatibility design](antigravity-native-rpc-core-design.md#current-reply-compatibility-contract);
+> the checklist below is not current implementation guidance.
 
 **Goal:** Rework the antigravity-native harness runtime onto agy's connect-RPC surface — structured trajectory-step reads, interaction bridging (questions + approvals), and real interrupt — replacing the JSONL transcript-tail + send-keys-interaction core.
 

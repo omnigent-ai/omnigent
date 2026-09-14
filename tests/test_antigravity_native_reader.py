@@ -3861,17 +3861,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_rotate_session_for_cascade`` runs claude's exact session-rotation sequence.
-
-    Asserts: GET old snapshot → POST /v1/sessions (agent_id + inherited labels) →
-    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" — and that
-    bridge state is rewritten with the new session id + new cascade id. Crucially,
-    NO ``external_session_id`` PATCH is made: agy is one long-lived process hosting
-    many cascades, so the new cascade is already live (reached via the rewritten
-    bridge state, not a later ``--resume``), exactly as claude's
-    ``_create_clear_replacement_session`` makes no such PATCH. The old code PATCHed
-    it, which 400'd on the auto-cold-started session and looped the rotation.
-    """
+    """Rotation transfers the pane and records its replacement session's resume id."""
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
         read_bridge_state,
@@ -3894,8 +3884,6 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         )
 
     assert new_session_id == "conv_new"
-    # The exact ordered API sequence (method, path) mirroring claude rotation —
-    # ONE PATCH on the new session (runner_id bind), then transfer, then release.
     methods_paths = [(m, p) for (m, p, _b) in calls]
     assert methods_paths == [
         ("GET", f"/v1/sessions/{_SESSION_ID}"),
@@ -3905,13 +3893,10 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
             "POST",
             f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
         ),
+        ("PATCH", "/v1/sessions/conv_new"),
         ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
     ]
-    # No external_session_id PATCH is made anywhere (the loop-bug source): every
-    # PATCH body is a runner_id bind/release, never an external_session_id write.
-    assert all("external_session_id" not in body for (_m, _p, body) in calls), (
-        f"rotation must not PATCH external_session_id (claude parity); calls={calls!r}"
-    )
+    assert calls[4][2] == {"external_session_id": new_cascade}
     # The create POST inherited the old agent_id + bridge-id label (so the new
     # session resolves to the same bridge_dir).
     create_body = calls[1][2]
@@ -3923,7 +3908,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     # The terminal transfer targeted the new session (the SAME agy moves over).
     assert calls[3][2] == {"target_session_id": "conv_new"}
     # Old runner released.
-    assert calls[4][2] == {"runner_id": ""}
+    assert calls[5][2] == {"runner_id": ""}
     # Bridge state was rewritten to the new session + new cascade (the reader
     # rebinds to the new cascade on the SAME agy via this shared bridge_dir).
     state = read_bridge_state(bridge_dir)

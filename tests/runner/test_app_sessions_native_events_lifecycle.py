@@ -62,6 +62,135 @@ class _EventRecordingServerClient(NullServerClient):
         return self._Response()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("pending_injection", [False, True])
+async def test_events_cancel_antigravity_native_without_inprocess_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_type: str,
+    pending_injection: bool,
+) -> None:
+    """Stop cancels a pending injection and still reaches active native generation."""
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+    from omnigent.inner import antigravity_native_executor as agy_executor
+
+    conv_id = "fc7a9e4c3c4141bfb96d8ad662ea28cd"
+    bridge_id = "active-antigravity-bridge"
+    monkeypatch.setattr(agy_bridge, "_BRIDGE_ROOT", tmp_path / "agy-bridges")
+
+    class _LabelServerClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            if url == f"/v1/sessions/{conv_id}/labels":
+
+                class _Labels(self._Response):
+                    def json(self) -> dict[str, Any]:
+                        return {
+                            "labels": {
+                                agy_bridge.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id
+                            }
+                        }
+
+                return _Labels()
+            return await super().get(url, **kwargs)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    release_injection = asyncio.Event()
+
+    class _InterruptHarnessClient(_ScriptedHarnessClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if kwargs.get("json", {}).get("type") == "interrupt":
+                release_injection.set()
+                await asyncio.sleep(0)
+                response = await super().post(url, **kwargs)
+                cancelled = await agy_executor.interrupt_bridge_turn(
+                    agy_bridge.bridge_dir_for_bridge_id(bridge_id), expected_session_id=conv_id
+                )
+                response.status_code = 204 if cancelled else 503
+                return response
+            return await super().post(url, **kwargs)
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_InterruptHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_LabelServerClient(),  # type: ignore[arg-type]
+    )
+    calls: list[tuple[int, str]] = []
+    injected: list[str] = []
+    monkeypatch.setattr(
+        agy_executor,
+        "inject_user_message_via_tui",
+        lambda bridge_dir, *, content: injected.append(content),
+    )
+    monkeypatch.setattr(agy_executor, "turn_is_idle_via_tui", lambda bridge_dir: pending_injection)
+    monkeypatch.setattr(agy_executor, "resolve_language_server_port", lambda cascade_id: 43210)
+    monkeypatch.setattr(
+        agy_executor,
+        "cancel_cascade_steps",
+        lambda port, cascade_id: calls.append((port, cascade_id)) or True,
+    )
+    monkeypatch.setattr(
+        agy_executor,
+        "interrupt_turn_via_tui",
+        lambda bridge_dir, **_kwargs: pytest.fail(
+            "validated RPC should take precedence over TUI Escape"
+        ),
+    )
+    monkeypatch.setattr(agy_executor, "wait_for_turn_idle_via_tui", lambda bridge_dir: True)
+
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agy-agent"}
+        )
+        assert created.status_code == 201, created.text
+        bridge_dir = agy_bridge.bridge_dir_for_bridge_id(bridge_id)
+        agy_bridge.write_bridge_state(
+            bridge_dir,
+            agy_bridge.AntigravityNativeBridgeState(
+                session_id=conv_id, conversation_id="agy-cascade-123"
+            ),
+        )
+        assert not app.state.active_turns.get(conv_id)
+
+        task: asyncio.Task[None] | None = None
+        if pending_injection:
+            executor = agy_executor.AntigravityNativeExecutor(bridge_dir=bridge_dir)
+            injection_pending = asyncio.Event()
+
+            async def _pending_turn() -> None:
+                injection_pending.set()
+                await release_injection.wait()
+                await executor.enqueue_session_message("main", "do not inject after Stop")
+
+            task = asyncio.create_task(_pending_turn())
+            app.state.active_turns[conv_id] = task
+            await injection_pending.wait()
+
+        try:
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events", json={"type": event_type}
+            )
+        finally:
+            release_injection.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+        if task is not None:
+            assert task.cancelled()
+            assert conv_id not in app.state.active_turns
+
+    assert response.status_code == 204, response.text
+    assert calls == ([] if pending_injection else [(43210, "agy-cascade-123")])
+    assert injected == []
+
+
 class _RecordingCodexAppServerClient:
     """
     Test double for Codex app-server JSON-RPC controls.

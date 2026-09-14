@@ -1,9 +1,47 @@
 # Antigravity-native harness: RPC core rework
 
-**Status:** Design (approved direction; pending implementation plan)
+**Status:** Current reply compatibility contract, followed by historical RPC design
 **Date:** 2026-06-22
 **Supersedes:** the runtime core of PR #892 (antigravity-native). Periphery from #892 is reused.
 **Source of truth for wire shapes:** live-verified against agy 1.0.10 — see memory `agy-rpc-interaction-bridge.md`.
+
+## Current reply compatibility contract
+
+The reader prefers a validated session-owned connect-RPC conversation. If local
+RPC is unavailable, including unauthorized access, it falls back only to the
+transcript selected by the bridge's isolated CLI state. It mirrors committed
+user/assistant text in file order with idempotent source IDs, preserving Unicode
+and literal wrapper tags. Launch/resume baselines exclude earlier records.
+The user-visible scope and approval guidance are documented in the
+[README](../README.md#quick-start).
+
+The native Stop hook captures the transcript's complete-byte boundary and file
+identity. Completion follows successful delivery through that boundary, not
+merely observing a planner response or reaching EOF. This relies on the CLI
+committing its final transcript record **before Stop runs**, verified for agy
+1.2.2; verify that ordering when supporting another CLI version. The generated
+hook uses a direct Stop command array, as checked by
+[`test_antigravity_transcript_fallback.py`](../tests/test_antigravity_transcript_fallback.py);
+nested hook groups are not the verified schema. Failed turns and unverifiable
+completion boundaries produce a failed status.
+
+User Stop reaches the native runner even after in-process injection finishes.
+Cancellation prefers RPC, falls back to Escape only in the owned active TUI,
+and confirms native idle before recording a sanitized cancelled boundary;
+native cancellation may emit no Stop hook. Already idle is idempotent, while
+unconfirmed cancellation remains a transport failure. Cancellation ownership
+serializes native side effects and boundary recording against later dispatch,
+including caller disconnection. Queued messages wait while cancellation is
+pending; later authoritative idle/failed status can resume them after an
+unconfirmed Stop. See the runner cancellation regressions in
+[`test_antigravity_stop_coordination.py`](../tests/runner/test_antigravity_stop_coordination.py).
+
+## Historical RPC design
+
+The sections below record the agy 1.0.10 design and wire observations. Their
+replacement plans are historical; the contract above governs reply fallback
+and cancellation, and the
+[executor](../omnigent/inner/antigravity_native_executor.py) owns attended TUI delivery.
 
 ## 1. Motivation
 
@@ -64,9 +102,10 @@ agy still runs in a runner-owned tmux terminal (terminal-first UX preserved). Th
 - **Interaction (question/approval):** read driver sees a `WAITING` step → interaction bridge surfaces an elicitation → user resolves in the web UI → bridge re-reads the freshest `WAITING` step and POSTs `HandleCascadeUserInteraction` → agy proceeds (step → `DONE`, `completedInteractions.response` echoes the answer).
 - **Interrupt:** `interrupt_session` → `CancelCascadeSteps {cascadeId}`.
 
-## 5. What is removed
+## 5. Legacy mechanisms retired by the RPC rework
 
-- JSONL transcript tailing + partial-line buffering + UTF-8 hold-back.
+- The legacy full-step JSONL transcript forwarder; the narrow compatibility
+  reader is governed by the current contract above.
 - The durable `forwarded_steps` SET cursor, gap-free-prefix delivery, out-of-order suppression, the `<=`-floor legacy materialization.
 - The delta (`output_text_delta`) + committed-message double-emission (source of the live double-render).
 - The forwarder mirroring of `USER_INPUT` that duplicated the direct `/events` user post.
