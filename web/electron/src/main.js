@@ -575,7 +575,14 @@ function silentReauthManaged(win) {
   console.log(`[omnigent] databricks: left ${origin} (session likely expired); silent re-mint`);
   ensureDatabricksSession(session.defaultSession, origin, { interactive: false })
     .then(() => {
-      if (!win.isDestroyed()) win.webContents.reload();
+      if (win.isDestroyed()) return;
+      // Navigate back to the workspace, NOT reload(): by now the window has
+      // already committed to the login page, so a reload would just re-load
+      // login. Load the workspace mount so the freshly-minted DBAUTH cookie
+      // lands us back in the app.
+      const target =
+        windows.get(win)?.serverUrl || databricksWorkspaceUiUrl(origin) || `${origin}/omnigent`;
+      void win.loadURL(target);
     })
     .catch((err) => console.warn(`[omnigent] databricks silent re-mint failed: ${err.message}`));
 }
