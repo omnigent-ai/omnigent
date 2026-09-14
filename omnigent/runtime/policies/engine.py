@@ -367,6 +367,7 @@ class PolicyEngine:
                     accumulated,
                     accumulated_state,
                     read_only=read_only,
+                    interrupt_subagents=result.interrupt_subagents,
                 )
             if result.data is not None:
                 composed_data = result.data
@@ -412,6 +413,7 @@ class PolicyEngine:
         accumulated_state: list[StateUpdate],
         *,
         read_only: bool = False,
+        interrupt_subagents: bool = False,
     ) -> PolicyResult:
         """
         Build the DENY short-circuit result.
@@ -434,6 +436,10 @@ class PolicyEngine:
             effects (label writes and state updates). The
             returned result still carries ``set_labels`` so the
             caller can see what *would* have been written.
+        :param interrupt_subagents: The DENYing policy's request to
+            interrupt running sub-agents in the spawn tree, carried
+            through so the enforcement site (which owns runner
+            transport) can act on it.
         :returns: Composed DENY :class:`PolicyResult`.
         """
         if not read_only:
@@ -445,6 +451,7 @@ class PolicyEngine:
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
             deciding_policies=[deciding_policy],
+            interrupt_subagents=interrupt_subagents,
         )
 
     def _should_fire(

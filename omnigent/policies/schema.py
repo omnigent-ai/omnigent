@@ -299,6 +299,13 @@ class PolicyResponse(TypedDict, total=False):
         ``DENY``; withheld on ``ASK`` pending approval.
     :param set_labels: Label key-value writes. Filtered through
         the policy's ``set_labels`` whitelist (if declared).
+    :param interrupt_subagents: Only meaningful on ``DENY``. When
+        ``True``, enforcement sites that own runner transport (the
+        server's policy gates) proactively interrupt the running
+        sub-agent sessions in the spawn tree — for denies that mean
+        no further model work is permitted tree-wide (e.g. a
+        block-all cost cap), so an unattended child doesn't keep
+        looping between its own gate events.
     """
 
     result: Literal["ALLOW", "DENY", "ASK"]
@@ -306,6 +313,7 @@ class PolicyResponse(TypedDict, total=False):
     data: object
     state_updates: list[StateUpdateEntry]
     set_labels: dict[str, str]
+    interrupt_subagents: bool
 
 
 # ── Callable protocol ────────────────────────────────────────────────────────

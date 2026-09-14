@@ -6451,6 +6451,63 @@ async def _forward_session_change_to_runner_impl(
     return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
 
 
+async def _interrupt_running_subagents(
+    session_id: str,
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    runner_router: Any,
+) -> None:
+    """
+    Best-effort interrupt of every other sub-agent in this session's spawn tree.
+
+    Enforcement arm of a DENY whose policy set ``interrupt_subagents`` (a
+    block-all budget cap): the deny stops only the gated call, while an
+    unattended sub-agent re-checks policies at its own next gate event —
+    between gates a looping child runs freely past the cap. Push the same
+    ``{"type": "interrupt"}`` the human-decline path forwards to every
+    non-archived sub-agent in the tree except the denied session itself
+    (its gated call is already blocked). The tree root is never targeted:
+    its turns are human-initiated and gate themselves.
+
+    Forwards are concurrent and best-effort — a child without a bound
+    runner is silently skipped by the forwarder.
+
+    :param session_id: The session whose gate produced the DENY,
+        e.g. ``"conv_abc123"``.
+    :param conv: That session's :class:`Conversation` row (names the
+        verified tree root).
+    :param conversation_store: Store to load the spawn tree from.
+    :param runner_router: The server's ``RunnerRouter`` (may be ``None``
+        in tests / in-process setups; the forwarder falls back).
+    """
+    from omnigent.runtime.policies.builder import load_session_tree
+
+    tree = await asyncio.to_thread(
+        load_session_tree, session_id, conversation_store, conv.root_conversation_id
+    )
+    targets = [
+        c.id
+        for c in tree
+        if c.id != session_id and c.parent_conversation_id is not None and not c.archived
+    ]
+    if not targets:
+        return
+    _logger.info(
+        "policy_interrupt_subagents: session=%s interrupting %d running sub-agent(s): %s",
+        session_id,
+        len(targets),
+        targets,
+        extra={"session_id": session_id},
+    )
+    await asyncio.gather(
+        *(
+            _forward_session_change_to_runner(t, runner_router, {"type": "interrupt"})
+            for t in targets
+        ),
+        return_exceptions=True,
+    )
+
+
 async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade

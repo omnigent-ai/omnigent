@@ -210,6 +210,35 @@ def test_over_budget_denies_all_models_by_default() -> None:
         assert "All model calls are blocked" in result["reason"]
 
 
+def test_block_all_deny_requests_subagent_interrupt() -> None:
+    """A block-all over-budget DENY asks the enforcement site to interrupt sub-agents.
+
+    With no ``expensive_models`` list the cap is a true hard stop: no model
+    in the spawn tree may keep working, so the deny must carry
+    ``interrupt_subagents`` — the signal the server's policy gates use to
+    proactively stop running children (which otherwise loop freely between
+    their own gate events). Both gated phases carry it.
+    """
+    policy = cost_budget(max_cost_usd=5.0)
+    for event in (_tool(6.0), _request(6.0)):
+        result = policy(event)
+        assert result["result"] == "DENY", result
+        assert result["interrupt_subagents"] is True
+
+
+def test_downgrade_gate_deny_does_not_request_subagent_interrupt() -> None:
+    """A downgrade-gate DENY must not interrupt sub-agents.
+
+    With an explicit ``expensive_models`` list, over-budget work may continue
+    on cheaper models — children are potentially doing legitimate work, so
+    the deny (which only forces a model switch) must not cancel them.
+    """
+    policy = cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
+    result = policy(_tool(6.0, model="opus"))
+    assert result["result"] == "DENY"
+    assert not result.get("interrupt_subagents")
+
+
 def test_deny_reason_for_codex_points_to_terminal() -> None:
     """A codex-native session's deny reason says to switch in the terminal.
 
@@ -660,6 +689,37 @@ async def test_resolve_from_spec_denies_over_budget_on_expensive_model() -> None
     policy: FunctionPolicy = resolve_function_policy(spec)
     result = await policy.evaluate(_tool_ctx(6.0, "databricks-claude-opus-4-8"), {})
     assert result.action == PolicyAction.DENY
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_spec_deny_carries_subagent_interrupt() -> None:
+    """The interrupt request survives the dict → PolicyResult coercion.
+
+    The block-all deny's ``interrupt_subagents`` must reach the engine as
+    a :class:`PolicyResult` field (that is what the enforcement site
+    reads); a downgrade-gate deny must cross the same boundary as False.
+    """
+    block_all = FunctionPolicySpec(
+        name="cost",
+        on=None,
+        function=FunctionRef(path=_HANDLER, arguments={"max_cost_usd": 5.0}),
+    )
+    result = await resolve_function_policy(block_all).evaluate(
+        _tool_ctx(6.0, "databricks-claude-opus-4-8"), {}
+    )
+    assert result.action == PolicyAction.DENY
+    assert result.interrupt_subagents is True
+
+    downgrade = FunctionPolicySpec(
+        name="cost",
+        on=None,
+        function=FunctionRef(
+            path=_HANDLER, arguments={"max_cost_usd": 5.0, "expensive_models": ["opus"]}
+        ),
+    )
+    result = await resolve_function_policy(downgrade).evaluate(_tool_ctx(6.0, "opus"), {})
+    assert result.action == PolicyAction.DENY
+    assert result.interrupt_subagents is False
 
 
 @pytest.mark.asyncio

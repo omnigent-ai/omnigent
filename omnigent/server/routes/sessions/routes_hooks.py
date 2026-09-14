@@ -78,6 +78,7 @@ from omnigent.server.routes._sessions.helpers import (
     _emit_server_routing_decision,
     _forward_session_change_to_runner,
     _get_runner_client,
+    _interrupt_running_subagents,
     _native_ask_gate_lock,
     _publish_policy_denied,
     _structured_ask_user_question,
@@ -995,6 +996,19 @@ def register_hooks_routes(
         # not gated on write access.
         if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
             _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
+        # A DENY whose policy set interrupt_subagents (a block-all budget cap)
+        # blocks only this gated call; running sub-agents in the tree would
+        # keep looping until their own next gate event. Push the interrupt
+        # BEFORE returning, so the cancellation is queued by the time the
+        # deny reaches the hook (same ordering as the human-decline path).
+        # Best-effort; a read-only viewer's evaluate must not signal runners.
+        if result.action == PolicyAction.DENY and result.interrupt_subagents and not is_read_only:
+            await _interrupt_running_subagents(
+                session_id,
+                conv,
+                conversation_store,
+                get_server_runner_router(),
+            )
         # An LLM_RESPONSE DENY reaches the harness only after the assistant
         # text already streamed through the runner relay, whose terminal
         # flush would persist it as a normal assistant message. Mark the

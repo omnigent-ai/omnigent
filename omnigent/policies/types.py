@@ -272,6 +272,15 @@ class PolicyResult:
         denied ASK must leave no trace). ``None`` means "no
         state changes." e.g.
         ``[StateUpdate(key="call_count", action=StateUpdateAction.INCREMENT, value=1)]``.
+    :param interrupt_subagents: Only meaningful on DENY. ``True`` asks
+        enforcement sites that own runner transport (the server's policy
+        gates) to proactively interrupt the running sub-agent sessions in
+        the spawn tree: the deny means no further model work is permitted
+        tree-wide, and an unattended child only re-checks policies at its
+        own next gate event, so without a push it keeps running between
+        gates. Set by budget policies whose hard cap blocks all models
+        (e.g. ``cost_budget``). Best-effort at the enforcement site;
+        ``False`` (the default) leaves running sub-agents untouched.
     """
 
     action: PolicyAction
@@ -280,6 +289,7 @@ class PolicyResult:
     deciding_policies: list[str] | None = None
     data: object | None = None
     state_updates: list[StateUpdate] | None = None
+    interrupt_subagents: bool = False
 
     @property
     def deciding_policy(self) -> str | None:

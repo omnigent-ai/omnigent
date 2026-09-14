@@ -525,6 +525,12 @@ def cost_budget(
                         phase=phase,
                         block_all=cfg.block_all_models,
                     ),
+                    # A block-all cap means no model work is permitted
+                    # tree-wide, so running sub-agents must be interrupted
+                    # rather than left looping until their own next gate.
+                    # A downgrade gate (non-empty expensive_models) must not
+                    # interrupt: children may continue on cheaper models.
+                    "interrupt_subagents": cfg.block_all_models,
                 }
             # Already on a cheaper model — the downgrade gate is satisfied.
             return _ALLOW

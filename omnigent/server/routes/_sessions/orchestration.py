@@ -248,6 +248,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _handle_advise_models_mcp,
+    _interrupt_running_subagents,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -7385,7 +7386,7 @@ async def _evaluate_input_policy(
     body: SessionEventInput,
     conversation_store: ConversationStore,
     agent_store: AgentStore,
-    _runner_router: RunnerRouter | None,
+    runner_router: RunnerRouter | None,
     *,
     actor: dict[str, str] | None = None,
     file_store: FileStore | None = None,
@@ -7414,8 +7415,9 @@ async def _evaluate_input_policy(
     :param body: The validated ``message`` event.
     :param conversation_store: Store for label state.
     :param agent_store: Store for agent spec lookups.
-    :param _runner_router: Unused, kept for signature
-        consistency.
+    :param runner_router: The server's ``RunnerRouter``, used to forward
+        proactive sub-agent interrupts on a DENY that requests them
+        (may be ``None`` in tests / in-process setups).
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
@@ -7493,6 +7495,12 @@ async def _evaluate_input_policy(
     if result.action == PolicyAction.DENY:
         if result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
+        # A DENY whose policy set interrupt_subagents (a block-all budget
+        # cap) blocks only this message; running sub-agents in the tree
+        # would keep looping until their own next gate event. Push the
+        # interrupt before reporting the deny (best-effort).
+        if result.interrupt_subagents:
+            await _interrupt_running_subagents(session_id, conv, conversation_store, runner_router)
         return {
             "verdict": "deny",
             "reason": result.reason or "Denied by policy",

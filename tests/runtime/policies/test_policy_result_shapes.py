@@ -43,6 +43,7 @@ def test_policy_result_defaults() -> None:
     assert r.set_labels is None
     assert r.deciding_policy is None
     assert r.deciding_policies is None
+    assert r.interrupt_subagents is False
 
 
 def test_policy_result_full_construction() -> None:

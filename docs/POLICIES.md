@@ -501,6 +501,12 @@ def block_domains(blocked_domains: list[str]) -> callable:
 
 `state_updates` supports four actions: `"set"`, `"increment"`, `"delete"`, `"append"`.
 
+`interrupt_subagents` (optional, DENY only): when `true`, the server's policy
+gates proactively forward an interrupt to every running sub-agent session in
+the spawn tree (best-effort). Use it when the deny means no further model work
+is permitted tree-wide — e.g. `cost_budget`'s block-all hard cap — so an
+unattended child doesn't keep looping between its own gate events.
+
 ### Making policies discoverable
 
 To make custom policies appear in the UI, export a `POLICY_REGISTRY` list from your module:
