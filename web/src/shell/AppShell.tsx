@@ -714,6 +714,7 @@ export function AppShell() {
   // root's cached tree, we hold that root until the authoritative
   // resolution lands (a no-op transition once it does).
   const stickyRootRef = useRef<string | null>(null);
+  const previousRootSessionIdRef = useRef<string | null>(null);
   const queryClient = useQueryClient();
   // Derive the root from `serverConversationId` (undefined for a temp id) so the
   // fallback below never yields `temp:*` — otherwise `useChildSessions` would
@@ -1038,7 +1039,9 @@ export function AppShell() {
     // Navigating within the visible Agents tree is one continuous rail action,
     // so keep that tab while moving between its root and descendants.
     const keepAgentsAcrossTreeNavigation =
-      rightRailTab === "subagents" && rootSessionId !== null && rootSessionId !== conversationId;
+      rightRailTab === "subagents" &&
+      rootSessionId !== null &&
+      previousRootSessionIdRef.current === rootSessionId;
     let nextTab: RightRailTab =
       persisted.rightRailTab ??
       (keepAgentsAcrossTreeNavigation ? "subagents" : readDefaultWorkspaceTab());
@@ -1090,6 +1093,11 @@ export function AppShell() {
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Record the incoming root after restoration compares it with the outgoing tree.
+  useEffect(() => {
+    previousRootSessionIdRef.current = rootSessionId;
+  }, [rootSessionId]);
+
   // Session metadata can arrive after the restore effect above. Once the
   // terminal-first label is known, apply URL state first, then the per-tab
   // choice, then the configured default.
@@ -1112,14 +1120,16 @@ export function AppShell() {
     }
   }, [agentTerminal, conversationId, searchParams, terminalFirst]);
 
-  // Keep the restored/default tab valid. This runs after session restoration
-  // so an unavailable restored choice cannot overwrite its own fallback.
+  // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
-    if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "subagents", "browser"] as const).find(
-      (tab) => railTabsAvailable[tab],
-    );
-    if (next) setRightRailTab(next);
+    setRightRailTab((tab) => {
+      if (railTabsAvailable[tab]) return tab;
+      return (
+        (["files", "changes", "github", "subagents", "browser"] as const).find(
+          (candidate) => railTabsAvailable[candidate],
+        ) ?? tab
+      );
+    });
   }, [railTabsAvailable, rightRailTab]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.

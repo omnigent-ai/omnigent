@@ -19,7 +19,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -2852,22 +2852,133 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
 
+  it.each(["remembered", "default"])(
+    "preserves the %s Browser tab when the outgoing Files tab becomes unavailable",
+    (source) => {
+      vi.stubGlobal("omnigentDesktop", {
+        kind: "electron",
+        browserOpenOrNavigate: vi.fn(),
+        setBadgeCount: vi.fn(),
+      });
+      try {
+        writeSessionWorkspaceState("conv_from", { rightRailTab: "files" });
+        if (source === "remembered") {
+          writeSessionWorkspaceState("conv_to", { rightRailTab: "browser" });
+        } else {
+          localStorage.setItem("omnigent:default-workspace-tab", "browser");
+        }
+        useEnvironmentMock.mockImplementation(
+          (id) =>
+            ({
+              data: { available: id === "conv_from", root: null, home: null },
+              isLoading: false,
+            }) as ReturnType<typeof useWorkspaceEnvironment>,
+        );
+        mockConversations([
+          { id: "conv_from", permission_level: null },
+          { id: "conv_to", permission_level: null },
+        ]);
+        const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+        render(
+          <QueryClientProvider client={qc}>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/c/conv_from"]}>
+                <Routes>
+                  <Route element={<AppShell />}>
+                    <Route
+                      path="c/:conversationId"
+                      element={<SessionNavButton to="/c/conv_to" />}
+                    />
+                  </Route>
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </QueryClientProvider>,
+        );
+        expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+
+        fireEvent.click(screen.getByTestId("nav-session"));
+
+        expect(screen.getByRole("tab", { name: /Browser/i })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+        expect(readSessionWorkspaceState("conv_to").rightRailTab).toBe("browser");
+      } finally {
+        cleanup();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("uses the default when navigating from Agents to a child in another tree", () => {
+    localStorage.setItem("omnigent:default-workspace-tab", "changes");
+    writeSessionWorkspaceState("conv_from", { rightRailTab: "subagents" });
+    useSessionMock.mockImplementation((id) => ({
+      session: id
+        ? {
+            id,
+            agentId: "ag",
+            agentName: null,
+            runnerId: null,
+            status: "idle",
+            createdAt: 0,
+            title: null,
+            labels: {},
+            items: [],
+            pendingElicitations: [],
+            permissionLevel: 4,
+            parentSessionId: id === "conv_child" ? "conv_other_root" : null,
+            subAgentName: null,
+            kind: id === "conv_child" ? "sub_agent" : "default",
+          }
+        : null,
+      isLoading: false,
+      error: null,
+    }));
+    mockConversations([{ id: "conv_from", permission_level: null }]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["rootSessionId", "conv_child"], "conv_other_root");
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_from"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_child" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    expect(screen.getByRole("tab", { name: /Changes/i })).toHaveAttribute("aria-selected", "true");
+    expect(readSessionWorkspaceState("conv_child").rightRailTab).toBe("changes");
+  });
+
   it("falls back to Files when the preferred tab is unavailable", () => {
-    localStorage.setItem("omnigent:default-workspace-tab", "terminals");
+    localStorage.setItem("omnigent:default-workspace-tab", "browser");
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_no_shells", permission_level: null }]);
+    mockConversations([{ id: "conv_no_browser", permission_level: null }]);
 
-    renderShell("/c/conv_no_shells");
+    renderShell("/c/conv_no_browser");
 
-    expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
+    expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
   });
 
   it("falls back to Agents when the preferred tab and Files are unavailable", () => {
-    localStorage.setItem("omnigent:default-workspace-tab", "todos");
+    localStorage.setItem("omnigent:default-workspace-tab", "changes");
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -2877,7 +2988,7 @@ describe("Right workspace card visibility", () => {
     renderShell("/c/conv_minimal");
 
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
-    expect(screen.queryByRole("tab", { name: /Tasks/i })).toBeNull();
+    expect(screen.queryByRole("tab", { name: /Changes/i })).toBeNull();
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
   });
 
