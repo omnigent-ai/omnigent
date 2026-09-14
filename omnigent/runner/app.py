@@ -2679,6 +2679,27 @@ class _BodyRequest:
         return self._body
 
 
+def _require_full_native_lock_coverage(
+    dispatch: dict[str, dict[str, asyncio.Lock]],
+) -> dict[str, dict[str, asyncio.Lock]]:
+    """Fail fast if the native terminal lock dispatch is missing a harness.
+
+    The launch and ensure paths index this map by ``agent.key``; a native
+    harness absent from it raises ``KeyError`` mid terminal-ensure and surfaces
+    to the user as a "malformed runner response (HTTP 500)". Asserting coverage
+    at app construction catches a newly-added native harness that was not wired
+    here immediately, rather than only when someone starts that harness.
+    """
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+
+    missing = {agent.key for agent in NATIVE_CODING_AGENTS} - set(dispatch)
+    if missing:
+        raise RuntimeError(
+            f"native terminal lock dispatch is missing harness(es): {sorted(missing)}"
+        )
+    return dispatch
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -3959,20 +3980,22 @@ def create_runner_app(
             # (claude/codex/antigravity) add a pre_launch check and, for
             # claude/codex, a build_context enrichment. All wire the comment
             # relay (pi/opencode route their policy hook through it).
-            _launch_locks = {
-                "claude": _claude_terminal_ensure_locks,
-                "codex": _codex_terminal_ensure_locks,
-                "pi": _pi_terminal_ensure_locks,
-                "cursor": _cursor_terminal_ensure_locks,
-                "kiro": _kiro_terminal_ensure_locks,
-                "antigravity": _antigravity_terminal_ensure_locks,
-                "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
-                "hermes": _hermes_terminal_ensure_locks,
-                "qwen": _qwen_terminal_ensure_locks,
-                "kimi": _kimi_terminal_ensure_locks,
-                "devin": _devin_terminal_ensure_locks,
-            }[_native_agent.key]
+            _launch_locks = _require_full_native_lock_coverage(
+                {
+                    "claude": _claude_terminal_ensure_locks,
+                    "codex": _codex_terminal_ensure_locks,
+                    "pi": _pi_terminal_ensure_locks,
+                    "cursor": _cursor_terminal_ensure_locks,
+                    "kiro": _kiro_terminal_ensure_locks,
+                    "antigravity": _antigravity_terminal_ensure_locks,
+                    "opencode": _opencode_terminal_ensure_locks,
+                    "goose": _goose_terminal_ensure_locks,
+                    "hermes": _hermes_terminal_ensure_locks,
+                    "qwen": _qwen_terminal_ensure_locks,
+                    "kimi": _kimi_terminal_ensure_locks,
+                    "devin": _devin_terminal_ensure_locks,
+                }
+            )[_native_agent.key]
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -9604,20 +9627,22 @@ def create_runner_app(
             # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
             # via build_context; codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
-            _ensure_locks = {
-                "claude": _claude_terminal_ensure_locks,
-                "codex": _codex_terminal_ensure_locks,
-                "pi": _pi_terminal_ensure_locks,
-                "cursor": _cursor_terminal_ensure_locks,
-                "kiro": _kiro_terminal_ensure_locks,
-                "antigravity": _antigravity_terminal_ensure_locks,
-                "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
-                "hermes": _hermes_terminal_ensure_locks,
-                "qwen": _qwen_terminal_ensure_locks,
-                "kimi": _kimi_terminal_ensure_locks,
-                "devin": _devin_terminal_ensure_locks,
-            }[_ensure_agent.key]
+            _ensure_locks = _require_full_native_lock_coverage(
+                {
+                    "claude": _claude_terminal_ensure_locks,
+                    "codex": _codex_terminal_ensure_locks,
+                    "pi": _pi_terminal_ensure_locks,
+                    "cursor": _cursor_terminal_ensure_locks,
+                    "kiro": _kiro_terminal_ensure_locks,
+                    "antigravity": _antigravity_terminal_ensure_locks,
+                    "opencode": _opencode_terminal_ensure_locks,
+                    "goose": _goose_terminal_ensure_locks,
+                    "hermes": _hermes_terminal_ensure_locks,
+                    "qwen": _qwen_terminal_ensure_locks,
+                    "kimi": _kimi_terminal_ensure_locks,
+                    "devin": _devin_terminal_ensure_locks,
+                }
+            )[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False
 
             def _publish_ensure_event(event_session_id: str, event: _JsonObject) -> None:

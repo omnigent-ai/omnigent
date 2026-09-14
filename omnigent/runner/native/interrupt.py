@@ -140,7 +140,7 @@ class _UniformStop:
     display_name: str
 
 
-# The seven uniform interrupt harnesses (claude/codex are special-cased). pi uses
+# The eight uniform interrupt harnesses (claude/codex are special-cased). pi uses
 # enqueue_interrupt + OSError and no timeout; the rest inject_interrupt +
 # RuntimeError + timeout_s.
 _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
@@ -201,9 +201,17 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         (RuntimeError,),
         True,
     ),
+    "devin": _UniformInterrupt(
+        "omnigent.harnesses.devin_native.bridge",
+        "inject_interrupt",
+        "devin_native_interrupt_failed",
+        "devin-native interrupt",
+        (RuntimeError,),
+        True,
+    ),
 }
 
-# The six uniform stop harnesses (claude has a special stop; codex/pi have no
+# The seven uniform stop harnesses (claude has a special stop; codex/pi have no
 # distinct stop — they route to interrupt, handled in ``stop``).
 _UNIFORM_STOP: dict[str, _UniformStop] = {
     "cursor": _UniformStop(
@@ -241,6 +249,12 @@ _UNIFORM_STOP: dict[str, _UniformStop] = {
         "qwen_native_stop_failed",
         "qwen-native stop",
         "Qwen",
+    ),
+    "devin": _UniformStop(
+        "omnigent.harnesses.devin_native.bridge",
+        "devin_native_stop_failed",
+        "devin-native stop",
+        "Devin",
     ),
 }
 
