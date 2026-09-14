@@ -26,8 +26,9 @@ export function TipTapCodeBlockView({ node, updateAttributes, editor }: NodeView
   // picker must not offer to mutate the doc in that case.
   const editable = editor.isEditable;
 
-  // If the doc uses a language not in our quick-pick list (e.g. ```rust), keep
-  // it selectable so switching away and back doesn't silently drop it.
+  // Surface a language not in the quick-pick list (e.g. ```rust) as the current
+  // option so the picker shows it selected instead of falling back to the first
+  // entry. (Switching away rewrites the fence, as with any language.)
   const options = useMemo(() => {
     if (language && !CODE_BLOCK_LANGUAGES.some((l) => l.value === language)) {
       return [...CODE_BLOCK_LANGUAGES, { value: language, label: language }];
@@ -37,9 +38,16 @@ export function TipTapCodeBlockView({ node, updateAttributes, editor }: NodeView
 
   const onLanguageChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
+      // Programmatic commands bypass the read-only DOM guard, so re-check here.
+      if (!editor.isEditable) return;
+      // The native <select> stole focus from the editor, so updateAttributes
+      // would fire an update while blurred — which the autosave/dirty wiring
+      // treats as a load-time re-baseline and never persists. Refocus first so
+      // the language change saves like any edit.
+      editor.commands.focus();
       updateAttributes({ language: e.target.value || null });
     },
-    [updateAttributes],
+    [editor, updateAttributes],
   );
 
   return (

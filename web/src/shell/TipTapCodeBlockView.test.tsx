@@ -31,16 +31,17 @@ function renderView(
   overrides: { language?: string | null; textContent?: string; editable?: boolean } = {},
 ) {
   const updateAttributes = vi.fn();
+  const focus = vi.fn();
   const props = {
     node: {
       attrs: { language: overrides.language ?? null },
       textContent: overrides.textContent ?? "",
     },
     updateAttributes,
-    editor: { isEditable: overrides.editable ?? true },
+    editor: { isEditable: overrides.editable ?? true, commands: { focus } },
   } as unknown as NodeViewProps;
   render(<TipTapCodeBlockView {...props} />);
-  return { updateAttributes };
+  return { updateAttributes, focus };
 }
 
 describe("TipTapCodeBlockView", () => {
@@ -68,6 +69,17 @@ describe("TipTapCodeBlockView", () => {
     const { updateAttributes } = renderView({ language: "python" });
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "mermaid" } });
     expect(updateAttributes).toHaveBeenCalledWith({ language: "mermaid" });
+  });
+
+  it("refocuses the editor before updating so the change autosaves", () => {
+    // The native <select> blurs the editor; without a refocus the language
+    // update fires while blurred and the autosave wiring drops it.
+    const { updateAttributes, focus } = renderView({ language: "python" });
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "mermaid" } });
+    expect(focus).toHaveBeenCalled();
+    expect(focus.mock.invocationCallOrder[0]).toBeLessThan(
+      updateAttributes.mock.invocationCallOrder[0],
+    );
   });
 
   it("maps the empty selection back to a null language", () => {
