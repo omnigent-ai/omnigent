@@ -140,6 +140,7 @@ def test_reasoning_effort_is_optional_and_validated() -> None:
         "high",
         "xhigh",
         "max",
+        "ultra",
     ]
     assert "reasoning_effort" not in branch["required"]
     _validate({"input": "go", "reasoning_effort": "high"})

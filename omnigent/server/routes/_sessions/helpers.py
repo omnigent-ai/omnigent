@@ -1,11051 +1,1913 @@
-"""Lower-layer helpers for the sessions routes (call-depth 0-1).
-
-Leaf/near-leaf helpers extracted from ``sessions.py``: SSE item builders,
-publishers, persistence, validation, and the runner-forward primitives.
-Imports shared state/constants from ``.common``; imported by
-``.orchestration`` and by the router in ``sessions.py``."""
-
-from __future__ import annotations
-
-import asyncio
-import contextlib
-import json
-import math
-import re
-import secrets
-import time
-import urllib.parse
-import weakref
-from collections import deque
-from collections.abc import (
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Coroutine,
-    Iterable,
-    Mapping,
-    Sequence,
-)
-from dataclasses import dataclass
-from typing import Any, Literal, cast
-
-import httpx
-from fastapi import (
-    HTTPException,
-    Request,
-    UploadFile,
-)
-from fastapi.responses import Response
-from pydantic import ValidationError
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
-
-from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
-from omnigent.db.utils import generate_task_id
-from omnigent.entities import (
-    USER_SESSION_TITLE_MAX_CHARS,
-    Agent,
-    Conversation,
-    ConversationItem,
-    ErrorData,
-    MessageData,
-    NewConversationItem,
-    SlashCommandData,
-    StoredFile,
-    synthesize_conversation_title,
-)
-from omnigent.entities.conversation import (
-    ITEM_TYPE_TO_DATA_CLS,
-    parse_item_data,
-)
-from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_plugins import (
-    NativeCodingAgent,
-)
-from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.model_override import validate_model_override
-from omnigent.native.native_coding_agents import (
-    native_coding_agent_for_harness,
-    native_coding_agent_for_wrapper_label,
-)
-from omnigent.policies.types import EvaluationContext
-from omnigent.runner.identity import (
-    token_bound_runner_id,
-)
-from omnigent.runner.launch_failure import classify_native_turn_error
-from omnigent.runner.routing import RunnerRouter
-from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
-from omnigent.runtime import (
-    get_policy_store,
-    inflight_text,
-    pending_elicitations,
-    pending_inputs,
-)
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.policies.engine import PolicyEngine
-from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state
-from omnigent.server._elicitation_registry import (
-    _harness_elicitation_owners,
-    _harness_parked_elicitations,
-    _harness_pre_resolved_elicitations,
-    _PreResolvedHarnessElicitation,
-)
-from omnigent.server.auth import (
-    LEVEL_OWNER,
-    LEVEL_READ,
-    RESERVED_USER_PUBLIC,
-)
-from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
-from omnigent.server.managed_hosts import (
-    MANAGED_SANDBOX_LABEL_NAMESPACE,
-    ManagedHostLaunch,
-    ManagedLaunch,
-    ManagedLaunchTracker,
-    ManagedSandboxDeployment,
-    RepoWorkspace,
-)
-from omnigent.server.routes._auth_helpers import (
-    require_access as _require_access,
-)
-from omnigent.server.routes._host_worktree import CreatedWorktree
-from omnigent.server.routes._session_create_validation import (
-    validate_existing_host_workspace,
-)
-
-# Shared constants, state, and small dataclasses live in the _sessions.common
-# leaf module; import them here so this module and its re-exporters see the same
-# objects. The mutable caches are shared by reference across the package.
-# Runtime bindings that tests patch on the historical ``sessions`` facade are
-# imported from common as facade-delegating proxies. They stay out of common's
-# ``__all__`` and the facade's explicit re-exports, preserving its real runtime
-# bindings so a facade-level monkeypatch is honoured in this module too.
-from omnigent.server.routes._sessions.common import (  # noqa: F401
-    _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
-    _ACP_SUBAGENT_ID_LABEL_KEY,
-    _ANTIGRAVITY_NATIVE_HARNESS,
-    _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY,
-    _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
-    _ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL_KEY,
-    _ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
-    _ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY,
-    _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-    _APPROVAL_TYPE,
-    _CHILD_PREVIEW_LIMIT,
-    _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
-    _CLAUDE_NATIVE_EDIT_TOOLS,
-    _CLAUDE_NATIVE_HARNESS,
-    _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
-    _CLAUDE_NATIVE_PERMISSION_MODES,
-    _CLAUDE_NATIVE_READABLE_PERMISSION_MODES,
-    _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
-    _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
-    _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-    _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY,
-    _CLAUDE_NATIVE_UI_LABEL_KEY,
-    _CLAUDE_NATIVE_UI_LABEL_VALUE,
-    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
-    _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
-    _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
-    _CODEX_NATIVE_COLLABORATION_MODES,
-    _CODEX_NATIVE_HARNESS,
-    _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
-    _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY,
-    _CODEX_NATIVE_SUBAGENT_PARENT_THREAD_ID_LABEL_KEY,
-    _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY,
-    _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY,
-    _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
-    _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
-    _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-    _CURSOR_FORK_HISTORY_HARNESSES,
-    _CURSOR_NATIVE_HARNESS,
-    _DENY_SENTINEL_PREFIX,
-    _ELICITATION_MODE,
-    _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
-    _FORK_HISTORY_NATIVE_HARNESSES,
-    _HOOK_ELICITATION_ID_RE,
-    _HOST_LAUNCH_RESULT_TIMEOUT_S,
-    _KIMI_NATIVE_HARNESS,
-    _LABEL_VALUE_MAX_LEN,
-    _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
-    _LAST_TASK_ERROR_CODE_LABEL_KEY,
-    _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
-    _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
-    _LAST_TASK_ERROR_TITLE_LABEL_KEY,
-    _MAX_TERMINAL_LAUNCH_ARG_LEN,
-    _MAX_TERMINAL_LAUNCH_ARGS,
-    _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
-    _MODEL_TOKEN_KEYS,
-    _NATIVE_POLICY_NOT_ENFORCED_CODE,
-    _NATIVE_TERMINAL_ENSURE_FAILED_CODE,
-    _PI_NATIVE_WRAPPER_LABEL_VALUE,
-    _RUNNER_CONVICTION_POLL_S,
-    _RUNNER_FORWARD_TIMEOUT,
-    _SERVER_STREAM_EVENT_ADAPTER,
-    _SESSION_STREAM_HEARTBEAT_INTERVAL_S,
-    _SHARED_DISCOVERY_KEY,
-    _SLASH_COMMAND_TYPE,
-    _STOP_RUNNER_RESULT_TIMEOUT_S,
-    _STOP_SESSION_TYPE,
-    _TURN_ACTOR_LABEL,
-    _UI_ADDED_AGENT_TITLE_PREFIX,
-    _UPLOAD_READ_CHUNK_BYTES,
-    COST_CONTROL_OVERRIDE_VALUES,
-    SUBAGENT_ROUTING_OVERRIDE_VALUES,
-    _catalog_prefetch_tasks,
-    _logger,
-    _managed_launch_tasks,
-    _model_options_cache,
-    _model_options_inflight,
-    _model_options_stale,
-    _native_ask_gate_locks,
-    _pending_policy_ask_writes,
-    _pushed_model_options_cache,
-    _read_explicit_unread,
-    _read_last_seen,
-    _runner_skills_cache,
-    _runner_skills_inflight,
-    _runner_skills_stale,
-    _session_active_response_cache,
-    _session_background_task_count_cache,
-    _session_background_tasks_cache,
-    _session_mcp_startup_cache,
-    _session_sandbox_status_cache,
-    _session_status_cache,
-    _session_terminal_pending_cache,
-    _session_todos_cache,
-    build_policy_engine,
-    get_agent_cache,
-    get_caps,
-    get_server_host_registry,
-    get_server_runner_router,
-    session_stream,
-    set_server_runner_router,
-    user_session_stream,
-)
-from omnigent.server.schemas import (
-    BackgroundTaskInfo,
-    ChildSessionSummary,
-    CompletedEvent,
-    CreatedSessionResponse,
-    ErrorDetail,
-    ErrorEvent,
-    McpServerStartup,
-    ModelUsage,
-    NativeModelOption,
-    OutputItemDoneEvent,
-    OutputTextDeltaEvent,
-    PolicyDeniedEvent,
-    ReasoningStartedEvent,
-    ReasoningTextDeltaEvent,
-    ResponseObject,
-    RetryErrorDetail,
-    SandboxStatus,
-    SessionBtwSidechatEvent,
-    SessionChildSessionUpdatedEvent,
-    SessionCodexApprovalModeEvent,
-    SessionCollaborationModeEvent,
-    SessionCreatedEvent,
-    SessionCreateMetadata,
-    SessionEventInput,
-    SessionGitOptions,
-    SessionInputConsumedEvent,
-    SessionInputConsumedPayload,
-    SessionInterruptedEvent,
-    SessionInterruptedPayload,
-    SessionListItem,
-    SessionMcpStartupEvent,
-    SessionModelEvent,
-    SessionModelOptionsEvent,
-    SessionPermissionModeEvent,
-    SessionReasoningEffortEvent,
-    SessionResourceListPage,
-    SessionResourcePaginatedList,
-    SessionSandboxStatusEvent,
-    SessionSkillsEvent,
-    SessionStatusEvent,
-    SessionSupersededEvent,
-    SessionTerminalPendingEvent,
-    SessionTitleEvent,
-    SessionTodosEvent,
-    SkillSummary,
-    ToolOutputDeltaEvent,
-)
-from omnigent.spec.types import (
-    AgentSpec,
-    Phase,
-    PolicyAction,
-)
-from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import (
-    ARCHIVED_AT_LABEL_KEY,
-    PINNED_LABEL_KEY,
-    ConversationNotFoundError,
-    NameAlreadyExistsError,
-)
-from omnigent.stores.host_store import Host, HostStore
-from omnigent.stores.permission_store import PermissionStore
-from omnigent.util.cost_plan import (
-    COST_CONTROL_LABEL_NAMESPACE,
-    reserved_cost_control_keys,
-)
-from omnigent.util.reasoning_effort import (
-    EFFORT_VALUES,
-    validate_effort,
-)
-from omnigent.util.session_lifecycle import (
-    labels_with_closed_status,
-    title_without_closed_marker,
-)
-
-
-def _codex_plan_mode_enabled(mode: str) -> bool:
-    """
-    Convert a validated Codex collaboration mode kind to the UI-facing flag.
-
-    :param mode: Codex collaboration mode kind, e.g. ``"plan"`` or
-        ``"default"``.
-    :returns: ``True`` for Plan mode.
-    """
-    return mode == "plan"
-
-
-def _publish_collaboration_mode(session_id: str, mode: str) -> None:
-    """
-    Publish the live collaboration-mode for a session.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param mode: The active collaboration mode string, e.g.
-        ``"plan"`` or ``"default"``.
-    :returns: None.
-    """
-    event = SessionCollaborationModeEvent(
-        type="session.collaboration_mode",
-        conversation_id=session_id,
-        mode=mode,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_permission_mode(session_id: str, mode: str) -> None:
-    """
-    Publish the live claude-native permission mode for a session.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param mode: The active permission mode, e.g. ``"auto"``.
-    :returns: None.
-    """
-    event = SessionPermissionModeEvent(
-        type="session.permission_mode",
-        conversation_id=session_id,
-        permission_mode=mode,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_codex_approval_mode(session_id: str, mode: str) -> None:
-    """
-    Publish the live codex-native approval/sandbox mode for a session.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param mode: The active approval mode, e.g. ``"read-only"``.
-    :returns: None.
-    """
-    event = SessionCodexApprovalModeEvent(
-        type="session.codex_approval_mode",
-        conversation_id=session_id,
-        approval_mode=mode,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
-    """
-    Publish a native policy-DENY signal on the session stream.
-
-    A native harness's policy DENY is decided synchronously in the
-    ``/policies/evaluate`` hook response, so nothing on the stream otherwise
-    reflects that an action was blocked. This surfaces the decision as a
-    positive event for observers (web UI, capability bench). Fire-and-forget.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param reason: Deny reason from the deciding policy.
-    :param phase: The policy phase the DENY landed on, e.g. ``"tool_call"``.
-    :returns: None.
-    """
-    event = PolicyDeniedEvent(
-        type="response.policy_denied",
-        conversation_id=session_id,
-        reason=reason,
-        phase=phase,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _allow_auto_mode_eligible(tool_name: str, permission_mode: str | None) -> bool:
-    """
-    Whether a regular Claude permission prompt may offer a session-scoped auto-mode switch.
-
-    Reuses the remember-ineligible set on purpose: those are exactly the
-    bespoke-card tools (ExitPlanMode, AskUserQuestion) with their own
-    approval flows, where a generic auto-mode button never belongs.
-
-    :param tool_name: The gated tool from Claude's PermissionRequest payload.
-    :param permission_mode: Claude's current permission mode, or None when absent.
-    :returns: True for tool approvals outside planning and already-automatic modes.
-    """
-    return tool_name not in _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS and permission_mode in (
-        None,
-        "default",
-        "acceptEdits",
-    )
-
-
-def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bool:
-    """
-    Whether a claude-native PermissionRequest may offer / honor the
-    "Accept & allow all edits" affordance.
-
-    Eligible for file-editing tools under a mode that still prompts,
-    and for ``ExitPlanMode`` â€” accepting a plan with the flag is the
-    plan card's "Yes, and use auto mode" option (exit plan mode AND
-    switch the session into Claude's ``auto`` mode).
-    Already-permissive modes (``acceptEdits`` / ``bypassPermissions``)
-    wouldn't prompt at all, so the switch would be inert. Used at BOTH
-    the stamp site (drives the UI button) and the verdict site (gates
-    the ``setMode`` decision), so the server never honors a
-    client-supplied ``allow_all_edits`` flag on a tool/mode the
-    affordance was never offered for.
-
-    :param tool_name: The gated tool from Claude's PermissionRequest
-        payload, e.g. ``"Edit"`` or ``"Bash"``.
-    :param permission_mode: Claude's current permission mode from the
-        payload, e.g. ``"default"`` / ``"plan"`` / ``"acceptEdits"`` /
-        ``None`` when absent.
-    :returns: ``True`` iff the affordance applies.
-    """
-    return (
-        tool_name in _CLAUDE_NATIVE_EDIT_TOOLS or tool_name == "ExitPlanMode"
-    ) and permission_mode not in (
-        "acceptEdits",
-        "bypassPermissions",
-    )
-
-
-def _allow_remember_eligible(tool_name: str, permission_mode: str | None) -> bool:
-    """
-    Whether a claude-native PermissionRequest may offer / honor the
-    persistent "don't ask again" affordance â€” a session-scoped allow
-    rule for the gated tool (WebFetch domain, or tool-wide otherwise).
-
-    This restores native Claude Code parity for NON-edit tools: the
-    native TUI lets the user approve a tool/domain once and adds an
-    allow rule so same-scope calls stop prompting. The web UI used to
-    collapse every prompt into binary Approve/Reject and never wrote a
-    rule, so e.g. each WebFetch â€” even same-domain github.com URLs â€”
-    re-prompted forever.
-
-    Eligible for any tool that ISN'T an edit tool (those take the
-    ``acceptEdits`` ``setMode`` path) and isn't one of the tools with a
-    bespoke card (see ``_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS``),
-    under any mode that still prompts. ``bypassPermissions`` never
-    prompts (the hook doesn't even fire), so a rule there would be
-    inert. Used at BOTH the stamp site (drives the UI button) and the
-    verdict site (gates the ``addRules`` decision), so the server never
-    honors a client-supplied ``remember`` flag on a tool/mode the
-    affordance was never offered for.
-
-    :param tool_name: The gated tool from Claude's PermissionRequest
-        payload, e.g. ``"WebFetch"`` or ``"Bash"``.
-    :param permission_mode: Claude's current permission mode from the
-        payload, e.g. ``"default"`` / ``"plan"`` / ``"acceptEdits"`` /
-        ``None`` when absent.
-    :returns: ``True`` iff the affordance applies.
-    """
-    return (
-        tool_name not in _CLAUDE_NATIVE_EDIT_TOOLS
-        and tool_name not in _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS
-        and permission_mode != "bypassPermissions"
-    )
-
-
-def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
-    """
-    Derive the domain host that a WebFetch "don't ask again" rule should
-    scope to, from the gated tool's input.
-
-    For ``WebFetch`` the persistent rule is scoped to the request's
-    host (``WebFetch(domain:<host>)`` in Claude rule syntax), so
-    approving ``https://github.com/a/b`` stops prompting for
-    ``https://github.com/c/d`` too â€” but not for other domains. Any
-    other tool (or a WebFetch with a missing/unparseable URL) returns
-    ``None``, which the callers treat as a tool-wide scope.
-
-    Only ``http`` / ``https`` URLs yield a domain scope: WebFetch
-    domain permissions are semantically HTTP(S)-oriented, so a
-    non-HTTP scheme (``ftp://``, ``file://``, â€¦) falls back to a
-    tool-wide rule rather than persisting a ``domain:<host>`` that
-    would never match a real fetch.
-
-    :param tool_name: The gated tool from Claude's PermissionRequest
-        payload.
-    :param tool_input: The tool's input dict (``None``/non-dict tolerated).
-    :returns: The lowercased host (no port), bracketed when it is an IPv6
-        literal (``[2001:db8::1]``), or ``None`` when no domain scope
-        applies.
-    """
-    if tool_name != "WebFetch" or not isinstance(tool_input, dict):
-        return None
-    url = tool_input.get("url")
-    if not isinstance(url, str) or not url:
-        return None
-    try:
-        parsed = urllib.parse.urlparse(url)
-    except ValueError:
-        return None
-    if parsed.scheme.lower() not in ("http", "https"):
-        return None
-    host = parsed.hostname
-    if not host:
-        return None
-    # urlparse already lowercases ``hostname`` and strips the port and
-    # any userinfo; lower() again makes the documented invariant explicit.
-    host = host.lower()
-    # urlparse strips the brackets off an IPv6 literal authority
-    # (``[2001:db8::1]`` â†’ ``2001:db8::1``), but Claude's
-    # ``domain:<host>`` rule grammar is colon-delimited, so a bare
-    # colon-laden IPv6 atom persists a broken/inert rule (the user
-    # clicks "don't ask again" and keeps getting prompted). A registered
-    # domain name can never contain a colon, so a ``:`` here is an
-    # unambiguous IPv6 literal â€” re-bracket it so the emitted rule is
-    # ``domain:[2001:db8::1]``.
-    if ":" in host:
-        return f"[{host}]"
-    return host
-
-
-def _read_state_entry(user_id: str | None, session_id: str) -> tuple[int | None, bool]:
-    """
-    Read the caller's read-state for one session, for embedding in the
-    per-user ``GET /v1/sessions`` list items.
-
-    :param user_id: Authenticated user id, or ``None`` in single-user mode.
-    :param session_id: Session/conversation identifier.
-    :returns: ``(last_seen, unread)`` â€” the wall-clock baseline (or ``None``
-        when the user has never seen the session) and the explicit-unread flag.
-    """
-    key = _discovery_key(user_id)
-    last_seen = _read_last_seen.get(key, {}).get(session_id)
-    unread = session_id in _read_explicit_unread.get(key, set())
-    return last_seen, unread
-
-
-def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread: bool) -> None:
-    """
-    Set the caller's read-state for one session.
-
-    :param user_id: Authenticated user id, or ``None`` in single-user mode.
-    :param session_id: Session/conversation identifier.
-    :param last_seen: Wall-clock baseline in seconds.
-    :param unread: Whether the session is explicitly flagged unread.
-    """
-    key = _discovery_key(user_id)
-    _read_last_seen.setdefault(key, {})[session_id] = last_seen
-    if unread:
-        _read_explicit_unread.setdefault(key, set()).add(session_id)
-    else:
-        unread_set = _read_explicit_unread.get(key)
-        if unread_set is not None:
-            unread_set.discard(session_id)
-
-
-def _prune_session_read_state(session_id: str) -> None:
-    """
-    Drop a session's read-state from every user's caches.
-
-    Called when a session leaves the default view for good â€” on delete, and
-    on archive (archived sessions are hidden and never show the unread dot).
-    This bounds the otherwise-monotonic ``_read_last_seen`` growth to live,
-    non-archived sessions. Read-state is a session-level removal (the session
-    is gone/archived for everyone), so it clears across all users. Unarchiving
-    does NOT restore the prior state â€” the session reads as seen, which is the
-    intended "done with it" semantics of archiving.
-
-    :param session_id: Session/conversation identifier.
-    """
-    for seen in _read_last_seen.values():
-        seen.pop(session_id, None)
-    for unread in _read_explicit_unread.values():
-        unread.discard(session_id)
-
-
-def _discovery_key(user_id: str | None) -> str:
-    """
-    Map an (optional) user id to the :mod:`user_session_stream` channel key.
-
-    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
-        ``None`` in single-user / no-auth mode.
-    :returns: ``user_id`` when set, else :data:`_SHARED_DISCOVERY_KEY`.
-    """
-    return user_id if user_id is not None else _SHARED_DISCOVERY_KEY
-
-
-def _announce_session_added(user_id: str | None, session_id: str) -> None:
-    """
-    Push a ``session_added`` discovery event to a user's updates streams.
-
-    Called after a session becomes accessible to ``user_id`` (created, forked,
-    or shared) so that user's open tabs surface it without a list poll. A no-op
-    when the user has no stream connected.
-
-    :param user_id: The user the session is now accessible to (the owner on
-        create/fork, the grantee on share), or ``None`` in single-user mode.
-    :param session_id: The newly-accessible session id, e.g. ``"conv_abc123"``.
-    """
-    user_session_stream.publish(
-        _discovery_key(user_id), {"type": "session_added", "session_id": session_id}
-    )
-
-
-def announce_hosts_changed(user_id: str | None) -> None:
-    """
-    Push a ``hosts_changed`` event to a user's session-updates streams.
-
-    Called when a host owned by ``user_id`` connects or disconnects so the
-    client invalidates its hosts cache without polling. A no-op when the user
-    has no stream connected.
-
-    :param user_id: Owner of the host that changed, or ``None`` in
-        single-user mode.
-    """
-    user_session_stream.publish(_discovery_key(user_id), {"type": "hosts_changed"})
-
-
-def announce_projects_changed(user_id: str | None) -> None:
-    """
-    Push a ``projects_changed`` event to a user's session-updates streams.
-
-    Called after one of ``user_id``'s projects is created, updated (renamed,
-    config change), or deleted, so that user's other connected clients refresh
-    their projects cache instead of showing the stale name until a reload. A
-    no-op when the user has no stream connected.
-
-    :param user_id: Owner of the project that changed, or ``None`` in
-        single-user mode.
-    """
-    user_session_stream.publish(_discovery_key(user_id), {"type": "projects_changed"})
-
-
-def _native_ask_gate_lock(conversation_id: str, deciding_policy: str) -> asyncio.Lock:
-    """
-    Return the lock serializing native ASK gates for one (session, policy).
-
-    Concurrent native tool calls that all trip the same ASKing policy must
-    prompt the human once, not once each. Callers hold the returned lock
-    across the entire human-approval wait and re-evaluate the policy under it;
-    the first approval records a checkpoint that collapses the siblings to
-    ALLOW. Get-or-create is race-free because there is no ``await`` between the
-    lookup and the insert (single event loop).
-
-    :param conversation_id: Omnigent conversation id whose ASK gate is being
-        serialized, e.g. ``"conv_abc123"``. Sub-agent native tool calls
-        evaluate against the parent conversation id, so they share its lock.
-    :param deciding_policy: Name of the policy that produced the ASK verdict,
-        e.g. ``"session_cost_guard"``. Distinct policies get distinct locks so
-        their approval prompts can surface concurrently.
-    :returns: A process-wide :class:`asyncio.Lock` shared by every concurrent
-        caller for the same ``(conversation_id, deciding_policy)`` pair.
-    """
-    key = (conversation_id, deciding_policy)
-    lock = _native_ask_gate_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _native_ask_gate_locks[key] = lock
-    return lock
-
-
-async def _poll_request_disconnect(*args: Any, **kwargs: Any) -> None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._poll_request_disconnect(*args, **kwargs)
-
-
-async def _poll_request_disconnect_impl(request: Request) -> None:
-    """
-    Resolve once Starlette reports the client closed the connection.
-
-    Long-poll routes that park on a verdict (e.g. the Claude-native
-    ``PermissionRequest`` hook) use this to detect that the upstream
-    client has hung up â€” Claude closes its HTTP request when its
-    TUI prompt receives an answer first, and without this wait the
-    handler would sit out the full timeout to notice.
-
-    Blocks on ``request.receive()`` rather than polling
-    ``request.is_disconnected()``. The poll variant runs each check
-    inside a pre-cancelled anyio ``CancelScope`` (Starlette's
-    non-blocking receive idiom); an external ``Task.cancel()`` that
-    lands while that scope is unwinding coalesces with the scope's own
-    cancellation and is swallowed with it, so the poller survives its
-    cancel and the caller's race cleanup blocks on it forever.
-    A blocking receive has no cancel scope in its await chain, so
-    cancellation always propagates; it is also cheaper than waking
-    twice a second.
-
-    :param request: The active FastAPI :class:`Request`. By the time
-        the handler parks, the route has consumed the body, so the
-        next receive yields only ``http.disconnect``.
-    :returns: None when the disconnect is observed. Cancellation
-        propagates: callers that race this against a verdict Future
-        cancel the wait once the verdict arrives.
-    """
-    while True:
-        message = await request.receive()
-        if message["type"] == "http.disconnect":
-            return
-
-
-def _attachment_disposition(filename: str) -> str:
-    """Build a safe ``Content-Disposition: attachment`` header value.
-
-    The filename is user-controlled, so it cannot be interpolated
-    into the header verbatim â€” a quote or newline would let the
-    uploader inject header content or break parsing. We emit an
-    ASCII-only ``filename`` fallback (with quotes/backslashes/control
-    characters stripped) plus an RFC 5987 ``filename*`` parameter that
-    percent-encodes the full UTF-8 name for modern browsers.
-
-    :param filename: The stored, user-supplied filename.
-    :returns: A ``Content-Disposition`` header value forcing download.
-    """
-    # ASCII fallback: drop anything outside printable ASCII and the
-    # characters that are structurally significant in the header.
-    ascii_name = "".join(ch for ch in filename if 0x20 <= ord(ch) < 0x7F and ch not in '"\\')
-    if not ascii_name:
-        ascii_name = "download"
-    encoded = urllib.parse.quote(filename, safe="")
-    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
-
-
-# A file id maps to one set of bytes for the file's whole life â€” content is
-# never rewritten in place, only deleted â€” so the id is a strong validator and
-# the bytes can be cached indefinitely. ``private`` keeps the response out of
-# shared caches, since the bytes are readable only by session members.
-FILE_CONTENT_CACHE_CONTROL = "private, max-age=31536000, immutable"
-
-
-def _file_content_etag(file_id: str) -> str:
-    """Build the strong ``ETag`` for a stored file's content.
-
-    :param file_id: The stored file identifier.
-    :returns: A quoted entity tag value.
-    """
-    return f'"{file_id}"'
-
-
-def _if_none_match_matches(header: str | None, etag: str) -> bool:
-    """Check an ``If-None-Match`` request header against an entity tag.
-
-    :param header: Raw ``If-None-Match`` value, or ``None`` when absent.
-    :param etag: The current entity tag, quoted.
-    :returns: ``True`` when the client's cached copy is still current.
-    """
-    if not header:
-        return False
-    candidates = [candidate.strip() for candidate in header.split(",")]
-    if "*" in candidates:
-        return True
-    # Comparison is weak per RFC 9110: strip the ``W/`` prefix before matching.
-    return any(candidate.removeprefix("W/") == etag for candidate in candidates)
-
-
-def _stored_file_to_resource(
-    session_id: str,
-    stored: StoredFile,
-) -> dict[str, Any]:
-    """Convert a :class:`StoredFile` to a session file resource dict.
-
-    Matches the ``session.resource`` shape with ``type: "file"``
-    used by the unified inventory and the session-scoped file
-    endpoints.
-
-    :param session_id: Owning session/conversation id.
-    :param stored: The stored file entity.
-    :returns: JSON-serializable resource dict.
-    """
-    return {
-        "id": stored.id,
-        "object": "session.resource",
-        "type": "file",
-        "session_id": session_id,
-        "name": stored.filename,
-        "metadata": {
-            "filename": stored.filename,
-            "bytes": stored.bytes,
-            "created_at": stored.created_at,
-        },
-    }
-
-
-def _publish_and_persist_resource_event(
-    session_id: str,
-    event_type: str,
-    resource_id: str,
-    resource_type: str,
-    conversation_store: ConversationStore,
-    resource: dict[str, Any] | None = None,
-) -> None:
-    """Publish an SSE event and persist it as a conversation item.
-
-    Emits the event on the live session stream so connected
-    clients see it immediately, and appends a ``resource_event``
-    conversation item so reconnecting clients discover it in the
-    snapshot.
-
-    :param session_id: Session/conversation identifier.
-    :param event_type: SSE event type, e.g.
-        ``"session.resource.created"``.
-    :param resource_id: Opaque id of the affected resource.
-    :param resource_type: Kind of resource, e.g. ``"terminal"``.
-    :param conversation_store: Store for persisting the item.
-    :param resource: Full resource dict for created events.
-    """
-    from omnigent.entities.conversation import ResourceEventData
-
-    sse_payload: dict[str, Any] = {"type": event_type}
-    if event_type == "session.resource.created":
-        sse_payload["resource"] = resource or {}
-    else:
-        sse_payload["resource_id"] = resource_id
-        sse_payload["resource_type"] = resource_type
-        sse_payload["session_id"] = session_id
-
-    session_stream.publish(session_id, sse_payload)
-
-    item = NewConversationItem(
-        type="resource_event",
-        response_id=session_id,
-        data=ResourceEventData(
-            event_type=event_type,
-            resource_id=resource_id,
-            resource_type=resource_type,
-            resource=resource,
-        ),
-    )
-    try:
-        conversation_store.append(session_id, [item])
-    except (AttributeError, TypeError, ValueError, RuntimeError):
-        _logger.debug(
-            "Failed to persist resource event for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-
-
-def _structured_ask_user_question(
-    tool_input: Any,
-) -> dict[str, Any] | None:
-    """
-    Build a structured AskUserQuestion payload for the elicitation
-    params extras.
-
-    Claude's PermissionRequest payload includes the full tool_input
-    when the gated tool is AskUserQuestion. Rather than relying on
-    the (truncated) ``content_preview`` JSON-string, we extract the
-    questions + options here and ship them as a typed structure the
-    UI consumes directly.
-
-    The returned shape is the same one the UI's
-    :file:`@/lib/askUserQuestion.ts` produces from its preview
-    parser â€” so the front-end can treat both sources uniformly.
-
-    :param tool_input: The ``tool_input`` field from the
-        PermissionRequest payload.
-    :returns: ``{"questions": [...]}`` on success, or ``None`` when
-        the input doesn't carry a usable AskUserQuestion shape (no
-        questions, malformed options, etc.) â€” caller falls back to
-        the binary preview-only render.
-    """
-    if not isinstance(tool_input, dict):
-        return None
-    questions_raw = tool_input.get("questions")
-    if not isinstance(questions_raw, list) or not questions_raw:
-        return None
-    questions: list[dict[str, Any]] = []
-    for entry in questions_raw:
-        if not isinstance(entry, dict):
-            continue
-        question_text = entry.get("question")
-        if not isinstance(question_text, str) or not question_text:
-            continue
-        options_raw = entry.get("options")
-        if not isinstance(options_raw, list):
-            continue
-        options: list[dict[str, Any]] = []
-        for opt in options_raw:
-            if isinstance(opt, dict):
-                label = opt.get("label")
-                if not isinstance(label, str) or not label:
-                    continue
-                option: dict[str, Any] = {"label": label}
-                description = opt.get("description")
-                if isinstance(description, str) and description:
-                    option["description"] = description
-                # ``preview`` is an optional richer snippet some
-                # Claude builds attach to an option (rendered as a
-                # <pre> below the option list when selected). Ride
-                # it through verbatim so the UI can surface it.
-                preview = opt.get("preview")
-                if isinstance(preview, str) and preview:
-                    option["preview"] = preview
-                options.append(option)
-            elif isinstance(opt, str) and opt:
-                options.append({"label": opt})
-        if not options:
-            continue
-        question: dict[str, Any] = {
-            "question": question_text,
-            "options": options,
-            "multiSelect": entry.get("multiSelect") is True,
-        }
-        header = entry.get("header")
-        if isinstance(header, str) and header:
-            question["header"] = header
-        questions.append(question)
-    if not questions:
-        return None
-    return {"questions": questions}
-
-
-def _canonical_tool_input(tool_input: dict[str, Any] | None) -> dict[str, Any]:
-    """
-    Canonicalize a tool input for terminal-resolved correlation.
-
-    The park side records an absent / non-dict input as ``None`` (a
-    permission prompt whose hook payload carries no ``tool_input`` â€” see
-    the ``_publish_and_wait_for_harness_elicitation`` call sites), while
-    the mirror side normalizes the parsed transcript arguments to ``{}``
-    (see :func:`_drive_terminal_resolved_elicitation`). Both mean "no
-    input", so collapse them to ``{}`` before comparing â€” otherwise a
-    no-input prompt would never match its own mirrored result (``None ==
-    {}`` is ``False``) and, with no count-based fallback, would orphan
-    until the hook timeout.
-
-    :param tool_input: Parked or mirrored tool input, e.g.
-        ``{"command": "ls"}``, ``{}``, or ``None``.
-    :returns: The dict unchanged, or ``{}`` when it is ``None``.
-    """
-    return tool_input if isinstance(tool_input, dict) else {}
-
-
-def _signal_terminal_resolved_harness_elicitation(*args: Any, **kwargs: Any) -> None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._signal_terminal_resolved_harness_elicitation(*args, **kwargs)
-
-
-def _signal_terminal_resolved_harness_elicitation_impl(
-    session_id: str,
-    tool_name: str,
-    tool_input: dict[str, Any] | None,
-) -> None:
-    """
-    Resolve the parked prompt a mirrored tool result belongs to,
-    ending its long-poll promptly.
-
-    Called when the transcript forwarder mirrors a tool result
-    (``function_call_output``) for a native session. A tool result is
-    only written AFTER the user answered that tool's permission prompt
-    in the native terminal â€” on accept the tool ran and produced output,
-    on reject the harness records a rejection result â€” so its arrival is
-    a reliable "the terminal already resolved this" signal.
-
-    Correlation is by exact tool identity, never positional: a result
-    resolves a parked prompt only when it has the SAME ``tool_name`` AND
-    the SAME ``tool_input`` in the same session. Claude Code's
-    ``PermissionRequest`` payload carries no ``tool_use_id`` (the id is
-    minted only when the tool call is emitted, after the permission
-    check), so ``(tool_name, tool_input)`` is the only correlation signal
-    available â€” and both sides are unmodified JSON round-trips of the
-    same input, so exact equality holds whenever they describe the same
-    call (absent input and empty input both canonicalize to ``{}`` via
-    :func:`_canonical_tool_input`, since the park and mirror sides spell
-    "no input" differently â€” ``None`` vs ``{}``). A non-matching or
-    ambiguous result resolves nothing; the web verdict or timeout still
-    applies. Exact-only matching is what stops
-    one prompt's result from clearing a different prompt: approving
-    ``Bash{ls}`` in the web UI un-parks it, and mirroring its own output
-    must not then clear a still-pending ``Bash{pwd}`` sibling (an
-    unrelated auto-allowed same-named tool's output is harmless for the
-    same reason).
-
-    Best-effort and idempotent: a no-op when no parked prompt matches
-    (e.g. the web UI already resolved it, the tool needed no permission,
-    or it is an unrelated tool). Harness-agnostic by construction â€”
-    keyed on the parked prompt's tool identity, not on a claude-native
-    check â€” so a Codex hook that records ``tool_name`` benefits too.
-
-    :param session_id: Omnigent conversation id whose forwarder mirrored the
-        result, e.g. ``"conv_abc123"``.
-    :param tool_name: Tool name the result is for, e.g. ``"Bash"``.
-    :param tool_input: Tool input the result is for, e.g.
-        ``{"command": "ls"}``, or ``None`` if unavailable.
-    """
-    candidates = [
-        parked
-        for parked in _harness_parked_elicitations.values()
-        if parked.session_id == session_id
-        and parked.tool_name == tool_name
-        and not parked.resolved_elsewhere.is_set()
-    ]
-    if not candidates:
-        return
-    mirrored_input = _canonical_tool_input(tool_input)
-    for parked in candidates:
-        if _canonical_tool_input(parked.tool_input) == mirrored_input:
-            parked.resolved_elsewhere.set()
-            return
-    # No exact input match. Correlation is exact-only: resolving a
-    # same-named-but-different-input prompt here would clear the wrong
-    # card, so leave every candidate to its own result / web verdict /
-    # timeout. This branch is reached routinely and benignly â€” e.g. after
-    # a sibling prompt was web-approved and un-parked, its mirrored output
-    # finds only the still-pending different-input prompt â€” so it logs at
-    # debug, not warning. (A genuine match failing to compare equal would
-    # also land here, but is indistinguishable from the benign case inside
-    # this call; both inputs are unmodified JSON round-trips, so such drift
-    # is not expected.)
-    _logger.debug(
-        "Mirrored %s result in %s matched no parked prompt by input "
-        "(%d same-named prompt(s) pending); leaving them to web verdict/timeout.",
-        tool_name,
-        session_id,
-        len(candidates),
-    )
-
-
-def _client_supplied_hook_elicitation_id(
-    payload: dict[str, Any],
-    session_id: str,
-) -> str | None:
-    """
-    Validate the hook client's optional re-attach elicitation id.
-
-    The hook mints one stable id per prompt and re-sends it on every
-    retry POST, so a severed wait re-parks as the SAME elicitation.
-    Client-controlled, so it is constrained to the claude-hook
-    namespace and may not collide with another session's parked id.
-
-    :param payload: Parsed PermissionRequest hook body. Reads the
-        optional ``_omnigent_elicitation_id`` key.
-    :param session_id: Session the hook call is for, e.g.
-        ``"conv_abc123"``.
-    :returns: The validated id, or ``None`` when the client supplied
-        none (the wait mints a random id as before).
-    :raises OmnigentError: 400 when the id is malformed or is
-        currently parked by a different session.
-    """
-    raw = payload.get("_omnigent_elicitation_id")
-    if raw is None:
-        return None
-    if not isinstance(raw, str) or not _HOOK_ELICITATION_ID_RE.fullmatch(raw):
-        raise OmnigentError(
-            "PermissionRequest hook '_omnigent_elicitation_id' must match "
-            "'elicit_<harness>_' + 32 hex chars.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    owner = _harness_elicitation_owners.get(raw)
-    if owner is not None and owner != session_id:
-        raise OmnigentError(
-            "Elicitation id belongs to a different session.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return raw
-
-
-def _consume_pre_resolved_harness_elicitation(
-    session_id: str,
-    elicitation_id: str,
-    request_fingerprint: str | None = None,
-) -> _PreResolvedHarnessElicitation | None:
-    """
-    Consume a resolution that arrived before the hook wait registered.
-
-    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
-    :param elicitation_id: Harness elicitation id, e.g.
-        ``"elicit_codex_abc123"``.
-    :param request_fingerprint: Digest of the consuming re-park's request
-        params, e.g. a sha256 hex string. A verdict-carrying tombstone
-        is adopted ONLY on a proven same-question match: both sides
-        must carry a fingerprint and they must be equal. Any other
-        combination (either side ``None``, or a mismatch) fails closed
-        â€” the tombstone is dropped and the prompt is re-published â€” so
-        a stale approval can never gate a DIFFERENT question that
-        reused this id. Terminal-side tombstones (``result is None``)
-        skip the check: adopting one only fail-asks, and their producer
-        has no params to fingerprint.
-    :returns: The consumed tombstone when one matched this session
-        (its ``result`` carries the web verdict to honor, or ``None``
-        for a terminal-side resolution), or ``None`` when nothing was
-        pre-resolved.
-    """
-    _prune_pre_resolved_harness_elicitations()
-    tombstone = _harness_pre_resolved_elicitations.pop(elicitation_id, None)
-    if tombstone is None:
-        return None
-    if tombstone.session_id != session_id:
-        _harness_pre_resolved_elicitations[elicitation_id] = tombstone
-        return None
-    if tombstone.result is not None and (
-        tombstone.request_fingerprint is None
-        or request_fingerprint is None
-        or tombstone.request_fingerprint != request_fingerprint
-    ):
-        # A verdict is replayed only on a proven same-question match.
-        # A differing fingerprint means the id was reused by a LATER,
-        # different question; a missing fingerprint on either side
-        # means the match cannot be proven (e.g. the gap path found no
-        # valid pending prompt to digest). Both fail closed: drop the
-        # tombstone and let the new prompt be published â€” the safe cost
-        # is one re-ask, never a stale approval gating a new question.
-        return None
-    return tombstone
-
-
-def _prune_pre_resolved_harness_elicitations(now: float | None = None) -> None:
-    """
-    Prune stale or excess pre-resolved harness elicitation tombstones.
-
-    :param now: Optional wall-clock timestamp from ``time.time()``,
-        e.g. ``1710000000.0``. ``None`` reads the current time.
-    :returns: None.
-    """
-    if not _harness_pre_resolved_elicitations:
-        return
-    # Resolve limits through the facade so a test's monkeypatch of these
-    # constants is honored here.
-    from omnigent.server.routes import sessions as _facade
-
-    now = time.time() if now is None else now
-    expired = [
-        elicitation_id
-        for elicitation_id, tombstone in _harness_pre_resolved_elicitations.items()
-        if now - tombstone.created_at > _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S
-    ]
-    for elicitation_id in expired:
-        _harness_pre_resolved_elicitations.pop(elicitation_id, None)
-    overflow = (
-        len(_harness_pre_resolved_elicitations)
-        - _facade._HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES
-    )
-    if overflow <= 0:
-        return
-    oldest = sorted(
-        _harness_pre_resolved_elicitations.items(),
-        key=lambda item: item[1].created_at,
-    )[:overflow]
-    for elicitation_id, _tombstone in oldest:
-        _harness_pre_resolved_elicitations.pop(elicitation_id, None)
-
-
-def _signal_harness_elicitation_resolved_by_id(
-    session_id: str,
-    elicitation_id: str,
-) -> None:
-    """
-    Resolve or pre-resolve one parked harness elicitation by id.
-
-    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
-    :param elicitation_id: Harness elicitation id, e.g.
-        ``"elicit_codex_abc123"``.
-    :returns: None.
-    :raises OmnigentError: If the id is malformed or belongs to a
-        different session.
-    """
-    if not elicitation_id:
-        raise OmnigentError(
-            "external_elicitation_resolved requires data.elicitation_id.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    owner = _harness_elicitation_owners.get(elicitation_id)
-    if owner is not None and owner != session_id:
-        raise OmnigentError(
-            "Elicitation does not belong to this session.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    _prune_pre_resolved_harness_elicitations()
-    parked = _harness_parked_elicitations.get(elicitation_id)
-    if parked is None:
-        _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-            session_id=session_id,
-            created_at=time.time(),
-        )
-        _prune_pre_resolved_harness_elicitations()
-        return
-    parked.resolved_elsewhere.set()
-
-
-def _format_sse(event_type: str, data: dict[str, Any]) -> str:
-    """
-    Format an SSE event string for the wire.
-
-    :param event_type: SSE event name, e.g.
-        ``"response.output_text.delta"``.
-    :param data: The event payload dict.
-    :returns: A formatted SSE message string ending in two newlines.
-    """
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-
-
-def _permission_level_from_grants(
-    user_id: str | None,
-    grants: list[SessionPermission],
-    is_admin: bool,
-) -> int | None:
-    """
-    Derive a user's permission level from a pre-fetched list of grants.
-
-    Mirrors :func:`omnigent.server.routes._auth_helpers._get_permission_level_sync`
-    but operates on grants already held in memory so callers can batch the
-    permission-store query across many sessions at once.
-
-    :param user_id: The authenticated user, or ``None`` for unauthenticated
-        requests, e.g. ``"alice@example.com"``.
-    :param grants: All grants for the session, as returned by
-        ``permission_store.list_for_sessions()[conv_id]``.
-    :param is_admin: Whether the user holds the admin flag.  Pass the result
-        of a single ``permission_store.is_admin(user_id)`` call made once
-        for the whole page rather than repeating it per session.
-    :returns: Numeric level (1â€“4), or ``None`` when permissions are disabled
-        or the user is unauthenticated.
-    """
-    if user_id is None:
-        return None
-    if is_admin:
-        return LEVEL_OWNER
-    user_grant = next((g for g in grants if g.user_id == user_id), None)
-    if user_grant is not None:
-        return user_grant.level
-    public_grant = next((g for g in grants if g.user_id == RESERVED_USER_PUBLIC), None)
-    if public_grant is not None:
-        return public_grant.level
-    return None
-
-
-def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
-    """
-    Find the session owner from a pre-fetched list of grants.
-
-    Mirrors :func:`omnigent.server.routes._auth_helpers.get_session_owner_id`
-    but operates on grants already held in memory so callers can batch the
-    permission-store query across many sessions at once.
-
-    :param grants: All grants for the session, as returned by
-        ``permission_store.list_for_sessions()[conv_id]``.
-    :returns: The ``user_id`` of the first grant whose level is at least
-        :data:`LEVEL_OWNER`, or ``None`` if no such grant exists.
-    """
-    return next((g.user_id for g in grants if g.level >= LEVEL_OWNER), None)
-
-
-def _session_status_from_cache(
-    conversation_id: str,
-    db_status: str | None = None,
-) -> Literal["idle", "running", "failed"]:
-    """
-    Map the relay-fed status cache value to a list-item status.
-
-    The cache stores the fine-grained relay status (``"running"``,
-    ``"waiting"``, ``"failed"``, ``"idle"``); the list-item shape
-    collapses ``"running"``/``"waiting"`` to ``"running"``. A cache
-    miss falls back to *db_status* â€” the row value the tunnel-holding
-    replica persisted (``omnigent_conversation_metadata.live_status``) â€” so a replica
-    that does NOT hold this session's runner tunnel still serves the
-    real status. No cache entry and no row value presents as ``"idle"``.
-
-    :param conversation_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param db_status: ``Conversation.live_status`` when the caller has
-        the row, else ``None``.
-    :returns: One of ``"idle"``, ``"running"``, ``"failed"``.
-    """
-    cached = _session_status_cache.get(conversation_id)
-    if cached is None:
-        cached = db_status
-    if cached in ("running", "waiting"):
-        return "running"
-    if cached == "failed":
-        return "failed"
-    return "idle"
-
-
-def _session_status_with_child_rollup(
-    conversation_id: str,
-    child_session_ids: list[str],
-    db_status: str | None = None,
-) -> Literal["idle", "running", "failed"]:
-    """
-    Map a session's cached status plus direct child activity to list status.
-
-    A parent session should read as ``"running"`` in the sidebar while any
-    direct sub-agent child is still ``"running"`` or ``"waiting"``, even if
-    the parent runner has already gone idle. This keeps every sidebar row
-    honest without mounting a child-session query for each row.
-
-    :param conversation_id: Parent session/conversation identifier,
-        e.g. ``"conv_parent123"``.
-    :param child_session_ids: Direct sub-agent child conversation ids,
-        e.g. ``["conv_child1", "conv_child2"]``.
-    :param db_status: The row's persisted ``live_status``, used when the
-        local cache has no entry (this replica doesn't hold the runner
-        tunnel). The child rollup below stays cache-only â€” a wrong-pod
-        miss there just skips the parent's roll-up spinner, best-effort.
-    :returns: One of ``"idle"``, ``"running"``, ``"failed"`` for the
-        session-list row.
-    """
-    own_status = _session_status_from_cache(conversation_id, db_status)
-    if own_status == "running":
-        return "running"
-    # Background shells outliving a turn do NOT make the row running: the
-    # session takes a new message immediately, and the tally only refreshes on
-    # the next ``Stop`` hook, so a spinner keyed off it can outlive the shells.
-    # The in-chat indicator still reports them from the count.
-    if any(
-        _session_status_cache.get(child_id) in ("running", "waiting")
-        for child_id in child_session_ids
-    ):
-        return "running"
-    return own_status
-
-
-async def _collect_descendant_conversation_ids(
-    conversation_store: ConversationStore,
-    root_id: str,
-) -> list[str]:
-    """
-    Return every sub-agent descendant of ``root_id``, at any depth.
-
-    Walks the tree one level at a time (child, grandchild, and so on),
-    batching each level into a single ``list_child_conversation_ids_by_parent``
-    call so an N-level tree costs N queries rather than one per node.
-
-    :param conversation_store: Store for child-id lookup.
-    :param root_id: Root session/conversation identifier.
-    :returns: Descendant ids in breadth-first order. Empty if ``root_id``
-        has no sub-agent descendants.
-    """
-    descendant_ids: list[str] = []
-    seen = {root_id}
-    frontier = [root_id]
-    while frontier:
-        child_ids_map = await asyncio.to_thread(
-            conversation_store.list_child_conversation_ids_by_parent,
-            frontier,
-        )
-        next_frontier: list[str] = []
-        for parent_id in frontier:
-            for child_id in child_ids_map.get(parent_id, []):
-                if child_id not in seen:
-                    seen.add(child_id)
-                    descendant_ids.append(child_id)
-                    next_frontier.append(child_id)
-        frontier = next_frontier
-    return descendant_ids
-
-
-@dataclass(frozen=True)
-class SessionLiveness:
-    """
-    The two honest liveness signals for a single session.
-
-    Returned (keyed by session id) by the server's
-    ``_bulk_session_liveness`` / ``_session_liveness`` lookups and
-    consumed by the list-item builder, the ``WS /v1/sessions/updates``
-    stream, the single-session ``SessionResponse`` snapshot, and
-    ``GET /health``. Splitting the old single conflated boolean into
-    two fields lets the open-session view distinguish "runner stopped
-    but host can relaunch â€” just send a message" from "host offline â€”
-    reconnect / fork".
-
-    :param runner_online: Strict runner reachability â€” ``True`` iff a
-        runner tunnel is currently registered for this session. This
-        is the sole reachability signal: it does **not** fold in
-        host-relaunch optimism (a dead runner on a live host reads
-        ``False`` here, not ``True``). A session with no runner
-        binding (in-process executor / not yet dispatched) reads
-        ``True``.
-    :param host_online: Whether the session's host tunnel is live
-        (status online and fresh within ``HOST_LIVENESS_TTL_S``).
-        ``True`` when the session's ``host_id`` is in the online-hosts
-        set, ``False`` when a ``host_id`` is set but not online, and
-        ``None`` when the session has no ``host_id`` (CLI / local).
-        Used only to choose what the open view shows when
-        ``runner_online`` is ``False``; never participates in the
-        reachability decision.
-    :param host_version: Version string from the bound host's
-        ``host.hello`` frame, e.g. ``"0.1.0"`` â€” surfaced in the
-        session info popover. ``None`` when the session has no host
-        binding, the host is offline, or its version isn't resolvable
-        on this replica (the version lives in the in-memory host
-        registry, not the hosts table, so a host connected to another
-        replica reads ``None`` here).
-    """
-
-    runner_online: bool
-    host_online: bool | None
-    host_version: str | None = None
-
-
-async def _apply_liveness_to_items(
-    items: list[SessionListItem],
-    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
-) -> None:
-    """
-    Attach runner + host liveness to session-list items when a lookup is
-    wired.
-
-    Both ``GET /v1/sessions`` and ``WS /v1/sessions/updates`` use this so
-    HTTP reconciliation preserves the same ``runner_online`` /
-    ``host_online`` fields that push frames patch into the web cache.
-
-    :param items: Session-list rows to annotate.
-    :param liveness_lookup: Bulk liveness lookup from session id to a
-        :class:`SessionLiveness` pair, e.g.
-        ``{"conv_abc123": SessionLiveness(runner_online=True,
-        host_online=None)}``. ``None`` means this server cannot compute
-        liveness for list rows, in which case both fields are left
-        ``None``.
-    :returns: ``None``. Mutates ``items`` in place.
-    """
-    if liveness_lookup is None or not items:
-        return
-    liveness = await asyncio.to_thread(liveness_lookup, [item.id for item in items])
-    for item in items:
-        result = liveness[item.id]
-        item.runner_online = result.runner_online
-        item.host_online = result.host_online
-        # A dead runner's parked prompts died with it, but the persisted
-        # pending count has no crash-time writer (a runner/host/replica that
-        # dies without a graceful resolve never decrements the row) â€” so an
-        # offline runner reads as zero pending rather than lighting a phantom
-        # inbox badge over an empty prompt list. Reconciled durably when the
-        # runner reconnects (see ``_on_runner_connect``'s pending resync).
-        if not result.runner_online:
-            item.pending_elicitations_count = 0
-
-
-def _targeted_elicitation_event(
-    event: dict[str, Any],
-    *,
-    target_session_id: str,
-) -> dict[str, Any]:
-    """
-    Return an elicitation event annotated with its resolution target.
-
-    Child-session elicitations can be mirrored into an ancestor's
-    chat stream. The mirrored card is rendered in the ancestor
-    conversation, but the harness Future still belongs to the child.
-    ``target_session_id`` tells clients which session's resolve URL
-    should receive the verdict.
-
-    :param event: Original ``response.elicitation_request`` event,
-        e.g. ``{"type": "response.elicitation_request",
-        "elicitation_id": "elicit_abc", "params": {...}}``.
-    :param target_session_id: Session that owns the parked
-        elicitation, e.g. ``"conv_child123"``.
-    :returns: A shallow event copy with a copied ``params`` dict
-        carrying ``target_session_id``.
-    """
-    mirrored = dict(event)
-    params = event.get("params")
-    if isinstance(params, dict):
-        mirrored["params"] = {**params, "target_session_id": target_session_id}
-    else:
-        mirrored["params"] = {"target_session_id": target_session_id}
-    return mirrored
-
-
-def _ancestor_session_ids(
-    conv_store: ConversationStore,
-    session_id: str,
-) -> list[str]:
-    """
-    Return ancestor session ids for a session, nearest parent first.
-
-    :param conv_store: Store used to read conversation parent links.
-    :param session_id: Session to walk upward from, e.g.
-        ``"conv_child123"``.
-    :returns: Ancestor ids in parent-to-root order. Empty when the
-        session is top-level or missing.
-    """
-    ancestors: list[str] = []
-    seen = {session_id}
-    current = conv_store.get_conversation(session_id)
-    while current is not None and current.parent_conversation_id is not None:
-        parent_id = current.parent_conversation_id
-        if parent_id in seen:
-            break
-        ancestors.append(parent_id)
-        seen.add(parent_id)
-        current = conv_store.get_conversation(parent_id)
-    return ancestors
-
-
-def _publish_elicitation_request_to_ancestors(
-    conv_store: ConversationStore,
-    session_id: str,
-    event: dict[str, Any],
-) -> None:
-    """
-    Mirror a child elicitation request into each ancestor stream.
-
-    :param conv_store: Store used to discover ancestor sessions.
-    :param session_id: Child session that owns the elicitation,
-        e.g. ``"conv_child123"``.
-    :param event: Original ``response.elicitation_request`` event.
-    """
-    mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        session_stream.publish(ancestor_id, mirrored)
-
-
-def _publish_elicitation_resolved_to_ancestors(
-    conv_store: ConversationStore,
-    session_id: str,
-    elicitation_id: str,
-    action: str | None = None,
-    reason: str | None = None,
-) -> None:
-    """
-    Mirror an elicitation-resolved event into each ancestor stream.
-
-    :param conv_store: Store used to discover ancestor sessions.
-    :param session_id: Child session that owns the elicitation,
-        e.g. ``"conv_child123"``.
-    :param elicitation_id: Elicitation correlation id, e.g.
-        ``"elicit_abc123"``.
-    :param action: Optional MCP verdict carried through to the
-        mirrors; see :func:`_publish_elicitation_resolved`.
-    :param reason: Optional no-verdict reason carried through to the
-        mirrors; see :func:`_publish_elicitation_resolved`.
-    """
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action, reason=reason)
-
-
-def _descendant_sessions(
-    conv_store: ConversationStore,
-    session_id: str,
-) -> list[Conversation]:
-    """
-    Return descendant sub-agent conversations for a session.
-
-    :param conv_store: Store used to list conversations.
-    :param session_id: Ancestor session id, e.g. ``"conv_root123"``.
-    :returns: Sub-agent conversations below ``session_id``. Empty
-        for sessions with no descendants.
-    """
-    descendants: list[Conversation] = []
-    queue: deque[str] = deque([session_id])
-    seen = {session_id}
-    while queue:
-        parent_id = queue.popleft()
-        after: str | None = None
-        while True:
-            page = conv_store.list_conversations(
-                kind="sub_agent",
-                parent_conversation_id=parent_id,
-                limit=100,
-                after=after,
-            )
-            for child in page.data:
-                if child.id in seen:
-                    continue
-                seen.add(child.id)
-                descendants.append(child)
-                queue.append(child.id)
-            if not page.has_more or page.last_id is None:
-                break
-            after = page.last_id
-    return descendants
-
-
-def _pending_elicitation_snapshot_for_session(
-    conv_store: ConversationStore,
-    conv: Conversation,
-) -> list[dict[str, Any]]:
-    """
-    Return pending elicitation events visible from a session snapshot.
-
-    The current session's own outstanding prompts are returned first.
-    Pending prompts from descendant sub-agents are appended with
-    ``params.target_session_id`` so a cold-loaded ancestor chat can
-    render and resolve child approvals.
-    Duplicate ids are skipped because live mirroring also records the
-    ancestor copy in the in-memory index.
-
-    The descendant walk costs one ``list_conversations`` query per
-    session in the tree, so it is skipped entirely unless some session
-    other than ``conv`` has an outstanding prompt in the in-memory
-    index (the common case is none anywhere).
-
-    :param conv_store: Store used to list descendant sub-agents.
-    :param conv: Session conversation being snapshotted.
-    :returns: Pending elicitation event dicts suitable for
-        :class:`SessionResponse.pending_elicitations`.
-    """
-    events = pending_elicitations.snapshot_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
-        return events
-    seen = {
-        event.get("elicitation_id")
-        for event in events
-        if isinstance(event.get("elicitation_id"), str)
-    }
-    for child in _descendant_sessions(conv_store, conv.id):
-        for event in pending_elicitations.snapshot_for(child.id):
-            elicitation_id = event.get("elicitation_id")
-            if isinstance(elicitation_id, str) and elicitation_id in seen:
-                continue
-            if isinstance(elicitation_id, str):
-                seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
-    return events
-
-
-def _publish_input_consumed(
-    session_id: str,
-    item: ConversationItem,
-    cleared_pending_id: str | None = None,
-) -> None:
-    """
-    Publish a ``session.input.consumed`` event for a just-persisted
-    conversation item.
-
-    Mirrors the wire shape consumers depend on for rendering the
-    input (user message bubble, tool-result block, etc.) at the
-    moment of acceptance.
-
-    :param session_id: The session/conversation identifier whose
-        stream should receive the event.
-    :param item: The persisted :class:`ConversationItem` carrying
-        the canonical ``id`` / ``type`` / ``data`` fields.
-    :param cleared_pending_id: When this message drained a
-        :mod:`omnigent.runtime.pending_inputs` entry (native-terminal
-        web message mirrored back from the transcript), that entry's
-        id, e.g. ``"pending_a1b2c3"`` â€” so clients drop the optimistic
-        bubble by id. ``None`` when nothing was drained.
-
-    Hidden context items (``is_meta``, e.g. injected skill text or a
-    Claude background-task notification) are published too, flagged in
-    ``data.is_meta``: subscribers hide or re-label them, and the web UI
-    shows the task notification as a system marker so the turn Claude
-    resumes on it starts a new bubble.
-    """
-    event = SessionInputConsumedEvent(
-        type="session.input.consumed",
-        data=SessionInputConsumedPayload(
-            item_id=item.id,
-            type=item.type,
-            data=item.data.model_dump() if item.data is not None else {},
-            created_by=item.created_by,
-            cleared_pending_id=cleared_pending_id,
-        ),
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-# Wall-clock start of each session's in-flight compaction. A long compaction
-# re-announces in_progress on every status poll; carrying one stable
-# started_at lets clients anchor their elapsed counter to the true start,
-# even across a page reload (the live stream has no replay).
-_compaction_started_at: dict[str, int] = {}
-
-
-def _publish_compaction_in_progress(session_id: str) -> None:
-    """
-    Publish the standard compaction progress event to a session stream.
-
-    Repeated calls while the same compaction runs reuse the ``started_at``
-    recorded on the first call; ``completed``/``failed`` clear it so the
-    next compaction starts a fresh clock.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    """
-    started_at = _compaction_started_at.setdefault(session_id, int(time.time()))
-    session_stream.publish(
-        session_id,
-        {"type": "response.compaction.in_progress", "started_at": started_at},
-    )
-
-
-def _publish_compaction_completed(session_id: str, total_tokens: int | None) -> None:
-    """
-    Publish the compaction-finished event to a session stream.
-
-    Emitted after :func:`compact_conversation_now` returns
-    successfully. Clients that rendered a spinner on the
-    ``response.compaction.in_progress`` event should upgrade it to
-    the permanent "Conversation compacted" marker on this event.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param total_tokens: Tiktoken estimate of the post-compaction
-        context size, e.g. ``8421``. ``None`` when unavailable.
-    """
-    _compaction_started_at.pop(session_id, None)
-    payload: dict[str, object] = {"type": "response.compaction.completed"}
-    if total_tokens is not None:
-        payload["total_tokens"] = total_tokens
-    session_stream.publish(session_id, payload)
-
-
-def _publish_compaction_failed(session_id: str) -> None:
-    """
-    Publish the compaction-failed event to a session stream.
-
-    Emitted when :func:`compact_conversation_now` raises. Clients
-    that rendered a spinner on the
-    ``response.compaction.in_progress`` event should dismiss it
-    without leaving a permanent marker â€” the conversation history
-    was not modified.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    """
-    _compaction_started_at.pop(session_id, None)
-    session_stream.publish(session_id, {"type": "response.compaction.failed"})
-
-
-def _publish_external_assistant_message(
-    session_id: str,
-    item: ConversationItem,
-    *,
-    response_id: str,
-    agent_name: str,
-) -> None:
-    """
-    Broadcast an assistant message appended outside the task runtime.
-
-    Terminal-backed integrations such as native Claude produce output
-    in a live terminal first, then mirror the semantic text into AP.
-    There is no ``agent_task`` to watch, so this helper publishes the
-    completed output item directly. The browser reducer renders the
-    persisted message content from ``response.output_item.done``;
-    emitting synthetic text deltas here would duplicate the same
-    transcript item when the snapshot path also sees it.
-
-    :param session_id: Session/conversation identifier.
-    :param item: Persisted assistant message item.
-    :param response_id: Legacy endpoint response id. The persisted
-        item already carries this value, so the publisher does not
-        need it separately.
-    :param agent_name: Legacy endpoint agent/model name. The
-        persisted item already carries this value.
-    :returns: None.
-    """
-    del response_id, agent_name
-    api_item = item.to_api_dict()
-    event = OutputItemDoneEvent(type="response.output_item.done", item=api_item)
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _resolve_llm_model(
-    conv: Conversation | None,
-    *,
-    agent_store: AgentStore | None = None,
-    agent_cache: AgentCache | None = None,
-) -> str | None:
-    """
-    Resolve the LLM model identifier from a conversation's agent spec.
-
-    Uses injected agent dependencies when available, falling back to the
-    runtime globals for legacy callers. Returns ``None`` when the conversation
-    has no agent binding or the spec cannot be loaded.
-
-    :param conv: The conversation entity, or ``None``.
-    :param agent_store: Optional store for resolving the bound agent.
-    :param agent_cache: Optional cache for loading the bound agent spec.
-    :returns: Model string (e.g. ``"databricks-gpt-5-5"``), or
-        ``None`` when unavailable.
-    """
-    if conv is None or conv.agent_id is None:
-        return None
-    try:
-        # Import ``get_agent_cache`` from the runtime at call time so a test
-        # patching ``omnigent.runtime.get_agent_cache`` is honored (the
-        # module-level name is a facade proxy that bypasses that patch).
-        from omnigent.runtime import get_agent_cache
-
-        if agent_store is None:
-            from omnigent.runtime._globals import _agent_store
-
-            agent_store = _agent_store
-        if agent_store is None:
-            return None
-        if agent_cache is None:
-            agent_cache = get_agent_cache()
-        agent = agent_store.get(conv.agent_id)
-        if agent is None:
-            return None
-        loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        )
-        return loaded.spec.llm.model if loaded.spec.llm else None
-    # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
-    except (
-        KeyError,
-        AttributeError,
-        ValueError,
-        ImportError,
-        OSError,
-        RuntimeError,
-        StatementError,
-    ):
-        # ``RuntimeError`` covers ``get_agent_cache()`` before the runtime is
-        # initialized: this is a best-effort display resolver (now also called
-        # on native cost-only broadcasts), so an uninitialized runtime must
-        # degrade to "model unknown" â€” the cost still records, just unattributed.
-        return None
-
-
-def _resolve_harness(*args: Any, **kwargs: Any) -> str | None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._resolve_harness(*args, **kwargs)
-
-
-def _resolve_harness_impl(
-    conv: Conversation | None,
-    *,
-    agent_store: AgentStore | None = None,
-    agent_cache: AgentCache | None = None,
-) -> str | None:
-    """
-    Resolve the canonical harness for a conversation's bound agent.
-
-    Mirrors :func:`_resolve_llm_model`: loads the parsed spec via the agent
-    cache and returns the executor's harness
-    (``executor.config["harness"]``, else ``executor.type``), canonicalized.
-    Surfacing this on :class:`SessionResponse` lets the REPL render the
-    active credential for the correct provider *family* â€” anthropic for
-    claude-sdk, openai for codex / openai-agents â€” instead of guessing the
-    family from the model string (which is wrong when the agent declares no
-    model, e.g. a generic-provider launcher).
-
-    :param conv: The conversation entity, or ``None``.
-    :param agent_store: Optional store for resolving the bound agent.
-    :param agent_cache: Optional cache for loading the bound agent spec.
-    :returns: The canonical harness (e.g. ``"openai-agents"`` or
-        ``"claude-sdk"``), or ``None`` when unavailable.
-    """
-    if conv is None:
-        return None
-    # A persisted per-session override (validated + canonicalized at
-    # create) wins over the spec's declared harness, so the snapshot
-    # reports what the runner actually spawns.
-    if conv.harness_override:
-        return conv.harness_override
-    if conv.agent_id is None:
-        return None
-    try:
-        from omnigent.harness_aliases import canonicalize_harness
-        from omnigent.runtime import get_agent_cache
-
-        if agent_store is None:
-            from omnigent.runtime._globals import _agent_store
-
-            agent_store = _agent_store
-        if agent_store is None:
-            return None
-        if agent_cache is None:
-            agent_cache = get_agent_cache()
-        agent = agent_store.get(conv.agent_id)
-        if agent is None:
-            return None
-        loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        )
-        executor = loaded.spec.executor
-        # For a bundled-agent head sub-agent, report the HEAD's own harness,
-        # not the bundle brain's â€” `harness` is this session's provider family
-        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
-        # brain harness when the head declares none or can't be matched.
-        if conv.sub_agent_name:
-            sub = next(
-                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
-                None,
-            )
-            if sub is not None:
-                executor = sub.executor
-        harness = (
-            executor.config.get("harness")
-            or loaded.spec.executor.config.get("harness")
-            or executor.type
-        )
-        return canonicalize_harness(harness) or harness
-    # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
-    except (
-        KeyError,
-        AttributeError,
-        ValueError,
-        ImportError,
-        OSError,
-        RuntimeError,
-        StatementError,
-    ):
-        return None
-
-
-def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
-    """
-    Validate + canonicalize a session-create ``harness_override``.
-
-    Mirrors the CLI's ``--harness`` rules (``_apply_harness_override_to_executor``
-    in ``omnigent/chat.py``): the canonical name must be a known bundle
-    harness, and the bound agent must be an ``executor.type: omnigent``
-    spec â€” other executor types have no ``config.harness``, so an
-    override there would be a silent no-op.
-
-    :param value: The raw override from the request body, e.g. ``"pi"``
-        or the ``"openai-agents-sdk"`` alias. ``None`` means no override.
-    :param agent: The bound agent row (already fetched by the caller).
-    :returns: The canonical harness id, or ``None`` when *value* is.
-    :raises OmnigentError: ``invalid_input`` for an unknown harness, a
-        non-omnigent executor type, or an unloadable agent bundle.
-    """
-    if value is None:
-        return None
-    from omnigent.harness_aliases import canonicalize_harness
-    from omnigent.runtime import get_agent_cache
-    from omnigent.spec._omnigent_compat import (
-        OMNIGENT_EXECUTOR_TYPE,
-        OMNIGENT_HARNESSES,
-    )
-
-    canonical = canonicalize_harness(value) or value
-    if canonical not in OMNIGENT_HARNESSES:
-        raise OmnigentError(
-            f"invalid harness_override: must be one of "
-            f"{sorted(OMNIGENT_HARNESSES)}, got {value!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    try:
-        loaded = get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        )
-    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
-        raise OmnigentError(
-            f"harness_override requires a loadable agent spec; "
-            f"agent {agent.name!r} failed to load: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
-    executor_type = loaded.spec.executor.type
-    if executor_type != OMNIGENT_EXECUTOR_TYPE:
-        raise OmnigentError(
-            f"harness_override only applies to executor.type "
-            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; agent {agent.name!r} "
-            f"declares executor.type {executor_type!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return canonical
-
-
-def _validated_harness_override_executor_type(agent: Agent) -> None:
-    """Validate that *agent* is an ``executor.type: omnigent`` spec.
-
-    Used by the ``"auto"`` harness path to enforce the same executor-type
-    gate as :func:`_validated_harness_override` without requiring a concrete
-    harness name (the real harness is resolved at first-message time).
-
-    :raises OmnigentError: ``invalid_input`` when the agent is not an
-        omnigent executor type or the bundle cannot be loaded.
-    """
-    from omnigent.runtime import get_agent_cache
-    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
-
-    try:
-        loaded = get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        )
-    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
-        raise OmnigentError(
-            f"harness_override 'auto' requires a loadable agent spec; "
-            f"agent {agent.name!r} failed to load: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
-    executor_type = loaded.spec.executor.type
-    if executor_type != OMNIGENT_EXECUTOR_TYPE:
-        raise OmnigentError(
-            f"harness_override 'auto' only applies to executor.type "
-            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; agent {agent.name!r} "
-            f"declares executor.type {executor_type!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-
-
-#: ``executor.config`` key by which a spec hands its brain harness to Smart
-#: Routing. ``auto`` is the only accepted value.
-SMART_ROUTING_HARNESS_CONFIG_KEY = "smart_routing_harness"
-
-#: The ``harness_override`` sentinel meaning "the router picks the harness".
-AUTO_HARNESS_SENTINEL = "auto"
-
-
-def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
-    """
-    Read a spec's opt-in for routing its own brain harness.
-
-    A spec that pins ``executor.config.harness`` also pins the family every
-    sub-agent is routed within, so a cross-family sub-agent cannot stay on its
-    declared harness. ``smart_routing_harness: auto`` lets such a spec keep its
-    pin for a normal session and hand the harness to the router when Smart
-    Routing is on.
-
-    Validated on the same rules as :func:`_validated_harness_override`: the
-    value must be the ``"auto"`` sentinel, and only an ``executor.type:
-    omnigent`` spec has a swappable brain harness to give away.
-
-    :param spec: The bound agent's parsed spec.
-    :returns: ``"auto"`` when the spec opts in, else ``None``.
-    :raises OmnigentError: ``invalid_input`` for any other value, or for the
-        key on a non-omnigent executor type.
-    """
-    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
-
-    value = spec.executor.config.get(SMART_ROUTING_HARNESS_CONFIG_KEY)
-    if value is None:
-        return None
-    key = f"executor.config.{SMART_ROUTING_HARNESS_CONFIG_KEY}"
-    if value != AUTO_HARNESS_SENTINEL:
-        raise OmnigentError(
-            f"invalid {key}: must be {AUTO_HARNESS_SENTINEL!r}, got {value!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if spec.executor.type != OMNIGENT_EXECUTOR_TYPE:
-        raise OmnigentError(
-            f"{key} only applies to executor.type {OMNIGENT_EXECUTOR_TYPE!r} "
-            f"agents; this spec declares executor.type {spec.executor.type!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return AUTO_HARNESS_SENTINEL
-
-
-def _utc_day(epoch_seconds: int) -> str:
-    """
-    Convert a Unix epoch timestamp to its UTC calendar day.
-
-    :param epoch_seconds: Unix epoch seconds, e.g. ``1749081600``.
-    :returns: The UTC date as ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
-    """
-    from datetime import datetime, timezone
-
-    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).date().isoformat()
-
-
-def _record_daily_cost(
-    conv: Conversation | None,
-    delta_usd: float,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Add a turn's LLM cost to the session owner's daily rollup.
-
-    A no-op when *delta_usd* is not positive or the session has no
-    resolvable owner. Attributes the cost to the session creator
-    (:meth:`ConversationStore.get_session_owner`) and buckets it by the
-    current UTC day, so a session spanning midnight splits its spend
-    across both days. Recorded for every priced turn regardless of
-    whether the session runs under a policy â€” the daily rollup is the
-    backing store for the per-user daily cost-budget policy, and is now
-    populated universally. (This relies on the conversation store
-    implementing the daily-cost methods on every deployment that runs
-    this code; the earlier policy gate that kept the managed deployment
-    from touching an absent ``user_daily_cost`` table is no longer needed
-    now that the managed store backs it.)
-
-    Sub-agent conversations are created without a permission grant (the
-    internal runner POST carries no user context), so
-    ``get_session_owner(conv.id)`` returns ``None`` for them.  When
-    that happens, fall back to the spawn-tree root's owner: every
-    conversation carries ``root_conversation_id`` pointing to the
-    top-level session that *was* created with user context and therefore
-    always has an owner grant.  This ensures relay / SDK sub-agent spend
-    is attributed to the same user as the parent rather than silently
-    dropped from the daily rollup.
-
-    :param conv: The conversation row for the session, or ``None``
-        (a no-op â€” no owner to attribute to).
-    :param delta_usd: The turn's cost in USD; ``<= 0`` is a no-op.
-    :param conversation_store: Store for the owner lookup and the
-        daily-cost UPSERT.
-    """
-    if conv is None or delta_usd <= 0:
-        return
-    owner = conversation_store.get_session_owner(conv.id)
-    if owner is None and conv.root_conversation_id != conv.id:
-        # Sub-agent: no direct owner grant â€” fall back to the root session's
-        # owner so sub-agent spend is attributed rather than silently dropped.
-        owner = conversation_store.get_session_owner(conv.root_conversation_id)
-    if owner is None:
-        return
-    from omnigent.db.utils import now_epoch
-
-    conversation_store.add_daily_cost(owner, _utc_day(now_epoch()), delta_usd)
-
-
-def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
-    """
-    Extract ``total_cost_usd`` for client display, or ``None`` when unpriced.
-
-    The key is present only when a turn was priced, so its absence ("â€”" in
-    the UI) is distinct from a priced ``$0.00``. The cost-budget policy is
-    unaffected â€” it reads the value with a ``0.0`` default.
-
-    :param usage: A conversation's ``session_usage`` dict, e.g.
-        ``{"input_tokens": 1200, "total_cost_usd": 0.42}`` (priced) or
-        ``{"input_tokens": 1200}`` (unpriced â€” no cost key).
-    :returns: The cumulative cost in USD when priced, else ``None``.
-    """
-    if "total_cost_usd" not in usage:
-        return None
-    try:
-        return float(usage["total_cost_usd"])
-    except (TypeError, ValueError):
-        # Defensive: a malformed persisted value must not break the
-        # snapshot / SSE emit. Treat it as unpriced.
-        return None
-
-
-def _model_usage_bucket(usage: dict[str, Any], model: str) -> dict[str, float]:
-    """
-    Get-or-create the per-model usage sub-bucket inside ``usage["by_model"]``.
-
-    The nested ``by_model`` map attributes token/cost usage to the specific
-    LLM that produced it, keyed on the raw harness-reported model id (faithful
-    and simplest â€” alias normalization is intentionally deferred). This mutates
-    ``usage`` in place, creating ``by_model`` and the per-model dict on first
-    use, and returns the model's bucket for the caller to increment / set.
-
-    :param usage: The conversation's mutable ``session_usage`` dict.
-    :param model: The raw harness model id, e.g. ``"claude-sonnet-4-6"`` or
-        ``"databricks-gpt-5-5"``.
-    :returns: The mutable per-model bucket, e.g. ``{"input_tokens": 1200}``.
-    """
-    raw_by_model = usage.setdefault("by_model", {})
-    if not isinstance(raw_by_model, dict):
-        raw_by_model = {}
-        usage["by_model"] = raw_by_model
-    by_model = cast(dict[str, Any], raw_by_model)
-    raw_bucket = by_model.setdefault(model, {})
-    if not isinstance(raw_bucket, dict):
-        raw_bucket = {}
-        by_model[model] = raw_bucket
-    return cast(dict[str, float], raw_bucket)
-
-
-def _add_model_usage_delta(
-    bucket: dict[str, float],
-    token_deltas: dict[str, int],
-    cost_delta: float | None,
-) -> None:
-    """
-    Add one turn's per-model token/cost deltas into a model bucket (ADD).
-
-    Mirrors the flat-counter increments in :func:`_accumulate_session_usage`
-    so the per-model totals stay consistent with the flat totals: every flat
-    increment is matched by an increment to exactly one model bucket, so the
-    sum of per-model buckets equals the flat total. ``cost_delta`` is added
-    only when the turn was priced (``None`` otherwise), preserving the
-    "priced âŸº ``total_cost_usd`` key present" contract at the per-model level.
-
-    :param bucket: The model's mutable bucket from :func:`_model_usage_bucket`.
-    :param token_deltas: This turn's per-bucket token counts to add, keyed by
-        the same names as :data:`_TOKEN_BREAKDOWN_KEYS`, e.g.
-        ``{"input_tokens": 1200, "output_tokens": 340, ...}``.
-    :param cost_delta: This turn's priced cost in USD to add, or ``None`` when
-        the turn was unpriced (the model's cost key stays absent).
-    """
-    for key, delta in token_deltas.items():
-        bucket[key] = bucket.get(key, 0) + delta
-    if cost_delta is not None:
-        bucket["total_cost_usd"] = bucket.get("total_cost_usd", 0.0) + cost_delta
-
-
-def _usage_by_model_for_display(usage: dict[str, Any]) -> dict[str, ModelUsage] | None:
-    """
-    Project the nested ``by_model`` usage map into typed :class:`ModelUsage`.
-
-    Companion to :func:`_token_breakdown_for_display` for the per-model view:
-    reads ``usage["by_model"]`` (the subtree-summed map from
-    :func:`load_session_usage`) and builds a ``{model_id: ModelUsage}`` dict
-    for the API. Token buckets are coerced to ``int`` and ``total_cost_usd``
-    to ``float``; an absent bucket stays ``None`` on the model (so a model
-    that was never priced has no cost), and malformed values are skipped.
-
-    :param usage: A subtree-summed usage dict, e.g.
-        ``{"input_tokens": 1500, "by_model": {"claude-sonnet-4-6":
-        {"input_tokens": 1500, "total_cost_usd": 0.42}}}``.
-    :returns: The per-model map, or ``None`` when no per-model usage is
-        present (so ``exclude_none`` omits the field entirely).
-    """
-    by_model = usage.get("by_model")
-    if not isinstance(by_model, dict) or not by_model:
-        return None
-    result: dict[str, ModelUsage] = {}
-    for model, bucket in by_model.items():
-        if not isinstance(bucket, dict):
-            continue
-        fields: dict[str, Any] = {}
-        for key in _MODEL_TOKEN_KEYS:
-            value = bucket.get(key)
-            if value is None:
-                continue
-            try:
-                fields[key] = int(value)
-            except (TypeError, ValueError):
-                continue
-        cost = _priced_cost_for_display(bucket)
-        if cost is not None:
-            fields["total_cost_usd"] = cost
-        result[model] = ModelUsage(**fields)
-    return result or None
-
-
-def _coerce_cumulative_field(
-    data: dict[str, Any],
-    key: str,
-    *,
-    numeric: bool,
-) -> float | int | None:
-    """
-    Read and validate an optional cumulative usage field from event data.
-
-    :param data: The ``external_session_usage`` event ``data`` dict.
-    :param key: Field name, e.g. ``"cumulative_input_tokens"``.
-    :param numeric: When ``True`` accept any finite non-negative number
-        (cost); when ``False`` require a finite non-negative int (token
-        counts).
-    :returns: The validated value, or ``None`` when the key is absent.
-    :raises OmnigentError: When present but the wrong type / negative /
-        non-finite (``NaN`` / ``inf`` â€” which the monotonic ``max(old,
-        new)`` clamp downstream would otherwise latch permanently).
-    """
-    value = data.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise OmnigentError(
-            f"external_session_usage data.{key} must be a finite non-negative "
-            f"{'number' if numeric else 'int'}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if (not numeric and not isinstance(value, int)) or not math.isfinite(value) or value < 0:
-        raise OmnigentError(
-            f"external_session_usage data.{key} must be a finite non-negative "
-            f"{'number' if numeric else 'int'}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return value
-
-
-async def _persist_external_model_change(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Persist and broadcast the model the harness reports it is running.
-
-    Mirrors a harness-side model report â€” the launch's own model, or a
-    ``/model`` change made inside the pane â€” onto the Omnigent session:
-    writes ``reported_model`` VERBATIM (the harness's own spelling,
-    never collapsed to a picker alias) so the value survives reload,
-    and publishes a ``session.model`` SSE event so every surface
-    re-renders from it. The user's request (``model_override``) is
-    deliberately untouched: requests and reports are separate roles,
-    and only reports are ever displayed. Unlike the PATCH path
-    (:func:`update_session`), this does NOT forward a ``model_change``
-    back to the runner â€” the terminal is already on the model, so
-    re-injecting ``/model`` would loop.
-
-    No-ops (no write, no event) when the reported model already equals
-    the persisted ``reported_model`` â€” the steady state between real
-    changes, since forwarders re-observe on every poll.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param conv: Conversation row for ``session_id`` (read at the route
-        boundary); ``conv.reported_model`` is the dedupe baseline.
-    :param body: External model-change event body. ``data.model`` must
-        be a non-empty string â€” the harness's verbatim model, e.g.
-        ``"claude-opus-4-8[1m]"`` or ``"gpt-5.6-luna"``.
-    :param conversation_store: Store used to upsert ``reported_model``.
-    :raises OmnigentError: If ``data.model`` is missing or not a
-        non-empty string.
-    """
-    raw_model = body.data.get("model")
-    if not isinstance(raw_model, str) or not raw_model.strip():
-        raise OmnigentError(
-            "external_model_change requires data.model to be a non-empty string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    model = concrete_reported_model(raw_model)
-    if model is None or conv.reported_model == model:
-        return
-    await asyncio.to_thread(
-        conversation_store.update_conversation,
-        session_id,
-        reported_model=model,
-    )
-    event = SessionModelEvent(
-        type="session.model",
-        conversation_id=session_id,
-        model=model,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-async def _persist_external_session_title(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Persist and broadcast a session rename made inside the terminal.
-
-    Mirrors a ``/rename`` typed into a claude-native session's Claude Code
-    pane onto the Omnigent session: writes ``title`` so the new name
-    survives reload and publishes a ``session.title`` SSE event so the
-    web session list updates live.
-
-    The rename is authoritative â€” an operator typing ``/rename`` is an
-    explicit act, so it overwrites whatever title the session currently
-    carries, including one set from the web UI. This is why it uses a
-    plain ``update_conversation`` rather than the seed-only
-    compare-and-swap behind ``POST /sessions/{id}/auto-title``, which
-    exists to stop an *automatic* titler from clobbering a human's name.
-
-    No-ops (no write, no event) when the title already matches, so a
-    forwarder that re-sends after a cursor rewind, or a rename echoing
-    back a name the web UI just set, costs nothing.
-
-    Declined for child sessions, whose titles are structural rather than
-    display text: ``sys_session_send`` writes them as ``"<agent>:<label>"``
-    and the sub-agent tooling parses them back apart. That also covers the
-    legacy ``:closed:`` title marker, which only ever lands on a child row
-    (both writers reject a non-sub-agent title).
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param conv: Conversation row for ``session_id`` (read at the route
-        boundary); ``conv.title`` is the dedupe baseline.
-    :param body: External title event body. ``data.title`` must be a
-        non-empty single-line string, e.g. ``"auth-refactor"``.
-    :param conversation_store: Store used to upsert ``title``.
-    :raises OmnigentError: If ``data.title`` is not a non-empty single line
-        within the user title length limit.
-    """
-    raw_title = body.data.get("title")
-    # Newlines are rejected outright rather than folded into spaces â€” a
-    # multi-line title means the sender is confused, not that it wants one
-    # long line. Mirrors ``POST /sessions/{id}/auto-title``.
-    if not isinstance(raw_title, str) or "\n" in raw_title or "\r" in raw_title:
-        raise OmnigentError(
-            "external_session_title requires data.title to be a single-line string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    title = " ".join(raw_title.split())
-    if not title:
-        raise OmnigentError(
-            "external_session_title requires data.title to be non-empty",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if len(title) > USER_SESSION_TITLE_MAX_CHARS:
-        raise OmnigentError(
-            f"external_session_title requires data.title to be at most "
-            f"{USER_SESSION_TITLE_MAX_CHARS} characters",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if conv.parent_conversation_id is not None:
-        return
-    if conv.title == title:
-        return
-    await asyncio.to_thread(
-        conversation_store.update_conversation,
-        session_id,
-        title=title,
-    )
-    event = SessionTitleEvent(
-        type="session.title",
-        conversation_id=session_id,
-        title=title,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _persist_external_model_options(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-) -> None:
-    """
-    Record the model catalog a native harness's extension reported.
-
-    Sourced from the harness's live model registry (pi-native:
-    ``ctx.modelRegistry.getAvailable()``), so it reflects the models the
-    harness actually loaded no matter how it authenticated â€” an
-    Omnigent-configured provider OR the harness's own ``/login``. This is why
-    the pi picker populates even in the ``/login`` path, where no
-    ``models.json`` is written into the bridge dir for a file-read to find.
-
-    Gated to the pi-native wrapper: only :func:`_fetch_model_options` *serves*
-    this cache for pi-native, so accepting a push from any other session would
-    just leave a stray cache entry alive until teardown. Reject at ingest to
-    keep the contract explicit.
-
-    Stores into :data:`_pushed_model_options_cache` (which a browser reload
-    does NOT clear â€” the extension only pushes on session start) and publishes
-    ``session.model_options`` so open clients re-read the snapshot. An empty
-    list evicts the entry rather than caching nothing.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param conv: Conversation row whose labels identify the wrapper.
-    :param body: External model-options event body. ``data.models`` must be a
-        list of ``{"id": str, ...}`` objects.
-    :raises OmnigentError: If the session is not pi-native, or ``data.models``
-        is missing or malformed.
-    """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _PI_NATIVE_WRAPPER_LABEL_VALUE:
-        raise OmnigentError(
-            "external_model_options is only accepted for pi-native sessions",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    raw_models = body.data.get("models")
-    if not isinstance(raw_models, list):
-        raise OmnigentError(
-            "external_model_options requires data.models to be a list",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    options: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for raw in raw_models:
-        model_id = raw.get("id") if isinstance(raw, dict) else None
-        if not isinstance(model_id, str) or not model_id or model_id in seen:
-            continue
-        seen.add(model_id)
-        display = raw.get("displayName") if isinstance(raw, dict) else None
-        options.append(
-            {
-                "id": model_id,
-                "displayName": display if isinstance(display, str) and display else model_id,
-                "isDefault": bool(raw.get("isDefault", False)) if isinstance(raw, dict) else False,
-            }
-        )
-    if options:
-        _pushed_model_options_cache[session_id] = options
-    else:
-        _pushed_model_options_cache.pop(session_id, None)
-    _publish_model_options(session_id)
-
-
-def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
-    """
-    Validate a terminal-observed reasoning-effort payload.
-
-    :param body: External effort-change event body. ``data.reasoning_effort``
-        must be present and either ``None`` or a supported effort string, e.g.
-        ``"medium"``.
-    :returns: Normalized effort string, or ``None`` when the terminal cleared
-        to its default effort.
-    :raises OmnigentError: If the payload is missing or unsupported.
-    """
-    if "reasoning_effort" not in body.data:
-        raise OmnigentError(
-            "external_reasoning_effort_change requires data.reasoning_effort",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    raw_effort = body.data["reasoning_effort"]
-    if raw_effort is None:
-        return None
-    if not isinstance(raw_effort, str) or not raw_effort.strip():
-        raise OmnigentError(
-            "external_reasoning_effort_change requires data.reasoning_effort "
-            "to be a non-empty string or null",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    effort = raw_effort.strip()
-    try:
-        return validate_effort(effort, "session metadata", EFFORT_VALUES)
-    except ValueError as exc:
-        raise OmnigentError(
-            f"invalid reasoning_effort: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
-
-
-async def _persist_external_reasoning_effort_change(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Persist and broadcast a reasoning-effort switch made inside the terminal.
-
-    Mirrors a native-terminal thinking-level change onto the Omnigent session.
-    Unlike the public PATCH path, this deliberately does NOT forward an
-    ``effort_change`` back to the runner: the terminal is already on that
-    effort, so re-injecting it would loop.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param conv: Conversation row for ``session_id`` at the route boundary.
-    :param body: External effort-change event body.
-    :param conversation_store: Store used to update ``reasoning_effort``.
-    :returns: None.
-    """
-    effort = _validate_external_reasoning_effort(body)
-    if conv.reasoning_effort == effort:
-        return
-    await asyncio.to_thread(
-        conversation_store.update_conversation,
-        session_id,
-        reasoning_effort=effort,
-        _unset_reasoning_effort=effort is None,
-    )
-    event = SessionReasoningEffortEvent(
-        type="session.reasoning_effort",
-        conversation_id=session_id,
-        reasoning_effort=effort,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-async def _persist_external_codex_collaboration_mode_change(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Persist Codex's collaboration mode kind as an internal session label.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param conv: Conversation row for ``session_id`` at the route boundary.
-    :param body: External Codex mode-change event body. ``data.mode`` must be
-        ``"default"`` or ``"plan"``.
-    :param conversation_store: Store used to upsert the mode label.
-    :returns: None.
-    :raises OmnigentError: If ``data.mode`` is missing or unsupported.
-    """
-    raw_mode = body.data.get("mode")
-    if not isinstance(raw_mode, str) or not raw_mode.strip():
-        raise OmnigentError(
-            "external_codex_collaboration_mode_change requires data.mode to be a non-empty string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    mode = raw_mode.strip()
-    if mode not in _CODEX_NATIVE_COLLABORATION_MODES:
-        raise OmnigentError(
-            "external_codex_collaboration_mode_change requires data.mode in "
-            f"{sorted(_CODEX_NATIVE_COLLABORATION_MODES)}; got {mode!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if conv.labels.get(_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY) == mode:
-        return
-    await asyncio.to_thread(
-        conversation_store.set_labels,
-        session_id,
-        {_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: mode},
-    )
-    _publish_collaboration_mode(session_id, mode)
-
-
-async def _persist_external_permission_mode_change(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Persist a pane-observed claude-native permission mode as a session label.
-
-    The forwarder posts this when the pane's mode footer differs from what it
-    last reported â€” i.e. the user pressed shift+tab in the TUI. Unlike the
-    PATCH path this needs no runner confirmation: the pane IS the source, so
-    the mode is already in effect.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param conv: Conversation row for ``session_id`` at the route boundary.
-    :param body: Event body; ``data.permission_mode`` must be a mode the pane
-        footer can report (the switchable modes plus ``bypassPermissions``).
-    :param conversation_store: Store used to upsert the mode label.
-    :returns: None.
-    :raises OmnigentError: If ``data.permission_mode`` is missing or unsupported.
-    """
-    raw_mode = body.data.get("permission_mode")
-    if not isinstance(raw_mode, str) or not raw_mode.strip():
-        raise OmnigentError(
-            "external_permission_mode_change requires data.permission_mode "
-            "to be a non-empty string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    mode = raw_mode.strip()
-    if mode not in _CLAUDE_NATIVE_READABLE_PERMISSION_MODES:
-        raise OmnigentError(
-            "external_permission_mode_change requires data.permission_mode in "
-            f"{sorted(_CLAUDE_NATIVE_READABLE_PERMISSION_MODES)}; got {mode!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # Reflect the switch into terminal_launch_args so a relaunch reopens in this
-    # mode â€” the launcher reads the mode from launch args, while the label below
-    # is only the web UI's read-back. Rewrites an existing --permission-mode only
-    # (a no-op for a session launched without one); kept ahead of the label
-    # short-circuit so a stale launch arg is fixed even when the label matches.
-    merged_args = _merge_claude_permission_launch_args(conv.terminal_launch_args, mode)
-    if conv.terminal_launch_args != merged_args:
-        await asyncio.to_thread(
-            conversation_store.update_conversation,
-            session_id,
-            terminal_launch_args=merged_args,
-        )
-    if conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY) == mode:
-        return
-    await asyncio.to_thread(
-        conversation_store.set_labels,
-        session_id,
-        {_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY: mode},
-    )
-    _publish_permission_mode(session_id, mode)
-
-
-async def _persist_external_codex_approval_mode_change(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """Persist a Codex-observed approval change (from a TUI ``/permissions`` switch).
-
-    The forwarder posts two things it saw in ``thread/settings/updated``:
-    ``terminal_launch_args`` (the create/fork/resume vocabulary, merged into the
-    row) and ``approval_mode`` (the runtime ``/permissions`` preset, stamped on
-    the read-back label + published live so the web picker tracks the TUI). Both
-    are optional but at least one must be present.
-    """
-    raw_args = body.data.get("terminal_launch_args")
-    raw_mode = body.data.get("approval_mode")
-    if raw_args is None and raw_mode is None:
-        raise OmnigentError(
-            "external_codex_approval_mode_change requires data.terminal_launch_args "
-            "or data.approval_mode",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if raw_args is not None:
-        if not isinstance(raw_args, list):
-            raise OmnigentError(
-                "external_codex_approval_mode_change data.terminal_launch_args must be a list",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        try:
-            permission_args = _validate_terminal_launch_args(raw_args)
-            terminal_launch_args = _validate_terminal_launch_args(
-                _merge_codex_permission_launch_args(
-                    conv.terminal_launch_args, permission_args or []
-                )
-            )
-        except ValueError as exc:
-            raise OmnigentError(
-                f"invalid terminal_launch_args: {exc}",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
-        if conv.terminal_launch_args != terminal_launch_args:
-            await asyncio.to_thread(
-                conversation_store.update_conversation,
-                session_id,
-                terminal_launch_args=terminal_launch_args,
-            )
-    if raw_mode is None:
-        return
-    if raw_mode not in CODEX_NATIVE_PERMISSION_VALUES:
-        raise OmnigentError(
-            "external_codex_approval_mode_change data.approval_mode must be one of "
-            f"{sorted(CODEX_NATIVE_PERMISSION_VALUES)}; got {raw_mode!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY) == raw_mode:
-        return
-    await asyncio.to_thread(
-        conversation_store.set_labels,
-        session_id,
-        {_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY: raw_mode},
-    )
-    _publish_codex_approval_mode(session_id, raw_mode)
-
-
-def _merge_codex_permission_launch_args(
-    existing_args: Sequence[str] | None,
-    permission_args: Sequence[str],
-) -> list[str]:
-    """Replace Codex permission arguments while preserving other launch args."""
-    config_keys = {
-        "approval_policy",
-        "approvals_reviewer",
-        "default_permissions",
-        "sandbox_mode",
-    }
-    value_options = {"--ask-for-approval", "-a", "--sandbox", "-s"}
-    merged: list[str] = []
-    args = list(existing_args or ())
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--dangerously-bypass-approvals-and-sandbox":
-            index += 1
-            continue
-        if arg in value_options:
-            index += 2
-            continue
-        if arg.startswith(("--ask-for-approval=", "-a=", "--sandbox=", "-s=")):
-            index += 1
-            continue
-        if arg in {"--config", "-c"} and index + 1 < len(args):
-            key = args[index + 1].partition("=")[0].strip()
-            if key in config_keys:
-                index += 2
-                continue
-            merged.extend(args[index : index + 2])
-            index += 2
-            continue
-        if arg.startswith(("--config=", "-c=")):
-            key = arg.split("=", 1)[1].partition("=")[0].strip()
-            if key in config_keys:
-                index += 1
-                continue
-        merged.append(arg)
-        index += 1
-    return [*merged, *permission_args]
-
-
-def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], bool]:
-    """
-    Drop every permission-mode selector from Claude launch args.
-
-    Removes ``--permission-mode`` (space- or ``=``-joined) and the standalone
-    ``--dangerously-skip-permissions``, which Claude treats as
-    ``--permission-mode bypassPermissions``; leaving that flag next to a pinned
-    mode would resume the session in bypass under a restricted label.
-
-    :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
-    :returns: The remaining args in order, and whether a selector was present.
-    """
-    stripped: list[str] = []
-    had_flag = False
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--dangerously-skip-permissions":
-            had_flag = True
-            index += 1
-            continue
-        if arg == "--permission-mode":
-            had_flag = True
-            index += 2  # drop the flag and its separate value token
-            continue
-        if arg.startswith("--permission-mode="):
-            had_flag = True
-            index += 1
-            continue
-        stripped.append(arg)
-        index += 1
-    return stripped, had_flag
-
-
-def _merge_claude_permission_launch_args(
-    existing_args: list[str] | None,
-    mode: str,
-) -> list[str] | None:
-    """Rewrite an existing ``--permission-mode`` in Claude launch args to ``mode``.
-
-    A runtime mode switch (shift+tab or PATCH) must survive relaunch, and the
-    launcher restores the mode from ``terminal_launch_args`` â€” not the label.
-    Rewrite the existing ``--permission-mode`` entry (space- or ``=``-joined) to
-    the current mode, preserving other args in order, so a cold resume reopens
-    in the mode the user last chose. A standalone ``--dangerously-skip-permissions``
-    counts as an existing ``--permission-mode bypassPermissions``.
-
-    Returns ``existing_args`` unchanged when they carry no ``--permission-mode``:
-    a session launched without the flag (manual, or a ``settings.json``
-    ``defaultMode``) must NOT be pinned to an explicit mode by a footer report â€”
-    the forwarder posts the launch mode on its first poll (see
-    ``claude_native_forwarder``), and pinning it would override the session's
-    settings default on relaunch. Those sessions surface the live mode through
-    the permission-mode label instead.
-    """
-    stripped, had_flag = _strip_claude_permission_launch_arg(list(existing_args or ()))
-    if not had_flag:
-        return existing_args
-    return [*stripped, "--permission-mode", mode]
-
-
-def _pin_claude_permission_launch_args(
-    existing_args: list[str] | None,
-    mode: str,
-) -> list[str]:
-    """
-    Set ``--permission-mode`` to ``mode`` in Claude launch args, adding it when absent.
-
-    For a switch the user made deliberately (the web picker, confirmed by the
-    runner) the mode must survive a cold resume even when the session was
-    created without the flag: the launcher rebuilds Claude's args from
-    ``terminal_launch_args`` alone and never reads the mode label, so a
-    label-only record reopens the session in Claude's default (manual) mode.
-    Pinning ``"default"`` is a deliberate choice of Claude's manual mode and
-    overrides a ``permissions.defaultMode`` in the user's settings on relaunch.
-
-    :param existing_args: Current launch args, e.g. ``["--model", "opus"]`` or ``None``.
-    :param mode: Runner-confirmed mode, e.g. ``"auto"``.
-    :returns: The args with exactly one trailing ``--permission-mode <mode>``.
-    """
-    stripped, _ = _strip_claude_permission_launch_arg(list(existing_args or ()))
-    return [*stripped, "--permission-mode", mode]
-
-
-def _handle_external_session_todos(
-    session_id: str,
-    body: SessionEventInput,
-) -> None:
-    """
-    Cache and broadcast a todo-list update from a native forwarder.
-
-    Sent by the claude-native forwarder (from ``TodoWrite``) and the
-    codex-native forwarder (from Codex plan updates); the panel is
-    harness-agnostic.
-
-    Updates the in-memory ``_session_todos_cache`` so subsequent
-    ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
-    field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected web clients update their todo panel immediately.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param body: The ``external_session_todos`` event body. Must have
-        ``data.todos`` as a list of todo dicts, e.g.
-        ``[{"content": "Fix bug", "status": "in_progress", "activeForm": "Fixing the bug"}]``.
-    :raises OmnigentError: When ``data.todos`` is missing or not a list.
-    """
-    todos = body.data.get("todos")
-    if not isinstance(todos, list):
-        raise OmnigentError(
-            "external_session_todos requires data.todos to be a list",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # Filter to well-formed items before caching so that malformed entries
-    # from a buggy forwarder version don't persist in the snapshot.  The
-    # same filter is applied by sse.ts on the live-event path; keeping the
-    # two in sync means the snapshot and live panel always show the same set.
-    valid_statuses = {"pending", "in_progress", "completed"}
-    validated: list[dict[str, Any]] = [
-        t
-        for t in todos
-        if isinstance(t, dict)
-        and isinstance(t.get("content"), str)
-        and t.get("status") in valid_statuses
-        and isinstance(t.get("activeForm"), str)
-    ]
-    _session_todos_cache[session_id] = validated
-    event = SessionTodosEvent(
-        type="session.todos",
-        conversation_id=session_id,
-        todos=validated,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_external_conversation_item(
-    session_id: str,
-    item: ConversationItem,
-    cleared_pending_id: str | None = None,
-    message_id: str | None = None,
-) -> None:
-    """
-    Broadcast a terminal-observed conversation item.
-
-    User messages use ``session.input.consumed`` so the web UI renders
-    them exactly like local/composer messages. Assistant/tool-side
-    items use ``response.output_item.done`` because they are already
-    completed records from Claude's transcript, not token deltas from
-    an active Omnigent task.
-
-    :param session_id: Session/conversation identifier.
-    :param item: Persisted conversation item.
-    :param cleared_pending_id: For a native user message, the id of the
-        optimistic pending-input entry the caller drained for it (so
-        clients drop that bubble by id), or ``None``. The drain happens
-        at the persist site â€” see :func:`_persist_external_conversation_item`
-        â€” because it also folds the entry's file blocks into the durable
-        item before append.
-    :param message_id: Optional live-preview stream finalized by this item.
-    :returns: None.
-    """
-    if item.type == "message" and isinstance(item.data, MessageData):
-        if item.data.role == "user":
-            _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
-            return
-        if item.data.is_meta:
-            # Hidden context on a non-user message has no live rendering
-            # path that filters on the flag, so keep it off the stream.
-            return
-    event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
-    payload = event.model_dump()
-    if message_id is not None:
-        payload["message_id"] = message_id
-    session_stream.publish(session_id, payload)
-
-
-def _publish_external_output_text_delta(session_id: str, body: SessionEventInput) -> None:
-    """
-    Broadcast a terminal-observed assistant text delta.
-
-    Terminal-backed integrations can observe streaming output before
-    their completed transcript item is available. This publishes the
-    standard Responses-style text-delta SSE event without persisting
-    anything; the final assistant message is persisted separately when
-    the integration posts ``external_conversation_item``.
-
-    The optional ``message_id`` / ``index`` / ``final`` fields are
-    carried through when present (native live streaming) and
-    omitted otherwise â€” ``exclude_none`` keeps the wire shape identical
-    to in-process task streaming for callers that don't set them.
-
-    :param session_id: Session/conversation identifier.
-    :param body: ``POST /events`` body whose type is
-        :data:`_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE`.
-    :returns: None.
-    :raises OmnigentError: If ``data.delta`` is not a string, or any
-        provided ``message_id`` / ``index`` / ``final`` has the wrong
-        type.
-    """
-    delta = body.data.get("delta")
-    if not isinstance(delta, str):
-        raise OmnigentError(
-            "external_output_text_delta requires string data.delta",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    message_id = body.data.get("message_id")
-    if message_id is not None and not isinstance(message_id, str):
-        raise OmnigentError(
-            "external_output_text_delta data.message_id must be a string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    index = body.data.get("index")
-    # ``bool`` is an ``int`` subclass; reject it explicitly so a stray
-    # boolean index is a loud error rather than a silent 0/1.
-    if index is not None and (not isinstance(index, int) or isinstance(index, bool)):
-        raise OmnigentError(
-            "external_output_text_delta data.index must be an integer",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    final = body.data.get("final")
-    if final is not None and not isinstance(final, bool):
-        raise OmnigentError(
-            "external_output_text_delta data.final must be a boolean",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    event = OutputTextDeltaEvent(
-        type="response.output_text.delta",
-        delta=delta,
-        message_id=message_id,
-        index=index,
-        final=final,
-    )
-    session_stream.publish(session_id, event.model_dump(exclude_none=True))
-
-
-def _publish_external_tool_output_delta(session_id: str, body: SessionEventInput) -> None:
-    """Broadcast a terminal-observed function-call output delta.
-
-    :param session_id: Session/conversation identifier.
-    :param body: Event body containing string ``call_id`` and ``delta`` values.
-    :returns: None.
-    :raises OmnigentError: If either required value is missing or not a string.
-    """
-    call_id = body.data.get("call_id")
-    delta = body.data.get("delta")
-    if not isinstance(call_id, str) or not call_id:
-        raise OmnigentError(
-            "external_tool_output_delta requires non-empty string data.call_id",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not isinstance(delta, str):
-        raise OmnigentError(
-            "external_tool_output_delta requires string data.delta",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    event = ToolOutputDeltaEvent(
-        type="response.function_call_output.delta",
-        call_id=call_id,
-        delta=delta,
-    )
-    session_stream.publish(session_id, event.model_dump(exclude_none=True))
-
-
-def _publish_external_output_reasoning_delta(session_id: str, body: SessionEventInput) -> None:
-    """
-    Broadcast a terminal-observed reasoning (chain-of-thought) delta.
-
-    The reasoning analogue of :func:`_publish_external_output_text_delta`:
-    terminal-backed integrations (the antigravity-native reader) observe a
-    streaming ``thinking`` block before the completed assistant item exists. This
-    publishes the standard reasoning SSE events the SPA already renders â€”
-    ``response.reasoning.started`` once (when ``data.started`` is true, marking a
-    new reasoning block) followed by ``response.reasoning_text.delta`` â€” without
-    persisting anything. Reasoning has no completed conversation item; the block
-    is finalized when the assistant message is persisted via
-    ``external_conversation_item``.
-
-    :param session_id: Session/conversation identifier.
-    :param body: ``POST /events`` body whose type is
-        :data:`_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE`.
-    :returns: None.
-    :raises OmnigentError: If ``data.delta`` is not a string, or ``data.started``
-        is provided with a non-boolean type.
-    """
-    delta = body.data.get("delta")
-    if not isinstance(delta, str):
-        raise OmnigentError(
-            "external_output_reasoning_delta requires string data.delta",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    started = body.data.get("started")
-    if started is not None and not isinstance(started, bool):
-        raise OmnigentError(
-            "external_output_reasoning_delta data.started must be a boolean",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if started:
-        session_stream.publish(
-            session_id,
-            ReasoningStartedEvent(type="response.reasoning.started").model_dump(exclude_none=True),
-        )
-    event = ReasoningTextDeltaEvent(type="response.reasoning_text.delta", delta=delta)
-    session_stream.publish(session_id, event.model_dump(exclude_none=True))
-
-
-_VALID_ELICITATION_ACTIONS: tuple[str, ...] = ("accept", "decline", "cancel")
-# Why a resolved event carries no verdict. ``"unanswered"``: the hook stopped
-# waiting (a severed poll never re-parked, or the ask timed out) before anyone
-# answered, so the prompt is gone rather than decided.
-_VALID_ELICITATION_RESOLVED_REASONS: tuple[str, ...] = ("unanswered",)
-
-
-def _publish_elicitation_resolved(
-    session_id: str,
-    elicitation_id: str,
-    action: str | None = None,
-    reason: str | None = None,
-) -> None:
-    """
-    Universal "approval done" signal â€” single publish drives both
-    sidebar (via :func:`pending_elicitations.record_publish` decrement)
-    and the chat-side ``ApprovalCard`` flip on every live subscriber.
-    Idempotent on duplicate emissions for the same id.
-
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :param elicitation_id: Correlation id, e.g. ``"elicit_abc123"``.
-    :param action: Optional MCP verdict (``"accept"``/``"decline"``/
-        ``"cancel"``) so downstream consumers â€” notably the
-        sub-agent block notifier's parent resolution notice â€” can
-        state how the gate was answered instead of leaving agents to
-        guess. Omitted from the payload when unknown or not one of
-        the three MCP actions.
-    :param reason: Why there is no verdict, e.g. ``"unanswered"`` when
-        the hook stopped waiting before anyone answered, so the card
-        can say the prompt expired instead of implying someone resolved
-        it. Omitted when unknown, not a recognised reason, or when a
-        verdict is present â€” a verdict and a no-verdict reason are
-        mutually exclusive on the wire.
-    """
-    payload: dict[str, Any] = {
-        "type": "response.elicitation_resolved",
-        "elicitation_id": elicitation_id,
-    }
-    if action in _VALID_ELICITATION_ACTIONS:
-        payload["action"] = action
-    elif reason in _VALID_ELICITATION_RESOLVED_REASONS:
-        payload["reason"] = reason
-    session_stream.publish(session_id, payload)
-
-
-async def _forward_approval_to_runner(
-    session_id: str,
-    data: dict[str, Any],
-    runner_router: RunnerRouter | None,
-) -> None:
-    """
-    Forward an approval verdict to the session's bound runner.
-
-    Runner-side elicitations (policy approvals parked in the runner's
-    ``_pending_approvals`` dict, scaffold dispatch) resolve when the
-    canonical ``approval`` event reaches the runner's ``/events``. The
-    serverâ†”runner contract stays the ``approval`` event regardless of
-    how the verdict arrived at the server (resolve URL or approval
-    event). No-op when no runner is bound (in-process setups). HTTP
-    errors are logged, not raised â€” a dead runner must not fail the
-    caller's resolution (the server-side Future was already set).
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param data: The approval payload to forward verbatim as the
-        event ``data``, e.g. ``{"elicitation_id": "elicit_abc",
-        "action": "accept"}``.
-    :param runner_router: Router used to resolve the bound runner, or
-        ``None`` in in-process setups (forward skipped).
-    """
-    runner_client = await _get_runner_client(session_id, runner_router)
-    if runner_client is None:
-        return
-    try:
-        await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": _APPROVAL_TYPE, "data": data},
-            timeout=10.0,
-        )
-    except (httpx.HTTPError, ConnectionError):
-        _logger.exception(
-            "Approval forward failed for %r",
-            session_id,
-            extra={"session_id": session_id},
-        )
-
-
-def _parse_external_assistant_message(
-    body: SessionEventInput,
-) -> tuple[str, str, str]:
-    """
-    Validate and unpack an external assistant-message event.
-
-    :param body: ``POST /events`` body whose type is
-        :data:`_EXTERNAL_ASSISTANT_MESSAGE_TYPE`.
-    :returns: ``(agent_name, text, response_id)``.
-    :raises OmnigentError: If required fields are missing or
-        malformed.
-    """
-    agent_name = body.data.get("agent")
-    if not isinstance(agent_name, str) or not agent_name.strip():
-        raise OmnigentError(
-            "external_assistant_message requires data.agent",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    text = body.data.get("text")
-    if not isinstance(text, str) or not text:
-        raise OmnigentError(
-            "external_assistant_message requires non-empty data.text",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    response_id = body.data.get("response_id")
-    if response_id is None:
-        response_id = generate_task_id()
-    if not isinstance(response_id, str) or not response_id.strip():
-        raise OmnigentError(
-            "external_assistant_message data.response_id must be a non-empty string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return agent_name.strip(), text, response_id.strip()
-
-
-async def _persist_external_assistant_message(
-    session_id: str,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> str:
-    """
-    Persist and broadcast assistant text produced outside Omnigent tasks.
-
-    The event is append-only conversation history. It intentionally
-    bypasses the legacy persist path so mirroring a
-    Claude terminal response does not create or steer an Omnigent
-    agent task.
-
-    :param session_id: Session/conversation identifier.
-    :param body: External assistant-message event body.
-    :param conversation_store: Store used to append the message.
-    :returns: Store-assigned conversation item id.
-    """
-    agent_name, text, response_id = _parse_external_assistant_message(body)
-    item = NewConversationItem(
-        type="message",
-        response_id=response_id,
-        data=MessageData(
-            role="assistant",
-            agent=agent_name,
-            content=[{"type": "output_text", "text": text}],
-        ),
-    )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    persisted = persisted_items[0]
-    _publish_external_assistant_message(
-        session_id,
-        persisted,
-        response_id=response_id,
-        agent_name=agent_name,
-    )
-    return persisted.id
-
-
-def _parse_external_conversation_item(
-    body: SessionEventInput,
-) -> NewConversationItem:
-    """
-    Validate and unpack an external conversation-item event.
-
-    :param body: ``POST /events`` body whose type is
-        :data:`_EXTERNAL_CONVERSATION_ITEM_TYPE`.
-    :returns: A parsed :class:`NewConversationItem` ready to append.
-    :raises OmnigentError: If required fields are missing or
-        malformed.
-    """
-    item_type = body.data.get("item_type")
-    if not isinstance(item_type, str) or item_type not in ITEM_TYPE_TO_DATA_CLS:
-        raise OmnigentError(
-            "external_conversation_item requires known data.item_type",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    item_data = body.data.get("item_data")
-    if not isinstance(item_data, dict):
-        raise OmnigentError(
-            "external_conversation_item requires object data.item_data",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    response_id = body.data.get("response_id")
-    if response_id is None:
-        response_id = generate_task_id()
-    if not isinstance(response_id, str) or not response_id.strip():
-        raise OmnigentError(
-            "external_conversation_item data.response_id must be a non-empty string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    message_id = body.data.get("message_id")
-    if message_id is not None and (not isinstance(message_id, str) or not message_id):
-        raise OmnigentError(
-            "external_conversation_item data.message_id must be a non-empty string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # NOTE: producers that can re-post (the native transcript forwarders
-    # retry timed-out POSTs whose disposition they cannot know) send a
-    # ``data.source_id`` dedup key; the persist path derives the item's
-    # stable id from it so the append is idempotent (see
-    # ``_persist_external_conversation_item``). Items without one keep the
-    # store-assigned random id and no server-side dedup.
-    # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
-    if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
-        item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
-    try:
-        data = parse_item_data(item_type, {"type": item_type, **item_data})
-    except (ValueError, TypeError) as exc:
-        raise OmnigentError(
-            f"Invalid data payload for external item type {item_type!r}: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
-    if message_id is not None and isinstance(data, MessageData) and data.role == "assistant":
-        data = data.model_copy(update={"stream_message_id": message_id})
-    return NewConversationItem(
-        type=item_type,
-        response_id=response_id.strip(),
-        data=data,
-    )
-
-
-def _find_claude_native_subagent_child(
-    conversation_store: ConversationStore,
-    parent_id: str,
-    subagent_id: str,
-) -> Conversation | None:
-    """
-    Look up an existing claude-native sub-agent child by its Claude-
-    side ``subagent_id``.
-
-    Used to make :func:`_persist_external_subagent_start` idempotent:
-    the forwarder retries on transient HTTP errors, so two POSTs may
-    carry the same ``subagent_id`` for the same physical sub-agent â€”
-    we want both to resolve to the same child Conversation row.
-
-    :param conversation_store: Store to query.
-    :param parent_id: Parent (claude-native) conversation id,
-        e.g. ``"conv_parent987"``.
-    :param subagent_id: Stable Claude-side identifier read from
-        ``agent-<id>.meta.json``'s directory name, e.g.
-        ``"a5c7effac5a9a35ab"``.
-    :returns: The matching child :class:`Conversation`, or ``None``
-        when no row has been minted for this sub-agent yet.
-    """
-    # Page through all children so the lookup isn't capped by result
-    # ordering. A parent with > 100 sub-agents would otherwise miss the
-    # existing row for an older ``subagent_id`` and fall through to
-    # ``create_conversation``, which then trips the
-    # ``(parent, title)`` unique constraint instead of returning the
-    # existing child id.
-    after: str | None = None
-    while True:
-        page = conversation_store.list_conversations(
-            kind="sub_agent",
-            parent_conversation_id=parent_id,
-            limit=100,
-            after=after,
-        )
-        for child in page.data:
-            if child.labels.get(_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY) == subagent_id:
-                return child
-        if not page.has_more or page.last_id is None:
-            return None
-        after = page.last_id
-
-
-def _find_acp_subagent_child(
-    conversation_store: ConversationStore,
-    parent_id: str,
-    subagent_id: str,
-) -> Conversation | None:
-    """
-    Look up an existing ACP sub-agent child by its harness-side id.
-
-    Mirrors :func:`_find_claude_native_subagent_child` (including its
-    pagination, so a parent with many sub-agents still finds an older row)
-    but keys on :data:`_ACP_SUBAGENT_ID_LABEL_KEY`.
-
-    :param conversation_store: Store to query.
-    :param parent_id: Parent conversation id, e.g. ``"conv_parent987"``.
-    :param subagent_id: The agent's own sub-agent id, e.g. ``"a0ac9364"``.
-    :returns: The matching child :class:`Conversation`, or ``None``.
-    """
-    after: str | None = None
-    while True:
-        page = conversation_store.list_conversations(
-            kind="sub_agent",
-            parent_conversation_id=parent_id,
-            limit=100,
-            after=after,
-        )
-        for child in page.data:
-            if child.labels.get(_ACP_SUBAGENT_ID_LABEL_KEY) == subagent_id:
-                return child
-        if not page.has_more or page.last_id is None:
-            return None
-        after = page.last_id
-
-
-async def _persist_external_acp_subagent_start(
-    parent_id: str,
-    parent_conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> str:
-    """
-    Mint a child :class:`Conversation` for an ACP agent's sub-agent.
-
-    The ACP counterpart of :func:`_persist_external_subagent_start`. An ACP
-    agent (e.g. Devin) runs its sub-agents inside its own single session, so the
-    child is a display row: it inherits the parent's ``agent_id`` and, crucially,
-    carries **no** ``omnigent.wrapper`` value. That absence is load-bearing â€” a
-    native subagent wrapper value makes the UI label the child with that vendor's
-    name (a Devin sub-agent minted through the claude path renders as "Claude
-    Code"), whereas with none the child's harness resolves through
-    :func:`_resolve_harness_impl` to the parent's (e.g. ``devin``) and the UI
-    labels it from the harness catalog.
-
-    Idempotent: a redelivery with the same ``subagent_id`` returns the existing
-    child id, with a title-collision recovery path matching the native helpers.
-
-    :param parent_id: Parent conversation id, e.g. ``"conv_parent987"``.
-    :param parent_conv: Pre-fetched parent row; its ``agent_id`` / ``runner_id``
-        are copied onto the child.
-    :param body: The POST event body. Required ``data`` keys: ``subagent_id``
-        (the agent's own id) and ``title`` (the row label). Optional:
-        ``description`` (the delegated task).
-    :param conversation_store: Store used to read existing children and create
-        the new row.
-    :returns: The child conversation id, e.g. ``"conv_child456"``.
-    :raises OmnigentError: 400 when a required key is missing or the parent has
-        no ``agent_id``.
-    """
-    subagent_id = body.data.get("subagent_id")
-    title_raw = body.data.get("title")
-    description = body.data.get("description") or ""
-    if not isinstance(subagent_id, str) or not subagent_id:
-        raise OmnigentError(
-            "external_acp_subagent_start requires non-empty data.subagent_id",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not isinstance(title_raw, str) or not title_raw:
-        raise OmnigentError(
-            "external_acp_subagent_start requires non-empty data.title",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not isinstance(description, str):
-        raise OmnigentError(
-            "external_acp_subagent_start data.description must be a string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if parent_conv.agent_id is None:
-        raise OmnigentError(
-            f"parent session {parent_id!r} has no agent_id; cannot create an ACP sub-agent child",
-            code=ErrorCode.INVALID_INPUT,
-        )
-
-    existing = await asyncio.to_thread(
-        _find_acp_subagent_child, conversation_store, parent_id, subagent_id
-    )
-    if existing is not None:
-        return existing.id
-
-    labels = {
-        _ACP_SUBAGENT_ID_LABEL_KEY: subagent_id,
-        _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY: description,
-    }
-    # ``(parent_conversation_id, title)`` is unique, and an agent can give two
-    # parallel sub-agents the same label, so the stable id disambiguates. The
-    # rail hides the post-colon half, so the user still reads just the label.
-    title = f"{title_raw}:{subagent_id}"
-    try:
-        child = await asyncio.to_thread(
-            conversation_store.create_conversation,
-            kind="sub_agent",
-            title=title,
-            parent_conversation_id=parent_id,
-            agent_id=parent_conv.agent_id,
-            runner_id=parent_conv.runner_id,
-            sub_agent_name=title_raw,
-        )
-    except NameAlreadyExistsError:
-        # The unique index fired but the label lookup missed â€” a concurrent POST
-        # won the insert, or an earlier one died before ``set_labels``. Adopt the
-        # row and re-stamp, mirroring the native helpers' recovery.
-        adopted = await asyncio.to_thread(
-            _find_subagent_child_by_title, conversation_store, parent_id, title
-        )
-        if adopted is None:
-            raise
-        await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
-        return adopted.id
-    await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
-    return child.id
-
-
-def _find_subagent_child_by_title(
-    conversation_store: ConversationStore,
-    parent_id: str,
-    title: str,
-) -> Conversation | None:
-    """
-    Look up an existing sub-agent child by its exact title.
-
-    Recovery path for duplicate-title races: when ``create_conversation``
-    trips the ``(parent_conversation_id, title)`` unique index but the
-    label-based idempotency lookup missed â€” the original POST crashed
-    after creating the row and before ``set_labels`` ran â€” the row can
-    only be found by the title itself. Native sub-agent titles embed the
-    stable harness-side id (e.g. ``"Explore:a5c7effac5a9a35ab"``,
-    ``"codex-native-ui-subagent:<thread_id>"``), so an exact title match
-    under the same parent identifies the same physical sub-agent.
-
-    :param conversation_store: Store to query.
-    :param parent_id: Parent conversation id, e.g. ``"conv_parent987"``.
-    :param title: Exact child title, e.g. ``"Explore:a5c7effac5a9a35ab"``.
-    :returns: Matching child :class:`Conversation`, or ``None`` when no
-        row under *parent_id* carries that title.
-    """
-    after: str | None = None
-    while True:
-        page = conversation_store.list_conversations(
-            kind="sub_agent",
-            parent_conversation_id=parent_id,
-            limit=100,
-            after=after,
-        )
-        for child in page.data:
-            if child.title == title:
-                return child
-        if not page.has_more or page.last_id is None:
-            return None
-        after = page.last_id
-
-
-def _publish_session_created(
-    parent_id: str,
-    child_session_id: str,
-    agent_id: str | None,
-) -> None:
-    """
-    Emit ``session.created`` on the parent's stream for a child session.
-
-    Clients watching the parent (e.g. the web Subagents rail tab)
-    invalidate their ``child_sessions`` cache and re-fetch on this
-    event.
-
-    :param parent_id: Parent conversation id, e.g. ``"conv_parent987"``.
-    :param child_session_id: The minted (or adopted) child id, e.g.
-        ``"conv_child456"``.
-    :param agent_id: Agent id stamped on the child (the parent's
-        agent), e.g. ``"ag_abc123"``. ``None`` only for legacy parents
-        without one.
-    """
-    event = SessionCreatedEvent(
-        type="session.created",
-        conversation_id=parent_id,
-        child_session_id=child_session_id,
-        agent_id=agent_id,
-        parent_session_id=parent_id,
-    )
-    session_stream.publish(parent_id, event.model_dump())
-
-
-async def _persist_external_subagent_start(
-    parent_id: str,
-    parent_conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-) -> str:
-    """
-    Mint a child :class:`Conversation` row for a claude-native
-    sub-agent and emit the parent's ``session.created`` SSE event.
-
-    Claude Code spawns sub-agents internally via its Task tool and
-    never POSTs to Omnigent to register them. The forwarder watches the
-    parent's on-disk ``subagents/`` directory and calls this handler
-    when a new ``.meta.json`` appears. We reuse the parent's
-    ``agent_id`` (claude-native sub-agents don't have their own
-    omnigent agent), stamp identifying labels, and publish the
-    same ``session.created`` event omnigent-spawned children fire
-    so the rail's ``child_sessions`` cache invalidates.
-
-    Idempotent: a second POST with the same ``subagent_id`` returns
-    the existing child's id without creating a duplicate â€” via the
-    label lookup when the row is fully stamped, or via title-collision
-    recovery when an earlier POST died between ``create_conversation``
-    and ``set_labels`` (the recovery also re-stamps the labels so the
-    row is healed for subsequent deliveries).
-
-    :param parent_id: Parent (claude-native) conversation id,
-        e.g. ``"conv_parent987"``.
-    :param parent_conv: Pre-fetched parent row â€” its ``agent_id`` is
-        copied onto the child and its labels disambiguate
-        claude-native parents from other harnesses.
-    :param body: The POST event body. Required ``data`` keys:
-        ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
-        ``agent_type`` (e.g. ``"Explore"``), ``description``
-        (free-form, used in the title), ``tool_use_id``
-        (e.g. ``"toolu_..."``).
-    :param conversation_store: Store used to read existing children
-        (for idempotency) and create the new row.
-    :returns: The child conversation id, e.g. ``"conv_child456"``.
-    :raises OmnigentError: 400 if the payload is missing any of
-        the required keys; 400 if the parent has no ``agent_id``
-        (claude-native parents always carry one, so this would be
-        a corrupted row).
-    """
-    subagent_id = body.data.get("subagent_id")
-    agent_type = body.data.get("agent_type")
-    description = body.data.get("description")
-    tool_use_id = body.data.get("tool_use_id")
-    if not isinstance(subagent_id, str) or not subagent_id:
-        raise OmnigentError(
-            "external_subagent_start requires non-empty data.subagent_id",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not isinstance(agent_type, str) or not agent_type:
-        raise OmnigentError(
-            "external_subagent_start requires non-empty data.agent_type",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not isinstance(description, str):
-        raise OmnigentError(
-            "external_subagent_start requires data.description (string)",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not isinstance(tool_use_id, str) or not tool_use_id:
-        raise OmnigentError(
-            "external_subagent_start requires non-empty data.tool_use_id",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if parent_conv.agent_id is None:
-        # claude-native parents are always created with an agent_id
-        # by ``omnigent claude`` (the synthetic Claude bundle).
-        # A null agent_id here means we're being called against a
-        # legacy / corrupt row â€” fail loud rather than silently
-        # mint a child without a parent agent.
-        raise OmnigentError(
-            f"parent session {parent_id!r} has no agent_id; cannot "
-            "create a claude-native sub-agent child",
-            code=ErrorCode.INVALID_INPUT,
-        )
-
-    # Idempotency: a forwarder retry with the same subagent_id must
-    # resolve to the same child row, not mint a duplicate. The
-    # forwarder also persists its own cursor file so this should be
-    # rare, but the network is unreliable and the cursor write
-    # happens after the POST.
-    existing = await asyncio.to_thread(
-        _find_claude_native_subagent_child,
-        conversation_store,
-        parent_id,
-        subagent_id,
-    )
-    if existing is not None:
-        return existing.id
-
-    # Title format mirrors omnigent-spawned children
-    # (``"{tool}:{session_name}"``). The ``session_name`` half must be
-    # unique per parent because the conversation store has a
-    # ``(parent_conversation_id, title)`` unique index â€” using the
-    # description here would collide whenever Claude's LLM passes the
-    # same agentType + description for parallel sub-agents (which the
-    # Task tool does routinely). The ``subagent_id`` is the only stable
-    # per-sub-agent identifier in the meta file, so it goes here.
-    #
-    # The title is therefore a uniqueness key, not a display string:
-    # nothing user-facing should render it. The human-readable
-    # description goes on a label below, and
-    # ``_claude_subagent_display_tool`` turns that label into the
-    # rail's row label.
-    title = f"{agent_type}:{subagent_id}"
-    labels = {
-        _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-        _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY: subagent_id,
-        _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY: tool_use_id,
-        _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY: description,
-    }
-
-    try:
-        child = await asyncio.to_thread(
-            conversation_store.create_conversation,
-            kind="sub_agent",
-            title=title,
-            parent_conversation_id=parent_id,
-            agent_id=parent_conv.agent_id,
-            runner_id=parent_conv.runner_id,
-            sub_agent_name=agent_type,
-        )
-    except NameAlreadyExistsError:
-        # The (parent, title) unique index fired: the row already exists
-        # but the label-based idempotency lookup above missed it â€” either
-        # a concurrent POST won the insert race, or an earlier POST died
-        # after create_conversation and before set_labels, leaving an
-        # unlabeled row. Without this recovery every forwarder redelivery
-        # 500s on the same collision until the forwarder gives up and
-        # parks the sub-agent (it then never appears in the rail). Adopt
-        # the existing row and re-stamp its labels (idempotent upsert) so
-        # the next delivery takes the fast label-lookup path.
-        adopted = await asyncio.to_thread(
-            _find_subagent_child_by_title,
-            conversation_store,
-            parent_id,
-            title,
-        )
-        if adopted is None:
-            raise
-        await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
-        # The POST that created this orphan died before reaching the
-        # ``session.created`` publish below, so live clients (the web
-        # Subagents rail) have never heard about the child â€” emit it now.
-        # In the concurrent-race case the winner also published; a
-        # duplicate event is a harmless extra cache invalidation.
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
-        return adopted.id
-    await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
-    return child.id
-
-
-def _antigravity_subagent_title(role: str, cascade_id: str) -> str:
-    """
-    Build the child row title for an agy sub-agent.
-
-    ``"<role>:<cascade id>"``. The Agents rail splits a child title on its FIRST
-    colon into ``tool`` / ``session_name``, so this renders the role as the agent
-    name and the cascade id as the correlation handle with no rail-side special
-    case â€” unlike claude/codex children, which need a display helper each. Any
-    colon inside the role is folded to a dash so that split lands where intended.
-
-    The cascade id is agy's own stable per-sub-agent id, which also makes the
-    title the idempotency key: a redelivered start trips the
-    ``(parent_conversation_id, title)`` unique index instead of minting a second
-    row for the same sub-agent.
-
-    :param role: agy ``subagentSpec`` role, e.g. ``"App Router Code Reviewer"``.
-    :param cascade_id: agy child conversation id, e.g. ``"1eca7625-â€¦"``.
-    :returns: Child conversation title.
-    """
-    head = role.replace(":", "-").strip() or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK
-    return f"{head}:{cascade_id}"
-
-
-def _antigravity_subagent_labels_from_body(
-    cascade_id: str,
-    body: SessionEventInput,
-) -> dict[str, str]:
-    """
-    Build the label dict for an agy sub-agent child row.
-
-    :param cascade_id: agy child conversation id, e.g. ``"1eca7625-â€¦"``.
-    :param body: Validated ``external_antigravity_subagent_start`` event body.
-    :returns: Labels to upsert on the child conversation row.
-    """
-    labels: dict[str, str] = {
-        _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-        _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY: cascade_id,
-    }
-    for data_key, label_key in (
-        ("tool_call_id", _ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY),
-        ("role", _ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL_KEY),
-        ("agent_type", _ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY),
-    ):
-        value = body.data.get(data_key)
-        if isinstance(value, str) and value:
-            labels[label_key] = value
-    return labels
-
-
-async def _inherit_native_child_reasoning_effort(
-    child: Conversation,
-    parent_conv: Conversation,
-    conversation_store: ConversationStore,
-) -> Conversation:
-    """Persist a native childâ€™s inherited parent reasoning effort."""
-    parent_effort = parent_conv.reasoning_effort
-    if child.reasoning_effort is not None or parent_effort is None:
-        return child
-    updated = await asyncio.to_thread(
-        conversation_store.update_conversation,
-        child.id,
-        reasoning_effort=parent_effort,
-    )
-    return updated or child
-
-
-async def _create_and_publish_antigravity_child(
-    parent_id: str,
-    parent_conv: Conversation,
-    title: str,
-    agent_type: str,
-    labels: dict[str, str],
-    conversation_store: ConversationStore,
-) -> str:
-    """
-    Create an agy sub-agent child row and publish ``session.created``.
-
-    :param parent_id: Parent antigravity-native conversation id.
-    :param parent_conv: Parent row whose ``agent_id`` / ``runner_id`` the child
-        inherits.
-    :param title: Child title from :func:`_antigravity_subagent_title`.
-    :param agent_type: agy ``subagentSpec`` type, e.g. ``"research"``.
-    :param labels: Labels to stamp on the new child row.
-    :param conversation_store: Store used to create the child row.
-    :returns: New child conversation id, e.g. ``"conv_child456"``.
-    """
-    try:
-        child = await asyncio.to_thread(
-            conversation_store.create_conversation,
-            kind="sub_agent",
-            title=title,
-            parent_conversation_id=parent_id,
-            agent_id=parent_conv.agent_id,
-            runner_id=parent_conv.runner_id,
-            sub_agent_name=agent_type or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
-        )
-    except NameAlreadyExistsError:
-        # The (parent, title) unique index fired: a concurrent start, or a
-        # redelivery that arrived before ``set_labels`` ran. Adopt the row and
-        # upsert labels rather than 500ing the sub-agent out of the rail.
-        existing = await asyncio.to_thread(
-            _find_subagent_child_by_title, conversation_store, parent_id, title
-        )
-        if existing is None:
-            raise
-        await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
-        existing = await _inherit_native_child_reasoning_effort(
-            existing, parent_conv, conversation_store
-        )
-        # An orphaned row's creator died before publishing, so live clients have
-        # never heard about this child; a duplicate publish in the race case is a
-        # harmless extra cache invalidation.
-        _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
-        return existing.id
-    child = await _inherit_native_child_reasoning_effort(child, parent_conv, conversation_store)
-    await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
-    return child.id
-
-
-def _find_codex_native_subagent_child(
-    conversation_store: ConversationStore,
-    parent_id: str,
-    thread_id: str,
-) -> Conversation | None:
-    """
-    Look up an existing Codex-native sub-agent child by its Codex thread id.
-
-    Makes ``_persist_external_codex_subagent_start`` idempotent: when the
-    forwarder re-posts because it observed both ``item/started`` and
-    ``item/completed`` for the same collab item, the second POST returns
-    the existing child row rather than creating a duplicate.
-
-    :param conversation_store: Store to query.
-    :param parent_id: Parent codex-native conversation id, e.g.
-        ``"conv_parent987"``.
-    :param thread_id: Codex child thread id, e.g.
-        ``"019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"``.
-    :returns: Matching child :class:`Conversation`, or ``None`` when no
-        row exists for this thread id.
-    """
-    after: str | None = None
-    while True:
-        page = conversation_store.list_conversations(
-            kind="sub_agent",
-            parent_conversation_id=parent_id,
-            limit=100,
-            after=after,
-        )
-        for child in page.data:
-            if child.labels.get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY) == thread_id:
-                return child
-        if not page.has_more or page.last_id is None:
-            return None
-        after = page.last_id
-
-
-def _codex_subagent_display_tool(labels: dict[str, str]) -> str:
-    """
-    Return the UI-facing label for a Codex child session.
-
-    Uses the Codex-assigned nickname when available, then the agent
-    role, then ``"Codex"`` as a generic fallback.
-
-    :param labels: Conversation labels from a Codex child row.
-    :returns: Display label, e.g. ``"auth-auditor"``.
-    """
-    nickname = labels.get(_CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY)
-    if nickname:
-        return nickname
-    role = labels.get(_CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY)
-    if role:
-        return role
-    return _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK
-
-
-def _claude_subagent_display_tool(conv: Conversation, labels: dict[str, str]) -> str | None:
-    """
-    Return the UI-facing label for a Claude Code sub-agent child.
-
-    The Task tool's free-form ``description`` ("wave-worker-696") is
-    the only part a human recognises, so it wins. Without one, fall
-    back to the agent type's trailing segment: plugin-namespaced types
-    arrive as ``"rpw-published:debug-lead"`` and only the agent name
-    carries meaning. The row's title is a uniqueness key built from the
-    opaque ``subagent_id``, so it is never a display candidate.
-
-    :param conv: Claude-native sub-agent child row; its
-        ``sub_agent_name`` holds the Claude ``agentType``.
-    :param labels: Conversation labels from that row.
-    :returns: Display label, e.g. ``"wave-worker-696"`` or
-        ``"debug-lead"``; ``None`` when the row carries neither.
-    """
-    description = " ".join((labels.get(_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY) or "").split())
-    if description:
-        return description
-    agent_type = (conv.sub_agent_name or "").strip()
-    if agent_type:
-        return agent_type.rpartition(":")[2] or agent_type
-    return None
-
-
-def _is_claude_native_subagent(conv: Conversation) -> bool:
-    """
-    Return whether a child conversation tracks a Claude Code sub-agent.
-
-    :param conv: Conversation row to inspect.
-    :returns: ``True`` when the row carries the claude-native sub-agent
-        wrapper label.
-    """
-    return (
-        conv.kind == "sub_agent"
-        and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-        == _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
-    )
-
-
-def _is_codex_native_subagent(conv: Conversation) -> bool:
-    """
-    Return whether a child conversation tracks a Codex internal sub-agent.
-
-    :param conv: Conversation row to inspect.
-    :returns: ``True`` when the row carries the codex-native sub-agent
-        wrapper label.
-    """
-    return (
-        conv.kind == "sub_agent"
-        and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-        == _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
-    )
-
-
-def _background_task_delivery_status(
-    status: str,
-    background_task_count: int | None,
-    conv: Conversation,
-) -> str:
-    """Collapse a background-task ``waiting`` back to ``idle``.
-
-    A claude-native session relabels its ``Stop`` turn-end ``idle`` to
-    ``waiting`` (in the forwarder) while background shells linger. The turn
-    itself is over â€” the TUI takes a new prompt immediately â€” so ``waiting``
-    misreports the session as mid-turn everywhere the status is read as a
-    turn gate: the composer queues each send behind "Steer", the sidebar dot
-    spins, and because ``waiting`` keeps ``_session_active_response_cache``
-    populated a reconnect reopens the settled turn's streaming bubble. For a
-    sub-agent it also hangs the orchestrator â€” the terminal-delivery branch
-    in ``post_event`` keys off ``idle``/``failed`` and no follow-up ``Stop``
-    ever comes.
-
-    The tally alone already drives every background-shell affordance at
-    ``idle`` (the in-chat "N background tasks still running" indicator reads
-    the count, not the status), so deliver ``idle`` and let the count speak
-    for the shells. Normalizing here rather than in the forwarder also covers
-    runners that predate the change.
-
-    Codex-internal children keep ``waiting``: they never emit a claude-native
-    ``Stop`` hook, and their status is consumed inside the app-server thread
-    tree rather than through this delivery branch.
-
-    :param status: The incoming external status, e.g. ``"waiting"``.
-    :param background_task_count: Parsed background-shell tally, or ``None``.
-    :param conv: The conversation the status is for.
-    :returns: ``"idle"`` for a background-task ``waiting`` on any non-codex
-        session; otherwise ``status`` unchanged.
-    """
-    if (
-        status == "waiting"
-        and background_task_count is not None
-        and background_task_count > 0
-        and not _is_codex_native_subagent(conv)
-    ):
-        return "idle"
-    return status
-
-
-# Cap the per-shell detail a single edge can carry, mirroring the forwarder's
-# own cap so a malformed payload can't bloat the status event server-side.
-_MAX_FORWARDED_BACKGROUND_TASKS = 100
-
-
-def _parse_background_tasks(raw: object) -> list[BackgroundTaskInfo] | None:
-    """
-    Validate the ``background_tasks`` detail off an external status edge.
-
-    The claude-native forwarder sends this alongside a positive
-    ``background_task_count`` (see :func:`_background_task_delivery_status`).
-    It is best-effort display data: non-dict / unvalidatable entries are
-    dropped rather than failing the whole edge, and the list is capped at
-    :data:`_MAX_FORWARDED_BACKGROUND_TASKS`.
-
-    :param raw: The raw ``data.background_tasks`` value off the wire.
-    :returns: Parsed detail, or ``None`` when absent or nothing validated.
-    """
-    if not isinstance(raw, list):
-        return None
-    parsed: list[BackgroundTaskInfo] = []
-    for entry in raw[:_MAX_FORWARDED_BACKGROUND_TASKS]:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            parsed.append(BackgroundTaskInfo.model_validate(entry))
-        except ValidationError:
-            continue
-    return parsed or None
-
-
-def _codex_subagent_labels_from_body(
-    thread_id: str,
-    body: SessionEventInput,
-) -> dict[str, str]:
-    """
-    Build the label dict for a Codex-native sub-agent child row.
-
-    :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param body: Validated ``external_codex_subagent_start`` event body.
-    :returns: Labels to upsert on the child conversation row.
-    """
-    labels: dict[str, str] = {
-        _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-        _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY: thread_id,
-    }
-    for data_key, label_key in (
-        ("parent_thread_id", _CODEX_NATIVE_SUBAGENT_PARENT_THREAD_ID_LABEL_KEY),
-        ("tool_call_id", _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY),
-        ("prompt", _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY),
-        ("agent_nickname", _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY),
-        ("agent_role", _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY),
-    ):
-        value = body.data.get(data_key)
-        if isinstance(value, str) and value:
-            labels[label_key] = value
-    return labels
-
-
-async def _create_and_publish_codex_child(
-    parent_id: str,
-    parent_conv: Conversation,
-    thread_id: str,
-    labels: dict[str, str],
-    conversation_store: ConversationStore,
-) -> str:
-    """
-    Create a new Codex child Conversation row and publish ``session.created``.
-
-    :param parent_id: Parent codex-native conversation id, e.g.
-        ``"conv_parent987"``.
-    :param parent_conv: Parent row whose ``agent_id`` and ``runner_id``
-        are inherited by the child.
-    :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param labels: Labels to stamp on the new child row.
-    :param conversation_store: Store used to create the child row.
-    :returns: New child conversation id, e.g. ``"conv_child456"``.
-    """
-    # Stable title so the (parent, title) unique index prevents race-condition
-    # duplicate rows when the forwarder retries a failed registration.
-    title = f"codex-native-ui-subagent:{thread_id}"
-    try:
-        child = await asyncio.to_thread(
-            conversation_store.create_conversation,
-            kind="sub_agent",
-            title=title,
-            parent_conversation_id=parent_id,
-            agent_id=parent_conv.agent_id,
-            runner_id=parent_conv.runner_id,
-            sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
-        )
-    except NameAlreadyExistsError:
-        # A concurrent POST (or a retry that arrived before set_labels ran)
-        # already created the row â€” find it and upsert labels instead.
-        existing = await asyncio.to_thread(
-            _find_codex_native_subagent_child, conversation_store, parent_id, thread_id
-        )
-        if existing is None:
-            # The thread-id label never landed (the original POST died
-            # between create_conversation and set_labels), so the label
-            # lookup can't see the row. The title embeds the same thread
-            # id and must exist for the unique index to have fired â€” fall
-            # back to it so redelivery heals the unlabeled row instead of
-            # permanently 500ing.
-            existing = await asyncio.to_thread(
-                _find_subagent_child_by_title,
-                conversation_store,
-                parent_id,
-                title,
-            )
-        if existing is not None:
-            await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
-            existing = await _inherit_native_child_reasoning_effort(
-                existing, parent_conv, conversation_store
-            )
-            # An orphaned row's creator died before publishing
-            # ``session.created``, so live clients have never heard about
-            # this child â€” emit it now. In the concurrent-race case the
-            # winner also published; the duplicate is a harmless extra
-            # cache invalidation.
-            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
-            return existing.id
-        raise
-    child = await _inherit_native_child_reasoning_effort(child, parent_conv, conversation_store)
-    await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
-    return child.id
-
-
-def _is_kiro_native_session(conv: Conversation) -> bool:
-    """Return whether a conversation is backed by the native Kiro terminal."""
-    return conv.labels.get("omnigent.wrapper") == "kiro-native-ui"
-
-
-# Claude Code writes this record into its own transcript when a turn is
-# interrupted (Escape, or steering while a tool is in flight). Anchored so a
-# user's bracketed question such as "[Request interrupted by user?]" stays a
-# real message. Kept in sync with `INTERRUPT_RE` in web/src/lib/systemMessage.ts,
-# which re-classifies the mirrored record as a muted "Interrupted" marker.
-_CLAUDE_INTERRUPT_RECORD_RE = re.compile(r"^\[Request interrupted by user(?: for tool use)?\]$")
-
-
-def _is_native_interrupt_record(data: MessageData) -> bool:
-    """
-    Whether a mirrored user item is the vendor CLI's own interrupt record.
-
-    The transcript forwarder mirrors every user-role record back, but this
-    one is synthesized by Claude itself â€” it is not the round-trip of a web
-    message, so no :mod:`omnigent.runtime.pending_inputs` entry exists for
-    it. Draining one anyway shifts the FIFO by a slot: the marker absorbs
-    the queued message's uploads and the real message persists with none.
-
-    Runtime ``[System: ...]`` notices are deliberately NOT matched here.
-    Those are posted through ``POST /v1/sessions/{id}/events`` and record a
-    pending entry of their own (see
-    :func:`_dispatch_session_event_to_runner`), so their mirror-back must
-    keep draining normally.
-
-    Matched on the first line only, exactly as ``parseSystemMessage`` does
-    web-side. The two predicates must agree: a record the web hides as a
-    marker but the server drains for would put the bug straight back.
-
-    :param data: The mirrored user message's data, whose ``content`` is a
-        list of block dicts, e.g. ``[{"type": "input_text", "text":
-        "[Request interrupted by user]"}]``.
-    :returns: ``True`` for an interrupt record, ``False`` for a real
-        user message.
-    """
-    if any(
-        isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
-        for block in data.content
-    ):
-        return False
-    text = _message_text(data.content)
-    if text is None:
-        return False
-    first_line = text.strip().split("\n", 1)[0]
-    return _CLAUDE_INTERRUPT_RECORD_RE.match(first_line) is not None
-
-
-def _merge_pending_file_blocks(
-    item: NewConversationItem,
-    pending_content: list[dict[str, Any]],
-) -> NewConversationItem:
-    """
-    Prepend a pending entry's file blocks onto a user-message item.
-
-    The claude-native transcript mirrors a user message back as
-    text-only â€” ``input_image`` / ``input_file`` blocks are dropped. The
-    optimistic pending-input entry still carries them (with real
-    ``file_id``s, assigned at upload), so we fold them into the durable
-    item here. Without it the image renders only on the optimistic
-    bubble and vanishes from history on the next reload.
-
-    No-op when the pending entry has no file blocks, or when the item
-    already carries file blocks (defensive â€” a future transcript that
-    does include them must not be doubled).
-
-    :param item: The parsed user-message item about to be persisted.
-        Its ``data`` is a :class:`MessageData` whose ``content`` is a
-        list of block dicts, e.g. ``[{"type": "input_text",
-        "text": "hi"}]``.
-    :param pending_content: The drained pending entry's content blocks,
-        e.g. ``[{"type": "input_image", "file_id": "file_x",
-        "filename": "a.png"}, {"type": "input_text", "text": "hi"}]``.
-    :returns: A copy of *item* with the file blocks prepended, or *item*
-        unchanged when there is nothing to merge.
-    """
-    if not isinstance(item.data, MessageData):
-        return item
-    file_blocks = [
-        block
-        for block in pending_content
-        if isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
-    ]
-    if not file_blocks:
-        return item
-    already_has_files = any(
-        isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
-        for block in item.data.content
-    )
-    if already_has_files:
-        return item
-    merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
-    return item.model_copy(update={"data": merged_data})
-
-
-def _message_text(content: list[dict[str, Any]]) -> str | None:
-    """
-    Extract joined text from message content blocks.
-
-    :param content: Message content blocks, e.g.
-        ``[{"type": "output_text", "text": "Done"}]``.
-    :returns: Joined text from ``text`` / ``input_text`` fields,
-        or ``None`` when no text field exists.
-    """
-    parts: list[str] = []
-    found_text = False
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        text = block.get("text")
-        if not isinstance(text, str):
-            text = block.get("input_text")
-        if isinstance(text, str):
-            found_text = True
-            parts.append(text)
-    return "\n".join(parts) if found_text else None
-
-
-def _latest_assistant_text_from_store(
-    conversation_store: ConversationStore,
-    session_id: str,
-) -> str | None:
-    """
-    Return the latest persisted assistant message text for a session.
-
-    Native harnesses mirror completed transcript items to the AP
-    server, not necessarily to the runner's in-memory history. This
-    helper lets Omnigent forward the durable assistant output with the
-    terminal-observed idle edge.
-
-    :param conversation_store: Store used to read conversation items.
-    :param session_id: Session/conversation id, e.g.
-        ``"conv_child123"``.
-    :returns: Latest assistant text, or ``None`` when none is
-        persisted yet.
-    """
-    page = conversation_store.list_items(
-        session_id,
-        limit=_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
-        order="desc",
-        type="message",
-    )
-    for item in page.data:
-        if not isinstance(item.data, MessageData):
-            continue
-        if item.data.role != "assistant" or item.data.is_meta:
-            continue
-        text = _message_text(item.data.content)
-        if text is not None:
-            return text
-    return None
-
-
-@dataclass(frozen=True)
-class _RunnerForwardResult:
-    """
-    HTTP result from forwarding a session-control event to the runner.
-
-    :param status_code: Runner response status, e.g. ``204``.
-    :param body: Runner response body text. Empty string when the runner
-        returns no body.
-    """
-
-    status_code: int
-    body: str
-
-
-def _require_external_status_forward(
-    session_id: str,
-    status: str,
-    runner_result: _RunnerForwardResult | None,
-) -> None:
-    """
-    Fail loudly when required external status forwarding does not land.
-
-    Terminal native sub-agent completion is delivered to the parent
-    runner through this forward. Dropping it would leave the parent
-    waiting forever with no inbox result.
-
-    :param session_id: Sub-agent session id, e.g. ``"conv_child123"``.
-    :param status: External status value, e.g. ``"idle"``.
-    :param runner_result: HTTP result returned by the runner, or ``None``
-        when no runner could be reached.
-    :returns: None.
-    :raises OmnigentError: If the runner was unavailable or
-        rejected the forwarded status.
-    """
-    if runner_result is None:
-        raise OmnigentError(
-            f"Could not reach runner to deliver external_session_status "
-            f"{status!r} for sub-agent session {session_id!r}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-    if runner_result.status_code >= 400:
-        detail = runner_result.body[:500]
-        suffix = f": {detail}" if detail else ""
-        raise OmnigentError(
-            f"Runner rejected external_session_status {status!r} for "
-            f"sub-agent session {session_id!r} with status "
-            f"{runner_result.status_code}{suffix}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-
-
-def _require_collaboration_mode_forward(
-    session_id: str,
-    enabled: bool,
-    runner_result: _RunnerForwardResult | None,
-) -> None:
-    """
-    Fail when a live Codex Plan-mode switch was not applied by the runner.
-
-    Codex Plan mode is a loaded-thread collaboration mode inside Codex
-    app-server. Persisting the Omnigent label without a successful runner
-    update would make the web UI claim Plan mode while Codex still runs in
-    the previous mode, so explicit UI toggles require a confirmed 2xx forward.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param enabled: ``True`` when entering Plan mode; ``False`` when
-        returning to Default mode.
-    :param runner_result: HTTP result returned by the runner, or ``None``
-        when no runner could be reached.
-    :returns: None.
-    :raises OmnigentError: If no runner was reachable or the runner rejected
-        the live Plan-mode update.
-    """
-    action = "enter Plan mode" if enabled else "exit Plan mode"
-    if runner_result is None:
-        raise OmnigentError(
-            f"Could not {action}: no live Codex runner is available for "
-            f"session {session_id!r}. Reconnect the session and try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-    if not 200 <= runner_result.status_code < 300:
-        raise OmnigentError(
-            f"Could not {action}: runner returned status "
-            f"{runner_result.status_code} for session {session_id!r}. "
-            f"Reconnect the session and try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-
-
-def _require_permission_mode_forward(
-    session_id: str,
-    mode: str,
-    runner_result: _RunnerForwardResult | None,
-) -> str:
-    """
-    Fail when a live claude-native permission-mode switch wasn't applied.
-
-    The mode lives in the running TUI, so persisting the label without a
-    confirmed 2xx forward would let the UI claim auto mode while Claude still
-    prompts on every edit. Returns the mode the runner actually reached, so
-    the caller stores what the pane shows rather than what was asked for.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param mode: Requested permission mode, e.g. ``"auto"``.
-    :param runner_result: HTTP result returned by the runner, or ``None``
-        when no runner could be reached.
-    :returns: The mode the runner reports the pane is now in â€” the
-        requested *mode* when the runner didn't echo one back.
-    :raises OmnigentError: If no runner was reachable or the runner could
-        not switch the session into *mode*.
-    """
-    if runner_result is None:
-        raise OmnigentError(
-            f"Could not switch to {mode} mode: no live Claude runner is available "
-            f"for session {session_id!r}. Reconnect the session and try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-    if not 200 <= runner_result.status_code < 300:
-        # The runner's body carries why the cycle failed (e.g. the mode
-        # isn't in this session's cycle); surface it so the UI banner
-        # explains the failure instead of showing a bare status code.
-        detail = ""
-        try:
-            payload = json.loads(runner_result.body)
-        except (TypeError, ValueError):
-            payload = None
-        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
-            detail = f" {payload['detail']}"
-        raise OmnigentError(
-            f"Could not switch to {mode} mode for session {session_id!r}.{detail}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-    try:
-        body = json.loads(runner_result.body)
-    except (TypeError, ValueError):
-        return mode
-    settled = body.get("permission_mode") if isinstance(body, dict) else None
-    return settled if isinstance(settled, str) and settled else mode
-
-
-def _publish_child_status_to_parent(session_id: str, status: str) -> None:
-    """
-    Mirror a status transition onto the session's parent stream.
-
-    A sub-agent's ``busy`` / ``current_task_status`` on the parent's Agents
-    rail comes from ``session.child_session.updated`` events. The runner
-    fans those out only for children it registered in-process, so a child
-    reused after a runner restart, or driven directly rather than through
-    its parent, changes status without the parent's stream ever hearing of
-    it. The server sees every transition in ``_session_status_cache``, so
-    it republishes the child's current summary to the parent from here; a
-    top-level session (no parent) publishes nothing.
-
-    The store reads run on the ordered live-state worker so a ``running``
-    â†’ ``idle`` pair can never fan out reversed, and the event-loop caller
-    only pays a queue put.
-
-    :param session_id: Session whose cached status just changed,
-        e.g. ``"conv_child123"``.
-    :param status: The new status, e.g. ``"running"``. Captured here rather
-        than re-read on the worker so each edge fans out its own value.
-    """
-    store = session_live_state.conversation_store()
-    if store is None:
-        return
-
-    def _fan_out() -> None:
-        conv = store.get_conversation(session_id)
-        if conv is None or conv.parent_conversation_id is None:
-            return
-        parent_id = conv.parent_conversation_id
-        items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
-        summary = _child_session_summary_from_conversation(
-            conv,
-            parent_id,
-            _latest_message_preview(items_by_child.get(conv.id, [])),
-            cached_status=status,
-        )
-        event = SessionChildSessionUpdatedEvent(
-            type="session.child_session.updated",
-            conversation_id=parent_id,
-            child_session_id=conv.id,
-            child=summary.model_dump(mode="json"),
-        )
-        session_stream.publish(parent_id, event.model_dump())
-
-    session_live_state.submit("child_status_fanout", _fan_out)
-
-
-def _require_codex_approval_mode_forward(
-    session_id: str,
-    mode: str,
-    runner_result: _RunnerForwardResult | None,
-) -> None:
-    """
-    Fail when a live codex approval-mode switch wasn't applied by the runner.
-
-    The runner applies the mode by driving Codex's own ``/permissions`` popup
-    and only returns 2xx once it confirms Codex echoed the switch. Persisting the
-    label without a confirmed forward would let the picker claim a mode the TUI
-    isn't in, so an explicit switch requires a reachable runner that confirmed it.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param mode: Requested approval mode, e.g. ``"read-only"``.
-    :param runner_result: HTTP result returned by the runner, or ``None`` when
-        no runner could be reached.
-    :returns: None.
-    :raises OmnigentError: If no runner was reachable or the runner rejected the
-        live approval-mode update.
-    """
-    if runner_result is None:
-        raise OmnigentError(
-            f"Could not switch to {mode} approval mode: no live Codex runner is "
-            f"available for session {session_id!r}. Reconnect the session and try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-    if not 200 <= runner_result.status_code < 300:
-        # The runner's body carries why the switch failed (e.g. the codex
-        # terminal isn't running, or Codex never echoed the switch); surface it
-        # so the UI banner explains the failure instead of a bare status code.
-        detail = ""
-        try:
-            payload = json.loads(runner_result.body)
-        except (TypeError, ValueError):
-            payload = None
-        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
-            detail = f" {payload['detail']}"
-        raise OmnigentError(
-            f"Could not switch to {mode} approval mode for session {session_id!r}.{detail}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-
-
-def _publish_status(
-    session_id: str,
-    status: str,
-    error: ErrorDetail | None = None,
-    response_id: str | None = None,
-    background_task_count: int | None = None,
-    background_tasks: list[BackgroundTaskInfo] | None = None,
-    blocked_on: str | None = None,
-    persist_live_status: bool = True,
-    scheduled_run_outcome: Literal["auto", "failed"] = "auto",
-) -> None:
-    """
-    Publish a typed :class:`SessionStatusEvent` to the live stream and
-    update the cache the list endpoint reads.
-
-    ``status`` must be one of the literals on
-    :class:`SessionStatusEvent` (``idle`` / ``running`` / ``waiting``
-    / ``failed``); other values fail Pydantic validation rather than
-    silently shipping a non-conforming wire shape (rule 15).
-
-    Every publish site funnels through here so the in-memory
-    ``_session_status_cache`` stays coherent with the SSE stream.
-    Without this, paths that publish but don't write the cache â€”
-    notably the ``external_session_status`` handler used by the
-    claude-native forwarder â€” leave the sidebar stuck on "idle"
-    while the chat itself shows "Workingâ€¦".
-
-    :param session_id: Session/conversation identifier.
-    :param status: New session status value.
-    :param error: Failure detail to forward on a ``"failed"``
-        transition, e.g. ``ErrorDetail(code="runner_error",
-        message="turn setup failed: ...")``. ``None`` for every
-        non-failed transition. Carrying it lets clients render a
-        terminal error line for SETUP-phase failures that never emit
-        a ``response.failed`` event.
-    :param response_id: Optional response id for terminal-backed status
-        edges, e.g. ``"codex_turn_abc123"``.
-    """
-    # ``failed`` is sticky against a trailing ``idle``. A turn error is
-    # terminal â€” it must not be silently downgraded to ``idle`` by a
-    # follow-on quiescence signal. This matters for claude-native: the
-    # turn-error edge comes from the ``StopFailure`` hook (â†’ ``failed``),
-    # but the pane then goes quiet, so the PTY-activity watcher emits a
-    # trailing ``idle`` ~1s later. Without this guard that ``idle`` would
-    # erase the error state before the user could see it. The next
-    # ``running`` edge (new activity) clears ``failed`` normally, so the
-    # error persists exactly until the session does real work again. No
-    # in-process flow performs a legitimate ``failed`` â†’ ``idle``
-    # transition (compaction failure publishes ``running`` â†’ ``idle``, not
-    # ``failed``), so this is a safe, harness-agnostic invariant.
-    if status == "idle" and _session_status_cache.get(session_id) == "failed":
-        # Session stays ``failed`` (terminal); the turn is over, so drop any
-        # tracked in-flight response id rather than leaving it for the
-        # snapshot to reopen a streaming bubble.
-        _session_active_response_cache.pop(session_id, None)
-        return
-    previous_status = _session_status_cache.get(session_id)
-    _session_status_cache[session_id] = status
-    if previous_status != status:
-        _publish_child_status_to_parent(session_id, status)
-    # Mirror the transition onto the conversation row (best-effort,
-    # deduplicated, off-loop) so replicas that don't hold this session's
-    # runner tunnel serve the same sidebar status.
-    if persist_live_status:
-        session_live_state.persist_live_status(session_id, status)
-    # Event-driven scheduled-run completion. A terminal edge (idle = the turn
-    # completed; failed = it errored/disconnected) flips the conversation's
-    # still-``running`` scheduled_task_run to succeeded/failed. This is the
-    # primary FU-1 mechanism: the run transitions the instant the turn ends,
-    # driven by the same terminal event that persists live_status â€” no poll.
-    # The event's own ``error`` carries the failure classification, so no label
-    # re-read is needed (and none of the race that would imply). A no-op for
-    # the common case: interactive (non-scheduled) conversations have no
-    # running run, and the reverse lookup cheaply returns None. running/waiting
-    # edges are skipped entirely so the hot path pays nothing mid-turn.
-    if scheduled_run_outcome == "failed":
-        session_live_state.persist_scheduled_run_completion(
-            session_id,
-            "failed",
-            error_code="incomplete",
-            error="runner disappeared before the turn reached a terminal state",
-        )
-    elif status == "idle":
-        session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
-    elif status == "failed":
-        # Canonical server-side broken-turn signal: every server-originated
-        # failed turn (runner disconnect mid-turn, setup/dispatch failure,
-        # rejection) funnels through here, so log once at ERROR for the
-        # dashboard. Relayed runner failures arrive via session_stream and are
-        # already logged runner-side, so they don't reach this path.
-        _logger.error(
-            "session turn failed for %s: %s",
-            session_id,
-            error.message if error is not None else "no detail",
-            extra={"session_id": session_id},
-        )
-        session_live_state.persist_scheduled_run_completion(
-            session_id,
-            "failed",
-            error_code=error.code if error is not None else None,
-            error=error.message if error is not None else None,
-        )
-    # Track the in-flight response id for snapshot-based reconnect (see
-    # _session_active_response_cache). A running/waiting edge that names a
-    # turn opens it; any idle/failed edge closes it.
-    if status in ("running", "waiting"):
-        if response_id is not None:
-            _session_active_response_cache[session_id] = response_id
-    else:
-        _session_active_response_cache.pop(session_id, None)
-    # Keep the background-shell tally sticky alongside the status (see the
-    # cache's declaration). A ``Stop`` hook reports an authoritative count
-    # (``None`` is never sent by it): a positive count sets the tally, and
-    # an explicit ``0`` clears it so a finished background shell drops the
-    # indicator on the next turn end. ``None`` means "no information" (the
-    # trailing PTY-activity ``idle`` carries none) and must NOT wipe the
-    # count the Stop hook just published. A new ``running`` turn does NOT clear
-    # it either â€” background shells outlive turn boundaries, so the tally
-    # persists across the turn (the composer pill stays lit alongside the
-    # working shimmer) until the next authoritative count. Only a failure
-    # clears it: a dead session may never post another count to drop a stale
-    # tally.
-    # The per-shell detail rides in lockstep with the count: they arrive on the
-    # same Stop edge, so an authoritative count owns both caches (a positive
-    # count stores the detail â€” possibly empty when a runner sent count-only â€”
-    # and a ``0`` / failure clears it). ``None`` leaves both untouched.
-    if background_task_count is not None:
-        if background_task_count > 0:
-            _session_background_task_count_cache[session_id] = background_task_count
-            _session_background_tasks_cache[session_id] = background_tasks or []
-        else:
-            _session_background_task_count_cache.pop(session_id, None)
-            _session_background_tasks_cache.pop(session_id, None)
-    elif status == "failed":
-        _session_background_task_count_cache.pop(session_id, None)
-        _session_background_tasks_cache.pop(session_id, None)
-    event = SessionStatusEvent(
-        type="session.status",
-        conversation_id=session_id,
-        status=status,  # type: ignore[arg-type]
-        response_id=response_id,
-        error=error,
-        background_task_count=background_task_count,
-        background_tasks=background_tasks,
-        blocked_on=blocked_on,
-    )
-    payload = event.model_dump()
-    if response_id is None:
-        payload.pop("response_id", None)
-    if background_task_count is None:
-        payload.pop("background_task_count", None)
-    # Only put detail on the wire when there's something to show â€” an absent or
-    # empty list stays off (the count alone drives the pill; the client clears
-    # its detail when the count clears).
-    if not background_tasks:
-        payload.pop("background_tasks", None)
-    if blocked_on is None:
-        payload.pop("blocked_on", None)
-    session_stream.publish(session_id, payload)
-
-
-def reconcile_orphaned_running_status(
-    session_id: str,
-    conversation_store: ConversationStore,
-    stale_before: int,
-) -> bool:
-    """
-    Settle a session that reads ``running`` but whose runner is
-    confirmed gone down to a non-running resting state.
-
-    A ``running`` live-status is only meaningful while a runner is
-    actually executing the turn. When the runner (and its host) have
-    dropped past the liveness window â€” a server replica that restarted
-    and outlived the runner, a crashed host, a graceful disconnect
-    mid-turn â€” the persisted ``running`` is stale: no executor will
-    ever emit the terminal edge that would clear it, so it sticks
-    forever. The sidebar then shows a turn that isn't happening, and
-    ``stop_session`` reports a success it never delivered.
-
-    This is the lazy-on-read backstop for that stale state. The store performs
-    one conditional transition so a fresh liveness stamp or terminal status
-    written by another replica wins the race. A successful transition updates
-    the local cache and stream without issuing a second status write, and
-    classifies any associated scheduled run as failed/incomplete.
-
-    :param session_id: Session/conversation identifier to settle.
-    :param conversation_store: Store performing the conditional transition.
-    :param stale_before: Runner stamps at or after this epoch are fresh.
-    :returns: Whether this call performed the transition.
-    """
-    if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
-        return False
-    _publish_status(
-        session_id,
-        "idle",
-        persist_live_status=False,
-        scheduled_run_outcome="failed",
-    )
-    return True
-
-
-def _truncate_label(value: str) -> str:
-    """Truncate a label value to fit the ``conversation_labels.value`` column.
-
-    Long failure messages (tracebacks, 5xx bodies) overflow the column and
-    cause a ``DataError`` that silently drops the error reason. Error messages
-    front-load their signal, so keeping the head and appending an ellipsis
-    preserves the useful part while flagging that more was dropped. The store
-    clamps again as a final guard, but truncating here keeps the marker and
-    makes the call site directly testable.
-
-    :param value: The raw string to truncate.
-    :returns: ``value`` unchanged if it already fits, else the head trimmed to
-        the column width with a trailing ``â€¦`` to signal truncation.
-    """
-    if len(value) <= _LABEL_VALUE_MAX_LEN:
-        return value
-    return value[: _LABEL_VALUE_MAX_LEN - 1] + "â€¦"
-
-
-async def _persist_session_status_error_labels(
-    session_id: str,
-    error: ErrorDetail | None,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Persist or clear the reload-visible failure detail for a session status.
-
-    ``session.status`` is an SSE edge, so its ``error`` object disappears on
-    reload. Terminal-native sessions can fail before any transcript item is
-    written, so store the latest failure detail as runner-owned labels and let
-    snapshots project it as ``last_task_error``. Empty string clears stale
-    values because the label store is upsert-only.
-
-    :param session_id: Session/conversation identifier.
-    :param error: Failure detail from a ``session.status: failed`` edge, or
-        ``None`` to clear stale error labels on subsequent activity.
-    :param conversation_store: Store used to upsert labels.
-    """
-    # Structured fields are optional (present only when the runner classified
-    # the failure). Always write all keys â€” empty when absent â€” because the
-    # label store is upsert-only and a stale title/cause from a prior failure
-    # must not leak onto a later, unclassified one.
-    updates = (
-        {
-            _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
-            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_label(error.message),
-            _LAST_TASK_ERROR_TITLE_LABEL_KEY: _truncate_label(error.title or ""),
-            _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
-            _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
-        }
-        if error is not None
-        else {
-            _LAST_TASK_ERROR_CODE_LABEL_KEY: "",
-            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "",
-            _LAST_TASK_ERROR_TITLE_LABEL_KEY: "",
-            _LAST_TASK_ERROR_CAUSE_LABEL_KEY: "",
-            _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
-        }
-    )
-    try:
-        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Failed to persist session status error labels for %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-
-
-def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:
-    """
-    Project runner-owned failure labels into the typed API error shape.
-
-    Terminal/native runtimes can fail before they write any transcript item,
-    so the session-status relay stores the latest failure as durable labels.
-    This helper is the single server-side boundary where those internal labels
-    become public ``last_task_error`` data for snapshots and child summaries.
-
-    :param labels: Conversation labels, usually after closed-status projection.
-    :returns: ``{"code": "...", "message": "..."}``, or ``None`` when either
-        value is absent/cleared.
-    """
-    raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
-    raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
-    if raw_error_code and raw_error_message:
-        error: dict[str, str] = {
-            "code": classify_native_turn_error(raw_error_code, raw_error_message),
-            "message": raw_error_message,
-        }
-        for key, label in (
-            ("title", _LAST_TASK_ERROR_TITLE_LABEL_KEY),
-            ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
-            ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
-        ):
-            value = labels.get(label)
-            if value:
-                error[key] = value
-        return error
-    return None
-
-
-def _publish_terminal_pending(session_id: str, pending: bool) -> None:
-    """
-    Publish a typed :class:`SessionTerminalPendingEvent` and update the
-    cache the snapshot reads.
-
-    Every relay site that changes the terminal-spin-up flag funnels
-    through here so the in-memory ``_session_terminal_pending_cache``
-    stays coherent with the SSE stream â€” a client connecting
-    mid-spin-up seeds the spinner from the snapshot's
-    ``terminal_pending`` field, while already-connected clients update
-    live off this event.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param pending: ``True`` while the runner is auto-creating the
-        terminal; ``False`` once it lands or auto-create fails.
-    """
-    # Store only ``True`` entries; delete on clear so the cache never
-    # accumulates stale ``False`` entries for every terminal-first session
-    # that has ever completed spin-up. The snapshot getter uses
-    # ``.get(id, False)`` so absent == False.
-    if pending:
-        _session_terminal_pending_cache[session_id] = True
-    else:
-        _session_terminal_pending_cache.pop(session_id, None)
-    event = SessionTerminalPendingEvent(
-        type="session.terminal_pending",
-        conversation_id=session_id,
-        pending=pending,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_sandbox_status(*args: Any, **kwargs: Any) -> None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._publish_sandbox_status(*args, **kwargs)
-
-
-def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None = None) -> None:
-    """
-    Publish a typed :class:`SessionSandboxStatusEvent` and update the
-    cache the snapshot reads.
-
-    Every stage transition of a managed-sandbox launch funnels through
-    here so the in-memory ``_session_sandbox_status_cache`` stays
-    coherent with the SSE stream â€” a client opening the session
-    mid-launch seeds its progress indicator from the snapshot's
-    ``sandbox_status`` field, while already-connected clients update
-    live off this event. Thread-safe (``session_stream.publish`` is a
-    thread-safe broadcast and the cache write is a single dict
-    assignment), so the launch pipeline may call this from the worker
-    thread its sandbox exec steps run on.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param stage: The launch stage just entered, e.g.
-        ``"provisioning"`` â€” one of
-        :data:`omnigent.server.schemas.SandboxLaunchStage`.
-    :param error: Failure detail when *stage* is ``"failed"``, e.g.
-        ``"managed sandbox launch failed: spend limit reached"``.
-        ``None`` for non-terminal stages.
-    """
-    # "ready" evicts: from then on the session looks like any
-    # host-bound session and the snapshot carries no launch state.
-    # Failures stay cached (mirroring ManagedLaunchTracker retention)
-    # so a reload after a dead launch still shows the reason.
-    status = SandboxStatus.model_validate({"stage": stage, "error": error})
-    if status.stage == "ready":
-        _session_sandbox_status_cache.pop(session_id, None)
-    else:
-        _session_sandbox_status_cache[session_id] = status
-    event = SessionSandboxStatusEvent(
-        type="session.sandbox_status",
-        conversation_id=session_id,
-        stage=status.stage,
-        error=status.error,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) -> None:
-    """
-    Publish a typed :class:`SessionMcpStartupEvent` to the live stream.
-
-    Fired when a native forwarder reports harness MCP-server startup
-    progress via ``external_mcp_startup``, so the web UI can show
-    per-server startup state while the harness boots instead of an
-    apparently hung session. Also updates the snapshot cache so a client
-    opening the session mid-startup seeds the band from the snapshot's
-    ``mcp_startup`` field; a map with nothing left to show â€” empty, or
-    every server ``ready`` â€” evicts the cache entry, mirroring the web
-    store's all-ready clear so a reloading client never seeds a band
-    that renders nothing.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param servers: Latest per-server startup map, e.g.
-        ``{"safe": McpServerStartup(status="starting", error=None)}``.
-    """
-    if any(record.status != "ready" for record in servers.values()):
-        _session_mcp_startup_cache[session_id] = servers
-    else:
-        _session_mcp_startup_cache.pop(session_id, None)
-    event = SessionMcpStartupEvent(
-        type="session.mcp_startup",
-        conversation_id=session_id,
-        servers=servers,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_runner_skills(session_id: str) -> None:
-    """
-    Publish a typed :class:`SessionSkillsEvent` to the live stream.
-
-    Fired the moment the background runner-skills fetch
-    (:func:`_load_runner_skills`) populates the per-session cache, so a
-    connected client can re-read the session snapshot and fill its
-    slash-command menu instead of waiting for the next bind. Carries no
-    payload beyond the conversation id â€” it is a "skills resolved,
-    re-read the snapshot" nudge; the snapshot's cache-backed ``skills``
-    field stays the source of truth.
-
-    No-op when no client is subscribed (``session_stream`` has no
-    buffer): a client binding later reads the now-warm snapshot directly.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    """
-    event = SessionSkillsEvent(
-        type="session.skills",
-        conversation_id=session_id,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _publish_model_options(session_id: str) -> None:
-    """
-    Publish a typed :class:`SessionModelOptionsEvent` to the live stream.
-
-    Fired when a background runner catalog fetch populates the per-session
-    model-options cache. Connected clients re-read the session snapshot and
-    apply its cache-backed ``model_options`` field.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    """
-    event = SessionModelOptionsEvent(
-        type="session.model_options",
-        conversation_id=session_id,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-def _invalidate_runner_backed_snapshot_state(
-    session_id: str,
-    *,
-    cancel_inflight: bool,
-    drop_model_options: bool,
-) -> None:
-    """
-    Drop runner-derived session snapshot overlays for one session.
-
-    Skills are discovered from the bound runner, so they are marked stale
-    and re-fetched at the next snapshot â€” but they keep serving until that
-    lands, because the request asking for the refresh is the same one whose
-    response fills the composer's slash-command menu. The native model
-    catalog is marked stale for the same reason, and additionally must
-    outlive runner death so the model picker stays populated (and offline
-    model/effort changes stay possible) while the session is asleep. Runner
-    teardown cancels any in-flight fetch so a dead runner cannot land a late
-    stale value, and drops the skills outright â€” they belong to the runner
-    that went away.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param cancel_inflight: Whether to cancel currently-running fetches.
-        Use ``True`` when a runner disconnects; use ``False`` for browser
-        refreshes so concurrent page-load callers do not cancel each other.
-    :param drop_model_options: Drop the cached catalog outright instead of
-        marking it stale. Pass ``True`` only when it can be re-fetched
-        right away (refresh with a live runner) or no longer belongs to
-        the session (agent switch); ``False`` keeps it serving while the
-        session has no runner.
-    """
-    from omnigent.server.smart_routing import invalidate_runner_catalog
-
-    # Only worth marking when there is something to keep serving: a session
-    # with no cached skills already re-fetches on the next read, and marking
-    # it would leave an id behind for every cold session ever opened.
-    if session_id in _runner_skills_cache:
-        _runner_skills_stale.add(session_id)
-    # Routing's candidate catalog is runner-derived too: a rebind or a relaunch
-    # can change which models the session can be switched onto, so it must not
-    # keep routing off the previous runner's list.
-    invalidate_runner_catalog(session_id)
-    if cancel_inflight:
-        _runner_skills_cache.pop(session_id, None)
-        _runner_skills_stale.discard(session_id)
-        inflight = _runner_skills_inflight.pop(session_id, None)
-        if inflight is not None:
-            inflight.cancel()
-    if drop_model_options:
-        _model_options_cache.pop(session_id, None)
-        _model_options_stale.discard(session_id)
-    else:
-        _model_options_stale.add(session_id)
-    if cancel_inflight:
-        codex_inflight = _model_options_inflight.pop(session_id, None)
-        if codex_inflight is not None:
-            codex_inflight.cancel()
-
-
-def _publish_changed_files_invalidated(session_id: str, environment_id: str = "default") -> None:
-    """
-    Publish a coarse filesystem-change invalidation to the live stream.
-
-    The event tells web clients to refetch visible filesystem views
-    for the environment instead of polling the tree while a session is
-    active. It is intentionally coarse because git-mode workspaces can
-    only answer "the working tree changed" cheaply, not per-directory
-    deltas.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param environment_id: Environment resource id,
-        e.g. ``"default"``.
-    """
-    session_stream.publish(
-        session_id,
-        {
-            "type": "session.changed_files.invalidated",
-            "session_id": session_id,
-            "environment_id": environment_id,
-        },
-    )
-
-
-def _publish_interrupted(session_id: str, response_id: str | None = None) -> None:
-    """
-    Publish a ``session.interrupted`` event to the live stream.
-
-    The event is co-emitted with ``response.incomplete`` (reason
-    ``"user_interrupt"``) by the runtime cancel handler so off-the-
-    shelf Responses parsers still close cleanly. This helper is
-    responsible only for the session-level signal â€” not the
-    response-level one.
-
-    :param session_id: The session/conversation identifier whose
-        stream should receive the event, e.g. ``"conv_abc123"``.
-    :param response_id: Optional response id for terminal-backed
-        interrupted turns, e.g. ``"codex_turn_abc123"``.
-    """
-    event = SessionInterruptedEvent(
-        type="session.interrupted",
-        data=SessionInterruptedPayload(
-            requested_at=int(time.time()),
-            response_id=response_id,
-        ),
-    )
-    payload = event.model_dump()
-    if response_id is None:
-        data = payload.get("data")
-        if isinstance(data, dict):
-            data.pop("response_id", None)
-    session_stream.publish(session_id, payload)
-
-
-def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
-    """
-    Publish a ``session.superseded`` event to the live stream.
-
-    Emitted when a Claude ``/clear`` rotates a session away (see
-    ``_post_clear_supersession`` in
-    ``omnigent/claude_native_forwarder.py``): a client actively viewing
-    ``session_id`` follows to ``target_conversation_id``. Live-only â€”
-    there is no SSE replay, so a client connecting after the rotation
-    relies on the persisted notice message instead.
-
-    :param session_id: The superseded (old) conversation id whose stream
-        should receive the event, e.g. ``"conv_old"``.
-    :param target_conversation_id: The conversation to redirect to, e.g.
-        ``"conv_new"``.
-    """
-    event = SessionSupersededEvent(
-        type="session.superseded",
-        conversation_id=session_id,
-        target_conversation_id=target_conversation_id,
-        reason="clear",
-    )
-    session_stream.publish(session_id, event.model_dump())
-    # Discard any unconsumed pending inputs on the superseded session â€” notably
-    # the ``/clear`` the user typed in the web UI. ``/clear`` is never mirrored
-    # back as a committed item (the session rotated away), so its pending entry
-    # would otherwise linger forever as a stuck optimistic bubble, re-hydrating
-    # from the snapshot on every reload of the old chat. Live viewers already
-    # drop the bubble on the ``session.superseded`` event above; this stops it
-    # coming back. We deliberately do NOT emit ``session.input.consumed`` (that
-    # would commit ``/clear`` as a user message) â€” the persisted clear notice
-    # already explains the rotation, so the input is simply abandoned.
-    discarded = 0
-    while pending_inputs.resolve_oldest(session_id) is not None:
-        discarded += 1
-    if discarded:
-        _logger.info(
-            "Discarded %d unconsumed pending input(s) on superseded session %s",
-            discarded,
-            session_id,
-            extra={"session_id": session_id},
-        )
-
-
-def _publish_btw_sidechat(
-    session_id: str,
-    *,
-    question: str,
-    answer: str,
-    truncated: bool,
-) -> None:
-    """
-    Publish a transient ``session.btw_sidechat`` overlay to the live stream.
-
-    Emitted when the claude-native forwarder scrapes a settled ``/btw``
-    side-chat from the pane (see ``_relay_btw_overlay`` in the
-    claude-native forwarder). Broadcast-only: nothing is written to the
-    conversation store, so the ephemeral exchange never lands in the main
-    transcript. Live viewers render a dismissable overlay; a client that
-    connects later never sees it (no SSE replay), matching the terminal
-    overlay's Escape-to-close, leave-no-history behavior.
-
-    The oldest pending input is also discarded so a web composer's
-    optimistic ``/btw`` bubble does not linger as a stuck "queued" message â€”
-    the same reconciliation ``_publish_session_superseded`` performs.
-    ``/btw`` is never committed as a user turn (no ``session.input.consumed``
-    is emitted); the overlay carries the request text instead.
-
-    :param session_id: Conversation id whose stream receives the event.
-    :param question: The ``/btw`` request line as typed.
-    :param answer: The side-chat answer text.
-    :param truncated: True when the pane clipped a longer answer.
-    """
-    event = SessionBtwSidechatEvent(
-        type="session.btw_sidechat",
-        conversation_id=session_id,
-        question=question,
-        answer=answer,
-        truncated=truncated,
-    )
-    session_stream.publish(session_id, event.model_dump())
-    # Drop the optimistic ``/btw`` bubble (the oldest unconsumed input) so it
-    # does not spin forever â€” ``/btw`` never round-trips through the transcript
-    # to earn a ``session.input.consumed``. Only the oldest is resolved so a
-    # follow-up the user queued after ``/btw`` is left intact.
-    if pending_inputs.resolve_oldest(session_id) is not None:
-        _logger.info(
-            "Discarded the pending /btw input on session %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-
-
-async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
-    """Call-time proxy so a ``sessions._get_runner_client`` patch is honored here.
-
-    The real body lives on the ``sessions`` facade (as the ``_impl`` alias); tests
-    patch the facade attribute, so sibling callers must resolve it there at call
-    time rather than binding the pre-split local copy.
-    """
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._get_runner_client(*args, **kwargs)
-
-
-async def _get_runner_client_impl(
-    session_id: str,
-    runner_router: RunnerRouter | None,
-    *,
-    conversation: Conversation | None = None,
-) -> httpx.AsyncClient | None:
-    """
-    Get an HTTP client for the runner bound to a session.
-
-    Uses the ``RunnerRouter`` to resolve the pinned runner. Falls
-    back to the in-process runner client for test setups.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param runner_router: The ``RunnerRouter`` instance, or
-        ``None`` for in-process setups.
-    :param conversation: An already-loaded conversation to reuse for routing.
-    :returns: An ``httpx.AsyncClient`` pointed at the runner,
-        or ``None`` if no runner is available.
-    """
-    from omnigent.runtime import get_runner_client
-
-    if runner_router is not None:
-        try:
-            if conversation is None:
-                routed = runner_router.client_for_session_resources(session_id)
-            else:
-                routed = runner_router.client_for_session_resources(
-                    session_id,
-                    conversation=conversation,
-                )
-            return routed.client
-        except (LookupError, httpx.HTTPError, OmnigentError):
-            _logger.debug(
-                "No runner bound for session=%s",
-                session_id,
-                extra={"session_id": session_id},
-            )
-            return None
-    return cast("httpx.AsyncClient | None", get_runner_client())
-
-
-async def _query_host_runner_status(
-    host_conn: HostConnection,
-    host_registry: HostRegistry,
-    runner_id: str,
-) -> str | None:
-    """
-    Ask a host whether a runner's process is alive, dead, or unknown.
-
-    The host owns runner-process liveness (it holds the ``Popen``), so it
-    can answer the one question the server's tunnel registry cannot: is an
-    absent-from-the-tunnel runner still coming (booting) or gone for good
-    (stopped, crashed, or lost to a host restart)? Used before the connect
-    grace so the dispatch path waits only for a runner that is coming.
-
-    :param host_conn: Live host connection to query.
-    :param host_registry: Registry used to enqueue the outbound frame.
-    :param runner_id: Runner to ask about, e.g. ``"runner_abc123..."``.
-    :returns: ``"alive"``, ``"dead"``, or ``"unknown"`` from the host; or
-        ``None`` when the host didn't reply in time, the connection
-        dropped, or the host is too old to support the query. ``None``
-        means "no authoritative answer" â€” the caller falls back to the
-        plain connect grace, preserving the prior blind-wait behavior.
-    """
-    from omnigent.host.frames import HostRunnerStatusFrame, encode_host_frame
-    from omnigent.server.routes import sessions as _facade
-
-    request_id = secrets.token_hex(8)
-    future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
-    host_conn.pending_runner_status[request_id] = future
-    frame = encode_host_frame(HostRunnerStatusFrame(request_id=request_id, runner_id=runner_id))
-    try:
-        try:
-            host_registry.send_text(host_conn, frame)
-        except ConnectionError:
-            return None
-        result = await asyncio.wait_for(
-            future,
-            timeout=_facade._HOST_RUNNER_STATUS_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        return None
-    except Exception:  # noqa: BLE001
-        # Defensive: this query only ever *speeds up* the connect grace, so
-        # any unexpected failure (e.g. the future resolved with an error)
-        # must degrade to "no verdict" and fall back to the wait rather than
-        # break the message POST. CancelledError is a BaseException and still
-        # propagates, so the race helper's cancel/drain is unaffected.
-        _logger.warning(
-            "host.runner_status query for runner %s failed; falling back to grace",
-            runner_id,
-            exc_info=True,
-        )
-        return None
-    finally:
-        host_conn.pending_runner_status.pop(request_id, None)
-    return result.get("status")
-
-
-async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._wait_for_runner_client(*args, **kwargs)
-
-
-async def _wait_for_runner_client_impl(
-    session_id: str,
-    runner_router: RunnerRouter | None,
-    tunnel_registry: TunnelRegistry | None,
-    *,
-    runner_id: str | None,
-    timeout_s: float,
-    runner_exit_reports: RunnerExitReports | None = None,
-) -> httpx.AsyncClient | None:
-    """
-    Wait until a runner connects, then resolve the session's runner client.
-
-    The tunnel registry owns the event-driven "runner connected" signal.
-    After that signal fires, this helper intentionally resolves through
-    :func:`_get_runner_client` instead of constructing a client directly
-    from the registry session: the router re-checks the conversation's
-    current ``runner_id`` binding and preserves the existing ownership /
-    capability checks.
-
-    When ``runner_exit_reports`` is supplied, the wait also ends the
-    moment the daemon reports this runner died (``host.runner_exited``).
-    That report is the authoritative "this runner is busted" signal â€” a
-    crashed runner can never connect, so waiting out ``timeout_s`` would
-    only delay the caller's failure handling. Returning ``None`` on the
-    report (same as a timeout) lets the caller persist the failure the
-    instant we are convinced, neither speculatively early nor a full
-    timeout late.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param runner_router: The ``RunnerRouter`` instance, or ``None`` for
-        in-process test setups.
-    :param tunnel_registry: The server's ``TunnelRegistry`` instance, or
-        ``None`` in test setups without runner tunnels.
-    :param runner_id: Runner id expected to connect, e.g.
-        ``"runner_0123456789abcdef"``.
-    :param timeout_s: Maximum seconds to wait, e.g. ``3.0``.
-    :param runner_exit_reports: Crash-report store consulted to abort the
-        wait early when this runner is reported dead. ``None`` keeps the
-        plain wait-to-timeout behavior.
-    :returns: A runner HTTP client if one becomes available, otherwise
-        ``None`` (timed out, or the runner was reported dead).
-    """
-    if runner_id is None:
-        return None
-    if tunnel_registry is None:
-        return await _get_runner_client(session_id, runner_router)
-    if runner_exit_reports is None:
-        session = await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
-        return None if session is None else await _get_runner_client(session_id, runner_router)
-    # Race the event-driven connect signal against the crash-report poll;
-    # whichever resolves first wins. A report means the runner is busted â€”
-    # stop waiting and let the caller fail the turn now.
-    connect_task = asyncio.ensure_future(
-        tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
-    )
-    try:
-        while not connect_task.done():
-            if runner_exit_reports.get(runner_id) is not None:
-                return None
-            await asyncio.wait({connect_task}, timeout=_RUNNER_CONVICTION_POLL_S)
-    finally:
-        if not connect_task.done():
-            connect_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await connect_task
-    session = connect_task.result()
-    return None if session is None else await _get_runner_client(session_id, runner_router)
-
-
-async def _validate_session_workspace(
-    *,
-    user_id: str | None,
-    host_id: str,
-    workspace: str | None,
-    agent: Any,
-    agent_cache: AgentCache | None,
-    request: Request,
-) -> str:
-    """
-    Validate a session's workspace against the agent's os_env boundary.
-
-    Wraps the seven-step validation in
-    :mod:`omnigent.server.routes._workspace_validation` and
-    raises :class:`OmnigentError` on failure so the route layer
-    converts the error into a 400 response with a clear message.
-    See ``designs/SESSION_WORKSPACE_SELECTION.md`` for the full
-    semantic spec.
-
-    The caller's host ownership is checked BEFORE the ``host.stat``
-    round-trip the validation performs, so a non-owner never reaches
-    another user's host (raises 403/404 via ``resolve_host_owner``).
-
-    :param user_id: Authenticated caller, e.g.
-        ``"alice@example.com"``, or ``None`` when auth is disabled.
-    :param host_id: Stable host id, e.g. ``"host_a1b2c3d4..."``.
-    :param workspace: Absolute path supplied by the caller, e.g.
-        ``"/Users/corey/universe/src/foo"``. ``None`` is rejected
-        with the "workspace required when host_id is set" message.
-    :param agent: The agent the session binds to. Used to load the
-        bundle and read ``os_env.cwd`` for boundary computation.
-    :param agent_cache: Cache for loading parsed agent specs from
-        bundle storage. Required because session-create needs the
-        spec; ``None`` is treated as a server config error.
-    :param request: FastAPI request; ``request.app.state``
-        carries the host registry and host store.
-    :returns: The canonicalized workspace path that should be
-        stored on the session row, e.g.
-        ``"/Users/corey/universe/src/foo"`` (realpath; symlinks
-        already resolved by the host).
-    :raises OmnigentError: With ``ErrorCode.INVALID_INPUT`` on
-        any validation failure (offline host, missing path,
-        outside boundary, missing subdir). With
-        ``ErrorCode.INTERNAL_ERROR`` if ``agent_cache`` is unset.
-    """
-    return await validate_existing_host_workspace(
-        user_id=user_id,
-        host_id=host_id,
-        workspace=workspace,
-        agent=agent,
-        agent_cache=agent_cache,
-        host_store=getattr(request.app.state, "host_store", None),
-        host_registry=getattr(request.app.state, "host_registry", None),
-    )
-
-
-@dataclass
-class _HostLaunchAttempt:
-    """
-    Outcome of a relaunch ``host.launch_runner`` round-trip.
-
-    :param runner_id: The token-bound runner id minted for this attempt,
-        e.g. ``"runner_token_abc123..."``. Always set (the binding is
-        rotated before the frame is sent), even when the host refused.
-    :param error_code: Structured failure category from the host's result
-        frame, e.g. ``"harness_not_configured"``; ``None`` on a successful
-        launch, on a timeout waiting for the result, or when the host sent
-        no code.
-    :param error: Human-readable failure message from the host, e.g.
-        ``"harness 'codex' is not configured on host 'laptop' â€” run
-        `omnigent setup` ..."``; ``None`` when there was no error.
-    """
-
-    runner_id: str
-    error_code: str | None = None
-    error: str | None = None
-
-
-async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttempt:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._launch_runner_on_host(*args, **kwargs)
-
-
-# Per-conversation relaunch locks (single-flight; weak values so a lock is
-# collected once no flight holds or awaits it), the most recent attempt per
-# conversation (so a rider that short-circuits onto another flight's binding
-# surfaces THAT flight's structured refusal instead of a generic connect
-# timeout), and strong refs to the detached superseded-runner stops.
-_relaunch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-_relaunch_last_attempt: dict[str, _HostLaunchAttempt] = {}
-# Riders read the memo within a flight's own window (milliseconds), so it only
-# has to outlive the racing callers, not the conversation. Cap it: a
-# weak-valued map would drop entries the racers still need, and an uncapped one
-# would keep a row for every conversation this process ever relaunched.
-_RELAUNCH_MEMO_MAX = 512
-_detached_supersede_stops: set[asyncio.Task[None]] = set()
-
-
-def _spawn_superseded_runner_stop(
-    session_id: str,
-    host_id: str,
-    runner_id: str,
-    host_registry: HostRegistry,
-) -> None:
-    """
-    Stop a relaunch's superseded runner as a retained background task.
-
-    The relaunch has already rotated the session's binding, so the old
-    runner serves nothing â€” but left alive it idles forever (tunnel still
-    authenticating, transcript forwarder still tailing the session): one
-    leaked generation per relaunch, each holding a native pane. Detached so
-    the relaunch's latency never waits out the stop's ack timeout; the host
-    connection is live by construction here (the launch frame just went
-    over it), so delivery is the overwhelmingly common case, and the
-    host-side supersession check covers a lost frame. Any failure is
-    logged rather than left as an unretrieved task exception.
-
-    :param session_id: Session/conversation identifier.
-    :param host_id: The session's owning host.
-    :param runner_id: The superseded runner's id.
-    :param host_registry: Registry holding the live host tunnel.
-    """
-
-    async def _stop_and_log() -> None:
-        try:
-            await _stop_session_host_runner(
-                session_id,
-                host_id,
-                runner_id,
-                host_registry,
-                expect_already_stopped=True,
-            )
-        except Exception:  # noqa: BLE001 â€” must never die unobserved
-            _logger.warning(
-                "Superseded-runner stop failed for session %s runner %s; "
-                "the host-side supersession check reaps it on the next relaunch",
-                session_id,
-                runner_id,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
-
-    task = asyncio.create_task(_stop_and_log())
-    _detached_supersede_stops.add(task)
-    task.add_done_callback(_detached_supersede_stops.discard)
-
-
-async def _launch_runner_on_host_impl(
-    conv: Conversation,
-    conversation_store: ConversationStore,
-    host_registry: HostRegistry,
-    host_conn: HostConnection,
-) -> _HostLaunchAttempt:
-    """
-    Ask a host to spawn a runner for a session and capture the result.
-
-    Generates a new binding token, writes the runner_id to the session
-    row, sends ``host.launch_runner`` (carrying the session's canonical
-    harness so the host can refuse an unconfigured one), and waits up to
-    :data:`_HOST_LAUNCH_RESULT_TIMEOUT_S` for the host's result frame.
-    Does NOT wait for the runner to *connect* â€” the caller polls for that
-    separately; this only captures the spawn/refuse verdict so a
-    structured refusal (harness not configured) can be surfaced instead
-    of silently timing out as ``RUNNER_UNAVAILABLE``.
-
-    Single-flight per conversation: concurrent callers (a turn POST racing a
-    terminal ensure, both seeing the runner offline) serialize on a
-    per-conversation lock, and a caller that waited re-reads the row â€” a
-    binding another flight just rotated is ridden instead of spawning a
-    second runner. The superseded runner is stopped best-effort in the
-    background (see :func:`_spawn_superseded_runner_stop`); before this,
-    every relaunch leaked the previous runner process on the host.
-
-    :param conv: The conversation that needs a runner.
-    :param conversation_store: Store for updating ``runner_id``.
-    :param host_registry: In-memory ``HostRegistry``.
-    :param host_conn: The live ``HostConnection`` for the host.
-    :returns: The :class:`_HostLaunchAttempt` â€” the new runner id plus any
-        structured refusal from the host.
-    """
-    lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
-    async with lock:
-        # Re-read under the lock: a binding that moved past the caller's
-        # snapshot means another flight just relaunched (concurrently, or
-        # a moment ago) â€” ride its runner rather than rotating it away
-        # and double-spawning. Return that flight's own attempt when it is
-        # on record, so a structured refusal (harness not configured,
-        # workspace missing) still reaches this caller's error surface.
-        fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if fresh is None:
-            # Deleted mid-relaunch: don't rotate a vanished row or spawn a
-            # runner for a session nothing can route to.
-            return _HostLaunchAttempt(
-                runner_id=conv.runner_id or "",
-                error_code="session_not_found",
-                error="session was deleted while its relaunch was in flight",
-            )
-        if fresh.runner_id and fresh.runner_id != conv.runner_id:
-            last = _relaunch_last_attempt.get(conv.id)
-            if last is not None and last.runner_id == fresh.runner_id:
-                return last
-            return _HostLaunchAttempt(runner_id=fresh.runner_id)
-        attempt = await _launch_runner_on_host_locked(
-            fresh, conversation_store, host_registry, host_conn
-        )
-        # Re-insert so the plain dict's insertion order is newest-last, then
-        # evict from the front once past the cap.
-        _relaunch_last_attempt.pop(conv.id, None)
-        _relaunch_last_attempt[conv.id] = attempt
-        while len(_relaunch_last_attempt) > _RELAUNCH_MEMO_MAX:
-            del _relaunch_last_attempt[next(iter(_relaunch_last_attempt))]
-        return attempt
-
-
-async def _launch_runner_on_host_locked(
-    conv: Conversation,
-    conversation_store: ConversationStore,
-    host_registry: HostRegistry,
-    host_conn: HostConnection,
-) -> _HostLaunchAttempt:
-    """The launch round-trip proper; runs under the conversation's lock."""
-    from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
-    from omnigent.runner.identity import token_bound_runner_id
-
-    superseded_runner_id = conv.runner_id
-    binding_token = secrets.token_urlsafe(32)
-    new_runner_id = token_bound_runner_id(binding_token)
-
-    await asyncio.to_thread(
-        conversation_store.replace_runner_id,
-        conv.id,
-        new_runner_id,
-    )
-    if superseded_runner_id and conv.host_id is not None:
-        # The old runner is unbound as of the replace above; reap it so it
-        # doesn't idle on the host forever (tunnel still authenticating,
-        # forwarder still tailing this session).
-        _spawn_superseded_runner_stop(conv.id, conv.host_id, superseded_runner_id, host_registry)
-
-    # Pull workspace from the session row â€” populated and validated
-    # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
-    # The check constraint guarantees workspace is non-NULL when
-    # host_id is set, so this assertion is a tripwire for any path
-    # that bypassed the validation.
-    if conv.workspace is None:  # pragma: no cover â€” constraint guards
-        _logger.error(
-            "session %s has host_id=%s but workspace is NULL â€” schema "
-            "constraint should have prevented this",
-            conv.id,
-            conv.host_id,
-            extra={"session_id": conv.id},
-        )
-        return _HostLaunchAttempt(runner_id=new_runner_id)
-    request_id = secrets.token_hex(8)
-    launch_future: asyncio.Future[dict[str, str | None]] = (
-        asyncio.get_running_loop().create_future()
-    )
-    host_conn.pending_launches[request_id] = launch_future
-    launch_frame = encode_host_frame(
-        HostLaunchRunnerFrame(
-            request_id=request_id,
-            binding_token=binding_token,
-            workspace=conv.workspace,
-            session_id=conv.id,
-            # Canonical harness (see _resolve_harness) so the host runs the
-            # same configuration check it does at create-time launch. None
-            # (agent not resolvable) skips the host-side check â€” fail open.
-            harness=_resolve_harness(conv),
-        )
-    )
-    try:
-        host_registry.send_text(host_conn, launch_frame)
-    except ConnectionError:
-        host_conn.pending_launches.pop(request_id, None)
-        _logger.warning(
-            "Host %s connection lost while launching runner for %s",
-            conv.host_id,
-            conv.id,
-            extra={"session_id": conv.id},
-        )
-        return _HostLaunchAttempt(runner_id=new_runner_id)
-    try:
-        result = await asyncio.wait_for(
-            launch_future,
-            timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        # No result yet â€” fall through to the caller's connect wait, which
-        # preserves the prior fire-and-forget timing for a slow-but-fine host.
-        host_conn.pending_launches.pop(request_id, None)
-        return _HostLaunchAttempt(runner_id=new_runner_id)
-    if result.get("status") == "failed":
-        return _HostLaunchAttempt(
-            runner_id=new_runner_id,
-            error_code=result.get("error_code"),
-            error=result.get("error"),
-        )
-    return _HostLaunchAttempt(runner_id=new_runner_id)
-
-
-async def cancel_managed_launch_tasks() -> None:
-    """
-    Cancel and await every in-flight background managed launch.
-
-    Lifespan-teardown hook: without it, a slow provision outlives the
-    ASGI shutdown and dies wherever the loop teardown happens to kill
-    it. Cancellation is deterministic teardown of the TASK only â€” an
-    already-provisioned sandbox is not terminated here (there is no
-    time budget for provider calls during shutdown); its armed launch
-    token expires with the provider lifetime cap that also reaps the
-    sandbox.
-
-    :returns: None once every task has settled (cancellations and any
-        in-flight failures are absorbed via ``return_exceptions``).
-    """
-    tasks = list(_managed_launch_tasks)
-    if not tasks:
-        return
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _provision_managed_sandbox(
-    *,
-    session_id: str,
-    owner: str,
-    sandbox_config: ManagedSandboxDeployment,
-    repos: Sequence[RepoWorkspace],
-    tracker: ManagedLaunchTracker,
-    host_store: HostStore,
-    relaunch_host: Host | None,
-    provider: str | None = None,
-    agent_name: str | None = None,
-) -> ManagedHostLaunch | None:
-    """
-    Run the provision phase of a background managed launch.
-
-    Dispatches to :func:`relaunch_managed_host` (existing host row)
-    or :func:`launch_managed_host` (fresh identity) and converts any
-    failure into a settled tracker entry â€” the background task has no
-    caller to raise to.
-
-    :param session_id: Session/conversation identifier.
-    :param owner: User the managed host acts for.
-    :param sandbox_config: The deployment's sandbox config.
-    :param repos: Repository workspaces to clone (empty for none).
-    :param tracker: The app's launch tracker (failed here on error).
-    :param host_store: Persistent host registrations.
-    :param relaunch_host: Existing host row for a relaunch, or
-        ``None`` for a first launch.
-    :param agent_name: Server-resolved built-in agent name the session
-        runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
-        (Kubernetes only), or ``None`` to leave it unstamped.
-    :returns: The launch result, or ``None`` when the launch failed
-        (the tracker entry is already settled with the reason).
-    """
-    from omnigent.server.managed_hosts import launch_managed_host, relaunch_managed_host
-
-    def _on_stage(stage: str) -> None:
-        """
-        Relay a launch-pipeline stage to the session's progress surface.
-
-        Passed into the launch helpers, which may invoke it from the
-        worker thread their sandbox exec steps run on â€”
-        :func:`_publish_sandbox_status` is thread-safe.
-
-        :param stage: The stage just entered, e.g. ``"cloning"``.
-        """
-        _publish_sandbox_status(session_id, stage)
-
-    try:
-        if relaunch_host is not None:
-            return await relaunch_managed_host(
-                config=sandbox_config,
-                host=relaunch_host,
-                host_store=host_store,
-                repos=repos,
-                agent_name=agent_name,
-                on_stage=_on_stage,
-            )
-        return await launch_managed_host(
-            config=sandbox_config,
-            owner=owner,
-            host_store=host_store,
-            repos=repos,
-            provider=provider,
-            agent_name=agent_name,
-            on_stage=_on_stage,
-        )
-    except HTTPException as exc:
-        _logger.warning(
-            "Managed sandbox launch failed for session %s: %s",
-            session_id,
-            exc.detail,
-            extra={"session_id": session_id},
-        )
-        tracker.fail(session_id, str(exc.detail))
-        _publish_sandbox_status(session_id, "failed", str(exc.detail))
-        return None
-    except Exception:  # noqa: BLE001
-        # Broad on purpose: this is a fire-and-forget task â€” an
-        # unexpected error must settle the tracker (or a waiting
-        # message POST hangs until its timeout) and must not escape
-        # as an unhandled-task traceback.
-        _logger.exception(
-            "Managed sandbox launch crashed for session %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        tracker.fail(session_id, "internal error during managed sandbox launch")
-        _publish_sandbox_status(
-            session_id, "failed", "internal error during managed sandbox launch"
-        )
-        return None
-
-
-async def _wait_for_managed_runner_tunnel(
-    session_id: str,
-    runner_id: str,
-    tunnel_registry: TunnelRegistry,
-    tracker: ManagedLaunchTracker,
-) -> bool:
-    """
-    Wait for a launched managed runner to connect, failing the launch on timeout.
-
-    :param session_id: Session/conversation identifier.
-    :param runner_id: Runner id returned by the host launch frame.
-    :param tunnel_registry: Runner tunnel registry to wait on.
-    :param tracker: Managed launch tracker to settle on failure.
-    :returns: ``True`` when the runner connected; ``False`` after publishing
-        and retaining a failed launch status.
-    """
-    from omnigent.server.routes import sessions as _facade
-
-    runner = await tunnel_registry.wait_for_runner(
-        runner_id,
-        timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-    )
-    if runner is not None:
-        return True
-    reason = "managed runner did not connect after launch"
-    tracker.fail(session_id, reason)
-    _publish_sandbox_status(session_id, "failed", reason)
-    return False
-
-
-async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
-    """
-    Block until a managed launch settles, raising its failure.
-
-    The rendezvous a message POST takes when it races a background
-    managed launch (create-time provisioning or a dead-sandbox
-    relaunch): resolve as soon as the launch settles, surface the
-    recorded reason when it failed, and give up with a clear retry
-    hint when the launch outlives the rendezvous budget.
-
-    :param launch: The session's tracker entry.
-    :raises OmnigentError: 503 when the launch failed or is still
-        running at the timeout.
-    """
-    from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
-
-    try:
-        await asyncio.wait_for(
-            launch.settled.wait(),
-            timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        raise OmnigentError(
-            "The session's managed sandbox is still provisioning; try again shortly",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from None
-    if launch.error is not None:
-        raise OmnigentError(
-            f"The session's managed sandbox failed to launch: {launch.error}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-
-
-async def _get_runner_client_for_resource_access(
-    *args: Any, **kwargs: Any
-) -> httpx.AsyncClient | None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._get_runner_client_for_resource_access(*args, **kwargs)
-
-
-async def _get_runner_client_for_resource_access_impl(
-    session_id: str,
-    *,
-    conversation: Conversation | None = None,
-) -> httpx.AsyncClient | None:
-    """Return the authoritative runner client for session resources.
-
-    Requires the session to be bound to a runner via
-    ``PATCH /v1/sessions/{id}``; raises ``conflict`` otherwise. If no
-    runner router is configured (unit-test/in-process setups), callers
-    may fall back to local registries. ``conversation`` reuses the row
-    already loaded during authorization.
-    """
-    from omnigent.runtime import get_runner_client, get_runner_router
-
-    runner_router = get_runner_router()
-    if runner_router is not None:
-        if conversation is None:
-            routed_runner = runner_router.client_for_session_resources(session_id)
-        else:
-            routed_runner = runner_router.client_for_session_resources(
-                session_id,
-                conversation=conversation,
-            )
-        return routed_runner.client
-    return cast("httpx.AsyncClient | None", get_runner_client())
-
-
-async def _proxy_get_session_resources_to_runner(
-    runner_client: httpx.AsyncClient,
-    session_id: str,
-    resource_type: str | None = None,
-) -> SessionResourcePaginatedList:
-    """Proxy ``GET /resources`` to the runner with strict validation.
-
-    :param runner_client: HTTP client bound to the session's runner.
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param resource_type: Optional ``?type=`` filter forwarded to the
-        runner, e.g. ``"environment"``. ``None`` returns all types.
-    :returns: The runner's validated resource page.
-    :raises HTTPException: 502 on runner failure or malformed response.
-    """
-    try:
-        resp = await runner_client.get(
-            f"/v1/sessions/{session_id}/resources",
-            # Runner-side list_session_resources applies the type filter.
-            params={"type": resource_type} if resource_type else None,
-            timeout=10.0,
-        )
-        if resp.status_code != 200:
-            _logger.warning(
-                "session resources: runner returned %d for session=%s",
-                resp.status_code,
-                session_id,
-                extra={"session_id": session_id},
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="runner session-resources endpoint failed",
-            )
-
-        try:
-            body = resp.json()
-            if not isinstance(body, dict):
-                raise TypeError("response body must be an object")
-            page = SessionResourceListPage.model_validate(body)
-        except (TypeError, ValueError, ValidationError) as exc:
-            _logger.warning(
-                "session resources: malformed runner response for session=%s: %s",
-                session_id,
-                exc,
-                extra={"session_id": session_id},
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="runner session-resources endpoint returned malformed response",
-            ) from exc
-
-        return SessionResourcePaginatedList(
-            data=page.data,
-            first_id=page.first_id,
-            last_id=page.last_id,
-            has_more=page.has_more,
-        )
-    except HTTPException:
-        raise
-    except (httpx.HTTPError, ConnectionError) as exc:
-        _logger.warning(
-            "session resources: runner call failed for session=%s (%s)",
-            session_id,
-            exc,
-            extra={"session_id": session_id},
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="runner session-resources endpoint unavailable",
-        ) from exc
-
-
-async def _reset_runner_resources_after_switch(*args: Any, **kwargs: Any) -> None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._reset_runner_resources_after_switch(*args, **kwargs)
-
-
-async def _reset_runner_resources_after_switch_impl(session_id: str) -> None:
-    """Best-effort reset of the session's runner-side state after a switch.
-
-    Run as a fire-and-forget background task by the switch-agent route. Calls
-    the runner's dedicated ``POST /v1/sessions/{id}/reset-state`` endpoint,
-    which closes the cached primary OSEnv + terminals AND drops the
-    spec-derived session caches. Two reasons:
-
-    1. **Sandbox correctness.** The primary OSEnv (which backs the web-UI
-       filesystem / shell endpoints) is materialized once per session from the
-       *original* agent's spec and cached. Closing it AND invalidating the
-       spec/snapshot caches forces the next access to re-resolve and
-       re-materialize from the NEW agent's spec, so those endpoints run
-       under the switched-to agent's ``os_env``/sandbox â€” not the old one.
-       (Agent ``sys_os_*`` tool calls already re-derive os_env per call, and
-       native terminals re-evaluate the sandbox gate on respawn; this closes
-       the remaining stale path.)
-    2. **Terminal rebuild.** A lingering native terminal would otherwise shadow
-       the switch-back transcript rebuild (auto-create skips while one exists).
-
-    A dedicated endpoint (rather than ``DELETE /resources``) keeps the
-    session-deletion contract untouched â€” deletion never needs the
-    switch-specific cache reset.
-
-    A switch only runs while the session is idle, so closing the env + terminal
-    here is safe â€” unlike doing it inside the next turn's dispatch, which wedges
-    that turn. cwd is re-derived from the runner's bound workspace, so the
-    working directory / git worktree is preserved (only the sandbox changes;
-    a ``fork``/``start_in_scratch`` agent gets a fresh scratch copy). The
-    claude-native auto-create gate remains the switch-back safety net if this
-    call is lost (runner offline, races).
-
-    :param session_id: Session/conversation id just switched, e.g.
-        ``"conv_abc123"``.
-    :returns: None.
-    """
-    try:
-        runner_client = await _get_runner_client_for_resource_access(session_id)
-        if runner_client is None:
-            return
-        reset_resp = await runner_client.post(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/reset-state",
-            timeout=15.0,
-        )
-        # httpx only raises on transport errors â€” a 4xx/5xx reset response
-        # still returns. A non-2xx means the runner did NOT close the old
-        # env, so it must take the failure path below (suppressing the
-        # invalidation publish); HTTPStatusError is an httpx.HTTPError.
-        reset_resp.raise_for_status()
-    except (httpx.HTTPError, HTTPException, OmnigentError, RuntimeError):
-        # Best-effort: a runner hiccup must not break the (already-committed)
-        # switch. OmnigentError covers the session-not-runner-bound / runner-
-        # offline case raised by _get_runner_client_for_resource_access. The
-        # auto-create gate rebuilds on switch-back regardless. No
-        # changed-files event on this path either: the runner's env cache is
-        # still the OLD agent's, so a triggered refetch would re-serve it â€”
-        # and a lost runner rebuilds from the new spec on relaunch anyway.
-        _logger.warning(
-            "post-switch runner-resource reset failed for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        return
-    # The old agent's cached OSEnv is now closed, so a refetch triggered by
-    # this event re-materializes filesystem state from the NEW agent's spec.
-    # This is what flips the web Files tab when the switch crosses an
-    # os_env boundary (noneâ†’some shows it, someâ†’none hides it) â€” the
-    # session.agent_changed event fires before the reset and so cannot
-    # carry a trustworthy availability signal.
-    _publish_changed_files_invalidated(session_id)
-
-
-def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | None:
-    """
-    Resolve native terminal metadata for a session, by wrapper label OR harness.
-
-    Two independent signals identify a native session, because native message
-    handling must NOT be coupled to the terminal-first presentation labels:
-
-    * the ``omnigent.wrapper`` presentation label â€” set for the built-in
-      terminal-first wrapper sessions (``omnigent claude`` / ``omnigent
-      codex``); resolved directly and cheaply here (short-circuits the harness
-      load below); and
-    * the bound agent's RESOLVED harness â€” for a CUSTOM agent that declares a
-      native harness (e.g. a user ``polly`` orchestrator with
-      ``executor.harness: codex-native``) but is intentionally CHAT-first, so
-      it carries no wrapper label. Its runner still runs a native transcript
-      forwarder (the single writer for the conversation), so its web messages
-      must take the same native single-writer path â€” else the inbound user
-      message is persisted AP-side AND mirrored by the forwarder, landing
-      twice. Resolved via :func:`_resolve_harness` (honors a per-session
-      ``harness_override``), independent of the presentation labels; SDK
-      harnesses resolve to ``None``.
-
-    :param conv: Conversation row for the target session.
-    :returns: The :class:`NativeCodingAgent` for the session's harness, or
-        ``None`` when it is not a native terminal harness.
-    """
-    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    native_agent = native_coding_agent_for_wrapper_label(wrapper)
-    if native_agent is not None:
-        return native_agent
-    return native_coding_agent_for_harness(_resolve_harness(conv))
-
-
-def _native_terminal_name_for_harness(harness: str) -> str:
-    """
-    Return the runner terminal resource name for a native harness.
-
-    :param harness: Native harness identifier, e.g. ``"codex-native"``.
-    :returns: Terminal resource name, e.g. ``"codex"``.
-    :raises OmnigentError: If *harness* is not a supported native
-        terminal harness.
-    """
-    native_agent = native_coding_agent_for_harness(harness)
-    if native_agent is not None:
-        return native_agent.terminal_name
-    raise OmnigentError(
-        "Unsupported native terminal session",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
-def _native_terminal_failure_from_runner_response(
-    resp: httpx.Response,
-    *,
-    display_name: str,
-) -> ErrorData:
-    """
-    Convert a failed runner terminal-ensure response into durable error data.
-
-    The runner's terminal ensure endpoint must return structured
-    ``{"error": {"code": ..., "message": ...}}`` for definitive startup
-    failures (for example a missing native CLI). Preserve that message
-    exactly so the transcript shows the real cause. If the runner returns
-    an opaque framework 500 body such as ``"Internal Server Error"``,
-    surface an explicit malformed-runner-response error instead of
-    inventing a native terminal cause.
-
-    :param resp: Non-2xx response from
-        ``POST /v1/sessions/{id}/resources/terminals``.
-    :param display_name: Human-readable runtime name, e.g. ``"Codex"``.
-    :returns: Error data suitable for a persisted ``type="error"``
-        conversation item.
-    """
-    try:
-        body = resp.json()
-    except ValueError:
-        body = None
-    if isinstance(body, dict):
-        raw_error = body.get("error")
-        if isinstance(raw_error, dict):
-            raw_code = raw_error.get("code")
-            raw_message = raw_error.get("message")
-            if (
-                isinstance(raw_code, str)
-                and raw_code.strip()
-                and isinstance(raw_message, str)
-                and raw_message.strip()
-            ):
-                return ErrorData(
-                    source="execution",
-                    code=raw_code,
-                    message=raw_message,
-                )
-    return ErrorData(
-        source="execution",
-        code=_NATIVE_TERMINAL_ENSURE_FAILED_CODE,
-        message=(
-            f"Native {display_name} terminal ensure failed with malformed "
-            f"runner response (HTTP {resp.status_code})."
-        ),
-    )
-
-
-def _native_terminal_ensure_transport_error(
-    exc: httpx.HTTPError | ConnectionError,
-    *,
-    display_name: str,
-) -> ErrorData:
-    """
-    Convert runner transport failure during native terminal ensure.
-
-    The message path has exactly one preflight path for native terminal
-    readiness. If that path cannot reach the runner, fail the user turn
-    explicitly instead of falling back to the old forward-and-wait path.
-
-    :param exc: Transport exception from the ensure request, e.g.
-        ``httpx.ConnectError("connection refused")`` or the bare
-        ``ConnectionError("tunnel closed before request completed")``
-        that ``WSTunnelTransport`` raises on tunnel close.
-    :param display_name: Human-readable runtime name, e.g. ``"Codex"``.
-    :returns: Error data suitable for a persisted ``type="error"``
-        conversation item.
-    """
-    detail = str(exc).strip()
-    message = f"Native {display_name} terminal ensure request failed."
-    if detail:
-        message = f"{message} {detail}"
-    return ErrorData(
-        source="execution",
-        code=_NATIVE_TERMINAL_ENSURE_FAILED_CODE,
-        message=message,
-    )
-
-
-@dataclass
-class _NativeTerminalEnsureOutcome:
-    """
-    Result of a native terminal readiness probe.
-
-    :param error: Error data when the runner definitively failed to
-        create the terminal (fails the turn with a durable banner), or
-        ``None`` when the terminal is ready / the failure was not
-        definitive.
-    :param policy_notice: Human-readable reason that tool-call policy
-        enforcement is NOT active for this session (fail-open â€” codex too
-        old or the hook could not be trusted), or ``None`` when
-        enforcement is active. Non-fatal: surfaced once as a durable
-        banner, never blocks the turn.
-    """
-
-    error: ErrorData | None
-    policy_notice: str | None = None
-
-
-def _policy_notice_from_ensure_response(resp: httpx.Response) -> str | None:
-    """
-    Extract a non-fatal policy-disabled notice from a 2xx ensure response.
-
-    The runner attaches ``policy_hook_disabled_reason`` (once) to its
-    terminal-ensure success body when the session degraded to no policy
-    enforcement. A malformed / non-JSON body is treated as "no notice"
-    rather than failing the (successful) readiness probe.
-
-    :param resp: The runner's 2xx ensure response.
-    :returns: The reason string, or ``None`` when absent / unparseable.
-    """
-    try:
-        body = resp.json()
-    except ValueError:
-        return None
-    if not isinstance(body, dict):
-        return None
-    reason = body.get("policy_hook_disabled_reason")
-    return reason if isinstance(reason, str) and reason.strip() else None
-
-
-def _publish_error_event(session_id: str, error: ErrorData) -> None:
-    """
-    Publish a live ``response.error`` event for a persisted error item.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param error: Durable error payload to mirror into SSE.
-    :returns: None.
-    """
-    event = ErrorEvent(
-        type="response.error",
-        source=error.source,
-        error=RetryErrorDetail(code=error.code, message=error.message),
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
-#: Error code for a model change the terminal never applied.
-_MODEL_CHANGE_NOT_APPLIED_CODE = "model_change_not_applied"
-
-
-def _surface_model_change_forward_failure(
-    session_id: str,
-    model: str | None,
-    runner_result: _RunnerForwardResult | None,
-) -> None:
-    """
-    Publish a visible notice when a native pane never took a model change.
-
-    A PATCH persists ``model_override`` and then forwards the change to the
-    runner, which types ``/model`` into the terminal. On a native terminal that
-    injection is the ONLY thing that moves the model, so a dropped forward left
-    the row (and the picker) claiming a model the pane was never on, silently.
-    This does not roll the row back â€” it makes the divergence visible.
-
-    Call only for native terminal sessions: every other harness re-reads the
-    persisted value at its next turn boundary, so a dropped forward there is
-    genuinely benign.
-
-    Silent when no runner answered at all. That session is stopped or detached,
-    and its relaunch reads ``model_override`` off the row, so nothing has
-    diverged â€” the notice is for a session whose runner IS reachable and still
-    did not switch the pane.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param model: The model that was persisted, or ``None`` when cleared.
-    :param runner_result: HTTP result from the forward, or ``None`` when no
-        runner was reachable.
-    :returns: None.
-    """
-    if runner_result is None:
-        _logger.info(
-            "Model change for session=%s model=%r reached no runner; the launch will read it "
-            "off the row",
-            session_id,
-            model,
-            extra={"session_id": session_id},
-        )
-        return
-    if 200 <= runner_result.status_code < 300:
-        return
-    reason = f"the runner returned status {runner_result.status_code}"
-    # The runner's own detail names the concrete cause (e.g. "a dialog may
-    # be open in the pane"); carry it into the visible notice when present.
-    with contextlib.suppress(ValueError, TypeError):
-        parsed_body = json.loads(runner_result.body)
-        detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
-        if isinstance(detail, str) and detail.strip():
-            reason = f"{reason} ({detail.strip()})"
-    _logger.warning(
-        "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
-        session_id,
-        model,
-        reason,
-        runner_result.body,
-        extra={"session_id": session_id},
-    )
-    target = model or "its default model"
-    _publish_error_event(
-        session_id,
-        ErrorData(
-            source="execution",
-            code=_MODEL_CHANGE_NOT_APPLIED_CODE,
-            message=(
-                f"The terminal was not switched to {target}: {reason}. "
-                "It is still running on its previous model."
-            ),
-        ),
-    )
-
-
-async def _persist_native_policy_notice(
-    session_id: str,
-    conversation_store: ConversationStore,
-    reason: str,
-) -> None:
-    """
-    Persist + publish a non-fatal "policy not enforced" banner.
-
-    The runner reports (once, via the terminal-ensure success response)
-    that a native codex session started but tool-call policy enforcement
-    is inactive (fail-open: codex too old, or the policy hook could not be
-    trusted). This records a durable ``type="error"`` banner so the web UI
-    shows the degraded-security state across refresh/reconnect, and
-    mirrors it as a live ``response.error`` event. Unlike
-    :func:`_persist_native_terminal_failure` it does NOT consume the user
-    message or mark the turn failed â€” the terminal is up and the message
-    still forwards; this is an advisory notice only.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param conversation_store: Store used for the durable append.
-    :param reason: Human-readable cause from the runner, e.g. ``"Codex CLI
-        0.128.0 is older than 0.129.0; upgrade codex to enforce tool-call
-        policies."``.
-    :returns: None.
-    """
-    error = ErrorData(
-        source="execution",
-        code=_NATIVE_POLICY_NOT_ENFORCED_CODE,
-        message=f"Tool-call policy enforcement is not active for this session: {reason}",
-    )
-    persisted = await _relay_persist_error_once(
-        conversation_store,
-        session_id,
-        NewConversationItem(
-            type="error",
-            response_id=generate_task_id(),
-            data=error,
-        ),
-    )
-    # Mirror to live clients only when newly persisted (the runner's
-    # one-shot flag already prevents re-surfacing; this dedups a same-turn
-    # retry against an already-recorded notice).
-    if persisted == "persisted":
-        _publish_error_event(session_id, error)
-
-
-def _extract_claude_native_runner_failure(resp: httpx.Response) -> str | None:
-    """
-    Return a harness failure message from a runner SSE response.
-
-    Runner ``POST /v1/sessions/{id}/events`` returns HTTP 200 for a
-    syntactically valid harness stream even when the harness emits
-    ``response.failed``. Claude-native Omnigent forwarding must treat that
-    as failed injection, otherwise the web UI would believe a message
-    reached the terminal when ``tmux send-keys`` actually failed.
-
-    :param resp: Completed runner response.
-    :returns: Failure message, or ``None`` when no failure event is
-        present.
-    """
-    content_type = resp.headers.get("content-type", "")
-    text = resp.text
-    if "text/event-stream" not in content_type and "response.failed" not in text:
-        return None
-    for frame in text.split("\n\n"):
-        data_lines = [
-            line.removeprefix("data:").strip()
-            for line in frame.splitlines()
-            if line.startswith("data:")
-        ]
-        if not data_lines:
-            continue
-        try:
-            payload = json.loads("\n".join(data_lines))
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or payload.get("type") != "response.failed":
-            continue
-        error = payload.get("error")
-        if isinstance(error, dict):
-            message = error.get("message") or error.get("detail")
-            if isinstance(message, str) and message:
-                return message
-            return json.dumps(error, sort_keys=True)
-        if isinstance(error, str) and error:
-            return error
-        return "runner reported response.failed"
-    return None
-
-
-async def _forward_session_change_to_runner(
-    *args: Any, **kwargs: Any
-) -> _RunnerForwardResult | None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._forward_session_change_to_runner(*args, **kwargs)
-
-
-#: Forward budget for a control event the runner answers by driving the TUI.
-#: The claude-native ``/model`` and ``/effort`` injectors wait up to 1s for the
-#: tmux advertisement and then up to 4s for the confirmation dialog, so the
-#: default 5s budget could time out on a legitimately-still-working injection
-#: and report a failure that did not happen.
-_TUI_INJECT_FORWARD_TIMEOUT_S = 20.0
-
-
-async def _forward_session_change_to_runner_impl(
-    session_id: str,
-    runner_router: Any,
-    event: dict[str, Any],
-    timeout_s: float = 5.0,
-) -> _RunnerForwardResult | None:
-    """
-    Best-effort POST a control event to the bound runner.
-
-    Used for control inputs the runner dispatches by harness in its
-    ``/v1/sessions/{id}/events`` handler â€” claude-native injects the
-    corresponding slash command into the tmux pane; other harnesses
-    return 204 no-op. Two kinds of caller use this:
-
-    * PATCH-driven harness notifications (``effort_change``,
-      ``model_change``) â€” claude-native injects the slash command,
-      other harnesses re-read the persisted value at the next turn
-      boundary, so they ignore the return value.
-    * Explicit ``compact`` â€” the caller inspects the returned status
-      to decide whether the runner handled the control (claude-native,
-      200) or the Omnigent server must run its own in-process compaction
-      (204 / no runner). See the ``compact`` branch in
-      :func:`post_event`.
-
-    Mirrors the interrupt-forward fallback chain: prefer the per-
-    session router binding, fall back to the global runner client
-    (in-process / test setups where the router hasn't bound the
-    session). When neither resolves to a client, the POST is silently
-    skipped â€” the persisted value on the Omnigent side is the authoritative
-    fallback, picked up by the next spawn.
-
-    Non-2xx runner responses (e.g. 503 when the tmux pane isn't
-    advertised yet) are logged as warnings so the failure surfaces
-    in the Omnigent log â€” otherwise the POST succeeds at the httpx layer
-    and the status would be silently dropped.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param runner_router: The session's ``RunnerRouter`` (may be
-        ``None`` in tests / in-process setups).
-    :param event: The ``/events`` POST body, e.g.
-        ``{"type": "effort_change", "effort": "high"}``,
-        ``{"type": "model_change", "model": "claude-opus-4-7"}``, or
-        ``{"type": "compact"}``.
-    :param timeout_s: Request budget, e.g. ``5.0``. Callers whose event the
-        runner answers by driving the TUI pass
-        :data:`_TUI_INJECT_FORWARD_TIMEOUT_S`.
-    :returns: The runner's HTTP status/body, or ``None`` when no
-        runner client could be resolved or the POST failed at the
-        transport layer (in both cases the AP-side persisted value /
-        operation is the authoritative fallback).
-    """
-    from omnigent.runtime import get_runner_client
-
-    runner_client = await _get_runner_client(session_id, runner_router)
-    if runner_client is None:
-        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
-    if runner_client is None:
-        return None
-    try:
-        resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json=event,
-            timeout=timeout_s,
-        )
-    except (httpx.HTTPError, ConnectionError):
-        _logger.exception(
-            "Session-change forward failed for session=%r type=%r",
-            session_id,
-            event.get("type"),
-            extra={"session_id": session_id},
-        )
-        return None
-    if resp.status_code >= 400:
-        _logger.warning(
-            "Session-change forward rejected for session=%s type=%r status=%s body=%s",
-            session_id,
-            event.get("type"),
-            resp.status_code,
-            resp.text,
-            extra={"session_id": session_id},
-        )
-    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
-
-
-async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._stop_session_via_runner(*args, **kwargs)
-
-
-async def _stop_session_via_runner_impl(
-    session_id: str,
-    runner_router: Any,
-) -> bool:
-    """
-    Forward a ``stop_session`` request to the bound runner, surfacing
-    failures to the caller instead of swallowing them.
-
-    Unlike :func:`_forward_session_change_to_runner` (used for
-    ``effort_change`` / ``model_change``, where a dropped forward is
-    benign â€” the runner re-reads the persisted value at the next turn),
-    a failed ``stop_session`` means the session is *still alive*. The
-    web UI's "Stop session" action is destructive and treats a 2xx as
-    success (it closes the confirmation dialog), so a swallowed failure
-    would tell the user the session stopped when it did not. This
-    helper therefore raises on a transport error or non-2xx runner
-    response.
-
-    Runner-client resolution mirrors the best-effort helper's fallback
-    chain: prefer the per-session router binding, fall back to the
-    global runner client (in-process / test setups). When neither
-    resolves to a client there is no live runner bound â€” the session is
-    not running on any runner, so the stop is a no-op success and this
-    returns ``False`` without raising (the caller uses that to discard
-    the turn fence it installed, since no runner means nothing else
-    would ever lift it).
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param runner_router: The session's ``RunnerRouter`` (may be
-        ``None`` in tests / in-process setups).
-    :returns: ``True`` if the stop was delivered to a runner (2xx),
-        ``False`` if no runner client resolved (nothing forwarded).
-    :raises OmnigentError: ``RUNNER_UNAVAILABLE`` (HTTP 503) if the
-        runner could not be reached or reported a non-2xx â€” e.g. the
-        claude-native tmux pane is wedged and ``kill_session`` failed.
-        The web UI maps this to a visible "stop failed" state rather
-        than closing the dialog as if the session stopped.
-    """
-    from omnigent.runtime import get_runner_client
-
-    runner_client = await _get_runner_client(session_id, runner_router)
-    if runner_client is None:
-        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
-    if runner_client is None:
-        return False
-    try:
-        resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": _STOP_SESSION_TYPE},
-            timeout=5.0,
-        )
-    except (httpx.HTTPError, ConnectionError) as exc:
-        # WSTunnelTransport raises bare ConnectionError on tunnel close.
-        raise OmnigentError(
-            f"Could not reach the runner to stop session {session_id!r}: {exc}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from exc
-    if resp.status_code >= 400:
-        raise OmnigentError(
-            f"Runner failed to stop session {session_id!r} "
-            f"(status {resp.status_code}): {resp.text}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-    return True
-
-
-async def _stop_session_host_runner(
-    session_id: str,
-    host_id: str,
-    runner_id: str,
-    host_registry: Any,
-    *,
-    expect_already_stopped: bool = False,
-) -> bool:
-    """
-    Terminate the host-launched runner backing a host-spawned session.
-
-    "Stop session" on a host-spawned session must end the dedicated runner
-    subprocess the host launched for it â€” there is exactly one runner per
-    host-launched session (see ``POST /v1/hosts/{host_id}/runners`` and the
-    host-launch branch of session create). Killing the ``claude`` tmux pane
-    via :func:`_stop_session_via_runner` is not enough on its own: the
-    runner stays connected, so ``GET /health`` keeps reporting
-    ``runner_online: true`` for the session and the web UI never shows it as
-    disconnected â€” new messages are accepted and hang on "working" against a
-    dead pane.
-
-    Bringing the runner's tunnel down is what flips ``runner_online`` to
-    ``false``; ``_on_runner_disconnect`` then marks the session and the web
-    UI renders the "Agent disconnected â€” click to show reconnect command"
-    banner, identical to the end state a CLI-launched session reaches when
-    its process exits.
-
-    Best-effort by design: the pane is already gone before this runs, so a
-    host that is offline, was replaced, or is slow to acknowledge is logged
-    and swallowed rather than failing the whole Stop. In the common case â€”
-    the host's ``omnigent host`` tunnel is open while the user drives
-    the web UI â€” the stop is delivered and the runner exits. The runner this
-    targets is read from the caller's own (owner-gated) session row, so it
-    can only ever stop the runner bound to that session.
-
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param host_id: Owning host identifier from the session row, e.g.
-        ``"host_a1b2c3d4..."``.
-    :param runner_id: Runner bound to the session, e.g.
-        ``"runner_token_abc123..."``.
-    :param host_registry: The :class:`HostRegistry` tracking live host
-        tunnels on this replica, or ``None`` when host support is not wired
-        (in-process / test setups without a host tunnel).
-    :param expect_already_stopped: Log a host-reported ``failed`` at debug
-        instead of warning, for callers that race another reaper for the same
-        runner (the relaunch belt: see
-        :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
-    :returns: ``True`` when the stop was delivered and acknowledged (the
-        runner is exiting, so a tunnel drop is expected); ``False`` on any
-        best-effort early-out (no host registry, host offline/replaced,
-        ack timeout, or host-reported failure) where the runner may keep
-        running and no tunnel drop will follow.
-    """
-    if host_registry is None:
-        return False
-    conn = host_registry.get(host_id)
-    if conn is None:
-        _logger.warning(
-            "Cannot stop runner %s for session %s: host %s is offline; "
-            "the runner may linger online and the session will not show as "
-            "disconnected",
-            runner_id,
-            session_id,
-            host_id,
-            extra={"session_id": session_id},
-        )
-        return False
-    from omnigent.host.frames import HostStopRunnerFrame, encode_host_frame
-
-    request_id = secrets.token_hex(8)
-    future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
-    conn.pending_stops[request_id] = future
-    stop_frame = encode_host_frame(
-        HostStopRunnerFrame(request_id=request_id, runner_id=runner_id),
-    )
-    try:
-        host_registry.send_text(conn, stop_frame)
-    except ConnectionError:
-        conn.pending_stops.pop(request_id, None)
-        _logger.warning(
-            "Cannot stop runner %s for session %s: host %s connection was replaced",
-            runner_id,
-            session_id,
-            host_id,
-            extra={"session_id": session_id},
-        )
-        return False
-    try:
-        result = await asyncio.wait_for(
-            future,
-            timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        conn.pending_stops.pop(request_id, None)
-        _logger.warning(
-            "Host %s did not acknowledge stop of runner %s for session %s",
-            host_id,
-            runner_id,
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return False
-    if result.get("status") == "failed":
-        # An unknown runner means someone already reaped it. Expected for the
-        # relaunch belt, which the host's own supersession normally beats, so
-        # a warning there would report a successful reap as a failure.
-        (_logger.debug if expect_already_stopped else _logger.warning)(
-            "Host %s failed to stop runner %s for session %s: %s",
-            host_id,
-            runner_id,
-            session_id,
-            result.get("error"),
-            extra={"session_id": session_id},
-        )
-        return False
-    return True
-
-
-def _build_new_item(
-    body: SessionEventInput,
-    response_id: str,
-    created_by: str | None = None,
-) -> NewConversationItem:
-    """
-    Construct a :class:`NewConversationItem` from a POSTed event.
-
-    Validates the data payload via ``parse_item_data`` and wraps the
-    result with the response_id linkage required by the conversation
-    store.
-
-    The item *type* is checked at the route boundary, but ``data`` is a
-    free-form dict there, so a caller can name a known type and omit the
-    fields it requires â€” ``{"type": "message"}`` with no ``role`` or
-    ``content`` is the shape seen in production. That is bad input, so the
-    raised ``ValidationError`` becomes an
-    :class:`~omnigent.errors.OmnigentError` the caller can act on rather
-    than escaping as an unhandled 500.
-
-    :param body: Validated event input â€” guaranteed to be a known
-        item type (the route checked ``_ALLOWED_EVENT_TYPES``).
-    :param response_id: The task id the new item should be tagged
-        with â€” either the steered active task or a freshly-created
-        one.
-    :param created_by: Authenticated identity of the actor posting
-        the event, recorded for per-message attribution. ``None`` in
-        single-user mode.
-    :returns: A :class:`NewConversationItem` ready for delivery
-        or persistence.
-    :raises OmnigentError: When ``body.data`` does not satisfy the
-        payload schema for ``body.type``.
-    """
-    try:
-        data = parse_item_data(body.type, {"type": body.type, **body.data})
-    except ValidationError as exc:
-        raise OmnigentError(
-            f"invalid data for {body.type!r} item: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
-    return NewConversationItem(
-        type=body.type,
-        response_id=response_id,
-        data=data,
-        created_by=created_by,
-    )
-
-
-def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:
-    """
-    Validate and unpack a structured skill slash-command event.
-
-    The REPL posts ``type="slash_command"`` for skill invocations.
-    Other command kinds are surfaced by terminal transcript bridges
-    through ``external_conversation_item`` and are not executable
-    session inputs on this route.
-
-    :param body: Validated event input with ``type="slash_command"``
-        and data such as ``{"kind": "skill", "name": "grill-me",
-        "arguments": "review this plan"}``.
-    :returns: ``(skill_name, arguments)`` with whitespace-trimmed
-        command name and raw argument text.
-    :raises OmnigentError: If the payload is not a skill command
-        or is missing a usable skill name / arguments string.
-    """
-    kind = body.data.get("kind", "skill")
-    if kind != "skill":
-        raise OmnigentError(
-            "slash_command events only support kind='skill'; use the "
-            "dedicated control event for built-in commands",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    name = body.data.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise OmnigentError(
-            "slash_command requires non-empty data.name",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    arguments = body.data.get("arguments", "")
-    if not isinstance(arguments, str):
-        raise OmnigentError(
-            "slash_command data.arguments must be a string",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return name.strip(), arguments
-
-
-def _build_skill_slash_command_policy_body(body: SessionEventInput) -> SessionEventInput:
-    """
-    Build the user-message shape used for input policy evaluation.
-
-    Skill commands inject a hidden meta message containing the full
-    skill body, but input guardrails should evaluate the text the user
-    actually typed, not the skill instructions maintained by the
-    server. This preserves the legacy policy surface of
-    ``/<skill> <arguments>`` without making bundled skill content
-    policy-sensitive.
-
-    :param body: Validated ``slash_command`` event body with data such
-        as ``{"name": "grill-me", "arguments": "review this plan"}``.
-    :returns: Synthetic user ``message`` event for policy evaluation.
-    :raises OmnigentError: If the slash-command payload is invalid.
-    """
-    skill_name, arguments = _parse_skill_slash_command(body)
-    command_text = f"/{skill_name}" if not arguments else f"/{skill_name} {arguments}"
-    return SessionEventInput(
-        type="message",
-        data={
-            "role": "user",
-            "content": [{"type": "input_text", "text": command_text}],
-        },
-    )
-
-
-async def _resolve_skill_meta_text_via_runner(
-    session_id: str,
-    skill_name: str,
-    arguments: str,
-    runner_client: httpx.AsyncClient,
-) -> str:
-    """
-    Resolve a skill's hidden ``<skill>`` meta text on the bound runner.
-
-    Skill content is runner-owned: the runner reads the ``SKILL.md``
-    body and resource files from the skill's directory on its own
-    filesystem, so the embedded ``<path>`` and resource listing are
-    valid where the harness executes. Wraps
-    ``POST /v1/sessions/{id}/skills/resolve``.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param skill_name: Exact skill name to resolve, e.g.
-        ``"code-review"``.
-    :param arguments: Raw argument string typed after the slash
-        command, e.g. ``"review this plan"``. Empty when none.
-    :param runner_client: HTTP client pointed at the bound runner.
-    :returns: The hidden ``<skill>`` meta text for a single
-        ``input_text`` block.
-    :raises OmnigentError: If the skill is not exposed for the session
-        (the runner 404s with the available list), or the runner is
-        unreachable / errors while resolving.
-    """
-    try:
-        resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/skills/resolve",
-            json={"name": skill_name, "arguments": arguments},
-            timeout=10.0,
-        )
-    except (httpx.HTTPError, ConnectionError) as exc:
-        raise OmnigentError(
-            f"Runner unreachable while resolving skill {skill_name!r}: {exc}",
-            code=ErrorCode.INTERNAL_ERROR,
-        ) from exc
-    if resp.status_code not in (200, 404):
-        raise OmnigentError(
-            f"Runner failed to resolve skill {skill_name!r}: HTTP {resp.status_code}",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-    # Parse the body once, guarded: a transport proxy / HTML error page /
-    # non-object body must surface as a controlled runner failure, not an
-    # uncaught 500.
-    try:
-        payload = resp.json()
-        if not isinstance(payload, dict):
-            raise ValueError("expected a JSON object")
-    except ValueError as exc:
-        raise OmnigentError(
-            f"Runner returned a malformed skill resolution for {skill_name!r}: {exc}",
-            code=ErrorCode.INTERNAL_ERROR,
-        ) from exc
-    if resp.status_code == 404:
-        available = payload.get("available", [])
-        raise OmnigentError(
-            f"Skill {skill_name!r} not found. Available skills: {available}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    meta_text = payload.get("meta_text")
-    if not isinstance(meta_text, str):
-        raise OmnigentError(
-            f"Runner returned malformed skill resolution for {skill_name!r}: missing 'meta_text'",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-    return meta_text
-
-
-async def _dispatch_skill_slash_command_to_runner(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-    runner_client: httpx.AsyncClient,
-    *,
-    agent: Agent,
-    has_mcp_servers: bool,
-    created_by: str | None,
-) -> str:
-    """
-    Persist a skill slash command and forward hidden skill context.
-
-    Skill content is runner-owned: this asks the bound runner to
-    resolve the skill (``POST /v1/sessions/{id}/skills/resolve``) into
-    its ``<skill>`` meta text, reading the ``SKILL.md`` body and
-    resource files from the skill's directory *on the runner* â€” so the
-    embedded ``<path>`` and resource listing are valid where the harness
-    executes. The server then persists the result (runner-resolves,
-    server-persists). Appends two conversation items with the same
-    response id:
-
-    * a visible ``slash_command`` item for the UI transcript;
-    * a hidden ``message`` item with ``is_meta=True`` containing the
-      full skill instructions for runner history replay.
-
-    Only the hidden message is sent to the runner as input. The visible
-    command is published as ``response.output_item.done`` after the
-    runner accepts the event.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param conv: Conversation row for ``session_id``.
-    :param body: Structured ``slash_command`` event body.
-    :param conversation_store: Store used to append both durable
-        items.
-    :param runner_client: HTTP client pointed at the bound runner.
-    :param agent: Agent bound to the conversation.
-    :param has_mcp_servers: ``True`` when the agent spec declares MCP
-        servers; forwarded unchanged to the runner event.
-    :param created_by: Authenticated actor id, e.g.
-        ``"alice@example.com"``, or ``None`` in single-user mode.
-    :returns: The persisted visible ``slash_command`` item id.
-    :raises OmnigentError: If the skill is not exposed for the
-        session, or the runner is unreachable while resolving it.
-    """
-    import uuid
-
-    skill_name, arguments = _parse_skill_slash_command(body)
-    meta_text = await _resolve_skill_meta_text_via_runner(
-        session_id,
-        skill_name,
-        arguments,
-        runner_client,
-    )
-
-    response_id = f"turn_{uuid.uuid4().hex}"
-    meta_content = [{"type": "input_text", "text": meta_text}]
-    visible_item = NewConversationItem(
-        type=_SLASH_COMMAND_TYPE,
-        response_id=response_id,
-        data=SlashCommandData(
-            agent=agent.name,
-            kind="skill",
-            name=skill_name,
-            arguments=arguments,
-        ),
-        created_by=created_by,
-    )
-    meta_item = NewConversationItem(
-        type="message",
-        response_id=response_id,
-        data=MessageData(
-            role="user",
-            content=meta_content,
-            is_meta=True,
-        ),
-        created_by=created_by,
-    )
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [visible_item, meta_item],
-    )
-    visible = persisted_items[0]
-
-    # Mirror the plain-message path's title seeding: a session whose FIRST
-    # message is a skill invocation (web landing composer, REPL) would
-    # otherwise keep a NULL title and the sidebar falls back to the
-    # conversation id. Titled from the typed command ("/debate kafkaâ€¦"),
-    # NOT the hidden meta item â€” that's the full SKILL.md instruction blob.
-    command_text = f"/{skill_name} {arguments}" if arguments else f"/{skill_name}"
-    await _seed_missing_title(
-        conv,
-        [{"type": "input_text", "text": command_text}],
-        conversation_store,
-    )
-
-    runner_body: dict[str, Any] = {
-        "type": "message",
-        "role": "user",
-        "content": meta_content,
-        "agent_id": conv.agent_id,
-        "model": agent.name,
-        "has_mcp_servers": has_mcp_servers,
-        # Live-renderer hint: the runner drops ``browser_*`` schemas for
-        # the turn when no renderer is subscribed to the session stream.
-        "browser_renderer_available": session_stream.has_subscribers(session_id),
-        # The forwarded message carries ``meta_content`` â€” i.e. the
-        # META item (persisted_items[1]), not the user-visible item.
-        # Hand the runner that id so a cold-cache reload drops the
-        # right persisted copy (see _forward_event_to_runner).
-        "persisted_item_id": persisted_items[1].id,
-    }
-    effective_runner_override = (
-        body.model_override if body.model_override is not None else conv.model_override
-    )
-    if effective_runner_override is not None:
-        runner_body["model_override"] = effective_runner_override
-    # Per-session brain-harness override â€” create-time only, so no
-    # per-event value exists; the persisted column is the source. The
-    # "auto" sentinel is resolved to a concrete harness at first-message
-    # time and never forwarded verbatim.
-    if conv.harness_override is not None and conv.harness_override != "auto":
-        runner_body["harness_override"] = conv.harness_override
-
-    try:
-        await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json=runner_body,
-            timeout=_RUNNER_FORWARD_TIMEOUT,
-        )
-        event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
-        session_stream.publish(session_id, event.model_dump())
-    except (httpx.HTTPError, ConnectionError) as exc:
-        _logger.exception(
-            "Forward of skill slash command failed for session=%s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        _publish_status(session_id, "idle")
-        raise OmnigentError(
-            "Runner is unreachable; message was persisted but could not be delivered. "
-            "The runner may be restarting â€” retry or spawn a new session.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from exc
-    return visible.id
-
-
-def _title_content_from_item(
-    item: NewConversationItem | ConversationItem,
-) -> list[dict[str, Any]]:
-    """
-    Extract title candidate content blocks from a session item.
-
-    User ``message`` items contribute their text. A Skill ``slash_command``
-    item (``kind == "skill"``) contributes its typed command, e.g.
-    ``"/my-plugin:my-skill ARG-123"`` â€” a Claude Code native session whose
-    first action is a Skill arrives over the transcript bridge as a
-    ``slash_command``, not a user ``message``, so without this it stays
-    untitled and the sidebar falls back to the generic "Claude Code" label
-    (#851). CLI built-ins (``kind == "command"`` â€” ``/clear``, ``/compact``,
-    ``/model``, â€¦) are excluded so a surfaced built-in never becomes the
-    session title. Tool results and assistant-shaped messages return an empty
-    list so callers leave the conversation title unchanged.
-
-    :param item: The parsed item being persisted, e.g. a user
-        ``"message"`` item with input text content.
-    :returns: Content blocks that may contribute to a synthesized
-        title, e.g. ``[{"type": "input_text", "text": "Hello"}]``.
-    """
-    if item.type == _SLASH_COMMAND_TYPE:
-        # Title a Skill-first session from the typed command; skip surfaced CLI
-        # built-ins (kind == "command") which aren't meaningful session topics.
-        if not isinstance(item.data, SlashCommandData) or item.data.kind != "skill":
-            return []
-        command = f"/{item.data.name}"
-        arguments = item.data.arguments.strip()
-        text = f"{command} {arguments}" if arguments else command
-        return [{"type": "input_text", "text": text}]
-    if item.type != "message":
-        return []
-    if not isinstance(item.data, MessageData):
-        return []
-    if item.data.role != "user":
-        return []
-    if item.data.is_meta:
-        return []
-    return item.data.content
-
-
-async def _seed_missing_title(
-    conv: Conversation,
-    content: list[dict[str, Any]],
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Set an untitled conversation's title from message content blocks.
-
-    No-op when the conversation already has a title or the blocks
-    yield no usable text. Mutates ``conv.title`` in place on success
-    so callers holding the row see the persisted value.
-
-    :param conv: The conversation row for the session.
-    :param content: Title-candidate blocks, e.g.
-        ``[{"type": "input_text", "text": "/debate kafka vs sqs"}]``.
-    :param conversation_store: Store used to persist the title.
-    :returns: None.
-    """
-    if conv.title is not None:
-        return
-    title = synthesize_conversation_title(content)
-    if title is None:
-        return
-    updated = await asyncio.to_thread(
-        conversation_store.update_conversation,
-        conv.id,
-        title=title,
-    )
-    if updated is not None:
-        conv.title = updated.title
-
-
-async def _seed_missing_title_from_user_message(
-    conv: Conversation,
-    item: NewConversationItem,
-    conversation_store: ConversationStore,
-) -> None:
-    """
-    Set an untitled session's title from a user message.
-
-    The app UI creates sessions with ``initial_items=[]`` and posts
-    the first user message through ``POST /v1/sessions/{id}/events``.
-    This helper also covers callers that pass initial items to
-    ``POST /v1/sessions``. Non-user-message items are ignored, and
-    already-titled conversations are left unchanged.
-
-    :param conv: The conversation row for the session.
-    :param item: The parsed item being persisted.
-    :param conversation_store: Store used to persist the title.
-    :returns: None.
-    """
-    await _seed_missing_title(conv, _title_content_from_item(item), conversation_store)
-
-
-def _extract_user_text_for_routing(body: SessionEventInput) -> str:
-    """Extract plain text from a user message event for the routing judge.
-
-    Concatenates all ``input_text`` blocks in ``body.data["content"]``,
-    returning the first 4 000 characters.  Returns ``""`` for non-message
-    events or events with no text content.
-    """
-    content = body.data.get("content")
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "input_text":
-            text = block.get("text", "")
-            if isinstance(text, str):
-                parts.append(text)
-    return " ".join(parts)[:4000]
-
-
-async def _emit_server_routing_decision(
-    session_id: str,
-    conversation_store: ConversationStore,
-    model: str,
-    verdict: dict[str, Any],
-    *,
-    agent: str | None = None,
-    scope: str = "turn",
-    harness: str | None = None,
-    decision_id: str | None = None,
-    attempted_override: str | None = None,
-) -> str | None:
-    """Persist and publish a ``routing_decision`` transcript chip.
-
-    Called by the server-side routing path before the turn is forwarded
-    to the runner.  The chip shows the judge's model pick at turn start
-    â€” the same UX the runner-side advisor produced, but driven entirely
-    by the server.
-
-    :param agent: Sub-agent name to include when mirroring a child
-        session's routing decision into the parent's transcript.
-    :param scope: What the decision governs, e.g. ``"child_session"``.
-    :param harness: Harness the decision applies to, when it picked one.
-    :param decision_id: Decision identity shared with the child-sessions
-        API. ``None`` mints one.
-    :param attempted_override: Model the spawning agent asked for and the
-        router overrode â€” an LLM-supplied ``args.model``, or a native
-        spawn's own ``requested_model``. ``None`` when nothing was asked
-        for, or when the pick names the same arm as the ask.
-    :returns: The decision id, so callers can join it onto the session
-        row, or ``None`` when the payload failed validation and no chip
-        was recorded.
-    """
-    import uuid
-
-    rationale = verdict.get("rationale", "")
-    applied = verdict.get("applied", True)
-    resolved_decision_id = decision_id or str(uuid.uuid4())
-    raw_model = verdict.get("raw_model")
-    # Which router answered, so the chip can mark an AI-Gateway-routed decision.
-    router_source = verdict.get("router_source")
-    item_data: dict[str, Any] = {
-        "model": model,
-        "applied": bool(applied),
-        "rationale": rationale if isinstance(rationale, str) else "",
-        "scope": scope,
-        "harness": harness,
-        "decision_id": resolved_decision_id,
-        "raw_model": raw_model if isinstance(raw_model, str) and raw_model else None,
-        "attempted_override": attempted_override,
-        "router_source": (
-            router_source if isinstance(router_source, str) and router_source else None
-        ),
-    }
-    if agent is not None:
-        item_data["agent"] = agent
-    try:
-        parsed_data = parse_item_data("routing_decision", item_data)
-    except (ValueError, TypeError):
-        _logger.warning(
-            "Server routing: failed to parse routing_decision data",
-            extra={"session_id": session_id},
-        )
-        return None
-
-    routing_item = NewConversationItem(
-        type="routing_decision",
-        response_id=f"routing_{uuid.uuid4().hex}",
-        data=parsed_data,
-    )
-    try:
-        persisted = await asyncio.to_thread(conversation_store.append, session_id, [routing_item])
-        persisted_id: str | None = persisted[0].id if persisted else None
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Server routing: routing_decision persist failed for session=%s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        persisted_id = None
-
-    # Publish live event so the web UI renders the chip immediately.
-    session_stream.publish(
-        session_id,
-        {
-            "type": "response.output_item.done",
-            "item": {
-                "id": persisted_id,
-                "type": "routing_decision",
-                **item_data,
-            },
-        },
-    )
-    return resolved_decision_id
-
-
-@dataclass
-class _SessionEventDispatchResult:
-    """
-    Outcome of forwarding one item-event to the runner.
-
-    :param item_id: Store-assigned id of the AP-persisted item, e.g.
-        ``"item_abc123"``. ``None`` for the claude-native message
-        bypass, which persists nothing AP-side.
-    :param pending_id: Id of the :mod:`omnigent.runtime.pending_inputs`
-        entry recorded for a native-terminal web message, e.g.
-        ``"pending_a1b2c3"`` â€” surfaced to the sender so it can adopt
-        the id and dedupe against the snapshot. ``None`` for non-native
-        events (already persisted, so no separate pending entry).
-    """
-
-    item_id: str | None
-    pending_id: str | None
-
-
-def _extract_persistent_item_from_sse(
-    event: dict[str, Any],
-    response_id: str | None = None,
-) -> NewConversationItem | None:
-    """
-    Extract a persistable conversation item from a runner SSE event.
-
-    Returns a ``NewConversationItem`` for:
-
-    - ``response.output_item.done`` events carrying an assistant
-      message, function_call, or function_call_output.
-    - ``compaction`` events carrying a conversation summary from
-      the runner's compaction system.
-
-    Returns ``None`` for all other events (transient deltas, turn
-    lifecycle, compaction progress indicators, etc.).
-
-    :param event: Parsed SSE event dict from the runner stream.
-    :param response_id: Turn-scoped id from the most recent
-        ``response.in_progress`` event. All items persisted within
-        the same turn share this id so the web UI can group them
-        into a single bubble and pair function_calls with their
-        outputs. Falls back to a fresh uuid when unavailable.
-    :returns: A ``NewConversationItem`` ready for
-        ``conv_store.append()``, or ``None``.
-    """
-    import uuid
-
-    evt_type = event.get("type")
-
-    if evt_type == "compaction":
-        try:
-            data = parse_item_data("compaction", event)
-        except (ValueError, TypeError):
-            _logger.warning("Failed to parse compaction item from SSE")
-            return None
-
-        return NewConversationItem(
-            type="compaction",
-            response_id=f"compact_{uuid.uuid4().hex}",
-            data=data,
-        )
-
-    if evt_type != "response.output_item.done":
-        return None
-    item = event.get("item")
-    if not isinstance(item, dict):
-        return None
-    item_type = item.get("type")
-    if item_type not in ("message", "function_call", "function_call_output"):
-        return None
-    # Skip transient observed function_call events (status
-    # ``in_progress`` / ``action_required``).  Only ``completed``
-    # function_calls are durable â€” the scaffold emits them after
-    # the dispatch Future resolves.  Persisting interim statuses
-    # creates orphan conversation items whose spinners never
-    # resolve in the web UI.
-    if item_type == "function_call" and item.get("status") != "completed":
-        return None
-    try:
-        data = parse_item_data(item_type, item)
-    except (ValueError, TypeError):
-        _logger.warning(
-            "Failed to parse persistent item from SSE: %s",
-            item_type,
-        )
-        return None
-
-    return NewConversationItem(
-        type=item_type,
-        response_id=response_id or f"turn_{uuid.uuid4().hex}",
-        data=data,
-    )
-
-
-def _resource_event_item_from_sse(
-    session_id: str,
-    event: dict[str, Any],
-) -> NewConversationItem | None:
-    """
-    Build a ``resource_event`` conversation item from a runner SSE event.
-
-    The runner emits ``session.resource.created`` /
-    ``session.resource.deleted`` when an agent tool
-    (``sys_terminal_launch`` / ``sys_terminal_close``) materializes or
-    tears down a session resource mid-turn. The relay republishes the
-    raw event onto the live ``session_stream`` (so connected clients
-    update instantly); this helper produces the durable conversation
-    item so a client that reconnects mid-turn rediscovers the resource
-    in the snapshot â€” matching the REST resource path
-    (:func:`_publish_and_persist_resource_event`).
-
-    Returns ``None`` for every other event type, and for malformed
-    resource events (missing id / type) so a bad frame can't poison
-    the relay.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param event: Parsed SSE event dict from the runner stream.
-    :returns: A ``resource_event`` :class:`NewConversationItem`, or
-        ``None``.
-    """
-    from omnigent.entities.conversation import ResourceEventData
-
-    evt_type = event.get("type")
-    if evt_type == "session.resource.created":
-        resource = event.get("resource")
-        if not isinstance(resource, dict):
-            return None
-        resource_id = resource.get("id")
-        resource_type = resource.get("type")
-    elif evt_type == "session.resource.deleted":
-        resource = None
-        resource_id = event.get("resource_id")
-        resource_type = event.get("resource_type")
-    else:
-        return None
-
-    # Require non-empty id/type. ``isinstance(x, str)`` alone admits
-    # ``""``, which would persist a malformed resource_event item the
-    # snapshot can't resolve back to a real resource. Drop the frame
-    # instead â€” the snapshot endpoint stays the source of truth.
-    if not resource_id or not isinstance(resource_id, str):
-        return None
-    if not resource_type or not isinstance(resource_type, str):
-        return None
-
-    return NewConversationItem(
-        type="resource_event",
-        response_id=session_id,
-        data=ResourceEventData(
-            event_type=evt_type,
-            resource_id=resource_id,
-            resource_type=resource_type,
-            resource=resource,
-        ),
-    )
-
-
-def _routing_decision_item_from_sse(
-    event: dict[str, Any],
-) -> NewConversationItem | None:
-    """
-    Build a ``routing_decision`` conversation item from a runner SSE event.
-
-    The runner's cost advisor emits a ``response.output_item.done`` with a
-    ``routing_decision`` item at the START of an advised turn (the
-    intelligent model router's pick). This produces the durable,
-    display-only transcript item so the pick survives reload at the right
-    position (BEFORE the turn's assistant output); the relay also
-    re-publishes a live event carrying the persisted item id so the live
-    chip and a turn-start snapshot refetch dedup by the same id (no
-    double render).
-
-    Returns ``None`` for every other event, and for a malformed routing
-    item (empty model) so a bad frame can't poison the relay.
-
-    :param event: Parsed SSE event dict from the runner stream.
-    :returns: A ``routing_decision`` :class:`NewConversationItem`, or
-        ``None``.
-    """
-    if event.get("type") != "response.output_item.done":
-        return None
-    item = event.get("item")
-    if not isinstance(item, dict) or item.get("type") != "routing_decision":
-        return None
-    try:
-        data = parse_item_data("routing_decision", item)
-    except (ValueError, TypeError):
-        _logger.warning("Failed to parse routing_decision item from SSE")
-        return None
-    # No turn response_id exists yet (emitted before response.in_progress),
-    # so stamp a fresh routing id â€” the chip renders as its own standalone
-    # line at turn start.
-    import uuid
-
-    return NewConversationItem(
-        type="routing_decision",
-        response_id=f"routing_{uuid.uuid4().hex}",
-        data=data,
-    )
-
-
-def _error_item_from_sse(
-    event: dict[str, Any],
-    response_id: str | None = None,
-) -> NewConversationItem | None:
-    """
-    Build a durable ``error`` item from a runner error SSE event.
-
-    The web UI already renders live ``response.error`` and
-    ``response.failed`` error payloads as real error banners. This
-    helper mirrors turn-scoped payloads into conversation history so the
-    banner survives refresh/reconnect.
-
-    A bare ``response.error`` emitted before ``response.in_progress`` is
-    a session/startup signal, not a transcript turn. Leaving it live-only
-    avoids creating an orphan banner at the top of the transcript; when
-    a user sends a message into the failed native terminal, the AP-side
-    fast-fail path records that user item and its sibling error in order.
-
-    :param event: Parsed runner SSE event.
-    :param response_id: Current response id, e.g. ``"resp_abc123"``.
-        ``None`` means no turn is active.
-    :returns: A ``type="error"`` item, or ``None`` when the event has
-        no structured error payload or is not tied to a turn.
-    """
-    evt_type = event.get("type")
-    raw_error: Any
-    source = event.get("source")
-    if evt_type == "response.error":
-        if response_id is None:
-            return None
-        raw_error = event.get("error")
-    elif evt_type == "response.failed":
-        raw_response = event.get("response")
-        raw_error = raw_response.get("error") if isinstance(raw_response, dict) else None
-        if raw_error is None:
-            raw_error = event.get("error")
-        source = event.get("source") or "execution"
-        if response_id is None and isinstance(raw_response, dict):
-            raw_response_id = raw_response.get("id")
-            if isinstance(raw_response_id, str) and raw_response_id:
-                response_id = raw_response_id
-    else:
-        return None
-    if response_id is None:
-        return None
-    if not isinstance(raw_error, dict):
-        return None
-    raw_code = raw_error.get("code")
-    raw_message = raw_error.get("message")
-    if not isinstance(raw_code, str) or not raw_code.strip():
-        return None
-    if not isinstance(raw_message, str) or not raw_message.strip():
-        return None
-    if source not in ("llm", "execution", "tool", "harness"):
-        source = "execution"
-    return NewConversationItem(
-        type="error",
-        response_id=response_id,
-        data=ErrorData(
-            source=source,
-            code=raw_code,
-            message=raw_message,
-        ),
-    )
-
-
-async def _relay_persist_error_once(
-    conversation_store: ConversationStore | None,
-    session_id: str,
-    item: NewConversationItem,
-) -> Literal["persisted", "duplicate", "skipped", "failed"]:
-    """
-    Persist a runner error item unless the same error already exists.
-
-    Native terminal startup can fail again on every runner reconnect.
-    Dedupe by the visible payload ``(source, code, message)`` only
-    when no user message has appeared since the matching error. That
-    suppresses reconnect spam while still recording a new error for a
-    user-initiated retry against the same broken terminal.
-
-    :param conversation_store: Store instance, or ``None`` to skip.
-    :param session_id: Session/conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :param item: The candidate ``type="error"`` item.
-    :returns: ``"persisted"`` if this call appended the item,
-        ``"duplicate"`` if a matching recent error already exists,
-        ``"skipped"`` if no store or non-error item was provided, or
-        ``"failed"`` if the store operation failed.
-    """
-    if conversation_store is None:
-        return "skipped"
-    if not isinstance(item.data, ErrorData):
-        return "skipped"
-    try:
-        recent = await asyncio.to_thread(
-            conversation_store.list_items,
-            session_id,
-            limit=20,
-            order="desc",
-        )
-        for existing in recent.data:
-            if (
-                existing.type == "message"
-                and isinstance(existing.data, MessageData)
-                and existing.data.role == "user"
-            ):
-                break
-            if existing.type != "error" or not isinstance(existing.data, ErrorData):
-                continue
-            if (
-                existing.data.source == item.data.source
-                and existing.data.code == item.data.code
-                and existing.data.message == item.data.message
-            ):
-                return "duplicate"
-        await asyncio.to_thread(
-            conversation_store.append,
-            session_id,
-            [item],
-        )
-        return "persisted"
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Relay error persist failed for session=%s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return "failed"
-
-
-async def _relay_persist(
-    conversation_store: ConversationStore | None,
-    session_id: str,
-    item: NewConversationItem,
-) -> None:
-    """
-    Persist a single conversation item from the relay.
-
-    :param conversation_store: Store instance, or ``None`` to skip.
-    :param session_id: Session/conversation identifier.
-    :param item: The item to persist.
-    """
-    if conversation_store is None:
-        return
-    try:
-        await asyncio.to_thread(
-            conversation_store.append,
-            session_id,
-            [item],
-        )
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Relay persist failed for session=%s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-
-
-async def _relay_response_policy_deny_reason(
-    conversation_store: ConversationStore,
-    session_id: str,
-    text: str,
-) -> str | None:
-    """
-    Evaluate *text* against the session's OUTPUT (RESPONSE) phase policies.
-
-    Runner-relayed (scaffold) harnesses never POST the assistant message
-    back through ``POST /v1/sessions/{id}/events``, so the
-    ``Phase.RESPONSE`` evaluator there is unreachable for them. The relay's
-    terminal text flush is their single persist point, so this evaluates the
-    same output policies over the final assistant text right before it
-    becomes durable â€” making a spec's ``response``-phase policy enforceable
-    in the runner topology.
-
-    Fails OPEN (returns ``None``) on any evaluation error, matching the LLM
-    phases' advisory default: a policy-engine hiccup must not destroy the
-    narration the user already watched.
-
-    :param conversation_store: Store for the conversation/labels lookup.
-    :param session_id: Session/conversation identifier.
-    :param text: The joined assistant text segment about to persist.
-    :returns: The deny reason when an output policy DENYs, else ``None``.
-    """
-    from omnigent.runtime._globals import _agent_store
-
-    if _agent_store is None:
-        # Fail open, but loudly: a mis-initialized runtime would otherwise
-        # silently disable RESPONSE-phase gating for every relayed session.
-        _logger.warning(
-            "Relay: agent store not initialized; skipping RESPONSE-phase "
-            "policy evaluation for session=%s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return None
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None or conv.agent_id is None:
-            return None
-        body = SessionEventInput(
-            type="message",
-            data={
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
-            },
-        )
-        # The relay has no HTTP caller; the acting principal is the
-        # turn-initiating human persisted at forward time (same label the
-        # policy-evaluate route falls back to), so per-user policies gate
-        # on the correct actor.
-        turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
-        verdict = await _evaluate_output_policy(
-            session_id,
-            conv,
-            body,
-            conversation_store,
-            _agent_store,
-            None,
-            actor=_build_actor(turn_actor),
-        )
-    except Exception:  # noqa: BLE001 â€” fail open: output phases are advisory on error
-        _logger.exception(
-            "Relay: RESPONSE-phase policy evaluation failed for session=%s; "
-            "persisting the text unmodified",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return None
-    if verdict is None:
-        return None
-    return str(verdict.get("reason") or "Denied by policy")
-
-
-async def _flush_relay_text(
-    conversation_store: ConversationStore | None,
-    session_id: str,
-    text_acc: list[str],
-    response_id: str | None,
-    model_id: str | None,
-    *,
-    deny_reason: str | None = None,
-    evaluate_response_phase: bool = False,
-) -> None:
-    """
-    Persist buffered assistant text as a message item and clear the buffer.
-
-    Scaffold harnesses (claude-sdk) stream text deltas with no per-message
-    ``output_item.done``, so the relay buffers them. Flushing at each
-    textâ†’function_call boundary (not only at ``response.completed``) keeps
-    the persisted transcript interleaved â€” ``[text, tool, text, tool]`` â€”
-    instead of collapsing a turn's narration into one block after its tool
-    calls (which renders tools-above-text + run-on text on reload).
-
-    After a confirmed persist the item is also published to the live
-    stream as ``response.output_item.done`` (mirroring the native path's
-    :func:`_publish_external_conversation_item`). Live clients already
-    rendered the text from the deltas; the publish delivers the
-    store-assigned item id so they can stamp it onto the streamed block.
-    Without it the rendered block stays id-less and every reconnect's
-    itemId-keyed reconciliation splices the persisted copy in as a
-    duplicate. Clients must dedupe this event by CONTENT, not by
-    open-section state: at a mid-turn tool-call boundary the streamed
-    text has already been closed/committed client-side (by the
-    function_call item or interleaved reasoning) before this publish
-    arrives. The web stamps the id onto the matching streamed
-    ``text_done`` block in place (web ``chatStore.ts``
-    ``pumpStreamEvents``); the TUI consumes a byte-equal committed
-    segment (``_repl.py`` ``_TurnProseTracker``).
-
-    The buffer and the in-flight replay are cleared ONLY after the append
-    is confirmed: clearing first would let a reconnect during the persist
-    ``await`` see neither the (not-yet-committed) message nor the replay,
-    dropping the narration â€” and a swallowed append failure would lose it
-    permanently. On failure the buffers are left intact so the text still
-    replays and is retried at the next flush / ``response.completed``.
-
-    On an OUTPUT-phase DENY the denied text must never become a durable
-    assistant message. Two deny sources feed this (both persist the same
-    ``[Denied by policy: ...]`` sentinel the ``_evaluate_output_policy``
-    route path uses):
-
-    - *deny_reason*: the ``PHASE_LLM_RESPONSE`` DENY the policy-evaluate
-      route recorded for this session's in-flight turn â€” the harness only
-      errors the turn after the text already streamed, so the relay is
-      the last gate before the denied content persists.
-    - *evaluate_response_phase*: evaluate the joined text against the
-      spec's ``Phase.RESPONSE`` policies right here. Runner-relayed
-      harnesses never POST the assistant message back through
-      ``POST .../events``, so this flush is the only place the
-      ``response`` phase can fire in this topology.
-
-    :param conversation_store: Store to append to, or ``None`` to skip
-        persistence (test parsing path).
-    :param session_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :param text_acc: Accumulated delta strings; cleared in place on success.
-    :param response_id: Turn id so the segment groups with its tool calls.
-    :param model_id: Assistant agent label for the message.
-    :param deny_reason: When set, an output policy already denied this
-        turn's assistant text; persist the deny sentinel instead of it.
-    :param evaluate_response_phase: When ``True`` (terminal flush), gate
-        the text through the spec's RESPONSE-phase policies before
-        persisting.
-    """
-    if not text_acc:
-        return
-    text = "".join(text_acc)
-    if not text.strip():
-        # Whitespace-only: nothing worth persisting. Drop it so it neither
-        # accumulates into the next segment nor replays as an empty bubble.
-        text_acc.clear()
-        inflight_text.reset_text(session_id)
-        return
-    if conversation_store is None:
-        text_acc.clear()
-        return
-    if deny_reason is None and evaluate_response_phase:
-        deny_reason = await _relay_response_policy_deny_reason(
-            conversation_store, session_id, text
-        )
-    if deny_reason is not None:
-        # Substitute the sentinel for the denied content â€” same Option-B
-        # shape as the ``_evaluate_output_policy`` route path, so follow-up
-        # turns and the items API see a consistent deny record. Publish the
-        # sentinel delta too: live clients already rendered the denied text
-        # from the stream (that flash is the residual gap full buffering
-        # would close), so without a visible sentinel the deny would only
-        # be discoverable after a reload.
-        text = f"{_DENY_SENTINEL_PREFIX}{deny_reason}]"
-        # Commit the substitution into the retry buffer itself: a failed
-        # persist below leaves ``text_acc`` for the next flush, and that
-        # retry must carry the sentinel, never the denied content. Without
-        # this, a RESPONSE-phase deny would be re-evaluated from scratch on
-        # retry â€” and a stateful policy whose labels moved on the first
-        # DENY could flip to ALLOW and leak the original text.
-        text_acc[:] = [text]
-        _publish_policy_deny(session_id, deny_reason)
-    import uuid
-
-    try:
-        item = NewConversationItem(
-            type="message",
-            response_id=response_id or f"turn_{uuid.uuid4().hex}",
-            data=parse_item_data(
-                "message",
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "agent": model_id or "unknown",
-                    "content": [{"type": "output_text", "text": text}],
-                },
-            ),
-        )
-        persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    except Exception:  # noqa: BLE001
-        # Keep text_acc + the in-flight buffer so the narration isn't lost:
-        # it still replays on reconnect and is retried at the next flush.
-        _logger.exception(
-            "Relay: failed to persist assistant text segment for session=%s",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return
-    # Confirmed persisted â€” now safe to clear. Synchronous (no await before
-    # the next yield), so no reconnect observes the committed message and a
-    # stale replay together.
-    text_acc.clear()
-    inflight_text.reset_text(session_id)
-    # Publish the persisted item so live clients learn its store-assigned
-    # id and stamp it onto the already-rendered streamed text (see the
-    # docstring). Ordered before the boundary item / terminal event the
-    # caller publishes next; clients match it back to the streamed text
-    # by byte-equal content, not by open-section state.
-    done_event = OutputItemDoneEvent(
-        type="response.output_item.done",
-        item=persisted[0].to_api_dict(),
-    )
-    session_stream.publish(session_id, done_event.model_dump())
-
-
-def _agent_provider_family(agent: Agent) -> str | None:
-    """Return the provider family of an agent's harness, or ``None``.
-
-    Loads the agent's spec to read its ``harness_kind`` and maps it to a
-    provider family (``"anthropic"`` / ``"openai"``). Returns ``None`` when
-    the bundle can't be loaded or the harness is unknown â€” callers treat
-    ``None`` as "can't confirm same family".
-
-    :param agent: The agent whose harness family to resolve.
-    :returns: ``"anthropic"`` / ``"openai"``, else ``None``.
-    """
-    from omnigent.onboarding.provider_config import provider_family_for_harness
-
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-            .spec
-        )
-    except Exception:  # noqa: BLE001
-        return None
-    return provider_family_for_harness(spec.executor.harness_kind)
-
-
-def _same_provider_family(*args: Any, **kwargs: Any) -> bool:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._same_provider_family(*args, **kwargs)
-
-
-def _same_provider_family_impl(a: Agent, b: Agent) -> bool:
-    """Return whether two agents share a (known) provider family.
-
-    ``False`` when either family is undeterminable, so a fork that can't
-    confirm both agents speak the same provider resets model settings and
-    skips resuming the source's native session (the runner rebuilds the
-    native transcript from Omnigent items instead).
-
-    :param a: First agent (e.g. the fork source's agent).
-    :param b: Second agent (e.g. the switch target).
-    :returns: ``True`` when both resolve to the same non-``None`` family.
-    """
-    family_a = _agent_provider_family(a)
-    return family_a is not None and family_a == _agent_provider_family(b)
-
-
-def _agent_is_native(*args: Any, **kwargs: Any) -> bool:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._agent_is_native(*args, **kwargs)
-
-
-def _agent_is_native_impl(agent: Agent) -> bool:
-    """Return whether an agent runs a native CLI harness.
-
-    Loads the agent's spec to read its ``harness_kind``. Native targets run
-    a vendor TUI in a terminal (claude-native / codex-native / pi-native /
-    cursor-native). This is broader than "can replay fork history" â€” every
-    native harness except cursor-native carries the session-file-rebuild path;
-    use ``_agent_carries_native_fork_history`` for that narrower gate. Returns
-    ``False`` when the bundle can't be loaded (treated as non-native).
-
-    :param agent: The agent whose harness to classify.
-    :returns: ``True`` for a native CLI harness, else ``False``.
-    """
-    from omnigent.harness_aliases import is_native_harness
-
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-            .spec
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    return is_native_harness(spec.executor.harness_kind)
-
-
-def _agent_carries_native_fork_history(*args: Any, **kwargs: Any) -> bool:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._agent_carries_native_fork_history(*args, **kwargs)
-
-
-def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
-    """Return whether *agent*'s native harness rebuilds a fork's transcript.
-
-    claude-native / codex-native / pi-native each record a resumable native
-    session file that the runner rebuilds from the copied Omnigent items on
-    fork/resume, so a fork bound to one of them carries prior history into the
-    native CLI. Used by both fork and switch-agent. cursor-native is a native
-    CLI but has no resumable session file to rebuild; it carries fork history a
-    different way (a text preamble, fork-only â€” see
-    :func:`_agent_carries_cursor_fork_history`), so stamping
-    ``carry_history_into_native`` for it here would be a false promise. Returns
-    ``False`` when the bundle can't be loaded (treated as non-carrying).
-
-    :param agent: The agent whose harness to classify.
-    :returns: ``True`` only for transcript-rebuild native harnesses.
-    """
-    from omnigent.harness_aliases import canonicalize_harness
-
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-            .spec
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    return canonicalize_harness(spec.executor.harness_kind) in _FORK_HISTORY_NATIVE_HARNESSES
-
-
-def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
-    """Return whether *agent*'s native harness carries FORK history via preamble.
-
-    Cursor's conversation is server-backed and opencode has no history-import
-    API, so neither can seed a local store for a rebuilt resume; instead the
-    runner replays prior turns as a text preamble on the fork (cursor: the
-    first message; opencode: a ``noReply`` context message). Fork-only â€”
-    switch-agent does not call this, so switching into one still launches fresh.
-    Returns ``False`` when the bundle can't be loaded.
-
-    :param agent: The agent whose harness to classify.
-    :returns: ``True`` for the cursor-native / opencode-native harnesses.
-    """
-    from omnigent.harness_aliases import canonicalize_harness
-
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-            .spec
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    return canonicalize_harness(spec.executor.harness_kind) in _CURSOR_FORK_HISTORY_HARNESSES
-
-
-def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
-    """
-    Return native coding-agent metadata for an agent's harness.
-
-    :param agent: The agent whose bundle should be inspected.
-    :returns: Registry metadata for the native TUI harness, or ``None``.
-    """
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-            .spec
-        )
-    except Exception:  # noqa: BLE001
-        return None
-    return native_coding_agent_for_harness(spec.executor.harness_kind)
-
-
-def _presentation_labels_for_agent(*args: Any, **kwargs: Any) -> dict[str, str]:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._presentation_labels_for_agent(*args, **kwargs)
-
-
-def _presentation_labels_for_agent_impl(agent: Agent) -> dict[str, str]:
-    """Return the Web UI presentation labels for an agent's harness.
-
-    A native-CLI agent runs **terminal-first** (the inline terminal is the
-    main view), gated on ``omnigent.ui == "terminal"`` plus the matching
-    ``omnigent.wrapper`` value; an SDK agent runs as plain chat (no such
-    labels). Used by the fork route so a switched clone's UI mode matches
-    the TARGET harness instead of inheriting the source's â€” otherwise an SDK
-    clone of a claude-native session renders a stale interactive terminal.
-
-    :param agent: The agent the fork will bind.
-    :returns: ``{ui: terminal, wrapper: <value>}`` for a native agent, or
-        ``{}`` for an SDK agent / undeterminable family (chat mode).
-    """
-    native_agent = _native_coding_agent_for_agent(agent)
-    return native_agent.presentation_labels if native_agent is not None else {}
-
-
-def _load_agent_spec_for_session(*args: Any, **kwargs: Any) -> AgentSpec | None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._load_agent_spec_for_session(*args, **kwargs)
-
-
-def _load_agent_spec_for_session_impl(
-    conv: Conversation,
-    agent_store: AgentStore,
-) -> AgentSpec | None:
-    # Split from _build_policy_engine_from_spec so the caller can run the
-    # cheap guardrails/default-policy skip check between the two and avoid
-    # paying for engine construction when no policy could fire. Both halves
-    # are blocking DB/IO, so each is run under asyncio.to_thread.
-    if conv.agent_id is None:
-        return None
-    agent = agent_store.get(conv.agent_id)
-    if agent is None:
-        return None
-    agent_cache = cast(AgentCache, get_agent_cache())
-    return agent_cache.load(
-        agent.id,
-        agent.bundle_location,
-        expand_env=agent.session_id is None,
-    ).spec
-
-
-def _build_policy_engine_from_spec(*args: Any, **kwargs: Any) -> PolicyEngine:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._build_policy_engine_from_spec(*args, **kwargs)
-
-
-def _build_policy_engine_from_spec_impl(
-    spec: AgentSpec,
-    session_id: str,
-    conversation_store: ConversationStore,
-    conversation: Conversation | None = None,
-) -> PolicyEngine:
-    """Build an engine for *spec*, reusing a conversation row when held.
-
-    Every caller of this wrapper already loaded the conversation to
-    resolve *spec*; passing it lets the builder skip its own read. Only
-    the row's immutable identity is reused â€” the builder re-derives
-    labels, session_state and model from a fresh read (see
-    :func:`build_policy_engine`).
-    """
-    caps = get_caps()
-    host_connection = (
-        caps.policy_llm_connection_factory() if caps.policy_llm_connection_factory else None
-    )
-    return build_policy_engine(
-        spec=spec,
-        conversation_id=session_id,
-        conversation_store=conversation_store,
-        conversation=conversation,
-        # The spec was resolved from this row's agent binding; the builder
-        # confirms it against its own fresh read and fails closed if a
-        # switch-agent landed in between.
-        expected_agent_id=conversation.agent_id if conversation is not None else None,
-        default_policies=caps.default_policies,
-        policy_store=get_policy_store(),
-        server_llm=caps.llm,
-        host_connection=host_connection,
-    )
-
-
-async def _apply_pending_policy_ask_writes(
-    session_id: str,
-    conv: Conversation,
-    conversation_store: ConversationStore,
-    agent_store: AgentStore,
-    data: dict[str, Any],
-) -> None:
-    """
-    Apply (or drop) policy writes stashed for a relay tool-call ASK.
-
-    Called when an ``approval`` verdict resolves a runner-owned policy
-    elicitation (both approval entry points â€” the ``approval`` event and the
-    resolve URL â€” route here via their callers). On ``accept`` the deciding
-    policy's stashed ``state_updates`` / ``set_labels`` are persisted by a
-    freshly built engine â€” exactly what the native ``_hold_native_ask_gate``
-    path does inline. On any other verdict (decline / cancel / missing) they
-    are dropped (POLICIES.md Â§7.2: a denied ASK leaves no trace). No-op when
-    the elicitation has no stashed writes (the common case â€” most ASKs and
-    all non-policy elicitations).
-
-    :param session_id: Session id that owns the elicitation, e.g.
-        ``"conv_abc123"``.
-    :param conv: The session conversation, for the agent / spec lookup.
-    :param conversation_store: Store the engine persists session state to.
-    :param agent_store: Store for the agent spec lookup.
-    :param data: The approval payload, carrying ``elicitation_id`` and the
-        verdict ``action`` (e.g. ``{"elicitation_id": "elicit_x",
-        "action": "accept"}``).
-    :returns: None.
-    """
-    elicitation_id = data.get("elicitation_id", "")
-    pending = _pending_policy_ask_writes.get(elicitation_id)
-    if pending is None:
-        return
-    if pending.from_mcp:
-        # MCP entries: the retry path (POST /mcp with requestState)
-        # pops and applies the writes itself. Applying here too would
-        # double-apply non-idempotent ops (e.g. INCREMENT state
-        # updates for cost-budget counters). Leave the entry for the
-        # retry path (it owns cleanup), dropping it only on decline.
-        if data.get("action") != "accept":
-            # Declined â€” remove the stashed writes (POLICIES.md Â§7.2:
-            # a denied ASK leaves no trace).
-            _pending_policy_ask_writes.pop(elicitation_id, None)
-        return
-    # Non-MCP relay path: claim the entry atomically (no await between
-    # the get above and this pop, so duplicate verdicts â€” a client
-    # transport retry racing its original POST, or a second client â€”
-    # can never both apply the same non-idempotent writes).
-    pending = _pending_policy_ask_writes.pop(elicitation_id, None)
-    if pending is None:
-        # A concurrent duplicate verdict already claimed the writes.
-        return
-    if data.get("action") != "accept":
-        # Declined â€” the claim already removed the stashed writes
-        # (POLICIES.md Â§7.2: a denied ASK leaves no trace).
-        return
-    # Resolve the agent spec + build the engine off the event loop: the
-    # lookup, cold-cache bundle fetch, and engine construction are all
-    # blocking DB/IO.
-    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-    if spec is None:
-        return
-    try:
-        engine = await asyncio.to_thread(
-            _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-        )
-    except BaseException:
-        # A raise here (e.g. a concurrent agent rebind) must not lose the
-        # approved writes with no retry possible â€” restore the claim.
-        _pending_policy_ask_writes.setdefault(elicitation_id, pending)
-        raise
-    # The label/state writes hit the DB synchronously too â€” keep them
-    # off the loop.
-    if pending.set_labels:
-        await asyncio.to_thread(engine.apply_label_writes, pending.set_labels)
-    if pending.state_updates:
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(engine.apply_state_updates, pending.state_updates)
-
-
-def _build_actor(user_id: str | None) -> dict[str, str] | None:
-    """
-    Build the ``actor`` dict for :class:`EvaluationContext`.
-
-    Returns ``{"run_as": user_id}`` when the authenticated user is
-    known, ``None`` otherwise (tests, legacy callers without auth).
-
-    :param user_id: Authenticated user email from the request,
-        e.g. ``"alice@example.com"``. ``None`` when auth is
-        disabled or the caller is unauthenticated.
-    :returns: Actor dict or ``None``.
-    """
-    if user_id is None:
-        return None
-    return {"run_as": user_id}
-
-
-def _build_evaluation_context(
-    phase: Phase,
-    data: dict[str, Any] | str,
-    event: dict[str, Any],
-    *,
-    actor: dict[str, str] | None = None,
-) -> EvaluationContext:
-    """
-    Build an :class:`EvaluationContext` from a proto-style event dict.
-
-    Maps the proto ``Event.data`` shape to the internal convention:
-
-    - ``TOOL_CALL``: ``content = {"name": name, "arguments": args}``,
-      ``tool_name = name``.
-    - ``TOOL_RESULT``: ``content = {"result": result_str}``,
-      ``tool_name`` from ``request_data.name``,
-      ``request_data`` from the event's ``request_data`` field.
-    - ``REQUEST`` / ``RESPONSE``: ``content = str(data)``.
-
-    :param phase: Internal phase enum.
-    :param data: ``event.data`` dict from the proto request.
-    :param event: Full event dict (for ``request_data``, ``context``).
-    :param actor: Authenticated principal, e.g.
-        ``{"run_as": "alice@example.com"}``. ``None`` when
-        identity is unknown.
-    :returns: Ready-to-evaluate context.
-    """
-    # A native hook may stamp the session's live model into the event context
-    # (e.g. the codex hook reads it from ``config.toml`` at gate time â€” the
-    # source of truth for an in-TUI ``/model`` selection). When present, this
-    # wins over the engine's server-resolved model (see
-    # ``PolicyEngine._inject_model``); ``None`` falls back to that resolution.
-    raw_context_value = event.get("context")
-    raw_context = raw_context_value if isinstance(raw_context_value, dict) else {}
-    supplied_model = raw_context.get("model")
-    hook_model = supplied_model if isinstance(supplied_model, str) and supplied_model else None
-    # The harness, when a native hook stamped it (e.g. the codex hook), so
-    # policies can tailor messages to the session's model-switch surface
-    # (codex-native is terminal-only). Carried through unchanged â€” the engine
-    # neither resolves nor overrides it.
-    supplied_harness = raw_context.get("harness")
-    hook_harness = (
-        supplied_harness if isinstance(supplied_harness, str) and supplied_harness else None
-    )
-    structured_data = data if isinstance(data, dict) else {}
-    if phase == Phase.TOOL_CALL:
-        raw_tool_name = structured_data.get("name")
-        tool_name = raw_tool_name if isinstance(raw_tool_name, str) else ""
-        raw_args = structured_data.get("arguments")
-        args = raw_args if isinstance(raw_args, dict) else {}
-        return EvaluationContext(
-            phase=phase,
-            content={"name": tool_name, "arguments": args},
-            tool_name=tool_name or None,
-            actor=actor,
-            model=hook_model,
-            harness=hook_harness,
-        )
-    if phase == Phase.TOOL_RESULT:
-        tool_result = structured_data.get("result", "")
-        raw_request_data = event.get("request_data")
-        request_data = raw_request_data if isinstance(raw_request_data, dict) else None
-        result_tool_name = None
-        if request_data is not None:
-            raw_tool_name = request_data.get("name")
-            result_tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
-        return EvaluationContext(
-            phase=phase,
-            content={
-                "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
-            },
-            tool_name=result_tool_name,
-            request_data=request_data,
-            actor=actor,
-            model=hook_model,
-            harness=hook_harness,
-        )
-    # LLM_REQUEST / LLM_RESPONSE â€” content is the full request/response dict.
-    if phase in (Phase.LLM_REQUEST, Phase.LLM_RESPONSE):
-        return EvaluationContext(
-            phase=phase,
-            content=data,
-            actor=actor,
-            model=hook_model,
-            harness=hook_harness,
-        )
-    # REQUEST / RESPONSE â€” content is the user/assistant text. The wire ``data``
-    # is a dict for every current first-party producer (``{"text"|"content":
-    # ...}``, including OpenCode's plugin, which sends ``{"text": ...}``), but
-    # a bare string is still accepted for ``PHASE_REQUEST`` for compatibility
-    # with older or third-party callers that send the prompt text directly.
-    # Accept both, and NEVER raise here: a crash 500s the evaluate endpoint,
-    # which silently fails the request/result gate OPEN (the exact symptom
-    # that let cost-over-budget terminal prompts through).
-    if isinstance(data, str):
-        text = data
-    elif isinstance(data, dict):
-        text = data.get("text") or data.get("content") or str(data)
-    else:
-        text = str(data)
-    text_str = text if isinstance(text, str) else json.dumps(text)
-    # REQUEST content is the structured dict ({"user_content", "attachments"}) so
-    # every request reaches policies in one shape, whatever the entry point. This
-    # native/terminal path carries no uploads, so ``attachments`` is always empty;
-    # the web input gate (_evaluate_input_policy) is what populates it. RESPONSE
-    # stays a plain string â€” attachments are an input-only concern.
-    request_or_response_content: Any = (
-        {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
-    )
-    return EvaluationContext(
-        phase=phase,
-        content=request_or_response_content,
-        actor=actor,
-        model=hook_model,
-        harness=hook_harness,
-    )
-
-
-def _extract_user_text_from_event(body: SessionEventInput) -> str:
-    """
-    Extract concatenated text from a user message event body.
-
-    Mirrors the logic in ``workflow._extract_user_text`` but
-    operates on the raw ``SessionEventInput.data`` dict rather
-    than a parsed ``MessageData`` object.
-
-    :param body: The validated ``message`` event with
-        ``role: "user"``.
-    :returns: Joined text from ``input_text`` / ``text`` content
-        blocks. Empty string if no text blocks found.
-    """
-    content = body.data.get("content") or []
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict):
-            text = block.get("text") or block.get("input_text")
-            if isinstance(text, str):
-                parts.append(text)
-    return "\n".join(parts)
-
-
-def _publish_policy_deny(session_id: str, reason: str) -> None:
-    """
-    Publish the ``[Denied by policy: ...]`` sentinel on the session stream.
-
-    The sentinel text is a load-bearing contract (the REPL renders it, e2e
-    tests assert it, and native harnesses relay it to the model), so it is
-    always carried in a ``response.output_text.delta``.
-
-    Input DENY callers also persist the same sentinel as an assistant
-    conversation item. This stream publish remains separate so live clients
-    still get immediate feedback before the handler returns. Stamping a unique
-    ``message_id`` (matching how live streaming text is tagged) routes the
-    delta through the web's live-preview path, where it folds into a single
-    ``live:<id>`` block rather than a response-scoped stray bubble.
-
-    Safe for the other consumers: the REPL converts any ``output_text.delta``
-    to a ``TextDelta`` regardless of ``message_id``; the ``/v1/responses`` API
-    surfaces the deny via input-deny synthesis (not session-stream deltas);
-    and the only ``message_id``-gated accumulator (``_relay_runner_stream``)
-    reads runner-relayed deltas, never this server-published one.
-
-    :param session_id: Session/conversation identifier.
-    :param reason: Human-readable deny reason from the policy verdict.
-    """
-    session_stream.publish(
-        session_id,
-        {
-            "type": "response.output_text.delta",
-            "delta": f"[Denied by policy: {reason}]",
-            # Unique per deny so two separate denials don't fold into one
-            # block; a single delta carries the whole sentinel, so index 0.
-            "message_id": f"deny_{secrets.token_hex(8)}",
-            "index": 0,
-        },
-    )
-
-
-def _publish_input_deny_terminal(session_id: str, conv: Conversation, reason: str) -> None:
-    """
-    Publish a terminal ``response.completed`` for an INPUT-phase DENY.
-
-    The short-circuit never forwards to a runner, so no runner-relayed
-    terminal ``response.*`` event is emitted. SSE consumers that drive a
-    turn off the live-tail (the headless ``-p`` client,
-    :class:`omnigent_client.SessionsChat.send`) iterate until a
-    turn-terminal event arrives and would otherwise block forever. The
-    output carries the same sentinel text so the terminal-snapshot fallback
-    also surfaces the deny.
-
-    :param session_id: Session/conversation identifier.
-    :param conv: Conversation whose agent/model name tags the response.
-    :param reason: Human-readable deny reason from the policy verdict.
-    """
-    sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
-    response = ResponseObject(
-        id=f"deny_{secrets.token_hex(8)}",
-        status="completed",
-        model=conv.agent_id or "policy",
-        created_at=int(time.time()),
-        completed_at=int(time.time()),
-        output=[
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": sentinel}],
-            }
-        ],
-    )
-    session_stream.publish(
-        session_id,
-        CompletedEvent(type="response.completed", response=response).model_dump(exclude_none=True),
-    )
-
-
-async def _persist_policy_deny_sentinel(
-    session_id: str,
-    conv: Conversation,
-    reason: str,
-    conversation_store: ConversationStore,
-    agent_store: AgentStore,
-) -> None:
-    """
-    Persist the ``[Denied by policy: ...]`` sentinel as assistant history.
-
-    INPUT policy DENY returns synchronously and never forwards the user turn
-    to a runner, so no downstream stream relay can append the assistant-side
-    deny marker. Persisting the same assistant message shape used by OUTPUT
-    policy DENY keeps follow-up turns and the items API consistent with the
-    streamed deny users already see.
-
-    After persisting, publish the committed item as a
-    ``response.output_item.done`` â€” the same commit event a streamed
-    assistant message emits (see :func:`_flush_relay_text`). Without it the
-    live deny only exists as the ``_publish_policy_deny`` sentinel delta,
-    which the web folds into a provisional ``live:`` preview block that the
-    terminal ``response.completed`` sweeps; the deny then reappeared only
-    after a refresh re-hydrated the persisted item. Emitting the commit event
-    lets the web reconcile the preview into a durable, itemId-keyed block that
-    survives the sweep, a reconnect, and a refresh alike.
-
-    :param session_id: Session/conversation identifier.
-    :param conv: Conversation whose agent/model name tags the message.
-    :param reason: Human-readable deny reason from the policy verdict.
-    :param conversation_store: Store for item persistence.
-    :param agent_store: Store used to resolve the agent's display name.
-    """
-    import uuid
-
-    sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
-    agent = agent_store.get(conv.agent_id) if conv.agent_id else None
-    agent_name = agent.name if agent is not None else conv.agent_id or "policy"
-    item = NewConversationItem(
-        type="message",
-        response_id=f"deny_{uuid.uuid4().hex}",
-        data=parse_item_data(
-            "message",
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": sentinel}],
-                "agent": agent_name,
-            },
-        ),
-    )
-    persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    if persisted:
-        done_event = OutputItemDoneEvent(
-            type="response.output_item.done",
-            item=persisted[0].to_api_dict(),
-        )
-        session_stream.publish(session_id, done_event.model_dump())
-
-
-def _extract_assistant_text_from_event(body: SessionEventInput) -> str:
-    """
-    Extract concatenated text from an assistant message event.
-
-    Mirrors :func:`_extract_user_text_from_event` but for
-    assistant messages. Content blocks use ``"text"`` (not
-    ``"input_text"``).
-
-    :param body: The validated ``message`` event with
-        ``role: "assistant"``.
-    :returns: Joined text from content blocks. Empty string if
-        no text blocks found.
-    """
-    content = body.data.get("content") or []
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict):
-            text = block.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-    return "\n".join(parts)
-
-
-def _replace_text_in_message_body(
-    body: SessionEventInput,
-    replacement: str,
-) -> SessionEventInput:
-    """
-    Return a copy of the message body with all text content
-    blocks replaced by *replacement*.
-
-    Used by OUTPUT policy DENY to substitute the deny sentinel
-    into the persisted message while preserving non-text content
-    blocks (images, etc.) and all other body fields.
-
-    :param body: The original assistant message event.
-    :param replacement: The deny sentinel text,
-        e.g. ``"[Denied by policy: harmful content]"``.
-    :returns: A new body with text blocks replaced.
-    """
-    content = body.data.get("content") or []
-    new_content: list[dict[str, Any]] = []
-    replaced = False
-    for block in content:
-        if isinstance(block, dict) and "text" in block:
-            if not replaced:
-                new_content.append({"type": "output_text", "text": replacement})
-                replaced = True
-        else:
-            new_content.append(block)
-    if not replaced:
-        new_content.append({"type": "output_text", "text": replacement})
-    new_data = {**body.data, "content": new_content}
-    return type(body)(type=body.type, data=new_data)
-
-
-async def _evaluate_output_policy(
-    session_id: str,
-    conv: Conversation,
-    body: SessionEventInput,
-    conversation_store: ConversationStore,
-    agent_store: AgentStore,
-    _runner_router: RunnerRouter | None,
-    *,
-    actor: dict[str, str] | None = None,
-) -> dict[str, Any] | None:
-    """
-    Evaluate an assistant message against OUTPUT phase policies.
-
-    Pure evaluation â€” does NOT persist the event. Returns
-    ``None`` on ALLOW. On DENY, returns a verdict dict with
-    ``_denied_body`` â€” the caller should persist this modified
-    body (text replaced with deny sentinel) instead of the
-    original.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param conv: The session's :class:`Conversation` entity.
-    :param body: The validated ``message`` event.
-    :param conversation_store: Store for label state.
-    :param agent_store: Store for agent spec lookups.
-    :param runner_router: Unused, kept for signature
-        consistency.
-    :param actor: Authenticated principal, e.g.
-        ``{"run_as": "alice@example.com"}``. ``None`` when
-        identity is unknown.
-    :returns: ``None`` on ALLOW (fall through). Verdict dict
-        with ``_denied_body`` on DENY.
-    """
-
-    assistant_text = _extract_assistant_text_from_event(body)
-    if not assistant_text:
-        return None
-
-    # Resolve the agent spec off the event loop (blocking DB + cold-cache
-    # bundle fetch). Spec only, so the cheap skip check below runs before
-    # the more expensive engine build.
-    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-    if spec is None:
-        return None
-    if not spec.guardrails and not get_caps().default_policies and get_policy_store() is None:
-        return None
-
-    engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-    )
-    ctx = EvaluationContext(
-        phase=Phase.RESPONSE,
-        content=assistant_text,
-        tool_name=None,
-        actor=actor,
-    )
-    result = await engine.evaluate(ctx)
-
-    if result.action == PolicyAction.ALLOW:
-        if result.set_labels:
-            await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
-        return None
-
-    # DENY â€” build the denied body with sentinel text.
-    # The caller persists this modified body instead of the
-    # original (Option B).
-    if result.set_labels:
-        await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
-    reason = result.reason or "Denied by policy"
-    sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
-    denied_body = _replace_text_in_message_body(body, sentinel)
-    return {
-        "verdict": "deny",
-        "reason": reason,
-        "_denied_body": denied_body,
-    }
-
-
-async def _stream_live_events(
-    request: Request,
-    session_id: str,
-    on_subscribed: Callable[[], Awaitable[Iterable[dict[str, Any]]]] | None = None,
-    viewer_user_id: str | None = None,
-    viewer_idle: bool = False,
-    presence_root_id: str | None = None,
-) -> AsyncIterator[str]:
-    """
-    Yield SSE-formatted events from the conversation's live stream.
-
-    Events are delivered live from the moment :func:`session_stream.subscribe`
-    is invoked forward â€” there is no buffer and no replay. Events
-    published before this generator subscribed are lost; clients
-    reconcile pre-subscribe state via the snapshot endpoint
-    (``GET /v1/sessions/{id}``) and dedupe by item id.
-
-    On normal completion (subscribe ends or the disconnect check
-    breaks the loop) this generator emits a ``[DONE]`` sentinel so
-    well-behaved SSE consumers see a clean stream termination. A
-    subscriber-queue overflow instead ends without ``[DONE]`` so clients
-    treat it as a dropped transport, reconnect, and reconcile from the
-    persisted snapshot.
-
-    ``finally`` is cleanup-only (presence deregistration): yielding
-    from ``finally`` during client ``aclose`` / ``GeneratorExit``
-    raises ``RuntimeError: async generator ignored GeneratorExit``.
-    The subscribe iterator is wrapped in ``contextlib.aclosing`` so
-    outer ``aclose`` tears down the pub-sub subscriber slot
-    immediately (a bare ``async for`` would defer that to GC).
-
-    Each emitted dict is validated against
-    :data:`ServerStreamEvent` at the wire boundary so a runtime
-    that publishes an unmodelled ``type`` fails loud rather than
-    serializing an unknown event verbatim.
-
-    The subscribe call passes a ``ready_event`` heartbeat plus
-    ``heartbeat_interval_s``. The ready heartbeat is yielded
-    immediately after the live-tail subscriber slot is registered,
-    before any snapshot hook runs, so clients can wait for a
-    concrete subscription acknowledgment before posting a fast
-    one-shot turn. The interval heartbeat keeps an idle stream
-    emitting ``session.heartbeat`` events on a fixed cadence (see
-    :data:`_SESSION_STREAM_HEARTBEAT_INTERVAL_S`). Without that,
-    a stream that sits between turns has nothing crossing the wire;
-    the client's SSE read-timeout and this route's
-    ``request.is_disconnected()`` check (only polled on event
-    arrival) both lag for minutes after a half-open socket forms
-    (e.g. after a laptop sleep). The heartbeat gives both sides a
-    regular byte to fire against.
-
-    :param request: The FastAPI request, used to detect disconnect.
-    :param session_id: Session/conversation identifier whose stream
-        to subscribe to, e.g. ``"conv_abc123"``.
-    :param on_subscribed: Optional snapshot-on-connect hook forwarded to
-        :func:`session_stream.subscribe`; its events are yielded ahead of
-        the live tail so a fresh client sees current resource state
-        without polling. ``None`` (default) keeps the pure live-tail
-        shape used by callers that reconcile via the snapshot endpoint.
-    :param viewer_user_id: Authenticated identity to register in the
-        session's presence registry for this stream's lifetime, e.g.
-        ``"alice@example.com"``. ``None`` (default, and the reserved
-        single-user sentinel mapped via ``attribution_user``) skips
-        presence tracking entirely.
-    :param viewer_idle: The viewer's connect-time idle flag (tab
-        backgrounded), from the route's ``idle`` query param. Ignored
-        when *viewer_user_id* is ``None``.
-    :param presence_root_id: Root conversation of the streamed
-        session's tree (its ``root_conversation_id``), e.g.
-        ``"conv_root123"``. Presence is scoped to the tree's root so
-        viewers of different agents/sub-agents in one session see
-        each other. Required when *viewer_user_id* is set; ignored
-        otherwise.
-    :returns: An async iterator of SSE message strings.
-    :raises ValueError: If *viewer_user_id* is set without
-        *presence_root_id* â€” a per-conversation presence scope would
-        silently split a session's viewers per agent.
-    """
-    # Presence registers before the subscribe loop: the join broadcast
-    # fans out to ALREADY-subscribed co-viewers, while this stream
-    # learns the full list (self included) from the snapshot-on-connect
-    # presence event â€” full-state events make that ordering race benign.
-    presence_token: str | None = None
-    if viewer_user_id is not None:
-        if presence_root_id is None:
-            raise ValueError("presence_root_id is required when viewer_user_id is set")
-        presence_token = presence.connect(
-            presence_root_id, session_id, viewer_user_id, viewer_idle
-        )
-    try:
-        # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
-        # a bare ``async for`` would leave the subscriber slot until GC.
-        async with contextlib.aclosing(
-            session_stream.subscribe(
-                session_id,
-                heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
-                ready_event={"type": "session.heartbeat"},
-                # In-flight text replay must be captured synchronously at slot
-                # registration (before ``ready_event`` suspends), not in the
-                # async ``on_subscribed`` hook, or window deltas double-render.
-                # Resource state stays in ``on_subscribed`` â€” it needs
-                # awaits and is not dedup-sensitive.
-                pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
-                on_subscribed=on_subscribed,
-            )
-        ) as live_events:
-            async for event in live_events:
-                if await request.is_disconnected():
-                    break
-                event_type = event.get("type")
-                if not isinstance(event_type, str):
-                    raise ValueError(
-                        f"session stream event missing string ``type`` field: {event!r}",
-                    )
-                validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
-                yield _format_sse(event_type, validated.model_dump())
-    except session_stream.SubscriberOverflowError:
-        _logger.warning(
-            "session stream subscriber overflowed for %s; closing for snapshot reconnect",
-            session_id,
-            extra={"session_id": session_id},
-        )
-    else:
-        # Normal completion only â€” never yield from ``finally`` (aclose /
-        # GeneratorExit would raise ``async generator ignored GeneratorExit``).
-        yield "data: [DONE]\n\n"
-    finally:
-        # The non-None checks besides presence_token's are type
-        # narrowing only: a minted token implies both were set above.
-        if (
-            presence_token is not None
-            and viewer_user_id is not None
-            and presence_root_id is not None
-        ):
-            presence.disconnect(presence_root_id, viewer_user_id, presence_token)
-
-
-def _validate_terminal_launch_args(value: list[str] | None) -> list[str] | None:
-    """
-    Validate per-session native-terminal pass-through args.
-
-    Enforces a flat list of strings within bounded count / length.
-    The flat-list shape is the security boundary: there is no key for
-    a caller to smuggle internal launch wiring (bridge dir, Omnigent URL,
-    auth) through â€” those stay runner-owned (see
-    designs/NATIVE_RUNNER_SERVER_LAUNCH.md).
-
-    :param value: The candidate args, e.g.
-        ``["--dangerously-skip-permissions"]``, or ``None`` to leave
-        unset / unchanged.
-    :returns: The validated list unchanged, or ``None`` when *value*
-        is ``None``.
-    :raises ValueError: If *value* is not a list of strings, exceeds
-        :data:`_MAX_TERMINAL_LAUNCH_ARGS` entries, or any entry
-        exceeds :data:`_MAX_TERMINAL_LAUNCH_ARG_LEN` characters.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, list) or not all(isinstance(arg, str) for arg in value):
-        raise ValueError("terminal_launch_args must be a list of strings")
-    if len(value) > _MAX_TERMINAL_LAUNCH_ARGS:
-        raise ValueError(f"terminal_launch_args exceeds {_MAX_TERMINAL_LAUNCH_ARGS} entries")
-    for arg in value:
-        if len(arg) > _MAX_TERMINAL_LAUNCH_ARG_LEN:
-            raise ValueError(
-                f"terminal_launch_args entry exceeds {_MAX_TERMINAL_LAUNCH_ARG_LEN} characters"
-            )
-    return value
-
-
-def _validated_cost_control_mode_override(value: str | None) -> str | None:
-    """
-    Validate a caller-supplied per-session cost-control switch.
-
-    :param value: The candidate value, e.g. ``"on"``, or ``None``
-        when the caller did not set / wants to clear the override.
-    :returns: The value unchanged when valid, or ``None``.
-    :raises OmnigentError: 400 (``invalid_input``) when *value* is
-        anything other than ``"on"``, ``"off"``, or ``None``.
-    """
-    if value is None or value in COST_CONTROL_OVERRIDE_VALUES:
-        return value
-    raise OmnigentError(
-        f"invalid cost_control_mode_override: {value!r} (expected 'on', 'off', or null to clear)",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
-def _validated_subagent_routing_override(value: str | None) -> str | None:
-    """
-    Validate a caller-supplied per-session subagent-routing switch.
-
-    Two-state: ``"on"`` routes subagent spawns and ``"off"`` / unset both
-    read as Default. ``None`` from a PATCH clears the stored value, which
-    lands the session on Default rather than inheriting anything.
-
-    :param value: The candidate value, e.g. ``"on"``, or ``None`` when
-        the caller did not set / wants to clear the override.
-    :returns: The value unchanged when valid, or ``None``.
-    :raises OmnigentError: 400 (``invalid_input``) when *value* is
-        anything other than ``"on"``, ``"off"``, or ``None``.
-    """
-    if value is None or value in SUBAGENT_ROUTING_OVERRIDE_VALUES:
-        return value
-    raise OmnigentError(
-        f"invalid subagent_routing_override: {value!r} (expected 'on', 'off', or null to clear)",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
-def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
-    """
-    Parse the JSON metadata part from bundled session creation.
-
-    :param metadata: Raw JSON string from the multipart form,
-        e.g. ``{"title": "debug auth flow"}``.
-    :returns: Validated :class:`SessionCreateMetadata`.
-    :raises OmnigentError: If the JSON fails the request schema.
-    """
-    try:
-        parsed = SessionCreateMetadata.model_validate_json(metadata)
-        reasoning_effort = validate_effort(
-            parsed.reasoning_effort,
-            "session metadata",
-            EFFORT_VALUES,
-        )
-        model_override = (
-            validate_model_override(parsed.model_override)
-            if parsed.model_override is not None
-            else None
-        )
-        # Bounds-check the native-terminal args; raises ValueError
-        # (wrapped below) on a malformed or oversized list.
-        _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(
-            update={
-                "reasoning_effort": reasoning_effort,
-                "model_override": model_override,
-            }
-        )
-    except (ValidationError, ValueError) as exc:
-        raise OmnigentError(
-            f"invalid session metadata: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
-
-
-def _multipart_missing_detail(field: str) -> dict[str, Any]:
-    """
-    Build a FastAPI-style missing multipart field error.
-
-    :param field: Missing form field name, e.g. ``"bundle"``.
-    :returns: A validation-detail dict for HTTP 422 responses.
-    """
-    return {
-        "type": "missing",
-        "loc": ["body", field],
-        "msg": "Field required",
-        "input": None,
-    }
-
-
-def _require_host_conn_for_worktree(host_id: str | None, request: Request) -> HostConnection:
-    """
-    Resolve the live host connection for a worktree operation.
-
-    :param host_id: Target host id from the session request, e.g.
-        ``"host_a1b2c3d4..."``. ``None`` is rejected â€” git worktree
-        creation requires a host (the server has no filesystem).
-    :param request: FastAPI request carrying ``app.state.host_registry``.
-    :returns: The live :class:`HostConnection` for ``host_id``.
-    :raises OmnigentError: ``invalid_input`` when ``host_id`` is
-        ``None``; ``internal_error`` when no host registry is
-        configured; ``conflict`` when the host is offline.
-    """
-    if host_id is None:
-        raise OmnigentError(
-            "git worktree creation requires host_id",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    host_registry = cast(HostRegistry | None, getattr(request.app.state, "host_registry", None))
-    if host_registry is None:
-        # Server misconfiguration, not bad client input â€” mirror
-        # _validate_session_workspace, which also returns internal_error.
-        raise OmnigentError(
-            "host registry is not configured; cannot create a worktree",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-    host_conn = host_registry.get(host_id)
-    if host_conn is None:
-        raise OmnigentError(
-            f"host {host_id!r} is offline; reconnect the host and try again",
-            code=ErrorCode.CONFLICT,
-        )
-    return host_conn
-
-
-async def _create_session_worktree(
-    *,
-    host_id: str | None,
-    source_repo: str | None,
-    git: SessionGitOptions,
-    request: Request,
-) -> CreatedWorktree:
-    """
-    Create a git worktree on the host for a new session branch.
-
-    Validates the branch name server-side (the host re-validates), then
-    proxies ``host.create_worktree``. The returned worktree path
-    becomes the session ``workspace``. See
-    designs/SESSION_GIT_WORKTREE.md.
-
-    :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
-        Required (worktree creation needs a host).
-    :param source_repo: Canonical path of the picked source repo (the
-        boundary-validated workspace), e.g. ``"/Users/alice/myrepo"``.
-        ``None`` is a programming error and fails loud.
-    :param git: Validated git options (``branch_name``, optional
-        ``base_branch``).
-    :param request: FastAPI request carrying the host registry.
-    :returns: The created worktree's ``worktree_path`` (to store as
-        ``workspace``) and ``branch`` (to store as ``git_branch``).
-    :raises OmnigentError: ``invalid_input`` for a bad branch name,
-        missing source repo, or a host-reported git failure (duplicate
-        branch, bad base ref, not a repo); ``conflict`` when the host is
-        offline or unresponsive; ``internal_error`` when no host registry
-        is configured.
-    """
-    from omnigent.host.git_worktree import WorktreeError, validate_branch_name
-    from omnigent.server.routes._host_worktree import (
-        WorktreeHostUnavailableError,
-        WorktreeProxyError,
-        create_worktree_on_host,
-    )
-
-    if source_repo is None:  # pragma: no cover â€” host_id guarantees a workspace
-        raise OmnigentError(
-            "git worktree creation requires a source repository workspace",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    try:
-        validate_branch_name(git.branch_name)
-    except WorktreeError as exc:
-        raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
-
-    host_conn = _require_host_conn_for_worktree(host_id, request)
-    host_registry = request.app.state.host_registry
-    try:
-        return await create_worktree_on_host(
-            host_registry=host_registry,
-            host_conn=host_conn,
-            repo_path=source_repo,
-            branch_name=git.branch_name,
-            base_branch=git.base_branch,
-            existing_branch=git.existing_branch,
-        )
-    except WorktreeHostUnavailableError as exc:
-        # Host offline / unresponsive â€” infra, not user input.
-        raise OmnigentError(exc.message, code=ErrorCode.CONFLICT) from exc
-    except WorktreeProxyError as exc:
-        # Host-reported git failure (dup branch, bad base, not a repo) â€”
-        # user-correctable input.
-        raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
-
-
-# Opt-in ``?delete_branch=true`` cannot reach git when the host tunnel
-# is down (users typically see this as ``runner_online: false``). Refuse
-# the delete instead of 404'ing or silently skipping cleanup.
-_DELETE_WORKTREE_OFFLINE_MESSAGE = (
-    "Cannot delete worktree â€” runner offline. "
-    "Delete session only (delete_branch=false) or wait for the runner to reconnect."
-)
-
-
-async def _remove_session_worktree_best_effort(
-    *,
-    host_id: str,
-    worktree_path: str,
-    branch: str,
-    delete_branch: bool,
-    request: Request,
-    reason: str,
-    conversation_store: ConversationStore | None = None,
-    exclude_conversation_id: str | None = None,
-    fail_if_unavailable: bool = False,
-) -> None:
-    """
-    Best-effort removal of a session's git worktree.
-
-    Used for create-rollback (orphan cleanup) and opt-in session-delete
-    cleanup. Host-reported git failures are logged so the caller's
-    primary operation still completes. When ``fail_if_unavailable`` is
-    set, an unreachable host raises ``CONFLICT`` instead of skipping â€”
-    the session is left in place so the caller can retry without
-    worktree cleanup.
-
-    :param host_id: Host that owns the worktree, e.g.
-        ``"host_a1b2c3d4..."``.
-    :param worktree_path: Absolute worktree directory to remove on the
-        host, e.g. ``"/Users/alice/myrepo-worktrees/feature-login"``.
-    :param branch: Branch checked out in the worktree, e.g.
-        ``"feature/login"``.
-    :param delete_branch: When ``True``, also run ``git branch -D``
-        after removing the worktree directory.
-    :param request: FastAPI request carrying the host registry.
-    :param reason: Short label for log lines, e.g.
-        ``"create-rollback"`` or ``"session-delete"``.
-    :param conversation_store: Store used to check whether another live
-        session shares this directory. ``None`` skips the check â€” correct
-        for create-rollback, whose worktree was made moments ago in the
-        same request and cannot be referenced by anything else.
-    :param exclude_conversation_id: The conversation whose delete triggered
-        this removal, excluded from that check. Required with
-        *conversation_store*.
-    :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
-        host cannot be reached to run git. Create-rollback leaves this
-        ``False`` so a failed create still surfaces its original error.
-    """
-    from omnigent.server.routes._host_worktree import (
-        WorktreeHostUnavailableError,
-        WorktreeProxyError,
-        remove_worktree_on_host,
-    )
-
-    # A fork reusing the source's directory, or several sessions attached to
-    # one existing worktree, all run in the same cwd. Removing it under them
-    # leaves their runners on a deleted directory, so leave a shared worktree
-    # alone and let the last session out clean it up. Checked before host
-    # reachability so an offline host does not 409 a delete that would not
-    # have touched the directory anyway.
-    if conversation_store is not None and exclude_conversation_id is not None:
-        shared = await asyncio.to_thread(
-            conversation_store.has_other_live_session_in_workspace,
-            host_id=host_id,
-            workspace=worktree_path,
-            exclude_conversation_id=exclude_conversation_id,
-        )
-        if shared:
-            _logger.info(
-                "Keeping worktree %s (%s): another live session still runs there",
-                worktree_path,
-                reason,
-            )
-            return
-
-    host_registry = getattr(request.app.state, "host_registry", None)
-    if host_registry is None:
-        if fail_if_unavailable:
-            raise OmnigentError(
-                "host registry is not configured; cannot delete a worktree",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        return
-    host_conn = host_registry.get(host_id)
-    if host_conn is None:
-        if fail_if_unavailable:
-            raise OmnigentError(
-                _DELETE_WORKTREE_OFFLINE_MESSAGE,
-                code=ErrorCode.CONFLICT,
-            )
-        _logger.warning(
-            "Skipping worktree removal (%s) for %s: host %s offline",
-            reason,
-            worktree_path,
-            host_id,
-        )
-        return
-    try:
-        await remove_worktree_on_host(
-            host_registry=host_registry,
-            host_conn=host_conn,
-            worktree_path=worktree_path,
-            branch=branch,
-            delete_branch=delete_branch,
-        )
-    except WorktreeHostUnavailableError as exc:
-        if fail_if_unavailable:
-            raise OmnigentError(
-                _DELETE_WORKTREE_OFFLINE_MESSAGE,
-                code=ErrorCode.CONFLICT,
-            ) from exc
-        _logger.warning(
-            "Best-effort worktree removal (%s) failed for %s: host %s unavailable",
-            reason,
-            worktree_path,
-            host_id,
-        )
-    except WorktreeProxyError:
-        _logger.warning(
-            "Best-effort worktree removal (%s) failed for %s",
-            reason,
-            worktree_path,
-            exc_info=True,
-        )
-
-
-def _resolve_subagent_spec(
-    *,
-    agent: Agent,
-    sub_agent_name: str,
-    agent_cache: AgentCache | None,
-) -> AgentSpec | None:
-    """
-    Load the parent bundle and resolve a child sub-agent's trusted spec.
-
-    This is the single trusted source for any per-sub-agent launch wiring
-    the server derives at create time (terminal-first labels, YOLO
-    pass-through args). The spec comes from the server-loaded parent
-    bundle â€” never from caller-supplied request fields â€” so a caller
-    cannot smuggle in launch config a sub-agent's own bundle did not
-    declare.
-
-    :param agent: The parent agent row, e.g. the ``polly`` orchestrator,
-        whose bundle contains the sub-agent specs.
-    :param sub_agent_name: The dispatched sub-agent's name, e.g.
-        ``"claude_code"``.
-    :param agent_cache: Cache for loading the parsed parent bundle. ``None``
-        disables resolution (returns ``None``).
-    :returns: The matching child :class:`AgentSpec`, or ``None`` when the
-        cache is absent, the bundle fails to load, or no sub-agent matches.
-    """
-    if agent_cache is None:
-        return None
-    from omnigent.runtime.workflow import _find_spec_by_name
-
-    try:
-        parent_spec = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        ).spec
-    except Exception:  # noqa: BLE001
-        # A bundle that fails to load here must not break session
-        # creation; the session still works, just without the
-        # derived labels / launch args.
-        _logger.warning(
-            "Could not load bundle for agent %s to resolve sub-agent %r spec",
-            agent.id,
-            sub_agent_name,
-            exc_info=True,
-        )
-        return None
-    return _find_spec_by_name(parent_spec, sub_agent_name)
-
-
-def _require_declared_subagent(
-    *,
-    agent: Agent,
-    sub_agent_name: str,
-    agent_cache: AgentCache | None,
-) -> None:
-    """
-    Reject a ``sub_agent_name`` the parent's spec does not declare.
-
-    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and no
-    downstream spec-swap site rejects an unresolvable one: each warns and
-    runs the session against the PARENT spec instead. An undeclared name
-    would therefore be stored once and answered by the parent for the
-    session's whole life, with a warning as the only sign. This gate rejects
-    it up front, before any row is persisted, mirroring normal dispatch
-    (``tool_dispatch`` rejects an undeclared ``agent``) and the
-    ``AGENTSPEC.md`` contract that unlisted names are rejected.
-
-    It narrows, but does not bound, what can reach the downstream fallback.
-    The check runs only when the bundle LOADS and the name is positively
-    absent: with no agent cache, or on any load failure, it returns without
-    adjudicating, so a never-declared name still reaches a swap site by
-    either route. What the gate guarantees is one direction only â€” a name
-    this check REJECTED never gets persisted.
-
-    :param agent: The parent agent row whose bundle declares the
-        sub-agents.
-    :param sub_agent_name: The requested sub-agent name to validate.
-    :param agent_cache: Cache for loading the parsed parent bundle.
-        ``None`` skips the check (cannot resolve the tree).
-    :raises OmnigentError: 404 ``NOT_FOUND`` when the bundle loads and
-        declares no sub-agent named ``sub_agent_name``.
-    """
-    if agent_cache is None:
-        return
-    from omnigent.runtime.workflow import _find_spec_by_name
-
-    try:
-        parent_spec = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        ).spec
-    except Exception:  # noqa: BLE001
-        # Can't load the bundle -> can't prove the name is undeclared.
-        # Leave it to the runner, which warns and runs the session on the
-        # parent spec, rather than rejecting a create we cannot adjudicate.
-        return
-    if _find_spec_by_name(parent_spec, sub_agent_name) is None:
-        raise OmnigentError(
-            f"Sub-agent not declared in parent spec: {sub_agent_name!r}",
-            code=ErrorCode.NOT_FOUND,
-        )
-
-
-def _spec_harness(spec: AgentSpec) -> str:
-    """
-    Return the canonical harness identifier for a resolved spec.
-
-    :param spec: A parsed agent / sub-agent spec.
-    :returns: The canonical harness id, e.g. ``"claude-native"`` or
-        ``"codex-native"``; falls back to ``executor.type`` when no
-        ``harness`` is declared.
-    """
-    from omnigent.harness_aliases import canonicalize_harness
-
-    harness = spec.executor.config.get("harness") or spec.executor.type
-    return canonicalize_harness(harness) or harness
-
-
-def _spec_config_flag_explicitly_disabled(spec: AgentSpec, key: str) -> bool:
-    """
-    Return whether an ``executor.config`` flag is explicitly set false.
-
-    The spec parser stringifies every ``executor.config`` value (see
-    ``omnigent/spec/parser.py`` â€” ``{str(k): str(v) ...}``), so a YAML
-    ``yolo: false`` arrives here as the string ``"False"``. A naive
-    ``not bool(value)`` is wrong: ``bool("False")`` is ``True`` (so a
-    naive truthiness test would read ``"False"`` as enabled). This
-    compares against the falsey spellings explicitly so only an
-    intentional ``false`` / ``False`` counts as disabled â€” an absent key
-    or any other value is NOT disabled.
-
-    Used for opt-OUT semantics: the relevant flag defaults to enabled and
-    an explicit ``false`` is the escape hatch (see the codex-native branch
-    of :func:`_derive_terminal_launch_args_from_spec`).
-
-    :param spec: A parsed sub-agent spec.
-    :param key: The ``executor.config`` key to read, e.g. ``"yolo"``.
-    :returns: ``True`` only when the value is the boolean ``False`` or the
-        string ``"false"`` (case-insensitive); ``False`` otherwise
-        (including when the key is absent).
-    """
-    value = spec.executor.config.get(key)
-    if isinstance(value, bool):
-        return value is False
-    return isinstance(value, str) and value.strip().lower() == "false"
-
-
-def _spec_config_flag_explicitly_enabled(spec: AgentSpec, key: str) -> bool:
-    """
-    Return whether an ``executor.config`` flag is explicitly set true.
-
-    The mirror of :func:`_spec_config_flag_explicitly_disabled`, used for
-    opt-IN semantics: the flag defaults to off and only an intentional
-    ``true`` / ``True`` enables it. Enabling values are matched without
-    whitespace tolerance (the value-matching policy of
-    :func:`_derive_terminal_launch_args_from_spec`), so ``" true"`` does
-    not enable.
-
-    :param spec: A parsed agent / sub-agent spec.
-    :param key: The ``executor.config`` key to read, e.g. ``"yolo"``.
-    :returns: ``True`` only when the value is the boolean ``True`` or the
-        case-insensitive string ``"true"``; ``False`` otherwise (including
-        when the key is absent).
-    """
-    value = spec.executor.config.get(key)
-    if isinstance(value, bool):
-        return value is True
-    return isinstance(value, str) and value.lower() == "true"
-
-
-def _derive_terminal_launch_args_from_spec(
-    spec: AgentSpec, *, headless_defaults: bool = True
-) -> list[str] | None:
-    """
-    Derive native-terminal YOLO pass-through args from a trusted sub-spec.
-
-    polly's native workers (claude-native / codex-native / cursor-native /
-    kimi-native / antigravity-native)
-    launch in a headless pane where no human can answer an ApprovalCard, so
-    every Edit/Write/Bash that prompts stalls the worker. This translates a
-    worker bundle's declared full-bypass intent into the per-session
-    ``terminal_launch_args`` the runner already appends to the native CLI
-    argv:
-
-    - claude-native + ``executor.config.permission_mode`` set ->
-      ``["--permission-mode", "<value>"]``. The value is passed through
-      verbatim so non-YOLO modes (``acceptEdits``, ``plan``, ...) work too;
-      YOLO uses ``bypassPermissions``.
-    - codex-native -> ``["--dangerously-bypass-approvals-and-sandbox"]``
-      by DEFAULT. A headless codex worker has no human to answer codex's
-      approval prompts, and codex's own command sandbox often cannot even
-      start (e.g. inside a hardened container), so codex's default
-      ``approval_policy=on-request`` + own-sandbox stance stalls the
-      worker on its first Edit/Write/Bash. Full bypass is the only
-      non-stalling stance for the headless seam (the container / worktree
-      is the real boundary, matching claude-native's ``bypassPermissions``
-      and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
-      ``executor.config.yolo: false`` opts back out for a read-only / must
-      -keep-prompting sub-agent. See issue #171.
-    - cursor-native -> ``["--yolo"]`` by DEFAULT. Headless cursor workers
-      otherwise stall on cursor-agent's in-terminal approval prompts (also
-      mirrored as web elicitation cards). ``--yolo`` is cursor-agent's
-      don't-ask / full-bypass flag (``--auto-review`` still prompts for
-      some calls). An explicit ``executor.config.yolo: false`` opts back
-      out. When ``executor.config.permission_mode`` / ``exec_mode`` is set
-      to ``auto`` or ``auto-review``, emit ``["--auto-review"]`` instead
-      (Smart Auto) so a bundle can choose Claude-style auto without full
-      yolo.
-    - kimi-native + ``executor.config.yolo: true`` -> ``["--yolo"]``
-      (kimi's auto-approve-tools flag; ``--auto`` full autonomy is NOT
-      mapped). Opt-IN: absent / false leaves args unset.
-    - antigravity-native + ``executor.config.permission_mode:
-      bypassPermissions`` -> ``["--dangerously-skip-permissions"]``, agy's
-      only pre-emptive permission control. Opt-IN like claude-native;
-      other / absent modes leave args unset.
-
-    Value-matching policy: enabling values are matched without whitespace
-    tolerance. Flag-valued keys (``yolo``) accept a real bool or the
-    case-insensitive strings ``"true"`` / ``"false"``. Mode-valued keys
-    (``permission_mode``) are matched exactly, mirroring claude-native's
-    verbatim pass-through and the runner's exact ``bypassPermissions``
-    comparison (``should_skip_permissions`` in
-    :mod:`omnigent.harnesses.antigravity_native.launch`). A present-but-unrecognized
-    value logs at debug and leaves args unset.
-
-    Only those native harnesses are translated; for any other harness
-    (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
-    ``permissionMode`` / ``auto_review`` spawn path, not a terminal flag)
-    this returns ``None`` so no terminal args are set. ``None`` is also
-    returned when the relevant field is absent / falsey.
-
-    ``headless_defaults`` selects the stance for a spec that declares
-    nothing: named-worker / bundled-child creates keep the headless
-    default above (codex-native / cursor-native bypass by DEFAULT, because
-    nobody can answer their prompts). Top-level and self-resolved-agent
-    creates pass ``headless_defaults=False``: those sessions are
-    interactive â€” a human can answer an ApprovalCard â€” so only the spec's
-    EXPLICIT declarations are honored (``yolo: true``, a
-    ``permission_mode`` / ``exec_mode`` value) and an undeclared spec
-    keeps the harness's own default approval stance.
-
-    :param spec: A trusted, server-loaded spec: a named worker's sub-spec
-        (via :func:`_resolve_subagent_spec`), a bundled child's spec, or â€”
-        with ``headless_defaults=False`` â€” the session's own agent spec.
-    :param headless_defaults: Whether an undeclared codex-native /
-        cursor-native spec falls back to the headless full-bypass default.
-        ``True`` for headless worker creates; ``False`` for top-level /
-        self-resolved creates, where only explicit opt-ins translate.
-    :returns: A flat CLI-arg list to store as the child session's
-        ``terminal_launch_args``, or ``None`` when nothing should be set.
-    :raises ValueError: If a spec-derived argument violates the same
-        bounds enforced for request-supplied ``terminal_launch_args``.
-    """
-    harness = _spec_harness(spec)
-    if harness == _CLAUDE_NATIVE_HARNESS:
-        permission_mode = spec.executor.config.get("permission_mode")
-        if permission_mode:
-            return _validate_terminal_launch_args(["--permission-mode", str(permission_mode)])
-        return None
-    if harness == _CODEX_NATIVE_HARNESS:
-        # Headless default: full bypass. The terminal_launch_args set the
-        # codex --remote TUI's launch flags, which is what creates the
-        # app-server thread and fixes its approval/sandbox stance for the
-        # session; the omnigent executor's later turn/start inherits that
-        # stance (codex_native_executor.run_turn carries no per-turn
-        # approval/sandbox). Without the flag the thread is created at
-        # codex's on-request + own-sandbox default and a headless worker
-        # stalls. An explicit ``yolo: false`` is the opt-out. See #171.
-        if _spec_config_flag_explicitly_disabled(spec, "yolo"):
-            return None
-        if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
-            return None
-        return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
-    if harness == _CURSOR_NATIVE_HARNESS:
-        # Prefer an explicit Smart Auto mode when the bundle asks for it
-        # (mirrors Claude's ``permission_mode: auto``), else full --yolo
-        # by default so headless polly workers don't stall on mirrored
-        # approval cards. ``yolo: false`` is the keep-prompting opt-out.
-        mode = (
-            spec.executor.config.get("permission_mode")
-            or spec.executor.config.get("exec_mode")
-            or ""
-        )
-        mode_norm = str(mode).strip().lower()
-        if mode_norm in ("auto", "auto-review"):
-            return _validate_terminal_launch_args(["--auto-review"])
-        if _spec_config_flag_explicitly_disabled(spec, "yolo"):
-            return None
-        if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
-            return None
-        return _validate_terminal_launch_args(["--yolo"])
-    if harness == _KIMI_NATIVE_HARNESS:
-        # Opt-IN (unlike codex/cursor's headless default-bypass). The bool
-        # arm covers programmatically built specs; the string arm covers the
-        # parser's stringified ``"True"`` (see the value-matching policy).
-        yolo = spec.executor.config.get("yolo")
-        if yolo is True or (isinstance(yolo, str) and yolo.lower() == "true"):
-            return _validate_terminal_launch_args(["--yolo"])
-        if (
-            yolo is not None
-            and yolo is not False
-            and not _spec_config_flag_explicitly_disabled(spec, "yolo")
-        ):
-            _logger.debug(
-                "kimi-native sub-spec has unrecognized yolo=%r; launching without --yolo.",
-                yolo,
-            )
-        return None
-    if harness == _ANTIGRAVITY_NATIVE_HARNESS:
-        # Opt-IN, matched exactly like the runner's should_skip_permissions;
-        # other modes have no agy analogue and leave args unset.
-        mode = spec.executor.config.get("permission_mode")
-        if isinstance(mode, str):
-            if mode == "bypassPermissions":
-                return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
-            if mode:
-                _logger.debug(
-                    "antigravity-native sub-spec permission_mode=%r has no agy analogue; "
-                    "launching without --dangerously-skip-permissions.",
-                    mode,
-                )
-        elif mode is not None:
-            _logger.debug(
-                "antigravity-native sub-spec has unrecognized permission_mode=%r; "
-                "launching without --dangerously-skip-permissions.",
-                mode,
-            )
-        return None
-    return None
-
-
-def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
-    """
-    Resolve terminal-first wrapper labels from an already-loaded sub-spec.
-
-    :param sub_spec: Trusted child sub-agent spec resolved from the
-        parent bundle.
-    :returns: ``{wrapper_key: value, ui_key: "terminal"}`` for a native
-        sub-agent, or ``{}`` when the sub-agent is not native.
-    """
-    harness = _spec_harness(sub_spec)
-    native_agent = native_coding_agent_for_harness(harness)
-    if native_agent is not None:
-        return {
-            _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: native_agent.wrapper_label,
-            _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE,
-        }
-    return {}
-
-
-def _repl_terminal_ui_labels(
-    *,
-    agent: Agent,
-    agent_cache: AgentCache | None,
-    harness_override: str | None,
-) -> dict[str, str]:
-    """
-    Resolve the terminal-view label for a session that gets a REPL terminal.
-
-    A non-native session's runner auto-creates the ``omnigent`` REPL
-    terminal and stamps ``omnigent.ui: terminal`` only *after* that
-    terminal exists. The web UI's "Starting upâ€¦" indicator needs the
-    label while the terminal is still missing, so that window is empty by
-    construction and such sessions fall back to the passive "Connectingâ€¦"
-    band instead. Stamping the same label at creation closes the gap.
-
-    Mirrors the runner's own auto-create predicate (non-native harness,
-    top-level session â€” see ``_auto_create_repl_terminal``'s call site in
-    ``omnigent/runner/app.py``); the caller adds the host-bound check.
-
-    :param agent: The agent row backing the session.
-    :param agent_cache: Cache used to load the parsed bundle. ``None``
-        disables resolution (returns an empty dict).
-    :param harness_override: The session's stored harness override, if
-        any. ``"auto"`` defers the harness to the first-message router,
-        so nothing is stamped.
-    :returns: ``{ui_key: "terminal"}`` when the runner will host a REPL
-        terminal, else ``{}``.
-    """
-    from omnigent.harness_aliases import is_native_harness
-
-    if agent_cache is None or harness_override == "auto":
-        return {}
-    if harness_override:
-        harness = harness_override
-    else:
-        try:
-            spec = agent_cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
-            ).spec
-        except Exception:  # noqa: BLE001
-            # Can't resolve the harness -> leave the label to the runner's
-            # own later stamp rather than guessing at creation.
-            return {}
-        harness = _spec_harness(spec)
-    if is_native_harness(harness):
-        return {}
-    return {_CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
-
-
-def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
-    """
-    Reject a session-create body that seeds policy-owned labels.
-
-    ``cost_control.*`` is the cost advisor's telemetry namespace and its
-    only legitimate writer is the session's bound runner â€” which cannot
-    exist yet at create time, so a seed is always a forgery.
-
-    :param labels: The client-supplied initial labels, e.g.
-        ``{"team": "ml"}``.
-    :raises OmnigentError: 400 when any ``cost_control.*`` key is
-        present.
-    """
-    reserved = reserved_cost_control_keys(labels)
-    if reserved:
-        raise OmnigentError(
-            f"labels {', '.join(repr(key) for key in reserved)} "
-            f"are in the policy-owned {COST_CONTROL_LABEL_NAMESPACE}* "
-            "namespace and cannot be set at session creation",
-            code=ErrorCode.INVALID_INPUT,
-        )
-
-
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
-    """
-    Reject a client-supplied label map that touches server-internal keys.
-
-    Keys in this set are written exclusively by server internals and must
-    not be client-settable â€” doing so would let callers forge security-
-    critical metadata (e.g. the policy-evaluation actor identity).
-
-    :param labels: The client-supplied label mapping, or ``None``.
-    :raises OmnigentError: 400 when any reserved key is present.
-    """
-    if not labels:
-        return
-    if _TURN_ACTOR_LABEL in labels:
-        raise OmnigentError(
-            f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # The archive timestamp is stamped by the server on the archive transition
-    # only; a client write would forge the retention clock, including on shared
-    # sessions the caller does not own.
-    if ARCHIVED_AT_LABEL_KEY in labels:
-        raise OmnigentError(
-            f"label {ARCHIVED_AT_LABEL_KEY!r} is server-internal and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # Pins are per-user: the client may only write the bare canonical
-    # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
-    # key). A suffixed ``omnigent.pinned.<user>`` is server-derived â€” accepting
-    # one from a client would let a caller pin/unpin a shared session for
-    # another user, or forge arbitrary per-user pin rows, defeating the per-user
-    # isolation. Reject any suffixed form; only the bare key is client-writable.
-    suffixed_pin = next(
-        (k for k in labels if k.startswith(f"{PINNED_LABEL_KEY}.")),
-        None,
-    )
-    if suffixed_pin is not None:
-        raise OmnigentError(
-            f"label {suffixed_pin!r} is server-derived; set the bare "
-            f"{PINNED_LABEL_KEY!r} key to pin for yourself",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # Sandbox lifecycle labels are written only by server internals and re-read
-    # across a relaunch to rebuild the runner Pod (e.g. the repository it
-    # re-clones). A client seed here would forge that reconstruction state, so
-    # reserve the whole namespace â€” every current and future key under it â€”
-    # rather than enumerating one key at a time.
-    sandbox_key = next(
-        (k for k in labels if k.startswith(MANAGED_SANDBOX_LABEL_NAMESPACE)),
-        None,
-    )
-    if sandbox_key is not None:
-        raise OmnigentError(
-            f"label {sandbox_key!r} is in the server-internal "
-            f"{MANAGED_SANDBOX_LABEL_NAMESPACE}* namespace and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
-
-
-def _require_cost_control_label_authority(
-    *,
-    reserved_keys: Sequence[str],
-    tunnel_token: str | None,
-    bound_runner_id: str | None,
-    allowed_tunnel_tokens: frozenset[str] | None,
-    multi_user: bool,
-) -> None:
-    """
-    Authorize a label write touching the policy-owned ``cost_control.*`` keys.
-
-    These are the cost advisor's telemetry labels, so ordinary session
-    editors must not set them via PATCH; the advisor's persist proves
-    itself with the runner tunnel binding token (allow-listed, or bound
-    to this session's runner id â€” the tunnel route's trust model).
-    Single-user servers skip the check: loopback runners may register
-    under stable ids unrelated to any token, and there is no second
-    identity to forge against.
-
-    :param reserved_keys: The ``cost_control.*`` keys the request tries
-        to write, e.g. ``("cost_control.plan",)``. Quoted in the error.
-    :param tunnel_token: Value of the ``X-Omnigent-Runner-Tunnel-Token``
-        request header, or ``None`` when absent.
-    :param bound_runner_id: The session's current ``runner_id``, or
-        ``None`` when no runner is bound.
-    :param allowed_tunnel_tokens: The server's tunnel-token allow-list,
-        or ``None`` when not configured.
-    :param multi_user: ``True`` when the server enforces per-user
-        permissions (a permission store is configured).
-    :raises OmnigentError: 403 when the caller presents no acceptable
-        runner proof on a multi-user server.
-    """
-    if not multi_user:
-        return
-    keys = ", ".join(repr(key) for key in reserved_keys)
-    token = (tunnel_token or "").strip()
-    if token:
-        if allowed_tunnel_tokens is not None and token in allowed_tunnel_tokens:
-            return
-        if bound_runner_id is not None and token_bound_runner_id(token) == bound_runner_id:
-            return
-    raise OmnigentError(
-        f"labels {keys} are in the policy-owned "
-        f"{COST_CONTROL_LABEL_NAMESPACE}* namespace; only the session's "
-        "bound runner may write them",
-        code=ErrorCode.FORBIDDEN,
-    )
-
-
-def _persist_stored_session_bundle(
-    conversation_store: ConversationStore,
-    artifact_store: ArtifactStore,
-    metadata: SessionCreateMetadata,
-    *,
-    agent_id: str,
-    agent_name: str,
-    agent_bundle_location: str,
-    agent_description: str | None,
-    runner_id: str | None = None,
-) -> CreatedSessionResponse:
-    """
-    Persist database rows for a bundle already written to artifacts.
-
-    :param conversation_store: Store that owns the atomic
-        conversation-plus-agent transaction.
-    :param artifact_store: Store for deleting the bundle on failure.
-    :param metadata: Validated session metadata. A set
-        ``parent_session_id`` creates the conversation as a
-        sub-agent child of that session.
-    :param agent_id: New agent id, e.g. ``"ag_abc123"``.
-    :param agent_name: Agent name loaded from the uploaded spec.
-    :param agent_bundle_location: Artifact key for the stored bundle.
-    :param agent_description: Optional description from the spec.
-    :param runner_id: Optional runner binding inherited from the
-        parent session, e.g. ``"runner_abc123"``.
-    :returns: Response with the new session id.
-    :raises OmnigentError: If the agent insert violates integrity
-        checks or the parent session no longer exists.
-    :raises SQLAlchemyError: If the database transaction fails for
-        any non-integrity reason.
-    """
-    try:
-        created = conversation_store.create_session_with_agent(
-            agent_id=agent_id,
-            agent_name=agent_name,
-            agent_bundle_location=agent_bundle_location,
-            agent_description=agent_description,
-            title=metadata.title,
-            labels=metadata.labels,
-            reasoning_effort=metadata.reasoning_effort,
-            model_override=metadata.model_override,
-            workspace=metadata.workspace,
-            terminal_launch_args=metadata.terminal_launch_args,
-            parent_conversation_id=metadata.parent_session_id,
-            runner_id=runner_id,
-            project_id=metadata.project_id,
-            host_id=metadata.host_id,
-        )
-    except ConversationNotFoundError as exc:
-        # Parent was authorized by the caller but vanished (deleted)
-        # before the insert transaction ran.
-        _delete_stored_session_bundle_after_failure(
-            artifact_store,
-            agent_bundle_location,
-        )
-        raise OmnigentError(
-            str(exc),
-            code=ErrorCode.NOT_FOUND,
-        ) from exc
-    except IntegrityError as exc:
-        _delete_stored_session_bundle_after_failure(
-            artifact_store,
-            agent_bundle_location,
-        )
-        # Expected integrity failures here are uniqueness collisions:
-        # generated agent id, generated conversation id, or
-        # agents.session_id. The route maps those to 409.
-        raise OmnigentError(
-            f"session agent write failed integrity checks: {exc.orig}",
-            code=ErrorCode.ALREADY_EXISTS,
-        ) from exc
-    except SQLAlchemyError:
-        _delete_stored_session_bundle_after_failure(
-            artifact_store,
-            agent_bundle_location,
-        )
-        raise
-
-    # The create request has no conv id in its URL; stamp the minted id so
-    # the create span joins the session's session.id group.
-    from omnigent.runtime import telemetry
-
-    telemetry.set_session_id(created.conversation.id)
-    return CreatedSessionResponse(
-        session_id=created.conversation.id,
-        agent_id=agent_id,
-        agent_name=agent_name,
-    )
-
-
-def _delete_stored_session_bundle_after_failure(
-    artifact_store: ArtifactStore,
-    agent_bundle_location: str,
-) -> None:
-    """
-    Delete an uploaded bundle after database creation fails.
-
-    Cleanup failures are logged but suppressed so the original
-    exception remains the error seen by callers.
-
-    :param artifact_store: Store that contains the uploaded bundle.
-    :param agent_bundle_location: Artifact key to delete, e.g.
-        ``"ag_abc123/a1b2c3d4"``.
-    :returns: None.
-    """
-    try:
-        artifact_store.delete(agent_bundle_location)
-    except Exception:  # noqa: BLE001
-        _logger.warning(
-            "Failed to delete uploaded session bundle %s after rollback",
-            agent_bundle_location,
-            exc_info=True,
-        )
-
-
-async def _authorize_bundled_parent_and_inherit_runner(
-    parent_session_id: str,
-    *,
-    user_id: str | None,
-    permission_store: PermissionStore | None,
-    conversation_store: ConversationStore,
-    runner_router: RunnerRouter | None,
-) -> tuple[str | None, str | None]:
-    """
-    Authorize a bundled create's parent link and resolve runner affinity.
-
-    The caller must have READ access to the parent session
-    before inheriting anything, mirroring the JSON create path â€”
-    without this, a forged parent link lets the caller inherit runner
-    bindings and parent a session they don't control. On success the
-    parent's runner binding is inherited (sub-agent co-location),
-    subject to a defense-in-depth ownership check: a runner the
-    caller doesn't own is not inherited.
-
-    :param parent_session_id: The requested parent session id,
-        e.g. ``"conv_abc123"``.
-    :param user_id: Authenticated caller, e.g. ``"alice@example.com"``.
-    :param permission_store: Permission store for the access
-        check; ``None`` in single-user / no-auth mode.
-    :param conversation_store: Store for the parent-conversation read.
-    :param runner_router: Router for the runner-ownership check;
-        ``None`` skips it.
-    :returns: A tuple of the inherited runner id and reasoning effort. Each
-        value is ``None`` when the parent has no corresponding setting or
-        ownership disallows inheritance.
-    :raises OmnigentError: 403/404 when the caller may not access the
-        parent session.
-    """
-    await _require_access(
-        user_id,
-        parent_session_id,
-        LEVEL_READ,
-        permission_store,
-        conversation_store,
-    )
-    parent_conv = await asyncio.to_thread(
-        conversation_store.get_conversation,
-        parent_session_id,
-    )
-    if parent_conv is None:
-        return None, None
-    inherited_runner_id = parent_conv.runner_id
-    if inherited_runner_id is not None and user_id is not None and runner_router is not None:
-        runner_owner = runner_router.runner_owner(inherited_runner_id)
-        if runner_owner is not None and runner_owner != user_id:
-            inherited_runner_id = None
-    return inherited_runner_id, parent_conv.reasoning_effort
-
-
-async def _notify_runner_of_bundled_child(
-    session_id: str,
-    agent_id: str,
-    runner_router: RunnerRouter | None,
-) -> None:
-    """
-    Notify the inherited runner that a bundled child session exists.
-
-    Lets the runner initialize per-session state (inbox queue,
-    agent-id cache) before the first forwarded event, mirroring the
-    JSON create path's post-create notify. Failures are logged and
-    swallowed â€” the notify is additive and must not fail the create.
-
-    :param session_id: The new child session id, e.g. ``"conv_abc123"``.
-    :param agent_id: The child's session-scoped agent id,
-        e.g. ``"ag_abc123"``.
-    :param runner_router: Router used to resolve the bound runner's
-        client; ``None`` falls back to the in-process runner.
-    :returns: None.
-    """
-    runner_client = await _get_runner_client(session_id, runner_router)
-    if runner_client is None:
-        return
-    try:
-        await runner_client.post(
-            "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "sub_agent_name": None,
-            },
-            timeout=10.0,
-        )
-    except (httpx.HTTPError, ConnectionError):
-        _logger.warning(
-            "Failed to notify runner about bundled session %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-
-
-def _registered_runner_id(
-    runner_router: RunnerRouter | None,
-    raw_runner_id: str,
-    *,
-    user_id: str | None = None,
-) -> str:
-    """
-    Validate a runner id from ``PATCH /v1/sessions/{id}``.
-
-    When ``user_id`` is provided the function also enforces runner
-    ownership: only the user who established the tunnel may
-    bind sessions to that runner.
-
-    :param runner_router: Router backed by the live tunnel registry.
-        ``None`` means this server cannot bind runners.
-    :param raw_runner_id: Runner id from the request body, e.g.
-        ``"runner_abc123"``.
-    :param user_id: Authenticated caller, e.g.
-        ``"alice@example.com"``. ``None`` skips the ownership
-        check (single-user / no-auth mode).
-    :returns: Trimmed registered runner id.
-    :raises OmnigentError: If the id is empty, the router is
-        unavailable, the runner is not registered, or the caller
-        does not own the runner.
-    """
-    runner_id = raw_runner_id.strip()
-    if not runner_id:
-        raise OmnigentError(
-            "runner_id must not be empty",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if runner_router is None:
-        raise OmnigentError(
-            "runner router is not configured",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-    if not runner_router.runner_is_online(runner_id):
-        raise OmnigentError(
-            f"runner {runner_id!r} is not registered",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # Enforce runner ownership. A caller must own the runner
-    # they are trying to bind to a session.
-    if user_id is not None:
-        runner_owner = runner_router.runner_owner(runner_id)
-        if runner_owner is not None and runner_owner != user_id:
-            raise OmnigentError(
-                f"runner {runner_id!r} is not owned by the requesting user",
-                code=ErrorCode.FORBIDDEN,
-            )
-    return runner_id
-
-
-def _latest_message_preview(
-    items: list[ConversationItem],
-    limit_chars: int = _CHILD_PREVIEW_LIMIT,
-) -> str | None:
-    """
-    Return a single-line text preview from newest-first message items.
-
-    Powers the sub-agent rail row's status line so the user can see what
-    the child is saying without opening it. The caller supplies a
-    batched newest-first message list for one child; this function joins
-    ``input_text`` / ``output_text`` blocks from the first non-meta
-    message with text, collapses whitespace, and truncates to
-    ``limit_chars``. Hidden meta messages carry durable runner context
-    and must never be shown as user-facing previews.
-
-    :param items: Newest-first message items for one conversation.
-    :param limit_chars: Max preview length in characters,
-        e.g. ``150``.
-    :returns: Truncated single-line preview text, e.g.
-        ``"I'll search the codebase for referencesâ€¦"``, or ``None``.
-    """
-    for item in items:
-        if not isinstance(item.data, MessageData) or item.data.is_meta:
-            continue
-        parts: list[str] = []
-        for block in item.data.content:
-            block_type = block.get("type")
-            text = block.get("text")
-            if block_type in ("input_text", "output_text") and isinstance(text, str):
-                parts.append(text)
-        collapsed = " ".join(" ".join(parts).split())
-        if not collapsed:
-            continue
-        if len(collapsed) <= limit_chars:
-            return collapsed
-        # Trim to one char less than the limit so the trailing ellipsis
-        # keeps the field at ``limit_chars`` total.
-        return collapsed[: max(0, limit_chars - 1)].rstrip() + "â€¦"
-    return None
-
-
-def _child_session_current_task_status_from_cached_status(status: object) -> str | None:
-    """
-    Map cached session lifecycle status onto child-summary task status.
-
-    :param status: Cached ``session.status`` value.
-    :returns: Public ``ChildSessionSummary.current_task_status`` value.
-    """
-    if status in ("running", "waiting"):
-        return "in_progress"
-    if status == "idle":
-        return "completed"
-    if status == "failed":
-        return "failed"
-    return None
-
-
-def _child_session_summary_from_conversation(
-    conv: Conversation,
-    parent_session_id: str,
-    last_message_preview: str | None,
-    parent_reasoning_effort: str | None = None,
-    parent_model: str | None = None,
-    *,
-    cached_status: str | None = None,
-) -> ChildSessionSummary:
-    """
-    Build a :class:`ChildSessionSummary` from a child conversation.
-
-    Parses the canonical sub-agent title format
-    ``"{agent_type}:{session_name}"`` written by
-    :func:`omnigent.tools.builtins.spawn._spawn_one`, plus the
-    3-segment ``"ui:{agent_name}:{user_label}"`` form written by the
-    Web UI "Add agent" flow (surfaced as ``tool={agent_name}`` and
-    ``session_name={user_label}``). Tolerates malformed/legacy rows:
-    if the title is ``None`` or has no colon, ``tool`` falls back to
-    the raw title and ``session_name`` is ``None`` â€” the row is still
-    surfaced so debug views can investigate.
-
-    Native-harness children are the exception: their titles are
-    uniqueness keys built from opaque runtime ids, so Codex and Claude
-    rows take ``tool`` from their labels instead of the title.
-
-    ``busy`` is derived from the relay-fed ``_session_status_cache``
-    (the tasks table has been removed). ``agent_id`` and ``agent_name``
-    are read from the conversation row directly.
-
-    :param conv: A child :class:`Conversation` row
-        (``kind="sub_agent"``) from
-        :meth:`ConversationStore.list_conversations`.
-    :param parent_session_id: The parent session id from the
-        route, e.g. ``"conv_parent987"``. Passed in rather than
-        re-reading from ``conv.parent_conversation_id`` to keep
-        the helper indifferent to legacy rows where the FK might
-        be missing.
-    :param last_message_preview: Preview text derived from a batched
-        child-message lookup, or ``None`` when no visible message exists.
-    :param parent_reasoning_effort: Parentâ€™s persisted effort, used as a
-        display fallback for older native child rows created before native
-        child inheritance was persisted.
-    :param parent_model: Parentâ€™s effective model, used as a display fallback
-        for older child rows whose native wrapper/spec exposes no model.
-    :param cached_status: Session status to derive ``busy`` /
-        ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
-    :returns: A populated :class:`ChildSessionSummary`.
-    """
-    display_title = title_without_closed_marker(conv.title)
-    # Child sessions aren't pinnable (the pin affordance lives on top-level
-    # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
-    # defensively so a shared child's summary can never expose another viewer's
-    # pin key. No collapse-to-canonical here: there's no pin to surface.
-    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
-    labels = labels_with_closed_status(raw_labels, conv.title)
-    tool: str | None
-    session_name: str | None
-    if _is_codex_native_subagent(conv):
-        # Codex-native child: surface the Codex-assigned nickname/role as
-        # ``tool`` and the raw thread id as ``session_name`` for correlation.
-        tool = _codex_subagent_display_tool(labels)
-        session_name = labels.get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
-    elif _is_claude_native_subagent(conv):
-        # Claude-native child: the title is "{agentType}:{subagent_id}" â€” an
-        # opaque uniqueness key whose halves are both unreadable once the
-        # agent type is plugin-namespaced. Surface the Task description (or
-        # the bare agent name) as ``tool`` and keep the raw Claude id as
-        # ``session_name`` for correlation.
-        tool = _claude_subagent_display_tool(conv, labels)
-        session_name = labels.get(_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY)
-    elif display_title and ":" in display_title:
-        head, _, tail = display_title.partition(":")
-        if head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail:
-            # User-added agent: "ui:<agent_name>:<user_label>". Surface the
-            # bound agent as ``tool`` and the user's label as ``session_name``
-            # so the Agents rail renders it like any other child row.
-            agent_name, _, user_label = tail.partition(":")
-            tool = agent_name
-            session_name = user_label
-        else:
-            tool = head
-            session_name = tail
-    else:
-        tool = display_title or None
-        session_name = None
-
-    # Derive busy from the relay-fed cache; tasks table is gone.
-    if cached_status is None:
-        cached_status = _session_status_cache.get(conv.id)
-    if cached_status in ("running", "waiting"):
-        busy = True
-    else:
-        busy = False
-    last_task_error = _last_task_error_from_labels(labels)
-    current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
-    if last_task_error is not None:
-        current_task_status = "failed"
-
-    # For Codex children, fall back to the prompt label as preview when the
-    # real transcript has not arrived yet â€” avoids synthesizing a user message
-    # just so the rail has something to show.
-    if last_message_preview is None and _is_codex_native_subagent(conv):
-        raw_prompt = labels.get(_CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY)
-        if raw_prompt:
-            collapsed = " ".join(raw_prompt.split())
-            last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
-
-    routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
-    reasoning_effort = conv.reasoning_effort
-    if reasoning_effort is None and _is_codex_native_subagent(conv):
-        reasoning_effort = parent_reasoning_effort
-    llm_model = concrete_reported_model(
-        conv.reported_model
-    ) or _child_llm_model_from_conversation(conv)
-    if llm_model is None and conv.model_override is not None:
-        llm_model = conv.model_override
-    if llm_model is None:
-        llm_model = parent_model
-    return ChildSessionSummary(
-        id=conv.id,
-        parent_session_id=parent_session_id,
-        title=display_title,
-        task_summary=conv.task_summary,
-        tool=tool,
-        session_name=session_name,
-        created_at=conv.created_at,
-        updated_at=conv.updated_at,
-        # agent_id comes from the conversation row; agent_name and task_id
-        # are no longer available from the (removed) tasks table.
-        agent_id=conv.agent_id,
-        agent_name=None,
-        current_task_id=None,
-        current_task_status=current_task_status,
-        busy=busy,
-        labels=labels,
-        last_task_error=last_task_error,
-        last_message_preview=last_message_preview,
-        # Surface the sub-agent's parked-elicitation count from the same
-        # in-memory index that feeds the sidebar badge, so the Agents
-        # rail can flag a child that's awaiting user input.
-        pending_elicitations_count=pending_elicitations.count_for(conv.id),
-        # The model routing picked for this child, reported only when a
-        # decision actually produced it: a user-pinned model_override is not a
-        # routed model, and reporting one with a null decision id makes the
-        # two fields contradict each other. The decision is joined through a
-        # conversation label rather than a new column.
-        routed_model=conv.model_override if routing_decision_id is not None else None,
-        model_override=conv.model_override,
-        llm_model=llm_model,
-        reasoning_effort=reasoning_effort,
-        routing_decision_id=routing_decision_id,
-    )
-
-
-def _child_llm_model_from_conversation(conv: Conversation | None) -> str | None:
-    """
-    Resolve a child conversation's effective spec model.
-
-    Mirrors the session-snapshot resolver (``spec.executor.model`` with
-    ``sub_agent_name`` spec lookup) so the Agents rail reports the same
-    model the composer read-out shows for spec-defaulted children that
-    carry neither a ``model_override`` nor a routing pin â€” e.g. native
-    opencode sub-agents whose model comes from the parent profile.
-
-    :param conv: The child conversation, or ``None``.
-    :returns: The model id (e.g. ``"opencode-go/deepseek-v4-flash"``), or
-        ``None`` when the child has no resolvable agent spec.
-    """
-    if conv is None or conv.agent_id is None:
-        return None
-    try:
-        # Imported at call time like ``_resolve_llm_model`` so a facade or
-        # runtime patch is honored by this module's lazy-global lookups.
-        from omnigent.runtime import get_agent_cache
-        from omnigent.runtime._globals import _agent_store
-        from omnigent.runtime.workflow import _find_spec_by_name
-
-        if _agent_store is None:
-            return None
-        agent = _agent_store.get(conv.agent_id)
-        if agent is None or agent.bundle_location is None:
-            return None
-        loaded = get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        )
-        spec = loaded.spec
-        if conv.sub_agent_name:
-            child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
-            if child_spec is not None:
-                spec = child_spec
-        return spec.executor.model
-    except (
-        KeyError,
-        AttributeError,
-        ValueError,
-        ImportError,
-        OSError,
-        RuntimeError,
-        StatementError,
-    ):
-        # Best-effort display resolver like ``_resolve_llm_model``: an
-        # uninitialized runtime or missing bundle degrades to "model
-        # unknown" rather than failing the whole child list.
-        return None
-
-
-def _mcp_tool_result(rpc_id: int | str | None, text: str) -> Response:
-    """
-    Wrap a plain-text tool result in a JSON-RPC 2.0 MCP ``tools/call`` response.
-
-    :param rpc_id: The JSON-RPC request id (may be int, str, or ``None``
-        for notifications), e.g. ``1``.
-    :param text: The tool output text to embed in the ``content`` block.
-    :returns: A :class:`Response` with ``Content-Type: application/json``
-        carrying the JSON-RPC 2.0 envelope with a single ``text`` content block.
-    """
-    body = json.dumps(
-        {"jsonrpc": "2.0", "id": rpc_id, "result": {"content": [{"type": "text", "text": text}]}}
-    )
-    return Response(content=body, media_type="application/json")
-
-
-async def _handle_advise_models_mcp(
-    rpc_id: int | str | None,
-    conv: Any,
-    arguments: dict[str, Any],
-    agent_store: Any,
-    *,
-    session_id: str | None = None,
-    runner_router: Any = None,
-) -> Response:
-    """
-    Server-side handler for ``sys_advise_models`` MCP tool calls.
-
-    Intercepts the call before the runner forward because the deployment's
-    routing backends live in the server process.
-
-    :param rpc_id: The JSON-RPC request id.
-    :param conv: The :class:`Conversation` for this session.
-    :param arguments: Parsed tool arguments from the LLM.
-    :param agent_store: Store for agent lookup (used to resolve sub-agent harnesses).
-    :returns: A JSON-RPC 2.0 ``tools/call`` result response.
-    """
-    tasks = arguments.get("tasks")
-    if not isinstance(tasks, list):
-        return _mcp_tool_result(
-            rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
-        )
-
-    from omnigent.server.routing_backend import backends_from_caps
-
-    caps = get_caps()
-    routing_client = backends_from_caps(caps).any()
-    if routing_client is None:
-        return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
-
-    from omnigent.models.model_catalog import spec_harness
-    from omnigent.server.smart_routing import _WORKER_NAME_TO_HARNESS, fetch_runner_models
-
-    # Fetch live model catalog from the runner once; used below to populate
-    # per-agent model lists when the caller omits explicit models.
-    # Keys are worker names ("self", "claude_code", etc.) as returned by
-    # catalog_for_spec. None when runner discovery is unavailable.
-    _runner_catalog: dict[str, list[str]] | None = None
-    if session_id is not None and runner_router is not None:
-        _runner_client = await _get_runner_client(session_id, runner_router)
-        if _runner_client is not None:
-            _runner_catalog = await fetch_runner_models(session_id, _runner_client)
-
-    # Resolve the parent agent spec to look up sub-agent harnesses.
-    spec: Any | None = None
-    if conv.agent_id is not None:
-        agent_obj = await asyncio.to_thread(agent_store.get, conv.agent_id)
-        if agent_obj is not None:
-            try:
-                spec = (
-                    get_agent_cache()
-                    .load(
-                        agent_obj.id,
-                        agent_obj.bundle_location,
-                        expand_env=agent_obj.session_id is None,
-                    )
-                    .spec
-                )
-            except Exception:  # noqa: BLE001
-                _logger.debug(
-                    "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
-                )
-
-    def _resolve_harness_for_worker(agent: str) -> str | None:
-        if spec is not None:
-            sub_agents = getattr(spec, "sub_agents", None) or []
-            for sub in sub_agents:
-                if getattr(sub, "name", None) == agent:
-                    h = spec_harness(sub)
-                    if h:
-                        return h
-                    break
-        return _WORKER_NAME_TO_HARNESS.get(agent)
-
-    recommendations: list[dict[str, Any]] = []
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-        title = task.get("title", "")
-        task_text = task.get("task", "")
-        agents_spec = task.get("agents")
-        if not isinstance(agents_spec, list) or not agents_spec:
-            continue
-
-        # Build harnessâ†’models map for the routing client, plus two reverse
-        # maps for resolving the chosen agent after the verdict:
-        # - harness_to_agent: preferred path when the judge picks a harness
-        # - model_to_agent: fallback when harness is absent or unrecognised
-        # Insertion order is preserved; first-agent-wins dedup applies when
-        # the same model appears in multiple harness lists.
-        model_to_agent: dict[str, str] = {}
-        harness_to_agent: dict[str, str] = {}
-        harness_models: dict[str, list[str]] = {}
-        for agent_entry in agents_spec:
-            if not isinstance(agent_entry, dict):
-                continue
-            agent = agent_entry.get("agent", "")
-            explicit_models: list[str] | None = agent_entry.get("models")
-            if explicit_models is not None and not isinstance(explicit_models, list):
-                explicit_models = None
-            if explicit_models:
-                harness_key = agent  # use agent name as key when models are explicit
-                candidates = explicit_models
-            else:
-                harness_key = _resolve_harness_for_worker(agent) or agent
-                # Prefer the worker name, then its normalized harness key.
-                candidates = (
-                    (_runner_catalog or {}).get(agent)
-                    or (_runner_catalog or {}).get(harness_key)
-                    or []
-                )
-            if candidates:
-                harness_models.setdefault(harness_key, [])
-                harness_to_agent.setdefault(harness_key, agent)
-                for m in candidates:
-                    if m not in model_to_agent:
-                        model_to_agent[m] = agent
-                        harness_models[harness_key].append(m)
-
-        if not harness_models:
-            recommendations.append(
-                {"title": title, "agent": None, "model": None, "rationale": "no candidates"}
-            )
-            continue
-        try:
-            verdict = await routing_client.route(task_text, harness_models)
-        except Exception:  # noqa: BLE001  # routing failures must not crash the advisor
-            _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
-            verdict = None
-        if verdict is None:
-            recommendations.append(
-                {
-                    "title": title,
-                    "agent": None,
-                    "model": None,
-                    "rationale": "router returned no verdict",
-                }
-            )
-        else:
-            # Prefer the judge's harness pick; fall back to model ownership.
-            chosen_agent = (
-                harness_to_agent.get(verdict.harness) if verdict.harness else None
-            ) or model_to_agent.get(verdict.model)
-            recommendations.append(
-                {
-                    "title": title,
-                    "agent": chosen_agent,
-                    "model": verdict.model,
-                    "rationale": verdict.rationale,
-                }
-            )
-
-    return _mcp_tool_result(
-        rpc_id, json.dumps({"router_on": True, "recommendations": recommendations})
-    )
-
-
-def _mcp_ok_response(rpc_id: int | str | None, result: dict[str, Any]) -> Response:
-    """
-    Wrap *result* in a JSON-RPC 2.0 success response.
-
-    :param rpc_id: The JSON-RPC request id (may be int, str, or ``None``
-        for notifications), e.g. ``1``.
-    :param result: The JSON-serialisable result payload, e.g.
-        ``{"tools": [...]}``.
-    :returns: A :class:`Response` with ``Content-Type: application/json``
-        carrying the JSON-RPC 2.0 envelope.
-    """
-    body = json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": result})
-    return Response(content=body, media_type="application/json")
-
-
-def _mcp_error_response(
-    rpc_id: int | str | None,
-    code: int,
-    message: str,
-) -> Response:
-    """
-    Wrap an error in a JSON-RPC 2.0 error response.
-
-    :param rpc_id: The JSON-RPC request id. Use ``None`` when the id
-        could not be parsed, e.g. ``None``.
-    :param code: JSON-RPC error code, e.g. ``-32601`` (method not found)
-        or ``-32000`` (application error).
-    :param message: Human-readable error description,
-        e.g. ``"Method not found: 'unsupported/method'"``.
-    :returns: A :class:`Response` with ``Content-Type: application/json``
-        carrying the JSON-RPC 2.0 error envelope.
-    """
-    body = json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "error": {"code": code, "message": message},
-        }
-    )
-    return Response(content=body, media_type="application/json")
-
-
-def _mcp_input_required_response(
-    rpc_id: int | str | None,
-    elicitation_id: str,
-    message: str,
-    request_state: str,
-    session_id: str | None = None,
-) -> Response:
-    """
-    Return an MCP ``InputRequiredResult`` asking the runner to collect
-    user approval before retrying the tool call.
-
-    Follows the Multi Round-Trip Requests (MRTR) spec:
-    ``https://modelcontextprotocol.io/specification/draft/basic/utilities/mrtr``.
-    The ``elicitation_id`` is used as the key in ``inputRequests`` so the
-    runner can identify the approval Future without inspecting the opaque
-    ``requestState``. When URL-mode is active and ``session_id`` is
-    known, adds ``mode``/``url`` to params.
-
-    :param rpc_id: The JSON-RPC request id, e.g. ``1``.
-    :param elicitation_id: Server-minted elicitation id used both as the
-        ``inputRequests`` key and inside the opaque ``requestState``,
-        e.g. ``"elicit_abc123"``.
-    :param message: Human-readable prompt shown to the user,
-        e.g. ``"Allow tool sys_os_shell?"``.
-    :param request_state: Opaque state blob the client echoes on retry.
-        Contains the ``elicitation_id`` and ``session_id`` so the server
-        can verify authenticity on retry without server-side storage.
-    :param session_id: Session/conversation id for constructing the
-        approval page URL, e.g. ``"conv_abc123"``. ``None`` omits the
-        URL (form mode).
-    :returns: A :class:`Response` carrying the JSON-RPC 2.0
-        ``InputRequiredResult`` envelope.
-    """
-
-    params: dict[str, Any] = {
-        "message": message,
-        "requestedSchema": {
-            "type": "object",
-            "properties": {"approved": {"type": "boolean"}},
-            "required": ["approved"],
-        },
-    }
-    if session_id is not None and _ELICITATION_MODE == "url":
-        params["mode"] = "url"
-        params["url"] = f"/approve/{session_id}/{elicitation_id}"
-    else:
-        params["mode"] = "form"
-
-    body = json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "result": {
-                "resultType": "input_required",
-                "inputRequests": {
-                    elicitation_id: {
-                        "method": "elicitation/create",
-                        "params": params,
-                    }
-                },
-                "requestState": request_state,
-            },
-        }
-    )
-    return Response(content=body, media_type="application/json")
-
-
-async def _handle_mcp_tools_list(
-    rpc_id: int | str | None,
-    session_id: str,
-    runner_router: RunnerRouter | None,
-) -> Response:
-    """
-    Handle a ``tools/list`` JSON-RPC request for the MCP proxy endpoint.
-
-    Delegates execution to the runner's ``POST
-    /v1/sessions/{id}/mcp/execute`` endpoint so that stdio MCP
-    subprocesses spawn on the runner's machine (correct ``cwd``,
-    env, and tooling). The Omnigent server's role here is routing only â€”
-    policy evaluation happens in ``tools/call``.
-
-    :param rpc_id: The JSON-RPC request id, e.g. ``1``.
-    :param session_id: The session id whose agent's tools to list,
-        e.g. ``"conv_abc123"``.
-    :param runner_router: Router used to get an httpx client pointed
-        at the session's runner. ``None`` returns an error.
-    :returns: A JSON-RPC 2.0 ``tools/list`` result response, or an
-        error response when the runner is unavailable.
-    """
-    runner_client = await _get_runner_client(session_id, runner_router)
-    if runner_client is None:
-        # Fall back to the in-process runner client (local single-user mode).
-        from omnigent.runtime import get_runner_client
-
-        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
-    if runner_client is None:
-        return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
-    _logger.debug(
-        "MCP tools/list: delegating to runner execute for session=%r",
-        session_id,
-        extra={"session_id": session_id},
-    )
-    try:
-        resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/mcp/execute",
-            json={"method": "tools/list", "params": {}},
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
-        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
-
-    if "error" in data:
-        err = data["error"]
-        return _mcp_error_response(
-            rpc_id, err.get("code", -32000), err.get("message", "unknown error")
-        )
-
-    result = data.get("result", {})
-    # schemas are already in OpenAI function-tool format from RunnerMcpManager;
-    # convert back to MCP inputSchema format for the tools/list response since
-    # ProxyMcpManager on the runner expects MCP-shaped tools/list output.
-    schemas: list[dict[str, Any]] = result.get("schemas", [])
-    tools = []
-    for schema in schemas:
-        # schema shape: {"type": "function", "name": "srv__tool",
-        #                "description": "...", "parameters": {...}}
-        tools.append(
-            {
-                "name": schema.get("name", ""),
-                "description": schema.get("description", ""),
-                "inputSchema": schema.get("parameters") or {"type": "object", "properties": {}},
-            }
-        )
-
-    failures: dict[str, str] = result.get("failures", {})
-    for srv, msg in failures.items():
-        _logger.warning("runner MCP server %r unavailable: %s", srv, msg)
-
-    _logger.debug(
-        "MCP tools/list: session=%r returning %d tools, %d failures",
-        session_id,
-        len(tools),
-        len(failures),
-        extra={"session_id": session_id},
-    )
-    return _mcp_ok_response(rpc_id, {"tools": tools})
-
-
-async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
-    """
-    Read an uploaded file into memory, aborting if it exceeds *limit_bytes*.
-
-    Reads in :data:`_UPLOAD_READ_CHUNK_BYTES` chunks and raises HTTP 413 as
-    soon as the cap is crossed, so an oversized upload never buffers more
-    than one chunk past the limit.
-
-    :param file: The multipart upload.
-    :param limit_bytes: Maximum allowed size in bytes.
-    :returns: The full file content.
-    :raises HTTPException: 413 when the upload exceeds *limit_bytes*.
-    """
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = await file.read(_UPLOAD_READ_CHUNK_BYTES)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > limit_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"Attachment exceeds the {limit_bytes // (1024 * 1024)} MB "
-                    "limit for this file type."
-                ),
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-async def _load_runner_skills(
-    runner_client: httpx.AsyncClient,
-    session_id: str,
-) -> None:
-    """Background single-flight fetch of a session's runner-owned skills.
-
-    Populates :data:`_runner_skills_cache` on success so subsequent
-    snapshot polls serve skills without a per-poll runner round-trip. Runs
-    off the snapshot's critical path (see :func:`_fetch_runner_skills`).
-    Best-effort: transport errors / non-200 / malformed payloads leave the
-    cache unset so a later poll retries.
-
-    :param runner_client: HTTP client pointed at the bound runner.
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    """
-    try:
-        resp = await runner_client.get(
-            f"/v1/sessions/{session_id}/skills",
-            timeout=5.0,
-        )
-    except (httpx.HTTPError, ConnectionError):
-        _logger.debug(
-            "Runner skills query failed for %s", session_id, extra={"session_id": session_id}
-        )
-        return
-    if resp.status_code != 200:
-        return
-    try:
-        raw = resp.json().get("skills", [])
-        skills = [SkillSummary(name=s["name"], description=s["description"]) for s in raw]
-    except (ValueError, AttributeError, KeyError, TypeError):
-        _logger.debug(
-            "Runner skills payload malformed for %s", session_id, extra={"session_id": session_id}
-        )
-        return
-    _runner_skills_cache[session_id] = skills
-    _runner_skills_stale.discard(session_id)
-    # Nudge any subscribed client to re-read the (now-warm) snapshot so
-    # its slash-command menu fills without waiting for the next bind.
-    _publish_runner_skills(session_id)
-
-
-def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
-    """
-    Validate runner-returned raw native ``model/list`` data.
-
-    :param raw_models: JSON value from the runner's
-        ``{"models": [...]}`` response, e.g. a list of model dicts.
-    :returns: Raw model options for the session snapshot; malformed rows
-        are skipped so one bad provider row cannot blank the picker.
-    :raises ValueError: If the payload is not a list.
-    """
-    if not isinstance(raw_models, list):
-        raise ValueError("Native model options payload must be a list")
-    options: list[dict[str, Any]] = []
-    for raw_model in raw_models:
-        # Skip malformed rows instead of discarding the whole catalog: one
-        # provider-supplied oddity must not blank the picker for the session.
-        if not isinstance(raw_model, dict):
-            continue
-        try:
-            option = NativeModelOption.model_validate(raw_model)
-        except ValidationError:
-            _logger.debug("Skipping malformed native model option: %r", raw_model)
-            continue
-        options.append(option.model_dump(exclude_defaults=True, exclude_none=True))
-    return options
-
-
-async def _load_model_options(
-    runner_client: httpx.AsyncClient,
-    session_id: str,
-    path: str,
-    fallback_path: str | None = None,
-) -> None:
-    """
-    Background single-flight fetch of a session's native model catalog.
-
-    :param runner_client: HTTP client pointed at the bound runner.
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    :param path: Runner route to query â€” the unified
-        ``"/v1/sessions/conv_abc/model-options"``.
-    :param fallback_path: Legacy harness-named route to fall back to when
-        *path* 404s (an older runner without the unified route), e.g.
-        ``"/v1/sessions/conv_abc/cursor-model-options"``. ``None`` disables
-        the fallback.
-    """
-    # Read the retry schedule off the facade so tests patching
-    # ``sessions._MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
-    import omnigent.server.routes.sessions as _facade
-
-    delays = _facade._MODEL_OPTIONS_RETRY_DELAYS_S
-    for attempt in range(len(delays) + 1):
-        try:
-            resp = await runner_client.get(path, timeout=5.0)
-        except (httpx.HTTPError, ConnectionError):
-            _logger.debug(
-                "Runner model-options query failed for %s",
-                session_id,
-                extra={"session_id": session_id},
-            )
-            return
-        if resp.status_code != 200:
-            # An older runner has no unified route; drop to the harness-named
-            # one without consuming a retry.
-            if resp.status_code == 404 and fallback_path and path != fallback_path:
-                path = fallback_path
-                continue
-            # 503 means the native backend (Codex app-server bridge / cursor
-            # login) is still booting. Keep the background single-flight alive
-            # so the web picker fills without a second manual refresh.
-            if resp.status_code == 503 and attempt < len(delays):
-                await asyncio.sleep(delays[attempt])
-                continue
-            return
-        try:
-            options = _model_options_from_wire(resp.json().get("models", []))
-        except (ValueError, KeyError, TypeError, ValidationError):
-            _logger.debug(
-                "Runner model-options payload malformed for %s",
-                session_id,
-                extra={"session_id": session_id},
-            )
-            return
-        if not options:
-            # Older runners returned 200 + [] for the same not-ready window.
-            # Do not cache that empty catalog; retry, then leave the cache
-            # cold so a later snapshot can try again.
-            if attempt < len(delays):
-                await asyncio.sleep(delays[attempt])
-                continue
-            return
-        _model_options_cache[session_id] = options
-        _model_options_stale.discard(session_id)
-        _publish_model_options(session_id)
-        return
-
-
-#: How many sessions may warm their catalogs at once. A tunnel flap reconnects
-#: every session bound to the runner at once, and each warm-up costs a runner
-#: round trip plus a provider listing on a worker thread; the cap keeps that
-#: burst off the executor the concurrent session re-init needs.
-_CATALOG_PREFETCH_CONCURRENCY = 4
-
-#: One semaphore per event loop: the server runs a single loop, but an asyncio
-#: primitive cannot be shared across the loops the test suite creates.
-_catalog_prefetch_semaphores: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, asyncio.Semaphore
-] = weakref.WeakKeyDictionary()
-
-
-def _catalog_prefetch_semaphore() -> asyncio.Semaphore:
-    """
-    Return this loop's catalog-prefetch concurrency gate.
-
-    :returns: The semaphore bounding concurrent prefetches.
-    """
-    loop = asyncio.get_running_loop()
-    semaphore = _catalog_prefetch_semaphores.get(loop)
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(_CATALOG_PREFETCH_CONCURRENCY)
-        _catalog_prefetch_semaphores[loop] = semaphore
-    return semaphore
-
-
-async def _run_catalog_prefetch(
-    coro: Coroutine[Any, Any, Any],
-    session_id: str,
-) -> None:
-    """
-    Run one best-effort catalog prefetch under the concurrency cap.
-
-    Retrieves its own exception: a prefetch is fire-and-forget, so anything it
-    raises (a runner round trip torn down mid-flight, say) would otherwise
-    surface as an unretrieved-task warning and drown real errors. A failure
-    here just leaves a cold cache, which every reader already handles.
-
-    :param coro: The prefetch coroutine to run.
-    :param session_id: Session/conversation identifier, for the log line.
-    """
-    try:
-        async with _catalog_prefetch_semaphore():
-            await coro
-    except asyncio.CancelledError:
-        coro.close()
-        raise
-    except Exception:  # noqa: BLE001 - best-effort warm-up; a cold cache is fine.
-        _logger.debug(
-            "Catalog prefetch failed for %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-
-
-def prefetch_session_routing_catalogs(
-    session_id: str,
-    conv: Conversation,
-    runner_client: httpx.AsyncClient,
-) -> None:
-    """
-    Warm the catalogs routing reads, at session launch instead of at turn time.
-
-    Both are runner-derived, and paying for them while a user's prompt is held
-    is what made a first routed message slow: the native picker vocabulary is
-    awaited by the turn path when its cached entry is stale, and the runner
-    model catalog is a round trip per turn for panes that have no picker
-    vocabulary. Started when the runner binds, both land well before the first
-    prompt; a turn arriving before they finish still falls back to its own
-    inline fetch, so this only ever removes waiting.
-
-    Only routed, live sessions warm anything. Smart Routing is the sole reader
-    of these caches, and the caller reconnects *every* session bound to a
-    runner â€” a plain-session host with a flapping tunnel would otherwise spend
-    two runner round trips per pane, on nothing, while the session re-init
-    running alongside it waits for the same executor. Archived sessions are
-    skipped for the same reason: nothing is going to route a turn on them.
-
-    Fire-and-forget: a failed prefetch is a cold cache, which every reader
-    already handles.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    :param conv: Conversation row, read for the routing state and the wrapper
-        label.
-    :param runner_client: HTTP client pointed at the newly bound runner.
-    """
-    from omnigent.runner.subagent_routing import routing_class_from_snapshot
-    from omnigent.server.smart_routing import prefetch_runner_catalog
-
-    if conv.archived:
-        return
-    routing_class = routing_class_from_snapshot(
-        cost_control_mode=conv.cost_control_mode_override,
-        harness_override=conv.harness_override,
-        labels=conv.labels,
-    )
-    if not routing_class.routing_enabled:
-        return
-
-    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(
-        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or ""
-    )
-    if endpoint is not None and session_id not in _model_options_inflight:
-        options_task = asyncio.create_task(
-            _run_catalog_prefetch(
-                _load_model_options(
-                    runner_client,
-                    session_id,
-                    f"/v1/sessions/{session_id}/model-options",
-                    fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
-                ),
-                session_id,
-            )
-        )
-        _model_options_inflight[session_id] = options_task
-        options_task.add_done_callback(
-            lambda _task, sid=session_id: _model_options_inflight.pop(sid, None)
-        )
-    _catalog_prefetch_tasks.add(
-        task := asyncio.create_task(
-            _run_catalog_prefetch(prefetch_runner_catalog(session_id, runner_client), session_id)
-        )
-    )
-    task.add_done_callback(_catalog_prefetch_tasks.discard)
-
-
-async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]] | None:
-    """
-    Resolve a host's pre-launch claude catalog over its live tunnel.
-
-    Session-side reuse of the new-session picker's source
-    (``get_host_model_options`` in ``routes/hosts.py``): the host resolves
-    the catalog locally, so no runner is needed.
-
-    :param host_id: Host identifier, e.g. ``"host_a1b2c3"``.
-    :returns: Raw model rows, or ``None`` when the host is not connected,
-        rejects the request, or times out.
-    """
-    registry = get_server_host_registry()
-    if registry is None:
-        return None
-    conn = registry.get(host_id)
-    if conn is None:
-        return None
-    # Local import: keeps routes.hosts out of this module's import graph.
-    from omnigent.server.routes.hosts import _proxy_model_options
-
-    try:
-        result = await _proxy_model_options(
-            host_registry=registry,
-            host_conn=conn,
-            harness="claude-native",
-        )
-    except HTTPException:
-        return None
-    if result.get("status") != "ok":
-        return None
-    models = result.get("models")
-    return models if isinstance(models, list) else None
-
-
-async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
-    """
-    Background catalog fill for an asleep claude-native session.
-
-    With no runner bound and a cold cache (e.g. the server restarted while
-    the session slept), the session's host can still resolve the claude
-    catalog â€” the same pre-launch source the new-session picker uses. Fills
-    the cache stale-marked so the next live runner replaces it with its
-    launch-exact snapshot, and publishes ``session.model_options`` so open
-    tabs re-read.
-
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    :param host_id: The session's bound host, e.g. ``"host_a1b2c3"``.
-    """
-    # Read through the facade so tests patching
-    # ``sessions._host_model_options_via_registry`` reach this impl.
-    import omnigent.server.routes.sessions as _facade
-
-    raw = await _facade._host_model_options_via_registry(host_id)
-    if not raw:
-        return
-    try:
-        options = _model_options_from_wire(raw)
-    except ValueError:
-        return
-    if not options:
-        return
-    _model_options_cache[session_id] = options
-    _model_options_stale.add(session_id)
-    _publish_model_options(session_id)
-
-
-__all__ = [
-    "FILE_CONTENT_CACHE_CONTROL",
-    "SessionLiveness",
-    "_HostLaunchAttempt",
-    "_NativeTerminalEnsureOutcome",
-    "_RunnerForwardResult",
-    "_SessionEventDispatchResult",
-    "_add_model_usage_delta",
-    "_agent_carries_cursor_fork_history",
-    "_agent_carries_native_fork_history",
-    "_agent_carries_native_fork_history_impl",
-    "_agent_is_native",
-    "_agent_is_native_impl",
-    "_agent_provider_family",
-    "_allow_all_edits_eligible",
-    "_allow_remember_eligible",
-    "_ancestor_session_ids",
-    "_announce_session_added",
-    "_antigravity_subagent_labels_from_body",
-    "_antigravity_subagent_title",
-    "_apply_liveness_to_items",
-    "_apply_pending_policy_ask_writes",
-    "_attachment_disposition",
-    "_authorize_bundled_parent_and_inherit_runner",
-    "_await_settled_managed_launch",
-    "_background_task_delivery_status",
-    "_build_actor",
-    "_build_evaluation_context",
-    "_build_new_item",
-    "_build_policy_engine_from_spec",
-    "_build_skill_slash_command_policy_body",
-    "_canonical_tool_input",
-    "_child_session_current_task_status_from_cached_status",
-    "_child_session_summary_from_conversation",
-    "_claude_native_remember_host",
-    "_claude_subagent_display_tool",
-    "_client_supplied_hook_elicitation_id",
-    "_codex_plan_mode_enabled",
-    "_codex_subagent_display_tool",
-    "_codex_subagent_labels_from_body",
-    "_coerce_cumulative_field",
-    "_collect_descendant_conversation_ids",
-    "_consume_pre_resolved_harness_elicitation",
-    "_create_and_publish_antigravity_child",
-    "_create_and_publish_codex_child",
-    "_create_session_worktree",
-    "_delete_stored_session_bundle_after_failure",
-    "_derive_terminal_launch_args_from_spec",
-    "_descendant_sessions",
-    "_discovery_key",
-    "_dispatch_skill_slash_command_to_runner",
-    "_emit_server_routing_decision",
-    "_error_item_from_sse",
-    "_evaluate_output_policy",
-    "_extract_assistant_text_from_event",
-    "_extract_claude_native_runner_failure",
-    "_extract_persistent_item_from_sse",
-    "_extract_user_text_for_routing",
-    "_extract_user_text_from_event",
-    "_file_content_etag",
-    "_find_claude_native_subagent_child",
-    "_find_codex_native_subagent_child",
-    "_find_subagent_child_by_title",
-    "_flush_relay_text",
-    "_format_sse",
-    "_forward_approval_to_runner",
-    "_forward_session_change_to_runner",
-    "_get_runner_client",
-    "_get_runner_client_for_resource_access",
-    "_handle_advise_models_mcp",
-    "_handle_external_session_todos",
-    "_handle_mcp_tools_list",
-    "_host_model_options_via_registry",
-    "_if_none_match_matches",
-    "_invalidate_runner_backed_snapshot_state",
-    "_is_claude_native_subagent",
-    "_is_codex_native_subagent",
-    "_is_kiro_native_session",
-    "_last_task_error_from_labels",
-    "_latest_assistant_text_from_store",
-    "_latest_message_preview",
-    "_launch_runner_on_host",
-    "_load_agent_spec_for_session",
-    "_load_model_options",
-    "_load_model_options_from_host",
-    "_load_runner_skills",
-    "_mcp_error_response",
-    "_mcp_input_required_response",
-    "_mcp_ok_response",
-    "_mcp_tool_result",
-    "_merge_claude_permission_launch_args",
-    "_merge_pending_file_blocks",
-    "_message_text",
-    "_model_options_from_wire",
-    "_model_usage_bucket",
-    "_multipart_missing_detail",
-    "_native_ask_gate_lock",
-    "_native_coding_agent_for_agent",
-    "_native_coding_agent_for_session",
-    "_native_subagent_wrapper_labels_from_spec",
-    "_native_terminal_ensure_transport_error",
-    "_native_terminal_failure_from_runner_response",
-    "_native_terminal_name_for_harness",
-    "_notify_runner_of_bundled_child",
-    "_owner_from_grants",
-    "_parse_external_assistant_message",
-    "_parse_external_conversation_item",
-    "_parse_session_create_metadata",
-    "_parse_skill_slash_command",
-    "_pending_elicitation_snapshot_for_session",
-    "_permission_level_from_grants",
-    "_persist_external_assistant_message",
-    "_persist_external_codex_approval_mode_change",
-    "_persist_external_codex_collaboration_mode_change",
-    "_persist_external_model_change",
-    "_persist_external_model_options",
-    "_persist_external_permission_mode_change",
-    "_persist_external_reasoning_effort_change",
-    "_persist_external_session_title",
-    "_persist_external_subagent_start",
-    "_persist_native_policy_notice",
-    "_persist_policy_deny_sentinel",
-    "_persist_session_status_error_labels",
-    "_persist_stored_session_bundle",
-    "_pin_claude_permission_launch_args",
-    "_policy_notice_from_ensure_response",
-    "_poll_request_disconnect",
-    "_presentation_labels_for_agent",
-    "_presentation_labels_for_agent_impl",
-    "_priced_cost_for_display",
-    "_provision_managed_sandbox",
-    "_proxy_get_session_resources_to_runner",
-    "_prune_pre_resolved_harness_elicitations",
-    "_prune_session_read_state",
-    "_publish_and_persist_resource_event",
-    "_publish_btw_sidechat",
-    "_publish_changed_files_invalidated",
-    "_publish_codex_approval_mode",
-    "_publish_collaboration_mode",
-    "_publish_compaction_completed",
-    "_publish_compaction_failed",
-    "_publish_compaction_in_progress",
-    "_publish_elicitation_request_to_ancestors",
-    "_publish_elicitation_resolved",
-    "_publish_elicitation_resolved_to_ancestors",
-    "_publish_error_event",
-    "_publish_external_assistant_message",
-    "_publish_external_conversation_item",
-    "_publish_external_output_reasoning_delta",
-    "_publish_external_output_text_delta",
-    "_publish_external_tool_output_delta",
-    "_publish_input_consumed",
-    "_publish_input_deny_terminal",
-    "_publish_interrupted",
-    "_publish_mcp_startup",
-    "_publish_model_options",
-    "_publish_permission_mode",
-    "_publish_policy_denied",
-    "_publish_policy_deny",
-    "_publish_runner_skills",
-    "_publish_sandbox_status",
-    "_publish_session_created",
-    "_publish_session_superseded",
-    "_publish_status",
-    "_publish_terminal_pending",
-    "_query_host_runner_status",
-    "_read_state_entry",
-    "_read_upload_capped",
-    "_record_daily_cost",
-    "_registered_runner_id",
-    "_reject_reserved_cost_control_label_seed",
-    "_reject_server_reserved_label_seed",
-    "_relay_persist",
-    "_relay_persist_error_once",
-    "_remove_session_worktree_best_effort",
-    "_repl_terminal_ui_labels",
-    "_replace_text_in_message_body",
-    "_require_codex_approval_mode_forward",
-    "_require_collaboration_mode_forward",
-    "_require_cost_control_label_authority",
-    "_require_declared_subagent",
-    "_require_external_status_forward",
-    "_require_host_conn_for_worktree",
-    "_require_permission_mode_forward",
-    "_reset_runner_resources_after_switch",
-    "_reset_runner_resources_after_switch_impl",
-    "_resolve_harness",
-    "_resolve_llm_model",
-    "_resolve_skill_meta_text_via_runner",
-    "_resolve_subagent_spec",
-    "_resource_event_item_from_sse",
-    "_routing_decision_item_from_sse",
-    "_same_provider_family",
-    "_same_provider_family_impl",
-    "_seed_missing_title",
-    "_seed_missing_title_from_user_message",
-    "_session_status_from_cache",
-    "_session_status_with_child_rollup",
-    "_set_read_state",
-    "_signal_harness_elicitation_resolved_by_id",
-    "_signal_terminal_resolved_harness_elicitation",
-    "_spec_config_flag_explicitly_disabled",
-    "_spec_harness",
-    "_stop_session_host_runner",
-    "_stop_session_via_runner",
-    "_stored_file_to_resource",
-    "_stream_live_events",
-    "_structured_ask_user_question",
-    "_targeted_elicitation_event",
-    "_title_content_from_item",
-    "_truncate_label",
-    "_usage_by_model_for_display",
-    "_utc_day",
-    "_validate_external_reasoning_effort",
-    "_validate_session_workspace",
-    "_validate_terminal_launch_args",
-    "_validated_cost_control_mode_override",
-    "_validated_harness_override",
-    "_validated_harness_override_executor_type",
-    "_validated_spec_smart_routing_harness",
-    "_validated_subagent_routing_override",
-    "_wait_for_managed_runner_tunnel",
-    "_wait_for_runner_client",
-    "announce_hosts_changed",
-    "cancel_managed_launch_tasks",
-    "prefetch_session_routing_catalogs",
-]
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×º÷Tèµ©hºÚn¶X§zÍHˆˆ“ÝÙ\‹[^Y\ˆ[\œÈ›ÜˆHÙ\ÜÚ[ÛœÈ›Ý]\È
+Ø[Y\LJK‚‚“XY‹Û™X\‹[XYˆ[\œÈ^˜XÝYœ›ÛHÙ\ÜÚ[ÛœËœXˆÔÑH][HZ[\œËœX›\Ú\œË\œÚ\Ý[˜ÙK˜[Y][Û‹[™H[›™\‹Y›ÜØ\™š[Z]]™\Ë‚’[\ÜÈÚ\™YÝ]KØÛÛœÝ[Èœ›ÛH˜ÛÛ[[Û˜È[\ÜYžB˜›Ü˜Ú\Ý˜][Û˜[™žHH›Ý]\ˆ[ˆÙ\ÜÚ[ÛœËœXˆˆˆ‚‚™œ›ÛH×Ù]\™W×È[\Ü[››Ý][ÛœÂ‚š[\Ü\Þ[˜Ú[Âš[\ÜÛÛ^X‚š[\ÜœÛÛ‚š[\ÜX]š[\Ü™Bš[\ÜÙXÜ™]Âš[\Ü[YBš[\Ü\›X‹œ\œÙBš[\ÜÙXZÜ™Y‚™œ›ÛHÛÛXÝ[ÛœÈ[\Ü\]YB™œ›ÛHÛÛXÝ[ÛœË˜X˜È[\Ü
+ˆ\Þ[˜Ò]\˜]Ü‹ˆ]ØZ]X›KˆØ[X›KˆÛÜ›Ý][™Kˆ]\˜X›KˆX\[™ËˆÙ\]Y[˜ÙKŠB™œ›ÛH]XÛ\ÜÙ\È[\Ü]XÛ\ÜÂ™œ›ÛH\[™È[\Ü[žK]\˜[Ø\Ý‚š[\Ü™œ›ÛH˜\Ý\H[\Ü
+ˆ^Ù\[Û‹ˆ™\]Y\Ýˆ\ØYš[KŠB™œ›ÛH˜\Ý\Kœ™\ÜÛœÙ\È[\Ü™\ÜÛœÙB™œ›ÛHY[XÈ[\Ü˜[Y][Û‘\œ›Ü‚™œ›ÛHÜ[[Ú[^K™^È[\Ü[YÜš]Q\œ›Ü‹ÔS[Ú[^Q\œ›Ü‹Ý][Y[\œ›Ü‚‚™œ›ÛHÛ[šYÙ[˜ÛÙ^Ø\›Ý˜[Û[Ù\È[\ÜÓÑVÓUU‘WÔT“RTÔÒSÓ—ÕSQTÂ™œ›ÛHÛ[šYÙ[™‹][È[\ÜÙ[™\˜]WÝ\Ú×ÚY™œ›ÛHÛ[šYÙ[™[]Y\È[\Ü
+ˆTÑT—ÔÑTÔÒSÓ—ÕUWÓPVÐÒT”ËˆYÙ[ˆÛÛ™\œØ][Û‹ˆÛÛ™\œØ][Û’][Kˆ\œ›Ü‘]KˆY\ÜØYÙQ]Kˆ™]ÐÛÛ™\œØ][Û’][KˆÛ\ÚÛÛ[X[™]KˆÝÜ™Yš[KˆÞ[\Ú^™WØÛÛ™\œØ][Û—Ý]KŠB™œ›ÛHÛ[šYÙ[™[]Y\Ë˜ÛÛ™\œØ][Ûˆ[\Ü
+ˆUSWÕTWÕ×ÑUWÐÓËˆ\œÙWÚ][WÙ]KŠB™œ›ÛHÛ[šYÙ[™[]Y\Ëœ\›Z\ÜÚ[Ûˆ[\ÜÙ\ÜÚ[Û”\›Z\ÜÚ[Û‚™œ›ÛHÛ[šYÙ[™\œ›ÜœÈ[\Ü\œ›ÜÛÙKÛ[šYÙ[\œ›Ü‚™œ›ÛHÛ[šYÙ[š\›™\Ü×ÜYÚ[œÈ[\Ü
+ˆ˜]]™PÛÙ[™ÐYÙ[ŠB™œ›ÛHÛ[šYÙ[›[Ù[Ë›[Ù[ÛY]Y]H[\ÜÛÛ˜Ü™]WÜ™\ÜYÛ[Ù[™œ›ÛHÛ[šYÙ[›[Ù[Ë›[Ù[ÛÝ™\œšYH[\Ü˜[Y]WÛ[Ù[ÛÝ™\œšYB™œ›ÛHÛ[šYÙ[›˜]]™K›˜]]™WØÛÙ[™×ØYÙ[È[\Ü
+ˆ˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—Ú\›™\ÜËˆ˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—ÝÜ˜\\—ÛX™[ŠB™œ›ÛHÛ[šYÙ[œÛXÚY\Ë\\È[\Ü]˜[X][ÛÛÛ^™œ›ÛHÛ[šYÙ[œ[›™\‹šY[]H[\Ü
+ˆÚÙ[—Ø›Ý[™Ü[›™\—ÚYŠB™œ›ÛHÛ[šYÙ[œ[›™\‹›][˜ÚÙ˜Z[\™H[\ÜÛ\ÜÚYžWÛ˜]]™WÝ\›—Ù\œ›Ü‚™œ›ÛHÛ[šYÙ[œ[›™\‹œ›Ý][™È[\Ü[›™\”›Ý]\‚™œ›ÛHÛ[šYÙ[œ[›™\‹œÝX˜YÙ[Ü›Ý][™È[\Ü“ÕUS‘×ÑPÒTÒSÓ—ÓP‘SÒÑVB™œ›ÛHÛ[šYÙ[œ[›™\‹˜[œÜÜËÜ×Ý[›™[œ™YÚ\ÝžH[\Ü[›™[™YÚ\ÝžB™œ›ÛHÛ[šYÙ[œ[[YH[\Ü
+ˆÙ]ÜÛXÞWÜÝÜ™Kˆ[™›YÚÝ^ˆ[™[™×Ù[XÚ]][ÛœËˆ[™[™×Ú[œ]ËŠB™œ›ÛHÛ[šYÙ[œ[[YK˜YÙ[ØØXÚH[\ÜYÙ[ØXÚB™œ›ÛHÛ[šYÙ[œ[[YKœÛXÚY\Ë™[™Ú[™H[\ÜÛXÞQ[™Ú[™B™œ›ÛHÛ[šYÙ[œ[[YKÛÛÛÝ]][\ÜØ\ÝÛÛÛÝ]]™œ›ÛHÛ[šYÙ[œÙ\™\ˆ[\Ü™\Ù[˜ÙKÙ\ÜÚ[Û—Û]™WÜÝ]B™œ›ÛHÛ[šYÙ[œÙ\™\‹—Ù[XÚ]][Û—Ü™YÚ\ÝžH[\Ü
+ˆÚ\›™\Ü×Ù[XÚ]][Û—ÛÝÛ™\œËˆÚ\›™\Ü×Ü\šÙYÙ[XÚ]][ÛœËˆÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœËˆÔ™T™\ÛÛ™Y\›™\ÜÑ[XÚ]][Û‹ŠB™œ›ÛHÛ[šYÙ[œÙ\™\‹˜]][\Ü
+ˆU‘SÓÕÓ‘T‹ˆU‘SÔ‘PQˆ‘TÑT•‘QÕTÑT—ÔP“PËŠB™œ›ÛHÛ[šYÙ[œÙ\™\‹šÜÝÜ™YÚ\ÝžH[\ÜÜÝÛÛ›™XÝ[Û‹ÜÝ™YÚ\ÝžK[›™\‘^]™\ÜÂ™œ›ÛHÛ[šYÙ[œÙ\™\‹›X[˜YÙYÚÜÝÈ[\Ü
+ˆPSQÑQÔÐS‘“ÖÓP‘SÓSQTÔPÑKˆX[˜YÙYÜÝ][˜ÚˆX[˜YÙY][˜ÚˆX[˜YÙY][˜Ú˜XÚÙ\‹ˆX[˜YÙYØ[™›Þ\Þ[Y[ˆ™\ÕÛÜšÜÜXÙKŠB™œ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\Ë—Ø]]Ú[\œÈ[\Ü
+ˆ™\]Z\™WØXØÙ\ÜÈ\ÈÜ™\]Z\™WØXØÙ\ÜËŠB™œ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\Ë—ÚÜÝÝÛÜšÝ™YH[\ÜÜ™X]YÛÜšÝ™YB™œ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\Ë—ÜÙ\ÜÚ[Û—ØÜ™X]WÝ˜[Y][Ûˆ[\Ü
+ˆ˜[Y]WÙ^\Ý[™×ÚÜÝÝÛÜšÜÜXÙKŠB‚ˆÈÚ\™YÛÛœÝ[ËÝ]K[™ÛX[]XÛ\ÜÙ\È]™H[ˆHÜÙ\ÜÚ[ÛœË˜ÛÛ[[Û‚ˆÈXYˆ[Ù[NÈ[\Ü[H\™HÛÈ\È[Ù[H[™]È™KY^Ü\œÈÙYHHØ[YBˆÈØš™XÝËˆH]]X›HØXÚ\È\™HÚ\™YžH™Y™\™[˜ÙHXÜ›ÜÜÈHXÚØYÙK‚ˆÈ[[YHš[™[™ÜÈ]\ÝÈ]ÚÛˆH\ÝÜšXØ[Ù\ÜÚ[ÛœØ˜XØYH\™BˆÈ[\ÜYœ›ÛHÛÛ[[Ûˆ\È˜XØYKY[YØ][™È›ÞY\Ëˆ^HÝ^HÝ]ÙˆÛÛ[[Û‰ÜÂˆÈ×Ø[×Ø[™H˜XØYIÜÈ^XÚ]™KY^ÜË™\Ù\š[™È]È™X[[[YBˆÈš[™[™ÜÈÛÈH˜XØYK[]™[[ÛšÙ^\]Ú\ÈÛ›Ý\™Y[ˆ\È[Ù[HÛË‚™œ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\Ë—ÜÙ\ÜÚ[ÛœË˜ÛÛ[[Ûˆ[\Ü
+È›ÜXNˆBˆÐPÔÔÕPQÑS•ÑTÐÔ’TSÓ—ÓP‘SÒÑVKˆÐPÔÔÕPQÑS•ÒQÓP‘SÒÑVKˆÐS•QÔU’UWÓUU‘WÒT“‘TÔËˆÐS•QÔU’UWÓUU‘WÔÕPQÑS•ÐÐTÐÐQWÒQÓP‘SÒÑVKˆÐS•QÔU’UWÓUU‘WÔÕPQÑS•ÑTÔVWÑSPÒËˆÐS•QÔU’UWÓUU‘WÔÕPQÑS•Ô“ÓWÓP‘SÒÑVKˆÐS•QÔU’UWÓUU‘WÔÕPQÑS•ÕÓÓÐÐSÒQÓP‘SÒÑVKˆÐS•QÔU’UWÓUU‘WÔÕPQÑS•ÕTWÓP‘SÒÑVKˆÐS•QÔU’UWÓUU‘WÔÕPQÑS•ÕÔTT—ÓP‘SÕSQKˆÐT“ÕSÕTKˆÐÒSÔ‘U’QU×ÓSRUˆÐÓUQWÓUU‘WÑTÐÔ’TSÓ—ÓP‘SÒÑVKˆÐÓUQWÓUU‘WÑQUÕÓÓËˆÐÓUQWÓUU‘WÒT“‘TÔËˆÐÓUQWÓUU‘WÔT“RTÔÒSÓ—ÓSÑWÓP‘SÒÑVKˆÐÓUQWÓUU‘WÔT“RTÔÒSÓ—ÓSÑTËˆÐÓUQWÓUU‘WÔ‘PQP“WÔT“RTÔÒSÓ—ÓSÑTËˆÐÓUQWÓUU‘WÔ‘SQSP‘T—ÒS‘SQÒP“WÕÓÓËˆÐÓUQWÓUU‘WÔÕPQÑS•ÒQÓP‘SÒÑVKˆÐÓUQWÓUU‘WÔÕPQÑS•ÕÔTT—ÓP‘SÕSQKˆÐÓUQWÓUU‘WÕÓÓÕTÑWÒQÓP‘SÒÑVKˆÐÓUQWÓUU‘WÕRWÓP‘SÒÑVKˆÐÓUQWÓUU‘WÕRWÓP‘SÕSQKˆÐÓUQWÓUU‘WÕÔTT—ÓP‘SÒÑVKˆÐÓÑVÓUU‘WÐT“ÕSÓSÑWÓP‘SÒÑVKˆÐÓÑVÓUU‘WÐÓÓP“ÔUSÓ—ÓSÑWÓP‘SÒÑVKˆÐÓÑVÓUU‘WÐÓÓP“ÔUSÓ—ÓSÑTËˆÐÓÑVÓUU‘WÒT“‘TÔËˆÐÓÑVÓUU‘WÔÕPQÑS•ÑTÔVWÑSPÒËˆÐÓÑVÓUU‘WÔÕPQÑS•Ó’PÒÓSQWÓP‘SÒÑVKˆÐÓÑVÓUU‘WÔÕPQÑS•ÔT‘S•Õ‘PQÒQÓP‘SÒÑVKˆÐÓÑVÓUU‘WÔÕPQÑS•Ô“ÓTÓP‘SÒÑVKˆÐÓÑVÓUU‘WÔÕPQÑS•Ô“ÓWÓP‘SÒÑVKˆÐÓÑVÓUU‘WÔÕPQÑS•Õ‘PQÒQÓP‘SÒÑVKˆÐÓÑVÓUU‘WÔÕPQÑS•ÕÓÓÐÐSÒQÓP‘SÒÑVKˆÐÓÑVÓUU‘WÔÕPQÑS•ÕÔTT—ÓP‘SÕSQKˆÐÕT”ÓÔ—Ñ“Ô’×ÒTÕÔ–WÒT“‘TÔÑTËˆÐÕT”ÓÔ—ÓUU‘WÒT“‘TÔËˆÑS–WÔÑS•S‘SÔ‘Q’VˆÑSPÒUUSÓ—ÓSÑKˆÑVT“SÔÕUT×ÐTÔÒTÕS•ÔÐÐS—ÓSRUˆÑ“Ô’×ÒTÕÔ–WÓUU‘WÒT“‘TÔÑTËˆÒÓÒ×ÑSPÒUUSÓ—ÒQÔ‘KˆÒÔÕÓUSÒÔ‘TÕSÕSQSÕUÔËˆÒÒSRWÓUU‘WÒT“‘TÔËˆÓP‘SÕSQWÓPVÓS‹ˆÓTÕÕTÒ×ÑT”“Ô—ÐÐUTÑWÓP‘SÒÑVKˆÓTÕÕTÒ×ÑT”“Ô—ÐÓÑWÓP‘SÒÑVKˆÓTÕÕTÒ×ÑT”“Ô—ÓQTÔÐQÑWÓP‘SÒÑVKˆÓTÕÕTÒ×ÑT”“Ô—Ô‘SQQPUSÓ—ÓP‘SÒÑVKˆÓTÕÕTÒ×ÑT”“Ô—ÕUWÓP‘SÒÑVKˆÓPVÕT“RSSÓUSÒÐT‘×ÓS‹ˆÓPVÕT“RSSÓUSÒÐT‘ÔËˆÓSÑSÓÔSÓ”×ÑS‘ÒS•Ð–WÕÔTT‹ˆÓSÑSÕÒÑS—ÒÑVTËˆÓUU‘WÔÓPÖWÓ“ÕÑS‘“ÔÑQÐÓÑKˆÓUU‘WÕT“RSSÑS”ÕT‘WÑRSQÐÓÑKˆÔWÓUU‘WÕÔTT—ÓP‘SÕSQKˆÔ•S“‘T—ÐÓÓ•’PÕSÓ—ÔÓÔËˆÔ•S“‘T—Ñ“Ô•ÐT‘ÕSQSÕUˆÔÑT•‘T—ÔÕ‘PSWÑU‘S•ÐQTT‹ˆÔÑTÔÒSÓ—ÔÕ‘PSWÒPT•‘PUÒS•T•SÔËˆÔÒT‘QÑTÐÓÕ‘T–WÒÑVKˆÔÓTÒÐÓÓSPS‘ÕTKˆÔÕÔÔ•S“‘T—Ô‘TÕSÕSQSÕUÔËˆÔÕÔÔÑTÔÒSÓ—ÕTKˆÕT“—ÐPÕÔ—ÓP‘SˆÕRWÐQQÐQÑS•ÕUWÔ‘Q’VˆÕTÐQÔ‘PQÐÒS’×Ð–UTËˆÓÔÕÐÓÓ•“ÓÓÕ‘T”’QWÕSQTËˆÕPQÑS•Ô“ÕUS‘×ÓÕ‘T”’QWÕSQTËˆØØ][Ù×Ü™Y™]ÚÝ\ÚÜËˆÛÙÙÙ\‹ˆÛX[˜YÙYÛ][˜ÚÝ\ÚÜËˆÛ[Ù[ÛÜ[Ûœ×ØØXÚKˆÛ[Ù[ÛÜ[Ûœ×Ú[™›YÚˆÛ[Ù[ÛÜ[Ûœ×ÜÝ[KˆÛ˜]]™WØ\Ú×ÙØ]WÛØÚÜËˆÜ[™[™×ÜÛXÞWØ\Ú×ÝÜš]\ËˆÜ\ÚYÛ[Ù[ÛÜ[Ûœ×ØØXÚKˆÜ™XYÙ^XÚ]Ý[œ™XYˆÜ™XYÛ\ÝÜÙY[‹ˆÜ[›™\—ÜÚÚ[×ØØXÚKˆÜ[›™\—ÜÚÚ[×Ú[™›YÚˆÜ[›™\—ÜÚÚ[×ÜÝ[KˆÜÙ\ÜÚ[Û—ØXÝ]™WÜ™\ÜÛœÙWØØXÚKˆÜÙ\ÜÚ[Û—Ø˜XÚÙÜ›Ý[™Ý\Ú×ØÛÝ[ØØXÚKˆÜÙ\ÜÚ[Û—Ø˜XÚÙÜ›Ý[™Ý\ÚÜ×ØØXÚKˆÜÙ\ÜÚ[Û—ÛXÜÜÝ\\ØØXÚKˆÜÙ\ÜÚ[Û—ÜØ[™›ÞÜÝ]\×ØØXÚKˆÜÙ\ÜÚ[Û—ÜÝ]\×ØØXÚKˆÜÙ\ÜÚ[Û—Ý\›Z[˜[Ü[™[™×ØØXÚKˆÜÙ\ÜÚ[Û—ÝÙÜ×ØØXÚKˆZ[ÜÛXÞWÙ[™Ú[™KˆÙ]ØYÙ[ØØXÚKˆÙ]ØØ\ËˆÙ]ÜÙ\™\—ÚÜÝÜ™YÚ\ÝžKˆÙ]ÜÙ\™\—Ü[›™\—Ü›Ý]\‹ˆÙ\ÜÚ[Û—ÜÝ™X[KˆÙ]ÜÙ\™\—Ü[›™\—Ü›Ý]\‹ˆ\Ù\—ÜÙ\ÜÚ[Û—ÜÝ™X[KŠB™œ›ÛHÛ[šYÙ[œÙ\™\‹œØÚ[X\È[\Ü
+ˆ˜XÚÙÜ›Ý[™\ÚÒ[™›ËˆÚ[Ù\ÜÚ[Û”Ý[[X\žKˆÛÛ\]Y]™[ˆÜ™X]YÙ\ÜÚ[Û”™\ÜÛœÙKˆ\œ›Ü‘]Z[ˆ\œ›Ü‘]™[ˆXÜÙ\™\”Ý\\ˆ[Ù[\ØYÙKˆ˜]]™S[Ù[Ü[Û‹ˆÝ]]][QÛ™Q]™[ˆÝ]]^[Q]™[ˆÛXÞQ[šYY]™[ˆ™X\ÛÛš[™ÔÝ\Y]™[ˆ™X\ÛÛš[™Õ^[Q]™[ˆ™\ÜÛœÙSØš™XÝˆ™]žQ\œ›Ü‘]Z[ˆØ[™›ÞÝ]\ËˆÙ\ÜÚ[ÛÔÚYXÚ]]™[ˆÙ\ÜÚ[ÛÚ[Ù\ÜÚ[Û•\]Y]™[ˆÙ\ÜÚ[ÛÛÙ^\›Ý˜[[ÙQ]™[ˆÙ\ÜÚ[ÛÛÛX›Ü˜][Û“[ÙQ]™[ˆÙ\ÜÚ[ÛÜ™X]Y]™[ˆÙ\ÜÚ[ÛÜ™X]SY]Y]KˆÙ\ÜÚ[Û‘]™[[œ]ˆÙ\ÜÚ[Û‘Ú]Ü[ÛœËˆÙ\ÜÚ[Û’[œ]ÛÛœÝ[YY]™[ˆÙ\ÜÚ[Û’[œ]ÛÛœÝ[YY^[ØYˆÙ\ÜÚ[Û’[\œ\Y]™[ˆÙ\ÜÚ[Û’[\œ\Y^[ØYˆÙ\ÜÚ[Û“\Ý][KˆÙ\ÜÚ[Û“XÜÝ\\]™[ˆÙ\ÜÚ[Û“[Ù[]™[ˆÙ\ÜÚ[Û“[Ù[Ü[ÛœÑ]™[ˆÙ\ÜÚ[Û”\›Z\ÜÚ[Û“[ÙQ]™[ˆÙ\ÜÚ[Û”™X\ÛÛš[™ÑY™›Ü]™[ˆÙ\ÜÚ[Û”™\ÛÝ\˜ÙS\ÝYÙKˆÙ\ÜÚ[Û”™\ÛÝ\˜ÙTYÚ[˜]Y\ÝˆÙ\ÜÚ[Û”Ø[™›ÞÝ]\Ñ]™[ˆÙ\ÜÚ[Û”ÚÚ[Ñ]™[ˆÙ\ÜÚ[Û”Ý]\Ñ]™[ˆÙ\ÜÚ[Û”Ý\\œÙYY]™[ˆÙ\ÜÚ[Û•\›Z[˜[[™[™Ñ]™[ˆÙ\ÜÚ[Û•]Q]™[ˆÙ\ÜÚ[Û•ÙÜÑ]™[ˆÚÚ[Ý[[X\žKˆÛÛÝ]][Q]™[ŠB™œ›ÛHÛ[šYÙ[œÜXË\\È[\Ü
+ˆYÙ[ÜXËˆ\ÙKˆÛXÞPXÝ[Û‹ŠB™œ›ÛHÛ[šYÙ[œÝÜ™\È[\ÜYÙ[ÝÜ™KÛÛ™\œØ][Û”ÝÜ™B™œ›ÛHÛ[šYÙ[œÝÜ™\Ë˜\Y˜XÝÜÝÜ™H[\Ü\Y˜XÝÝÜ™B™œ›ÛHÛ[šYÙ[œÝÜ™\Ë˜ÛÛ™\œØ][Û—ÜÝÜ™H[\Ü
+ˆTÒU‘QÐUÓP‘SÒÑVKˆS“‘QÓP‘SÒÑVKˆÛÛ™\œØ][Û“›Ý›Ý[™\œ›Ü‹ˆ˜[YP[™XYQ^\ÝÑ\œ›Ü‹ŠB™œ›ÛHÛ[šYÙ[œÝÜ™\ËšÜÝÜÝÜ™H[\ÜÜÝÜÝÝÜ™B™œ›ÛHÛ[šYÙ[œÝÜ™\Ëœ\›Z\ÜÚ[Û—ÜÝÜ™H[\Ü\›Z\ÜÚ[Û”ÝÜ™B™œ›ÛHÛ[šYÙ[][˜ÛÜÝÜ[ˆ[\Ü
+ˆÓÔÕÐÓÓ•“ÓÓP‘SÓSQTÔPÑKˆ™\Ù\™YØÛÜÝØÛÛ›ÛÚÙ^\ËŠB™œ›ÛHÛ[šYÙ[][œ™X\ÛÛš[™×ÙY™›Ü[\Ü
+ˆQ‘“Ô•ÕSQTËˆ˜[Y]WÙY™›ÜŠB™œ›ÛHÛ[šYÙ[][œÙ\ÜÚ[Û—ÛY™XÞXÛH[\Ü
+ˆX™[×ÝÚ]ØÛÜÙYÜÝ]\Ëˆ]WÝÚ]Ý]ØÛÜÙYÛX\šÙ\‹ŠB‚‚™YˆØÛÙ^Ü[—Û[ÙWÙ[˜X›Y
+[ÙNˆÝŠHOˆ›ÛÛ‚ˆˆˆ‚ˆÛÛ™\H˜[Y]YÛÙ^ÛÛX›Ü˜][Ûˆ[ÙHÚ[™ÈHRKY˜XÚ[™È›YË‚‚ˆœ\˜[H[ÙNˆÛÙ^ÛÛX›Ü˜][Ûˆ[ÙHÚ[™K™Ëˆœ[ˆ˜Ü‚ˆ™Y˜][˜‚ˆœ™]\›œÎˆYX›Üˆ[ˆ[ÙK‚ˆˆˆ‚ˆ™]\›ˆ[ÙHOHœ[ˆ‚‚‚™YˆÜX›\ÚØÛÛX›Ü˜][Û—Û[ÙJÙ\ÜÚ[Û—ÚYˆÝ‹[ÙNˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚH]™HÛÛX›Ü˜][Û‹[[ÙH›ÜˆHÙ\ÜÚ[Û‹‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H[ÙNˆHXÝ]™HÛÛX›Ü˜][Ûˆ[ÙHÝš[™ËK™Ë‚ˆœ[ˆ˜Üˆ™Y˜][˜‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆ]™[HÙ\ÜÚ[ÛÛÛX›Ü˜][Û“[ÙQ]™[
+ˆ\OHœÙ\ÜÚ[Û‹˜ÛÛX›Ü˜][Û—Û[ÙH‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆ[ÙO[[ÙKˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚™YˆÜX›\ÚÜ\›Z\ÜÚ[Û—Û[ÙJÙ\ÜÚ[Û—ÚYˆÝ‹[ÙNˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚH]™HÛ]YK[˜]]™H\›Z\ÜÚ[Ûˆ[ÙH›ÜˆHÙ\ÜÚ[Û‹‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H[ÙNˆHXÝ]™H\›Z\ÜÚ[Ûˆ[ÙKK™Ëˆ˜]]È˜‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆ]™[HÙ\ÜÚ[Û”\›Z\ÜÚ[Û“[ÙQ]™[
+ˆ\OHœÙ\ÜÚ[Û‹œ\›Z\ÜÚ[Û—Û[ÙH‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆ\›Z\ÜÚ[Û—Û[ÙO[[ÙKˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚™YˆÜX›\ÚØÛÙ^Ø\›Ý˜[Û[ÙJÙ\ÜÚ[Û—ÚYˆÝ‹[ÙNˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚH]™HÛÙ^[˜]]™H\›Ý˜[ÜØ[™›Þ[ÙH›ÜˆHÙ\ÜÚ[Û‹‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H[ÙNˆHXÝ]™H\›Ý˜[[ÙKK™Ëˆœ™XY[Û›H˜‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆ]™[HÙ\ÜÚ[ÛÛÙ^\›Ý˜[[ÙQ]™[
+ˆ\OHœÙ\ÜÚ[Û‹˜ÛÙ^Ø\›Ý˜[Û[ÙH‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆ\›Ý˜[Û[ÙO[[ÙKˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚™YˆÜX›\ÚÜÛXÞWÙ[šYY
+Ù\ÜÚ[Û—ÚYˆÝ‹™X\ÛÛŽˆÝ‹\ÙNˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚH˜]]™HÛXÞKQS–HÚYÛ˜[ÛˆHÙ\ÜÚ[ÛˆÝ™X[K‚‚ˆH˜]]™H\›™\ÜÉÜÈÛXÞHS–H\ÈXÚYYÞ[˜Ú›Û›Ý\ÛH[ˆBˆÜÛXÚY\ËÙ]˜[X]XÛÚÈ™\ÜÛœÙKÛÈ›Ý[™ÈÛˆHÝ™X[HÝ\Ú\ÙBˆ™Y›XÝÈ][ˆXÝ[ÛˆØ\È›ØÚÙYˆ\ÈÝ\™˜XÙ\ÈHXÚ\Ú[Ûˆ\ÈBˆÜÚ]]™H]™[›ÜˆØœÙ\™\œÈ
+ÙXˆRKØ\Xš[]H™[˜Ú
+Kˆš\™KX[™Y›Ü™Ù]‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H™X\ÛÛŽˆ[žH™X\ÛÛˆœ›ÛHHXÚY[™ÈÛXÞK‚ˆœ\˜[H\ÙNˆHÛXÞH\ÙHHS–H[™YÛ‹K™ËˆÛÛØØ[˜‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆ]™[HÛXÞQ[šYY]™[
+ˆ\OHœ™\ÜÛœÙKœÛXÞWÙ[šYY‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆ™X\ÛÛ\™X\ÛÛ‹ˆ\ÙO\\ÙKˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚™YˆØ[Ý×Ø]]×Û[ÙWÙ[YÚX›JÛÛÛ˜[YNˆÝ‹\›Z\ÜÚ[Û—Û[ÙNˆÝˆ›Û™JHOˆ›ÛÛ‚ˆˆˆ‚ˆÚ]\ˆH™YÝ[\ˆÛ]YH\›Z\ÜÚ[Ûˆ›Û\X^HÙ™™\ˆHÙ\ÜÚ[Û‹\ØÛÜY]]Ë[[ÙHÝÚ]Ú‚‚ˆ™]\Ù\ÈH™[Y[X™\‹Z[™[YÚX›HÙ]Ûˆ\œÜÙNˆÜÙH\™H^XÝHBˆ™\ÜÚÙKXØ\™ÛÛÈ
+^][“[ÙK\ÚÕ\Ù\”]Y\Ý[ÛŠHÚ]Z\ˆÝÛ‚ˆ\›Ý˜[›ÝÜËÚ\™HHÙ[™\šXÈ]]Ë[[ÙH]Ûˆ™]™\ˆ™[Û™ÜË‚‚ˆœ\˜[HÛÛÛ˜[YNˆHØ]YÛÛœ›ÛHÛ]YIÜÈ\›Z\ÜÚ[Û”™\]Y\Ý^[ØY‚ˆœ\˜[H\›Z\ÜÚ[Û—Û[ÙNˆÛ]YIÜÈÝ\œ™[\›Z\ÜÚ[Ûˆ[ÙKÜˆ›Û™HÚ[ˆXœÙ[‚ˆœ™]\›œÎˆYH›ÜˆÛÛ\›Ý˜[ÈÝ]ÚYH[›š[™È[™[™XYKX]]ÛX]XÈ[Ù\Ë‚ˆˆˆ‚ˆ™]\›ˆÛÛÛ˜[YH›Ý[ˆÐÓUQWÓUU‘WÔ‘SQSP‘T—ÒS‘SQÒP“WÕÓÓÈ[™\›Z\ÜÚ[Û—Û[ÙH[ˆ
+ˆ›Û™Kˆ™Y˜][‹ˆ˜XØÙ\Y]È‹ˆ
+B‚‚™YˆØ[Ý×Ø[ÙY]×Ù[YÚX›JÛÛÛ˜[YNˆÝ‹\›Z\ÜÚ[Û—Û[ÙNˆÝˆ›Û™JHOˆ›ÛÛ‚ˆˆˆ‚ˆÚ]\ˆHÛ]YK[˜]]™H\›Z\ÜÚ[Û”™\]Y\ÝX^HÙ™™\ˆÈÛ›ÜˆBˆXØÙ\	ˆ[ÝÈ[Y]ÈˆY™›Ü™[˜ÙK‚‚ˆ[YÚX›H›Üˆš[KYY][™ÈÛÛÈ[™\ˆH[ÙH]Ý[›Û\Ëˆ[™›Üˆ^][“[ÙX8 %XØÙ\[™ÈH[ˆÚ]H›YÈ\ÈBˆ[ˆØ\™	ÜÈ–Y\Ë[™\ÙH]]È[ÙHˆÜ[Ûˆ
+^][ˆ[ÙHS‘ˆÝÚ]ÚHÙ\ÜÚ[Ûˆ[ÈÛ]YIÜÈ]]Ø[ÙJK‚ˆ[™XYK\\›Z\ÜÚ]™H[Ù\È
+XØÙ\Y]ØÈž\\ÜÔ\›Z\ÜÚ[ÛœØ
+BˆÛÝ[‰Ý›Û\][ÛÈHÝÚ]ÚÛÝ[™H[™\ˆ\ÙY]“ÕˆHÝ[\Ú]H
+š]™\ÈHRH]ÛŠH[™H™\™XÝÚ]H
+Ø]\ÂˆHÙ][ÙXXÚ\Ú[ÛŠKÛÈHÙ\™\ˆ™]™\ˆÛ›ÜœÈBˆÛY[\Ý\YY[Ý×Ø[ÙY]Ø›YÈÛˆHÛÛÛ[ÙHBˆY™›Ü™[˜ÙHØ\È™]™\ˆÙ™™\™Y›Ü‹‚‚ˆœ\˜[HÛÛÛ˜[YNˆHØ]YÛÛœ›ÛHÛ]YIÜÈ\›Z\ÜÚ[Û”™\]Y\Ýˆ^[ØYK™Ëˆ‘Y]˜Üˆ˜\Ú˜‚ˆœ\˜[H\›Z\ÜÚ[Û—Û[ÙNˆÛ]YIÜÈÝ\œ™[\›Z\ÜÚ[Ûˆ[ÙHœ›ÛHBˆ^[ØYK™Ëˆ™Y˜][˜Èœ[ˆ˜È˜XØÙ\Y]È˜Âˆ›Û™XÚ[ˆXœÙ[‚ˆœ™]\›œÎˆYXY™ˆHY™›Ü™[˜ÙH\Y\Ë‚ˆˆˆ‚ˆ™]\›ˆ
+ˆÛÛÛ˜[YH[ˆÐÓUQWÓUU‘WÑQUÕÓÓÈÜˆÛÛÛ˜[YHOH‘^][“[ÙH‚ˆ
+H[™\›Z\ÜÚ[Û—Û[ÙH›Ý[ˆ
+ˆ˜XØÙ\Y]È‹ˆ˜ž\\ÜÔ\›Z\ÜÚ[ÛœÈ‹ˆ
+B‚‚™YˆØ[Ý×Ü™[Y[X™\—Ù[YÚX›JÛÛÛ˜[YNˆÝ‹\›Z\ÜÚ[Û—Û[ÙNˆÝˆ›Û™JHOˆ›ÛÛ‚ˆˆˆ‚ˆÚ]\ˆHÛ]YK[˜]]™H\›Z\ÜÚ[Û”™\]Y\ÝX^HÙ™™\ˆÈÛ›ÜˆBˆ\œÚ\Ý[™Û‰Ý\ÚÈYØZ[ˆˆY™›Ü™[˜ÙH8 %HÙ\ÜÚ[Û‹\ØÛÜY[ÝÂˆ[H›ÜˆHØ]YÛÛ
+ÙX‘™]ÚÛXZ[‹ÜˆÛÛ]ÚYHÝ\Ú\ÙJK‚‚ˆ\È™\ÝÜ™\È˜]]™HÛ]YHÛÙH\š]H›Üˆ“Ó‹YY]ÛÛÎˆBˆ˜]]™HRH]ÈH\Ù\ˆ\›Ý™HHÛÛÙÛXZ[ˆÛ˜ÙH[™YÈ[‚ˆ[ÝÈ[HÛÈØ[YK\ØÛÜHØ[ÈÝÜ›Û\[™ËˆHÙXˆRH\ÙYÂˆÛÛ\ÙH]™\žH›Û\[Èš[˜\žH\›Ý™KÔ™Z™XÝ[™™]™\ˆÜ›ÝHBˆ[KÛÈK™ËˆXXÚÙX‘™]Ú8 %]™[ˆØ[YKYÛXZ[ˆÚ]X‹˜ÛÛHT“È8 %ˆ™K\›Û\Y›Ü™]™\‹‚‚ˆ[YÚX›H›Üˆ[žHÛÛ]TÓ‰Õ[ˆY]ÛÛ
+ÜÙHZÙHBˆXØÙ\Y]ØÙ][ÙX]
+H[™\Û‰ÝÛ™HÙˆHÛÛÈÚ]Bˆ™\ÜÚÙHØ\™
+ÙYHÐÓUQWÓUU‘WÔ‘SQSP‘T—ÒS‘SQÒP“WÕÓÓØ
+Kˆ[™\ˆ[žH[ÙH]Ý[›Û\Ëˆž\\ÜÔ\›Z\ÜÚ[ÛœØ™]™\‚ˆ›Û\È
+HÛÚÈÙ\Û‰Ý]™[ˆš\™JKÛÈH[H\™HÛÝ[™Bˆ[™\ˆ\ÙY]“ÕHÝ[\Ú]H
+š]™\ÈHRH]ÛŠH[™Bˆ™\™XÝÚ]H
+Ø]\ÈHY[\ØXÚ\Ú[ÛŠKÛÈHÙ\™\ˆ™]™\‚ˆÛ›ÜœÈHÛY[\Ý\YY™[Y[X™\˜›YÈÛˆHÛÛÛ[ÙHBˆY™›Ü™[˜ÙHØ\È™]™\ˆÙ™™\™Y›Ü‹‚‚ˆœ\˜[HÛÛÛ˜[YNˆHØ]YÛÛœ›ÛHÛ]YIÜÈ\›Z\ÜÚ[Û”™\]Y\Ýˆ^[ØYK™Ëˆ•ÙX‘™]Ú˜Üˆ˜\Ú˜‚ˆœ\˜[H\›Z\ÜÚ[Û—Û[ÙNˆÛ]YIÜÈÝ\œ™[\›Z\ÜÚ[Ûˆ[ÙHœ›ÛHBˆ^[ØYK™Ëˆ™Y˜][˜Èœ[ˆ˜È˜XØÙ\Y]È˜Âˆ›Û™XÚ[ˆXœÙ[‚ˆœ™]\›œÎˆYXY™ˆHY™›Ü™[˜ÙH\Y\Ë‚ˆˆˆ‚ˆ™]\›ˆ
+ˆÛÛÛ˜[YH›Ý[ˆÐÓUQWÓUU‘WÑQUÕÓÓÂˆ[™ÛÛÛ˜[YH›Ý[ˆÐÓUQWÓUU‘WÔ‘SQSP‘T—ÒS‘SQÒP“WÕÓÓÂˆ[™\›Z\ÜÚ[Û—Û[ÙHOH˜ž\\ÜÔ\›Z\ÜÚ[ÛœÈ‚ˆ
+B‚‚™YˆØÛ]YWÛ˜]]™WÜ™[Y[X™\—ÚÜÝ
+ÛÛÛ˜[YNˆÝ‹ÛÛÚ[œ]ˆ[žJHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ\š]™HHÛXZ[ˆÜÝ]HÙX‘™]Ú™Û‰Ý\ÚÈYØZ[ˆˆ[HÚÝ[ˆØÛÜHËœ›ÛHHØ]YÛÛ	ÜÈ[œ]‚‚ˆ›ÜˆÙX‘™]ÚH\œÚ\Ý[[H\ÈØÛÜYÈH™\]Y\Ý	ÜÂˆÜÝ
+ÙX‘™]Ú
+ÛXZ[ŽÜÝŠX[ˆÛ]YH[HÞ[^
+KÛÂˆ\›Ýš[™ÈÎ‹ËÙÚ]X‹˜ÛÛKØKØ˜ÝÜÈ›Û\[™È›Ü‚ˆÎ‹ËÙÚ]X‹˜ÛÛKØËÙÛÈ8 %]›Ý›ÜˆÝ\ˆÛXZ[œËˆ[žBˆÝ\ˆÛÛ
+ÜˆHÙX‘™]ÚÚ]HZ\ÜÚ[™ËÝ[œ\œÙXX›HT“
+H™]\›œÂˆ›Û™XÚXÚHØ[\œÈ™X]\ÈHÛÛ]ÚYHØÛÜK‚‚ˆÛ›HÈØT“ÈZY[HÛXZ[ˆØÛÜNˆÙX‘™]ÚˆÛXZ[ˆ\›Z\ÜÚ[ÛœÈ\™HÙ[X[XØ[H
+ÊK[ÜšY[YÛÈBˆ›Û‹RØÚ[YH
+‹ËØš[N‹ËØ8 )ŠH˜[È˜XÚÈÈBˆÛÛ]ÚYH[H˜]\ˆ[ˆ\œÚ\Ý[™ÈHÛXZ[ŽÜÝ˜]ˆÛÝ[™]™\ˆX]ÚH™X[™]Ú‚‚ˆœ\˜[HÛÛÛ˜[YNˆHØ]YÛÛœ›ÛHÛ]YIÜÈ\›Z\ÜÚ[Û”™\]Y\Ýˆ^[ØY‚ˆœ\˜[HÛÛÚ[œ]ˆHÛÛ	ÜÈ[œ]XÝ
+›Û™XÛ›Û‹YXÝÛ\˜]Y
+K‚ˆœ™]\›œÎˆHÝÙ\˜Ø\ÙYÜÝ
+›ÈÜ
+Kœ˜XÚÙ]YÚ[ˆ]\È[ˆT‚ˆ]\˜[
+ÌŒN™ŽŽŒWX
+KÜˆ›Û™XÚ[ˆ›ÈÛXZ[ˆØÛÜBˆ\Y\Ë‚ˆˆˆ‚ˆYˆÛÛÛ˜[YHOH•ÙX‘™]ÚˆÜˆ›Ý\Ú[œÝ[˜ÙJÛÛÚ[œ]XÝ
+N‚ˆ™]\›ˆ›Û™Bˆ\›HÛÛÚ[œ]™Ù]
+\›ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ\›ÝŠHÜˆ›Ý\›‚ˆ™]\›ˆ›Û™BˆžN‚ˆ\œÙYH\›X‹œ\œÙK\›\œÙJ\›
+Bˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆ›Û™BˆYˆ\œÙYœØÚ[YK›ÝÙ\Š
+H›Ý[ˆ
+š‹šÈŠN‚ˆ™]\›ˆ›Û™BˆÜÝH\œÙYšÜÝ˜[YBˆYˆ›ÝÜÝ‚ˆ™]\›ˆ›Û™BˆÈ\›\œÙH[™XYHÝÙ\˜Ø\Ù\ÈÜÝ˜[YX[™Ýš\ÈHÜ[™ˆÈ[žH\Ù\š[™›ÎÈÝÙ\Š
+HYØZ[ˆXZÙ\ÈHØÝ[Y[Y[˜\šX[^XÚ]‚ˆÜÝHÜÝ›ÝÙ\Š
+BˆÈ\›\œÙHÝš\ÈHœ˜XÚÙ]ÈÙ™ˆ[ˆTˆ]\˜[]]Üš]BˆÈ
+ÌŒN™ŽŽŒWX8¡¤ˆŒN™ŽŽŒX
+K]Û]YIÜÂˆÈÛXZ[ŽÜÝ˜[HÜ˜[[X\ˆ\ÈÛÛÛ‹Y[[Z]YÛÈH˜\™BˆÈÛÛÛ‹[Y[ˆTˆ]ÛH\œÚ\ÝÈHœ›ÚÙ[‹Ú[™\[H
+H\Ù\‚ˆÈÛXÚÜÈ™Û‰Ý\ÚÈYØZ[ˆˆ[™ÙY\ÈÙ][™È›Û\Y
+KˆH™YÚ\Ý\™YˆÈÛXZ[ˆ˜[YHØ[ˆ™]™\ˆÛÛZ[ˆHÛÛÛ‹ÛÈH˜\™H\È[‚ˆÈ[˜[XšYÝ[Ý\ÈTˆ]\˜[8 %™KXœ˜XÚÙ]]ÛÈH[Z]Y[H\ÂˆÈÛXZ[Ž–ÌŒN™ŽŽŒWX‚ˆYˆŽˆˆ[ˆÜÝ‚ˆ™]\›ˆˆ–ÞÚÜÝWH‚ˆ™]\›ˆÜÝ‚‚™YˆÜ™XYÜÝ]WÙ[žJ\Ù\—ÚYˆÝˆ›Û™KÙ\ÜÚ[Û—ÚYˆÝŠHOˆ\VÚ[›Û™K›ÛÛN‚ˆˆˆ‚ˆ™XYHØ[\‰ÜÈ™XY\Ý]H›ÜˆÛ™HÙ\ÜÚ[Û‹›Üˆ[X™Y[™È[ˆBˆ\‹]\Ù\ˆÑUÝŒKÜÙ\ÜÚ[ÛœØ\Ý][\Ë‚‚ˆœ\˜[H\Ù\—ÚYˆ]][XØ]Y\Ù\ˆYÜˆ›Û™X[ˆÚ[™ÛK]\Ù\ˆ[ÙK‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ™]\›œÎˆ
+\ÝÜÙY[‹[œ™XY
+X8 %HØ[XÛØÚÈ˜\Ù[[™H
+Üˆ›Û™XˆÚ[ˆH\Ù\ˆ\È™]™\ˆÙY[ˆHÙ\ÜÚ[ÛŠH[™H^XÚ]][œ™XY›YË‚ˆˆˆ‚ˆÙ^HHÙ\ØÛÝ™\žWÚÙ^J\Ù\—ÚY
+Bˆ\ÝÜÙY[ˆHÜ™XYÛ\ÝÜÙY[‹™Ù]
+Ù^KßJK™Ù]
+Ù\ÜÚ[Û—ÚY
+Bˆ[œ™XYHÙ\ÜÚ[Û—ÚY[ˆÜ™XYÙ^XÚ]Ý[œ™XY™Ù]
+Ù^KÙ]
+
+JBˆ™]\›ˆ\ÝÜÙY[‹[œ™XY‚‚™YˆÜÙ]Ü™XYÜÝ]J\Ù\—ÚYˆÝˆ›Û™KÙ\ÜÚ[Û—ÚYˆÝ‹\ÝÜÙY[Žˆ[[œ™XYˆ›ÛÛ
+HOˆ›Û™N‚ˆˆˆ‚ˆÙ]HØ[\‰ÜÈ™XY\Ý]H›ÜˆÛ™HÙ\ÜÚ[Û‹‚‚ˆœ\˜[H\Ù\—ÚYˆ]][XØ]Y\Ù\ˆYÜˆ›Û™X[ˆÚ[™ÛK]\Ù\ˆ[ÙK‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H\ÝÜÙY[ŽˆØ[XÛØÚÈ˜\Ù[[™H[ˆÙXÛÛ™Ë‚ˆœ\˜[H[œ™XYˆÚ]\ˆHÙ\ÜÚ[Ûˆ\È^XÚ]H›YÙÙY[œ™XY‚ˆˆˆ‚ˆÙ^HHÙ\ØÛÝ™\žWÚÙ^J\Ù\—ÚY
+BˆÜ™XYÛ\ÝÜÙY[‹œÙ]Y˜][
+Ù^KßJVÜÙ\ÜÚ[Û—ÚYHH\ÝÜÙY[‚ˆYˆ[œ™XY‚ˆÜ™XYÙ^XÚ]Ý[œ™XYœÙ]Y˜][
+Ù^KÙ]
+
+JK˜Y
+Ù\ÜÚ[Û—ÚY
+Bˆ[ÙN‚ˆ[œ™XYÜÙ]HÜ™XYÙ^XÚ]Ý[œ™XY™Ù]
+Ù^JBˆYˆ[œ™XYÜÙ]\È›Ý›Û™N‚ˆ[œ™XYÜÙ]™\ØØ\™
+Ù\ÜÚ[Û—ÚY
+B‚‚™YˆÜ[™WÜÙ\ÜÚ[Û—Ü™XYÜÝ]JÙ\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆ›ÜHÙ\ÜÚ[Û‰ÜÈ™XY\Ý]Hœ›ÛH]™\žH\Ù\‰ÜÈØXÚ\Ë‚‚ˆØ[YÚ[ˆHÙ\ÜÚ[ÛˆX]™\ÈHY˜][šY]È›ÜˆÛÛÙ8 %Ûˆ[]K[™ˆÛˆ\˜Ú]™H
+\˜Ú]™YÙ\ÜÚ[ÛœÈ\™HY[ˆ[™™]™\ˆÚÝÈH[œ™XYÝ
+K‚ˆ\È›Ý[™ÈHÝ\Ú\ÙK[[Û›ÝÛšXÈÜ™XYÛ\ÝÜÙY[˜Ü›ÝÝÈ]™Kˆ›Û‹X\˜Ú]™YÙ\ÜÚ[ÛœËˆ™XY\Ý]H\ÈHÙ\ÜÚ[Û‹[]™[™[[Ý˜[
+HÙ\ÜÚ[Û‚ˆ\ÈÛÛ™KØ\˜Ú]™Y›Üˆ]™\ž[Û™JKÛÈ]ÛX\œÈXÜ›ÜÜÈ[\Ù\œËˆ[˜\˜Ú]š[™ÂˆÙ\È“Õ™\ÝÜ™HHš[ÜˆÝ]H8 %HÙ\ÜÚ[Ûˆ™XYÈ\ÈÙY[‹ÚXÚ\ÈBˆ[[™Y™Û™HÚ]]ˆÙ[X[XÜÈÙˆ\˜Ú]š[™Ë‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆˆˆ‚ˆ›ÜˆÙY[ˆ[ˆÜ™XYÛ\ÝÜÙY[‹˜[Y\Ê
+N‚ˆÙY[‹œÜ
+Ù\ÜÚ[Û—ÚY›Û™JBˆ›Üˆ[œ™XY[ˆÜ™XYÙ^XÚ]Ý[œ™XY˜[Y\Ê
+N‚ˆ[œ™XY™\ØØ\™
+Ù\ÜÚ[Û—ÚY
+B‚‚™YˆÙ\ØÛÝ™\žWÚÙ^J\Ù\—ÚYˆÝˆ›Û™JHOˆÝŽ‚ˆˆˆ‚ˆX\[ˆ
+Ü[Û˜[
+H\Ù\ˆYÈH›[Ù˜\Ù\—ÜÙ\ÜÚ[Û—ÜÝ™X[XÚ[›™[Ù^K‚‚ˆœ\˜[H\Ù\—ÚYˆ]][XØ]Y\Ù\ˆYK™Ëˆ˜[XÙP^[\K˜ÛÛH˜Ü‚ˆ›Û™X[ˆÚ[™ÛK]\Ù\ˆÈ›ËX]][ÙK‚ˆœ™]\›œÎˆ\Ù\—ÚYÚ[ˆÙ][ÙH™]N˜ÔÒT‘QÑTÐÓÕ‘T–WÒÑVX‚ˆˆˆ‚ˆ™]\›ˆ\Ù\—ÚYYˆ\Ù\—ÚY\È›Ý›Û™H[ÙHÔÒT‘QÑTÐÓÕ‘T–WÒÑVB‚‚™YˆØ[››Ý[˜ÙWÜÙ\ÜÚ[Û—ØYY
+\Ù\—ÚYˆÝˆ›Û™KÙ\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆ\ÚHÙ\ÜÚ[Û—ØYY\ØÛÝ™\žH]™[ÈH\Ù\‰ÜÈ\]\ÈÝ™X[\Ë‚‚ˆØ[YY\ˆHÙ\ÜÚ[Ûˆ™XÛÛY\ÈXØÙ\ÜÚX›HÈ\Ù\—ÚY
+Ü™X]Y›ÜšÙYˆÜˆÚ\™Y
+HÛÈ]\Ù\‰ÜÈÜ[ˆXœÈÝ\™˜XÙH]Ú]Ý]H\ÝÛˆH›Ë[ÜˆÚ[ˆH\Ù\ˆ\È›ÈÝ™X[HÛÛ›™XÝY‚‚ˆœ\˜[H\Ù\—ÚYˆH\Ù\ˆHÙ\ÜÚ[Ûˆ\È›ÝÈXØÙ\ÜÚX›HÈ
+HÝÛ™\ˆÛ‚ˆÜ™X]KÙ›ÜšËHÜ˜[YHÛˆÚ\™JKÜˆ›Û™X[ˆÚ[™ÛK]\Ù\ˆ[ÙK‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆH™]ÛKXXØÙ\ÜÚX›HÙ\ÜÚ[ÛˆYK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆˆˆ‚ˆ\Ù\—ÜÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+ˆÙ\ØÛÝ™\žWÚÙ^J\Ù\—ÚY
+KÈ\HŽˆœÙ\ÜÚ[Û—ØYY‹œÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYBˆ
+B‚‚™Yˆ[››Ý[˜ÙWÚÜÝ×ØÚ[™ÙY
+\Ù\—ÚYˆÝˆ›Û™JHOˆ›Û™N‚ˆˆˆ‚ˆ\ÚHÜÝ×ØÚ[™ÙY]™[ÈH\Ù\‰ÜÈÙ\ÜÚ[Û‹]\]\ÈÝ™X[\Ë‚‚ˆØ[YÚ[ˆHÜÝÝÛ™YžH\Ù\—ÚYÛÛ›™XÝÈÜˆ\ØÛÛ›™XÝÈÛÈBˆÛY[[˜[Y]\È]ÈÜÝÈØXÚHÚ]Ý]Û[™ËˆH›Ë[ÜÚ[ˆH\Ù\‚ˆ\È›ÈÝ™X[HÛÛ›™XÝY‚‚ˆœ\˜[H\Ù\—ÚYˆÝÛ™\ˆÙˆHÜÝ]Ú[™ÙYÜˆ›Û™X[‚ˆÚ[™ÛK]\Ù\ˆ[ÙK‚ˆˆˆ‚ˆ\Ù\—ÜÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ØÛÝ™\žWÚÙ^J\Ù\—ÚY
+KÈ\HŽˆšÜÝ×ØÚ[™ÙYŸJB‚‚™Yˆ[››Ý[˜ÙWÜ›Ú™XÝ×ØÚ[™ÙY
+\Ù\—ÚYˆÝˆ›Û™JHOˆ›Û™N‚ˆˆˆ‚ˆ\ÚH›Ú™XÝ×ØÚ[™ÙY]™[ÈH\Ù\‰ÜÈÙ\ÜÚ[Û‹]\]\ÈÝ™X[\Ë‚‚ˆØ[YY\ˆÛ™HÙˆ\Ù\—ÚY	ÜÈ›Ú™XÝÈ\ÈÜ™X]Y\]Y
+™[˜[YYˆÛÛ™šYÈÚ[™ÙJKÜˆ[]YÛÈ]\Ù\‰ÜÈÝ\ˆÛÛ›™XÝYÛY[È™Yœ™\ÚˆZ\ˆ›Ú™XÝÈØXÚH[œÝXYÙˆÚÝÚ[™ÈHÝ[H˜[YH[[H™[ØYˆBˆ›Ë[ÜÚ[ˆH\Ù\ˆ\È›ÈÝ™X[HÛÛ›™XÝY‚‚ˆœ\˜[H\Ù\—ÚYˆÝÛ™\ˆÙˆH›Ú™XÝ]Ú[™ÙYÜˆ›Û™X[‚ˆÚ[™ÛK]\Ù\ˆ[ÙK‚ˆˆˆ‚ˆ\Ù\—ÜÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ØÛÝ™\žWÚÙ^J\Ù\—ÚY
+KÈ\HŽˆœ›Ú™XÝ×ØÚ[™ÙYŸJB‚‚™YˆÛ˜]]™WØ\Ú×ÙØ]WÛØÚÊÛÛ™\œØ][Û—ÚYˆÝ‹XÚY[™×ÜÛXÞNˆÝŠHOˆ\Þ[˜Ú[Ë“ØÚÎ‚ˆˆˆ‚ˆ™]\›ˆHØÚÈÙ\šX[^š[™È˜]]™HTÒÈØ]\È›ÜˆÛ™H
+Ù\ÜÚ[Û‹ÛXÞJK‚‚ˆÛÛ˜Ý\œ™[˜]]™HÛÛØ[È][š\HØ[YHTÒÚ[™ÈÛXÞH]\Ýˆ›Û\H[X[ˆÛ˜ÙK›ÝÛ˜ÙHXXÚˆØ[\œÈÛH™]\›™YØÚÂˆXÜ›ÜÜÈH[\™H[X[‹X\›Ý˜[ØZ][™™KY]˜[X]HHÛXÞH[™\ˆ]ÂˆHš\œÝ\›Ý˜[™XÛÜ™ÈHÚXÚÜÚ[]ÛÛ\Ù\ÈHÚX›[™ÜÈÂˆSÕËˆÙ][Ü‹XÜ™X]H\È˜XÙKYœ™YH™XØ]\ÙH\™H\È›È]ØZ]™]ÙY[ˆBˆÛÚÝ\[™H[œÙ\
+Ú[™ÛH]™[ÛÜ
+K‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÚYˆÛ[šYÙ[ÛÛ™\œØ][ÛˆYÚÜÙHTÒÈØ]H\È™Z[™ÂˆÙ\šX[^™YK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜ˆÝX‹XYÙ[˜]]™HÛÛØ[Âˆ]˜[X]HYØZ[œÝH\™[ÛÛ™\œØ][ÛˆYÛÈ^HÚ\™H]ÈØÚË‚ˆœ\˜[HXÚY[™×ÜÛXÞNˆ˜[YHÙˆHÛXÞH]›ÙXÙYHTÒÈ™\™XÝˆK™ËˆœÙ\ÜÚ[Û—ØÛÜÝÙÝX\™˜ˆ\Ý[˜ÝÛXÚY\ÈÙ]\Ý[˜ÝØÚÜÈÛÂˆZ\ˆ\›Ý˜[›Û\ÈØ[ˆÝ\™˜XÙHÛÛ˜Ý\œ™[K‚ˆœ™]\›œÎˆH›ØÙ\ÜË]ÚYH˜Û\ÜÎ˜\Þ[˜Ú[Ë“ØÚØÚ\™YžH]™\žHÛÛ˜Ý\œ™[ˆØ[\ˆ›ÜˆHØ[YH
+ÛÛ™\œØ][Û—ÚYXÚY[™×ÜÛXÞJXZ\‹‚ˆˆˆ‚ˆÙ^HH
+ÛÛ™\œØ][Û—ÚYXÚY[™×ÜÛXÞJBˆØÚÈHÛ˜]]™WØ\Ú×ÙØ]WÛØÚÜË™Ù]
+Ù^JBˆYˆØÚÈ\È›Û™N‚ˆØÚÈH\Þ[˜Ú[Ë“ØÚÊ
+BˆÛ˜]]™WØ\Ú×ÙØ]WÛØÚÜÖÚÙ^WHHØÚÂˆ™]\›ˆØÚÂ‚‚˜\Þ[˜ÈYˆÜÛÜ™\]Y\ÝÙ\ØÛÛ›™XÝ
+
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆ›Û™N‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆ]ØZ]Ù˜XØYK—ÜÛÜ™\]Y\ÝÙ\ØÛÛ›™XÝ
+
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚˜\Þ[˜ÈYˆÜÛÜ™\]Y\ÝÙ\ØÛÛ›™XÝÚ[\
+™\]Y\Ýˆ™\]Y\Ý
+HOˆ›Û™N‚ˆˆˆ‚ˆ™\ÛÛ™HÛ˜ÙHÝ\›]H™\ÜÈHÛY[ÛÜÙYHÛÛ›™XÝ[Û‹‚‚ˆÛ™Ë\Û›Ý]\È]\šÈÛˆH™\™XÝ
+K™ËˆHÛ]YK[˜]]™Bˆ\›Z\ÜÚ[Û”™\]Y\ÝÛÚÊH\ÙH\ÈÈ]XÝ]H\Ý™X[BˆÛY[\È[™È\8 %Û]YHÛÜÙ\È]È™\]Y\ÝÚ[ˆ]ÂˆRH›Û\™XÙZ]™\È[ˆ[œÝÙ\ˆš\œÝ[™Ú]Ý]\ÈØZ]Bˆ[™\ˆÛÝ[Ú]Ý]H[[Y[Ý]È›ÝXÙK‚‚ˆ›ØÚÜÈÛˆ™\]Y\Ýœ™XÙZ]™J
+X˜]\ˆ[ˆÛ[™Âˆ™\]Y\Ýš\×Ù\ØÛÛ›™XÝY
+
+XˆHÛ˜\šX[[œÈXXÚÚXÚÂˆ[œÚYHH™KXØ[˜Ù[Y[žZ[ÈØ[˜Ù[ØÛÜX
+Ý\›]IÜÂˆ›Û‹X›ØÚÚ[™È™XÙZ]™HY[ÛJNÈ[ˆ^\›˜[\ÚË˜Ø[˜Ù[
+
+X]ˆ[™ÈÚ[H]ØÛÜH\È[Ú[™[™ÈÛØ[\ØÙ\ÈÚ]HØÛÜIÜÈÝÛ‚ˆØ[˜Ù[][Ûˆ[™\ÈÝØ[ÝÙYÚ]]ÛÈHÛ\ˆÝ\š]™\È]ÂˆØ[˜Ù[[™HØ[\‰ÜÈ˜XÙHÛX[\›ØÚÜÈÛˆ]›Ü™]™\‹‚ˆH›ØÚÚ[™È™XÙZ]™H\È›ÈØ[˜Ù[ØÛÜH[ˆ]È]ØZ]ÚZ[‹ÛÂˆØ[˜Ù[][Ûˆ[Ø^\È›ÜYØ]\ÎÈ]\È[ÛÈÚX\\ˆ[ˆØZÚ[™ÂˆÚXÙHHÙXÛÛ™‚‚ˆœ\˜[H™\]Y\ÝˆHXÝ]™H˜\ÝTH˜Û\ÜÎ˜™\]Y\ÝˆžHH[YBˆH[™\ˆ\šÜËH›Ý]H\ÈÛÛœÝ[YYH›ÙKÛÈBˆ™^™XÙZ]™HZY[ÈÛ›H™\ØÛÛ›™XÝ‚ˆœ™]\›œÎˆ›Û™HÚ[ˆH\ØÛÛ›™XÝ\ÈØœÙ\™YˆØ[˜Ù[][Û‚ˆ›ÜYØ]\ÎˆØ[\œÈ]˜XÙH\ÈYØZ[œÝH™\™XÝ]\™BˆØ[˜Ù[HØZ]Û˜ÙHH™\™XÝ\œš]™\Ë‚ˆˆˆ‚ˆÚ[HYN‚ˆY\ÜØYÙHH]ØZ]™\]Y\Ýœ™XÙZ]™J
+BˆYˆY\ÜØYÙVÈ\H—HOHš™\ØÛÛ›™XÝŽ‚ˆ™]\›‚‚‚™YˆØ]XÚY[Ù\ÜÜÚ][ÛŠš[[˜[YNˆÝŠHOˆÝŽ‚ˆˆˆZ[HØY™HÛÛ[Q\ÜÜÚ][ÛŽˆ]XÚY[XY\ˆ˜[YK‚‚ˆHš[[˜[YH\È\Ù\‹XÛÛ›ÛYÛÈ]Ø[››Ý™H[\œÛ]Yˆ[ÈHXY\ˆ™\˜˜][H8 %H][ÝHÜˆ™]Û[™HÛÝ[]Bˆ\ØY\ˆ[š™XÝXY\ˆÛÛ[Üˆœ™XZÈ\œÚ[™ËˆÙH[Z][‚ˆTÐÒRK[Û›Hš[[˜[YX˜[˜XÚÈ
+Ú]][Ý\ËØ˜XÚÜÛ\Ú\ËØÛÛ›ÛˆÚ\˜XÝ\œÈÝš\Y
+H\È[ˆ‘ÈNNÈš[[˜[YJ˜\˜[Y]\ˆ]ˆ\˜Ù[Y[˜ÛÙ\ÈH[U‹N˜[YH›Üˆ[Ù\›ˆœ›ÝÜÙ\œË‚‚ˆœ\˜[Hš[[˜[YNˆHÝÜ™Y\Ù\‹\Ý\YYš[[˜[YK‚ˆœ™]\›œÎˆHÛÛ[Q\ÜÜÚ][Û˜XY\ˆ˜[YH›Ü˜Ú[™ÈÝÛ›ØY‚ˆˆˆ‚ˆÈTÐÒRH˜[˜XÚÎˆ›Ü[ž][™ÈÝ]ÚYHš[X›HTÐÒRH[™BˆÈÚ\˜XÝ\œÈ]\™HÝXÝ\˜[HÚYÛšYšXØ[[ˆHXY\‹‚ˆ\ØÚZWÛ˜[YHHˆ‹š›Ú[ŠÚ›ÜˆÚ[ˆš[[˜[YHYˆŒHÜ™
+Ú
+HÑˆ[™Ú›Ý[ˆ	È—	ÊBˆYˆ›Ý\ØÚZWÛ˜[YN‚ˆ\ØÚZWÛ˜[YHH™ÝÛ›ØY‚ˆ[˜ÛÙYH\›X‹œ\œÙKœ][ÝJš[[˜[YKØY™OHˆŠBˆ™]\›ˆˆ˜]XÚY[Èš[[˜[YOWžØ\ØÚZWÛ˜[Y_WŽÈš[[˜[YJUU‹N	ÉÞÙ[˜ÛÙYH‚‚‚ˆÈHš[HYX\ÈÈÛ™HÙ]Ùˆž]\È›ÜˆHš[IÜÈÚÛHY™H8 %ÛÛ[\ÂˆÈ™]™\ˆ™]Üš][ˆ[ˆXÙKÛ›H[]Y8 %ÛÈHY\ÈHÝ›Û™È˜[Y]Üˆ[™ˆÈHž]\ÈØ[ˆ™HØXÚY[™Yš[š][Kˆš]˜]XÙY\ÈH™\ÜÛœÙHÝ]Ù‚ˆÈÚ\™YØXÚ\ËÚ[˜ÙHHž]\È\™H™XYX›HÛ›HžHÙ\ÜÚ[ÛˆY[X™\œË‚‘’SWÐÓÓ•S•ÐÐPÒWÐÓÓ•“ÓHœš]˜]KX^XYÙOLÌMLÍŒ[[]]X›H‚‚‚™YˆÙš[WØÛÛ[Ù]YÊš[WÚYˆÝŠHOˆÝŽ‚ˆˆˆZ[HÝ›Û™ÈUYØ›ÜˆHÝÜ™Yš[IÜÈÛÛ[‚‚ˆœ\˜[Hš[WÚYˆHÝÜ™Yš[HY[YšY\‹‚ˆœ™]\›œÎˆH][ÝY[]HYÈ˜[YK‚ˆˆˆ‚ˆ™]\›ˆ‰ÈžÙš[WÚYH‰Â‚‚™YˆÚY—Û›Û™WÛX]ÚÛX]Ú\ÊXY\ŽˆÝˆ›Û™K]YÎˆÝŠHOˆ›ÛÛ‚ˆˆˆÚXÚÈ[ˆY‹S›Û™KSX]Ú™\]Y\ÝXY\ˆYØZ[œÝ[ˆ[]HYË‚‚ˆœ\˜[HXY\Žˆ˜]ÈY‹S›Û™KSX]Ú˜[YKÜˆ›Û™XÚ[ˆXœÙ[‚ˆœ\˜[H]YÎˆHÝ\œ™[[]HYË][ÝY‚ˆœ™]\›œÎˆYXÚ[ˆHÛY[	ÜÈØXÚYÛÜH\ÈÝ[Ý\œ™[‚ˆˆˆ‚ˆYˆ›ÝXY\Ž‚ˆ™]\›ˆ˜[ÙBˆØ[™Y]\ÈHØØ[™Y]KœÝš\
+
+H›ÜˆØ[™Y]H[ˆXY\‹œÜ]
+‹ŠWBˆYˆŠˆˆ[ˆØ[™Y]\Î‚ˆ™]\›ˆYBˆÈÛÛ\\š\ÛÛˆ\ÈÙXZÈ\ˆ‘ÈLLLˆÝš\HËØ™Yš^™Y›Ü™HX]Ú[™Ë‚ˆ™]\›ˆ[žJØ[™Y]Kœ™[[Ý™\™Yš^
+•ËÈŠHOH]YÈ›ÜˆØ[™Y]H[ˆØ[™Y]\ÊB‚‚™YˆÜÝÜ™YÙš[WÝ×Ü™\ÛÝ\˜ÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÝÜ™YˆÝÜ™Yš[KŠHOˆXÝÜÝ‹[žWN‚ˆˆˆÛÛ™\H˜Û\ÜÎ˜ÝÜ™Yš[XÈHÙ\ÜÚ[Ûˆš[H™\ÛÝ\˜ÙHXÝ‚‚ˆX]Ú\ÈHÙ\ÜÚ[Û‹œ™\ÛÝ\˜ÙXÚ\HÚ]\Nˆ™š[H˜ˆ\ÙYžHH[šYšYY[™[ÜžH[™HÙ\ÜÚ[Û‹\ØÛÜYš[Bˆ[™Ú[Ë‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÝÛš[™ÈÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY‚ˆœ\˜[HÝÜ™YˆHÝÜ™Yš[H[]K‚ˆœ™]\›œÎˆ”ÓÓ‹\Ù\šX[^˜X›H™\ÛÝ\˜ÙHXÝ‚ˆˆˆ‚ˆ™]\›ˆÂˆšYŽˆÝÜ™YšYˆ›Øš™XÝŽˆœÙ\ÜÚ[Û‹œ™\ÛÝ\˜ÙH‹ˆ\HŽˆ™š[H‹ˆœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYˆ›˜[YHŽˆÝÜ™Y™š[[˜[YKˆ›Y]Y]HŽˆÂˆ™š[[˜[YHŽˆÝÜ™Y™š[[˜[YKˆ˜ž]\ÈŽˆÝÜ™Y˜ž]\Ëˆ˜Ü™X]YØ]ŽˆÝÜ™Y˜Ü™X]YØ]ˆKˆB‚‚™YˆÜX›\ÚØ[™Ü\œÚ\ÝÜ™\ÛÝ\˜ÙWÙ]™[
+ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ]™[Ý\NˆÝ‹ˆ™\ÛÝ\˜ÙWÚYˆÝ‹ˆ™\ÛÝ\˜ÙWÝ\NˆÝ‹ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™Kˆ™\ÛÝ\˜ÙNˆXÝÜÝ‹[žWH›Û™HH›Û™KŠHOˆ›Û™N‚ˆˆˆ”X›\Ú[ˆÔÑH]™[[™\œÚ\Ý]\ÈHÛÛ™\œØ][Ûˆ][K‚‚ˆ[Z]ÈH]™[ÛˆH]™HÙ\ÜÚ[ÛˆÝ™X[HÛÈÛÛ›™XÝYˆÛY[ÈÙYH][[YYX][K[™\[™ÈH™\ÛÝ\˜ÙWÙ]™[ˆÛÛ™\œØ][Ûˆ][HÛÈ™XÛÛ›™XÝ[™ÈÛY[È\ØÛÝ™\ˆ][ˆBˆÛ˜\ÚÝ‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H]™[Ý\NˆÔÑH]™[\KK™Ë‚ˆœÙ\ÜÚ[Û‹œ™\ÛÝ\˜ÙK˜Ü™X]Y˜‚ˆœ\˜[H™\ÛÝ\˜ÙWÚYˆÜ\]YHYÙˆHY™™XÝY™\ÛÝ\˜ÙK‚ˆœ\˜[H™\ÛÝ\˜ÙWÝ\NˆÚ[™Ùˆ™\ÛÝ\˜ÙKK™Ëˆ\›Z[˜[˜‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H›Üˆ\œÚ\Ý[™ÈH][K‚ˆœ\˜[H™\ÛÝ\˜ÙNˆ[™\ÛÝ\˜ÙHXÝ›ÜˆÜ™X]Y]™[Ë‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[™[]Y\Ë˜ÛÛ™\œØ][Ûˆ[\Ü™\ÛÝ\˜ÙQ]™[]B‚ˆÜÙWÜ^[ØYˆXÝÜÝ‹[žWHHÈ\HŽˆ]™[Ý\_BˆYˆ]™[Ý\HOHœÙ\ÜÚ[Û‹œ™\ÛÝ\˜ÙK˜Ü™X]YŽ‚ˆÜÙWÜ^[ØYÈœ™\ÛÝ\˜ÙH—HH™\ÛÝ\˜ÙHÜˆßBˆ[ÙN‚ˆÜÙWÜ^[ØYÈœ™\ÛÝ\˜ÙWÚY—HH™\ÛÝ\˜ÙWÚYˆÜÙWÜ^[ØYÈœ™\ÛÝ\˜ÙWÝ\H—HH™\ÛÝ\˜ÙWÝ\BˆÜÙWÜ^[ØYÈœÙ\ÜÚ[Û—ÚY—HHÙ\ÜÚ[Û—ÚY‚ˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚYÜÙWÜ^[ØY
+B‚ˆ][HH™]ÐÛÛ™\œØ][Û’][Jˆ\OHœ™\ÛÝ\˜ÙWÙ]™[‹ˆ™\ÜÛœÙWÚY\Ù\ÜÚ[Û—ÚYˆ]OT™\ÛÝ\˜ÙQ]™[]Jˆ]™[Ý\OY]™[Ý\Kˆ™\ÛÝ\˜ÙWÚY\™\ÛÝ\˜ÙWÚYˆ™\ÛÝ\˜ÙWÝ\O\™\ÛÝ\˜ÙWÝ\Kˆ™\ÛÝ\˜ÙO\™\ÛÝ\˜ÙKˆ
+Kˆ
+BˆžN‚ˆÛÛ™\œØ][Û—ÜÝÜ™K˜\[™
+Ù\ÜÚ[Û—ÚYÚ][WJBˆ^Ù\
+]šX]Q\œ›Ü‹\Q\œ›Ü‹˜[YQ\œ›Ü‹[[YQ\œ›ÜŠN‚ˆÛÙÙÙ\‹™XYÊˆ‘˜Z[YÈ\œÚ\Ý™\ÛÝ\˜ÙH]™[›ÜˆÙ\ÜÚ[ÛI\È‹ˆÙ\ÜÚ[Û—ÚYˆ^×Ú[™›ÏUYKˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+B‚‚™YˆÜÝXÝ\™YØ\Ú×Ý\Ù\—Ü]Y\Ý[ÛŠˆÛÛÚ[œ]ˆ[žKŠHOˆXÝÜÝ‹[žWH›Û™N‚ˆˆˆ‚ˆZ[HÝXÝ\™Y\ÚÕ\Ù\”]Y\Ý[Ûˆ^[ØY›ÜˆH[XÚ]][Û‚ˆ\˜[\È^˜\Ë‚‚ˆÛ]YIÜÈ\›Z\ÜÚ[Û”™\]Y\Ý^[ØY[˜ÛY\ÈH[ÛÛÚ[œ]ˆÚ[ˆHØ]YÛÛ\È\ÚÕ\Ù\”]Y\Ý[Û‹ˆ˜]\ˆ[ˆ™[Z[™ÈÛ‚ˆH
+[˜Ø]Y
+HÛÛ[Ü™]šY]Ø”ÓÓ‹\Ýš[™ËÙH^˜XÝBˆ]Y\Ý[ÛœÈ
+ÈÜ[ÛœÈ\™H[™Ú\[H\ÈH\YÝXÝ\™HBˆRHÛÛœÝ[Y\È\™XÝK‚‚ˆH™]\›™YÚ\H\ÈHØ[YHÛ™HHRIÜÂˆ™š[N˜ÛX‹Ø\ÚÕ\Ù\”]Y\Ý[Û‹Ø›ÙXÙ\Èœ›ÛH]È™]šY]Âˆ\œÙ\ˆ8 %ÛÈHœ›ÛY[™Ø[ˆ™X]›ÝÛÝ\˜Ù\È[šY›Ü›[K‚‚ˆœ\˜[HÛÛÚ[œ]ˆHÛÛÚ[œ]šY[œ›ÛHBˆ\›Z\ÜÚ[Û”™\]Y\Ý^[ØY‚ˆœ™]\›œÎˆÈœ]Y\Ý[ÛœÈŽˆË‹‹—_XÛˆÝXØÙ\ÜËÜˆ›Û™XÚ[‚ˆH[œ]Ù\Û‰ÝØ\œžHH\ØX›H\ÚÕ\Ù\”]Y\Ý[ÛˆÚ\H
+›Âˆ]Y\Ý[ÛœËX[›Ü›YYÜ[ÛœË]ËŠH8 %Ø[\ˆ˜[È˜XÚÈÂˆHš[˜\žH™]šY]Ë[Û›H™[™\‹‚ˆˆˆ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÛÛÚ[œ]XÝ
+N‚ˆ™]\›ˆ›Û™Bˆ]Y\Ý[Ûœ×Ü˜]ÈHÛÛÚ[œ]™Ù]
+œ]Y\Ý[ÛœÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ]Y\Ý[Ûœ×Ü˜]Ë\Ý
+HÜˆ›Ý]Y\Ý[Ûœ×Ü˜]Î‚ˆ™]\›ˆ›Û™Bˆ]Y\Ý[ÛœÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ[žH[ˆ]Y\Ý[Ûœ×Ü˜]Î‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ[žKXÝ
+N‚ˆÛÛ[YBˆ]Y\Ý[Û—Ý^H[žK™Ù]
+œ]Y\Ý[ÛˆŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ]Y\Ý[Û—Ý^ÝŠHÜˆ›Ý]Y\Ý[Û—Ý^‚ˆÛÛ[YBˆÜ[Ûœ×Ü˜]ÈH[žK™Ù]
+›Ü[ÛœÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÜ[Ûœ×Ü˜]Ë\Ý
+N‚ˆÛÛ[YBˆÜ[ÛœÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›ÜˆÜ[ˆÜ[Ûœ×Ü˜]Î‚ˆYˆ\Ú[œÝ[˜ÙJÜXÝ
+N‚ˆX™[HÜ™Ù]
+›X™[ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJX™[ÝŠHÜˆ›ÝX™[‚ˆÛÛ[YBˆÜ[ÛŽˆXÝÜÝ‹[žWHHÈ›X™[ŽˆX™[Bˆ\ØÜš\[ÛˆHÜ™Ù]
+™\ØÜš\[ÛˆŠBˆYˆ\Ú[œÝ[˜ÙJ\ØÜš\[Û‹ÝŠH[™\ØÜš\[ÛŽ‚ˆÜ[Û–È™\ØÜš\[Ûˆ—HH\ØÜš\[Û‚ˆÈ™]šY]Ø\È[ˆÜ[Û˜[šXÚ\ˆÛš\]ÛÛYBˆÈÛ]YHZ[È]XÚÈ[ˆÜ[Ûˆ
+™[™\™Y\ÈBˆÈ™Oˆ™[ÝÈHÜ[Ûˆ\ÝÚ[ˆÙ[XÝY
+KˆšYBˆÈ]›ÝYÚ™\˜˜][HÛÈHRHØ[ˆÝ\™˜XÙH]‚ˆ™]šY]ÈHÜ™Ù]
+œ™]šY]ÈŠBˆYˆ\Ú[œÝ[˜ÙJ™]šY]ËÝŠH[™™]šY]Î‚ˆÜ[Û–Èœ™]šY]È—HH™]šY]ÂˆÜ[ÛœË˜\[™
+Ü[ÛŠBˆ[Yˆ\Ú[œÝ[˜ÙJÜÝŠH[™Ü‚ˆÜ[ÛœË˜\[™
+È›X™[ŽˆÜJBˆYˆ›ÝÜ[ÛœÎ‚ˆÛÛ[YBˆ]Y\Ý[ÛŽˆXÝÜÝ‹[žWHHÂˆœ]Y\Ý[ÛˆŽˆ]Y\Ý[Û—Ý^ˆ›Ü[ÛœÈŽˆÜ[ÛœËˆ›][TÙ[XÝŽˆ[žK™Ù]
+›][TÙ[XÝŠH\ÈYKˆBˆXY\ˆH[žK™Ù]
+šXY\ˆŠBˆYˆ\Ú[œÝ[˜ÙJXY\‹ÝŠH[™XY\Ž‚ˆ]Y\Ý[Û–ÈšXY\ˆ—HHXY\‚ˆ]Y\Ý[ÛœË˜\[™
+]Y\Ý[ÛŠBˆYˆ›Ý]Y\Ý[ÛœÎ‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÈœ]Y\Ý[ÛœÈŽˆ]Y\Ý[ÛœßB‚‚™YˆØØ[›ÛšXØ[ÝÛÛÚ[œ]
+ÛÛÚ[œ]ˆXÝÜÝ‹[žWH›Û™JHOˆXÝÜÝ‹[žWN‚ˆˆˆ‚ˆØ[›ÛšXØ[^™HHÛÛ[œ]›Üˆ\›Z[˜[\™\ÛÛ™YÛÜœ™[][Û‹‚‚ˆH\šÈÚYH™XÛÜ™È[ˆXœÙ[È›Û‹YXÝ[œ]\È›Û™X
+Bˆ\›Z\ÜÚ[Ûˆ›Û\ÚÜÙHÛÚÈ^[ØYØ\œšY\È›ÈÛÛÚ[œ]8 %ÙYBˆHÜX›\ÚØ[™ÝØZ]Ù›Ü—Ú\›™\Ü×Ù[XÚ]][Û˜Ø[Ú]\ÊKÚ[BˆHZ\œ›ÜˆÚYH›Ü›X[^™\ÈH\œÙY˜[œØÜš\\™Ý[Y[ÈÈßXˆ
+ÙYH™[˜Î˜Ùš]™WÝ\›Z[˜[Ü™\ÛÛ™YÙ[XÚ]][Û˜
+Kˆ›ÝYX[ˆ››Âˆ[œ]‹ÛÈÛÛ\ÙH[HÈßX™Y›Ü™HÛÛ\\š[™È8 %Ý\Ú\ÙHBˆ›ËZ[œ]›Û\ÛÝ[™]™\ˆX]Ú]ÈÝÛˆZ\œ›Ü™Y™\Ý[
+›Û™HOBˆßX\È˜[ÙX
+H[™Ú]›ÈÛÝ[X˜\ÙY˜[˜XÚËÛÝ[Üœ[‚ˆ[[HÛÚÈ[Y[Ý]‚‚ˆœ\˜[HÛÛÚ[œ]ˆ\šÙYÜˆZ\œ›Ü™YÛÛ[œ]K™Ë‚ˆÈ˜ÛÛ[X[™Žˆ›ÈŸXßXÜˆ›Û™X‚ˆœ™]\›œÎˆHXÝ[˜Ú[™ÙYÜˆßXÚ[ˆ]\È›Û™X‚ˆˆˆ‚ˆ™]\›ˆÛÛÚ[œ]Yˆ\Ú[œÝ[˜ÙJÛÛÚ[œ]XÝ
+H[ÙHßB‚‚™YˆÜÚYÛ˜[Ý\›Z[˜[Ü™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛŠ
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆ›Û™N‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—ÜÚYÛ˜[Ý\›Z[˜[Ü™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛŠ
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆÜÚYÛ˜[Ý\›Z[˜[Ü™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][Û—Ú[\
+ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛÛ˜[YNˆÝ‹ˆÛÛÚ[œ]ˆXÝÜÝ‹[žWH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ™\ÛÛ™HH\šÙY›Û\HZ\œ›Ü™YÛÛ™\Ý[™[Û™ÜÈËˆ[™[™È]ÈÛ™Ë\Û›Û\K‚‚ˆØ[YÚ[ˆH˜[œØÜš\›ÜØ\™\ˆZ\œ›ÜœÈHÛÛ™\Ý[ˆ
+[˜Ý[Û—ØØ[ÛÝ]]
+H›ÜˆH˜]]™HÙ\ÜÚ[Û‹ˆHÛÛ™\Ý[\ÂˆÛ›HÜš][ˆQ•TˆH\Ù\ˆ[œÝÙ\™Y]ÛÛ	ÜÈ\›Z\ÜÚ[Ûˆ›Û\ˆ[ˆH˜]]™H\›Z[˜[8 %ÛˆXØÙ\HÛÛ˜[ˆ[™›ÙXÙYÝ]]ˆÛˆ™Z™XÝH\›™\ÜÈ™XÛÜ™ÈH™Z™XÝ[Ûˆ™\Ý[8 %ÛÈ]È\œš]˜[\ÂˆH™[XX›HH\›Z[˜[[™XYH™\ÛÛ™Y\ÈˆÚYÛ˜[‚‚ˆÛÜœ™[][Ûˆ\ÈžH^XÝÛÛY[]K™]™\ˆÜÚ][Û˜[ˆH™\Ý[ˆ™\ÛÛ™\ÈH\šÙY›Û\Û›HÚ[ˆ]\ÈHÐSQHÛÛÛ˜[YXS‘ˆHÐSQHÛÛÚ[œ][ˆHØ[YHÙ\ÜÚ[Û‹ˆÛ]YHÛÙIÜÂˆ\›Z\ÜÚ[Û”™\]Y\Ý^[ØYØ\œšY\È›ÈÛÛÝ\ÙWÚY
+HY\ÂˆZ[YÛ›HÚ[ˆHÛÛØ[\È[Z]YY\ˆH\›Z\ÜÚ[Û‚ˆÚXÚÊKÛÈ
+ÛÛÛ˜[YKÛÛÚ[œ]
+X\ÈHÛ›HÛÜœ™[][ÛˆÚYÛ˜[ˆ]˜Z[X›H8 %[™›ÝÚY\È\™H[›[ÙYšYY”ÓÓˆ›Ý[™]š\ÈÙˆBˆØ[YH[œ]ÛÈ^XÝ\]X[]HÛÈÚ[™]™\ˆ^H\ØÜšX™HHØ[YBˆØ[
+XœÙ[[œ][™[\H[œ]›ÝØ[›ÛšXØ[^™HÈßXšXBˆ™[˜Î˜ØØ[›ÛšXØ[ÝÛÛÚ[œ]Ú[˜ÙHH\šÈ[™Z\œ›ÜˆÚY\ÈÜ[ˆ››È[œ]ˆY™™\™[H8 %›Û™XœÈßX
+KˆH›Û‹[X]Ú[™ÈÜ‚ˆ[XšYÝ[Ý\È™\Ý[™\ÛÛ™\È›Ý[™ÎÈHÙXˆ™\™XÝÜˆ[Y[Ý]Ý[ˆ\Y\Ëˆ^XÝ[Û›HX]Ú[™È\ÈÚ]ÝÜÂˆÛ™H›Û\	ÜÈ™\Ý[œ›ÛHÛX\š[™ÈHY™™\™[›Û\ˆ\›Ýš[™Âˆ˜\ÚÛßX[ˆHÙXˆRH[‹\\šÜÈ][™Z\œ›Üš[™È]ÈÝÛˆÝ]]ˆ]\Ý›Ý[ˆÛX\ˆHÝ[\[™[™È˜\ÚÜÙXÚX›[™È
+[‚ˆ[œ™[]Y]]ËX[ÝÙYØ[YK[˜[YYÛÛ	ÜÈÝ]]\È\›[\ÜÈ›ÜˆBˆØ[YH™X\ÛÛŠK‚‚ˆ™\ÝYY™›Ü[™Y[\Ý[ˆH›Ë[ÜÚ[ˆ›È\šÙY›Û\X]Ú\Âˆ
+K™ËˆHÙXˆRH[™XYH™\ÛÛ™Y]HÛÛ™YYY›È\›Z\ÜÚ[Û‹ˆÜˆ]\È[ˆ[œ™[]YÛÛ
+Kˆ\›™\ÜËXYÛ›ÜÝXÈžHÛÛœÝXÝ[Ûˆ8 %ˆÙ^YYÛˆH\šÙY›Û\	ÜÈÛÛY[]K›ÝÛˆHÛ]YK[˜]]™BˆÚXÚÈ8 %ÛÈHÛÙ^ÛÚÈ]™XÛÜ™ÈÛÛÛ˜[YX™[™Yš]ÈÛË‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÛ[šYÙ[ÛÛ™\œØ][ÛˆYÚÜÙH›ÜØ\™\ˆZ\œ›Ü™YBˆ™\Ý[K™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛÛ˜[YNˆÛÛ˜[YHH™\Ý[\È›Ü‹K™Ëˆ˜\Ú˜‚ˆœ\˜[HÛÛÚ[œ]ˆÛÛ[œ]H™\Ý[\È›Ü‹K™Ë‚ˆÈ˜ÛÛ[X[™Žˆ›ÈŸXÜˆ›Û™XYˆ[˜]˜Z[X›K‚ˆˆˆ‚ˆØ[™Y]\ÈHÂˆ\šÙYˆ›Üˆ\šÙY[ˆÚ\›™\Ü×Ü\šÙYÙ[XÚ]][ÛœË˜[Y\Ê
+BˆYˆ\šÙYœÙ\ÜÚ[Û—ÚYOHÙ\ÜÚ[Û—ÚYˆ[™\šÙYÛÛÛ˜[YHOHÛÛÛ˜[YBˆ[™›Ý\šÙYœ™\ÛÛ™YÙ[Ù]Ú\™Kš\×ÜÙ]
+
+BˆBˆYˆ›ÝØ[™Y]\Î‚ˆ™]\›‚ˆZ\œ›Ü™YÚ[œ]HØØ[›ÛšXØ[ÝÛÛÚ[œ]
+ÛÛÚ[œ]
+Bˆ›Üˆ\šÙY[ˆØ[™Y]\Î‚ˆYˆØØ[›ÛšXØ[ÝÛÛÚ[œ]
+\šÙYÛÛÚ[œ]
+HOHZ\œ›Ü™YÚ[œ]‚ˆ\šÙYœ™\ÛÛ™YÙ[Ù]Ú\™KœÙ]
+
+Bˆ™]\›‚ˆÈ›È^XÝ[œ]X]ÚˆÛÜœ™[][Ûˆ\È^XÝ[Û›Nˆ™\ÛÛš[™ÈBˆÈØ[YK[˜[YYX]YY™™\™[Z[œ]›Û\\™HÛÝ[ÛX\ˆHÜ›Û™ÂˆÈØ\™ÛÈX]™H]™\žHØ[™Y]HÈ]ÈÝÛˆ™\Ý[ÈÙXˆ™\™XÝÂˆÈ[Y[Ý]ˆ\Èœ˜[˜Ú\È™XXÚY›Ý][™[H[™™[šYÛ›H8 %K™ËˆY\‚ˆÈHÚX›[™È›Û\Ø\ÈÙX‹X\›Ý™Y[™[‹\\šÙY]ÈZ\œ›Ü™YÝ]]ˆÈš[™ÈÛ›HHÝ[\[™[™ÈY™™\™[Z[œ]›Û\8 %ÛÈ]ÙÜÈ]ˆÈXYË›ÝØ\›š[™Ëˆ
+HÙ[Z[™HX]Ú˜Z[[™ÈÈÛÛ\\™H\]X[ÛÝ[ˆÈ[ÛÈ[™\™K]\È[™\Ý[™ÝZ\ÚX›Hœ›ÛHH™[šYÛˆØ\ÙH[œÚYBˆÈ\ÈØ[È›Ý[œ]È\™H[›[ÙYšYY”ÓÓˆ›Ý[™]š\ËÛÈÝXÚšYˆÈ\È›Ý^XÝYŠBˆÛÙÙÙ\‹™XYÊˆ“Z\œ›Ü™Y	\È™\Ý[[ˆ	\ÈX]ÚY›È\šÙY›Û\žH[œ]‚ˆŠ	YØ[YK[˜[YY›Û\
+ÊH[™[™ÊNÈX]š[™È[HÈÙXˆ™\™XÝÝ[Y[Ý]ˆ‹ˆÛÛÛ˜[YKˆÙ\ÜÚ[Û—ÚYˆ[ŠØ[™Y]\ÊKˆ
+B‚‚™YˆØÛY[ÜÝ\YYÚÛÚ×Ù[XÚ]][Û—ÚY
+ˆ^[ØYˆXÝÜÝ‹[žWKˆÙ\ÜÚ[Û—ÚYˆÝ‹ŠHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ˜[Y]HHÛÚÈÛY[	ÜÈÜ[Û˜[™KX]XÚ[XÚ]][ÛˆY‚‚ˆHÛÚÈZ[ÈÛ™HÝX›HY\ˆ›Û\[™™K\Ù[™È]Ûˆ]™\žBˆ™]žHÔÕÛÈHÙ]™\™YØZ]™K\\šÜÈ\ÈHÐSQH[XÚ]][Û‹‚ˆÛY[XÛÛ›ÛYÛÈ]\ÈÛÛœÝ˜Z[™YÈHÛ]YKZÛÚÂˆ˜[Y\ÜXÙH[™X^H›ÝÛÛYHÚ][›Ý\ˆÙ\ÜÚ[Û‰ÜÈ\šÙYY‚‚ˆœ\˜[H^[ØYˆ\œÙY\›Z\ÜÚ[Û”™\]Y\ÝÛÚÈ›ÙKˆ™XYÈBˆÜ[Û˜[ÛÛ[šYÙ[Ù[XÚ]][Û—ÚYÙ^K‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[ÛˆHÛÚÈØ[\È›Ü‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ™]\›œÎˆH˜[Y]YYÜˆ›Û™XÚ[ˆHÛY[Ý\YYˆ›Û™H
+HØZ]Z[ÈH˜[™ÛHY\È™Y›Ü™JK‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆÚ[ˆHY\ÈX[›Ü›YYÜˆ\ÂˆÝ\œ™[H\šÙYžHHY™™\™[Ù\ÜÚ[Û‹‚ˆˆˆ‚ˆ˜]ÈH^[ØY™Ù]
+—ÛÛ[šYÙ[Ù[XÚ]][Û—ÚYŠBˆYˆ˜]È\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]ËÝŠHÜˆ›ÝÒÓÒ×ÑSPÒUUSÓ—ÒQÔ‘K™[X]Ú
+˜]ÊN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ”\›Z\ÜÚ[Û”™\]Y\ÝÛÚÈ	×ÛÛ[šYÙ[Ù[XÚ]][Û—ÚY	È]\ÝX]Ú‚ˆ‰Ù[XÚ]Ï\›™\ÜÏ—ÉÈ
+ÈÌˆ^Ú\œËˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÝÛ™\ˆHÚ\›™\Ü×Ù[XÚ]][Û—ÛÝÛ™\œË™Ù]
+˜]ÊBˆYˆÝÛ™\ˆ\È›Ý›Û™H[™ÝÛ™\ˆOHÙ\ÜÚ[Û—ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ‘[XÚ]][ÛˆY™[Û™ÜÈÈHY™™\™[Ù\ÜÚ[Û‹ˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ™]\›ˆ˜]Â‚‚™YˆØÛÛœÝ[YWÜ™WÜ™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛŠˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[XÚ]][Û—ÚYˆÝ‹ˆ™\]Y\ÝÙš[™Ù\œš[ˆÝˆ›Û™HH›Û™KŠHOˆÔ™T™\ÛÛ™Y\›™\ÜÑ[XÚ]][Ûˆ›Û™N‚ˆˆˆ‚ˆÛÛœÝ[YHH™\ÛÛ][Ûˆ]\œš]™Y™Y›Ü™HHÛÚÈØZ]™YÚ\Ý\™Y‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÛ[šYÙ[Ù\ÜÚ[ÛˆYK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H[XÚ]][Û—ÚYˆ\›™\ÜÈ[XÚ]][ÛˆYK™Ë‚ˆ™[XÚ]ØÛÙ^ØX˜ÌLŒÈ˜‚ˆœ\˜[H™\]Y\ÝÙš[™Ù\œš[ˆYÙ\ÝÙˆHÛÛœÝ[Z[™È™K\\šÉÜÈ™\]Y\Ýˆ\˜[\ËK™ËˆHÚLMˆ^Ýš[™ËˆH™\™XÝXØ\œžZ[™ÈÛXœÝÛ™Bˆ\ÈYÜYÓ“HÛˆH›Ý™[ˆØ[YK\]Y\Ý[ÛˆX]Úˆ›ÝÚY\Âˆ]\ÝØ\œžHHš[™Ù\œš[[™^H]\Ý™H\]X[ˆ[žHÝ\‚ˆÛÛXš[˜][Ûˆ
+Z]\ˆÚYH›Û™XÜˆHZ\ÛX]Ú
+H˜Z[ÈÛÜÙYˆ8 %HÛXœÝÛ™H\È›ÜY[™H›Û\\È™K\X›\ÚY8 %ÛÂˆHÝ[H\›Ý˜[Ø[ˆ™]™\ˆØ]HHQ‘‘T‘S•]Y\Ý[Ûˆ]ˆ™]\ÙY\ÈYˆ\›Z[˜[\ÚYHÛXœÝÛ™\È
+™\Ý[\È›Û™X
+BˆÚÚ\HÚXÚÎˆYÜ[™ÈÛ™HÛ›H˜Z[X\ÚÜË[™Z\ˆ›ÙXÙ\‚ˆ\È›È\˜[\ÈÈš[™Ù\œš[‚ˆœ™]\›œÎˆHÛÛœÝ[YYÛXœÝÛ™HÚ[ˆÛ™HX]ÚY\ÈÙ\ÜÚ[Û‚ˆ
+]È™\Ý[Ø\œšY\ÈHÙXˆ™\™XÝÈÛ›Ü‹Üˆ›Û™Xˆ›ÜˆH\›Z[˜[\ÚYH™\ÛÛ][ÛŠKÜˆ›Û™XÚ[ˆ›Ý[™ÈØ\Âˆ™K\™\ÛÛ™Y‚ˆˆˆ‚ˆÜ[™WÜ™WÜ™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛœÊ
+BˆÛXœÝÛ™HHÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœËœÜ
+[XÚ]][Û—ÚY›Û™JBˆYˆÛXœÝÛ™H\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆÛXœÝÛ™KœÙ\ÜÚ[Û—ÚYOHÙ\ÜÚ[Û—ÚY‚ˆÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœÖÙ[XÚ]][Û—ÚYHHÛXœÝÛ™Bˆ™]\›ˆ›Û™BˆYˆÛXœÝÛ™Kœ™\Ý[\È›Ý›Û™H[™
+ˆÛXœÝÛ™Kœ™\]Y\ÝÙš[™Ù\œš[\È›Û™BˆÜˆ™\]Y\ÝÙš[™Ù\œš[\È›Û™BˆÜˆÛXœÝÛ™Kœ™\]Y\ÝÙš[™Ù\œš[OH™\]Y\ÝÙš[™Ù\œš[ˆ
+N‚ˆÈH™\™XÝ\È™\^YYÛ›HÛˆH›Ý™[ˆØ[YK\]Y\Ý[ÛˆX]Ú‚ˆÈHY™™\š[™Èš[™Ù\œš[YX[œÈHYØ\È™]\ÙYžHHUT‹ˆÈY™™\™[]Y\Ý[ÛŽÈHZ\ÜÚ[™Èš[™Ù\œš[ÛˆZ]\ˆÚYBˆÈYX[œÈHX]ÚØ[››Ý™H›Ý™[ˆ
+K™ËˆHØ\]›Ý[™›ÂˆÈ˜[Y[™[™È›Û\ÈYÙ\Ý
+Kˆ›Ý˜Z[ÛÜÙYˆ›ÜBˆÈÛXœÝÛ™H[™]H™]È›Û\™HX›\ÚY8 %HØY™HÛÜÝˆÈ\ÈÛ™H™KX\ÚË™]™\ˆHÝ[H\›Ý˜[Ø][™ÈH™]È]Y\Ý[Û‹‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÛXœÝÛ™B‚‚™YˆÜ[™WÜ™WÜ™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛœÊ›ÝÎˆ›Ø]›Û™HH›Û™JHOˆ›Û™N‚ˆˆˆ‚ˆ[™HÝ[HÜˆ^Ù\ÜÈ™K\™\ÛÛ™Y\›™\ÜÈ[XÚ]][ÛˆÛXœÝÛ™\Ë‚‚ˆœ\˜[H›ÝÎˆÜ[Û˜[Ø[XÛØÚÈ[Y\Ý[\œ›ÛH[YK[YJ
+XˆK™ËˆMÌLŒˆ›Û™X™XYÈHÝ\œ™[[YK‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆYˆ›ÝÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœÎ‚ˆ™]\›‚ˆÈ™\ÛÛ™H[Z]È›ÝYÚH˜XØYHÛÈH\Ý	ÜÈ[ÛšÙ^\]ÚÙˆ\ÙBˆÈÛÛœÝ[È\ÈÛ›Ü™Y\™K‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ›ÝÈH[YK[YJ
+HYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆ^\™YHÂˆ[XÚ]][Û—ÚYˆ›Üˆ[XÚ]][Û—ÚYÛXœÝÛ™H[ˆÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœËš][\Ê
+BˆYˆ›ÝÈHÛXœÝÛ™K˜Ü™X]YØ]ˆÙ˜XØYK—ÒT“‘TÔ×Ô‘WÔ‘TÓÓ‘QÑSPÒUUSÓ—ÕÔÂˆBˆ›Üˆ[XÚ]][Û—ÚY[ˆ^\™Y‚ˆÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœËœÜ
+[XÚ]][Û—ÚY›Û™JBˆÝ™\™›ÝÈH
+ˆ[ŠÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœÊBˆHÙ˜XØYK—ÒT“‘TÔ×Ô‘WÔ‘TÓÓ‘QÑSPÒUUSÓ—ÓPVÑS•’QTÂˆ
+BˆYˆÝ™\™›ÝÈH‚ˆ™]\›‚ˆÛ\ÝHÛÜY
+ˆÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœËš][\Ê
+KˆÙ^O[[X™H][Nˆ][VÌWK˜Ü™X]YØ]ˆ
+VÎ›Ý™\™›Ý×Bˆ›Üˆ[XÚ]][Û—ÚYÝÛXœÝÛ™H[ˆÛ\Ý‚ˆÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœËœÜ
+[XÚ]][Û—ÚY›Û™JB‚‚™YˆÜÚYÛ˜[Ú\›™\Ü×Ù[XÚ]][Û—Ü™\ÛÛ™YØžWÚY
+ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[XÚ]][Û—ÚYˆÝ‹ŠHOˆ›Û™N‚ˆˆˆ‚ˆ™\ÛÛ™HÜˆ™K\™\ÛÛ™HÛ™H\šÙY\›™\ÜÈ[XÚ]][ÛˆžHY‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÛ[šYÙ[Ù\ÜÚ[ÛˆYK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H[XÚ]][Û—ÚYˆ\›™\ÜÈ[XÚ]][ÛˆYK™Ë‚ˆ™[XÚ]ØÛÙ^ØX˜ÌLŒÈ˜‚ˆœ™]\›œÎˆ›Û™K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆHY\ÈX[›Ü›YYÜˆ™[Û™ÜÈÈBˆY™™\™[Ù\ÜÚ[Û‹‚ˆˆˆ‚ˆYˆ›Ý[XÚ]][Û—ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ù[XÚ]][Û—Ü™\ÛÛ™Y™\]Z\™\È]K™[XÚ]][Û—ÚYˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÝÛ™\ˆHÚ\›™\Ü×Ù[XÚ]][Û—ÛÝÛ™\œË™Ù]
+[XÚ]][Û—ÚY
+BˆYˆÝÛ™\ˆ\È›Ý›Û™H[™ÝÛ™\ˆOHÙ\ÜÚ[Û—ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ‘[XÚ]][ÛˆÙ\È›Ý™[Û™ÈÈ\ÈÙ\ÜÚ[Û‹ˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÜ[™WÜ™WÜ™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛœÊ
+Bˆ\šÙYHÚ\›™\Ü×Ü\šÙYÙ[XÚ]][ÛœË™Ù]
+[XÚ]][Û—ÚY
+BˆYˆ\šÙY\È›Û™N‚ˆÚ\›™\Ü×Ü™WÜ™\ÛÛ™YÙ[XÚ]][ÛœÖÙ[XÚ]][Û—ÚYHHÔ™T™\ÛÛ™Y\›™\ÜÑ[XÚ]][ÛŠˆÙ\ÜÚ[Û—ÚY\Ù\ÜÚ[Û—ÚYˆÜ™X]YØ]][YK[YJ
+Kˆ
+BˆÜ[™WÜ™WÜ™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛœÊ
+Bˆ™]\›‚ˆ\šÙYœ™\ÛÛ™YÙ[Ù]Ú\™KœÙ]
+
+B‚‚™YˆÙ›Ü›X]ÜÜÙJ]™[Ý\NˆÝ‹]NˆXÝÜÝ‹[žWJHOˆÝŽ‚ˆˆˆ‚ˆ›Ü›X][ˆÔÑH]™[Ýš[™È›ÜˆHÚ\™K‚‚ˆœ\˜[H]™[Ý\NˆÔÑH]™[˜[YKK™Ë‚ˆœ™\ÜÛœÙK›Ý]]Ý^™[H˜‚ˆœ\˜[H]NˆH]™[^[ØYXÝ‚ˆœ™]\›œÎˆH›Ü›X]YÔÑHY\ÜØYÙHÝš[™È[™[™È[ˆÛÈ™]Û[™\Ë‚ˆˆˆ‚ˆ™]\›ˆˆ™]™[ˆÙ]™[Ý\_W™]NˆÚœÛÛ‹™[\Ê]J_W—ˆ‚‚‚™YˆÜ\›Z\ÜÚ[Û—Û]™[Ùœ›ÛWÙÜ˜[Êˆ\Ù\—ÚYˆÝˆ›Û™KˆÜ˜[Îˆ\ÝÔÙ\ÜÚ[Û”\›Z\ÜÚ[Û—Kˆ\×ØYZ[Žˆ›ÛÛŠHOˆ[›Û™N‚ˆˆˆ‚ˆ\š]™HH\Ù\‰ÜÈ\›Z\ÜÚ[Ûˆ]™[œ›ÛHH™KY™]ÚY\ÝÙˆÜ˜[Ë‚‚ˆZ\œ›ÜœÈ™[˜Î˜Û[šYÙ[œÙ\™\‹œ›Ý]\Ë—Ø]]Ú[\œË—ÙÙ]Ü\›Z\ÜÚ[Û—Û]™[ÜÞ[˜Øˆ]Ü\˜]\ÈÛˆÜ˜[È[™XYH[[ˆY[[ÜžHÛÈØ[\œÈØ[ˆ˜]ÚBˆ\›Z\ÜÚ[Û‹\ÝÜ™H]Y\žHXÜ›ÜÜÈX[žHÙ\ÜÚ[ÛœÈ]Û˜ÙK‚‚ˆœ\˜[H\Ù\—ÚYˆH]][XØ]Y\Ù\‹Üˆ›Û™X›Üˆ[˜]][XØ]Yˆ™\]Y\ÝËK™Ëˆ˜[XÙP^[\K˜ÛÛH˜‚ˆœ\˜[HÜ˜[Îˆ[Ü˜[È›ÜˆHÙ\ÜÚ[Û‹\È™]\›™YžBˆ\›Z\ÜÚ[Û—ÜÝÜ™K›\ÝÙ›Ü—ÜÙ\ÜÚ[ÛœÊ
+VØÛÛ—ÚYX‚ˆœ\˜[H\×ØYZ[ŽˆÚ]\ˆH\Ù\ˆÛÈHYZ[ˆ›YËˆ\ÜÈH™\Ý[ˆÙˆHÚ[™ÛH\›Z\ÜÚ[Û—ÜÝÜ™Kš\×ØYZ[Š\Ù\—ÚY
+XØ[XYHÛ˜ÙBˆ›ÜˆHÚÛHYÙH˜]\ˆ[ˆ™\X][™È]\ˆÙ\ÜÚ[Û‹‚ˆœ™]\›œÎˆ[Y\šXÈ]™[
+x $Í
+KÜˆ›Û™XÚ[ˆ\›Z\ÜÚ[ÛœÈ\™H\ØX›YˆÜˆH\Ù\ˆ\È[˜]][XØ]Y‚ˆˆˆ‚ˆYˆ\Ù\—ÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆ\×ØYZ[Ž‚ˆ™]\›ˆU‘SÓÕÓ‘T‚ˆ\Ù\—ÙÜ˜[H™^
+
+È›ÜˆÈ[ˆÜ˜[ÈYˆË\Ù\—ÚYOH\Ù\—ÚY
+K›Û™JBˆYˆ\Ù\—ÙÜ˜[\È›Ý›Û™N‚ˆ™]\›ˆ\Ù\—ÙÜ˜[›]™[ˆX›X×ÙÜ˜[H™^
+
+È›ÜˆÈ[ˆÜ˜[ÈYˆË\Ù\—ÚYOH‘TÑT•‘QÕTÑT—ÔP“PÊK›Û™JBˆYˆX›X×ÙÜ˜[\È›Ý›Û™N‚ˆ™]\›ˆX›X×ÙÜ˜[›]™[ˆ™]\›ˆ›Û™B‚‚™YˆÛÝÛ™\—Ùœ›ÛWÙÜ˜[ÊÜ˜[Îˆ\ÝÔÙ\ÜÚ[Û”\›Z\ÜÚ[Û—JHOˆÝˆ›Û™N‚ˆˆˆ‚ˆš[™HÙ\ÜÚ[ÛˆÝÛ™\ˆœ›ÛHH™KY™]ÚY\ÝÙˆÜ˜[Ë‚‚ˆZ\œ›ÜœÈ™[˜Î˜Û[šYÙ[œÙ\™\‹œ›Ý]\Ë—Ø]]Ú[\œË™Ù]ÜÙ\ÜÚ[Û—ÛÝÛ™\—ÚYˆ]Ü\˜]\ÈÛˆÜ˜[È[™XYH[[ˆY[[ÜžHÛÈØ[\œÈØ[ˆ˜]ÚBˆ\›Z\ÜÚ[Û‹\ÝÜ™H]Y\žHXÜ›ÜÜÈX[žHÙ\ÜÚ[ÛœÈ]Û˜ÙK‚‚ˆœ\˜[HÜ˜[Îˆ[Ü˜[È›ÜˆHÙ\ÜÚ[Û‹\È™]\›™YžBˆ\›Z\ÜÚ[Û—ÜÝÜ™K›\ÝÙ›Ü—ÜÙ\ÜÚ[ÛœÊ
+VØÛÛ—ÚYX‚ˆœ™]\›œÎˆH\Ù\—ÚYÙˆHš\œÝÜ˜[ÚÜÙH]™[\È]X\Ýˆ™]N˜U‘SÓÕÓ‘T˜Üˆ›Û™XYˆ›ÈÝXÚÜ˜[^\ÝË‚ˆˆˆ‚ˆ™]\›ˆ™^
+
+Ë\Ù\—ÚY›ÜˆÈ[ˆÜ˜[ÈYˆË›]™[HU‘SÓÕÓ‘TŠK›Û™JB‚‚™YˆÜÙ\ÜÚ[Û—ÜÝ]\×Ùœ›ÛWØØXÚJˆÛÛ™\œØ][Û—ÚYˆÝ‹ˆ—ÜÝ]\ÎˆÝˆ›Û™HH›Û™KŠHOˆ]\˜[ÈšYH‹œ[›š[™È‹™˜Z[Y—N‚ˆˆˆ‚ˆX\H™[^KY™YÝ]\ÈØXÚH˜[YHÈH\ÝZ][HÝ]\Ë‚‚ˆHØXÚHÝÜ™\ÈHš[™KYÜ˜Z[™Y™[^HÝ]\È
+œ[›š[™È˜ˆØZ][™È˜™˜Z[Y˜šYH˜
+NÈH\ÝZ][HÚ\BˆÛÛ\Ù\Èœ[›š[™È˜ØØZ][™È˜Èœ[›š[™È˜ˆHØXÚBˆZ\ÜÈ˜[È˜XÚÈÈ
+™—ÜÝ]\Êˆ8 %H›ÝÈ˜[YHH[›™[ZÛ[™Âˆ™\XØH\œÚ\ÝY
+Û[šYÙ[ØÛÛ™\œØ][Û—ÛY]Y]K›]™WÜÝ]\Ø
+H8 %ÛÈH™\XØBˆ]Ù\È“ÕÛ\ÈÙ\ÜÚ[Û‰ÜÈ[›™\ˆ[›™[Ý[Ù\™\ÈBˆ™X[Ý]\Ëˆ›ÈØXÚH[žH[™›È›ÝÈ˜[YH™\Ù[È\ÈšYH˜‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹ˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H—ÜÝ]\ÎˆÛÛ™\œØ][Û‹›]™WÜÝ]\ØÚ[ˆHØ[\ˆ\ÂˆH›ÝË[ÙH›Û™X‚ˆœ™]\›œÎˆÛ™HÙˆšYH˜œ[›š[™È˜™˜Z[Y˜‚ˆˆˆ‚ˆØXÚYHÜÙ\ÜÚ[Û—ÜÝ]\×ØØXÚK™Ù]
+ÛÛ™\œØ][Û—ÚY
+BˆYˆØXÚY\È›Û™N‚ˆØXÚYH—ÜÝ]\ÂˆYˆØXÚY[ˆ
+œ[›š[™È‹ØZ][™ÈŠN‚ˆ™]\›ˆœ[›š[™È‚ˆYˆØXÚYOH™˜Z[YŽ‚ˆ™]\›ˆ™˜Z[Y‚ˆ™]\›ˆšYH‚‚‚™YˆÜÙ\ÜÚ[Û—ÜÝ]\×ÝÚ]ØÚ[Ü›Û\
+ˆÛÛ™\œØ][Û—ÚYˆÝ‹ˆÚ[ÜÙ\ÜÚ[Û—ÚYÎˆ\ÝÜÝ—Kˆ—ÜÝ]\ÎˆÝˆ›Û™HH›Û™KŠHOˆ]\˜[ÈšYH‹œ[›š[™È‹™˜Z[Y—N‚ˆˆˆ‚ˆX\HÙ\ÜÚ[Û‰ÜÈØXÚYÝ]\È\È\™XÝÚ[XÝ]š]HÈ\ÝÝ]\Ë‚‚ˆH\™[Ù\ÜÚ[ÛˆÚÝ[™XY\Èœ[›š[™È˜[ˆHÚYX˜\ˆÚ[H[žBˆ\™XÝÝX‹XYÙ[Ú[\ÈÝ[œ[›š[™È˜ÜˆØZ][™È˜]™[ˆY‚ˆH\™[[›™\ˆ\È[™XYHÛÛ™HYKˆ\ÈÙY\È]™\žHÚYX˜\ˆ›ÝÂˆÛ™\ÝÚ]Ý][Ý[[™ÈHÚ[\Ù\ÜÚ[Ûˆ]Y\žH›ÜˆXXÚ›ÝË‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÚYˆ\™[Ù\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹ˆK™Ëˆ˜ÛÛ—Ü\™[LŒÈ˜‚ˆœ\˜[HÚ[ÜÙ\ÜÚ[Û—ÚYÎˆ\™XÝÝX‹XYÙ[Ú[ÛÛ™\œØ][ÛˆYËˆK™ËˆÈ˜ÛÛ—ØÚ[H‹˜ÛÛ—ØÚ[ˆ—X‚ˆœ\˜[H—ÜÝ]\ÎˆH›ÝÉÜÈ\œÚ\ÝY]™WÜÝ]\Ø\ÙYÚ[ˆBˆØØ[ØXÚH\È›È[žH
+\È™\XØHÙ\Û‰ÝÛH[›™\‚ˆ[›™[
+KˆHÚ[›Û\™[ÝÈÝ^\ÈØXÚK[Û›H8 %HÜ›Û™Ë\ÙˆZ\ÜÈ\™H\ÝÚÚ\ÈH\™[	ÜÈ›Û]\Ü[›™\‹™\ÝYY™›Ü‚ˆœ™]\›œÎˆÛ™HÙˆšYH˜œ[›š[™È˜™˜Z[Y˜›ÜˆBˆÙ\ÜÚ[Û‹[\Ý›ÝË‚ˆˆˆ‚ˆÝÛ—ÜÝ]\ÈHÜÙ\ÜÚ[Û—ÜÝ]\×Ùœ›ÛWØØXÚJÛÛ™\œØ][Û—ÚY—ÜÝ]\ÊBˆYˆÝÛ—ÜÝ]\ÈOHœ[›š[™ÈŽ‚ˆ™]\›ˆœ[›š[™È‚ˆÈ˜XÚÙÜ›Ý[™Ú[ÈÝ]]š[™ÈH\›ˆÈ“ÕXZÙHH›ÝÈ[›š[™ÎˆBˆÈÙ\ÜÚ[ÛˆZÙ\ÈH™]ÈY\ÜØYÙH[[YYX][K[™H[HÛ›H™Yœ™\Ú\ÈÛ‚ˆÈH™^ÝÜÛÚËÛÈHÜ[›™\ˆÙ^YYÙ™ˆ]Ø[ˆÝ]]™HHÚ[Ë‚ˆÈH[‹XÚ][™XØ]ÜˆÝ[™\ÜÈ[Hœ›ÛHHÛÝ[‚ˆYˆ[žJˆÜÙ\ÜÚ[Û—ÜÝ]\×ØØXÚK™Ù]
+Ú[ÚY
+H[ˆ
+œ[›š[™È‹ØZ][™ÈŠBˆ›ÜˆÚ[ÚY[ˆÚ[ÜÙ\ÜÚ[Û—ÚYÂˆ
+N‚ˆ™]\›ˆœ[›š[™È‚ˆ™]\›ˆÝÛ—ÜÝ]\Â‚‚˜\Þ[˜ÈYˆØÛÛXÝÙ\ØÙ[™[ØÛÛ™\œØ][Û—ÚYÊˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™Kˆ›ÛÝÚYˆÝ‹ŠHOˆ\ÝÜÝ—N‚ˆˆˆ‚ˆ™]\›ˆ]™\žHÝX‹XYÙ[\ØÙ[™[Ùˆ›ÛÝÚY][žH\‚‚ˆØ[ÜÈH™YHÛ™H]™[]H[YH
+Ú[Ü˜[™Ú[[™ÛÈÛŠKˆ˜]Ú[™ÈXXÚ]™[[ÈHÚ[™ÛH\ÝØÚ[ØÛÛ™\œØ][Û—ÚY×ØžWÜ\™[ˆØ[ÛÈ[ˆ‹[]™[™YHÛÜÝÈˆ]Y\šY\È˜]\ˆ[ˆÛ™H\ˆ›ÙK‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H›ÜˆÚ[ZYÛÚÝ\‚ˆœ\˜[H›ÛÝÚYˆ›ÛÝÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ™]\›œÎˆ\ØÙ[™[YÈ[ˆœ™XYYš\œÝÜ™\‹ˆ[\HYˆ›ÛÝÚYˆ\È›ÈÝX‹XYÙ[\ØÙ[™[Ë‚ˆˆˆ‚ˆ\ØÙ[™[ÚYÎˆ\ÝÜÝ—HH×BˆÙY[ˆHÜ›ÛÝÚYBˆœ›ÛY\ˆHÜ›ÛÝÚYBˆÚ[Hœ›ÛY\Ž‚ˆÚ[ÚY×ÛX\H]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K›\ÝØÚ[ØÛÛ™\œØ][Û—ÚY×ØžWÜ\™[ˆœ›ÛY\‹ˆ
+Bˆ™^Ùœ›ÛY\Žˆ\ÝÜÝ—HH×Bˆ›Üˆ\™[ÚY[ˆœ›ÛY\Ž‚ˆ›ÜˆÚ[ÚY[ˆÚ[ÚY×ÛX\™Ù]
+\™[ÚY×JN‚ˆYˆÚ[ÚY›Ý[ˆÙY[Ž‚ˆÙY[‹˜Y
+Ú[ÚY
+Bˆ\ØÙ[™[ÚYË˜\[™
+Ú[ÚY
+Bˆ™^Ùœ›ÛY\‹˜\[™
+Ú[ÚY
+Bˆœ›ÛY\ˆH™^Ùœ›ÛY\‚ˆ™]\›ˆ\ØÙ[™[ÚYÂ‚‚]XÛ\ÜÊœ›Þ™[UYJB˜Û\ÜÈÙ\ÜÚ[Û“]™[™\ÜÎ‚ˆˆˆ‚ˆHÛÈÛ™\Ý]™[™\ÜÈÚYÛ˜[È›ÜˆHÚ[™ÛHÙ\ÜÚ[Û‹‚‚ˆ™]\›™Y
+Ù^YYžHÙ\ÜÚ[ÛˆY
+HžHHÙ\™\‰ÜÂˆØ[×ÜÙ\ÜÚ[Û—Û]™[™\ÜØÈÜÙ\ÜÚ[Û—Û]™[™\ÜØÛÚÝ\È[™ˆÛÛœÝ[YYžHH\ÝZ][HZ[\‹HÔÈÝŒKÜÙ\ÜÚ[ÛœËÝ\]\ØˆÝ™X[KHÚ[™ÛK\Ù\ÜÚ[ÛˆÙ\ÜÚ[Û”™\ÜÛœÙXÛ˜\ÚÝ[™ˆÑUÚX[ˆÜ][™ÈHÛÚ[™ÛHÛÛ™›]Y›ÛÛX[ˆ[ÂˆÛÈšY[È]ÈHÜ[‹\Ù\ÜÚ[ÛˆšY]È\Ý[™ÝZ\Úœ[›™\ˆÝÜYˆ]ÜÝØ[ˆ™[][˜Ú8 %\ÝÙ[™HY\ÜØYÙHˆœ›ÛHšÜÝÙ™›[™H8 %ˆ™XÛÛ›™XÝÈ›ÜšÈ‹‚‚ˆœ\˜[H[›™\—ÛÛ›[™NˆÝšXÝ[›™\ˆ™XXÚXš[]H8 %YXY™ˆBˆ[›™\ˆ[›™[\ÈÝ\œ™[H™YÚ\Ý\™Y›Üˆ\ÈÙ\ÜÚ[Û‹ˆ\Âˆ\ÈHÛÛH™XXÚXš[]HÚYÛ˜[ˆ]Ù\È
+Š››Ý
+Šˆ›Û[‚ˆÜÝ\™[][˜ÚÜ[Z\ÛH
+HXY[›™\ˆÛˆH]™HÜÝ™XYÂˆ˜[ÙX\™K›ÝYX
+KˆHÙ\ÜÚ[ÛˆÚ]›È[›™\‚ˆš[™[™È
+[‹\›ØÙ\ÜÈ^XÝ]ÜˆÈ›ÝY]\Ü]ÚY
+H™XYÂˆYX‚ˆœ\˜[HÜÝÛÛ›[™NˆÚ]\ˆHÙ\ÜÚ[Û‰ÜÈÜÝ[›™[\È]™Bˆ
+Ý]\ÈÛ›[™H[™œ™\ÚÚ][ˆÔÕÓU‘S‘TÔ×ÕÔØ
+K‚ˆYXÚ[ˆHÙ\ÜÚ[Û‰ÜÈÜÝÚY\È[ˆHÛ›[™KZÜÝÂˆÙ]˜[ÙXÚ[ˆHÜÝÚY\ÈÙ]]›ÝÛ›[™K[™ˆ›Û™XÚ[ˆHÙ\ÜÚ[Ûˆ\È›ÈÜÝÚY
+ÓHÈØØ[
+K‚ˆ\ÙYÛ›HÈÚÛÜÙHÚ]HÜ[ˆšY]ÈÚÝÜÈÚ[‚ˆ[›™\—ÛÛ›[™X\È˜[ÙXÈ™]™\ˆ\XÚ\]\È[ˆBˆ™XXÚXš[]HXÚ\Ú[Û‹‚ˆœ\˜[HÜÝÝ™\œÚ[ÛŽˆ™\œÚ[ÛˆÝš[™Èœ›ÛHH›Ý[™ÜÝ	ÜÂˆÜÝš[Øœ˜[YKK™ËˆŒŒKŒ˜8 %Ý\™˜XÙY[ˆBˆÙ\ÜÚ[Ûˆ[™›ÈÜÝ™\‹ˆ›Û™XÚ[ˆHÙ\ÜÚ[Ûˆ\È›ÈÜÝˆš[™[™ËHÜÝ\ÈÙ™›[™KÜˆ]È™\œÚ[Ûˆ\Û‰Ý™\ÛÛ˜X›BˆÛˆ\È™\XØH
+H™\œÚ[Ûˆ]™\È[ˆH[‹[Y[[ÜžHÜÝˆ™YÚ\ÝžK›ÝHÜÝÈX›KÛÈHÜÝÛÛ›™XÝYÈ[›Ý\‚ˆ™\XØH™XYÈ›Û™X\™JK‚ˆˆˆ‚‚ˆ[›™\—ÛÛ›[™Nˆ›ÛÛˆÜÝÛÛ›[™Nˆ›ÛÛ›Û™BˆÜÝÝ™\œÚ[ÛŽˆÝˆ›Û™HH›Û™B‚‚˜\Þ[˜ÈYˆØ\WÛ]™[™\Ü×Ý×Ú][\Êˆ][\Îˆ\ÝÔÙ\ÜÚ[Û“\Ý][WKˆ]™[™\Ü×ÛÛÚÝ\ˆØ[X›VÖÛ\ÝÜÝ—WKXÝÜÝ‹Ù\ÜÚ[Û“]™[™\Ü×WH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ]XÚ[›™\ˆ
+ÈÜÝ]™[™\ÜÈÈÙ\ÜÚ[Û‹[\Ý][\ÈÚ[ˆHÛÚÝ\\ÂˆÚ\™Y‚‚ˆ›ÝÑUÝŒKÜÙ\ÜÚ[ÛœØ[™ÔÈÝŒKÜÙ\ÜÚ[ÛœËÝ\]\Ø\ÙH\ÈÛÂˆ™XÛÛ˜Ú[X][Ûˆ™\Ù\™\ÈHØ[YH[›™\—ÛÛ›[™XÂˆÜÝÛÛ›[™XšY[È]\Úœ˜[Y\È]Ú[ÈHÙXˆØXÚK‚‚ˆœ\˜[H][\ÎˆÙ\ÜÚ[Û‹[\Ý›ÝÜÈÈ[››Ý]K‚ˆœ\˜[H]™[™\Ü×ÛÛÚÝ\ˆ[È]™[™\ÜÈÛÚÝ\œ›ÛHÙ\ÜÚ[ÛˆYÈBˆ˜Û\ÜÎ˜Ù\ÜÚ[Û“]™[™\ÜØZ\‹K™Ë‚ˆÈ˜ÛÛ—ØX˜ÌLŒÈŽˆÙ\ÜÚ[Û“]™[™\ÜÊ[›™\—ÛÛ›[™OUYKˆÜÝÛÛ›[™OS›Û™J_Xˆ›Û™XYX[œÈ\ÈÙ\™\ˆØ[››ÝÛÛ\]Bˆ]™[™\ÜÈ›Üˆ\Ý›ÝÜË[ˆÚXÚØ\ÙH›ÝšY[È\™HYˆ›Û™X‚ˆœ™]\›œÎˆ›Û™Xˆ]]]\È][\Ø[ˆXÙK‚ˆˆˆ‚ˆYˆ]™[™\Ü×ÛÛÚÝ\\È›Û™HÜˆ›Ý][\Î‚ˆ™]\›‚ˆ]™[™\ÜÈH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+]™[™\Ü×ÛÛÚÝ\Ú][KšY›Üˆ][H[ˆ][\×JBˆ›Üˆ][H[ˆ][\Î‚ˆ™\Ý[H]™[™\ÜÖÚ][KšYBˆ][Kœ[›™\—ÛÛ›[™HH™\Ý[œ[›™\—ÛÛ›[™Bˆ][KšÜÝÛÛ›[™HH™\Ý[šÜÝÛÛ›[™BˆÈHXY[›™\‰ÜÈ\šÙY›Û\ÈYYÚ]]]H\œÚ\ÝYˆÈ[™[™ÈÛÝ[\È›ÈÜ˜\Ú][YHÜš]\ˆ
+H[›™\‹ÚÜÝÜ™\XØH]ˆÈY\ÈÚ]Ý]HÜ˜XÙY[™\ÛÛ™H™]™\ˆXÜ™[Y[ÈH›ÝÊH8 %ÛÈ[‚ˆÈÙ™›[™H[›™\ˆ™XYÈ\È™\›È[™[™È˜]\ˆ[ˆYÚ[™ÈH[ÛBˆÈ[˜›Þ˜YÙHÝ™\ˆ[ˆ[\H›Û\\Ýˆ™XÛÛ˜Ú[Y\˜X›HÚ[ˆBˆÈ[›™\ˆ™XÛÛ›™XÝÈ
+ÙYHÛÛ—Ü[›™\—ØÛÛ›™XÝ	ÜÈ[™[™È™\Þ[˜ÊK‚ˆYˆ›Ý™\Ý[œ[›™\—ÛÛ›[™N‚ˆ][Kœ[™[™×Ù[XÚ]][Ûœ×ØÛÝ[H‚‚™YˆÝ\™Ù]YÙ[XÚ]][Û—Ù]™[
+ˆ]™[ˆXÝÜÝ‹[žWKˆ
+‹ˆ\™Ù]ÜÙ\ÜÚ[Û—ÚYˆÝ‹ŠHOˆXÝÜÝ‹[žWN‚ˆˆˆ‚ˆ™]\›ˆ[ˆ[XÚ]][Ûˆ]™[[››Ý]YÚ]]È™\ÛÛ][Ûˆ\™Ù]‚‚ˆÚ[\Ù\ÜÚ[Ûˆ[XÚ]][ÛœÈØ[ˆ™HZ\œ›Ü™Y[È[ˆ[˜Ù\ÝÜ‰ÜÂˆÚ]Ý™X[KˆHZ\œ›Ü™YØ\™\È™[™\™Y[ˆH[˜Ù\ÝÜ‚ˆÛÛ™\œØ][Û‹]H\›™\ÜÈ]\™HÝ[™[Û™ÜÈÈHÚ[‚ˆ\™Ù]ÜÙ\ÜÚ[Û—ÚY[ÈÛY[ÈÚXÚÙ\ÜÚ[Û‰ÜÈ™\ÛÛ™HT“ˆÚÝ[™XÙZ]™HH™\™XÝ‚‚ˆœ\˜[H]™[ˆÜšYÚ[˜[™\ÜÛœÙK™[XÚ]][Û—Ü™\]Y\Ý]™[ˆK™ËˆÈ\HŽˆœ™\ÜÛœÙK™[XÚ]][Û—Ü™\]Y\Ý‹ˆ™[XÚ]][Û—ÚYŽˆ™[XÚ]ØX˜È‹œ\˜[\ÈŽˆË‹‹Ÿ_X‚ˆœ\˜[H\™Ù]ÜÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Ûˆ]ÝÛœÈH\šÙYˆ[XÚ]][Û‹K™Ëˆ˜ÛÛ—ØÚ[LŒÈ˜‚ˆœ™]\›œÎˆHÚ[ÝÈ]™[ÛÜHÚ]HÛÜYY\˜[\ØXÝˆØ\œžZ[™È\™Ù]ÜÙ\ÜÚ[Û—ÚY‚ˆˆˆ‚ˆZ\œ›Ü™YHXÝ
+]™[
+Bˆ\˜[\ÈH]™[™Ù]
+œ\˜[\ÈŠBˆYˆ\Ú[œÝ[˜ÙJ\˜[\ËXÝ
+N‚ˆZ\œ›Ü™YÈœ\˜[\È—HHÊŠœ\˜[\Ë\™Ù]ÜÙ\ÜÚ[Û—ÚYŽˆ\™Ù]ÜÙ\ÜÚ[Û—ÚYBˆ[ÙN‚ˆZ\œ›Ü™YÈœ\˜[\È—HHÈ\™Ù]ÜÙ\ÜÚ[Û—ÚYŽˆ\™Ù]ÜÙ\ÜÚ[Û—ÚYBˆ™]\›ˆZ\œ›Ü™Y‚‚™YˆØ[˜Ù\ÝÜ—ÜÙ\ÜÚ[Û—ÚYÊˆÛÛ—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ŠHOˆ\ÝÜÝ—N‚ˆˆˆ‚ˆ™]\›ˆ[˜Ù\ÝÜˆÙ\ÜÚ[ÛˆYÈ›ÜˆHÙ\ÜÚ[Û‹™X\™\Ý\™[š\œÝ‚‚ˆœ\˜[HÛÛ—ÜÝÜ™NˆÝÜ™H\ÙYÈ™XYÛÛ™\œØ][Ûˆ\™[[šÜË‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[ÛˆÈØ[È\Ø\™œ›ÛKK™Ë‚ˆ˜ÛÛ—ØÚ[LŒÈ˜‚ˆœ™]\›œÎˆ[˜Ù\ÝÜˆYÈ[ˆ\™[]Ë\›ÛÝÜ™\‹ˆ[\HÚ[ˆBˆÙ\ÜÚ[Ûˆ\ÈÜ[]™[ÜˆZ\ÜÚ[™Ë‚ˆˆˆ‚ˆ[˜Ù\ÝÜœÎˆ\ÝÜÝ—HH×BˆÙY[ˆHÜÙ\ÜÚ[Û—ÚYBˆÝ\œ™[HÛÛ—ÜÝÜ™K™Ù]ØÛÛ™\œØ][ÛŠÙ\ÜÚ[Û—ÚY
+BˆÚ[HÝ\œ™[\È›Ý›Û™H[™Ý\œ™[œ\™[ØÛÛ™\œØ][Û—ÚY\È›Ý›Û™N‚ˆ\™[ÚYHÝ\œ™[œ\™[ØÛÛ™\œØ][Û—ÚYˆYˆ\™[ÚY[ˆÙY[Ž‚ˆœ™XZÂˆ[˜Ù\ÝÜœË˜\[™
+\™[ÚY
+BˆÙY[‹˜Y
+\™[ÚY
+BˆÝ\œ™[HÛÛ—ÜÝÜ™K™Ù]ØÛÛ™\œØ][ÛŠ\™[ÚY
+Bˆ™]\›ˆ[˜Ù\ÝÜœÂ‚‚™YˆÜX›\ÚÙ[XÚ]][Û—Ü™\]Y\ÝÝ×Ø[˜Ù\ÝÜœÊˆÛÛ—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ]™[ˆXÝÜÝ‹[žWKŠHOˆ›Û™N‚ˆˆˆ‚ˆZ\œ›ÜˆHÚ[[XÚ]][Ûˆ™\]Y\Ý[ÈXXÚ[˜Ù\ÝÜˆÝ™X[K‚‚ˆœ\˜[HÛÛ—ÜÝÜ™NˆÝÜ™H\ÙYÈ\ØÛÝ™\ˆ[˜Ù\ÝÜˆÙ\ÜÚ[ÛœË‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÚ[Ù\ÜÚ[Ûˆ]ÝÛœÈH[XÚ]][Û‹ˆK™Ëˆ˜ÛÛ—ØÚ[LŒÈ˜‚ˆœ\˜[H]™[ˆÜšYÚ[˜[™\ÜÛœÙK™[XÚ]][Û—Ü™\]Y\Ý]™[‚ˆˆˆ‚ˆZ\œ›Ü™YHÝ\™Ù]YÙ[XÚ]][Û—Ù]™[
+]™[\™Ù]ÜÙ\ÜÚ[Û—ÚY\Ù\ÜÚ[Û—ÚY
+Bˆ›Üˆ[˜Ù\ÝÜ—ÚY[ˆØ[˜Ù\ÝÜ—ÜÙ\ÜÚ[Û—ÚYÊÛÛ—ÜÝÜ™KÙ\ÜÚ[Û—ÚY
+N‚ˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+[˜Ù\ÝÜ—ÚYZ\œ›Ü™Y
+B‚‚™YˆÜX›\ÚÙ[XÚ]][Û—Ü™\ÛÛ™YÝ×Ø[˜Ù\ÝÜœÊˆÛÛ—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[XÚ]][Û—ÚYˆÝ‹ˆXÝ[ÛŽˆÝˆ›Û™HH›Û™Kˆ™X\ÛÛŽˆÝˆ›Û™HH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆZ\œ›Üˆ[ˆ[XÚ]][Û‹\™\ÛÛ™Y]™[[ÈXXÚ[˜Ù\ÝÜˆÝ™X[K‚‚ˆœ\˜[HÛÛ—ÜÝÜ™NˆÝÜ™H\ÙYÈ\ØÛÝ™\ˆ[˜Ù\ÝÜˆÙ\ÜÚ[ÛœË‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÚ[Ù\ÜÚ[Ûˆ]ÝÛœÈH[XÚ]][Û‹ˆK™Ëˆ˜ÛÛ—ØÚ[LŒÈ˜‚ˆœ\˜[H[XÚ]][Û—ÚYˆ[XÚ]][ÛˆÛÜœ™[][ÛˆYK™Ë‚ˆ™[XÚ]ØX˜ÌLŒÈ˜‚ˆœ\˜[HXÝ[ÛŽˆÜ[Û˜[PÔ™\™XÝØ\œšYY›ÝYÚÈBˆZ\œ›ÜœÎÈÙYH™[˜Î˜ÜX›\ÚÙ[XÚ]][Û—Ü™\ÛÛ™Y‚ˆœ\˜[H™X\ÛÛŽˆÜ[Û˜[›Ë]™\™XÝ™X\ÛÛˆØ\œšYY›ÝYÚÈBˆZ\œ›ÜœÎÈÙYH™[˜Î˜ÜX›\ÚÙ[XÚ]][Û—Ü™\ÛÛ™Y‚ˆˆˆ‚ˆ›Üˆ[˜Ù\ÝÜ—ÚY[ˆØ[˜Ù\ÝÜ—ÜÙ\ÜÚ[Û—ÚYÊÛÛ—ÜÝÜ™KÙ\ÜÚ[Û—ÚY
+N‚ˆÜX›\ÚÙ[XÚ]][Û—Ü™\ÛÛ™Y
+[˜Ù\ÝÜ—ÚY[XÚ]][Û—ÚYXÝ[ÛXXÝ[Û‹™X\ÛÛ\™X\ÛÛŠB‚‚™YˆÙ\ØÙ[™[ÜÙ\ÜÚ[ÛœÊˆÛÛ—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ŠHOˆ\ÝÐÛÛ™\œØ][Û—N‚ˆˆˆ‚ˆ™]\›ˆ\ØÙ[™[ÝX‹XYÙ[ÛÛ™\œØ][ÛœÈ›ÜˆHÙ\ÜÚ[Û‹‚‚ˆœ\˜[HÛÛ—ÜÝÜ™NˆÝÜ™H\ÙYÈ\ÝÛÛ™\œØ][ÛœË‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆ[˜Ù\ÝÜˆÙ\ÜÚ[ÛˆYK™Ëˆ˜ÛÛ—Ü›ÛÝLŒÈ˜‚ˆœ™]\›œÎˆÝX‹XYÙ[ÛÛ™\œØ][ÛœÈ™[ÝÈÙ\ÜÚ[Û—ÚYˆ[\Bˆ›ÜˆÙ\ÜÚ[ÛœÈÚ]›È\ØÙ[™[Ë‚ˆˆˆ‚ˆ\ØÙ[™[Îˆ\ÝÐÛÛ™\œØ][Û—HH×Bˆ]Y]YNˆ\]YVÜÝ—HH\]YJÜÙ\ÜÚ[Û—ÚYJBˆÙY[ˆHÜÙ\ÜÚ[Û—ÚYBˆÚ[H]Y]YN‚ˆ\™[ÚYH]Y]YKœÜY
+
+BˆY\ŽˆÝˆ›Û™HH›Û™BˆÚ[HYN‚ˆYÙHHÛÛ—ÜÝÜ™K›\ÝØÛÛ™\œØ][ÛœÊˆÚ[™HœÝX—ØYÙ[‹ˆ\™[ØÛÛ™\œØ][Û—ÚY\\™[ÚYˆ[Z]LLˆY\XY\‹ˆ
+Bˆ›ÜˆÚ[[ˆYÙK™]N‚ˆYˆÚ[šY[ˆÙY[Ž‚ˆÛÛ[YBˆÙY[‹˜Y
+Ú[šY
+Bˆ\ØÙ[™[Ë˜\[™
+Ú[
+Bˆ]Y]YK˜\[™
+Ú[šY
+BˆYˆ›ÝYÙKš\×Û[Ü™HÜˆYÙK›\ÝÚY\È›Û™N‚ˆœ™XZÂˆY\ˆHYÙK›\ÝÚYˆ™]\›ˆ\ØÙ[™[Â‚‚™YˆÜ[™[™×Ù[XÚ]][Û—ÜÛ˜\ÚÝÙ›Ü—ÜÙ\ÜÚ[ÛŠˆÛÛ—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆÛÛŽˆÛÛ™\œØ][Û‹ŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆˆˆ‚ˆ™]\›ˆ[™[™È[XÚ]][Ûˆ]™[Èš\ÚX›Hœ›ÛHHÙ\ÜÚ[ÛˆÛ˜\ÚÝ‚‚ˆHÝ\œ™[Ù\ÜÚ[Û‰ÜÈÝÛˆÝ]Ý[™[™È›Û\È\™H™]\›™Yš\œÝ‚ˆ[™[™È›Û\Èœ›ÛH\ØÙ[™[ÝX‹XYÙ[È\™H\[™YÚ]ˆ\˜[\Ë\™Ù]ÜÙ\ÜÚ[Û—ÚYÛÈHÛÛ[ØYY[˜Ù\ÝÜˆÚ]Ø[‚ˆ™[™\ˆ[™™\ÛÛ™HÚ[\›Ý˜[Ë‚ˆ\XØ]HYÈ\™HÚÚ\Y™XØ]\ÙH]™HZ\œ›Üš[™È[ÛÈ™XÛÜ™ÈBˆ[˜Ù\ÝÜˆÛÜH[ˆH[‹[Y[[ÜžH[™^‚‚ˆH\ØÙ[™[Ø[ÈÛÜÝÈÛ™H\ÝØÛÛ™\œØ][ÛœØ]Y\žH\‚ˆÙ\ÜÚ[Ûˆ[ˆH™YKÛÈ]\ÈÚÚ\Y[\™[H[›\ÜÈÛÛYHÙ\ÜÚ[Û‚ˆÝ\ˆ[ˆÛÛ˜\È[ˆÝ]Ý[™[™È›Û\[ˆH[‹[Y[[ÜžBˆ[™^
+HÛÛ[[ÛˆØ\ÙH\È›Û™H[ž]Ú\™JK‚‚ˆœ\˜[HÛÛ—ÜÝÜ™NˆÝÜ™H\ÙYÈ\Ý\ØÙ[™[ÝX‹XYÙ[Ë‚ˆœ\˜[HÛÛŽˆÙ\ÜÚ[ÛˆÛÛ™\œØ][Ûˆ™Z[™ÈÛ˜\ÚÝY‚ˆœ™]\›œÎˆ[™[™È[XÚ]][Ûˆ]™[XÝÈÝZ]X›H›Ü‚ˆ˜Û\ÜÎ˜Ù\ÜÚ[Û”™\ÜÛœÙKœ[™[™×Ù[XÚ]][ÛœØ‚ˆˆˆ‚ˆ]™[ÈH[™[™×Ù[XÚ]][ÛœËœÛ˜\ÚÝÙ›ÜŠÛÛ‹šY
+BˆYˆ›Ý
+Ù]
+[™[™×Ù[XÚ]][ÛœËœ[™[™×ÜÙ\ÜÚ[Û—ÚYÊ
+JHHØÛÛ‹šYJN‚ˆ™]\›ˆ]™[ÂˆÙY[ˆHÂˆ]™[™Ù]
+™[XÚ]][Û—ÚYŠBˆ›Üˆ]™[[ˆ]™[ÂˆYˆ\Ú[œÝ[˜ÙJ]™[™Ù]
+™[XÚ]][Û—ÚYŠKÝŠBˆBˆ›ÜˆÚ[[ˆÙ\ØÙ[™[ÜÙ\ÜÚ[ÛœÊÛÛ—ÜÝÜ™KÛÛ‹šY
+N‚ˆ›Üˆ]™[[ˆ[™[™×Ù[XÚ]][ÛœËœÛ˜\ÚÝÙ›ÜŠÚ[šY
+N‚ˆ[XÚ]][Û—ÚYH]™[™Ù]
+™[XÚ]][Û—ÚYŠBˆYˆ\Ú[œÝ[˜ÙJ[XÚ]][Û—ÚYÝŠH[™[XÚ]][Û—ÚY[ˆÙY[Ž‚ˆÛÛ[YBˆYˆ\Ú[œÝ[˜ÙJ[XÚ]][Û—ÚYÝŠN‚ˆÙY[‹˜Y
+[XÚ]][Û—ÚY
+Bˆ]™[Ë˜\[™
+Ý\™Ù]YÙ[XÚ]][Û—Ù]™[
+]™[\™Ù]ÜÙ\ÜÚ[Û—ÚYXÚ[šY
+JBˆ™]\›ˆ]™[Â‚‚™YˆÜX›\ÚÚ[œ]ØÛÛœÝ[YY
+ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ][NˆÛÛ™\œØ][Û’][KˆÛX\™YÜ[™[™×ÚYˆÝˆ›Û™HH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚHÙ\ÜÚ[Û‹š[œ]˜ÛÛœÝ[YY]™[›ÜˆH\Ý\\œÚ\ÝYˆÛÛ™\œØ][Ûˆ][K‚‚ˆZ\œ›ÜœÈHÚ\™HÚ\HÛÛœÝ[Y\œÈ\[™Ûˆ›Üˆ™[™\š[™ÈBˆ[œ]
+\Ù\ˆY\ÜØYÙHX˜›KÛÛ\™\Ý[›ØÚË]ËŠH]Bˆ[ÛY[ÙˆXØÙ\[˜ÙK‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆHÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\ˆÚÜÙBˆÝ™X[HÚÝ[™XÙZ]™HH]™[‚ˆœ\˜[H][NˆH\œÚ\ÝY˜Û\ÜÎ˜ÛÛ™\œØ][Û’][XØ\œžZ[™ÂˆHØ[›ÛšXØ[YÈ\XÈ]XšY[Ë‚ˆœ\˜[HÛX\™YÜ[™[™×ÚYˆÚ[ˆ\ÈY\ÜØYÙH˜Z[™YBˆ›[Ù˜Û[šYÙ[œ[[YKœ[™[™×Ú[œ]Ø[žH
+˜]]™K]\›Z[˜[ˆÙXˆY\ÜØYÙHZ\œ›Ü™Y˜XÚÈœ›ÛHH˜[œØÜš\
+K][žIÜÂˆYK™Ëˆœ[™[™×ØLXŒ˜ÌÈ˜8 %ÛÈÛY[È›ÜHÜ[Z\ÝXÂˆX˜›HžHYˆ›Û™XÚ[ˆ›Ý[™ÈØ\È˜Z[™Y‚‚ˆY[ˆÛÛ^][\È
+\×ÛY]XK™Ëˆ[š™XÝYÚÚ[^ÜˆBˆÛ]YH˜XÚÙÜ›Ý[™]\ÚÈ›ÝYšXØ][ÛŠH\™HX›\ÚYÛË›YÙÙY[‚ˆ]Kš\×ÛY]XˆÝXœØÜšX™\œÈYHÜˆ™K[X™[[K[™HÙXˆRBˆÚÝÜÈH\ÚÈ›ÝYšXØ][Ûˆ\ÈHÞ\Ý[HX\šÙ\ˆÛÈH\›ˆÛ]YBˆ™\Ý[Y\ÈÛˆ]Ý\ÈH™]ÈX˜›K‚ˆˆˆ‚ˆ]™[HÙ\ÜÚ[Û’[œ]ÛÛœÝ[YY]™[
+ˆ\OHœÙ\ÜÚ[Û‹š[œ]˜ÛÛœÝ[YY‹ˆ]OTÙ\ÜÚ[Û’[œ]ÛÛœÝ[YY^[ØY
+ˆ][WÚYZ][KšYˆ\OZ][K\Kˆ]OZ][K™]K›[Ù[Ù[\
+
+HYˆ][K™]H\È›Ý›Û™H[ÙHßKˆÜ™X]YØžOZ][K˜Ü™X]YØžKˆÛX\™YÜ[™[™×ÚYXÛX\™YÜ[™[™×ÚYˆ
+Kˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚ˆÈØ[XÛØÚÈÝ\ÙˆXXÚÙ\ÜÚ[Û‰ÜÈ[‹Y›YÚÛÛ\XÝ[Û‹ˆHÛ™ÈÛÛ\XÝ[Û‚ˆÈ™KX[››Ý[˜Ù\È[—Ü›ÙÜ™\ÜÈÛˆ]™\žHÝ]\ÈÛÈØ\œžZ[™ÈÛ™HÝX›BˆÈÝ\YØ]]ÈÛY[È[˜ÚÜˆZ\ˆ[\ÙYÛÝ[\ˆÈHYHÝ\ˆÈ]™[ˆXÜ›ÜÜÈHYÙH™[ØY
+H]™HÝ™X[H\È›È™\^JK‚—ØÛÛ\XÝ[Û—ÜÝ\YØ]ˆXÝÜÝ‹[HHßB‚‚™YˆÜX›\ÚØÛÛ\XÝ[Û—Ú[—Ü›ÙÜ™\ÜÊÙ\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚHÝ[™\™ÛÛ\XÝ[Ûˆ›ÙÜ™\ÜÈ]™[ÈHÙ\ÜÚ[ÛˆÝ™X[K‚‚ˆ™\X]YØ[ÈÚ[HHØ[YHÛÛ\XÝ[Ûˆ[œÈ™]\ÙHHÝ\YØ]ˆ™XÛÜ™YÛˆHš\œÝØ[ÈÛÛ\]YØ˜Z[YÛX\ˆ]ÛÈBˆ™^ÛÛ\XÝ[ÛˆÝ\ÈHœ™\ÚÛØÚË‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹ˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆˆˆ‚ˆÝ\YØ]HØÛÛ\XÝ[Û—ÜÝ\YØ]œÙ]Y˜][
+Ù\ÜÚ[Û—ÚY[
+[YK[YJ
+JJBˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+ˆÙ\ÜÚ[Û—ÚYˆÈ\HŽˆœ™\ÜÛœÙK˜ÛÛ\XÝ[Û‹š[—Ü›ÙÜ™\ÜÈ‹œÝ\YØ]ŽˆÝ\YØ]Kˆ
+B‚‚™YˆÜX›\ÚØÛÛ\XÝ[Û—ØÛÛ\]Y
+Ù\ÜÚ[Û—ÚYˆÝ‹Ý[ÝÚÙ[œÎˆ[›Û™JHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚHÛÛ\XÝ[Û‹Yš[š\ÚY]™[ÈHÙ\ÜÚ[ÛˆÝ™X[K‚‚ˆ[Z]YY\ˆ™[˜Î˜ÛÛ\XÝØÛÛ™\œØ][Û—Û›ÝØ™]\›œÂˆÝXØÙ\ÜÙ[KˆÛY[È]™[™\™YHÜ[›™\ˆÛˆBˆ™\ÜÛœÙK˜ÛÛ\XÝ[Û‹š[—Ü›ÙÜ™\ÜØ]™[ÚÝ[\Ü˜YH]ÂˆH\›X[™[ÛÛ™\œØ][ÛˆÛÛ\XÝYˆX\šÙ\ˆÛˆ\È]™[‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹ˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÝ[ÝÚÙ[œÎˆZÝÚÙ[ˆ\Ý[X]HÙˆHÜÝXÛÛ\XÝ[Û‚ˆÛÛ^Ú^™KK™ËˆŒXˆ›Û™XÚ[ˆ[˜]˜Z[X›K‚ˆˆˆ‚ˆØÛÛ\XÝ[Û—ÜÝ\YØ]œÜ
+Ù\ÜÚ[Û—ÚY›Û™JBˆ^[ØYˆXÝÜÝ‹Øš™XÝHHÈ\HŽˆœ™\ÜÛœÙK˜ÛÛ\XÝ[Û‹˜ÛÛ\]YŸBˆYˆÝ[ÝÚÙ[œÈ\È›Ý›Û™N‚ˆ^[ØYÈÝ[ÝÚÙ[œÈ—HHÝ[ÝÚÙ[œÂˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY^[ØY
+B‚‚™YˆÜX›\ÚØÛÛ\XÝ[Û—Ù˜Z[Y
+Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚHÛÛ\XÝ[Û‹Y˜Z[Y]™[ÈHÙ\ÜÚ[ÛˆÝ™X[K‚‚ˆ[Z]YÚ[ˆ™[˜Î˜ÛÛ\XÝØÛÛ™\œØ][Û—Û›ÝØ˜Z\Ù\ËˆÛY[Âˆ]™[™\™YHÜ[›™\ˆÛˆBˆ™\ÜÛœÙK˜ÛÛ\XÝ[Û‹š[—Ü›ÙÜ™\ÜØ]™[ÚÝ[\ÛZ\ÜÈ]ˆÚ]Ý]X]š[™ÈH\›X[™[X\šÙ\ˆ8 %HÛÛ™\œØ][Ûˆ\ÝÜžBˆØ\È›Ý[ÙYšYY‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹ˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆˆˆ‚ˆØÛÛ\XÝ[Û—ÜÝ\YØ]œÜ
+Ù\ÜÚ[Û—ÚY›Û™JBˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚYÈ\HŽˆœ™\ÜÛœÙK˜ÛÛ\XÝ[Û‹™˜Z[YŸJB‚‚™YˆÜX›\ÚÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ][NˆÛÛ™\œØ][Û’][Kˆ
+‹ˆ™\ÜÛœÙWÚYˆÝ‹ˆYÙ[Û˜[YNˆÝ‹ŠHOˆ›Û™N‚ˆˆˆ‚ˆœ›ØYØ\Ý[ˆ\ÜÚ\Ý[Y\ÜØYÙH\[™YÝ]ÚYHH\ÚÈ[[YK‚‚ˆ\›Z[˜[X˜XÚÙY[YÜ˜][ÛœÈÝXÚ\È˜]]™HÛ]YH›ÙXÙHÝ]]ˆ[ˆH]™H\›Z[˜[š\œÝ[ˆZ\œ›ÜˆHÙ[X[XÈ^[ÈT‚ˆ\™H\È›ÈYÙ[Ý\ÚØÈØ]ÚÛÈ\È[\ˆX›\Ú\ÈBˆÛÛ\]YÝ]]][H\™XÝKˆHœ›ÝÜÙ\ˆ™YXÙ\ˆ™[™\œÈBˆ\œÚ\ÝYY\ÜØYÙHÛÛ[œ›ÛH™\ÜÛœÙK›Ý]]Ú][K™Û™XÂˆ[Z][™ÈÞ[]XÈ^[\È\™HÛÝ[\XØ]HHØ[YBˆ˜[œØÜš\][HÚ[ˆHÛ˜\ÚÝ][ÛÈÙY\È]‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H][Nˆ\œÚ\ÝY\ÜÚ\Ý[Y\ÜØYÙH][K‚ˆœ\˜[H™\ÜÛœÙWÚYˆYØXÞH[™Ú[™\ÜÛœÙHYˆH\œÚ\ÝYˆ][H[™XYHØ\œšY\È\È˜[YKÛÈHX›\Ú\ˆÙ\È›Ýˆ™YY]Ù\\˜][K‚ˆœ\˜[HYÙ[Û˜[YNˆYØXÞH[™Ú[YÙ[Û[Ù[˜[YKˆBˆ\œÚ\ÝY][H[™XYHØ\œšY\È\È˜[YK‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆ[™\ÜÛœÙWÚYYÙ[Û˜[YBˆ\WÚ][HH][K×Ø\WÙXÝ
+
+Bˆ]™[HÝ]]][QÛ™Q]™[
+\OHœ™\ÜÛœÙK›Ý]]Ú][K™Û™H‹][OX\WÚ][JBˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚™YˆÜ™\ÛÛ™WÛWÛ[Ù[
+ˆÛÛŽˆÛÛ™\œØ][Ûˆ›Û™Kˆ
+‹ˆYÙ[ÜÝÜ™NˆYÙ[ÝÜ™H›Û™HH›Û™KˆYÙ[ØØXÚNˆYÙ[ØXÚH›Û™HH›Û™KŠHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ™\ÛÛ™HHH[Ù[Y[YšY\ˆœ›ÛHHÛÛ™\œØ][Û‰ÜÈYÙ[ÜXË‚‚ˆ\Ù\È[š™XÝYYÙ[\[™[˜ÚY\ÈÚ[ˆ]˜Z[X›K˜[[™È˜XÚÈÈBˆ[[YHÛØ˜[È›ÜˆYØXÞHØ[\œËˆ™]\›œÈ›Û™XÚ[ˆHÛÛ™\œØ][Û‚ˆ\È›ÈYÙ[š[™[™ÈÜˆHÜXÈØ[››Ý™HØYY‚‚ˆœ\˜[HÛÛŽˆHÛÛ™\œØ][Ûˆ[]KÜˆ›Û™X‚ˆœ\˜[HYÙ[ÜÝÜ™NˆÜ[Û˜[ÝÜ™H›Üˆ™\ÛÛš[™ÈH›Ý[™YÙ[‚ˆœ\˜[HYÙ[ØØXÚNˆÜ[Û˜[ØXÚH›ÜˆØY[™ÈH›Ý[™YÙ[ÜXË‚ˆœ™]\›œÎˆ[Ù[Ýš[™È
+K™Ëˆ™]XœšXÚÜËYÜMKMH˜
+KÜ‚ˆ›Û™XÚ[ˆ[˜]˜Z[X›K‚ˆˆˆ‚ˆYˆÛÛˆ\È›Û™HÜˆÛÛ‹˜YÙ[ÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆžN‚ˆÈ[\ÜÙ]ØYÙ[ØØXÚXœ›ÛHH[[YH]Ø[[YHÛÈH\ÝˆÈ]Ú[™ÈÛ[šYÙ[œ[[YK™Ù]ØYÙ[ØØXÚX\ÈÛ›Ü™Y
+BˆÈ[Ù[K[]™[˜[YH\ÈH˜XØYH›ÞH]ž\\ÜÙ\È]]Ú
+K‚ˆœ›ÛHÛ[šYÙ[œ[[YH[\ÜÙ]ØYÙ[ØØXÚB‚ˆYˆYÙ[ÜÝÜ™H\È›Û™N‚ˆœ›ÛHÛ[šYÙ[œ[[YK—ÙÛØ˜[È[\ÜØYÙ[ÜÝÜ™B‚ˆYÙ[ÜÝÜ™HHØYÙ[ÜÝÜ™BˆYˆYÙ[ÜÝÜ™H\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆYÙ[ØØXÚH\È›Û™N‚ˆYÙ[ØØXÚHHÙ]ØYÙ[ØØXÚJ
+BˆYÙ[HYÙ[ÜÝÜ™K™Ù]
+ÛÛ‹˜YÙ[ÚY
+BˆYˆYÙ[\È›Û™N‚ˆ™]\›ˆ›Û™BˆØYYHYÙ[ØØXÚK›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+Bˆ™]\›ˆØYYœÜXË›K›[Ù[YˆØYYœÜXË›H[ÙH›Û™BˆÈURQš[™˜Z[\™\È\™HÜ˜\YžHÔS[Ú[^NÈÈ›ÝYHœ›ØY\ˆˆ\œ›ÜœË‚ˆ^Ù\
+ˆÙ^Q\œ›Ü‹ˆ]šX]Q\œ›Ü‹ˆ˜[YQ\œ›Ü‹ˆ[\Ü\œ›Ü‹ˆÔÑ\œ›Ü‹ˆ[[YQ\œ›Ü‹ˆÝ][Y[\œ›Ü‹ˆ
+N‚ˆÈ[[YQ\œ›Ü˜ÛÝ™\œÈÙ]ØYÙ[ØØXÚJ
+X™Y›Ü™HH[[YH\ÂˆÈ[š]X[^™Yˆ\È\ÈH™\ÝYY™›Ü\Ü^H™\ÛÛ™\ˆ
+›ÝÈ[ÛÈØ[YˆÈÛˆ˜]]™HÛÜÝ[Û›Hœ›ØYØ\ÝÊKÛÈ[ˆ[š[š]X[^™Y[[YH]\ÝˆÈYÜ˜YHÈ›[Ù[[šÛ›ÝÛˆˆ8 %HÛÜÝÝ[™XÛÜ™Ë\Ý[˜]šX]Y‚ˆ™]\›ˆ›Û™B‚‚™YˆÜ™\ÛÛ™WÚ\›™\ÜÊ
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆÝˆ›Û™N‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—Ü™\ÛÛ™WÚ\›™\ÜÊ
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆÜ™\ÛÛ™WÚ\›™\Ü×Ú[\
+ˆÛÛŽˆÛÛ™\œØ][Ûˆ›Û™Kˆ
+‹ˆYÙ[ÜÝÜ™NˆYÙ[ÝÜ™H›Û™HH›Û™KˆYÙ[ØØXÚNˆYÙ[ØXÚH›Û™HH›Û™KŠHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ™\ÛÛ™HHØ[›ÛšXØ[\›™\ÜÈ›ÜˆHÛÛ™\œØ][Û‰ÜÈ›Ý[™YÙ[‚‚ˆZ\œ›ÜœÈ™[˜Î˜Ü™\ÛÛ™WÛWÛ[Ù[ˆØYÈH\œÙYÜXÈšXHHYÙ[ˆØXÚH[™™]\›œÈH^XÝ]Ü‰ÜÈ\›™\ÜÂˆ
+^XÝ]Ü‹˜ÛÛ™šYÖÈš\›™\ÜÈ—X[ÙH^XÝ]Ü‹\X
+KØ[›ÛšXØ[^™Y‚ˆÝ\™˜XÚ[™È\ÈÛˆ˜Û\ÜÎ˜Ù\ÜÚ[Û”™\ÜÛœÙX]ÈH‘T™[™\ˆBˆXÝ]™HÜ™Y[X[›ÜˆHÛÜœ™XÝ›ÝšY\ˆ
+™˜[Z[Jˆ8 %[›ÜXÈ›Ü‚ˆÛ]YK\ÙËÜ[˜ZH›ÜˆÛÙ^ÈÜ[˜ZKXYÙ[È8 %[œÝXYÙˆÝY\ÜÚ[™ÈBˆ˜[Z[Hœ›ÛHH[Ù[Ýš[™È
+ÚXÚ\ÈÜ›Û™ÈÚ[ˆHYÙ[XÛ\™\È›Âˆ[Ù[K™ËˆHÙ[™\šXË\›ÝšY\ˆ][˜Ú\ŠK‚‚ˆœ\˜[HÛÛŽˆHÛÛ™\œØ][Ûˆ[]KÜˆ›Û™X‚ˆœ\˜[HYÙ[ÜÝÜ™NˆÜ[Û˜[ÝÜ™H›Üˆ™\ÛÛš[™ÈH›Ý[™YÙ[‚ˆœ\˜[HYÙ[ØØXÚNˆÜ[Û˜[ØXÚH›ÜˆØY[™ÈH›Ý[™YÙ[ÜXË‚ˆœ™]\›œÎˆHØ[›ÛšXØ[\›™\ÜÈ
+K™Ëˆ›Ü[˜ZKXYÙ[È˜Ü‚ˆ˜Û]YK\ÙÈ˜
+KÜˆ›Û™XÚ[ˆ[˜]˜Z[X›K‚ˆˆˆ‚ˆYˆÛÛˆ\È›Û™N‚ˆ™]\›ˆ›Û™BˆÈH\œÚ\ÝY\‹\Ù\ÜÚ[ÛˆÝ™\œšYH
+˜[Y]Y
+ÈØ[›ÛšXØ[^™Y]ˆÈÜ™X]JHÚ[œÈÝ™\ˆHÜXÉÜÈXÛ\™Y\›™\ÜËÛÈHÛ˜\ÚÝˆÈ™\ÜÈÚ]H[›™\ˆXÝX[HÜ]ÛœË‚ˆYˆÛÛ‹š\›™\Ü×ÛÝ™\œšYN‚ˆ™]\›ˆÛÛ‹š\›™\Ü×ÛÝ™\œšYBˆYˆÛÛ‹˜YÙ[ÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆžN‚ˆœ›ÛHÛ[šYÙ[š\›™\Ü×Ø[X\Ù\È[\ÜØ[›ÛšXØ[^™WÚ\›™\ÜÂˆœ›ÛHÛ[šYÙ[œ[[YH[\ÜÙ]ØYÙ[ØØXÚB‚ˆYˆYÙ[ÜÝÜ™H\È›Û™N‚ˆœ›ÛHÛ[šYÙ[œ[[YK—ÙÛØ˜[È[\ÜØYÙ[ÜÝÜ™B‚ˆYÙ[ÜÝÜ™HHØYÙ[ÜÝÜ™BˆYˆYÙ[ÜÝÜ™H\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆYÙ[ØØXÚH\È›Û™N‚ˆYÙ[ØØXÚHHÙ]ØYÙ[ØØXÚJ
+BˆYÙ[HYÙ[ÜÝÜ™K™Ù]
+ÛÛ‹˜YÙ[ÚY
+BˆYˆYÙ[\È›Û™N‚ˆ™]\›ˆ›Û™BˆØYYHYÙ[ØØXÚK›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+Bˆ^XÝ]ÜˆHØYYœÜXË™^XÝ]Ü‚ˆÈ›ÜˆH[™YXYÙ[XYÝX‹XYÙ[™\ÜHPQ	ÜÈÝÛˆ\›™\ÜËˆÈ›ÝH[™Hœ˜Z[‰ÜÈ8 %\›™\ÜØ\È\ÈÙ\ÜÚ[Û‰ÜÈ›ÝšY\ˆ˜[Z[BˆÈ
+HÜXY[œÈÛÙ^›ÝHÛ]YK\ÙÈœ˜Z[ŠKˆ˜[È˜XÚÈÈBˆÈœ˜Z[ˆ\›™\ÜÈÚ[ˆHXYXÛ\™\È›Û™HÜˆØ[‰Ý™HX]ÚY‚ˆYˆÛÛ‹œÝX—ØYÙ[Û˜[YN‚ˆÝXˆH™^
+ˆ
+È›ÜˆÈ[ˆØYYœÜXËœÝX—ØYÙ[ÈYˆË›˜[YHOHÛÛ‹œÝX—ØYÙ[Û˜[YJKˆ›Û™Kˆ
+BˆYˆÝXˆ\È›Ý›Û™N‚ˆ^XÝ]ÜˆHÝX‹™^XÝ]Ü‚ˆ\›™\ÜÈH
+ˆ^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+š\›™\ÜÈŠBˆÜˆØYYœÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+š\›™\ÜÈŠBˆÜˆ^XÝ]Ü‹\Bˆ
+Bˆ™]\›ˆØ[›ÛšXØ[^™WÚ\›™\ÜÊ\›™\ÜÊHÜˆ\›™\ÜÂˆÈURQš[™˜Z[\™\È\™HÜ˜\YžHÔS[Ú[^NÈÈ›ÝYHœ›ØY\ˆˆ\œ›ÜœË‚ˆ^Ù\
+ˆÙ^Q\œ›Ü‹ˆ]šX]Q\œ›Ü‹ˆ˜[YQ\œ›Ü‹ˆ[\Ü\œ›Ü‹ˆÔÑ\œ›Ü‹ˆ[[YQ\œ›Ü‹ˆÝ][Y[\œ›Ü‹ˆ
+N‚ˆ™]\›ˆ›Û™B‚‚™YˆÝ˜[Y]YÚ\›™\Ü×ÛÝ™\œšYJ˜[YNˆÝˆ›Û™KYÙ[ˆYÙ[
+HOˆÝˆ›Û™N‚ˆˆˆ‚ˆ˜[Y]H
+ÈØ[›ÛšXØ[^™HHÙ\ÜÚ[Û‹XÜ™X]H\›™\Ü×ÛÝ™\œšYX‚‚ˆZ\œ›ÜœÈHÓIÜÈKZ\›™\ÜØ[\È
+Ø\WÚ\›™\Ü×ÛÝ™\œšYWÝ×Ù^XÝ]Ü˜ˆ[ˆÛ[šYÙ[ØÚ]œX
+NˆHØ[›ÛšXØ[˜[YH]\Ý™HHÛ›ÝÛˆ[™Bˆ\›™\ÜË[™H›Ý[™YÙ[]\Ý™H[ˆ^XÝ]Ü‹\NˆÛ[šYÙ[ˆÜXÈ8 %Ý\ˆ^XÝ]Üˆ\\È]™H›ÈÛÛ™šYËš\›™\ÜØÛÈ[‚ˆÝ™\œšYH\™HÛÝ[™HHÚ[[›Ë[Ü‚‚ˆœ\˜[H˜[YNˆH˜]ÈÝ™\œšYHœ›ÛHH™\]Y\Ý›ÙKK™ËˆœH˜ˆÜˆH›Ü[˜ZKXYÙ[Ë\ÙÈ˜[X\Ëˆ›Û™XYX[œÈ›ÈÝ™\œšYK‚ˆœ\˜[HYÙ[ˆH›Ý[™YÙ[›ÝÈ
+[™XYH™]ÚYžHHØ[\ŠK‚ˆœ™]\›œÎˆHØ[›ÛšXØ[\›™\ÜÈYÜˆ›Û™XÚ[ˆ
+˜[YJˆ\Ë‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ[˜[YÚ[œ]›Üˆ[ˆ[šÛ›ÝÛˆ\›™\ÜËBˆ›Û‹[Û[šYÙ[^XÝ]Üˆ\KÜˆ[ˆ[›ØYX›HYÙ[[™K‚ˆˆˆ‚ˆYˆ˜[YH\È›Û™N‚ˆ™]\›ˆ›Û™Bˆœ›ÛHÛ[šYÙ[š\›™\Ü×Ø[X\Ù\È[\ÜØ[›ÛšXØ[^™WÚ\›™\ÜÂˆœ›ÛHÛ[šYÙ[œ[[YH[\ÜÙ]ØYÙ[ØØXÚBˆœ›ÛHÛ[šYÙ[œÜXË—ÛÛ[šYÙ[ØÛÛ\][\Ü
+ˆÓS’QÑS•ÑVPÕUÔ—ÕTKˆÓS’QÑS•ÒT“‘TÔÑTËˆ
+B‚ˆØ[›ÛšXØ[HØ[›ÛšXØ[^™WÚ\›™\ÜÊ˜[YJHÜˆ˜[YBˆYˆØ[›ÛšXØ[›Ý[ˆÓS’QÑS•ÒT“‘TÔÑTÎ‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš[˜[Y\›™\Ü×ÛÝ™\œšYNˆ]\Ý™HÛ™HÙˆ‚ˆˆžÜÛÜY
+ÓS’QÑS•ÒT“‘TÔÑTÊ_KÛÝÝ˜[YH\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆžN‚ˆØYYHÙ]ØYÙ[ØØXÚJ
+K›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+Bˆ^Ù\
+Ù^Q\œ›Ü‹]šX]Q\œ›Ü‹˜[YQ\œ›Ü‹[\Ü\œ›Ü‹ÔÑ\œ›ÜŠH\È^Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš\›™\Ü×ÛÝ™\œšYH™\]Z\™\ÈHØYX›HYÙ[ÜXÎÈ‚ˆˆ˜YÙ[ØYÙ[›˜[YH\ŸH˜Z[YÈØYˆÙ^ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Hœ›ÛH^Âˆ^XÝ]Ü—Ý\HHØYYœÜXË™^XÝ]Ü‹\BˆYˆ^XÝ]Ü—Ý\HOHÓS’QÑS•ÑVPÕUÔ—ÕTN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš\›™\Ü×ÛÝ™\œšYHÛ›H\Y\ÈÈ^XÝ]Ü‹\H‚ˆˆžÓÓS’QÑS•ÑVPÕUÔ—ÕTH\ŸHYÙ[ÎÈYÙ[ØYÙ[›˜[YH\ŸH‚ˆˆ™XÛ\™\È^XÝ]Ü‹\HÙ^XÝ]Ü—Ý\H\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ™]\›ˆØ[›ÛšXØ[‚‚™YˆÝ˜[Y]YÚ\›™\Ü×ÛÝ™\œšYWÙ^XÝ]Ü—Ý\JYÙ[ˆYÙ[
+HOˆ›Û™N‚ˆˆˆ•˜[Y]H]
+˜YÙ[
+ˆ\È[ˆ^XÝ]Ü‹\NˆÛ[šYÙ[ÜXË‚‚ˆ\ÙYžHH˜]]È˜\›™\ÜÈ]È[™›Ü˜ÙHHØ[YH^XÝ]Ü‹]\BˆØ]H\È™[˜Î˜Ý˜[Y]YÚ\›™\Ü×ÛÝ™\œšYXÚ]Ý]™\]Z\š[™ÈHÛÛ˜Ü™]Bˆ\›™\ÜÈ˜[YH
+H™X[\›™\ÜÈ\È™\ÛÛ™Y]š\œÝ[Y\ÜØYÙH[YJK‚‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ[˜[YÚ[œ]Ú[ˆHYÙ[\È›Ý[‚ˆÛ[šYÙ[^XÝ]Üˆ\HÜˆH[™HØ[››Ý™HØYY‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œ[[YH[\ÜÙ]ØYÙ[ØØXÚBˆœ›ÛHÛ[šYÙ[œÜXË—ÛÛ[šYÙ[ØÛÛ\][\ÜÓS’QÑS•ÑVPÕUÔ—ÕTB‚ˆžN‚ˆØYYHÙ]ØYÙ[ØØXÚJ
+K›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+Bˆ^Ù\
+Ù^Q\œ›Ü‹]šX]Q\œ›Ü‹˜[YQ\œ›Ü‹[\Ü\œ›Ü‹ÔÑ\œ›ÜŠH\È^Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš\›™\Ü×ÛÝ™\œšYH	Ø]]ÉÈ™\]Z\™\ÈHØYX›HYÙ[ÜXÎÈ‚ˆˆ˜YÙ[ØYÙ[›˜[YH\ŸH˜Z[YÈØYˆÙ^ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Hœ›ÛH^Âˆ^XÝ]Ü—Ý\HHØYYœÜXË™^XÝ]Ü‹\BˆYˆ^XÝ]Ü—Ý\HOHÓS’QÑS•ÑVPÕUÔ—ÕTN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš\›™\Ü×ÛÝ™\œšYH	Ø]]ÉÈÛ›H\Y\ÈÈ^XÝ]Ü‹\H‚ˆˆžÓÓS’QÑS•ÑVPÕUÔ—ÕTH\ŸHYÙ[ÎÈYÙ[ØYÙ[›˜[YH\ŸH‚ˆˆ™XÛ\™\È^XÝ]Ü‹\HÙ^XÝ]Ü—Ý\H\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+B‚‚ˆÎˆ^XÝ]Ü‹˜ÛÛ™šYØÙ^HžHÚXÚHÜXÈ[™È]Èœ˜Z[ˆ\›™\ÜÈÈÛX\ˆÎˆ›Ý][™Ëˆ]]Ø\ÈHÛ›HXØÙ\Y˜[YK‚”ÓPT•Ô“ÕUS‘×ÒT“‘TÔ×ÐÓÓ‘’Q×ÒÑVHHœÛX\Ü›Ý][™×Ú\›™\ÜÈ‚‚ˆÎˆH\›™\Ü×ÛÝ™\œšYXÙ[[™[YX[š[™ÈH›Ý]\ˆXÚÜÈH\›™\ÜÈ‹‚UU×ÒT“‘TÔ×ÔÑS•S‘SH˜]]È‚‚‚™YˆÝ˜[Y]YÜÜX×ÜÛX\Ü›Ý][™×Ú\›™\ÜÊÜXÎˆYÙ[ÜXÊHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ™XYHÜXÉÜÈÜZ[ˆ›Üˆ›Ý][™È]ÈÝÛˆœ˜Z[ˆ\›™\ÜË‚‚ˆHÜXÈ][œÈ^XÝ]Ü‹˜ÛÛ™šYËš\›™\ÜØ[ÛÈ[œÈH˜[Z[H]™\žBˆÝX‹XYÙ[\È›Ý]YÚ][‹ÛÈHÜ›ÜÜËY˜[Z[HÝX‹XYÙ[Ø[››ÝÝ^HÛˆ]ÂˆXÛ\™Y\›™\ÜËˆÛX\Ü›Ý][™×Ú\›™\ÜÎˆ]]Ø]ÈÝXÚHÜXÈÙY\]Âˆ[ˆ›ÜˆH›Ü›X[Ù\ÜÚ[Ûˆ[™[™H\›™\ÜÈÈH›Ý]\ˆÚ[ˆÛX\ˆ›Ý][™È\ÈÛ‹‚‚ˆ˜[Y]YÛˆHØ[YH[\È\È™[˜Î˜Ý˜[Y]YÚ\›™\Ü×ÛÝ™\œšYXˆBˆ˜[YH]\Ý™HH˜]]È˜Ù[[™[[™Û›H[ˆ^XÝ]Ü‹\N‚ˆÛ[šYÙ[ÜXÈ\ÈHÝØ\X›Hœ˜Z[ˆ\›™\ÜÈÈÚ]™H]Ø^K‚‚ˆœ\˜[HÜXÎˆH›Ý[™YÙ[	ÜÈ\œÙYÜXË‚ˆœ™]\›œÎˆ˜]]È˜Ú[ˆHÜXÈÜÈ[‹[ÙH›Û™X‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ[˜[YÚ[œ]›Üˆ[žHÝ\ˆ˜[YKÜˆ›ÜˆBˆÙ^HÛˆH›Û‹[Û[šYÙ[^XÝ]Üˆ\K‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÜXË—ÛÛ[šYÙ[ØÛÛ\][\ÜÓS’QÑS•ÑVPÕUÔ—ÕTB‚ˆ˜[YHHÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+ÓPT•Ô“ÕUS‘×ÒT“‘TÔ×ÐÓÓ‘’Q×ÒÑVJBˆYˆ˜[YH\È›Û™N‚ˆ™]\›ˆ›Û™BˆÙ^HHˆ™^XÝ]Ü‹˜ÛÛ™šYËžÔÓPT•Ô“ÕUS‘×ÒT“‘TÔ×ÐÓÓ‘’Q×ÒÑV_H‚ˆYˆ˜[YHOHUU×ÒT“‘TÔ×ÔÑS•S‘S‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš[˜[YÚÙ^_Nˆ]\Ý™HÐUU×ÒT“‘TÔ×ÔÑS•S‘S\ŸKÛÝÝ˜[YH\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆÜXË™^XÝ]Ü‹\HOHÓS’QÑS•ÑVPÕUÔ—ÕTN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆžÚÙ^_HÛ›H\Y\ÈÈ^XÝ]Ü‹\HÓÓS’QÑS•ÑVPÕUÔ—ÕTH\ŸH‚ˆˆ˜YÙ[ÎÈ\ÈÜXÈXÛ\™\È^XÝ]Ü‹\HÜÜXË™^XÝ]Ü‹\H\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ™]\›ˆUU×ÒT“‘TÔ×ÔÑS•S‘S‚‚™YˆÝ]×Ù^J\ØÚÜÙXÛÛ™Îˆ[
+HOˆÝŽ‚ˆˆˆ‚ˆÛÛ™\H[š^\ØÚ[Y\Ý[\È]ÈUÈØ[[™\ˆ^K‚‚ˆœ\˜[H\ØÚÜÙXÛÛ™Îˆ[š^\ØÚÙXÛÛ™ËK™ËˆMÍLMŒ‚ˆœ™]\›œÎˆHUÈ]H\È–VVVKSSKQ˜K™ËˆŒŒ‹L‹LH˜‚ˆˆˆ‚ˆœ›ÛH]][YH[\Ü]][YK[Y^›Û™B‚ˆ™]\›ˆ]][YK™œ›Û][Y\Ý[\
+\ØÚÜÙXÛÛ™Ë][Y^›Û™K]ÊK™]J
+Kš\ÛÙ›Ü›X]
+
+B‚‚™YˆÜ™XÛÜ™ÙZ[WØÛÜÝ
+ˆÛÛŽˆÛÛ™\œØ][Ûˆ›Û™Kˆ[WÝ\Ùˆ›Ø]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ‚ˆYH\›‰ÜÈHÛÜÝÈHÙ\ÜÚ[ÛˆÝÛ™\‰ÜÈZ[H›Û\‚‚ˆH›Ë[ÜÚ[ˆ
+™[WÝ\Ù
+ˆ\È›ÝÜÚ]]™HÜˆHÙ\ÜÚ[Ûˆ\È›Âˆ™\ÛÛ˜X›HÝÛ™\‹ˆ]šX]\ÈHÛÜÝÈHÙ\ÜÚ[ÛˆÜ™X]Ü‚ˆ
+›Y]˜ÛÛ™\œØ][Û”ÝÜ™K™Ù]ÜÙ\ÜÚ[Û—ÛÝÛ™\˜
+H[™XÚÙ]È]žHBˆÝ\œ™[UÈ^KÛÈHÙ\ÜÚ[ÛˆÜ[›š[™ÈZYšYÚÜ]È]ÈÜ[™ˆXÜ›ÜÜÈ›Ý^\Ëˆ™XÛÜ™Y›Üˆ]™\žHšXÙY\›ˆ™YØ\™\ÜÈÙ‚ˆÚ]\ˆHÙ\ÜÚ[Ûˆ[œÈ[™\ˆHÛXÞH8 %HZ[H›Û\\ÈBˆ˜XÚÚ[™ÈÝÜ™H›ÜˆH\‹]\Ù\ˆZ[HÛÜÝXYÙ]ÛXÞK[™\È›ÝÂˆÜ[]Y[š]™\œØ[Kˆ
+\È™[Y\ÈÛˆHÛÛ™\œØ][ÛˆÝÜ™Bˆ[\[Y[[™ÈHZ[KXÛÜÝY]ÙÈÛˆ]™\žH\Þ[Y[][œÂˆ\ÈÛÙNÈHX\›Y\ˆÛXÞHØ]H]Ù\HX[˜YÙY\Þ[Y[ˆœ›ÛHÝXÚ[™È[ˆXœÙ[\Ù\—ÙZ[WØÛÜÝX›H\È›ÈÛ™Ù\ˆ™YYYˆ›ÝÈ]HX[˜YÙYÝÜ™H˜XÚÜÈ]ŠB‚ˆÝX‹XYÙ[ÛÛ™\œØ][ÛœÈ\™HÜ™X]YÚ]Ý]H\›Z\ÜÚ[ÛˆÜ˜[
+Bˆ[\›˜[[›™\ˆÔÕØ\œšY\È›È\Ù\ˆÛÛ^
+KÛÂˆÙ]ÜÙ\ÜÚ[Û—ÛÝÛ™\ŠÛÛ‹šY
+X™]\›œÈ›Û™X›Üˆ[KˆÚ[‚ˆ]\[œË˜[˜XÚÈÈHÜ]Û‹]™YH›ÛÝ	ÜÈÝÛ™\Žˆ]™\žBˆÛÛ™\œØ][ÛˆØ\œšY\È›ÛÝØÛÛ™\œØ][Û—ÚYÚ[[™ÈÈBˆÜ[]™[Ù\ÜÚ[Ûˆ]
+Ø\ÊˆÜ™X]YÚ]\Ù\ˆÛÛ^[™\™Y›Ü™Bˆ[Ø^\È\È[ˆÝÛ™\ˆÜ˜[ˆ\È[œÝ\™\È™[^HÈÑÈÝX‹XYÙ[Ü[™ˆ\È]šX]YÈHØ[YH\Ù\ˆ\ÈH\™[˜]\ˆ[ˆÚ[[Bˆ›ÜYœ›ÛHHZ[H›Û\‚‚ˆœ\˜[HÛÛŽˆHÛÛ™\œØ][Ûˆ›ÝÈ›ÜˆHÙ\ÜÚ[Û‹Üˆ›Û™Xˆ
+H›Ë[Ü8 %›ÈÝÛ™\ˆÈ]šX]HÊK‚ˆœ\˜[H[WÝ\ÙˆH\›‰ÜÈÛÜÝ[ˆTÑÈH\ÈH›Ë[Ü‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H›ÜˆHÝÛ™\ˆÛÚÝ\[™BˆZ[KXÛÜÝTÑT•‚ˆˆˆ‚ˆYˆÛÛˆ\È›Û™HÜˆ[WÝ\ÙH‚ˆ™]\›‚ˆÝÛ™\ˆHÛÛ™\œØ][Û—ÜÝÜ™K™Ù]ÜÙ\ÜÚ[Û—ÛÝÛ™\ŠÛÛ‹šY
+BˆYˆÝÛ™\ˆ\È›Û™H[™ÛÛ‹œ›ÛÝØÛÛ™\œØ][Û—ÚYOHÛÛ‹šY‚ˆÈÝX‹XYÙ[ˆ›È\™XÝÝÛ™\ˆÜ˜[8 %˜[˜XÚÈÈH›ÛÝÙ\ÜÚ[Û‰ÜÂˆÈÝÛ™\ˆÛÈÝX‹XYÙ[Ü[™\È]šX]Y˜]\ˆ[ˆÚ[[H›ÜY‚ˆÝÛ™\ˆHÛÛ™\œØ][Û—ÜÝÜ™K™Ù]ÜÙ\ÜÚ[Û—ÛÝÛ™\ŠÛÛ‹œ›ÛÝØÛÛ™\œØ][Û—ÚY
+BˆYˆÝÛ™\ˆ\È›Û™N‚ˆ™]\›‚ˆœ›ÛHÛ[šYÙ[™‹][È[\Ü›Ý×Ù\ØÚ‚ˆÛÛ™\œØ][Û—ÜÝÜ™K˜YÙZ[WØÛÜÝ
+ÝÛ™\‹Ý]×Ù^J›Ý×Ù\ØÚ
+
+JK[WÝ\Ù
+B‚‚™YˆÜšXÙYØÛÜÝÙ›Ü—Ù\Ü^J\ØYÙNˆXÝÜÝ‹[žWJHOˆ›Ø]›Û™N‚ˆˆˆ‚ˆ^˜XÝÝ[ØÛÜÝÝ\Ù›ÜˆÛY[\Ü^KÜˆ›Û™XÚ[ˆ[œšXÙY‚‚ˆHÙ^H\È™\Ù[Û›HÚ[ˆH\›ˆØ\ÈšXÙYÛÈ]ÈXœÙ[˜ÙH
+¸ %ˆ[‚ˆHRJH\È\Ý[˜Ýœ›ÛHHšXÙY	ŒˆHÛÜÝXYÙ]ÛXÞH\Âˆ[˜Y™™XÝY8 %]™XYÈH˜[YHÚ]HŒY˜][‚‚ˆœ\˜[H\ØYÙNˆHÛÛ™\œØ][Û‰ÜÈÙ\ÜÚ[Û—Ý\ØYÙXXÝK™Ë‚ˆÈš[œ]ÝÚÙ[œÈŽˆLŒÝ[ØÛÜÝÝ\ÙŽˆŸX
+šXÙY
+HÜ‚ˆÈš[œ]ÝÚÙ[œÈŽˆLŒX
+[œšXÙY8 %›ÈÛÜÝÙ^JK‚ˆœ™]\›œÎˆHÝ[][]]™HÛÜÝ[ˆTÑÚ[ˆšXÙY[ÙH›Û™X‚ˆˆˆ‚ˆYˆÝ[ØÛÜÝÝ\Ùˆ›Ý[ˆ\ØYÙN‚ˆ™]\›ˆ›Û™BˆžN‚ˆ™]\›ˆ›Ø]
+\ØYÙVÈÝ[ØÛÜÝÝ\Ù—JBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÈY™[œÚ]™NˆHX[›Ü›YY\œÚ\ÝY˜[YH]\Ý›Ýœ™XZÈBˆÈÛ˜\ÚÝÈÔÑH[Z]ˆ™X]]\È[œšXÙY‚ˆ™]\›ˆ›Û™B‚‚™YˆÛ[Ù[Ý\ØYÙWØXÚÙ]
+\ØYÙNˆXÝÜÝ‹[žWK[Ù[ˆÝŠHOˆXÝÜÝ‹›Ø]N‚ˆˆˆ‚ˆÙ][Ü‹XÜ™X]HH\‹[[Ù[\ØYÙHÝX‹XXÚÙ][œÚYH\ØYÙVÈ˜žWÛ[Ù[—X‚‚ˆH™\ÝYžWÛ[Ù[X\]šX]\ÈÚÙ[‹ØÛÜÝ\ØYÙHÈHÜXÚYšXÂˆH]›ÙXÙY]Ù^YYÛˆH˜]È\›™\ÜË\™\ÜY[Ù[Y
+˜Z][ˆ[™Ú[\\Ý8 %[X\È›Ü›X[^˜][Ûˆ\È[[[Û˜[HY™\œ™Y
+Kˆ\È]]]\Âˆ\ØYÙX[ˆXÙKÜ™X][™ÈžWÛ[Ù[[™H\‹[[Ù[XÝÛˆš\œÝˆ\ÙK[™™]\›œÈH[Ù[	ÜÈXÚÙ]›ÜˆHØ[\ˆÈ[˜Ü™[Y[ÈÙ]‚‚ˆœ\˜[H\ØYÙNˆHÛÛ™\œØ][Û‰ÜÈ]]X›HÙ\ÜÚ[Û—Ý\ØYÙXXÝ‚ˆœ\˜[H[Ù[ˆH˜]È\›™\ÜÈ[Ù[YK™Ëˆ˜Û]YK\ÛÛ›™]MMˆ˜Ü‚ˆ™]XœšXÚÜËYÜMKMH˜‚ˆœ™]\›œÎˆH]]X›H\‹[[Ù[XÚÙ]K™ËˆÈš[œ]ÝÚÙ[œÈŽˆLŒX‚ˆˆˆ‚ˆ˜]×ØžWÛ[Ù[H\ØYÙKœÙ]Y˜][
+˜žWÛ[Ù[‹ßJBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×ØžWÛ[Ù[XÝ
+N‚ˆ˜]×ØžWÛ[Ù[HßBˆ\ØYÙVÈ˜žWÛ[Ù[—HH˜]×ØžWÛ[Ù[ˆžWÛ[Ù[HØ\Ý
+XÝÜÝ‹[žWK˜]×ØžWÛ[Ù[
+Bˆ˜]×ØXÚÙ]HžWÛ[Ù[œÙ]Y˜][
+[Ù[ßJBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×ØXÚÙ]XÝ
+N‚ˆ˜]×ØXÚÙ]HßBˆžWÛ[Ù[Û[Ù[HH˜]×ØXÚÙ]ˆ™]\›ˆØ\Ý
+XÝÜÝ‹›Ø]K˜]×ØXÚÙ]
+B‚‚™YˆØYÛ[Ù[Ý\ØYÙWÙ[JˆXÚÙ]ˆXÝÜÝ‹›Ø]KˆÚÙ[—Ù[\ÎˆXÝÜÝ‹[KˆÛÜÝÙ[Nˆ›Ø]›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆYÛ™H\›‰ÜÈ\‹[[Ù[ÚÙ[‹ØÛÜÝ[\È[ÈH[Ù[XÚÙ]
+Q
+K‚‚ˆZ\œ›ÜœÈH›]XÛÝ[\ˆ[˜Ü™[Y[È[ˆ™[˜Î˜ØXØÝ[][]WÜÙ\ÜÚ[Û—Ý\ØYÙXˆÛÈH\‹[[Ù[Ý[ÈÝ^HÛÛœÚ\Ý[Ú]H›]Ý[Îˆ]™\žH›]ˆ[˜Ü™[Y[\ÈX]ÚYžH[ˆ[˜Ü™[Y[È^XÝHÛ™H[Ù[XÚÙ]ÛÈBˆÝ[HÙˆ\‹[[Ù[XÚÙ]È\]X[ÈH›]Ý[ˆÛÜÝÙ[X\ÈYYˆÛ›HÚ[ˆH\›ˆØ\ÈšXÙY
+›Û™XÝ\Ú\ÙJK™\Ù\š[™ÈBˆœšXÙY8§îˆÝ[ØÛÜÝÝ\ÙÙ^H™\Ù[ˆÛÛ˜XÝ]H\‹[[Ù[]™[‚‚ˆœ\˜[HXÚÙ]ˆH[Ù[	ÜÈ]]X›HXÚÙ]œ›ÛH™[˜Î˜Û[Ù[Ý\ØYÙWØXÚÙ]‚ˆœ\˜[HÚÙ[—Ù[\Îˆ\È\›‰ÜÈ\‹XXÚÙ]ÚÙ[ˆÛÝ[ÈÈYÙ^YYžBˆHØ[YH˜[Y\È\È™]N˜ÕÒÑS—Ð”‘PRÑÕÓ—ÒÑVTØK™Ë‚ˆÈš[œ]ÝÚÙ[œÈŽˆLŒ›Ý]]ÝÚÙ[œÈŽˆÍ‹‹ŸX‚ˆœ\˜[HÛÜÝÙ[Nˆ\È\›‰ÜÈšXÙYÛÜÝ[ˆTÑÈYÜˆ›Û™XÚ[‚ˆH\›ˆØ\È[œšXÙY
+H[Ù[	ÜÈÛÜÝÙ^HÝ^\ÈXœÙ[
+K‚ˆˆˆ‚ˆ›ÜˆÙ^K[H[ˆÚÙ[—Ù[\Ëš][\Ê
+N‚ˆXÚÙ]ÚÙ^WHHXÚÙ]™Ù]
+Ù^K
+H
+È[BˆYˆÛÜÝÙ[H\È›Ý›Û™N‚ˆXÚÙ]ÈÝ[ØÛÜÝÝ\Ù—HHXÚÙ]™Ù]
+Ý[ØÛÜÝÝ\Ù‹Œ
+H
+ÈÛÜÝÙ[B‚‚™YˆÝ\ØYÙWØžWÛ[Ù[Ù›Ü—Ù\Ü^J\ØYÙNˆXÝÜÝ‹[žWJHOˆXÝÜÝ‹[Ù[\ØYÙWH›Û™N‚ˆˆˆ‚ˆ›Ú™XÝH™\ÝYžWÛ[Ù[\ØYÙHX\[È\Y˜Û\ÜÎ˜[Ù[\ØYÙX‚‚ˆÛÛ\[š[ÛˆÈ™[˜Î˜ÝÚÙ[—Øœ™XZÙÝÛ—Ù›Ü—Ù\Ü^X›ÜˆH\‹[[Ù[šY]Î‚ˆ™XYÈ\ØYÙVÈ˜žWÛ[Ù[—X
+HÝX™YK\Ý[[YYX\œ›ÛBˆ™[˜Î˜ØYÜÙ\ÜÚ[Û—Ý\ØYÙX
+H[™Z[ÈHÛ[Ù[ÚYˆ[Ù[\ØYÙ_XXÝˆ›ÜˆHTKˆÚÙ[ˆXÚÙ]È\™HÛÙ\˜ÙYÈ[[™Ý[ØÛÜÝÝ\ÙˆÈ›Ø]È[ˆXœÙ[XÚÙ]Ý^\È›Û™XÛˆH[Ù[
+ÛÈH[Ù[ˆ]Ø\È™]™\ˆšXÙY\È›ÈÛÜÝ
+K[™X[›Ü›YY˜[Y\È\™HÚÚ\Y‚‚ˆœ\˜[H\ØYÙNˆHÝX™YK\Ý[[YY\ØYÙHXÝK™Ë‚ˆÈš[œ]ÝÚÙ[œÈŽˆML˜žWÛ[Ù[ŽˆÈ˜Û]YK\ÛÛ›™]MMˆŽ‚ˆÈš[œ]ÝÚÙ[œÈŽˆMLÝ[ØÛÜÝÝ\ÙŽˆŸ__X‚ˆœ™]\›œÎˆH\‹[[Ù[X\Üˆ›Û™XÚ[ˆ›È\‹[[Ù[\ØYÙH\Âˆ™\Ù[
+ÛÈ^ÛYWÛ›Û™XÛZ]ÈHšY[[\™[JK‚ˆˆˆ‚ˆžWÛ[Ù[H\ØYÙK™Ù]
+˜žWÛ[Ù[ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJžWÛ[Ù[XÝ
+HÜˆ›ÝžWÛ[Ù[‚ˆ™]\›ˆ›Û™Bˆ™\Ý[ˆXÝÜÝ‹[Ù[\ØYÙWHHßBˆ›Üˆ[Ù[XÚÙ][ˆžWÛ[Ù[š][\Ê
+N‚ˆYˆ›Ý\Ú[œÝ[˜ÙJXÚÙ]XÝ
+N‚ˆÛÛ[YBˆšY[ÎˆXÝÜÝ‹[žWHHßBˆ›ÜˆÙ^H[ˆÓSÑSÕÒÑS—ÒÑVTÎ‚ˆ˜[YHHXÚÙ]™Ù]
+Ù^JBˆYˆ˜[YH\È›Û™N‚ˆÛÛ[YBˆžN‚ˆšY[ÖÚÙ^WHH[
+˜[YJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÛÛ[YBˆÛÜÝHÜšXÙYØÛÜÝÙ›Ü—Ù\Ü^JXÚÙ]
+BˆYˆÛÜÝ\È›Ý›Û™N‚ˆšY[ÖÈÝ[ØÛÜÝÝ\Ù—HHÛÜÝˆ™\Ý[Û[Ù[HH[Ù[\ØYÙJ
+Š™šY[ÊBˆ™]\›ˆ™\Ý[Üˆ›Û™B‚‚™YˆØÛÙ\˜ÙWØÝ[][]]™WÙšY[
+ˆ]NˆXÝÜÝ‹[žWKˆÙ^NˆÝ‹ˆ
+‹ˆ[Y\šXÎˆ›ÛÛŠHOˆ›Ø][›Û™N‚ˆˆˆ‚ˆ™XY[™˜[Y]H[ˆÜ[Û˜[Ý[][]]™H\ØYÙHšY[œ›ÛH]™[]K‚‚ˆœ\˜[H]NˆH^\›˜[ÜÙ\ÜÚ[Û—Ý\ØYÙX]™[]XXÝ‚ˆœ\˜[HÙ^NˆšY[˜[YKK™Ëˆ˜Ý[][]]™WÚ[œ]ÝÚÙ[œÈ˜‚ˆœ\˜[H[Y\šXÎˆÚ[ˆYXXØÙ\[žHš[š]H›Û‹[™YØ]]™H[X™\‚ˆ
+ÛÜÝ
+NÈÚ[ˆ˜[ÙX™\]Z\™HHš[š]H›Û‹[™YØ]]™H[
+ÚÙ[‚ˆÛÝ[ÊK‚ˆœ™]\›œÎˆH˜[Y]Y˜[YKÜˆ›Û™XÚ[ˆHÙ^H\ÈXœÙ[‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆÚ[ˆ™\Ù[]HÜ›Û™È\HÈ™YØ]]™HÂˆ›Û‹Yš[š]H
+˜S˜È[™˜8 %ÚXÚH[Û›ÝÛšXÈX^
+Ûˆ™]ÊXÛ[\ÝÛœÝ™X[HÛÝ[Ý\Ú\ÙH]Ú\›X[™[JK‚ˆˆˆ‚ˆ˜[YHH]K™Ù]
+Ù^JBˆYˆ˜[YH\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆ\Ú[œÝ[˜ÙJ˜[YK›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJ˜[YK
+[›Ø]
+JN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ™^\›˜[ÜÙ\ÜÚ[Û—Ý\ØYÙH]KžÚÙ^_H]\Ý™HHš[š]H›Û‹[™YØ]]™H‚ˆˆžÉÛ[X™\‰ÈYˆ[Y\šXÈ[ÙH	Ú[	ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ
+›Ý[Y\šXÈ[™›Ý\Ú[œÝ[˜ÙJ˜[YK[
+JHÜˆ›ÝX]š\Ùš[š]J˜[YJHÜˆ˜[YH‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ™^\›˜[ÜÙ\ÜÚ[Û—Ý\ØYÙH]KžÚÙ^_H]\Ý™HHš[š]H›Û‹[™YØ]]™H‚ˆˆžÉÛ[X™\‰ÈYˆ[Y\šXÈ[ÙH	Ú[	ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ™]\›ˆ˜[YB‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[Û[Ù[ØÚ[™ÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\Ý[™œ›ØYØ\ÝH[Ù[H\›™\ÜÈ™\ÜÈ]\È[›š[™Ë‚‚ˆZ\œ›ÜœÈH\›™\ÜË\ÚYH[Ù[™\Ü8 %H][˜Ú	ÜÈÝÛˆ[Ù[ÜˆBˆÛ[Ù[Ú[™ÙHXYH[œÚYHH[™H8 %ÛÈHÛ[šYÙ[Ù\ÜÚ[ÛŽ‚ˆÜš]\È™\ÜYÛ[Ù[‘TUSH
+H\›™\ÜÉÜÈÝÛˆÜ[[™Ëˆ™]™\ˆÛÛ\ÙYÈHXÚÙ\ˆ[X\ÊHÛÈH˜[YHÝ\š]™\È™[ØYˆ[™X›\Ú\ÈHÙ\ÜÚ[Û‹›[Ù[ÔÑH]™[ÛÈ]™\žHÝ\™˜XÙBˆ™K\™[™\œÈœ›ÛH]ˆH\Ù\‰ÜÈ™\]Y\Ý
+[Ù[ÛÝ™\œšYX
+H\Âˆ[X™\˜][H[ÝXÚYˆ™\]Y\ÝÈ[™™\ÜÈ\™HÙ\\˜]H›Û\Ëˆ[™Û›H™\ÜÈ\™H]™\ˆ\Ü^YYˆ[›ZÙHHUÒ]ˆ
+™[˜Î˜\]WÜÙ\ÜÚ[Û˜
+K\ÈÙ\È“Õ›ÜØ\™H[Ù[ØÚ[™ÙXˆ˜XÚÈÈH[›™\ˆ8 %H\›Z[˜[\È[™XYHÛˆH[Ù[ÛÂˆ™KZ[š™XÝ[™ÈÛ[Ù[ÛÝ[ÛÜ‚‚ˆ›Ë[ÜÈ
+›ÈÜš]K›È]™[
+HÚ[ˆH™\ÜY[Ù[[™XYH\]X[ÂˆH\œÚ\ÝY™\ÜYÛ[Ù[8 %HÝXYHÝ]H™]ÙY[ˆ™X[ˆÚ[™Ù\ËÚ[˜ÙH›ÜØ\™\œÈ™K[ØœÙ\™HÛˆ]™\žHÛ‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][Ûˆ›ÝÈ›ÜˆÙ\ÜÚ[Û—ÚY
+™XY]H›Ý]Bˆ›Ý[™\žJNÈÛÛ‹œ™\ÜYÛ[Ù[\ÈHY\H˜\Ù[[™K‚ˆœ\˜[H›ÙNˆ^\›˜[[Ù[XÚ[™ÙH]™[›ÙKˆ]K›[Ù[]\Ýˆ™HH›Û‹Y[\HÝš[™È8 %H\›™\ÜÉÜÈ™\˜˜][H[Ù[K™Ë‚ˆ˜Û]YK[Ü\ËMNÌ[WH˜Üˆ™ÜMK‹[[˜H˜‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ\Ù\™\ÜYÛ[Ù[‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ]K›[Ù[\ÈZ\ÜÚ[™ÈÜˆ›ÝBˆ›Û‹Y[\HÝš[™Ë‚ˆˆˆ‚ˆ˜]×Û[Ù[H›ÙK™]K™Ù]
+›[Ù[ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Û[Ù[ÝŠHÜˆ›Ý˜]×Û[Ù[œÝš\
+
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Û[Ù[ØÚ[™ÙH™\]Z\™\È]K›[Ù[È™HH›Û‹Y[\HÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ[Ù[HÛÛ˜Ü™]WÜ™\ÜYÛ[Ù[
+˜]×Û[Ù[
+BˆYˆ[Ù[\È›Û™HÜˆÛÛ‹œ™\ÜYÛ[Ù[OH[Ù[‚ˆ™]\›‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K\]WØÛÛ™\œØ][Û‹ˆÙ\ÜÚ[Û—ÚYˆ™\ÜYÛ[Ù[[[Ù[ˆ
+Bˆ]™[HÙ\ÜÚ[Û“[Ù[]™[
+ˆ\OHœÙ\ÜÚ[Û‹›[Ù[‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆ[Ù[[[Ù[ˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[ÜÙ\ÜÚ[Û—Ý]JˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\Ý[™œ›ØYØ\ÝHÙ\ÜÚ[Ûˆ™[˜[YHXYH[œÚYHH\›Z[˜[‚‚ˆZ\œ›ÜœÈHÜ™[˜[YX\Y[ÈHÛ]YK[˜]]™HÙ\ÜÚ[Û‰ÜÈÛ]YHÛÙBˆ[™HÛÈHÛ[šYÙ[Ù\ÜÚ[ÛŽˆÜš]\È]XÛÈH™]È˜[YBˆÝ\š]™\È™[ØY[™X›\Ú\ÈHÙ\ÜÚ[Û‹]XÔÑH]™[ÛÈBˆÙXˆÙ\ÜÚ[Ûˆ\Ý\]\È]™K‚‚ˆH™[˜[YH\È]]Üš]]]™H8 %[ˆÜ\˜]Üˆ\[™ÈÜ™[˜[YX\È[‚ˆ^XÚ]XÝÛÈ]Ý™\Üš]\ÈÚ]]™\ˆ]HHÙ\ÜÚ[ÛˆÝ\œ™[BˆØ\œšY\Ë[˜ÛY[™ÈÛ™HÙ]œ›ÛHHÙXˆRKˆ\È\ÈÚH]\Ù\ÈBˆZ[ˆ\]WØÛÛ™\œØ][Û˜˜]\ˆ[ˆHÙYY[Û›BˆÛÛ\\™KX[™\ÝØ\™Z[™ÔÕÜÙ\ÜÚ[ÛœËÞÚYKØ]]Ë]]XÚXÚˆ^\ÝÈÈÝÜ[ˆ
+˜]]ÛX]XÊˆ]\ˆœ›ÛHÛØ˜™\š[™ÈH[X[‰ÜÈ˜[YK‚‚ˆ›Ë[ÜÈ
+›ÈÜš]K›È]™[
+HÚ[ˆH]H[™XYHX]Ú\ËÛÈBˆ›ÜØ\™\ˆ]™K\Ù[™ÈY\ˆHÝ\œÛÜˆ™]Ú[™ÜˆH™[˜[YHXÚÚ[™Âˆ˜XÚÈH˜[YHHÙXˆRH\ÝÙ]ÛÜÝÈ›Ý[™Ë‚‚ˆXÛ[™Y›ÜˆÚ[Ù\ÜÚ[ÛœËÚÜÙH]\È\™HÝXÝ\˜[˜]\ˆ[‚ˆ\Ü^H^ˆÞ\×ÜÙ\ÜÚ[Û—ÜÙ[™Üš]\È[H\ÈYÙ[ŽX™[ˆ˜ˆ[™HÝX‹XYÙ[ÛÛ[™È\œÙ\È[H˜XÚÈ\\ˆ][ÛÈÛÝ™\œÈBˆYØXÞH˜ÛÜÙY˜]HX\šÙ\‹ÚXÚÛ›H]™\ˆ[™ÈÛˆHÚ[›ÝÂˆ
+›ÝÜš]\œÈ™Z™XÝH›Û‹\ÝX‹XYÙ[]JK‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][Ûˆ›ÝÈ›ÜˆÙ\ÜÚ[Û—ÚY
+™XY]H›Ý]Bˆ›Ý[™\žJNÈÛÛ‹]X\ÈHY\H˜\Ù[[™K‚ˆœ\˜[H›ÙNˆ^\›˜[]H]™[›ÙKˆ]K]X]\Ý™HBˆ›Û‹Y[\HÚ[™ÛK[[™HÝš[™ËK™Ëˆ˜]]\™Y˜XÝÜˆ˜‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ\Ù\]X‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ]K]X\È›ÝH›Û‹Y[\HÚ[™ÛH[™BˆÚ][ˆH\Ù\ˆ]H[™Ý[Z]‚ˆˆˆ‚ˆ˜]×Ý]HH›ÙK™]K™Ù]
+]HŠBˆÈ™]Û[™\È\™H™Z™XÝYÝ]šYÚ˜]\ˆ[ˆ›ÛY[ÈÜXÙ\È8 %BˆÈ][K[[™H]HYX[œÈHÙ[™\ˆ\ÈÛÛ™\ÙY›Ý]]Ø[ÈÛ™BˆÈÛ™È[™KˆZ\œ›ÜœÈÔÕÜÙ\ÜÚ[ÛœËÞÚYKØ]]Ë]]X‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Ý]KÝŠHÜˆ—ˆˆ[ˆ˜]×Ý]HÜˆ—ˆˆ[ˆ˜]×Ý]N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÜÙ\ÜÚ[Û—Ý]H™\]Z\™\È]K]HÈ™HHÚ[™ÛK[[™HÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ]HHˆ‹š›Ú[Š˜]×Ý]KœÜ]
+
+JBˆYˆ›Ý]N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÜÙ\ÜÚ[Û—Ý]H™\]Z\™\È]K]HÈ™H›Û‹Y[\H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ[Š]JHˆTÑT—ÔÑTÔÒSÓ—ÕUWÓPVÐÒT”Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ™^\›˜[ÜÙ\ÜÚ[Û—Ý]H™\]Z\™\È]K]HÈ™H][ÜÝ‚ˆˆžÕTÑT—ÔÑTÔÒSÓ—ÕUWÓPVÐÒT”ßHÚ\˜XÝ\œÈ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆÛÛ‹œ\™[ØÛÛ™\œØ][Û—ÚY\È›Ý›Û™N‚ˆ™]\›‚ˆYˆÛÛ‹]HOH]N‚ˆ™]\›‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K\]WØÛÛ™\œØ][Û‹ˆÙ\ÜÚ[Û—ÚYˆ]O]]Kˆ
+Bˆ]™[HÙ\ÜÚ[Û•]Q]™[
+ˆ\OHœÙ\ÜÚ[Û‹]H‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆ]O]]Kˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚™YˆÜ\œÚ\ÝÙ^\›˜[Û[Ù[ÛÜ[ÛœÊˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ŠHOˆ›Û™N‚ˆˆˆ‚ˆ™XÛÜ™H[Ù[Ø][ÙÈH˜]]™H\›™\ÜÉÜÈ^[œÚ[Ûˆ™\ÜY‚‚ˆÛÝ\˜ÙYœ›ÛHH\›™\ÜÉÜÈ]™H[Ù[™YÚ\ÝžH
+K[˜]]™N‚ˆÝ›[Ù[™YÚ\ÝžK™Ù]]˜Z[X›J
+X
+KÛÈ]™Y›XÝÈH[Ù[ÈBˆ\›™\ÜÈXÝX[HØYY›ÈX]\ˆÝÈ]]][XØ]Y8 %[‚ˆÛ[šYÙ[XÛÛ™šYÝ\™Y›ÝšY\ˆÔˆH\›™\ÜÉÜÈÝÛˆÛÙÚ[˜ˆ\È\ÈÚBˆHHXÚÙ\ˆÜ[]\È]™[ˆ[ˆHÛÙÚ[˜]Ú\™H›Âˆ[Ù[ËšœÛÛ˜\ÈÜš][ˆ[ÈHœšYÙH\ˆ›ÜˆHš[K\™XYÈš[™‚‚ˆØ]YÈHK[˜]]™HÜ˜\\ŽˆÛ›H™[˜Î˜Ù™]ÚÛ[Ù[ÛÜ[ÛœØ
+œÙ\™\Ê‚ˆ\ÈØXÚH›ÜˆK[˜]]™KÛÈXØÙ\[™ÈH\Úœ›ÛH[žHÝ\ˆÙ\ÜÚ[ÛˆÛÝ[ˆ\ÝX]™HHÝ˜^HØXÚH[žH[]™H[[X\™ÝÛ‹ˆ™Z™XÝ][™Ù\ÝÂˆÙY\HÛÛ˜XÝ^XÚ]‚‚ˆÝÜ™\È[È™]N˜Ü\ÚYÛ[Ù[ÛÜ[Ûœ×ØØXÚX
+ÚXÚHœ›ÝÜÙ\ˆ™[ØYˆÙ\È“ÕÛX\ˆ8 %H^[œÚ[ÛˆÛ›H\Ú\ÈÛˆÙ\ÜÚ[ÛˆÝ\
+H[™X›\Ú\ÂˆÙ\ÜÚ[Û‹›[Ù[ÛÜ[ÛœØÛÈÜ[ˆÛY[È™K\™XYHÛ˜\ÚÝˆ[ˆ[\Bˆ\Ý]šXÝÈH[žH˜]\ˆ[ˆØXÚ[™È›Ý[™Ë‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][Ûˆ›ÝÈÚÜÙHX™[ÈY[YžHHÜ˜\\‹‚ˆœ\˜[H›ÙNˆ^\›˜[[Ù[[Ü[ÛœÈ]™[›ÙKˆ]K›[Ù[Ø]\Ý™HBˆ\ÝÙˆÈšYŽˆÝ‹‹‹ŸXØš™XÝË‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆHÙ\ÜÚ[Ûˆ\È›ÝK[˜]]™KÜˆ]K›[Ù[Øˆ\ÈZ\ÜÚ[™ÈÜˆX[›Ü›YY‚ˆˆˆ‚ˆYˆÛÛ‹›X™[Ë™Ù]
+ÐÓUQWÓUU‘WÕÔTT—ÓP‘SÒÑVJHOHÔWÓUU‘WÕÔTT—ÓP‘SÕSQN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Û[Ù[ÛÜ[ÛœÈ\ÈÛ›HXØÙ\Y›ÜˆK[˜]]™HÙ\ÜÚ[ÛœÈ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ˜]×Û[Ù[ÈH›ÙK™]K™Ù]
+›[Ù[ÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Û[Ù[Ë\Ý
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Û[Ù[ÛÜ[ÛœÈ™\]Z\™\È]K›[Ù[ÈÈ™HH\Ý‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÜ[ÛœÎˆ\ÝÙXÝÜÝ‹[žWWHH×BˆÙY[ŽˆÙ]ÜÝ—HHÙ]
+
+Bˆ›Üˆ˜]È[ˆ˜]×Û[Ù[Î‚ˆ[Ù[ÚYH˜]Ë™Ù]
+šYŠHYˆ\Ú[œÝ[˜ÙJ˜]ËXÝ
+H[ÙH›Û™BˆYˆ›Ý\Ú[œÝ[˜ÙJ[Ù[ÚYÝŠHÜˆ›Ý[Ù[ÚYÜˆ[Ù[ÚY[ˆÙY[Ž‚ˆÛÛ[YBˆÙY[‹˜Y
+[Ù[ÚY
+Bˆ\Ü^HH˜]Ë™Ù]
+™\Ü^S˜[YHŠHYˆ\Ú[œÝ[˜ÙJ˜]ËXÝ
+H[ÙH›Û™BˆÜ[ÛœË˜\[™
+ˆÂˆšYŽˆ[Ù[ÚYˆ™\Ü^S˜[YHŽˆ\Ü^HYˆ\Ú[œÝ[˜ÙJ\Ü^KÝŠH[™\Ü^H[ÙH[Ù[ÚYˆš\ÑY˜][Žˆ›ÛÛ
+˜]Ë™Ù]
+š\ÑY˜][‹˜[ÙJJHYˆ\Ú[œÝ[˜ÙJ˜]ËXÝ
+H[ÙH˜[ÙKˆBˆ
+BˆYˆÜ[ÛœÎ‚ˆÜ\ÚYÛ[Ù[ÛÜ[Ûœ×ØØXÚVÜÙ\ÜÚ[Û—ÚYHHÜ[ÛœÂˆ[ÙN‚ˆÜ\ÚYÛ[Ù[ÛÜ[Ûœ×ØØXÚKœÜ
+Ù\ÜÚ[Û—ÚY›Û™JBˆÜX›\ÚÛ[Ù[ÛÜ[ÛœÊÙ\ÜÚ[Û—ÚY
+B‚‚™YˆÝ˜[Y]WÙ^\›˜[Ü™X\ÛÛš[™×ÙY™›Ü
+›ÙNˆÙ\ÜÚ[Û‘]™[[œ]
+HOˆÝˆ›Û™N‚ˆˆˆ‚ˆ˜[Y]HH\›Z[˜[[ØœÙ\™Y™X\ÛÛš[™ËYY™›Ü^[ØY‚‚ˆœ\˜[H›ÙNˆ^\›˜[Y™›ÜXÚ[™ÙH]™[›ÙKˆ]Kœ™X\ÛÛš[™×ÙY™›Üˆ]\Ý™H™\Ù[[™Z]\ˆ›Û™XÜˆHÝ\ÜYY™›ÜÝš[™ËK™Ë‚ˆ›YY][H˜‚ˆœ™]\›œÎˆ›Ü›X[^™YY™›ÜÝš[™ËÜˆ›Û™XÚ[ˆH\›Z[˜[ÛX\™YˆÈ]ÈY˜][Y™›Ü‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆH^[ØY\ÈZ\ÜÚ[™ÈÜˆ[œÝ\ÜY‚ˆˆˆ‚ˆYˆœ™X\ÛÛš[™×ÙY™›Üˆ›Ý[ˆ›ÙK™]N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ü™X\ÛÛš[™×ÙY™›ÜØÚ[™ÙH™\]Z\™\È]Kœ™X\ÛÛš[™×ÙY™›Ü‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ˜]×ÙY™›ÜH›ÙK™]VÈœ™X\ÛÛš[™×ÙY™›Ü—BˆYˆ˜]×ÙY™›Ü\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×ÙY™›ÜÝŠHÜˆ›Ý˜]×ÙY™›ÜœÝš\
+
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ü™X\ÛÛš[™×ÙY™›ÜØÚ[™ÙH™\]Z\™\È]Kœ™X\ÛÛš[™×ÙY™›Ü‚ˆÈ™HH›Û‹Y[\HÝš[™ÈÜˆ[‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆY™›ÜH˜]×ÙY™›ÜœÝš\
+
+BˆžN‚ˆ™]\›ˆ˜[Y]WÙY™›Ü
+Y™›ÜœÙ\ÜÚ[ÛˆY]Y]H‹Q‘“Ô•ÕSQTÊBˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš[˜[Y™X\ÛÛš[™×ÙY™›ÜˆÙ^ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Hœ›ÛH^Â‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[Ü™X\ÛÛš[™×ÙY™›ÜØÚ[™ÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\Ý[™œ›ØYØ\ÝH™X\ÛÛš[™ËYY™›ÜÝÚ]ÚXYH[œÚYHH\›Z[˜[‚‚ˆZ\œ›ÜœÈH˜]]™K]\›Z[˜[[šÚ[™Ë[]™[Ú[™ÙHÛÈHÛ[šYÙ[Ù\ÜÚ[Û‹‚ˆ[›ZÙHHX›XÈUÒ]\È[X™\˜][HÙ\È“Õ›ÜØ\™[‚ˆY™›ÜØÚ[™ÙX˜XÚÈÈH[›™\ŽˆH\›Z[˜[\È[™XYHÛˆ]ˆY™›ÜÛÈ™KZ[š™XÝ[™È]ÛÝ[ÛÜ‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][Ûˆ›ÝÈ›ÜˆÙ\ÜÚ[Û—ÚY]H›Ý]H›Ý[™\žK‚ˆœ\˜[H›ÙNˆ^\›˜[Y™›ÜXÚ[™ÙH]™[›ÙK‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ\]H™X\ÛÛš[™×ÙY™›Ü‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆY™›ÜHÝ˜[Y]WÙ^\›˜[Ü™X\ÛÛš[™×ÙY™›Ü
+›ÙJBˆYˆÛÛ‹œ™X\ÛÛš[™×ÙY™›ÜOHY™›Ü‚ˆ™]\›‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K\]WØÛÛ™\œØ][Û‹ˆÙ\ÜÚ[Û—ÚYˆ™X\ÛÛš[™×ÙY™›ÜYY™›ÜˆÝ[œÙ]Ü™X\ÛÛš[™×ÙY™›ÜYY™›Ü\È›Û™Kˆ
+Bˆ]™[HÙ\ÜÚ[Û”™X\ÛÛš[™ÑY™›Ü]™[
+ˆ\OHœÙ\ÜÚ[Û‹œ™X\ÛÛš[™×ÙY™›Ü‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆ™X\ÛÛš[™×ÙY™›ÜYY™›Üˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[ØÛÙ^ØÛÛX›Ü˜][Û—Û[ÙWØÚ[™ÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\ÝÛÙ^	ÜÈÛÛX›Ü˜][Ûˆ[ÙHÚ[™\È[ˆ[\›˜[Ù\ÜÚ[ÛˆX™[‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][Ûˆ›ÝÈ›ÜˆÙ\ÜÚ[Û—ÚY]H›Ý]H›Ý[™\žK‚ˆœ\˜[H›ÙNˆ^\›˜[ÛÙ^[ÙKXÚ[™ÙH]™[›ÙKˆ]K›[ÙX]\Ý™Bˆ™Y˜][˜Üˆœ[ˆ˜‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ\Ù\H[ÙHX™[‚ˆœ™]\›œÎˆ›Û™K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ]K›[ÙX\ÈZ\ÜÚ[™ÈÜˆ[œÝ\ÜY‚ˆˆˆ‚ˆ˜]×Û[ÙHH›ÙK™]K™Ù]
+›[ÙHŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Û[ÙKÝŠHÜˆ›Ý˜]×Û[ÙKœÝš\
+
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÙ^ØÛÛX›Ü˜][Û—Û[ÙWØÚ[™ÙH™\]Z\™\È]K›[ÙHÈ™HH›Û‹Y[\HÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ[ÙHH˜]×Û[ÙKœÝš\
+
+BˆYˆ[ÙH›Ý[ˆÐÓÑVÓUU‘WÐÓÓP“ÔUSÓ—ÓSÑTÎ‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÙ^ØÛÛX›Ü˜][Û—Û[ÙWØÚ[™ÙH™\]Z\™\È]K›[ÙH[ˆ‚ˆˆžÜÛÜY
+ÐÓÑVÓUU‘WÐÓÓP“ÔUSÓ—ÓSÑTÊ_NÈÛÝÛ[ÙH\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆÛÛ‹›X™[Ë™Ù]
+ÐÓÑVÓUU‘WÐÓÓP“ÔUSÓ—ÓSÑWÓP‘SÒÑVJHOH[ÙN‚ˆ™]\›‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™KœÙ]ÛX™[ËˆÙ\ÜÚ[Û—ÚYˆ×ÐÓÑVÓUU‘WÐÓÓP“ÔUSÓ—ÓSÑWÓP‘SÒÑVNˆ[Ù_Kˆ
+BˆÜX›\ÚØÛÛX›Ü˜][Û—Û[ÙJÙ\ÜÚ[Û—ÚY[ÙJB‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[Ü\›Z\ÜÚ[Û—Û[ÙWØÚ[™ÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\ÝH[™K[ØœÙ\™YÛ]YK[˜]]™H\›Z\ÜÚ[Ûˆ[ÙH\ÈHÙ\ÜÚ[ÛˆX™[‚‚ˆH›ÜØ\™\ˆÜÝÈ\ÈÚ[ˆH[™IÜÈ[ÙH›ÛÝ\ˆY™™\œÈœ›ÛHÚ]]ˆ\Ý™\ÜY8 %K™KˆH\Ù\ˆ™\ÜÙYÚY
+ÝXˆ[ˆHRKˆ[›ZÙHBˆUÒ]\È™YYÈ›È[›™\ˆÛÛ™š\›X][ÛŽˆH[™HTÈHÛÝ\˜ÙKÛÂˆH[ÙH\È[™XYH[ˆY™™XÝ‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][Ûˆ›ÝÈ›ÜˆÙ\ÜÚ[Û—ÚY]H›Ý]H›Ý[™\žK‚ˆœ\˜[H›ÙNˆ]™[›ÙNÈ]Kœ\›Z\ÜÚ[Û—Û[ÙX]\Ý™HH[ÙHH[™Bˆ›ÛÝ\ˆØ[ˆ™\Ü
+HÝÚ]ÚX›H[Ù\È\Èž\\ÜÔ\›Z\ÜÚ[ÛœØ
+K‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ\Ù\H[ÙHX™[‚ˆœ™]\›œÎˆ›Û™K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ]Kœ\›Z\ÜÚ[Û—Û[ÙX\ÈZ\ÜÚ[™ÈÜˆ[œÝ\ÜY‚ˆˆˆ‚ˆ˜]×Û[ÙHH›ÙK™]K™Ù]
+œ\›Z\ÜÚ[Û—Û[ÙHŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Û[ÙKÝŠHÜˆ›Ý˜]×Û[ÙKœÝš\
+
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ü\›Z\ÜÚ[Û—Û[ÙWØÚ[™ÙH™\]Z\™\È]Kœ\›Z\ÜÚ[Û—Û[ÙH‚ˆÈ™HH›Û‹Y[\HÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ[ÙHH˜]×Û[ÙKœÝš\
+
+BˆYˆ[ÙH›Ý[ˆÐÓUQWÓUU‘WÔ‘PQP“WÔT“RTÔÒSÓ—ÓSÑTÎ‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ü\›Z\ÜÚ[Û—Û[ÙWØÚ[™ÙH™\]Z\™\È]Kœ\›Z\ÜÚ[Û—Û[ÙH[ˆ‚ˆˆžÜÛÜY
+ÐÓUQWÓUU‘WÔ‘PQP“WÔT“RTÔÒSÓ—ÓSÑTÊ_NÈÛÝÛ[ÙH\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÈ™Y›XÝHÝÚ]Ú[È\›Z[˜[Û][˜ÚØ\™ÜÈÛÈH™[][˜Ú™[Ü[œÈ[ˆ\ÂˆÈ[ÙH8 %H][˜Ú\ˆ™XYÈH[ÙHœ›ÛH][˜Ú\™ÜËÚ[HHX™[™[ÝÂˆÈ\ÈÛ›HHÙXˆRIÜÈ™XYX˜XÚËˆ™]Üš]\È[ˆ^\Ý[™ÈK\\›Z\ÜÚ[Û‹[[ÙHÛ›BˆÈ
+H›Ë[Ü›ÜˆHÙ\ÜÚ[Ûˆ][˜ÚYÚ]Ý]Û™JNÈÙ\ZXYÙˆHX™[ˆÈÚÜXÚ\˜ÝZ]ÛÈHÝ[H][˜Ú\™È\Èš^Y]™[ˆÚ[ˆHX™[X]Ú\Ë‚ˆY\™ÙYØ\™ÜÈHÛY\™ÙWØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™ÜÊÛÛ‹\›Z[˜[Û][˜ÚØ\™ÜË[ÙJBˆYˆÛÛ‹\›Z[˜[Û][˜ÚØ\™ÜÈOHY\™ÙYØ\™ÜÎ‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K\]WØÛÛ™\œØ][Û‹ˆÙ\ÜÚ[Û—ÚYˆ\›Z[˜[Û][˜ÚØ\™ÜÏ[Y\™ÙYØ\™ÜËˆ
+BˆYˆÛÛ‹›X™[Ë™Ù]
+ÐÓUQWÓUU‘WÔT“RTÔÒSÓ—ÓSÑWÓP‘SÒÑVJHOH[ÙN‚ˆ™]\›‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™KœÙ]ÛX™[ËˆÙ\ÜÚ[Û—ÚYˆ×ÐÓUQWÓUU‘WÔT“RTÔÒSÓ—ÓSÑWÓP‘SÒÑVNˆ[Ù_Kˆ
+BˆÜX›\ÚÜ\›Z\ÜÚ[Û—Û[ÙJÙ\ÜÚ[Û—ÚY[ÙJB‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[ØÛÙ^Ø\›Ý˜[Û[ÙWØÚ[™ÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ”\œÚ\ÝHÛÙ^[ØœÙ\™Y\›Ý˜[Ú[™ÙH
+œ›ÛHHRHÜ\›Z\ÜÚ[ÛœØÝÚ]Ú
+K‚‚ˆH›ÜØ\™\ˆÜÝÈÛÈ[™ÜÈ]Ø]È[ˆ™XYÜÙ][™ÜËÝ\]Y‚ˆ\›Z[˜[Û][˜ÚØ\™ÜØ
+HÜ™X]KÙ›ÜšËÜ™\Ý[YH›ØØX[\žKY\™ÙY[ÈBˆ›ÝÊH[™\›Ý˜[Û[ÙX
+H[[YHÜ\›Z\ÜÚ[ÛœØ™\Ù]Ý[\YÛ‚ˆH™XYX˜XÚÈX™[
+ÈX›\ÚY]™HÛÈHÙXˆXÚÙ\ˆ˜XÚÜÈHRJKˆ›Ýˆ\™HÜ[Û˜[]]X\ÝÛ™H]\Ý™H™\Ù[‚ˆˆˆ‚ˆ˜]×Ø\™ÜÈH›ÙK™]K™Ù]
+\›Z[˜[Û][˜ÚØ\™ÜÈŠBˆ˜]×Û[ÙHH›ÙK™]K™Ù]
+˜\›Ý˜[Û[ÙHŠBˆYˆ˜]×Ø\™ÜÈ\È›Û™H[™˜]×Û[ÙH\È›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÙ^Ø\›Ý˜[Û[ÙWØÚ[™ÙH™\]Z\™\È]K\›Z[˜[Û][˜ÚØ\™ÜÈ‚ˆ›Üˆ]K˜\›Ý˜[Û[ÙH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ˜]×Ø\™ÜÈ\È›Ý›Û™N‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Ø\™ÜË\Ý
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÙ^Ø\›Ý˜[Û[ÙWØÚ[™ÙH]K\›Z[˜[Û][˜ÚØ\™ÜÈ]\Ý™HH\Ý‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆžN‚ˆ\›Z\ÜÚ[Û—Ø\™ÜÈHÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊ˜]×Ø\™ÜÊBˆ\›Z[˜[Û][˜ÚØ\™ÜÈHÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊˆÛY\™ÙWØÛÙ^Ü\›Z\ÜÚ[Û—Û][˜ÚØ\™ÜÊˆÛÛ‹\›Z[˜[Û][˜ÚØ\™ÜË\›Z\ÜÚ[Û—Ø\™ÜÈÜˆ×Bˆ
+Bˆ
+Bˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš[˜[Y\›Z[˜[Û][˜ÚØ\™ÜÎˆÙ^ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Hœ›ÛH^ÂˆYˆÛÛ‹\›Z[˜[Û][˜ÚØ\™ÜÈOH\›Z[˜[Û][˜ÚØ\™ÜÎ‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K\]WØÛÛ™\œØ][Û‹ˆÙ\ÜÚ[Û—ÚYˆ\›Z[˜[Û][˜ÚØ\™ÜÏ]\›Z[˜[Û][˜ÚØ\™ÜËˆ
+BˆYˆ˜]×Û[ÙH\È›Û™N‚ˆ™]\›‚ˆYˆ˜]×Û[ÙH›Ý[ˆÓÑVÓUU‘WÔT“RTÔÒSÓ—ÕSQTÎ‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÙ^Ø\›Ý˜[Û[ÙWØÚ[™ÙH]K˜\›Ý˜[Û[ÙH]\Ý™HÛ™HÙˆ‚ˆˆžÜÛÜY
+ÓÑVÓUU‘WÔT“RTÔÒSÓ—ÕSQTÊ_NÈÛÝÜ˜]×Û[ÙH\ŸH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆÛÛ‹›X™[Ë™Ù]
+ÐÓÑVÓUU‘WÐT“ÕSÓSÑWÓP‘SÒÑVJHOH˜]×Û[ÙN‚ˆ™]\›‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™KœÙ]ÛX™[ËˆÙ\ÜÚ[Û—ÚYˆ×ÐÓÑVÓUU‘WÐT“ÕSÓSÑWÓP‘SÒÑVNˆ˜]×Û[Ù_Kˆ
+BˆÜX›\ÚØÛÙ^Ø\›Ý˜[Û[ÙJÙ\ÜÚ[Û—ÚY˜]×Û[ÙJB‚‚™YˆÛY\™ÙWØÛÙ^Ü\›Z\ÜÚ[Û—Û][˜ÚØ\™ÜÊˆ^\Ý[™×Ø\™ÜÎˆÙ\]Y[˜ÙVÜÝ—H›Û™Kˆ\›Z\ÜÚ[Û—Ø\™ÜÎˆÙ\]Y[˜ÙVÜÝ—KŠHOˆ\ÝÜÝ—N‚ˆˆˆ”™\XÙHÛÙ^\›Z\ÜÚ[Ûˆ\™Ý[Y[ÈÚ[H™\Ù\š[™ÈÝ\ˆ][˜Ú\™ÜËˆˆˆ‚ˆÛÛ™šY×ÚÙ^\ÈHÂˆ˜\›Ý˜[ÜÛXÞH‹ˆ˜\›Ý˜[×Ü™]šY]Ù\ˆ‹ˆ™Y˜][Ü\›Z\ÜÚ[ÛœÈ‹ˆœØ[™›ÞÛ[ÙH‹ˆBˆ˜[YWÛÜ[ÛœÈHÈ‹KX\ÚËY›Ü‹X\›Ý˜[‹‹XH‹‹K\Ø[™›Þ‹‹\ÈŸBˆY\™ÙYˆ\ÝÜÝ—HH×Bˆ\™ÜÈH\Ý
+^\Ý[™×Ø\™ÜÈÜˆ
+
+JBˆ[™^HˆÚ[H[™^[Š\™ÜÊN‚ˆ\™ÈH\™ÜÖÚ[™^BˆYˆ\™ÈOH‹KY[™Ù\›Ý\ÛKXž\\ÜËX\›Ý˜[ËX[™\Ø[™›ÞŽ‚ˆ[™^
+ÏHBˆÛÛ[YBˆYˆ\™È[ˆ˜[YWÛÜ[ÛœÎ‚ˆ[™^
+ÏH‚ˆÛÛ[YBˆYˆ\™ËœÝ\ÝÚ]
+
+‹KX\ÚËY›Ü‹X\›Ý˜[H‹‹XOH‹‹K\Ø[™›ÞH‹‹\ÏHŠJN‚ˆ[™^
+ÏHBˆÛÛ[YBˆYˆ\™È[ˆÈ‹KXÛÛ™šYÈ‹‹XÈŸH[™[™^
+ÈH[Š\™ÜÊN‚ˆÙ^HH\™ÜÖÚ[™^
+ÈWKœ\][ÛŠHŠVÌKœÝš\
+
+BˆYˆÙ^H[ˆÛÛ™šY×ÚÙ^\Î‚ˆ[™^
+ÏH‚ˆÛÛ[YBˆY\™ÙY™^[™
+\™ÜÖÚ[™^ˆ[™^
+È—JBˆ[™^
+ÏH‚ˆÛÛ[YBˆYˆ\™ËœÝ\ÝÚ]
+
+‹KXÛÛ™šYÏH‹‹XÏHŠJN‚ˆÙ^HH\™ËœÜ]
+H‹JVÌWKœ\][ÛŠHŠVÌKœÝš\
+
+BˆYˆÙ^H[ˆÛÛ™šY×ÚÙ^\Î‚ˆ[™^
+ÏHBˆÛÛ[YBˆY\™ÙY˜\[™
+\™ÊBˆ[™^
+ÏHBˆ™]\›ˆÊ›Y\™ÙY
+œ\›Z\ÜÚ[Û—Ø\™Ü×B‚‚™YˆÜÝš\ØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™Ê\™ÜÎˆ\ÝÜÝ—JHOˆ\VÛ\ÝÜÝ—K›ÛÛN‚ˆˆˆ‚ˆ›Ü]™\žH\›Z\ÜÚ[Û‹[[ÙHÙ[XÝÜˆœ›ÛHÛ]YH][˜Ú\™ÜË‚‚ˆ™[[Ý™\ÈK\\›Z\ÜÚ[Û‹[[ÙX
+ÜXÙKHÜˆXZ›Ú[™Y
+H[™HÝ[™[Û™BˆKY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœØÚXÚÛ]YH™X]È\ÂˆK\\›Z\ÜÚ[Û‹[[ÙHž\\ÜÔ\›Z\ÜÚ[ÛœØÈX]š[™È]›YÈ™^ÈH[›™Yˆ[ÙHÛÝ[™\Ý[YHHÙ\ÜÚ[Ûˆ[ˆž\\ÜÈ[™\ˆH™\ÝšXÝYX™[‚‚ˆœ\˜[H\™ÜÎˆ][˜Ú\™ÜËK™ËˆÈ‹K[[Ù[‹›Ü\È‹‹K\\›Z\ÜÚ[Û‹[[ÙH‹œ[ˆ—X‚ˆœ™]\›œÎˆH™[XZ[š[™È\™ÜÈ[ˆÜ™\‹[™Ú]\ˆHÙ[XÝÜˆØ\È™\Ù[‚ˆˆˆ‚ˆÝš\Yˆ\ÝÜÝ—HH×BˆYÙ›YÈH˜[ÙBˆ[™^HˆÚ[H[™^[Š\™ÜÊN‚ˆ\™ÈH\™ÜÖÚ[™^BˆYˆ\™ÈOH‹KY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœÈŽ‚ˆYÙ›YÈHYBˆ[™^
+ÏHBˆÛÛ[YBˆYˆ\™ÈOH‹K\\›Z\ÜÚ[Û‹[[ÙHŽ‚ˆYÙ›YÈHYBˆ[™^
+ÏHˆÈ›ÜH›YÈ[™]ÈÙ\\˜]H˜[YHÚÙ[‚ˆÛÛ[YBˆYˆ\™ËœÝ\ÝÚ]
+‹K\\›Z\ÜÚ[Û‹[[ÙOHŠN‚ˆYÙ›YÈHYBˆ[™^
+ÏHBˆÛÛ[YBˆÝš\Y˜\[™
+\™ÊBˆ[™^
+ÏHBˆ™]\›ˆÝš\YYÙ›YÂ‚‚™YˆÛY\™ÙWØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™ÜÊˆ^\Ý[™×Ø\™ÜÎˆ\ÝÜÝ—H›Û™Kˆ[ÙNˆÝ‹ŠHOˆ\ÝÜÝ—H›Û™N‚ˆˆˆ”™]Üš]H[ˆ^\Ý[™ÈK\\›Z\ÜÚ[Û‹[[ÙX[ˆÛ]YH][˜Ú\™ÜÈÈ[ÙX‚‚ˆH[[YH[ÙHÝÚ]Ú
+ÚY
+ÝXˆÜˆUÒ
+H]\ÝÝ\š]™H™[][˜Ú[™Bˆ][˜Ú\ˆ™\ÝÜ™\ÈH[ÙHœ›ÛH\›Z[˜[Û][˜ÚØ\™ÜØ8 %›ÝHX™[‚ˆ™]Üš]HH^\Ý[™ÈK\\›Z\ÜÚ[Û‹[[ÙX[žH
+ÜXÙKHÜˆXZ›Ú[™Y
+HÂˆHÝ\œ™[[ÙK™\Ù\š[™ÈÝ\ˆ\™ÜÈ[ˆÜ™\‹ÛÈHÛÛ™\Ý[YH™[Ü[œÂˆ[ˆH[ÙHH\Ù\ˆ\ÝÚÜÙKˆHÝ[™[Û™HKY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœØˆÛÝ[È\È[ˆ^\Ý[™ÈK\\›Z\ÜÚ[Û‹[[ÙHž\\ÜÔ\›Z\ÜÚ[ÛœØ‚‚ˆ™]\›œÈ^\Ý[™×Ø\™ÜØ[˜Ú[™ÙYÚ[ˆ^HØ\œžH›ÈK\\›Z\ÜÚ[Û‹[[ÙX‚ˆHÙ\ÜÚ[Ûˆ][˜ÚYÚ]Ý]H›YÈ
+X[X[ÜˆHÙ][™ÜËšœÛÛ˜ˆY˜][[ÙX
+H]\Ý“Õ™H[›™YÈ[ˆ^XÚ][ÙHžHH›ÛÝ\ˆ™\Ü8 %ˆH›ÜØ\™\ˆÜÝÈH][˜Ú[ÙHÛˆ]Èš\œÝÛ
+ÙYBˆÛ]YWÛ˜]]™WÙ›ÜØ\™\˜
+K[™[›š[™È]ÛÝ[Ý™\œšYHHÙ\ÜÚ[Û‰ÜÂˆÙ][™ÜÈY˜][Ûˆ™[][˜ÚˆÜÙHÙ\ÜÚ[ÛœÈÝ\™˜XÙHH]™H[ÙH›ÝYÚˆH\›Z\ÜÚ[Û‹[[ÙHX™[[œÝXY‚ˆˆˆ‚ˆÝš\YYÙ›YÈHÜÝš\ØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™Ê\Ý
+^\Ý[™×Ø\™ÜÈÜˆ
+
+JJBˆYˆ›ÝYÙ›YÎ‚ˆ™]\›ˆ^\Ý[™×Ø\™ÜÂˆ™]\›ˆÊœÝš\Y‹K\\›Z\ÜÚ[Û‹[[ÙH‹[ÙWB‚‚™YˆÜ[—ØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™ÜÊˆ^\Ý[™×Ø\™ÜÎˆ\ÝÜÝ—H›Û™Kˆ[ÙNˆÝ‹ŠHOˆ\ÝÜÝ—N‚ˆˆˆ‚ˆÙ]K\\›Z\ÜÚ[Û‹[[ÙXÈ[ÙX[ˆÛ]YH][˜Ú\™ÜËY[™È]Ú[ˆXœÙ[‚‚ˆ›ÜˆHÝÚ]ÚH\Ù\ˆXYH[X™\˜][H
+HÙXˆXÚÙ\‹ÛÛ™š\›YYžHBˆ[›™\ŠHH[ÙH]\ÝÝ\š]™HHÛÛ™\Ý[YH]™[ˆÚ[ˆHÙ\ÜÚ[ÛˆØ\ÂˆÜ™X]YÚ]Ý]H›YÎˆH][˜Ú\ˆ™XZ[ÈÛ]YIÜÈ\™ÜÈœ›ÛBˆ\›Z[˜[Û][˜ÚØ\™ÜØ[Û™H[™™]™\ˆ™XYÈH[ÙHX™[ÛÈBˆX™[[Û›H™XÛÜ™™[Ü[œÈHÙ\ÜÚ[Ûˆ[ˆÛ]YIÜÈY˜][
+X[X[
+H[ÙK‚ˆ[›š[™È™Y˜][˜\ÈH[X™\˜]HÚÚXÙHÙˆÛ]YIÜÈX[X[[ÙH[™ˆÝ™\œšY\ÈH\›Z\ÜÚ[ÛœË™Y˜][[ÙX[ˆH\Ù\‰ÜÈÙ][™ÜÈÛˆ™[][˜Ú‚‚ˆœ\˜[H^\Ý[™×Ø\™ÜÎˆÝ\œ™[][˜Ú\™ÜËK™ËˆÈ‹K[[Ù[‹›Ü\È—XÜˆ›Û™X‚ˆœ\˜[H[ÙNˆ[›™\‹XÛÛ™š\›YY[ÙKK™Ëˆ˜]]È˜‚ˆœ™]\›œÎˆH\™ÜÈÚ]^XÝHÛ™H˜Z[[™ÈK\\›Z\ÜÚ[Û‹[[ÙH[ÙO˜‚ˆˆˆ‚ˆÝš\YÈHÜÝš\ØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™Ê\Ý
+^\Ý[™×Ø\™ÜÈÜˆ
+
+JJBˆ™]\›ˆÊœÝš\Y‹K\\›Z\ÜÚ[Û‹[[ÙH‹[ÙWB‚‚™YˆÚ[™WÙ^\›˜[ÜÙ\ÜÚ[Û—ÝÙÜÊˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ŠHOˆ›Û™N‚ˆˆˆ‚ˆØXÚH[™œ›ØYØ\ÝHÙË[\Ý\]Hœ›ÛHH˜]]™H›ÜØ\™\‹‚‚ˆÙ[žHHÛ]YK[˜]]™H›ÜØ\™\ˆ
+œ›ÛHÙÕÜš]X
+H[™BˆÛÙ^[˜]]™H›ÜØ\™\ˆ
+œ›ÛHÛÙ^[ˆ\]\ÊNÈH[™[\Âˆ\›™\ÜËXYÛ›ÜÝXË‚‚ˆ\]\ÈH[‹[Y[[ÜžHÜÙ\ÜÚ[Û—ÝÙÜ×ØØXÚXÛÈÝXœÙ\]Y[ˆÑUÝŒKÜÙ\ÜÚ[ÛœËÞÚYXÛ˜\ÚÝØ[ÈØ[ˆÜ[]HHÙÜØˆšY[Ú]Ý]Hš[H™XYˆ[ˆX›\Ú\ÈHÙ\ÜÚ[Û‹ÙÜØÔÑH]™[ˆÛÈÛÛ›™XÝYÙXˆÛY[È\]HZ\ˆÙÈ[™[[[YYX][K‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹ˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H›ÙNˆH^\›˜[ÜÙ\ÜÚ[Û—ÝÙÜØ]™[›ÙKˆ]\Ý]™Bˆ]KÙÜØ\ÈH\ÝÙˆÙÈXÝËK™Ë‚ˆÞÈ˜ÛÛ[Žˆ‘š^YÈ‹œÝ]\ÈŽˆš[—Ü›ÙÜ™\ÜÈ‹˜XÝ]™Q›Ü›HŽˆ‘š^[™ÈHYÈŸWX‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆÚ[ˆ]KÙÜØ\ÈZ\ÜÚ[™ÈÜˆ›ÝH\Ý‚ˆˆˆ‚ˆÙÜÈH›ÙK™]K™Ù]
+ÙÜÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÙÜË\Ý
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÜÙ\ÜÚ[Û—ÝÙÜÈ™\]Z\™\È]KÙÜÈÈ™HH\Ý‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÈš[\ˆÈÙ[Y›Ü›YY][\È™Y›Ü™HØXÚ[™ÈÛÈ]X[›Ü›YY[šY\ÂˆÈœ›ÛHHYÙÞH›ÜØ\™\ˆ™\œÚ[ÛˆÛ‰Ý\œÚ\Ý[ˆHÛ˜\ÚÝˆBˆÈØ[YHš[\ˆ\È\YYžHÜÙKÈÛˆH]™KY]™[]ÈÙY\[™ÈBˆÈÛÈ[ˆÞ[˜ÈYX[œÈHÛ˜\ÚÝ[™]™H[™[[Ø^\ÈÚÝÈHØ[YHÙ]‚ˆ˜[YÜÝ]\Ù\ÈHÈœ[™[™È‹š[—Ü›ÙÜ™\ÜÈ‹˜ÛÛ\]YŸBˆ˜[Y]Yˆ\ÝÙXÝÜÝ‹[žWWHHÂˆˆ›Üˆ[ˆÙÜÂˆYˆ\Ú[œÝ[˜ÙJXÝ
+Bˆ[™\Ú[œÝ[˜ÙJ™Ù]
+˜ÛÛ[ŠKÝŠBˆ[™™Ù]
+œÝ]\ÈŠH[ˆ˜[YÜÝ]\Ù\Âˆ[™\Ú[œÝ[˜ÙJ™Ù]
+˜XÝ]™Q›Ü›HŠKÝŠBˆBˆÜÙ\ÜÚ[Û—ÝÙÜ×ØØXÚVÜÙ\ÜÚ[Û—ÚYHH˜[Y]Yˆ]™[HÙ\ÜÚ[Û•ÙÜÑ]™[
+ˆ\OHœÙ\ÜÚ[Û‹ÙÜÈ‹ˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆÙÜÏ]˜[Y]Yˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+
+JB‚‚™YˆÜX›\ÚÙ^\›˜[ØÛÛ™\œØ][Û—Ú][JˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ][NˆÛÛ™\œØ][Û’][KˆÛX\™YÜ[™[™×ÚYˆÝˆ›Û™HH›Û™KˆY\ÜØYÙWÚYˆÝˆ›Û™HH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆœ›ØYØ\ÝH\›Z[˜[[ØœÙ\™YÛÛ™\œØ][Ûˆ][K‚‚ˆ\Ù\ˆY\ÜØYÙ\È\ÙHÙ\ÜÚ[Û‹š[œ]˜ÛÛœÝ[YYÛÈHÙXˆRH™[™\œÂˆ[H^XÝHZÙHØØ[ØÛÛ\ÜÙ\ˆY\ÜØYÙ\Ëˆ\ÜÚ\Ý[ÝÛÛ\ÚYBˆ][\È\ÙH™\ÜÛœÙK›Ý]]Ú][K™Û™X™XØ]\ÙH^H\™H[™XYBˆÛÛ\]Y™XÛÜ™Èœ›ÛHÛ]YIÜÈ˜[œØÜš\›ÝÚÙ[ˆ[\Èœ›ÛBˆ[ˆXÝ]™HÛ[šYÙ[\ÚË‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H][Nˆ\œÚ\ÝYÛÛ™\œØ][Ûˆ][K‚ˆœ\˜[HÛX\™YÜ[™[™×ÚYˆ›ÜˆH˜]]™H\Ù\ˆY\ÜØYÙKHYÙˆBˆÜ[Z\ÝXÈ[™[™ËZ[œ][žHHØ[\ˆ˜Z[™Y›Üˆ]
+ÛÂˆÛY[È›Ü]X˜›HžHY
+KÜˆ›Û™XˆH˜Z[ˆ\[œÂˆ]H\œÚ\ÝÚ]H8 %ÙYH™[˜Î˜Ü\œÚ\ÝÙ^\›˜[ØÛÛ™\œØ][Û—Ú][Xˆ8 %™XØ]\ÙH][ÛÈ›ÛÈH[žIÜÈš[H›ØÚÜÈ[ÈH\˜X›Bˆ][H™Y›Ü™H\[™‚ˆœ\˜[HY\ÜØYÙWÚYˆÜ[Û˜[]™K\™]šY]ÈÝ™X[Hš[˜[^™YžH\È][K‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆYˆ][K\HOH›Y\ÜØYÙHˆ[™\Ú[œÝ[˜ÙJ][K™]KY\ÜØYÙQ]JN‚ˆYˆ][K™]Kœ›ÛHOH\Ù\ˆŽ‚ˆÜX›\ÚÚ[œ]ØÛÛœÝ[YY
+Ù\ÜÚ[Û—ÚY][KÛX\™YÜ[™[™×ÚYXÛX\™YÜ[™[™×ÚY
+Bˆ™]\›‚ˆYˆ][K™]Kš\×ÛY]N‚ˆÈY[ˆÛÛ^ÛˆH›Û‹]\Ù\ˆY\ÜØYÙH\È›È]™H™[™\š[™ÂˆÈ]]š[\œÈÛˆH›YËÛÈÙY\]Ù™ˆHÝ™X[K‚ˆ™]\›‚ˆ]™[HÝ]]][QÛ™Q]™[
+\OHœ™\ÜÛœÙK›Ý]]Ú][K™Û™H‹][OZ][K×Ø\WÙXÝ
+
+JBˆ^[ØYH]™[›[Ù[Ù[\
+
+BˆYˆY\ÜØYÙWÚY\È›Ý›Û™N‚ˆ^[ØYÈ›Y\ÜØYÙWÚY—HHY\ÜØYÙWÚYˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY^[ØY
+B‚‚™YˆÜX›\ÚÙ^\›˜[ÛÝ]]Ý^Ù[JÙ\ÜÚ[Û—ÚYˆÝ‹›ÙNˆÙ\ÜÚ[Û‘]™[[œ]
+HOˆ›Û™N‚ˆˆˆ‚ˆœ›ØYØ\ÝH\›Z[˜[[ØœÙ\™Y\ÜÚ\Ý[^[K‚‚ˆ\›Z[˜[X˜XÚÙY[YÜ˜][ÛœÈØ[ˆØœÙ\™HÝ™X[Z[™ÈÝ]]™Y›Ü™BˆZ\ˆÛÛ\]Y˜[œØÜš\][H\È]˜Z[X›Kˆ\ÈX›\Ú\ÈBˆÝ[™\™™\ÜÛœÙ\Ë\Ý[H^Y[HÔÑH]™[Ú]Ý]\œÚ\Ý[™Âˆ[ž][™ÎÈHš[˜[\ÜÚ\Ý[Y\ÜØYÙH\È\œÚ\ÝYÙ\\˜][HÚ[‚ˆH[YÜ˜][ÛˆÜÝÈ^\›˜[ØÛÛ™\œØ][Û—Ú][X‚‚ˆHÜ[Û˜[Y\ÜØYÙWÚYÈ[™^Èš[˜[šY[È\™BˆØ\œšYY›ÝYÚÚ[ˆ™\Ù[
+˜]]™H]™HÝ™X[Z[™ÊH[™ˆÛZ]YÝ\Ú\ÙH8 %^ÛYWÛ›Û™XÙY\ÈHÚ\™HÚ\HY[XØ[ˆÈ[‹\›ØÙ\ÜÈ\ÚÈÝ™X[Z[™È›ÜˆØ[\œÈ]Û‰ÝÙ][K‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H›ÙNˆÔÕÙ]™[Ø›ÙHÚÜÙH\H\Âˆ™]N˜ÑVT“SÓÕUUÕVÑSWÕTX‚ˆœ™]\›œÎˆ›Û™K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ]K™[X\È›ÝHÝš[™ËÜˆ[žBˆ›ÝšYYY\ÜØYÙWÚYÈ[™^Èš[˜[\ÈHÜ›Û™Âˆ\K‚ˆˆˆ‚ˆ[HH›ÙK™]K™Ù]
+™[HŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ[KÝŠN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÛÝ]]Ý^Ù[H™\]Z\™\ÈÝš[™È]K™[H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆY\ÜØYÙWÚYH›ÙK™]K™Ù]
+›Y\ÜØYÙWÚYŠBˆYˆY\ÜØYÙWÚY\È›Ý›Û™H[™›Ý\Ú[œÝ[˜ÙJY\ÜØYÙWÚYÝŠN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÛÝ]]Ý^Ù[H]K›Y\ÜØYÙWÚY]\Ý™HHÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ[™^H›ÙK™]K™Ù]
+š[™^ŠBˆÈ›ÛÛ\È[ˆ[ÝX˜Û\ÜÎÈ™Z™XÝ]^XÚ]HÛÈHÝ˜^BˆÈ›ÛÛX[ˆ[™^\ÈHÝY\œ›Üˆ˜]\ˆ[ˆHÚ[[ÌK‚ˆYˆ[™^\È›Ý›Û™H[™
+›Ý\Ú[œÝ[˜ÙJ[™^[
+HÜˆ\Ú[œÝ[˜ÙJ[™^›ÛÛ
+JN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÛÝ]]Ý^Ù[H]Kš[™^]\Ý™H[ˆ[YÙ\ˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆš[˜[H›ÙK™]K™Ù]
+™š[˜[ŠBˆYˆš[˜[\È›Ý›Û™H[™›Ý\Ú[œÝ[˜ÙJš[˜[›ÛÛ
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÛÝ]]Ý^Ù[H]K™š[˜[]\Ý™HH›ÛÛX[ˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ]™[HÝ]]^[Q]™[
+ˆ\OHœ™\ÜÛœÙK›Ý]]Ý^™[H‹ˆ[OY[KˆY\ÜØYÙWÚY[Y\ÜØYÙWÚYˆ[™^Z[™^ˆš[˜[Yš[˜[ˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+^ÛYWÛ›Û™OUYJJB‚‚™YˆÜX›\ÚÙ^\›˜[ÝÛÛÛÝ]]Ù[JÙ\ÜÚ[Û—ÚYˆÝ‹›ÙNˆÙ\ÜÚ[Û‘]™[[œ]
+HOˆ›Û™N‚ˆˆˆœ›ØYØ\ÝH\›Z[˜[[ØœÙ\™Y[˜Ý[Û‹XØ[Ý]][K‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H›ÙNˆ]™[›ÙHÛÛZ[š[™ÈÝš[™ÈØ[ÚY[™[X˜[Y\Ë‚ˆœ™]\›œÎˆ›Û™K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆZ]\ˆ™\]Z\™Y˜[YH\ÈZ\ÜÚ[™ÈÜˆ›ÝHÝš[™Ë‚ˆˆˆ‚ˆØ[ÚYH›ÙK™]K™Ù]
+˜Ø[ÚYŠBˆ[HH›ÙK™]K™Ù]
+™[HŠBˆYˆ›Ý\Ú[œÝ[˜ÙJØ[ÚYÝŠHÜˆ›ÝØ[ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÝÛÛÛÝ]]Ù[H™\]Z\™\È›Û‹Y[\HÝš[™È]K˜Ø[ÚY‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ›Ý\Ú[œÝ[˜ÙJ[KÝŠN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÝÛÛÛÝ]]Ù[H™\]Z\™\ÈÝš[™È]K™[H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ]™[HÛÛÝ]][Q]™[
+ˆ\OHœ™\ÜÛœÙK™[˜Ý[Û—ØØ[ÛÝ]]™[H‹ˆØ[ÚYXØ[ÚYˆ[OY[Kˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+^ÛYWÛ›Û™OUYJJB‚‚™YˆÜX›\ÚÙ^\›˜[ÛÝ]]Ü™X\ÛÛš[™×Ù[JÙ\ÜÚ[Û—ÚYˆÝ‹›ÙNˆÙ\ÜÚ[Û‘]™[[œ]
+HOˆ›Û™N‚ˆˆˆ‚ˆœ›ØYØ\ÝH\›Z[˜[[ØœÙ\™Y™X\ÛÛš[™È
+ÚZ[‹[Ù‹]ÝYÚ
+H[K‚‚ˆH™X\ÛÛš[™È[˜[ÙÝYHÙˆ™[˜Î˜ÜX›\ÚÙ^\›˜[ÛÝ]]Ý^Ù[X‚ˆ\›Z[˜[X˜XÚÙY[YÜ˜][ÛœÈ
+H[YÜ˜]š]K[˜]]™H™XY\ŠHØœÙ\™HBˆÝ™X[Z[™È[šÚ[™Ø›ØÚÈ™Y›Ü™HHÛÛ\]Y\ÜÚ\Ý[][H^\ÝËˆ\ÂˆX›\Ú\ÈHÝ[™\™™X\ÛÛš[™ÈÔÑH]™[ÈHÔH[™XYH™[™\œÈ8 %ˆ™\ÜÛœÙKœ™X\ÛÛš[™ËœÝ\YÛ˜ÙH
+Ú[ˆ]KœÝ\Y\ÈYKX\šÚ[™ÈBˆ™]È™X\ÛÛš[™È›ØÚÊH›ÛÝÙYžH™\ÜÛœÙKœ™X\ÛÛš[™×Ý^™[X8 %Ú]Ý]ˆ\œÚ\Ý[™È[ž][™Ëˆ™X\ÛÛš[™È\È›ÈÛÛ\]YÛÛ™\œØ][Ûˆ][NÈH›ØÚÂˆ\Èš[˜[^™YÚ[ˆH\ÜÚ\Ý[Y\ÜØYÙH\È\œÚ\ÝYšXBˆ^\›˜[ØÛÛ™\œØ][Û—Ú][X‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H›ÙNˆÔÕÙ]™[Ø›ÙHÚÜÙH\H\Âˆ™]N˜ÑVT“SÓÕUUÔ‘PTÓÓ’S‘×ÑSWÕTX‚ˆœ™]\›œÎˆ›Û™K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ]K™[X\È›ÝHÝš[™ËÜˆ]KœÝ\Yˆ\È›ÝšYYÚ]H›Û‹X›ÛÛX[ˆ\K‚ˆˆˆ‚ˆ[HH›ÙK™]K™Ù]
+™[HŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ[KÝŠN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÛÝ]]Ü™X\ÛÛš[™×Ù[H™\]Z\™\ÈÝš[™È]K™[H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÝ\YH›ÙK™]K™Ù]
+œÝ\YŠBˆYˆÝ\Y\È›Ý›Û™H[™›Ý\Ú[œÝ[˜ÙJÝ\Y›ÛÛ
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÛÝ]]Ü™X\ÛÛš[™×Ù[H]KœÝ\Y]\Ý™HH›ÛÛX[ˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆÝ\Y‚ˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+ˆÙ\ÜÚ[Û—ÚYˆ™X\ÛÛš[™ÔÝ\Y]™[
+\OHœ™\ÜÛœÙKœ™X\ÛÛš[™ËœÝ\YŠK›[Ù[Ù[\
+^ÛYWÛ›Û™OUYJKˆ
+Bˆ]™[H™X\ÛÛš[™Õ^[Q]™[
+\OHœ™\ÜÛœÙKœ™X\ÛÛš[™×Ý^™[H‹[OY[JBˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY]™[›[Ù[Ù[\
+^ÛYWÛ›Û™OUYJJB‚‚—ÕSQÑSPÒUUSÓ—ÐPÕSÓ”Îˆ\VÜÝ‹‹‹—HH
+˜XØÙ\‹™XÛ[™H‹˜Ø[˜Ù[ŠBˆÈÚHH™\ÛÛ™Y]™[Ø\œšY\È›È™\™XÝˆ[˜[œÝÙ\™Y˜ˆHÛÚÈÝÜYˆÈØZ][™È
+HÙ]™\™YÛ™]™\ˆ™K\\šÙYÜˆH\ÚÈ[YYÝ]
+H™Y›Ü™H[ž[Û™BˆÈ[œÝÙ\™YÛÈH›Û\\ÈÛÛ™H˜]\ˆ[ˆXÚYY‚—ÕSQÑSPÒUUSÓ—Ô‘TÓÓ‘QÔ‘PTÓÓ”Îˆ\VÜÝ‹‹‹—HH
+[˜[œÝÙ\™Y‹
+B‚‚™YˆÜX›\ÚÙ[XÚ]][Û—Ü™\ÛÛ™Y
+ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[XÚ]][Û—ÚYˆÝ‹ˆXÝ[ÛŽˆÝˆ›Û™HH›Û™Kˆ™X\ÛÛŽˆÝˆ›Û™HH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ[š]™\œØ[˜\›Ý˜[Û™HˆÚYÛ˜[8 %Ú[™ÛHX›\Úš]™\È›ÝˆÚYX˜\ˆ
+šXH™[˜Î˜[™[™×Ù[XÚ]][ÛœËœ™XÛÜ™ÜX›\ÚXÜ™[Y[
+Bˆ[™HÚ]\ÚYH\›Ý˜[Ø\™›\Ûˆ]™\žH]™HÝXœØÜšX™\‹‚ˆY[\Ý[Ûˆ\XØ]H[Z\ÜÚ[ÛœÈ›ÜˆHØ[YHY‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[ÛˆYK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H[XÚ]][Û—ÚYˆÛÜœ™[][ÛˆYK™Ëˆ™[XÚ]ØX˜ÌLŒÈ˜‚ˆœ\˜[HXÝ[ÛŽˆÜ[Û˜[PÔ™\™XÝ
+˜XØÙ\˜Ø™XÛ[™H˜Âˆ˜Ø[˜Ù[˜
+HÛÈÝÛœÝ™X[HÛÛœÝ[Y\œÈ8 %›ÝX›HBˆÝX‹XYÙ[›ØÚÈ›ÝYšY\‰ÜÈ\™[™\ÛÛ][Ûˆ›ÝXÙH8 %Ø[‚ˆÝ]HÝÈHØ]HØ\È[œÝÙ\™Y[œÝXYÙˆX]š[™ÈYÙ[ÈÂˆÝY\ÜËˆÛZ]Yœ›ÛHH^[ØYÚ[ˆ[šÛ›ÝÛˆÜˆ›ÝÛ™HÙ‚ˆH™YHPÔXÝ[ÛœË‚ˆœ\˜[H™X\ÛÛŽˆÚH\™H\È›È™\™XÝK™Ëˆ[˜[œÝÙ\™Y˜Ú[‚ˆHÛÚÈÝÜYØZ][™È™Y›Ü™H[ž[Û™H[œÝÙ\™YÛÈHØ\™ˆØ[ˆØ^HH›Û\^\™Y[œÝXYÙˆ[\Z[™ÈÛÛY[Û™H™\ÛÛ™Yˆ]ˆÛZ]YÚ[ˆ[šÛ›ÝÛ‹›ÝH™XÛÙÛš\ÙY™X\ÛÛ‹ÜˆÚ[ˆBˆ™\™XÝ\È™\Ù[8 %H™\™XÝ[™H›Ë]™\™XÝ™X\ÛÛˆ\™Bˆ]]X[H^Û\Ú]™HÛˆHÚ\™K‚ˆˆˆ‚ˆ^[ØYˆXÝÜÝ‹[žWHHÂˆ\HŽˆœ™\ÜÛœÙK™[XÚ]][Û—Ü™\ÛÛ™Y‹ˆ™[XÚ]][Û—ÚYŽˆ[XÚ]][Û—ÚYˆBˆYˆXÝ[Ûˆ[ˆÕSQÑSPÒUUSÓ—ÐPÕSÓ”Î‚ˆ^[ØYÈ˜XÝ[Ûˆ—HHXÝ[Û‚ˆ[Yˆ™X\ÛÛˆ[ˆÕSQÑSPÒUUSÓ—Ô‘TÓÓ‘QÔ‘PTÓÓ”Î‚ˆ^[ØYÈœ™X\ÛÛˆ—HH™X\ÛÛ‚ˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚY^[ØY
+B‚‚˜\Þ[˜ÈYˆÙ›ÜØ\™Ø\›Ý˜[Ý×Ü[›™\ŠˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ]NˆXÝÜÝ‹[žWKˆ[›™\—Ü›Ý]\Žˆ[›™\”›Ý]\ˆ›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ›ÜØ\™[ˆ\›Ý˜[™\™XÝÈHÙ\ÜÚ[Û‰ÜÈ›Ý[™[›™\‹‚‚ˆ[›™\‹\ÚYH[XÚ]][ÛœÈ
+ÛXÞH\›Ý˜[È\šÙY[ˆH[›™\‰ÜÂˆÜ[™[™×Ø\›Ý˜[ØXÝØØY™›Û\Ü]Ú
+H™\ÛÛ™HÚ[ˆBˆØ[›ÛšXØ[\›Ý˜[]™[™XXÚ\ÈH[›™\‰ÜÈÙ]™[ØˆBˆÙ\™\¸¡¥[›™\ˆÛÛ˜XÝÝ^\ÈH\›Ý˜[]™[™YØ\™\ÜÈÙ‚ˆÝÈH™\™XÝ\œš]™Y]HÙ\™\ˆ
+™\ÛÛ™HT“Üˆ\›Ý˜[ˆ]™[
+Kˆ›Ë[ÜÚ[ˆ›È[›™\ˆ\È›Ý[™
+[‹\›ØÙ\ÜÈÙ]\ÊKˆˆ\œ›ÜœÈ\™HÙÙÙY›Ý˜Z\ÙY8 %HXY[›™\ˆ]\Ý›Ý˜Z[BˆØ[\‰ÜÈ™\ÛÛ][Ûˆ
+HÙ\™\‹\ÚYH]\™HØ\È[™XYHÙ]
+K‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H]NˆH\›Ý˜[^[ØYÈ›ÜØ\™™\˜˜][H\ÈBˆ]™[]XK™ËˆÈ™[XÚ]][Û—ÚYŽˆ™[XÚ]ØX˜È‹ˆ˜XÝ[ÛˆŽˆ˜XØÙ\ŸX‚ˆœ\˜[H[›™\—Ü›Ý]\Žˆ›Ý]\ˆ\ÙYÈ™\ÛÛ™HH›Ý[™[›™\‹Ü‚ˆ›Û™X[ˆ[‹\›ØÙ\ÜÈÙ]\È
+›ÜØ\™ÚÚ\Y
+K‚ˆˆˆ‚ˆ[›™\—ØÛY[H]ØZ]ÙÙ]Ü[›™\—ØÛY[
+Ù\ÜÚ[Û—ÚY[›™\—Ü›Ý]\ŠBˆYˆ[›™\—ØÛY[\È›Û™N‚ˆ™]\›‚ˆžN‚ˆ]ØZ][›™\—ØÛY[œÜÝ
+ˆˆ‹ÝŒKÜÙ\ÜÚ[ÛœËÞÜÙ\ÜÚ[Û—ÚYKÙ]™[È‹ˆœÛÛ^È\HŽˆÐT“ÕSÕTK™]HŽˆ]_Kˆ[Y[Ý]LLŒˆ
+Bˆ^Ù\
+’\œ›Ü‹ÛÛ›™XÝ[Û‘\œ›ÜŠN‚ˆÛÙÙÙ\‹™^Ù\[ÛŠˆ\›Ý˜[›ÜØ\™˜Z[Y›Üˆ	\ˆ‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+B‚‚™YˆÜ\œÙWÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙJˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ŠHOˆ\VÜÝ‹Ý‹Ý—N‚ˆˆˆ‚ˆ˜[Y]H[™[œXÚÈ[ˆ^\›˜[\ÜÚ\Ý[[Y\ÜØYÙH]™[‚‚ˆœ\˜[H›ÙNˆÔÕÙ]™[Ø›ÙHÚÜÙH\H\Âˆ™]N˜ÑVT“SÐTÔÒTÕS•ÓQTÔÐQÑWÕTX‚ˆœ™]\›œÎˆ
+YÙ[Û˜[YK^™\ÜÛœÙWÚY
+X‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ™\]Z\™YšY[È\™HZ\ÜÚ[™ÈÜ‚ˆX[›Ü›YY‚ˆˆˆ‚ˆYÙ[Û˜[YHH›ÙK™]K™Ù]
+˜YÙ[ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJYÙ[Û˜[YKÝŠHÜˆ›ÝYÙ[Û˜[YKœÝš\
+
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙH™\]Z\™\È]K˜YÙ[‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ^H›ÙK™]K™Ù]
+^ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ^ÝŠHÜˆ›Ý^‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙH™\]Z\™\È›Û‹Y[\H]K^‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ™\ÜÛœÙWÚYH›ÙK™]K™Ù]
+œ™\ÜÛœÙWÚYŠBˆYˆ™\ÜÛœÙWÚY\È›Û™N‚ˆ™\ÜÛœÙWÚYHÙ[™\˜]WÝ\Ú×ÚY
+
+BˆYˆ›Ý\Ú[œÝ[˜ÙJ™\ÜÛœÙWÚYÝŠHÜˆ›Ý™\ÜÛœÙWÚYœÝš\
+
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙH]Kœ™\ÜÛœÙWÚY]\Ý™HH›Û‹Y[\HÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ™]\›ˆYÙ[Û˜[YKœÝš\
+
+K^™\ÜÛœÙWÚYœÝš\
+
+B‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆÝŽ‚ˆˆˆ‚ˆ\œÚ\Ý[™œ›ØYØ\Ý\ÜÚ\Ý[^›ÙXÙYÝ]ÚYHÛ[šYÙ[\ÚÜË‚‚ˆH]™[\È\[™[Û›HÛÛ™\œØ][Ûˆ\ÝÜžKˆ][[[Û˜[Bˆž\\ÜÙ\ÈHYØXÞH\œÚ\Ý]ÛÈZ\œ›Üš[™ÈBˆÛ]YH\›Z[˜[™\ÜÛœÙHÙ\È›ÝÜ™X]HÜˆÝY\ˆ[ˆÛ[šYÙ[ˆYÙ[\ÚË‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H›ÙNˆ^\›˜[\ÜÚ\Ý[[Y\ÜØYÙH]™[›ÙK‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ\[™HY\ÜØYÙK‚ˆœ™]\›œÎˆÝÜ™KX\ÜÚYÛ™YÛÛ™\œØ][Ûˆ][HY‚ˆˆˆ‚ˆYÙ[Û˜[YK^™\ÜÛœÙWÚYHÜ\œÙWÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙJ›ÙJBˆ][HH™]ÐÛÛ™\œØ][Û’][Jˆ\OH›Y\ÜØYÙH‹ˆ™\ÜÛœÙWÚY\™\ÜÛœÙWÚYˆ]OSY\ÜØYÙQ]Jˆ›ÛOH˜\ÜÚ\Ý[‹ˆYÙ[XYÙ[Û˜[YKˆÛÛ[VÞÈ\HŽˆ›Ý]]Ý^‹^Žˆ^WKˆ
+Kˆ
+Bˆ\œÚ\ÝYÚ][\ÈH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™K˜\[™Ù\ÜÚ[Û—ÚYÚ][WJBˆ\œÚ\ÝYH\œÚ\ÝYÚ][\ÖÌBˆÜX›\ÚÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙJˆÙ\ÜÚ[Û—ÚYˆ\œÚ\ÝYˆ™\ÜÛœÙWÚY\™\ÜÛœÙWÚYˆYÙ[Û˜[YOXYÙ[Û˜[YKˆ
+Bˆ™]\›ˆ\œÚ\ÝYšY‚‚™YˆÜ\œÙWÙ^\›˜[ØÛÛ™\œØ][Û—Ú][Jˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ŠHOˆ™]ÐÛÛ™\œØ][Û’][N‚ˆˆˆ‚ˆ˜[Y]H[™[œXÚÈ[ˆ^\›˜[ÛÛ™\œØ][Û‹Z][H]™[‚‚ˆœ\˜[H›ÙNˆÔÕÙ]™[Ø›ÙHÚÜÙH\H\Âˆ™]N˜ÑVT“SÐÓÓ•‘T”ÐUSÓ—ÒUSWÕTX‚ˆœ™]\›œÎˆH\œÙY˜Û\ÜÎ˜™]ÐÛÛ™\œØ][Û’][X™XYHÈ\[™‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆ™\]Z\™YšY[È\™HZ\ÜÚ[™ÈÜ‚ˆX[›Ü›YY‚ˆˆˆ‚ˆ][WÝ\HH›ÙK™]K™Ù]
+š][WÝ\HŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ][WÝ\KÝŠHÜˆ][WÝ\H›Ý[ˆUSWÕTWÕ×ÑUWÐÓÎ‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÛ™\œØ][Û—Ú][H™\]Z\™\ÈÛ›ÝÛˆ]Kš][WÝ\H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ][WÙ]HH›ÙK™]K™Ù]
+š][WÙ]HŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ][WÙ]KXÝ
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÛ™\œØ][Û—Ú][H™\]Z\™\ÈØš™XÝ]Kš][WÙ]H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Bˆ™\ÜÛœÙWÚYH›ÙK™]K™Ù]
+œ™\ÜÛœÙWÚYŠBˆYˆ™\ÜÛœÙWÚY\È›Û™N‚ˆ™\ÜÛœÙWÚYHÙ[™\˜]WÝ\Ú×ÚY
+
+BˆYˆ›Ý\Ú[œÝ[˜ÙJ™\ÜÛœÙWÚYÝŠHÜˆ›Ý™\ÜÛœÙWÚYœÝš\
+
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÛ™\œØ][Û—Ú][H]Kœ™\ÜÛœÙWÚY]\Ý™HH›Û‹Y[\HÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆY\ÜØYÙWÚYH›ÙK™]K™Ù]
+›Y\ÜØYÙWÚYŠBˆYˆY\ÜØYÙWÚY\È›Ý›Û™H[™
+›Ý\Ú[œÝ[˜ÙJY\ÜØYÙWÚYÝŠHÜˆ›ÝY\ÜØYÙWÚY
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØÛÛ™\œØ][Û—Ú][H]K›Y\ÜØYÙWÚY]\Ý™HH›Û‹Y[\HÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÈ“ÕNˆ›ÙXÙ\œÈ]Ø[ˆ™K\ÜÝ
+H˜]]™H˜[œØÜš\›ÜØ\™\œÂˆÈ™]žH[YY[Ý]ÔÕÈÚÜÙH\ÜÜÚ][Ûˆ^HØ[››ÝÛ›ÝÊHÙ[™BˆÈ]KœÛÝ\˜ÙWÚYY\Ù^NÈH\œÚ\Ý]\š]™\ÈH][IÜÂˆÈÝX›HYœ›ÛH]ÛÈH\[™\ÈY[\Ý[
+ÙYBˆÈÜ\œÚ\ÝÙ^\›˜[ØÛÛ™\œØ][Û—Ú][X
+Kˆ][\ÈÚ]Ý]Û™HÙY\BˆÈÝÜ™KX\ÜÚYÛ™Y˜[™ÛHY[™›ÈÙ\™\‹\ÚYHY\‚ˆÈØ\H˜]]™HÛÛ™\Ý[ÛÈH][KSPˆÝ]]\Û‰Ý\œÚ\ÝY
+Èœ›ØYØ\Ý\ÈÛ™Hœ˜[YK‚ˆYˆ][WÝ\HOH™[˜Ý[Û—ØØ[ÛÝ]]ˆ[™\Ú[œÝ[˜ÙJ][WÙ]K™Ù]
+›Ý]]ŠKÝŠN‚ˆ][WÙ]HHÊŠš][WÙ]K›Ý]]ŽˆØ\ÝÛÛÛÝ]]
+][WÙ]VÈ›Ý]]—J_BˆžN‚ˆ]HH\œÙWÚ][WÙ]J][WÝ\KÈ\HŽˆ][WÝ\K
+Šš][WÙ]_JBˆ^Ù\
+˜[YQ\œ›Ü‹\Q\œ›ÜŠH\È^Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ’[˜[Y]H^[ØY›Üˆ^\›˜[][H\HÚ][WÝ\H\ŸNˆÙ^ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Hœ›ÛH^ÂˆYˆY\ÜØYÙWÚY\È›Ý›Û™H[™\Ú[œÝ[˜ÙJ]KY\ÜØYÙQ]JH[™]Kœ›ÛHOH˜\ÜÚ\Ý[Ž‚ˆ]HH]K›[Ù[ØÛÜJ\]O^ÈœÝ™X[WÛY\ÜØYÙWÚYŽˆY\ÜØYÙWÚYJBˆ™]\›ˆ™]ÐÛÛ™\œØ][Û’][Jˆ\OZ][WÝ\Kˆ™\ÜÛœÙWÚY\™\ÜÛœÙWÚYœÝš\
+
+Kˆ]OY]Kˆ
+B‚‚™YˆÙš[™ØÛ]YWÛ˜]]™WÜÝX˜YÙ[ØÚ[
+ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™Kˆ\™[ÚYˆÝ‹ˆÝX˜YÙ[ÚYˆÝ‹ŠHOˆÛÛ™\œØ][Ûˆ›Û™N‚ˆˆˆ‚ˆÛÚÈ\[ˆ^\Ý[™ÈÛ]YK[˜]]™HÝX‹XYÙ[Ú[žH]ÈÛ]YKBˆÚYHÝX˜YÙ[ÚY‚‚ˆ\ÙYÈXZÙH™[˜Î˜Ü\œÚ\ÝÙ^\›˜[ÜÝX˜YÙ[ÜÝ\Y[\Ý[‚ˆH›ÜØ\™\ˆ™]šY\ÈÛˆ˜[œÚY[\œ›ÜœËÛÈÛÈÔÕÈX^BˆØ\œžHHØ[YHÝX˜YÙ[ÚY›ÜˆHØ[YH\ÚXØ[ÝX‹XYÙ[8 %ˆÙHØ[›ÝÈ™\ÛÛ™HÈHØ[YHÚ[ÛÛ™\œØ][Ûˆ›ÝË‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™HÈ]Y\žK‚ˆœ\˜[H\™[ÚYˆ\™[
+Û]YK[˜]]™JHÛÛ™\œØ][ÛˆYˆK™Ëˆ˜ÛÛ—Ü\™[NÈ˜‚ˆœ\˜[HÝX˜YÙ[ÚYˆÝX›HÛ]YK\ÚYHY[YšY\ˆ™XYœ›ÛBˆYÙ[OY‹›Y]KšœÛÛ˜	ÜÈ\™XÝÜžH˜[YKK™Ë‚ˆ˜MXÍÙY™˜XÍXNXLÍXXˆ˜‚ˆœ™]\›œÎˆHX]Ú[™ÈÚ[˜Û\ÜÎ˜ÛÛ™\œØ][Û˜Üˆ›Û™XˆÚ[ˆ›È›ÝÈ\È™Y[ˆZ[Y›Üˆ\ÈÝX‹XYÙ[Y]‚ˆˆˆ‚ˆÈYÙH›ÝYÚ[Ú[™[ˆÛÈHÛÚÝ\\Û‰ÝØ\YžH™\Ý[ˆÈÜ™\š[™ËˆH\™[Ú]ˆLÝX‹XYÙ[ÈÛÝ[Ý\Ú\ÙHZ\ÜÈBˆÈ^\Ý[™È›ÝÈ›Üˆ[ˆÛ\ˆÝX˜YÙ[ÚY[™˜[›ÝYÚÂˆÈÜ™X]WØÛÛ™\œØ][Û˜ÚXÚ[ˆš\ÈBˆÈ
+\™[]JX[š\]YHÛÛœÝ˜Z[[œÝXYÙˆ™]\›š[™ÈBˆÈ^\Ý[™ÈÚ[Y‚ˆY\ŽˆÝˆ›Û™HH›Û™BˆÚ[HYN‚ˆYÙHHÛÛ™\œØ][Û—ÜÝÜ™K›\ÝØÛÛ™\œØ][ÛœÊˆÚ[™HœÝX—ØYÙ[‹ˆ\™[ØÛÛ™\œØ][Û—ÚY\\™[ÚYˆ[Z]LLˆY\XY\‹ˆ
+Bˆ›ÜˆÚ[[ˆYÙK™]N‚ˆYˆÚ[›X™[Ë™Ù]
+ÐÓUQWÓUU‘WÔÕPQÑS•ÒQÓP‘SÒÑVJHOHÝX˜YÙ[ÚY‚ˆ™]\›ˆÚ[ˆYˆ›ÝYÙKš\×Û[Ü™HÜˆYÙK›\ÝÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆY\ˆHYÙK›\ÝÚY‚‚™YˆÙš[™ØXÜÜÝX˜YÙ[ØÚ[
+ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™Kˆ\™[ÚYˆÝ‹ˆÝX˜YÙ[ÚYˆÝ‹ŠHOˆÛÛ™\œØ][Ûˆ›Û™N‚ˆˆˆ‚ˆÛÚÈ\[ˆ^\Ý[™ÈPÔÝX‹XYÙ[Ú[žH]È\›™\ÜË\ÚYHY‚‚ˆZ\œ›ÜœÈ™[˜Î˜Ùš[™ØÛ]YWÛ˜]]™WÜÝX˜YÙ[ØÚ[
+[˜ÛY[™È]ÂˆYÚ[˜][Û‹ÛÈH\™[Ú]X[žHÝX‹XYÙ[ÈÝ[š[™È[ˆÛ\ˆ›ÝÊBˆ]Ù^\ÈÛˆ™]N˜ÐPÔÔÕPQÑS•ÒQÓP‘SÒÑVX‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™HÈ]Y\žK‚ˆœ\˜[H\™[ÚYˆ\™[ÛÛ™\œØ][ÛˆYK™Ëˆ˜ÛÛ—Ü\™[NÈ˜‚ˆœ\˜[HÝX˜YÙ[ÚYˆHYÙ[	ÜÈÝÛˆÝX‹XYÙ[YK™Ëˆ˜LXÎLÍ˜‚ˆœ™]\›œÎˆHX]Ú[™ÈÚ[˜Û\ÜÎ˜ÛÛ™\œØ][Û˜Üˆ›Û™X‚ˆˆˆ‚ˆY\ŽˆÝˆ›Û™HH›Û™BˆÚ[HYN‚ˆYÙHHÛÛ™\œØ][Û—ÜÝÜ™K›\ÝØÛÛ™\œØ][ÛœÊˆÚ[™HœÝX—ØYÙ[‹ˆ\™[ØÛÛ™\œØ][Û—ÚY\\™[ÚYˆ[Z]LLˆY\XY\‹ˆ
+Bˆ›ÜˆÚ[[ˆYÙK™]N‚ˆYˆÚ[›X™[Ë™Ù]
+ÐPÔÔÕPQÑS•ÒQÓP‘SÒÑVJHOHÝX˜YÙ[ÚY‚ˆ™]\›ˆÚ[ˆYˆ›ÝYÙKš\×Û[Ü™HÜˆYÙK›\ÝÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆY\ˆHYÙK›\ÝÚY‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[ØXÜÜÝX˜YÙ[ÜÝ\
+ˆ\™[ÚYˆÝ‹ˆ\™[ØÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆÝŽ‚ˆˆˆ‚ˆZ[HÚ[˜Û\ÜÎ˜ÛÛ™\œØ][Û˜›Üˆ[ˆPÔYÙ[	ÜÈÝX‹XYÙ[‚‚ˆHPÔÛÝ[\œ\Ùˆ™[˜Î˜Ü\œÚ\ÝÙ^\›˜[ÜÝX˜YÙ[ÜÝ\ˆ[ˆPÔˆYÙ[
+K™Ëˆ]š[ŠH[œÈ]ÈÝX‹XYÙ[È[œÚYH]ÈÝÛˆÚ[™ÛHÙ\ÜÚ[Û‹ÛÈBˆÚ[\ÈH\Ü^H›ÝÎˆ][š\š]ÈH\™[	ÜÈYÙ[ÚY[™ÜXÚX[KˆØ\œšY\È
+Š››ÊŠˆÛ[šYÙ[Ü˜\\˜˜[YKˆ]XœÙ[˜ÙH\ÈØYX™X\š[™È8 %Bˆ˜]]™HÝX˜YÙ[Ü˜\\ˆ˜[YHXZÙ\ÈHRHX™[HÚ[Ú]]™[™Ü‰ÜÂˆ˜[YH
+H]š[ˆÝX‹XYÙ[Z[Y›ÝYÚHÛ]YH]™[™\œÈ\ÈÛ]YBˆÛÙHŠKÚ\™X\ÈÚ]›Û™HHÚ[	ÜÈ\›™\ÜÈ™\ÛÛ™\È›ÝYÚˆ™[˜Î˜Ü™\ÛÛ™WÚ\›™\Ü×Ú[\ÈH\™[	ÜÈ
+K™Ëˆ]š[˜
+H[™HRBˆX™[È]œ›ÛHH\›™\ÜÈØ][ÙË‚‚ˆY[\Ý[ˆH™Y[]™\žHÚ]HØ[YHÝX˜YÙ[ÚY™]\›œÈH^\Ý[™ÂˆÚ[YÚ]H]KXÛÛ\Ú[Ûˆ™XÛÝ™\žH]X]Ú[™ÈH˜]]™H[\œË‚‚ˆœ\˜[H\™[ÚYˆ\™[ÛÛ™\œØ][ÛˆYK™Ëˆ˜ÛÛ—Ü\™[NÈ˜‚ˆœ\˜[H\™[ØÛÛŽˆ™KY™]ÚY\™[›ÝÎÈ]ÈYÙ[ÚYÈ[›™\—ÚYˆ\™HÛÜYYÛÈHÚ[‚ˆœ\˜[H›ÙNˆHÔÕ]™[›ÙKˆ™\]Z\™Y]XÙ^\ÎˆÝX˜YÙ[ÚYˆ
+HYÙ[	ÜÈÝÛˆY
+H[™]X
+H›ÝÈX™[
+KˆÜ[Û˜[‚ˆ\ØÜš\[Û˜
+H[YØ]Y\ÚÊK‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ™XY^\Ý[™ÈÚ[™[ˆ[™Ü™X]BˆH™]È›ÝË‚ˆœ™]\›œÎˆHÚ[ÛÛ™\œØ][ÛˆYK™Ëˆ˜ÛÛ—ØÚ[Mˆ˜‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆÚ[ˆH™\]Z\™YÙ^H\ÈZ\ÜÚ[™ÈÜˆH\™[\Âˆ›ÈYÙ[ÚY‚ˆˆˆ‚ˆÝX˜YÙ[ÚYH›ÙK™]K™Ù]
+œÝX˜YÙ[ÚYŠBˆ]WÜ˜]ÈH›ÙK™]K™Ù]
+]HŠBˆ\ØÜš\[ÛˆH›ÙK™]K™Ù]
+™\ØÜš\[ÛˆŠHÜˆˆ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÝX˜YÙ[ÚYÝŠHÜˆ›ÝÝX˜YÙ[ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØXÜÜÝX˜YÙ[ÜÝ\™\]Z\™\È›Û‹Y[\H]KœÝX˜YÙ[ÚY‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ›Ý\Ú[œÝ[˜ÙJ]WÜ˜]ËÝŠHÜˆ›Ý]WÜ˜]Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØXÜÜÝX˜YÙ[ÜÝ\™\]Z\™\È›Û‹Y[\H]K]H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ›Ý\Ú[œÝ[˜ÙJ\ØÜš\[Û‹ÝŠN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ØXÜÜÝX˜YÙ[ÜÝ\]K™\ØÜš\[Ûˆ]\Ý™HHÝš[™È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ\™[ØÛÛ‹˜YÙ[ÚY\È›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆœ\™[Ù\ÜÚ[ÛˆÜ\™[ÚY\ŸH\È›ÈYÙ[ÚYÈØ[››ÝÜ™X]H[ˆPÔÝX‹XYÙ[Ú[‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+B‚ˆ^\Ý[™ÈH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÙš[™ØXÜÜÝX˜YÙ[ØÚ[ÛÛ™\œØ][Û—ÜÝÜ™K\™[ÚYÝX˜YÙ[ÚYˆ
+BˆYˆ^\Ý[™È\È›Ý›Û™N‚ˆ™]\›ˆ^\Ý[™ËšY‚ˆX™[ÈHÂˆÐPÔÔÕPQÑS•ÒQÓP‘SÒÑVNˆÝX˜YÙ[ÚYˆÐPÔÔÕPQÑS•ÑTÐÔ’TSÓ—ÓP‘SÒÑVNˆ\ØÜš\[Û‹ˆBˆÈ
+\™[ØÛÛ™\œØ][Û—ÚY]JX\È[š\]YK[™[ˆYÙ[Ø[ˆÚ]™HÛÂˆÈ\˜[[ÝX‹XYÙ[ÈHØ[YHX™[ÛÈHÝX›HY\Ø[XšYÝX]\ËˆBˆÈ˜Z[Y\ÈHÜÝXÛÛÛˆ[‹ÛÈH\Ù\ˆÝ[™XYÈ\ÝHX™[‚ˆ]HHˆžÝ]WÜ˜]ßNžÜÝX˜YÙ[ÚYH‚ˆžN‚ˆÚ[H]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜Ü™X]WØÛÛ™\œØ][Û‹ˆÚ[™HœÝX—ØYÙ[‹ˆ]O]]Kˆ\™[ØÛÛ™\œØ][Û—ÚY\\™[ÚYˆYÙ[ÚY\\™[ØÛÛ‹˜YÙ[ÚYˆ[›™\—ÚY\\™[ØÛÛ‹œ[›™\—ÚYˆÝX—ØYÙ[Û˜[YO]]WÜ˜]Ëˆ
+Bˆ^Ù\˜[YP[™XYQ^\ÝÑ\œ›ÜŽ‚ˆÈH[š\]YH[™^š\™Y]HX™[ÛÚÝ\Z\ÜÙY8 %HÛÛ˜Ý\œ™[ÔÕˆÈÛÛˆH[œÙ\Üˆ[ˆX\›Y\ˆÛ™HYY™Y›Ü™HÙ]ÛX™[ØˆYÜBˆÈ›ÝÈ[™™K\Ý[\Z\œ›Üš[™ÈH˜]]™H[\œÉÈ™XÛÝ™\žK‚ˆYÜYH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÙš[™ÜÝX˜YÙ[ØÚ[ØžWÝ]KÛÛ™\œØ][Û—ÜÝÜ™K\™[ÚY]Bˆ
+BˆYˆYÜY\È›Û™N‚ˆ˜Z\ÙBˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™KœÙ]ÛX™[ËYÜYšYX™[ÊBˆÜX›\ÚÜÙ\ÜÚ[Û—ØÜ™X]Y
+\™[ÚYYÜYšY\™[ØÛÛ‹˜YÙ[ÚY
+Bˆ™]\›ˆYÜYšYˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™KœÙ]ÛX™[ËÚ[šYX™[ÊBˆÜX›\ÚÜÙ\ÜÚ[Û—ØÜ™X]Y
+\™[ÚYÚ[šY\™[ØÛÛ‹˜YÙ[ÚY
+Bˆ™]\›ˆÚ[šY‚‚™YˆÙš[™ÜÝX˜YÙ[ØÚ[ØžWÝ]JˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™Kˆ\™[ÚYˆÝ‹ˆ]NˆÝ‹ŠHOˆÛÛ™\œØ][Ûˆ›Û™N‚ˆˆˆ‚ˆÛÚÈ\[ˆ^\Ý[™ÈÝX‹XYÙ[Ú[žH]È^XÝ]K‚‚ˆ™XÛÝ™\žH]›Üˆ\XØ]K]]H˜XÙ\ÎˆÚ[ˆÜ™X]WØÛÛ™\œØ][Û˜ˆš\ÈH
+\™[ØÛÛ™\œØ][Û—ÚY]JX[š\]YH[™^]BˆX™[X˜\ÙYY[\Ý[˜ÞHÛÚÝ\Z\ÜÙY8 %HÜšYÚ[˜[ÔÕÜ˜\ÚYˆY\ˆÜ™X][™ÈH›ÝÈ[™™Y›Ü™HÙ]ÛX™[Ø˜[ˆ8 %H›ÝÈØ[‚ˆÛ›H™H›Ý[™žHH]H]Ù[‹ˆ˜]]™HÝX‹XYÙ[]\È[X™YBˆÝX›H\›™\ÜË\ÚYHY
+K™Ëˆ‘^Ü™N˜MXÍÙY™˜XÍXNXLÍXXˆ˜ˆ˜ÛÙ^[˜]]™K]ZK\ÝX˜YÙ[™XYÚYˆ˜
+KÛÈ[ˆ^XÝ]HX]Úˆ[™\ˆHØ[YH\™[Y[YšY\ÈHØ[YH\ÚXØ[ÝX‹XYÙ[‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™HÈ]Y\žK‚ˆœ\˜[H\™[ÚYˆ\™[ÛÛ™\œØ][ÛˆYK™Ëˆ˜ÛÛ—Ü\™[NÈ˜‚ˆœ\˜[H]Nˆ^XÝÚ[]KK™Ëˆ‘^Ü™N˜MXÍÙY™˜XÍXNXLÍXXˆ˜‚ˆœ™]\›œÎˆX]Ú[™ÈÚ[˜Û\ÜÎ˜ÛÛ™\œØ][Û˜Üˆ›Û™XÚ[ˆ›Âˆ›ÝÈ[™\ˆ
+œ\™[ÚY
+ˆØ\œšY\È]]K‚ˆˆˆ‚ˆY\ŽˆÝˆ›Û™HH›Û™BˆÚ[HYN‚ˆYÙHHÛÛ™\œØ][Û—ÜÝÜ™K›\ÝØÛÛ™\œØ][ÛœÊˆÚ[™HœÝX—ØYÙ[‹ˆ\™[ØÛÛ™\œØ][Û—ÚY\\™[ÚYˆ[Z]LLˆY\XY\‹ˆ
+Bˆ›ÜˆÚ[[ˆYÙK™]N‚ˆYˆÚ[]HOH]N‚ˆ™]\›ˆÚ[ˆYˆ›ÝYÙKš\×Û[Ü™HÜˆYÙK›\ÝÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆY\ˆHYÙK›\ÝÚY‚‚™YˆÜX›\ÚÜÙ\ÜÚ[Û—ØÜ™X]Y
+ˆ\™[ÚYˆÝ‹ˆÚ[ÜÙ\ÜÚ[Û—ÚYˆÝ‹ˆYÙ[ÚYˆÝˆ›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ[Z]Ù\ÜÚ[Û‹˜Ü™X]YÛˆH\™[	ÜÈÝ™X[H›ÜˆHÚ[Ù\ÜÚ[Û‹‚‚ˆÛY[ÈØ]Ú[™ÈH\™[
+K™ËˆHÙXˆÝX˜YÙ[È˜Z[XŠBˆ[˜[Y]HZ\ˆÚ[ÜÙ\ÜÚ[ÛœØØXÚH[™™KY™]ÚÛˆ\Âˆ]™[‚‚ˆœ\˜[H\™[ÚYˆ\™[ÛÛ™\œØ][ÛˆYK™Ëˆ˜ÛÛ—Ü\™[NÈ˜‚ˆœ\˜[HÚ[ÜÙ\ÜÚ[Û—ÚYˆHZ[Y
+ÜˆYÜY
+HÚ[YK™Ë‚ˆ˜ÛÛ—ØÚ[Mˆ˜‚ˆœ\˜[HYÙ[ÚYˆYÙ[YÝ[\YÛˆHÚ[
+H\™[	ÜÂˆYÙ[
+KK™Ëˆ˜Y×ØX˜ÌLŒÈ˜ˆ›Û™XÛ›H›ÜˆYØXÞH\™[ÂˆÚ]Ý]Û™K‚ˆˆˆ‚ˆ]™[HÙ\ÜÚ[ÛÜ™X]Y]™[
+ˆ\OHœÙ\ÜÚ[Û‹˜Ü™X]Y‹ˆÛÛ™\œØ][Û—ÚY\\™[ÚYˆÚ[ÜÙ\ÜÚ[Û—ÚYXÚ[ÜÙ\ÜÚ[Û—ÚYˆYÙ[ÚYXYÙ[ÚYˆ\™[ÜÙ\ÜÚ[Û—ÚY\\™[ÚYˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+\™[ÚY]™[›[Ù[Ù[\
+
+JB‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÙ^\›˜[ÜÝX˜YÙ[ÜÝ\
+ˆ\™[ÚYˆÝ‹ˆ\™[ØÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KŠHOˆÝŽ‚ˆˆˆ‚ˆZ[HÚ[˜Û\ÜÎ˜ÛÛ™\œØ][Û˜›ÝÈ›ÜˆHÛ]YK[˜]]™BˆÝX‹XYÙ[[™[Z]H\™[	ÜÈÙ\ÜÚ[Û‹˜Ü™X]YÔÑH]™[‚‚ˆÛ]YHÛÙHÜ]ÛœÈÝX‹XYÙ[È[\›˜[HšXH]È\ÚÈÛÛ[™ˆ™]™\ˆÔÕÈÈÛ[šYÙ[È™YÚ\Ý\ˆ[KˆH›ÜØ\™\ˆØ]Ú\ÈBˆ\™[	ÜÈÛ‹Y\ÚÈÝX˜YÙ[ËØ\™XÝÜžH[™Ø[È\È[™\‚ˆÚ[ˆH™]È›Y]KšœÛÛ˜\X\œËˆÙH™]\ÙHH\™[	ÜÂˆYÙ[ÚY
+Û]YK[˜]]™HÝX‹XYÙ[ÈÛ‰Ý]™HZ\ˆÝÛ‚ˆÛ[šYÙ[YÙ[
+KÝ[\Y[YžZ[™ÈX™[Ë[™X›\ÚBˆØ[YHÙ\ÜÚ[Û‹˜Ü™X]Y]™[Û[šYÙ[\Ü]Û™YÚ[™[ˆš\™BˆÛÈH˜Z[	ÜÈÚ[ÜÙ\ÜÚ[ÛœØØXÚH[˜[Y]\Ë‚‚ˆY[\Ý[ˆHÙXÛÛ™ÔÕÚ]HØ[YHÝX˜YÙ[ÚY™]\›œÂˆH^\Ý[™ÈÚ[	ÜÈYÚ]Ý]Ü™X][™ÈH\XØ]H8 %šXHBˆX™[ÛÚÝ\Ú[ˆH›ÝÈ\È[HÝ[\YÜˆšXH]KXÛÛ\Ú[Û‚ˆ™XÛÝ™\žHÚ[ˆ[ˆX\›Y\ˆÔÕYY™]ÙY[ˆÜ™X]WØÛÛ™\œØ][Û˜ˆ[™Ù]ÛX™[Ø
+H™XÛÝ™\žH[ÛÈ™K\Ý[\ÈHX™[ÈÛÈBˆ›ÝÈ\ÈX[Y›ÜˆÝXœÙ\]Y[[]™\šY\ÊK‚‚ˆœ\˜[H\™[ÚYˆ\™[
+Û]YK[˜]]™JHÛÛ™\œØ][ÛˆYˆK™Ëˆ˜ÛÛ—Ü\™[NÈ˜‚ˆœ\˜[H\™[ØÛÛŽˆ™KY™]ÚY\™[›ÝÈ8 %]ÈYÙ[ÚY\ÂˆÛÜYYÛÈHÚ[[™]ÈX™[È\Ø[XšYÝX]BˆÛ]YK[˜]]™H\™[Èœ›ÛHÝ\ˆ\›™\ÜÙ\Ë‚ˆœ\˜[H›ÙNˆHÔÕ]™[›ÙKˆ™\]Z\™Y]XÙ^\Î‚ˆÝX˜YÙ[ÚY
+Û]YK\ÚYHYK™Ëˆ˜MXÍÙY™‹‹‹ˆ˜
+KˆYÙ[Ý\X
+K™Ëˆ‘^Ü™H˜
+K\ØÜš\[Û˜ˆ
+œ™YKY›Ü›K\ÙY[ˆH]JKÛÛÝ\ÙWÚYˆ
+K™ËˆÛÛWË‹‹ˆ˜
+K‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈ™XY^\Ý[™ÈÚ[™[‚ˆ
+›ÜˆY[\Ý[˜ÞJH[™Ü™X]HH™]È›ÝË‚ˆœ™]\›œÎˆHÚ[ÛÛ™\œØ][ÛˆYK™Ëˆ˜ÛÛ—ØÚ[Mˆ˜‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆH^[ØY\ÈZ\ÜÚ[™È[žHÙ‚ˆH™\]Z\™YÙ^\ÎÈYˆH\™[\È›ÈYÙ[ÚYˆ
+Û]YK[˜]]™H\™[È[Ø^\ÈØ\œžHÛ™KÛÈ\ÈÛÝ[™BˆHÛÜœ\Y›ÝÊK‚ˆˆˆ‚ˆÝX˜YÙ[ÚYH›ÙK™]K™Ù]
+œÝX˜YÙ[ÚYŠBˆYÙ[Ý\HH›ÙK™]K™Ù]
+˜YÙ[Ý\HŠBˆ\ØÜš\[ÛˆH›ÙK™]K™Ù]
+™\ØÜš\[ÛˆŠBˆÛÛÝ\ÙWÚYH›ÙK™]K™Ù]
+ÛÛÝ\ÙWÚYŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÝX˜YÙ[ÚYÝŠHÜˆ›ÝÝX˜YÙ[ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÜÝX˜YÙ[ÜÝ\™\]Z\™\È›Û‹Y[\H]KœÝX˜YÙ[ÚY‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ›Ý\Ú[œÝ[˜ÙJYÙ[Ý\KÝŠHÜˆ›ÝYÙ[Ý\N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÜÝX˜YÙ[ÜÝ\™\]Z\™\È›Û‹Y[\H]K˜YÙ[Ý\H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ›Ý\Ú[œÝ[˜ÙJ\ØÜš\[Û‹ÝŠN‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÜÝX˜YÙ[ÜÝ\™\]Z\™\È]K™\ØÜš\[Ûˆ
+Ýš[™ÊH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ›Ý\Ú[œÝ[˜ÙJÛÛÝ\ÙWÚYÝŠHÜˆ›ÝÛÛÝ\ÙWÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™^\›˜[ÜÝX˜YÙ[ÜÝ\™\]Z\™\È›Û‹Y[\H]KÛÛÝ\ÙWÚY‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ\™[ØÛÛ‹˜YÙ[ÚY\È›Û™N‚ˆÈÛ]YK[˜]]™H\™[È\™H[Ø^\ÈÜ™X]YÚ][ˆYÙ[ÚYˆÈžHÛ[šYÙ[Û]YX
+HÞ[]XÈÛ]YH[™JK‚ˆÈH[YÙ[ÚY\™HYX[œÈÙIÜ™H™Z[™ÈØ[YYØZ[œÝBˆÈYØXÞHÈÛÜœ\›ÝÈ8 %˜Z[ÝY˜]\ˆ[ˆÚ[[BˆÈZ[HÚ[Ú]Ý]H\™[YÙ[‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆœ\™[Ù\ÜÚ[ÛˆÜ\™[ÚY\ŸH\È›ÈYÙ[ÚYÈØ[››Ý‚ˆ˜Ü™X]HHÛ]YK[˜]]™HÝX‹XYÙ[Ú[‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+B‚ˆÈY[\Ý[˜ÞNˆH›ÜØ\™\ˆ™]žHÚ]HØ[YHÝX˜YÙ[ÚY]\ÝˆÈ™\ÛÛ™HÈHØ[YHÚ[›ÝË›ÝZ[H\XØ]KˆBˆÈ›ÜØ\™\ˆ[ÛÈ\œÚ\ÝÈ]ÈÝÛˆÝ\œÛÜˆš[HÛÈ\ÈÚÝ[™BˆÈ˜\™K]H™]ÛÜšÈ\È[œ™[XX›H[™HÝ\œÛÜˆÜš]BˆÈ\[œÈY\ˆHÔÕ‚ˆ^\Ý[™ÈH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÙš[™ØÛ]YWÛ˜]]™WÜÝX˜YÙ[ØÚ[ˆÛÛ™\œØ][Û—ÜÝÜ™Kˆ\™[ÚYˆÝX˜YÙ[ÚYˆ
+BˆYˆ^\Ý[™È\È›Ý›Û™N‚ˆ™]\›ˆ^\Ý[™ËšY‚ˆÈ]H›Ü›X]Z\œ›ÜœÈÛ[šYÙ[\Ü]Û™YÚ[™[‚ˆÈ
+žÝÛÛNžÜÙ\ÜÚ[Û—Û˜[Y_H˜
+KˆHÙ\ÜÚ[Û—Û˜[YX[ˆ]\Ý™BˆÈ[š\]YH\ˆ\™[™XØ]\ÙHHÛÛ™\œØ][ÛˆÝÜ™H\ÈBˆÈ
+\™[ØÛÛ™\œØ][Û—ÚY]JX[š\]YH[™^8 %\Ú[™ÈBˆÈ\ØÜš\[Ûˆ\™HÛÝ[ÛÛYHÚ[™]™\ˆÛ]YIÜÈH\ÜÙ\ÈBˆÈØ[YHYÙ[\H
+È\ØÜš\[Ûˆ›Üˆ\˜[[ÝX‹XYÙ[È
+ÚXÚBˆÈ\ÚÈÛÛÙ\È›Ý][™[JKˆHÝX˜YÙ[ÚY\ÈHÛ›HÝX›BˆÈ\‹\ÝX‹XYÙ[Y[YšY\ˆ[ˆHY]Hš[KÛÈ]ÛÙ\È\™K‚ˆÂˆÈH]H\È\™Y›Ü™HH[š\]Y[™\ÜÈÙ^K›ÝH\Ü^HÝš[™Î‚ˆÈ›Ý[™È\Ù\‹Y˜XÚ[™ÈÚÝ[™[™\ˆ]ˆH[X[‹\™XYX›BˆÈ\ØÜš\[ÛˆÛÙ\ÈÛˆHX™[™[ÝË[™ˆÈØÛ]YWÜÝX˜YÙ[Ù\Ü^WÝÛÛ\›œÈ]X™[[ÈBˆÈ˜Z[	ÜÈ›ÝÈX™[‚ˆ]HHˆžØYÙ[Ý\_NžÜÝX˜YÙ[ÚYH‚ˆX™[ÈHÂˆÐÓUQWÓUU‘WÕÔTT—ÓP‘SÒÑVNˆÐÓUQWÓUU‘WÔÕPQÑS•ÕÔTT—ÓP‘SÕSQKˆÐÓUQWÓUU‘WÔÕPQÑS•ÒQÓP‘SÒÑVNˆÝX˜YÙ[ÚYˆÐÓUQWÓUU‘WÕÓÓÕTÑWÒQÓP‘SÒÑVNˆÛÛÝ\ÙWÚYˆÐÓUQWÓUU‘WÑTÐÔ’TSÓ—ÓP‘SÒÑVNˆ\ØÜš\[Û‹ˆB‚ˆžN‚ˆÚ[H]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜Ü™X]WØÛÛ™\œØ][Û‹ˆÚ[™HœÝX—ØYÙ[‹ˆ]O]]Kˆ\™[ØÛÛ™\œØ][Û—ÚY\\™[ÚYˆYÙ[ÚY\\™[ØÛÛ‹˜YÙ[ÚYˆ[›™\—ÚY\\™[ØÛÛ‹œ[›™\—ÚYˆÝX—ØYÙ[Û˜[YOXYÙ[Ý\Kˆ
+Bˆ^Ù\˜[YP[™XYQ^\ÝÑ\œ›ÜŽ‚ˆÈH
+\™[]JH[š\]YH[™^š\™YˆH›ÝÈ[™XYH^\ÝÂˆÈ]HX™[X˜\ÙYY[\Ý[˜ÞHÛÚÝ\X›Ý™HZ\ÜÙY]8 %Z]\‚ˆÈHÛÛ˜Ý\œ™[ÔÕÛÛˆH[œÙ\˜XÙKÜˆ[ˆX\›Y\ˆÔÕYYˆÈY\ˆÜ™X]WØÛÛ™\œØ][Ûˆ[™™Y›Ü™HÙ]ÛX™[ËX]š[™È[‚ˆÈ[›X™[Y›ÝËˆÚ]Ý]\È™XÛÝ™\žH]™\žH›ÜØ\™\ˆ™Y[]™\žBˆÈLÈÛˆHØ[YHÛÛ\Ú[Ûˆ[[H›ÜØ\™\ˆÚ]™\È\[™ˆÈ\šÜÈHÝX‹XYÙ[
+][ˆ™]™\ˆ\X\œÈ[ˆH˜Z[
+KˆYÜˆÈH^\Ý[™È›ÝÈ[™™K\Ý[\]ÈX™[È
+Y[\Ý[\Ù\
+HÛÂˆÈH™^[]™\žHZÙ\ÈH˜\ÝX™[[ÛÚÝ\]‚ˆYÜYH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÙš[™ÜÝX˜YÙ[ØÚ[ØžWÝ]KˆÛÛ™\œØ][Û—ÜÝÜ™Kˆ\™[ÚYˆ]Kˆ
+BˆYˆYÜY\È›Û™N‚ˆ˜Z\ÙBˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™KœÙ]ÛX™[ËYÜYšYX™[ÊBˆÈHÔÕ]Ü™X]Y\ÈÜœ[ˆYY™Y›Ü™H™XXÚ[™ÈBˆÈÙ\ÜÚ[Û‹˜Ü™X]YX›\Ú™[ÝËÛÈ]™HÛY[È
+HÙX‚ˆÈÝX˜YÙ[È˜Z[
+H]™H™]™\ˆX\™X›Ý]HÚ[8 %[Z]]›ÝË‚ˆÈ[ˆHÛÛ˜Ý\œ™[\˜XÙHØ\ÙHHÚ[›™\ˆ[ÛÈX›\ÚYÈBˆÈ\XØ]H]™[\ÈH\›[\ÜÈ^˜HØXÚH[˜[Y][Û‹‚ˆÜX›\ÚÜÙ\ÜÚ[Û—ØÜ™X]Y
+\™[ÚYYÜYšY\™[ØÛÛ‹˜YÙ[ÚY
+Bˆ™]\›ˆYÜYšYˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™KœÙ]ÛX™[ËÚ[šYX™[ÊBˆÜX›\ÚÜÙ\ÜÚ[Û—ØÜ™X]Y
+\™[ÚYÚ[šY\™[ØÛÛ‹˜YÙ[ÚY
+Bˆ™]\›ˆÚ[šY‚‚™YˆØ[YÜ˜]š]WÜÝX˜YÙ[Ý]J›ÛNˆÝ‹Ø\ØØYWÚYˆÝŠHOˆÝŽ‚ˆˆˆ‚ˆZ[HÚ[›ÝÈ]H›Üˆ[ˆYÞHÝX‹XYÙ[‚‚ˆ›ÛOŽØ\ØØYHYˆ˜ˆHYÙ[È˜Z[Ü]ÈHÚ[]HÛˆ]È’T”ÕˆÛÛÛˆ[ÈÛÛÈÙ\ÜÚ[Û—Û˜[YXÛÈ\È™[™\œÈH›ÛH\ÈHyÛ¯u¶‰žËkºwµçNˆÝ‹ˆ][Nˆ™]ÐÛÛ™\œØ][Û’][KŠHOˆ]\˜[Èœ\œÚ\ÝY‹™\XØ]H‹œÚÚ\Y‹™˜Z[Y—N‚ˆˆˆ‚ˆ\œÚ\ÝH[›™\ˆ\œ›Üˆ][H[›\ÜÈHØ[YH\œ›Üˆ[™XYH^\ÝË‚‚ˆ˜]]™H\›Z[˜[Ý\\Ø[ˆ˜Z[YØZ[ˆÛˆ]™\žH[›™\ˆ™XÛÛ›™XÝ‚ˆY\HžHHš\ÚX›H^[ØY
+ÛÝ\˜ÙKÛÙKY\ÜØYÙJXÛ›BˆÚ[ˆ›È\Ù\ˆY\ÜØYÙH\È\X\™YÚ[˜ÙHHX]Ú[™È\œ›Ü‹ˆ]ˆÝ\™\ÜÙ\È™XÛÛ›™XÝÜ[HÚ[HÝ[™XÛÜ™[™ÈH™]È\œ›Üˆ›ÜˆBˆ\Ù\‹Z[š]X]Y™]žHYØZ[œÝHØ[YHœ›ÚÙ[ˆ\›Z[˜[‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H[œÝ[˜ÙKÜˆ›Û™XÈÚÚ\‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H][NˆHØ[™Y]H\OH™\œ›Üˆ˜][K‚ˆœ™]\›œÎˆœ\œÚ\ÝY˜Yˆ\ÈØ[\[™YH][Kˆ™\XØ]H˜YˆHX]Ú[™È™XÙ[\œ›Üˆ[™XYH^\ÝËˆœÚÚ\Y˜Yˆ›ÈÝÜ™HÜˆ›Û‹Y\œ›Üˆ][HØ\È›ÝšYYÜ‚ˆ™˜Z[Y˜YˆHÝÜ™HÜ\˜][Ûˆ˜Z[Y‚ˆˆˆ‚ˆYˆÛÛ™\œØ][Û—ÜÝÜ™H\È›Û™N‚ˆ™]\›ˆœÚÚ\Y‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ][K™]K\œ›Ü‘]JN‚ˆ™]\›ˆœÚÚ\Y‚ˆžN‚ˆ™XÙ[H]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K›\ÝÚ][\ËˆÙ\ÜÚ[Û—ÚYˆ[Z]LŒˆÜ™\H™\ØÈ‹ˆ
+Bˆ›Üˆ^\Ý[™È[ˆ™XÙ[™]N‚ˆYˆ
+ˆ^\Ý[™Ë\HOH›Y\ÜØYÙH‚ˆ[™\Ú[œÝ[˜ÙJ^\Ý[™Ë™]KY\ÜØYÙQ]JBˆ[™^\Ý[™Ë™]Kœ›ÛHOH\Ù\ˆ‚ˆ
+N‚ˆœ™XZÂˆYˆ^\Ý[™Ë\HOH™\œ›ÜˆˆÜˆ›Ý\Ú[œÝ[˜ÙJ^\Ý[™Ë™]K\œ›Ü‘]JN‚ˆÛÛ[YBˆYˆ
+ˆ^\Ý[™Ë™]KœÛÝ\˜ÙHOH][K™]KœÛÝ\˜ÙBˆ[™^\Ý[™Ë™]K˜ÛÙHOH][K™]K˜ÛÙBˆ[™^\Ý[™Ë™]K›Y\ÜØYÙHOH][K™]K›Y\ÜØYÙBˆ
+N‚ˆ™]\›ˆ™\XØ]H‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜\[™ˆÙ\ÜÚ[Û—ÚYˆÚ][WKˆ
+Bˆ™]\›ˆœ\œÚ\ÝY‚ˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÛÙÙÙ\‹™^Ù\[ÛŠˆ”™[^H\œ›Üˆ\œÚ\Ý˜Z[Y›ÜˆÙ\ÜÚ[ÛI\È‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ™]\›ˆ™˜Z[Y‚‚‚˜\Þ[˜ÈYˆÜ™[^WÜ\œÚ\Ý
+ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™H›Û™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ][Nˆ™]ÐÛÛ™\œØ][Û’][KŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\ÝHÚ[™ÛHÛÛ™\œØ][Ûˆ][Hœ›ÛHH™[^K‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H[œÝ[˜ÙKÜˆ›Û™XÈÚÚ\‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H][NˆH][HÈ\œÚ\Ý‚ˆˆˆ‚ˆYˆÛÛ™\œØ][Û—ÜÝÜ™H\È›Û™N‚ˆ™]\›‚ˆžN‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜\[™ˆÙ\ÜÚ[Û—ÚYˆÚ][WKˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÛÙÙÙ\‹™^Ù\[ÛŠˆ”™[^H\œÚ\Ý˜Z[Y›ÜˆÙ\ÜÚ[ÛI\È‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+B‚‚˜\Þ[˜ÈYˆÜ™[^WÜ™\ÜÛœÙWÜÛXÞWÙ[žWÜ™X\ÛÛŠˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ^ˆÝ‹ŠHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ]˜[X]H
+^
+ˆYØZ[œÝHÙ\ÜÚ[Û‰ÜÈÕUU
+‘TÔÓ”ÑJH\ÙHÛXÚY\Ë‚‚ˆ[›™\‹\™[^YY
+ØØY™›Û
+H\›™\ÜÙ\È™]™\ˆÔÕH\ÜÚ\Ý[Y\ÜØYÙBˆ˜XÚÈ›ÝYÚÔÕÝŒKÜÙ\ÜÚ[ÛœËÞÚYKÙ]™[ØÛÈBˆ\ÙK”‘TÔÓ”ÑX]˜[X]Üˆ\™H\È[œ™XXÚX›H›Üˆ[KˆH™[^IÜÂˆ\›Z[˜[^›\Ú\ÈZ\ˆÚ[™ÛH\œÚ\ÝÚ[ÛÈ\È]˜[X]\ÈBˆØ[YHÝ]]ÛXÚY\ÈÝ™\ˆHš[˜[\ÜÚ\Ý[^šYÚ™Y›Ü™H]ˆ™XÛÛY\È\˜X›H8 %XZÚ[™ÈHÜXÉÜÈ™\ÜÛœÙX\\ÙHÛXÞH[™›Ü˜ÙXX›Bˆ[ˆH[›™\ˆÜÛÙÞK‚‚ˆ˜Z[ÈÔSˆ
+™]\›œÈ›Û™X
+HÛˆ[žH]˜[X][Ûˆ\œ›Ü‹X]Ú[™ÈHBˆ\Ù\ÉÈYš\ÛÜžHY˜][ˆHÛXÞKY[™Ú[™HXØÝ\]\Ý›Ý\Ý›ÞHBˆ˜\œ˜][ÛˆH\Ù\ˆ[™XYHØ]ÚY‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H›ÜˆHÛÛ™\œØ][Û‹ÛX™[ÈÛÚÝ\‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H^ˆH›Ú[™Y\ÜÚ\Ý[^ÙYÛY[X›Ý]È\œÚ\Ý‚ˆœ™]\›œÎˆH[žH™X\ÛÛˆÚ[ˆ[ˆÝ]]ÛXÞHS–\Ë[ÙH›Û™X‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œ[[YK—ÙÛØ˜[È[\ÜØYÙ[ÜÝÜ™B‚ˆYˆØYÙ[ÜÝÜ™H\È›Û™N‚ˆÈ˜Z[Ü[‹]ÝYNˆHZ\ËZ[š]X[^™Y[[YHÛÝ[Ý\Ú\ÙBˆÈÚ[[H\ØX›H‘TÔÓ”ÑK\\ÙHØ][™È›Üˆ]™\žH™[^YYÙ\ÜÚ[Û‹‚ˆÛÙÙÙ\‹Ø\›š[™Êˆ”™[^NˆYÙ[ÝÜ™H›Ý[š]X[^™YÈÚÚ\[™È‘TÔÓ”ÑK\\ÙH‚ˆœÛXÞH]˜[X][Ûˆ›ÜˆÙ\ÜÚ[ÛI\È‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ™]\›ˆ›Û™BˆžN‚ˆÛÛˆH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™K™Ù]ØÛÛ™\œØ][Û‹Ù\ÜÚ[Û—ÚY
+BˆYˆÛÛˆ\È›Û™HÜˆÛÛ‹˜YÙ[ÚY\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ›ÙHHÙ\ÜÚ[Û‘]™[[œ]
+ˆ\OH›Y\ÜØYÙH‹ˆ]O^Âˆœ›ÛHŽˆ˜\ÜÚ\Ý[‹ˆ˜ÛÛ[ŽˆÞÈ\HŽˆ›Ý]]Ý^‹^Žˆ^WKˆKˆ
+BˆÈH™[^H\È›ÈØ[\ŽÈHXÝ[™Èš[˜Ú\[\ÈBˆÈ\›‹Z[š]X][™È[X[ˆ\œÚ\ÝY]›ÜØ\™[YH
+Ø[YHX™[BˆÈÛXÞKY]˜[X]H›Ý]H˜[È˜XÚÈÊKÛÈ\‹]\Ù\ˆÛXÚY\ÈØ]BˆÈÛˆHÛÜœ™XÝXÝÜ‹‚ˆ\›—ØXÝÜˆH
+ÛÛ‹›X™[ÈÜˆßJK™Ù]
+ÕT“—ÐPÕÔ—ÓP‘S
+Bˆ™\™XÝH]ØZ]Ù]˜[X]WÛÝ]]ÜÛXÞJˆÙ\ÜÚ[Û—ÚYˆÛÛ‹ˆ›ÙKˆÛÛ™\œØ][Û—ÜÝÜ™KˆØYÙ[ÜÝÜ™Kˆ›Û™KˆXÝÜWØZ[ØXÝÜŠ\›—ØXÝÜŠKˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LH8 %˜Z[Ü[ŽˆÝ]]\Ù\È\™HYš\ÛÜžHÛˆ\œ›Ü‚ˆÛÙÙÙ\‹™^Ù\[ÛŠˆ”™[^Nˆ‘TÔÓ”ÑK\\ÙHÛXÞH]˜[X][Ûˆ˜Z[Y›ÜˆÙ\ÜÚ[ÛI\ÎÈ‚ˆœ\œÚ\Ý[™ÈH^[›[ÙYšYY‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ™]\›ˆ›Û™BˆYˆ™\™XÝ\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÝŠ™\™XÝ™Ù]
+œ™X\ÛÛˆŠHÜˆ‘[šYYžHÛXÞHŠB‚‚˜\Þ[˜ÈYˆÙ›\ÚÜ™[^WÝ^
+ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™H›Û™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ^ØXØÎˆ\ÝÜÝ—Kˆ™\ÜÛœÙWÚYˆÝˆ›Û™Kˆ[Ù[ÚYˆÝˆ›Û™Kˆ
+‹ˆ[žWÜ™X\ÛÛŽˆÝˆ›Û™HH›Û™Kˆ]˜[X]WÜ™\ÜÛœÙWÜ\ÙNˆ›ÛÛH˜[ÙKŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\ÝY™™\™Y\ÜÚ\Ý[^\ÈHY\ÜØYÙH][H[™ÛX\ˆHY™™\‹‚‚ˆØØY™›Û\›™\ÜÙ\È
+Û]YK\ÙÊHÝ™X[H^[\ÈÚ]›È\‹[Y\ÜØYÙBˆÝ]]Ú][K™Û™XÛÈH™[^HY™™\œÈ[Kˆ›\Ú[™È]XXÚˆ^8¡¤™[˜Ý[Û—ØØ[›Ý[™\žH
+›ÝÛ›H]™\ÜÛœÙK˜ÛÛ\]Y
+HÙY\ÂˆH\œÚ\ÝY˜[œØÜš\[\›X]™Y8 %Ý^ÛÛ^ÛÛX8 %ˆ[œÝXYÙˆÛÛ\Ú[™ÈH\›‰ÜÈ˜\œ˜][Ûˆ[ÈÛ™H›ØÚÈY\ˆ]ÈÛÛˆØ[È
+ÚXÚ™[™\œÈÛÛËXX›Ý™K]^
+È[‹[Ûˆ^Ûˆ™[ØY
+K‚‚ˆY\ˆHÛÛ™š\›YY\œÚ\ÝH][H\È[ÛÈX›\ÚYÈH]™BˆÝ™X[H\È™\ÜÛœÙK›Ý]]Ú][K™Û™X
+Z\œ›Üš[™ÈH˜]]™H]	ÜÂˆ™[˜Î˜ÜX›\ÚÙ^\›˜[ØÛÛ™\œØ][Û—Ú][X
+Kˆ]™HÛY[È[™XYBˆ™[™\™YH^œ›ÛHH[\ÎÈHX›\Ú[]™\œÈBˆÝÜ™KX\ÜÚYÛ™Y][HYÛÈ^HØ[ˆÝ[\]ÛÈHÝ™X[YY›ØÚË‚ˆÚ]Ý]]H™[™\™Y›ØÚÈÝ^\ÈY[\ÜÈ[™]™\žH™XÛÛ›™XÝ	ÜÂˆ][RYZÙ^YY™XÛÛ˜Ú[X][ÛˆÜXÙ\ÈH\œÚ\ÝYÛÜH[ˆ\ÈBˆ\XØ]KˆÛY[È]\ÝY\H\È]™[žHÓÓ•S•›ÝžBˆÜ[‹\ÙXÝ[ÛˆÝ]Nˆ]HZY]\›ˆÛÛXØ[›Ý[™\žHHÝ™X[YYˆ^\È[™XYH™Y[ˆÛÜÙYØÛÛ[Z]YÛY[\ÚYH
+žHBˆ[˜Ý[Û—ØØ[][HÜˆ[\›X]™Y™X\ÛÛš[™ÊH™Y›Ü™H\ÈX›\Úˆ\œš]™\ËˆHÙXˆÝ[\ÈHYÛÈHX]Ú[™ÈÝ™X[YYˆ^ÙÛ™X›ØÚÈ[ˆXÙH
+ÙXˆÚ]ÝÜ™KØˆ[\Ý™X[Q]™[Ø
+NÈHRHÛÛœÝ[Y\ÈHž]KY\]X[ÛÛ[Z]YˆÙYÛY[
+Ü™\œXÕ\›”›ÜÙU˜XÚÙ\˜
+K‚‚ˆHY™™\ˆ[™H[‹Y›YÚ™\^H\™HÛX\™YÓ“HY\ˆH\[™ˆ\ÈÛÛ™š\›YYˆÛX\š[™Èš\œÝÛÝ[]H™XÛÛ›™XÝ\š[™ÈH\œÚ\Ýˆ]ØZ]ÙYH™Z]\ˆH
+›Ý^Y]XÛÛ[Z]Y
+HY\ÜØYÙH›ÜˆH™\^Kˆ›Ü[™ÈH˜\œ˜][Ûˆ8 %[™HÝØ[ÝÙY\[™˜Z[\™HÛÝ[ÜÙH]ˆ\›X[™[KˆÛˆ˜Z[\™HHY™™\œÈ\™HY[XÝÛÈH^Ý[ˆ™\^\È[™\È™]šYY]H™^›\ÚÈ™\ÜÛœÙK˜ÛÛ\]Y‚‚ˆÛˆ[ˆÕUU\\ÙHS–HH[šYY^]\Ý™]™\ˆ™XÛÛYHH\˜X›Bˆ\ÜÚ\Ý[Y\ÜØYÙKˆÛÈ[žHÛÝ\˜Ù\È™YY\È
+›Ý\œÚ\ÝHØ[YBˆÑ[šYYžHÛXÞNˆ‹‹—XÙ[[™[HÙ]˜[X]WÛÝ]]ÜÛXÞXˆ›Ý]H]\Ù\ÊN‚‚ˆH
+™[žWÜ™X\ÛÛŠŽˆHTÑWÓWÔ‘TÔÓ”ÑXS–HHÛXÞKY]˜[X]Bˆ›Ý]H™XÛÜ™Y›Üˆ\ÈÙ\ÜÚ[Û‰ÜÈ[‹Y›YÚ\›ˆ8 %H\›™\ÜÈÛ›Bˆ\œ›ÜœÈH\›ˆY\ˆH^[™XYHÝ™X[YYÛÈH™[^H\ÂˆH\ÝØ]H™Y›Ü™HH[šYYÛÛ[\œÚ\ÝË‚ˆH
+™]˜[X]WÜ™\ÜÛœÙWÜ\ÙJŽˆ]˜[X]HH›Ú[™Y^YØZ[œÝBˆÜXÉÜÈ\ÙK”‘TÔÓ”ÑXÛXÚY\ÈšYÚ\™Kˆ[›™\‹\™[^YYˆ\›™\ÜÙ\È™]™\ˆÔÕH\ÜÚ\Ý[Y\ÜØYÙH˜XÚÈ›ÝYÚˆÔÕ‹‹‹Ù]™[ØÛÈ\È›\Ú\ÈHÛ›HXÙHBˆ™\ÜÛœÙX\ÙHØ[ˆš\™H[ˆ\ÈÜÛÙÞK‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™HÈ\[™ËÜˆ›Û™XÈÚÚ\ˆ\œÚ\Ý[˜ÙH
+\Ý\œÚ[™È]
+K‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÛÛ™\œØ][Û‹ÜÙ\ÜÚ[ÛˆYK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H^ØXØÎˆXØÝ[][]Y[HÝš[™ÜÎÈÛX\™Y[ˆXÙHÛˆÝXØÙ\ÜË‚ˆœ\˜[H™\ÜÛœÙWÚYˆ\›ˆYÛÈHÙYÛY[Ü›Ý\ÈÚ]]ÈÛÛØ[Ë‚ˆœ\˜[H[Ù[ÚYˆ\ÜÚ\Ý[YÙ[X™[›ÜˆHY\ÜØYÙK‚ˆœ\˜[H[žWÜ™X\ÛÛŽˆÚ[ˆÙ][ˆÝ]]ÛXÞH[™XYH[šYY\Âˆ\›‰ÜÈ\ÜÚ\Ý[^È\œÚ\ÝH[žHÙ[[™[[œÝXYÙˆ]‚ˆœ\˜[H]˜[X]WÜ™\ÜÛœÙWÜ\ÙNˆÚ[ˆYX
+\›Z[˜[›\Ú
+KØ]BˆH^›ÝYÚHÜXÉÜÈ‘TÔÓ”ÑK\\ÙHÛXÚY\È™Y›Ü™Bˆ\œÚ\Ý[™Ë‚ˆˆˆ‚ˆYˆ›Ý^ØXØÎ‚ˆ™]\›‚ˆ^Hˆ‹š›Ú[Š^ØXØÊBˆYˆ›Ý^œÝš\
+
+N‚ˆÈÚ]\ÜXÙK[Û›Nˆ›Ý[™ÈÛÜ\œÚ\Ý[™Ëˆ›Ü]ÛÈ]™Z]\‚ˆÈXØÝ[][]\È[ÈH™^ÙYÛY[›Üˆ™\^\È\È[ˆ[\HX˜›K‚ˆ^ØXØË˜ÛX\Š
+Bˆ[™›YÚÝ^œ™\Ù]Ý^
+Ù\ÜÚ[Û—ÚY
+Bˆ™]\›‚ˆYˆÛÛ™\œØ][Û—ÜÝÜ™H\È›Û™N‚ˆ^ØXØË˜ÛX\Š
+Bˆ™]\›‚ˆYˆ[žWÜ™X\ÛÛˆ\È›Û™H[™]˜[X]WÜ™\ÜÛœÙWÜ\ÙN‚ˆ[žWÜ™X\ÛÛˆH]ØZ]Ü™[^WÜ™\ÜÛœÙWÜÛXÞWÙ[žWÜ™X\ÛÛŠˆÛÛ™\œØ][Û—ÜÝÜ™KÙ\ÜÚ[Û—ÚY^ˆ
+BˆYˆ[žWÜ™X\ÛÛˆ\È›Ý›Û™N‚ˆÈÝXœÝ]]HHÙ[[™[›ÜˆH[šYYÛÛ[8 %Ø[YHÜ[Û‹P‚ˆÈÚ\H\ÈHÙ]˜[X]WÛÝ]]ÜÛXÞX›Ý]H]ÛÈ›ÛÝË]\ˆÈ\›œÈ[™H][\ÈTHÙYHHÛÛœÚ\Ý[[žH™XÛÜ™ˆX›\ÚBˆÈÙ[[™[[HÛÎˆ]™HÛY[È[™XYH™[™\™YH[šYY^ˆÈœ›ÛHHÝ™X[H
+]›\Ú\ÈH™\ÚYX[Ø\[Y™™\š[™ÂˆÈÛÝ[ÛÜÙJKÛÈÚ]Ý]Hš\ÚX›HÙ[[™[H[žHÛÝ[Û›BˆÈ™H\ØÛÝ™\˜X›HY\ˆH™[ØY‚ˆ^Hˆž×ÑS–WÔÑS•S‘SÔ‘Q’V^Ù[žWÜ™X\ÛÛŸWH‚ˆÈÛÛ[Z]HÝXœÝ]][Ûˆ[ÈH™]žHY™™\ˆ]Ù[ŽˆH˜Z[YˆÈ\œÚ\Ý™[ÝÈX]™\È^ØXØØ›ÜˆH™^›\Ú[™]ˆÈ™]žH]\ÝØ\œžHHÙ[[™[™]™\ˆH[šYYÛÛ[ˆÚ]Ý]ˆÈ\ËH‘TÔÓ”ÑK\\ÙH[žHÛÝ[™H™KY]˜[X]Yœ›ÛHØÜ˜]ÚÛ‚ˆÈ™]žH8 %[™HÝ]Y[ÛXÞHÚÜÙHX™[È[Ý™YÛˆHš\œÝˆÈS–HÛÝ[›\ÈSÕÈ[™XZÈHÜšYÚ[˜[^‚ˆ^ØXØÖÎ—HHÝ^BˆÜX›\ÚÜÛXÞWÙ[žJÙ\ÜÚ[Û—ÚY[žWÜ™X\ÛÛŠBˆ[\Ü]ZY‚ˆžN‚ˆ][HH™]ÐÛÛ™\œØ][Û’][Jˆ\OH›Y\ÜØYÙH‹ˆ™\ÜÛœÙWÚY\™\ÜÛœÙWÚYÜˆˆ\›—ÞÝ]ZY]ZY
+
+Kš^H‹ˆ]O\\œÙWÚ][WÙ]Jˆ›Y\ÜØYÙH‹ˆÂˆ\HŽˆ›Y\ÜØYÙH‹ˆœ›ÛHŽˆ˜\ÜÚ\Ý[‹ˆ˜YÙ[Žˆ[Ù[ÚYÜˆ[šÛ›ÝÛˆ‹ˆ˜ÛÛ[ŽˆÞÈ\HŽˆ›Ý]]Ý^‹^Žˆ^WKˆKˆ
+Kˆ
+Bˆ\œÚ\ÝYH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™K˜\[™Ù\ÜÚ[Û—ÚYÚ][WJBˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÈÙY\^ØXØÈ
+ÈH[‹Y›YÚY™™\ˆÛÈH˜\œ˜][Ûˆ\Û‰ÝÜÝ‚ˆÈ]Ý[™\^\ÈÛˆ™XÛÛ›™XÝ[™\È™]šYY]H™^›\Ú‚ˆÛÙÙÙ\‹™^Ù\[ÛŠˆ”™[^Nˆ˜Z[YÈ\œÚ\Ý\ÜÚ\Ý[^ÙYÛY[›ÜˆÙ\ÜÚ[ÛI\È‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ™]\›‚ˆÈÛÛ™š\›YY\œÚ\ÝY8 %›ÝÈØY™HÈÛX\‹ˆÞ[˜Ú›Û›Ý\È
+›È]ØZ]™Y›Ü™BˆÈH™^ZY[
+KÛÈ›È™XÛÛ›™XÝØœÙ\™\ÈHÛÛ[Z]YY\ÜØYÙH[™BˆÈÝ[H™\^HÙÙ]\‹‚ˆ^ØXØË˜ÛX\Š
+Bˆ[™›YÚÝ^œ™\Ù]Ý^
+Ù\ÜÚ[Û—ÚY
+BˆÈX›\ÚH\œÚ\ÝY][HÛÈ]™HÛY[ÈX\›ˆ]ÈÝÜ™KX\ÜÚYÛ™YˆÈY[™Ý[\]ÛÈH[™XYK\™[™\™YÝ™X[YY^
+ÙYHBˆÈØÜÝš[™ÊKˆÜ™\™Y™Y›Ü™HH›Ý[™\žH][HÈ\›Z[˜[]™[BˆÈØ[\ˆX›\Ú\È™^ÈÛY[ÈX]Ú]˜XÚÈÈHÝ™X[YY^ˆÈžHž]KY\]X[ÛÛ[›ÝžHÜ[‹\ÙXÝ[ÛˆÝ]K‚ˆÛ™WÙ]™[HÝ]]][QÛ™Q]™[
+ˆ\OHœ™\ÜÛœÙK›Ý]]Ú][K™Û™H‹ˆ][O\\œÚ\ÝYÌK×Ø\WÙXÝ
+
+Kˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚYÛ™WÙ]™[›[Ù[Ù[\
+
+JB‚‚™YˆØYÙ[Ü›ÝšY\—Ù˜[Z[JYÙ[ˆYÙ[
+HOˆÝˆ›Û™N‚ˆˆˆ”™]\›ˆH›ÝšY\ˆ˜[Z[HÙˆ[ˆYÙ[	ÜÈ\›™\ÜËÜˆ›Û™X‚‚ˆØYÈHYÙ[	ÜÈÜXÈÈ™XY]È\›™\Ü×ÚÚ[™[™X\È]ÈBˆ›ÝšY\ˆ˜[Z[H
+˜[›ÜXÈ˜È›Ü[˜ZH˜
+Kˆ™]\›œÈ›Û™XÚ[‚ˆH[™HØ[‰Ý™HØYYÜˆH\›™\ÜÈ\È[šÛ›ÝÛˆ8 %Ø[\œÈ™X]ˆ›Û™X\È˜Ø[‰ÝÛÛ™š\›HØ[YH˜[Z[H‹‚‚ˆœ\˜[HYÙ[ˆHYÙ[ÚÜÙH\›™\ÜÈ˜[Z[HÈ™\ÛÛ™K‚ˆœ™]\›œÎˆ˜[›ÜXÈ˜È›Ü[˜ZH˜[ÙH›Û™X‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[›Û˜›Ø\™[™Ëœ›ÝšY\—ØÛÛ™šYÈ[\Ü›ÝšY\—Ù˜[Z[WÙ›Ü—Ú\›™\ÜÂ‚ˆžN‚ˆÜXÈH
+ˆÙ]ØYÙ[ØØXÚJ
+Bˆ›ØY
+YÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™JBˆœÜXÂˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆ™]\›ˆ›Û™Bˆ™]\›ˆ›ÝšY\—Ù˜[Z[WÙ›Ü—Ú\›™\ÜÊÜXË™^XÝ]Ü‹š\›™\Ü×ÚÚ[™
+B‚‚™YˆÜØ[YWÜ›ÝšY\—Ù˜[Z[J
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆ›ÛÛ‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—ÜØ[YWÜ›ÝšY\—Ù˜[Z[J
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆÜØ[YWÜ›ÝšY\—Ù˜[Z[WÚ[\
+NˆYÙ[ŽˆYÙ[
+HOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆÛÈYÙ[ÈÚ\™HH
+Û›ÝÛŠH›ÝšY\ˆ˜[Z[K‚‚ˆ˜[ÙXÚ[ˆZ]\ˆ˜[Z[H\È[™]\›Z[˜X›KÛÈH›ÜšÈ]Ø[‰ÝˆÛÛ™š\›H›ÝYÙ[ÈÜXZÈHØ[YH›ÝšY\ˆ™\Ù]È[Ù[Ù][™ÜÈ[™ˆÚÚ\È™\Ý[Z[™ÈHÛÝ\˜ÙIÜÈ˜]]™HÙ\ÜÚ[Ûˆ
+H[›™\ˆ™XZ[ÈBˆ˜]]™H˜[œØÜš\œ›ÛHÛ[šYÙ[][\È[œÝXY
+K‚‚ˆœ\˜[HNˆš\œÝYÙ[
+K™ËˆH›ÜšÈÛÝ\˜ÙIÜÈYÙ[
+K‚ˆœ\˜[HŽˆÙXÛÛ™YÙ[
+K™ËˆHÝÚ]Ú\™Ù]
+K‚ˆœ™]\›œÎˆYXÚ[ˆ›Ý™\ÛÛ™HÈHØ[YH›Û‹X›Û™X˜[Z[K‚ˆˆˆ‚ˆ˜[Z[WØHHØYÙ[Ü›ÝšY\—Ù˜[Z[JJBˆ™]\›ˆ˜[Z[WØH\È›Ý›Û™H[™˜[Z[WØHOHØYÙ[Ü›ÝšY\—Ù˜[Z[JŠB‚‚™YˆØYÙ[Ú\×Û˜]]™J
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆ›ÛÛ‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—ØYÙ[Ú\×Û˜]]™J
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆØYÙ[Ú\×Û˜]]™WÚ[\
+YÙ[ˆYÙ[
+HOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆ[ˆYÙ[[œÈH˜]]™HÓH\›™\ÜË‚‚ˆØYÈHYÙ[	ÜÈÜXÈÈ™XY]È\›™\Ü×ÚÚ[™ˆ˜]]™H\™Ù]È[‚ˆH™[™ÜˆRH[ˆH\›Z[˜[
+Û]YK[˜]]™HÈÛÙ^[˜]]™HÈK[˜]]™HÂˆÝ\œÛÜ‹[˜]]™JKˆ\È\Èœ›ØY\ˆ[ˆ˜Ø[ˆ™\^H›ÜšÈ\ÝÜžHˆ8 %]™\žBˆ˜]]™H\›™\ÜÈ^Ù\Ý\œÛÜ‹[˜]]™HØ\œšY\ÈHÙ\ÜÚ[Û‹Yš[K\™XZ[]Âˆ\ÙHØYÙ[ØØ\œšY\×Û˜]]™WÙ›Üš×Ú\ÝÜžX›Üˆ]˜\œ›ÝÙ\ˆØ]Kˆ™]\›œÂˆ˜[ÙXÚ[ˆH[™HØ[‰Ý™HØYY
+™X]Y\È›Û‹[˜]]™JK‚‚ˆœ\˜[HYÙ[ˆHYÙ[ÚÜÙH\›™\ÜÈÈÛ\ÜÚYžK‚ˆœ™]\›œÎˆYX›ÜˆH˜]]™HÓH\›™\ÜË[ÙH˜[ÙX‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[š\›™\Ü×Ø[X\Ù\È[\Ü\×Û˜]]™WÚ\›™\ÜÂ‚ˆžN‚ˆÜXÈH
+ˆÙ]ØYÙ[ØØXÚJ
+Bˆ›ØY
+YÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™JBˆœÜXÂˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆ™]\›ˆ˜[ÙBˆ™]\›ˆ\×Û˜]]™WÚ\›™\ÜÊÜXË™^XÝ]Ü‹š\›™\Ü×ÚÚ[™
+B‚‚™YˆØYÙ[ØØ\œšY\×Û˜]]™WÙ›Üš×Ú\ÝÜžJ
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆ›ÛÛ‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—ØYÙ[ØØ\œšY\×Û˜]]™WÙ›Üš×Ú\ÝÜžJ
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆØYÙ[ØØ\œšY\×Û˜]]™WÙ›Üš×Ú\ÝÜžWÚ[\
+YÙ[ˆYÙ[
+HOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆ
+˜YÙ[
+‰ÜÈ˜]]™H\›™\ÜÈ™XZ[ÈH›ÜšÉÜÈ˜[œØÜš\‚‚ˆÛ]YK[˜]]™HÈÛÙ^[˜]]™HÈK[˜]]™HXXÚ™XÛÜ™H™\Ý[XX›H˜]]™BˆÙ\ÜÚ[Ûˆš[H]H[›™\ˆ™XZ[Èœ›ÛHHÛÜYYÛ[šYÙ[][\ÈÛ‚ˆ›ÜšËÜ™\Ý[YKÛÈH›ÜšÈ›Ý[™ÈÛ™HÙˆ[HØ\œšY\Èš[Üˆ\ÝÜžH[ÈBˆ˜]]™HÓKˆ\ÙYžH›Ý›ÜšÈ[™ÝÚ]ÚXYÙ[ˆÝ\œÛÜ‹[˜]]™H\ÈH˜]]™BˆÓH]\È›È™\Ý[XX›HÙ\ÜÚ[Ûˆš[HÈ™XZ[È]Ø\œšY\È›ÜšÈ\ÝÜžHBˆY™™\™[Ø^H
+H^™X[X›K›ÜšË[Û›H8 %ÙYBˆ™[˜Î˜ØYÙ[ØØ\œšY\×ØÝ\œÛÜ—Ù›Üš×Ú\ÝÜžX
+KÛÈÝ[\[™ÂˆØ\œžWÚ\ÝÜžWÚ[×Û˜]]™X›Üˆ]\™HÛÝ[™HH˜[ÙH›ÛZ\ÙKˆ™]\›œÂˆ˜[ÙXÚ[ˆH[™HØ[‰Ý™HØYY
+™X]Y\È›Û‹XØ\œžZ[™ÊK‚‚ˆœ\˜[HYÙ[ˆHYÙ[ÚÜÙH\›™\ÜÈÈÛ\ÜÚYžK‚ˆœ™]\›œÎˆYXÛ›H›Üˆ˜[œØÜš\\™XZ[˜]]™H\›™\ÜÙ\Ë‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[š\›™\Ü×Ø[X\Ù\È[\ÜØ[›ÛšXØ[^™WÚ\›™\ÜÂ‚ˆžN‚ˆÜXÈH
+ˆÙ]ØYÙ[ØØXÚJ
+Bˆ›ØY
+YÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™JBˆœÜXÂˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆ™]\›ˆ˜[ÙBˆ™]\›ˆØ[›ÛšXØ[^™WÚ\›™\ÜÊÜXË™^XÝ]Ü‹š\›™\Ü×ÚÚ[™
+H[ˆÑ“Ô’×ÒTÕÔ–WÓUU‘WÒT“‘TÔÑTÂ‚‚™YˆØYÙ[ØØ\œšY\×ØÝ\œÛÜ—Ù›Üš×Ú\ÝÜžJYÙ[ˆYÙ[
+HOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆ
+˜YÙ[
+‰ÜÈ˜]]™H\›™\ÜÈØ\œšY\È“Ô’È\ÝÜžHšXH™X[X›K‚‚ˆÝ\œÛÜ‰ÜÈÛÛ™\œØ][Ûˆ\ÈÙ\™\‹X˜XÚÙY[™Ü[˜ÛÙH\È›È\ÝÜžKZ[\ÜˆTKÛÈ™Z]\ˆØ[ˆÙYYHØØ[ÝÜ™H›ÜˆH™XZ[™\Ý[YNÈ[œÝXYBˆ[›™\ˆ™\^\Èš[Üˆ\›œÈ\ÈH^™X[X›HÛˆH›ÜšÈ
+Ý\œÛÜŽˆBˆš\œÝY\ÜØYÙNÈÜ[˜ÛÙNˆH›Ô™\XÛÛ^Y\ÜØYÙJKˆ›ÜšË[Û›H8 %ˆÝÚ]ÚXYÙ[Ù\È›ÝØ[\ËÛÈÝÚ]Ú[™È[ÈÛ™HÝ[][˜Ú\Èœ™\Ú‚ˆ™]\›œÈ˜[ÙXÚ[ˆH[™HØ[‰Ý™HØYY‚‚ˆœ\˜[HYÙ[ˆHYÙ[ÚÜÙH\›™\ÜÈÈÛ\ÜÚYžK‚ˆœ™]\›œÎˆYX›ÜˆHÝ\œÛÜ‹[˜]]™HÈÜ[˜ÛÙK[˜]]™H\›™\ÜÙ\Ë‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[š\›™\Ü×Ø[X\Ù\È[\ÜØ[›ÛšXØ[^™WÚ\›™\ÜÂ‚ˆžN‚ˆÜXÈH
+ˆÙ]ØYÙ[ØØXÚJ
+Bˆ›ØY
+YÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™JBˆœÜXÂˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆ™]\›ˆ˜[ÙBˆ™]\›ˆØ[›ÛšXØ[^™WÚ\›™\ÜÊÜXË™^XÝ]Ü‹š\›™\Ü×ÚÚ[™
+H[ˆÐÕT”ÓÔ—Ñ“Ô’×ÒTÕÔ–WÒT“‘TÔÑTÂ‚‚™YˆÛ˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—ØYÙ[
+YÙ[ˆYÙ[
+HOˆ˜]]™PÛÙ[™ÐYÙ[›Û™N‚ˆˆˆ‚ˆ™]\›ˆ˜]]™HÛÙ[™ËXYÙ[Y]Y]H›Üˆ[ˆYÙ[	ÜÈ\›™\ÜË‚‚ˆœ\˜[HYÙ[ˆHYÙ[ÚÜÙH[™HÚÝ[™H[œÜXÝY‚ˆœ™]\›œÎˆ™YÚ\ÝžHY]Y]H›ÜˆH˜]]™HRH\›™\ÜËÜˆ›Û™X‚ˆˆˆ‚ˆžN‚ˆÜXÈH
+ˆÙ]ØYÙ[ØØXÚJ
+Bˆ›ØY
+YÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™JBˆœÜXÂˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆ™]\›ˆ›Û™Bˆ™]\›ˆ˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—Ú\›™\ÜÊÜXË™^XÝ]Ü‹š\›™\Ü×ÚÚ[™
+B‚‚™YˆÜ™\Ù[][Û—ÛX™[×Ù›Ü—ØYÙ[
+
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆXÝÜÝ‹Ý—N‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—Ü™\Ù[][Û—ÛX™[×Ù›Ü—ØYÙ[
+
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆÜ™\Ù[][Û—ÛX™[×Ù›Ü—ØYÙ[Ú[\
+YÙ[ˆYÙ[
+HOˆXÝÜÝ‹Ý—N‚ˆˆˆ”™]\›ˆHÙXˆRH™\Ù[][ÛˆX™[È›Üˆ[ˆYÙ[	ÜÈ\›™\ÜË‚‚ˆH˜]]™KPÓHYÙ[[œÈ
+Š\›Z[˜[Yš\œÝ
+Šˆ
+H[›[™H\›Z[˜[\ÈBˆXZ[ˆšY]ÊKØ]YÛˆÛ[šYÙ[ZHOH\›Z[˜[˜\ÈHX]Ú[™ÂˆÛ[šYÙ[Ü˜\\˜˜[YNÈ[ˆÑÈYÙ[[œÈ\ÈZ[ˆÚ]
+›ÈÝXÚˆX™[ÊKˆ\ÙYžHH›ÜšÈ›Ý]HÛÈHÝÚ]ÚYÛÛ™IÜÈRH[ÙHX]Ú\ÂˆHT‘ÑU\›™\ÜÈ[œÝXYÙˆ[š\š][™ÈHÛÝ\˜ÙIÜÈ8 %Ý\Ú\ÙH[ˆÑÂˆÛÛ™HÙˆHÛ]YK[˜]]™HÙ\ÜÚ[Ûˆ™[™\œÈHÝ[H[\˜XÝ]™H\›Z[˜[‚‚ˆœ\˜[HYÙ[ˆHYÙ[H›ÜšÈÚ[š[™‚ˆœ™]\›œÎˆÝZNˆ\›Z[˜[Ü˜\\Žˆ˜[YOŸX›ÜˆH˜]]™HYÙ[Ü‚ˆßX›Üˆ[ˆÑÈYÙ[È[™]\›Z[˜X›H˜[Z[H
+Ú][ÙJK‚ˆˆˆ‚ˆ˜]]™WØYÙ[HÛ˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—ØYÙ[
+YÙ[
+Bˆ™]\›ˆ˜]]™WØYÙ[œ™\Ù[][Û—ÛX™[ÈYˆ˜]]™WØYÙ[\È›Ý›Û™H[ÙHßB‚‚™YˆÛØYØYÙ[ÜÜX×Ù›Ü—ÜÙ\ÜÚ[ÛŠ
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆYÙ[ÜXÈ›Û™N‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—ÛØYØYÙ[ÜÜX×Ù›Ü—ÜÙ\ÜÚ[ÛŠ
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆÛØYØYÙ[ÜÜX×Ù›Ü—ÜÙ\ÜÚ[Û—Ú[\
+ˆÛÛŽˆÛÛ™\œØ][Û‹ˆYÙ[ÜÝÜ™NˆYÙ[ÝÜ™KŠHOˆYÙ[ÜXÈ›Û™N‚ˆÈÜ]œ›ÛHØZ[ÜÛXÞWÙ[™Ú[™WÙœ›ÛWÜÜXÈÛÈHØ[\ˆØ[ˆ[ˆBˆÈÚX\ÝX\™˜Z[ËÙY˜][\ÛXÞHÚÚ\ÚXÚÈ™]ÙY[ˆHÛÈ[™]›ÚYˆÈ^Z[™È›Üˆ[™Ú[™HÛÛœÝXÝ[ÛˆÚ[ˆ›ÈÛXÞHÛÝ[š\™Kˆ›Ý[™\ÂˆÈ\™H›ØÚÚ[™È‹ÒSËÛÈXXÚ\È[ˆ[™\ˆ\Þ[˜Ú[Ë×Ý™XY‚ˆYˆÛÛ‹˜YÙ[ÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆYÙ[HYÙ[ÜÝÜ™K™Ù]
+ÛÛ‹˜YÙ[ÚY
+BˆYˆYÙ[\È›Û™N‚ˆ™]\›ˆ›Û™BˆYÙ[ØØXÚHHØ\Ý
+YÙ[ØXÚKÙ]ØYÙ[ØØXÚJ
+JBˆ™]\›ˆYÙ[ØØXÚK›ØY
+ˆYÙ[šYˆYÙ[˜[™WÛØØ][Û‹ˆ^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Kˆ
+KœÜXÂ‚‚™YˆØZ[ÜÛXÞWÙ[™Ú[™WÙœ›ÛWÜÜXÊ
+˜\™ÜÎˆ[žK
+ŠšÝØ\™ÜÎˆ[žJHOˆÛXÞQ[™Ú[™N‚ˆˆˆØ[][YH›ÞHÛÈH˜XØYH]ÚÙˆ\ÈÞ[X›Û\ÈÛ›Ü™Y\™Kˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\È[\ÜÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ™]\›ˆÙ˜XØYK—ØZ[ÜÛXÞWÙ[™Ú[™WÙœ›ÛWÜÜXÊ
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚‚™YˆØZ[ÜÛXÞWÙ[™Ú[™WÙœ›ÛWÜÜX×Ú[\
+ˆÜXÎˆYÙ[ÜXËˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆÛÛ™\œØ][ÛŽˆÛÛ™\œØ][Ûˆ›Û™HH›Û™KŠHOˆÛXÞQ[™Ú[™N‚ˆˆˆZ[[ˆ[™Ú[™H›Üˆ
+œÜXÊ‹™]\Ú[™ÈHÛÛ™\œØ][Ûˆ›ÝÈÚ[ˆ[‚‚ˆ]™\žHØ[\ˆÙˆ\ÈÜ˜\\ˆ[™XYHØYYHÛÛ™\œØ][ÛˆÂˆ™\ÛÛ™H
+œÜXÊŽÈ\ÜÚ[™È]]ÈHZ[\ˆÚÚ\]ÈÝÛˆ™XYˆÛ›BˆH›ÝÉÜÈ[[]]X›HY[]H\È™]\ÙY8 %HZ[\ˆ™KY\š]™\ÂˆX™[ËÙ\ÜÚ[Û—ÜÝ]H[™[Ù[œ›ÛHHœ™\Ú™XY
+ÙYBˆ™[˜Î˜Z[ÜÛXÞWÙ[™Ú[™X
+K‚ˆˆˆ‚ˆØ\ÈHÙ]ØØ\Ê
+BˆÜÝØÛÛ›™XÝ[ÛˆH
+ˆØ\ËœÛXÞWÛWØÛÛ›™XÝ[Û—Ù˜XÝÜžJ
+HYˆØ\ËœÛXÞWÛWØÛÛ›™XÝ[Û—Ù˜XÝÜžH[ÙH›Û™Bˆ
+Bˆ™]\›ˆZ[ÜÛXÞWÙ[™Ú[™JˆÜXÏ\ÜXËˆÛÛ™\œØ][Û—ÚY\Ù\ÜÚ[Û—ÚYˆÛÛ™\œØ][Û—ÜÝÜ™OXÛÛ™\œØ][Û—ÜÝÜ™KˆÛÛ™\œØ][ÛXÛÛ™\œØ][Û‹ˆÈHÜXÈØ\È™\ÛÛ™Yœ›ÛH\È›ÝÉÜÈYÙ[š[™[™ÎÈHZ[\‚ˆÈÛÛ™š\›\È]YØZ[œÝ]ÈÝÛˆœ™\Ú™XY[™˜Z[ÈÛÜÙYYˆBˆÈÝÚ]ÚXYÙ[[™Y[ˆ™]ÙY[‹‚ˆ^XÝYØYÙ[ÚYXÛÛ™\œØ][Û‹˜YÙ[ÚYYˆÛÛ™\œØ][Ûˆ\È›Ý›Û™H[ÙH›Û™KˆY˜][ÜÛXÚY\ÏXØ\Ë™Y˜][ÜÛXÚY\ËˆÛXÞWÜÝÜ™OYÙ]ÜÛXÞWÜÝÜ™J
+KˆÙ\™\—ÛOXØ\Ë›KˆÜÝØÛÛ›™XÝ[ÛZÜÝØÛÛ›™XÝ[Û‹ˆ
+B‚‚˜\Þ[˜ÈYˆØ\WÜ[™[™×ÜÛXÞWØ\Ú×ÝÜš]\ÊˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆYÙ[ÜÝÜ™NˆYÙ[ÝÜ™Kˆ]NˆXÝÜÝ‹[žWKŠHOˆ›Û™N‚ˆˆˆ‚ˆ\H
+Üˆ›Ü
+HÛXÞHÜš]\ÈÝ\ÚY›ÜˆH™[^HÛÛXØ[TÒË‚‚ˆØ[YÚ[ˆ[ˆ\›Ý˜[™\™XÝ™\ÛÛ™\ÈH[›™\‹[ÝÛ™YÛXÞBˆ[XÚ]][Ûˆ
+›Ý\›Ý˜[[žHÚ[È8 %H\›Ý˜[]™[[™Bˆ™\ÛÛ™HT“8 %›Ý]H\™HšXHZ\ˆØ[\œÊKˆÛˆXØÙ\HXÚY[™ÂˆÛXÞIÜÈÝ\ÚYÝ]WÝ\]\ØÈÙ]ÛX™[Ø\™H\œÚ\ÝYžHBˆœ™\ÚHZ[[™Ú[™H8 %^XÝHÚ]H˜]]™HÚÛÛ˜]]™WØ\Ú×ÙØ]Xˆ]Ù\È[›[™KˆÛˆ[žHÝ\ˆ™\™XÝ
+XÛ[™HÈØ[˜Ù[ÈZ\ÜÚ[™ÊH^Bˆ\™H›ÜY
+ÓPÒQTË›Y0©ÍËŒŽˆH[šYYTÒÈX]™\È›È˜XÙJKˆ›Ë[ÜÚ[‚ˆH[XÚ]][Ûˆ\È›ÈÝ\ÚYÜš]\È
+HÛÛ[[ÛˆØ\ÙH8 %[ÜÝTÒÜÈ[™ˆ[›Û‹\ÛXÞH[XÚ]][ÛœÊK‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[ÛˆY]ÝÛœÈH[XÚ]][Û‹K™Ë‚ˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆHÙ\ÜÚ[ÛˆÛÛ™\œØ][Û‹›ÜˆHYÙ[ÈÜXÈÛÚÝ\‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™HH[™Ú[™H\œÚ\ÝÈÙ\ÜÚ[ÛˆÝ]HË‚ˆœ\˜[HYÙ[ÜÝÜ™NˆÝÜ™H›ÜˆHYÙ[ÜXÈÛÚÝ\‚ˆœ\˜[H]NˆH\›Ý˜[^[ØYØ\œžZ[™È[XÚ]][Û—ÚY[™Bˆ™\™XÝXÝ[Û˜
+K™ËˆÈ™[XÚ]][Û—ÚYŽˆ™[XÚ]Þ‹ˆ˜XÝ[ÛˆŽˆ˜XØÙ\ŸX
+K‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆ[XÚ]][Û—ÚYH]K™Ù]
+™[XÚ]][Û—ÚY‹ˆŠBˆ[™[™ÈHÜ[™[™×ÜÛXÞWØ\Ú×ÝÜš]\Ë™Ù]
+[XÚ]][Û—ÚY
+BˆYˆ[™[™È\È›Û™N‚ˆ™]\›‚ˆYˆ[™[™Ë™œ›ÛWÛXÜ‚ˆÈPÔ[šY\ÎˆH™]žH]
+ÔÕÛXÜÚ]™\]Y\ÝÝ]JBˆÈÜÈ[™\Y\ÈHÜš]\È]Ù[‹ˆ\Z[™È\™HÛÈÛÝ[ˆÈÝX›KX\H›Û‹ZY[\Ý[ÜÈ
+K™ËˆSÔ‘SQS•Ý]BˆÈ\]\È›ÜˆÛÜÝXYÙ]ÛÝ[\œÊKˆX]™HH[žH›ÜˆBˆÈ™]žH]
+]ÝÛœÈÛX[\
+K›Ü[™È]Û›HÛˆXÛ[™K‚ˆYˆ]K™Ù]
+˜XÝ[ÛˆŠHOH˜XØÙ\Ž‚ˆÈXÛ[™Y8 %™[[Ý™HHÝ\ÚYÜš]\È
+ÓPÒQTË›Y0©ÍËŒŽ‚ˆÈH[šYYTÒÈX]™\È›È˜XÙJK‚ˆÜ[™[™×ÜÛXÞWØ\Ú×ÝÜš]\ËœÜ
+[XÚ]][Û—ÚY›Û™JBˆ™]\›‚ˆÈ›Û‹SPÔ™[^H]ˆÛZ[HH[žH]ÛZXØ[H
+›È]ØZ]™]ÙY[‚ˆÈHÙ]X›Ý™H[™\ÈÜÛÈ\XØ]H™\™XÝÈ8 %HÛY[ˆÈ˜[œÜÜ™]žH˜XÚ[™È]ÈÜšYÚ[˜[ÔÕÜˆHÙXÛÛ™ÛY[8 %ˆÈØ[ˆ™]™\ˆ›Ý\HHØ[YH›Û‹ZY[\Ý[Üš]\ÊK‚ˆ[™[™ÈHÜ[™[™×ÜÛXÞWØ\Ú×ÝÜš]\ËœÜ
+[XÚ]][Û—ÚY›Û™JBˆYˆ[™[™È\È›Û™N‚ˆÈHÛÛ˜Ý\œ™[\XØ]H™\™XÝ[™XYHÛZ[YYHÜš]\Ë‚ˆ™]\›‚ˆYˆ]K™Ù]
+˜XÝ[ÛˆŠHOH˜XØÙ\Ž‚ˆÈXÛ[™Y8 %HÛZ[H[™XYH™[[Ý™YHÝ\ÚYÜš]\ÂˆÈ
+ÓPÒQTË›Y0©ÍËŒŽˆH[šYYTÒÈX]™\È›È˜XÙJK‚ˆ™]\›‚ˆÈ™\ÛÛ™HHYÙ[ÜXÈ
+ÈZ[H[™Ú[™HÙ™ˆH]™[ÛÜˆBˆÈÛÚÝ\ÛÛXØXÚH[™H™]Ú[™[™Ú[™HÛÛœÝXÝ[Ûˆ\™H[ˆÈ›ØÚÚ[™È‹ÒSË‚ˆÜXÈH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛØYØYÙ[ÜÜX×Ù›Ü—ÜÙ\ÜÚ[Û‹ÛÛ‹YÙ[ÜÝÜ™JBˆYˆÜXÈ\È›Û™N‚ˆ™]\›‚ˆžN‚ˆ[™Ú[™HH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆØZ[ÜÛXÞWÙ[™Ú[™WÙœ›ÛWÜÜXËÜXËÙ\ÜÚ[Û—ÚYÛÛ™\œØ][Û—ÜÝÜ™KÛÛ‚ˆ
+Bˆ^Ù\˜\ÙQ^Ù\[ÛŽ‚ˆÈH˜Z\ÙH\™H
+K™ËˆHÛÛ˜Ý\œ™[YÙ[™Xš[™
+H]\Ý›ÝÜÙHBˆÈ\›Ý™YÜš]\ÈÚ]›È™]žHÜÜÚX›H8 %™\ÝÜ™HHÛZ[K‚ˆÜ[™[™×ÜÛXÞWØ\Ú×ÝÜš]\ËœÙ]Y˜][
+[XÚ]][Û—ÚY[™[™ÊBˆ˜Z\ÙBˆÈHX™[ÜÝ]HÜš]\È]HˆÞ[˜Ú›Û›Ý\ÛHÛÈ8 %ÙY\[BˆÈÙ™ˆHÛÜ‚ˆYˆ[™[™ËœÙ]ÛX™[Î‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+[™Ú[™K˜\WÛX™[ÝÜš]\Ë[™[™ËœÙ]ÛX™[ÊBˆYˆ[™[™ËœÝ]WÝ\]\Î‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊÛÛ™\œØ][Û“›Ý›Ý[™\œ›ÜŠN‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+[™Ú[™K˜\WÜÝ]WÝ\]\Ë[™[™ËœÝ]WÝ\]\ÊB‚‚™YˆØZ[ØXÝÜŠ\Ù\—ÚYˆÝˆ›Û™JHOˆXÝÜÝ‹Ý—H›Û™N‚ˆˆˆ‚ˆZ[HXÝÜ˜XÝ›Üˆ˜Û\ÜÎ˜]˜[X][ÛÛÛ^‚‚ˆ™]\›œÈÈœ[—Ø\ÈŽˆ\Ù\—ÚYXÚ[ˆH]][XØ]Y\Ù\ˆ\ÂˆÛ›ÝÛ‹›Û™XÝ\Ú\ÙH
+\ÝËYØXÞHØ[\œÈÚ]Ý]]]
+K‚‚ˆœ\˜[H\Ù\—ÚYˆ]][XØ]Y\Ù\ˆ[XZ[œ›ÛHH™\]Y\ÝˆK™Ëˆ˜[XÙP^[\K˜ÛÛH˜ˆ›Û™XÚ[ˆ]]\Âˆ\ØX›YÜˆHØ[\ˆ\È[˜]][XØ]Y‚ˆœ™]\›œÎˆXÝÜˆXÝÜˆ›Û™X‚ˆˆˆ‚ˆYˆ\Ù\—ÚY\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÈœ[—Ø\ÈŽˆ\Ù\—ÚYB‚‚™YˆØZ[Ù]˜[X][Û—ØÛÛ^
+ˆ\ÙNˆ\ÙKˆ]NˆXÝÜÝ‹[žWHÝ‹ˆ]™[ˆXÝÜÝ‹[žWKˆ
+‹ˆXÝÜŽˆXÝÜÝ‹Ý—H›Û™HH›Û™KŠHOˆ]˜[X][ÛÛÛ^‚ˆˆˆ‚ˆZ[[ˆ˜Û\ÜÎ˜]˜[X][ÛÛÛ^œ›ÛHH›ÝË\Ý[H]™[XÝ‚‚ˆX\ÈH›ÝÈ]™[™]XÚ\HÈH[\›˜[ÛÛ™[[ÛŽ‚‚ˆHÓÓÐÐSˆÛÛ[HÈ›˜[YHŽˆ˜[YK˜\™Ý[Y[ÈŽˆ\™ÜßXˆÛÛÛ˜[YHH˜[YX‚ˆHÓÓÔ‘TÕSˆÛÛ[HÈœ™\Ý[Žˆ™\Ý[ÜÝŸXˆÛÛÛ˜[YXœ›ÛH™\]Y\ÝÙ]K›˜[YXˆ™\]Y\ÝÙ]Xœ›ÛHH]™[	ÜÈ™\]Y\ÝÙ]XšY[‚ˆH‘TUQTÕÈ‘TÔÓ”ÑXˆÛÛ[HÝŠ]JX‚‚ˆœ\˜[H\ÙNˆ[\›˜[\ÙH[[K‚ˆœ\˜[H]Nˆ]™[™]XXÝœ›ÛHH›ÝÈ™\]Y\Ý‚ˆœ\˜[H]™[ˆ[]™[XÝ
+›Üˆ™\]Y\ÝÙ]XÛÛ^
+K‚ˆœ\˜[HXÝÜŽˆ]][XØ]Yš[˜Ú\[K™Ë‚ˆÈœ[—Ø\ÈŽˆ˜[XÙP^[\K˜ÛÛHŸXˆ›Û™XÚ[‚ˆY[]H\È[šÛ›ÝÛ‹‚ˆœ™]\›œÎˆ™XYK]ËY]˜[X]HÛÛ^‚ˆˆˆ‚ˆÈH˜]]™HÛÚÈX^HÝ[\HÙ\ÜÚ[Û‰ÜÈ]™H[Ù[[ÈH]™[ÛÛ^ˆÈ
+K™ËˆHÛÙ^ÛÚÈ™XYÈ]œ›ÛHÛÛ™šYËÛ[]Ø]H[YH8 %BˆÈÛÝ\˜ÙHÙˆ]›Üˆ[ˆ[‹URHÛ[Ù[Ù[XÝ[ÛŠKˆÚ[ˆ™\Ù[\ÂˆÈÚ[œÈÝ™\ˆH[™Ú[™IÜÈÙ\™\‹\™\ÛÛ™Y[Ù[
+ÙYBˆÈÛXÞQ[™Ú[™K—Ú[š™XÝÛ[Ù[
+NÈ›Û™X˜[È˜XÚÈÈ]™\ÛÛ][Û‹‚ˆ˜]×ØÛÛ^Ý˜[YHH]™[™Ù]
+˜ÛÛ^ŠBˆ˜]×ØÛÛ^H˜]×ØÛÛ^Ý˜[YHYˆ\Ú[œÝ[˜ÙJ˜]×ØÛÛ^Ý˜[YKXÝ
+H[ÙHßBˆÝ\YYÛ[Ù[H˜]×ØÛÛ^™Ù]
+›[Ù[ŠBˆÛÚ×Û[Ù[HÝ\YYÛ[Ù[Yˆ\Ú[œÝ[˜ÙJÝ\YYÛ[Ù[ÝŠH[™Ý\YYÛ[Ù[[ÙH›Û™BˆÈH\›™\ÜËÚ[ˆH˜]]™HÛÚÈÝ[\Y]
+K™ËˆHÛÙ^ÛÚÊKÛÂˆÈÛXÚY\ÈØ[ˆZ[ÜˆY\ÜØYÙ\ÈÈHÙ\ÜÚ[Û‰ÜÈ[Ù[\ÝÚ]ÚÝ\™˜XÙBˆÈ
+ÛÙ^[˜]]™H\È\›Z[˜[[Û›JKˆØ\œšYY›ÝYÚ[˜Ú[™ÙY8 %H[™Ú[™BˆÈ™Z]\ˆ™\ÛÛ™\È›ÜˆÝ™\œšY\È]‚ˆÝ\YYÚ\›™\ÜÈH˜]×ØÛÛ^™Ù]
+š\›™\ÜÈŠBˆÛÚ×Ú\›™\ÜÈH
+ˆÝ\YYÚ\›™\ÜÈYˆ\Ú[œÝ[˜ÙJÝ\YYÚ\›™\ÜËÝŠH[™Ý\YYÚ\›™\ÜÈ[ÙH›Û™Bˆ
+BˆÝXÝ\™YÙ]HH]HYˆ\Ú[œÝ[˜ÙJ]KXÝ
+H[ÙHßBˆYˆ\ÙHOH\ÙK•ÓÓÐÐS‚ˆ˜]×ÝÛÛÛ˜[YHHÝXÝ\™YÙ]K™Ù]
+›˜[YHŠBˆÛÛÛ˜[YHH˜]×ÝÛÛÛ˜[YHYˆ\Ú[œÝ[˜ÙJ˜]×ÝÛÛÛ˜[YKÝŠH[ÙHˆ‚ˆ˜]×Ø\™ÜÈHÝXÝ\™YÙ]K™Ù]
+˜\™Ý[Y[ÈŠBˆ\™ÜÈH˜]×Ø\™ÜÈYˆ\Ú[œÝ[˜ÙJ˜]×Ø\™ÜËXÝ
+H[ÙHßBˆ™]\›ˆ]˜[X][ÛÛÛ^
+ˆ\ÙO\\ÙKˆÛÛ[^È›˜[YHŽˆÛÛÛ˜[YK˜\™Ý[Y[ÈŽˆ\™ÜßKˆÛÛÛ˜[YO]ÛÛÛ˜[YHÜˆ›Û™KˆXÝÜXXÝÜ‹ˆ[Ù[ZÛÚ×Û[Ù[ˆ\›™\ÜÏZÛÚ×Ú\›™\ÜËˆ
+BˆYˆ\ÙHOH\ÙK•ÓÓÔ‘TÕS‚ˆÛÛÜ™\Ý[HÝXÝ\™YÙ]K™Ù]
+œ™\Ý[‹ˆŠBˆ˜]×Ü™\]Y\ÝÙ]HH]™[™Ù]
+œ™\]Y\ÝÙ]HŠBˆ™\]Y\ÝÙ]HH˜]×Ü™\]Y\ÝÙ]HYˆ\Ú[œÝ[˜ÙJ˜]×Ü™\]Y\ÝÙ]KXÝ
+H[ÙH›Û™Bˆ™\Ý[ÝÛÛÛ˜[YHH›Û™BˆYˆ™\]Y\ÝÙ]H\È›Ý›Û™N‚ˆ˜]×ÝÛÛÛ˜[YHH™\]Y\ÝÙ]K™Ù]
+›˜[YHŠBˆ™\Ý[ÝÛÛÛ˜[YHH˜]×ÝÛÛÛ˜[YHYˆ\Ú[œÝ[˜ÙJ˜]×ÝÛÛÛ˜[YKÝŠH[ÙH›Û™Bˆ™]\›ˆ]˜[X][ÛÛÛ^
+ˆ\ÙO\\ÙKˆÛÛ[^Âˆœ™\Ý[ŽˆÛÛÜ™\Ý[Yˆ\Ú[œÝ[˜ÙJÛÛÜ™\Ý[ÝŠH[ÙHœÛÛ‹™[\ÊÛÛÜ™\Ý[
+KˆKˆÛÛÛ˜[YO\™\Ý[ÝÛÛÛ˜[YKˆ™\]Y\ÝÙ]O\™\]Y\ÝÙ]KˆXÝÜXXÝÜ‹ˆ[Ù[ZÛÚ×Û[Ù[ˆ\›™\ÜÏZÛÚ×Ú\›™\ÜËˆ
+BˆÈWÔ‘TUQTÕÈWÔ‘TÔÓ”ÑH8 %ÛÛ[\ÈH[™\]Y\ÝÜ™\ÜÛœÙHXÝ‚ˆYˆ\ÙH[ˆ
+\ÙK“WÔ‘TUQTÕ\ÙK“WÔ‘TÔÓ”ÑJN‚ˆ™]\›ˆ]˜[X][ÛÛÛ^
+ˆ\ÙO\\ÙKˆÛÛ[Y]KˆXÝÜXXÝÜ‹ˆ[Ù[ZÛÚ×Û[Ù[ˆ\›™\ÜÏZÛÚ×Ú\›™\ÜËˆ
+BˆÈ‘TUQTÕÈ‘TÔÓ”ÑH8 %ÛÛ[\ÈH\Ù\‹Ø\ÜÚ\Ý[^ˆHÚ\™H]XˆÈ\ÈHXÝ›Üˆ]™\žHÝ\œ™[š\œÝ\\H›ÙXÙ\ˆ
+È^Ÿ˜ÛÛ[Ž‚ˆÈ‹‹ŸX[˜ÛY[™ÈÜ[ÛÙIÜÈYÚ[‹ÚXÚÙ[™ÈÈ^Žˆ‹‹ŸX
+K]ˆÈH˜\™HÝš[™È\ÈÝ[XØÙ\Y›ÜˆTÑWÔ‘TUQTÕ›ÜˆÛÛ\]Xš[]BˆÈÚ]Û\ˆÜˆ\™\\HØ[\œÈ]Ù[™H›Û\^\™XÝK‚ˆÈXØÙ\›Ý[™‘U‘Tˆ˜Z\ÙH\™NˆHÜ˜\ÚLÈH]˜[X]H[™Ú[ˆÈÚXÚÚ[[H˜Z[ÈH™\]Y\ÝÜ™\Ý[Ø]HÔSˆ
+H^XÝÞ[\ÛBˆÈ]]ÛÜÝ[Ý™\‹XYÙ]\›Z[˜[›Û\È›ÝYÚ
+K‚ˆYˆ\Ú[œÝ[˜ÙJ]KÝŠN‚ˆ^H]Bˆ[Yˆ\Ú[œÝ[˜ÙJ]KXÝ
+N‚ˆ^H]K™Ù]
+^ŠHÜˆ]K™Ù]
+˜ÛÛ[ŠHÜˆÝŠ]JBˆ[ÙN‚ˆ^HÝŠ]JBˆ^ÜÝˆH^Yˆ\Ú[œÝ[˜ÙJ^ÝŠH[ÙHœÛÛ‹™[\Ê^
+BˆÈ‘TUQTÕÛÛ[\ÈHÝXÝ\™YXÝ
+È\Ù\—ØÛÛ[‹˜]XÚY[ÈŸJHÛÂˆÈ]™\žH™\]Y\Ý™XXÚ\ÈÛXÚY\È[ˆÛ™HÚ\KÚ]]™\ˆH[žHÚ[ˆ\ÂˆÈ˜]]™KÝ\›Z[˜[]Ø\œšY\È›È\ØYËÛÈ]XÚY[Ø\È[Ø^\È[\NÂˆÈHÙXˆ[œ]Ø]H
+Ù]˜[X]WÚ[œ]ÜÛXÞJH\ÈÚ]Ü[]\È]ˆ‘TÔÓ”ÑBˆÈÝ^\ÈHZ[ˆÝš[™È8 %]XÚY[È\™H[ˆ[œ][Û›HÛÛ˜Ù\›‹‚ˆ™\]Y\ÝÛÜ—Ü™\ÜÛœÙWØÛÛ[ˆ[žHH
+ˆÈ\Ù\—ØÛÛ[Žˆ^ÜÝ‹˜]XÚY[ÈŽˆ×_HYˆ\ÙHOH\ÙK”‘TUQTÕ[ÙH^ÜÝ‚ˆ
+Bˆ™]\›ˆ]˜[X][ÛÛÛ^
+ˆ\ÙO\\ÙKˆÛÛ[\™\]Y\ÝÛÜ—Ü™\ÜÛœÙWØÛÛ[ˆXÝÜXXÝÜ‹ˆ[Ù[ZÛÚ×Û[Ù[ˆ\›™\ÜÏZÛÚ×Ú\›™\ÜËˆ
+B‚‚™YˆÙ^˜XÝÝ\Ù\—Ý^Ùœ›ÛWÙ]™[
+›ÙNˆÙ\ÜÚ[Û‘]™[[œ]
+HOˆÝŽ‚ˆˆˆ‚ˆ^˜XÝÛÛ˜Ø][˜]Y^œ›ÛHH\Ù\ˆY\ÜØYÙH]™[›ÙK‚‚ˆZ\œ›ÜœÈHÙÚXÈ[ˆÛÜšÙ›ÝË—Ù^˜XÝÝ\Ù\—Ý^]ˆÜ\˜]\ÈÛˆH˜]ÈÙ\ÜÚ[Û‘]™[[œ]™]XXÝ˜]\‚ˆ[ˆH\œÙYY\ÜØYÙQ]XØš™XÝ‚‚ˆœ\˜[H›ÙNˆH˜[Y]YY\ÜØYÙX]™[Ú]ˆ›ÛNˆ\Ù\ˆ˜‚ˆœ™]\›œÎˆ›Ú[™Y^œ›ÛH[œ]Ý^È^ÛÛ[ˆ›ØÚÜËˆ[\HÝš[™ÈYˆ›È^›ØÚÜÈ›Ý[™‚ˆˆˆ‚ˆÛÛ[H›ÙK™]K™Ù]
+˜ÛÛ[ŠHÜˆ×Bˆ\Îˆ\ÝÜÝ—HH×Bˆ›Üˆ›ØÚÈ[ˆÛÛ[‚ˆYˆ\Ú[œÝ[˜ÙJ›ØÚËXÝ
+N‚ˆ^H›ØÚË™Ù]
+^ŠHÜˆ›ØÚË™Ù]
+š[œ]Ý^ŠBˆYˆ\Ú[œÝ[˜ÙJ^ÝŠN‚ˆ\Ë˜\[™
+^
+Bˆ™]\›ˆ—ˆ‹š›Ú[Š\ÊB‚‚™YˆÜX›\ÚÜÛXÞWÙ[žJÙ\ÜÚ[Û—ÚYˆÝ‹™X\ÛÛŽˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚHÑ[šYYžHÛXÞNˆ‹‹—XÙ[[™[ÛˆHÙ\ÜÚ[ÛˆÝ™X[K‚‚ˆHÙ[[™[^\ÈHØYX™X\š[™ÈÛÛ˜XÝ
+H‘T™[™\œÈ]L™Bˆ\ÝÈ\ÜÙ\][™˜]]™H\›™\ÜÙ\È™[^H]ÈH[Ù[
+KÛÈ]\Âˆ[Ø^\ÈØ\œšYY[ˆH™\ÜÛœÙK›Ý]]Ý^™[X‚‚ˆ[œ]S–HØ[\œÈ[ÛÈ\œÚ\ÝHØ[YHÙ[[™[\È[ˆ\ÜÚ\Ý[ˆÛÛ™\œØ][Ûˆ][Kˆ\ÈÝ™X[HX›\Ú™[XZ[œÈÙ\\˜]HÛÈ]™HÛY[ÂˆÝ[Ù][[YYX]H™YY˜XÚÈ™Y›Ü™HH[™\ˆ™]\›œËˆÝ[\[™ÈH[š\]YBˆY\ÜØYÙWÚY
+X]Ú[™ÈÝÈ]™HÝ™X[Z[™È^\ÈYÙÙY
+H›Ý]\ÈBˆ[H›ÝYÚHÙX‰ÜÈ]™K\™]šY]È]Ú\™H]›ÛÈ[ÈHÚ[™ÛBˆ]™NY˜›ØÚÈ˜]\ˆ[ˆH™\ÜÛœÙK\ØÛÜYÝ˜^HX˜›K‚‚ˆØY™H›ÜˆHÝ\ˆÛÛœÝ[Y\œÎˆH‘TÛÛ™\È[žHÝ]]Ý^™[XˆÈH^[X™YØ\™\ÜÈÙˆY\ÜØYÙWÚYÈHÝŒKÜ™\ÜÛœÙ\ØTBˆÝ\™˜XÙ\ÈH[žHšXH[œ]Y[žHÞ[\Ú\È
+›ÝÙ\ÜÚ[Û‹\Ý™X[H[\ÊNÂˆ[™HÛ›HY\ÜØYÙWÚYYØ]YXØÝ[][]Üˆ
+Ü™[^WÜ[›™\—ÜÝ™X[X
+Bˆ™XYÈ[›™\‹\™[^YY[\Ë™]™\ˆ\ÈÙ\™\‹\X›\ÚYÛ™K‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[H™X\ÛÛŽˆ[X[‹\™XYX›H[žH™X\ÛÛˆœ›ÛHHÛXÞH™\™XÝ‚ˆˆˆ‚ˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+ˆÙ\ÜÚ[Û—ÚYˆÂˆ\HŽˆœ™\ÜÛœÙK›Ý]]Ý^™[H‹ˆ™[HŽˆˆ–Ñ[šYYžHÛXÞNˆÜ™X\ÛÛŸWH‹ˆÈ[š\]YH\ˆ[žHÛÈÛÈÙ\\˜]H[šX[ÈÛ‰Ý›Û[ÈÛ™BˆÈ›ØÚÎÈHÚ[™ÛH[HØ\œšY\ÈHÚÛHÙ[[™[ÛÈ[™^‚ˆ›Y\ÜØYÙWÚYŽˆˆ™[žWÞÜÙXÜ™]ËÚÙ[—Ú^
+
+_H‹ˆš[™^ŽˆˆKˆ
+B‚‚™YˆÜX›\ÚÚ[œ]Ù[žWÝ\›Z[˜[
+Ù\ÜÚ[Û—ÚYˆÝ‹ÛÛŽˆÛÛ™\œØ][Û‹™X\ÛÛŽˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆX›\ÚH\›Z[˜[™\ÜÛœÙK˜ÛÛ\]Y›Üˆ[ˆS”U\\ÙHS–K‚‚ˆHÚÜXÚ\˜ÝZ]™]™\ˆ›ÜØ\™ÈÈH[›™\‹ÛÈ›È[›™\‹\™[^YYˆ\›Z[˜[™\ÜÛœÙKŠ˜]™[\È[Z]YˆÔÑHÛÛœÝ[Y\œÈ]š]™HBˆ\›ˆÙ™ˆH]™K]Z[
+HXY\ÜÈ\ÛY[ˆ˜Û\ÜÎ˜Û[šYÙ[ØÛY[”Ù\ÜÚ[ÛœÐÚ]œÙ[™
+H]\˜]H[[Bˆ\›‹]\›Z[˜[]™[\œš]™\È[™ÛÝ[Ý\Ú\ÙH›ØÚÈ›Ü™]™\‹ˆBˆÝ]]Ø\œšY\ÈHØ[YHÙ[[™[^ÛÈH\›Z[˜[\Û˜\ÚÝ˜[˜XÚÂˆ[ÛÈÝ\™˜XÙ\ÈH[žK‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][ÛˆÚÜÙHYÙ[Û[Ù[˜[YHYÜÈH™\ÜÛœÙK‚ˆœ\˜[H™X\ÛÛŽˆ[X[‹\™XYX›H[žH™X\ÛÛˆœ›ÛHHÛXÞH™\™XÝ‚ˆˆˆ‚ˆÙ[[™[Hˆž×ÑS–WÔÑS•S‘SÔ‘Q’V^Ü™X\ÛÛŸWH‚ˆ™\ÜÛœÙHH™\ÜÛœÙSØš™XÝ
+ˆYYˆ™[žWÞÜÙXÜ™]ËÚÙ[—Ú^
+
+_H‹ˆÝ]\ÏH˜ÛÛ\]Y‹ˆ[Ù[XÛÛ‹˜YÙ[ÚYÜˆœÛXÞH‹ˆÜ™X]YØ]Z[
+[YK[YJ
+JKˆÛÛ\]YØ]Z[
+[YK[YJ
+JKˆÝ]]VÂˆÂˆ\HŽˆ›Y\ÜØYÙH‹ˆœ›ÛHŽˆ˜\ÜÚ\Ý[‹ˆ˜ÛÛ[ŽˆÞÈ\HŽˆ›Ý]]Ý^‹^ŽˆÙ[[™[WKˆBˆKˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+ˆÙ\ÜÚ[Û—ÚYˆÛÛ\]Y]™[
+\OHœ™\ÜÛœÙK˜ÛÛ\]Y‹™\ÜÛœÙO\™\ÜÛœÙJK›[Ù[Ù[\
+^ÛYWÛ›Û™OUYJKˆ
+B‚‚˜\Þ[˜ÈYˆÜ\œÚ\ÝÜÛXÞWÙ[žWÜÙ[[™[
+ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ™X\ÛÛŽˆÝ‹ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆYÙ[ÜÝÜ™NˆYÙ[ÝÜ™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ\œÚ\ÝHÑ[šYYžHÛXÞNˆ‹‹—XÙ[[™[\È\ÜÚ\Ý[\ÝÜžK‚‚ˆS”UÛXÞHS–H™]\›œÈÞ[˜Ú›Û›Ý\ÛH[™™]™\ˆ›ÜØ\™ÈH\Ù\ˆ\›‚ˆÈH[›™\‹ÛÈ›ÈÝÛœÝ™X[HÝ™X[H™[^HØ[ˆ\[™H\ÜÚ\Ý[\ÚYBˆ[žHX\šÙ\‹ˆ\œÚ\Ý[™ÈHØ[YH\ÜÚ\Ý[Y\ÜØYÙHÚ\H\ÙYžHÕUUˆÛXÞHS–HÙY\È›ÛÝË]\\›œÈ[™H][\ÈTHÛÛœÚ\Ý[Ú]BˆÝ™X[YY[žH\Ù\œÈ[™XYHÙYK‚‚ˆY\ˆ\œÚ\Ý[™ËX›\ÚHÛÛ[Z]Y][H\ÈBˆ™\ÜÛœÙK›Ý]]Ú][K™Û™X8 %HØ[YHÛÛ[Z]]™[HÝ™X[YYˆ\ÜÚ\Ý[Y\ÜØYÙH[Z]È
+ÙYH™[˜Î˜Ù›\ÚÜ™[^WÝ^
+KˆÚ]Ý]]Bˆ]™H[žHÛ›H^\ÝÈ\ÈHÜX›\ÚÜÛXÞWÙ[žXÙ[[™[[KˆÚXÚHÙXˆ›ÛÈ[ÈH›Ýš\Ú[Û˜[]™N˜™]šY]È›ØÚÈ]Bˆ\›Z[˜[™\ÜÛœÙK˜ÛÛ\]YÝÙY\ÎÈH[žH[ˆ™X\X\™YÛ›BˆY\ˆH™Yœ™\Ú™KZY˜]YH\œÚ\ÝY][Kˆ[Z][™ÈHÛÛ[Z]]™[ˆ]ÈHÙXˆ™XÛÛ˜Ú[HH™]šY]È[ÈH\˜X›K][RYZÙ^YY›ØÚÈ]ˆÝ\š]™\ÈHÝÙY\H™XÛÛ›™XÝ[™H™Yœ™\Ú[ZÙK‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][ÛˆÚÜÙHYÙ[Û[Ù[˜[YHYÜÈHY\ÜØYÙK‚ˆœ\˜[H™X\ÛÛŽˆ[X[‹\™XYX›H[žH™X\ÛÛˆœ›ÛHHÛXÞH™\™XÝ‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H›Üˆ][H\œÚ\Ý[˜ÙK‚ˆœ\˜[HYÙ[ÜÝÜ™NˆÝÜ™H\ÙYÈ™\ÛÛ™HHYÙ[	ÜÈ\Ü^H˜[YK‚ˆˆˆ‚ˆ[\Ü]ZY‚ˆÙ[[™[Hˆž×ÑS–WÔÑS•S‘SÔ‘Q’V^Ü™X\ÛÛŸWH‚ˆYÙ[HYÙ[ÜÝÜ™K™Ù]
+ÛÛ‹˜YÙ[ÚY
+HYˆÛÛ‹˜YÙ[ÚY[ÙH›Û™BˆYÙ[Û˜[YHHYÙ[›˜[YHYˆYÙ[\È›Ý›Û™H[ÙHÛÛ‹˜YÙ[ÚYÜˆœÛXÞH‚ˆ][HH™]ÐÛÛ™\œØ][Û’][Jˆ\OH›Y\ÜØYÙH‹ˆ™\ÜÛœÙWÚYYˆ™[žWÞÝ]ZY]ZY
+
+Kš^H‹ˆ]O\\œÙWÚ][WÙ]Jˆ›Y\ÜØYÙH‹ˆÂˆ\HŽˆ›Y\ÜØYÙH‹ˆœ›ÛHŽˆ˜\ÜÚ\Ý[‹ˆ˜ÛÛ[ŽˆÞÈ\HŽˆ›Ý]]Ý^‹^ŽˆÙ[[™[WKˆ˜YÙ[ŽˆYÙ[Û˜[YKˆKˆ
+Kˆ
+Bˆ\œÚ\ÝYH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛÛ™\œØ][Û—ÜÝÜ™K˜\[™Ù\ÜÚ[Û—ÚYÚ][WJBˆYˆ\œÚ\ÝY‚ˆÛ™WÙ]™[HÝ]]][QÛ™Q]™[
+ˆ\OHœ™\ÜÛœÙK›Ý]]Ú][K™Û™H‹ˆ][O\\œÚ\ÝYÌK×Ø\WÙXÝ
+
+Kˆ
+BˆÙ\ÜÚ[Û—ÜÝ™X[KœX›\Ú
+Ù\ÜÚ[Û—ÚYÛ™WÙ]™[›[Ù[Ù[\
+
+JB‚‚™YˆÙ^˜XÝØ\ÜÚ\Ý[Ý^Ùœ›ÛWÙ]™[
+›ÙNˆÙ\ÜÚ[Û‘]™[[œ]
+HOˆÝŽ‚ˆˆˆ‚ˆ^˜XÝÛÛ˜Ø][˜]Y^œ›ÛH[ˆ\ÜÚ\Ý[Y\ÜØYÙH]™[‚‚ˆZ\œ›ÜœÈ™[˜Î˜Ù^˜XÝÝ\Ù\—Ý^Ùœ›ÛWÙ]™[]›Ü‚ˆ\ÜÚ\Ý[Y\ÜØYÙ\ËˆÛÛ[›ØÚÜÈ\ÙH^˜
+›Ýˆš[œ]Ý^˜
+K‚‚ˆœ\˜[H›ÙNˆH˜[Y]YY\ÜØYÙX]™[Ú]ˆ›ÛNˆ˜\ÜÚ\Ý[˜‚ˆœ™]\›œÎˆ›Ú[™Y^œ›ÛHÛÛ[›ØÚÜËˆ[\HÝš[™ÈY‚ˆ›È^›ØÚÜÈ›Ý[™‚ˆˆˆ‚ˆÛÛ[H›ÙK™]K™Ù]
+˜ÛÛ[ŠHÜˆ×Bˆ\Îˆ\ÝÜÝ—HH×Bˆ›Üˆ›ØÚÈ[ˆÛÛ[‚ˆYˆ\Ú[œÝ[˜ÙJ›ØÚËXÝ
+N‚ˆ^H›ØÚË™Ù]
+^ŠBˆYˆ\Ú[œÝ[˜ÙJ^ÝŠN‚ˆ\Ë˜\[™
+^
+Bˆ™]\›ˆ—ˆ‹š›Ú[Š\ÊB‚‚™YˆÜ™\XÙWÝ^Ú[—ÛY\ÜØYÙWØ›ÙJˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆ™\XÙ[Y[ˆÝ‹ŠHOˆÙ\ÜÚ[Û‘]™[[œ]‚ˆˆˆ‚ˆ™]\›ˆHÛÜHÙˆHY\ÜØYÙH›ÙHÚ][^ÛÛ[ˆ›ØÚÜÈ™\XÙYžH
+œ™\XÙ[Y[
+‹‚‚ˆ\ÙYžHÕUUÛXÞHS–HÈÝXœÝ]]HH[žHÙ[[™[ˆ[ÈH\œÚ\ÝYY\ÜØYÙHÚ[H™\Ù\š[™È›Û‹]^ÛÛ[ˆ›ØÚÜÈ
+[XYÙ\Ë]ËŠH[™[Ý\ˆ›ÙHšY[Ë‚‚ˆœ\˜[H›ÙNˆHÜšYÚ[˜[\ÜÚ\Ý[Y\ÜØYÙH]™[‚ˆœ\˜[H™\XÙ[Y[ˆH[žHÙ[[™[^ˆK™Ëˆ–Ñ[šYYžHÛXÞNˆ\›Y[ÛÛ[H˜‚ˆœ™]\›œÎˆH™]È›ÙHÚ]^›ØÚÜÈ™\XÙY‚ˆˆˆ‚ˆÛÛ[H›ÙK™]K™Ù]
+˜ÛÛ[ŠHÜˆ×Bˆ™]×ØÛÛ[ˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ™\XÙYH˜[ÙBˆ›Üˆ›ØÚÈ[ˆÛÛ[‚ˆYˆ\Ú[œÝ[˜ÙJ›ØÚËXÝ
+H[™^ˆ[ˆ›ØÚÎ‚ˆYˆ›Ý™\XÙY‚ˆ™]×ØÛÛ[˜\[™
+È\HŽˆ›Ý]]Ý^‹^Žˆ™\XÙ[Y[JBˆ™\XÙYHYBˆ[ÙN‚ˆ™]×ØÛÛ[˜\[™
+›ØÚÊBˆYˆ›Ý™\XÙY‚ˆ™]×ØÛÛ[˜\[™
+È\HŽˆ›Ý]]Ý^‹^Žˆ™\XÙ[Y[JBˆ™]×Ù]HHÊŠ˜›ÙK™]K˜ÛÛ[Žˆ™]×ØÛÛ[Bˆ™]\›ˆ\J›ÙJJ\OX›ÙK\K]O[™]×Ù]JB‚‚˜\Þ[˜ÈYˆÙ]˜[X]WÛÝ]]ÜÛXÞJˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ›ÙNˆÙ\ÜÚ[Û‘]™[[œ]ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™KˆYÙ[ÜÝÜ™NˆYÙ[ÝÜ™KˆÜ[›™\—Ü›Ý]\Žˆ[›™\”›Ý]\ˆ›Û™Kˆ
+‹ˆXÝÜŽˆXÝÜÝ‹Ý—H›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWH›Û™N‚ˆˆˆ‚ˆ]˜[X]H[ˆ\ÜÚ\Ý[Y\ÜØYÙHYØZ[œÝÕUU\ÙHÛXÚY\Ë‚‚ˆ\™H]˜[X][Ûˆ8 %Ù\È“Õ\œÚ\ÝH]™[ˆ™]\›œÂˆ›Û™XÛˆSÕËˆÛˆS–K™]\›œÈH™\™XÝXÝÚ]ˆÙ[šYYØ›ÙX8 %HØ[\ˆÚÝ[\œÚ\Ý\È[ÙYšYYˆ›ÙH
+^™\XÙYÚ][žHÙ[[™[
+H[œÝXYÙˆBˆÜšYÚ[˜[‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹ˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛÛŽˆHÙ\ÜÚ[Û‰ÜÈ˜Û\ÜÎ˜ÛÛ™\œØ][Û˜[]K‚ˆœ\˜[H›ÙNˆH˜[Y]YY\ÜØYÙX]™[‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H›ÜˆX™[Ý]K‚ˆœ\˜[HYÙ[ÜÝÜ™NˆÝÜ™H›ÜˆYÙ[ÜXÈÛÚÝ\Ë‚ˆœ\˜[H[›™\—Ü›Ý]\Žˆ[\ÙYÙ\›ÜˆÚYÛ˜]\™BˆÛÛœÚ\Ý[˜ÞK‚ˆœ\˜[HXÝÜŽˆ]][XØ]Yš[˜Ú\[K™Ë‚ˆÈœ[—Ø\ÈŽˆ˜[XÙP^[\K˜ÛÛHŸXˆ›Û™XÚ[‚ˆY[]H\È[šÛ›ÝÛ‹‚ˆœ™]\›œÎˆ›Û™XÛˆSÕÈ
+˜[›ÝYÚ
+Kˆ™\™XÝXÝˆÚ]Ù[šYYØ›ÙXÛˆS–K‚ˆˆˆ‚‚ˆ\ÜÚ\Ý[Ý^HÙ^˜XÝØ\ÜÚ\Ý[Ý^Ùœ›ÛWÙ]™[
+›ÙJBˆYˆ›Ý\ÜÚ\Ý[Ý^‚ˆ™]\›ˆ›Û™B‚ˆÈ™\ÛÛ™HHYÙ[ÜXÈÙ™ˆH]™[ÛÜ
+›ØÚÚ[™Èˆ
+ÈÛÛXØXÚBˆÈ[™H™]Ú
+KˆÜXÈÛ›KÛÈHÚX\ÚÚ\ÚXÚÈ™[ÝÈ[œÈ™Y›Ü™BˆÈH[Ü™H^[œÚ]™H[™Ú[™HZ[‚ˆÜXÈH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ÛØYØYÙ[ÜÜX×Ù›Ü—ÜÙ\ÜÚ[Û‹ÛÛ‹YÙ[ÜÝÜ™JBˆYˆÜXÈ\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆ›ÝÜXË™ÝX\™˜Z[È[™›ÝÙ]ØØ\Ê
+K™Y˜][ÜÛXÚY\È[™Ù]ÜÛXÞWÜÝÜ™J
+H\È›Û™N‚ˆ™]\›ˆ›Û™B‚ˆ[™Ú[™HH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆØZ[ÜÛXÞWÙ[™Ú[™WÙœ›ÛWÜÜXËÜXËÙ\ÜÚ[Û—ÚYÛÛ™\œØ][Û—ÜÝÜ™KÛÛ‚ˆ
+BˆÝH]˜[X][ÛÛÛ^
+ˆ\ÙOT\ÙK”‘TÔÓ”ÑKˆÛÛ[X\ÜÚ\Ý[Ý^ˆÛÛÛ˜[YOS›Û™KˆXÝÜXXÝÜ‹ˆ
+Bˆ™\Ý[H]ØZ][™Ú[™K™]˜[X]JÝ
+B‚ˆYˆ™\Ý[˜XÝ[ÛˆOHÛXÞPXÝ[Û‹SÕÎ‚ˆYˆ™\Ý[œÙ]ÛX™[Î‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+[™Ú[™K˜\WÛX™[ÝÜš]\Ë™\Ý[œÙ]ÛX™[ÊBˆ™]\›ˆ›Û™B‚ˆÈS–H8 %Z[H[šYY›ÙHÚ]Ù[[™[^‚ˆÈHØ[\ˆ\œÚ\ÝÈ\È[ÙYšYY›ÙH[œÝXYÙˆBˆÈÜšYÚ[˜[
+Ü[ÛˆŠK‚ˆYˆ™\Ý[œÙ]ÛX™[Î‚ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+[™Ú[™K˜\WÛX™[ÝÜš]\Ë™\Ý[œÙ]ÛX™[ÊBˆ™X\ÛÛˆH™\Ý[œ™X\ÛÛˆÜˆ‘[šYYžHÛXÞH‚ˆÙ[[™[Hˆž×ÑS–WÔÑS•S‘SÔ‘Q’V^Ü™X\ÛÛŸWH‚ˆ[šYYØ›ÙHHÜ™\XÙWÝ^Ú[—ÛY\ÜØYÙWØ›ÙJ›ÙKÙ[[™[
+Bˆ™]\›ˆÂˆ™\™XÝŽˆ™[žH‹ˆœ™X\ÛÛˆŽˆ™X\ÛÛ‹ˆ—Ù[šYYØ›ÙHŽˆ[šYYØ›ÙKˆB‚‚˜\Þ[˜ÈYˆÜÝ™X[WÛ]™WÙ]™[Êˆ™\]Y\Ýˆ™\]Y\ÝˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛ—ÜÝXœØÜšX™YˆØ[X›VÖ×K]ØZ]X›VÒ]\˜X›VÙXÝÜÝ‹[žWWWWH›Û™HH›Û™KˆšY]Ù\—Ý\Ù\—ÚYˆÝˆ›Û™HH›Û™KˆšY]Ù\—ÚYNˆ›ÛÛH˜[ÙKˆ™\Ù[˜ÙWÜ›ÛÝÚYˆÝˆ›Û™HH›Û™KŠHOˆ\Þ[˜Ò]\˜]Ü–ÜÝ—N‚ˆˆˆ‚ˆZY[ÔÑKY›Ü›X]Y]™[Èœ›ÛHHÛÛ™\œØ][Û‰ÜÈ]™HÝ™X[K‚‚ˆ]™[È\™H[]™\™Y]™Hœ›ÛHH[ÛY[™[˜Î˜Ù\ÜÚ[Û—ÜÝ™X[KœÝXœØÜšX™Xˆ\È[›ÚÙY›ÜØ\™8 %\™H\È›ÈY™™\ˆ[™›È™\^Kˆ]™[ÂˆX›\ÚY™Y›Ü™H\ÈÙ[™\˜]ÜˆÝXœØÜšX™Y\™HÜÝÈÛY[Âˆ™XÛÛ˜Ú[H™K\ÝXœØÜšX™HÝ]HšXHHÛ˜\ÚÝ[™Ú[ˆ
+ÑUÝŒKÜÙ\ÜÚ[ÛœËÞÚYX
+H[™Y\HžH][HY‚‚ˆÛˆ›Ü›X[ÛÛ\][Ûˆ
+ÝXœØÜšX™H[™ÈÜˆH\ØÛÛ›™XÝÚXÚÂˆœ™XZÜÈHÛÜ
+H\ÈÙ[™\˜]Üˆ[Z]ÈHÑÓ‘WXÙ[[™[ÛÂˆÙ[X™Z]™YÔÑHÛÛœÝ[Y\œÈÙYHHÛX[ˆÝ™X[H\›Z[˜][Û‹ˆBˆÝXœØÜšX™\‹\]Y]YHÝ™\™›ÝÈ[œÝXY[™ÈÚ]Ý]ÑÓ‘WXÛÈÛY[Âˆ™X]]\ÈH›ÜY˜[œÜÜ™XÛÛ›™XÝ[™™XÛÛ˜Ú[Hœ›ÛHBˆ\œÚ\ÝYÛ˜\ÚÝ‚‚ˆš[˜[X\ÈÛX[\[Û›H
+™\Ù[˜ÙH\™YÚ\Ý˜][ÛŠNˆZY[[™Âˆœ›ÛHš[˜[X\š[™ÈÛY[XÛÜÙXÈÙ[™\˜]Ü‘^]ˆ˜Z\Ù\È[[YQ\œ›ÜŽˆ\Þ[˜ÈÙ[™\˜]ÜˆYÛ›Ü™YÙ[™\˜]Ü‘^]‚ˆHÝXœØÜšX™H]\˜]Üˆ\ÈÜ˜\Y[ˆÛÛ^X‹˜XÛÜÚ[™ØÛÂˆÝ]\ˆXÛÜÙXX\œÈÝÛˆHX‹\ÝXˆÝXœØÜšX™\ˆÛÝˆ[[YYX][H
+H˜\™H\Þ[˜È›Ü˜ÛÝ[Y™\ˆ]ÈÐÊK‚‚ˆXXÚ[Z]YXÝ\È˜[Y]YYØZ[œÝˆ™]N˜Ù\™\”Ý™X[Q]™[]HÚ\™H›Ý[™\žHÛÈH[[YBˆ]X›\Ú\È[ˆ[›[Ù[Y\X˜Z[ÈÝY˜]\ˆ[‚ˆÙ\šX[^š[™È[ˆ[šÛ›ÝÛˆ]™[™\˜˜][K‚‚ˆHÝXœØÜšX™HØ[\ÜÙ\ÈH™XYWÙ]™[X\™X]\ÂˆX\™X]Ú[\˜[ÜØˆH™XYHX\™X]\ÈZY[Yˆ[[YYX][HY\ˆH]™K]Z[ÝXœØÜšX™\ˆÛÝ\È™YÚ\Ý\™Yˆ™Y›Ü™H[žHÛ˜\ÚÝÛÚÈ[œËÛÈÛY[ÈØ[ˆØZ]›ÜˆBˆÛÛ˜Ü™]HÝXœØÜš\[ÛˆXÚÛ›ÝÛYÛY[™Y›Ü™HÜÝ[™ÈH˜\ÝˆÛ™K\ÚÝ\›‹ˆH[\˜[X\™X]ÙY\È[ˆYHÝ™X[Bˆ[Z][™ÈÙ\ÜÚ[Û‹šX\™X]]™[ÈÛˆHš^YØY[˜ÙH
+ÙYBˆ™]N˜ÔÑTÔÒSÓ—ÔÕ‘PSWÒPT•‘PUÒS•T•SÔØ
+KˆÚ]Ý]]ˆHÝ™X[H]Ú]È™]ÙY[ˆ\›œÈ\È›Ý[™ÈÜ›ÜÜÚ[™ÈHÚ\™NÂˆHÛY[	ÜÈÔÑH™XY][Y[Ý][™\È›Ý]IÜÂˆ™\]Y\Ýš\×Ù\ØÛÛ›™XÝY
+
+XÚXÚÈ
+Û›HÛYÛˆ]™[ˆ\œš]˜[
+H›ÝYÈ›ÜˆZ[]\ÈY\ˆH[‹[Ü[ˆÛØÚÙ]›Ü›\Âˆ
+K™ËˆY\ˆH\ÜÛY\
+KˆHX\™X]Ú]™\È›ÝÚY\ÈBˆ™YÝ[\ˆž]HÈš\™HYØZ[œÝ‚‚ˆœ\˜[H™\]Y\ÝˆH˜\ÝTH™\]Y\Ý\ÙYÈ]XÝ\ØÛÛ›™XÝ‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\ˆÚÜÙHÝ™X[BˆÈÝXœØÜšX™HËK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HÛ—ÜÝXœØÜšX™YˆÜ[Û˜[Û˜\ÚÝ[Û‹XÛÛ›™XÝÛÚÈ›ÜØ\™YÂˆ™[˜Î˜Ù\ÜÚ[Û—ÜÝ™X[KœÝXœØÜšX™XÈ]È]™[È\™HZY[YZXYÙ‚ˆH]™HZ[ÛÈHœ™\ÚÛY[ÙY\ÈÝ\œ™[™\ÛÝ\˜ÙHÝ]BˆÚ]Ý]Û[™Ëˆ›Û™X
+Y˜][
+HÙY\ÈH\™H]™K]Z[ˆÚ\H\ÙYžHØ[\œÈ]™XÛÛ˜Ú[HšXHHÛ˜\ÚÝ[™Ú[‚ˆœ\˜[HšY]Ù\—Ý\Ù\—ÚYˆ]][XØ]YY[]HÈ™YÚ\Ý\ˆ[ˆBˆÙ\ÜÚ[Û‰ÜÈ™\Ù[˜ÙH™YÚ\ÝžH›Üˆ\ÈÝ™X[IÜÈY™][YKK™Ë‚ˆ˜[XÙP^[\K˜ÛÛH˜ˆ›Û™X
+Y˜][[™H™\Ù\™YˆÚ[™ÛK]\Ù\ˆÙ[[™[X\YšXH]šX][Û—Ý\Ù\˜
+HÚÚ\Âˆ™\Ù[˜ÙH˜XÚÚ[™È[\™[K‚ˆœ\˜[HšY]Ù\—ÚYNˆHšY]Ù\‰ÜÈÛÛ›™XÝ][YHYH›YÈ
+X‚ˆ˜XÚÙÜ›Ý[™Y
+Kœ›ÛHH›Ý]IÜÈYX]Y\žH\˜[KˆYÛ›Ü™YˆÚ[ˆ
+šY]Ù\—Ý\Ù\—ÚY
+ˆ\È›Û™X‚ˆœ\˜[H™\Ù[˜ÙWÜ›ÛÝÚYˆ›ÛÝÛÛ™\œØ][ÛˆÙˆHÝ™X[YYˆÙ\ÜÚ[Û‰ÜÈ™YH
+]È›ÛÝØÛÛ™\œØ][Û—ÚY
+KK™Ë‚ˆ˜ÛÛ—Ü›ÛÝLŒÈ˜ˆ™\Ù[˜ÙH\ÈØÛÜYÈH™YIÜÈ›ÛÝÛÂˆšY]Ù\œÈÙˆY™™\™[YÙ[ËÜÝX‹XYÙ[È[ˆÛ™HÙ\ÜÚ[ÛˆÙYBˆXXÚÝ\‹ˆ™\]Z\™YÚ[ˆ
+šY]Ù\—Ý\Ù\—ÚY
+ˆ\ÈÙ]ÈYÛ›Ü™YˆÝ\Ú\ÙK‚ˆœ™]\›œÎˆ[ˆ\Þ[˜È]\˜]ÜˆÙˆÔÑHY\ÜØYÙHÝš[™ÜË‚ˆœ˜Z\Ù\È˜[YQ\œ›ÜŽˆYˆ
+šY]Ù\—Ý\Ù\—ÚY
+ˆ\ÈÙ]Ú]Ý]ˆ
+œ™\Ù[˜ÙWÜ›ÛÝÚY
+ˆ8 %H\‹XÛÛ™\œØ][Ûˆ™\Ù[˜ÙHØÛÜHÛÝ[ˆÚ[[HÜ]HÙ\ÜÚ[Û‰ÜÈšY]Ù\œÈ\ˆYÙ[‚ˆˆˆ‚ˆÈ™\Ù[˜ÙH™YÚ\Ý\œÈ™Y›Ü™HHÝXœØÜšX™HÛÜˆH›Ú[ˆœ›ØYØ\ÝˆÈ˜[œÈÝ]ÈS‘PQK\ÝXœØÜšX™YÛË]šY]Ù\œËÚ[H\ÈÝ™X[BˆÈX\›œÈH[\Ý
+Ù[ˆ[˜ÛYY
+Hœ›ÛHHÛ˜\ÚÝ[Û‹XÛÛ›™XÝˆÈ™\Ù[˜ÙH]™[8 %[\Ý]H]™[ÈXZÙH]Ü™\š[™È˜XÙH™[šYÛ‹‚ˆ™\Ù[˜ÙWÝÚÙ[ŽˆÝˆ›Û™HH›Û™BˆYˆšY]Ù\—Ý\Ù\—ÚY\È›Ý›Û™N‚ˆYˆ™\Ù[˜ÙWÜ›ÛÝÚY\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠœ™\Ù[˜ÙWÜ›ÛÝÚY\È™\]Z\™YÚ[ˆšY]Ù\—Ý\Ù\—ÚY\ÈÙ]ŠBˆ™\Ù[˜ÙWÝÚÙ[ˆH™\Ù[˜ÙK˜ÛÛ›™XÝ
+ˆ™\Ù[˜ÙWÜ›ÛÝÚYÙ\ÜÚ[Û—ÚYšY]Ù\—Ý\Ù\—ÚYšY]Ù\—ÚYBˆ
+BˆžN‚ˆÈXÛÜÚ[™Ø›ÜYØ]\ÈÝ]\ˆXÛÜÙX[ÈÝXœØÜšX™XÂˆÈH˜\™H\Þ[˜È›Ü˜ÛÝ[X]™HHÝXœØÜšX™\ˆÛÝ[[ÐË‚ˆ\Þ[˜ÈÚ]ÛÛ^X‹˜XÛÜÚ[™ÊˆÙ\ÜÚ[Û—ÜÝ™X[KœÝXœØÜšX™JˆÙ\ÜÚ[Û—ÚYˆX\™X]Ú[\˜[ÜÏWÔÑTÔÒSÓ—ÔÕ‘PSWÒPT•‘PUÒS•T•SÔËˆ™XYWÙ]™[^È\HŽˆœÙ\ÜÚ[Û‹šX\™X]ŸKˆÈ[‹Y›YÚ^™\^H]\Ý™HØ\\™YÞ[˜Ú›Û›Ý\ÛH]ÛÝˆÈ™YÚ\Ý˜][Ûˆ
+™Y›Ü™H™XYWÙ]™[Ý\Ü[™ÊK›Ý[ˆBˆÈ\Þ[˜ÈÛ—ÜÝXœØÜšX™YÛÚËÜˆÚ[™ÝÈ[\ÈÝX›K\™[™\‹‚ˆÈ™\ÛÝ\˜ÙHÝ]HÝ^\È[ˆÛ—ÜÝXœØÜšX™Y8 %]™YYÂˆÈ]ØZ]È[™\È›ÝY\\Ù[œÚ]]™K‚ˆ™WÜ™XYWÜÛ˜\ÚÝ[[X™Nˆ[™›YÚÝ^œÛ˜\ÚÝÙ›ÜŠÙ\ÜÚ[Û—ÚY
+KˆÛ—ÜÝXœØÜšX™Y[Û—ÜÝXœØÜšX™Yˆ
+Bˆ
+H\È]™WÙ]™[Î‚ˆ\Þ[˜È›Üˆ]™[[ˆ]™WÙ]™[Î‚ˆYˆ]ØZ]™\]Y\Ýš\×Ù\ØÛÛ›™XÝY
+
+N‚ˆœ™XZÂˆ]™[Ý\HH]™[™Ù]
+\HŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ]™[Ý\KÝŠN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆˆœÙ\ÜÚ[ÛˆÝ™X[H]™[Z\ÜÚ[™ÈÝš[™È\XšY[ˆÙ]™[\ŸH‹ˆ
+Bˆ˜[Y]YHÔÑT•‘T—ÔÕ‘PSWÑU‘S•ÐQTT‹˜[Y]WÜ]ÛŠ]™[
+BˆZY[Ù›Ü›X]ÜÜÙJ]™[Ý\K˜[Y]Y›[Ù[Ù[\
+
+JBˆ^Ù\Ù\ÜÚ[Û—ÜÝ™X[K”ÝXœØÜšX™\“Ý™\™›ÝÑ\œ›ÜŽ‚ˆÛÙÙÙ\‹Ø\›š[™ÊˆœÙ\ÜÚ[ÛˆÝ™X[HÝXœØÜšX™\ˆÝ™\™›ÝÙY›Üˆ	\ÎÈÛÜÚ[™È›ÜˆÛ˜\ÚÝ™XÛÛ›™XÝ‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ[ÙN‚ˆÈ›Ü›X[ÛÛ\][ÛˆÛ›H8 %™]™\ˆZY[œ›ÛHš[˜[X
+XÛÜÙHÂˆÈÙ[™\˜]Ü‘^]ÛÝ[˜Z\ÙH\Þ[˜ÈÙ[™\˜]ÜˆYÛ›Ü™YÙ[™\˜]Ü‘^]
+K‚ˆZY[™]NˆÑÓ‘WW—ˆ‚ˆš[˜[N‚ˆÈH›Û‹S›Û™HÚXÚÜÈ™\ÚY\È™\Ù[˜ÙWÝÚÙ[‰ÜÈ\™H\BˆÈ˜\œ›ÝÚ[™ÈÛ›NˆHZ[YÚÙ[ˆ[\Y\È›ÝÙ\™HÙ]X›Ý™K‚ˆYˆ
+ˆ™\Ù[˜ÙWÝÚÙ[ˆ\È›Ý›Û™Bˆ[™šY]Ù\—Ý\Ù\—ÚY\È›Ý›Û™Bˆ[™™\Ù[˜ÙWÜ›ÛÝÚY\È›Ý›Û™Bˆ
+N‚ˆ™\Ù[˜ÙK™\ØÛÛ›™XÝ
+™\Ù[˜ÙWÜ›ÛÝÚYšY]Ù\—Ý\Ù\—ÚY™\Ù[˜ÙWÝÚÙ[ŠB‚‚™YˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊ˜[YNˆ\ÝÜÝ—H›Û™JHOˆ\ÝÜÝ—H›Û™N‚ˆˆˆ‚ˆ˜[Y]H\‹\Ù\ÜÚ[Ûˆ˜]]™K]\›Z[˜[\ÜË]›ÝYÚ\™ÜË‚‚ˆ[™›Ü˜Ù\ÈH›]\ÝÙˆÝš[™ÜÈÚ][ˆ›Ý[™YÛÝ[È[™Ý‚ˆH›][\ÝÚ\H\ÈHÙXÝ\š]H›Ý[™\žNˆ\™H\È›ÈÙ^H›Ü‚ˆHØ[\ˆÈÛ]YÙÛH[\›˜[][˜ÚÚ\š[™È
+œšYÙH\‹Û[šYÙ[T“ˆ]]
+H›ÝYÚ8 %ÜÙHÝ^H[›™\‹[ÝÛ™Y
+ÙYBˆ\ÚYÛœËÓUU‘WÔ•S“‘T—ÔÑT•‘T—ÓUSÒ›Y
+K‚‚ˆœ\˜[H˜[YNˆHØ[™Y]H\™ÜËK™Ë‚ˆÈ‹KY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœÈ—XÜˆ›Û™XÈX]™Bˆ[œÙ]È[˜Ú[™ÙY‚ˆœ™]\›œÎˆH˜[Y]Y\Ý[˜Ú[™ÙYÜˆ›Û™XÚ[ˆ
+˜[YJ‚ˆ\È›Û™X‚ˆœ˜Z\Ù\È˜[YQ\œ›ÜŽˆYˆ
+˜[YJˆ\È›ÝH\ÝÙˆÝš[™ÜË^ÙYYÂˆ™]N˜ÓPVÕT“RSSÓUSÒÐT‘ÔØ[šY\ËÜˆ[žH[žBˆ^ÙYYÈ™]N˜ÓPVÕT“RSSÓUSÒÐT‘×ÓS˜Ú\˜XÝ\œË‚ˆˆˆ‚ˆYˆ˜[YH\È›Û™N‚ˆ™]\›ˆ›Û™BˆYˆ›Ý\Ú[œÝ[˜ÙJ˜[YK\Ý
+HÜˆ›Ý[
+\Ú[œÝ[˜ÙJ\™ËÝŠH›Üˆ\™È[ˆ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ\›Z[˜[Û][˜ÚØ\™ÜÈ]\Ý™HH\ÝÙˆÝš[™ÜÈŠBˆYˆ[Š˜[YJHˆÓPVÕT“RSSÓUSÒÐT‘ÔÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ\›Z[˜[Û][˜ÚØ\™ÜÈ^ÙYYÈ×ÓPVÕT“RSSÓUSÒÐT‘ÔßH[šY\ÈŠBˆ›Üˆ\™È[ˆ˜[YN‚ˆYˆ[Š\™ÊHˆÓPVÕT“RSSÓUSÒÐT‘×ÓSŽ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆˆ\›Z[˜[Û][˜ÚØ\™ÜÈ[žH^ÙYYÈ×ÓPVÕT“RSSÓUSÒÐT‘×ÓSŸHÚ\˜XÝ\œÈ‚ˆ
+Bˆ™]\›ˆ˜[YB‚‚™YˆÝ˜[Y]YØÛÜÝØÛÛ›ÛÛ[ÙWÛÝ™\œšYJ˜[YNˆÝˆ›Û™JHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ˜[Y]HHØ[\‹\Ý\YY\‹\Ù\ÜÚ[ÛˆÛÜÝXÛÛ›ÛÝÚ]Ú‚‚ˆœ\˜[H˜[YNˆHØ[™Y]H˜[YKK™Ëˆ›Ûˆ˜Üˆ›Û™XˆÚ[ˆHØ[\ˆY›ÝÙ]ÈØ[ÈÈÛX\ˆHÝ™\œšYK‚ˆœ™]\›œÎˆH˜[YH[˜Ú[™ÙYÚ[ˆ˜[YÜˆ›Û™X‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ
+[˜[YÚ[œ]
+HÚ[ˆ
+˜[YJˆ\Âˆ[ž][™ÈÝ\ˆ[ˆ›Ûˆ˜›Ù™ˆ˜Üˆ›Û™X‚ˆˆˆ‚ˆYˆ˜[YH\È›Û™HÜˆ˜[YH[ˆÓÔÕÐÓÓ•“ÓÓÕ‘T”’QWÕSQTÎ‚ˆ™]\›ˆ˜[YBˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš[˜[YÛÜÝØÛÛ›ÛÛ[ÙWÛÝ™\œšYNˆÝ˜[YH\ŸH
+^XÝY	ÛÛ‰Ë	ÛÙ™‰ËÜˆ[ÈÛX\ŠH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+B‚‚™YˆÝ˜[Y]YÜÝX˜YÙ[Ü›Ý][™×ÛÝ™\œšYJ˜[YNˆÝˆ›Û™JHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ˜[Y]HHØ[\‹\Ý\YY\‹\Ù\ÜÚ[ÛˆÝX˜YÙ[\›Ý][™ÈÝÚ]Ú‚‚ˆÛË\Ý]Nˆ›Ûˆ˜›Ý]\ÈÝX˜YÙ[Ü]ÛœÈ[™›Ù™ˆ˜È[œÙ]›Ýˆ™XY\ÈY˜][ˆ›Û™Xœ›ÛHHUÒÛX\œÈHÝÜ™Y˜[YKÚXÚˆ[™ÈHÙ\ÜÚ[ÛˆÛˆY˜][˜]\ˆ[ˆ[š\š][™È[ž][™Ë‚‚ˆœ\˜[H˜[YNˆHØ[™Y]H˜[YKK™Ëˆ›Ûˆ˜Üˆ›Û™XÚ[‚ˆHØ[\ˆY›ÝÙ]ÈØ[ÈÈÛX\ˆHÝ™\œšYK‚ˆœ™]\›œÎˆH˜[YH[˜Ú[™ÙYÚ[ˆ˜[YÜˆ›Û™X‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ
+[˜[YÚ[œ]
+HÚ[ˆ
+˜[YJˆ\Âˆ[ž][™ÈÝ\ˆ[ˆ›Ûˆ˜›Ù™ˆ˜Üˆ›Û™X‚ˆˆˆ‚ˆYˆ˜[YH\È›Û™HÜˆ˜[YH[ˆÕPQÑS•Ô“ÕUS‘×ÓÕ‘T”’QWÕSQTÎ‚ˆ™]\›ˆ˜[YBˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš[˜[YÝX˜YÙ[Ü›Ý][™×ÛÝ™\œšYNˆÝ˜[YH\ŸH
+^XÝY	ÛÛ‰Ë	ÛÙ™‰ËÜˆ[ÈÛX\ŠH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+B‚‚™YˆÜ\œÙWÜÙ\ÜÚ[Û—ØÜ™X]WÛY]Y]JY]Y]NˆÝŠHOˆÙ\ÜÚ[ÛÜ™X]SY]Y]N‚ˆˆˆ‚ˆ\œÙHH”ÓÓˆY]Y]H\œ›ÛH[™YÙ\ÜÚ[ÛˆÜ™X][Û‹‚‚ˆœ\˜[HY]Y]Nˆ˜]È”ÓÓˆÝš[™Èœ›ÛHH][\\›Ü›KˆK™ËˆÈ]HŽˆ™XYÈ]]›ÝÈŸX‚ˆœ™]\›œÎˆ˜[Y]Y˜Û\ÜÎ˜Ù\ÜÚ[ÛÜ™X]SY]Y]X‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆH”ÓÓˆ˜Z[ÈH™\]Y\ÝØÚ[XK‚ˆˆˆ‚ˆžN‚ˆ\œÙYHÙ\ÜÚ[ÛÜ™X]SY]Y]K›[Ù[Ý˜[Y]WÚœÛÛŠY]Y]JBˆ™X\ÛÛš[™×ÙY™›ÜH˜[Y]WÙY™›Ü
+ˆ\œÙYœ™X\ÛÛš[™×ÙY™›ÜˆœÙ\ÜÚ[ÛˆY]Y]H‹ˆQ‘“Ô•ÕSQTËˆ
+Bˆ[Ù[ÛÝ™\œšYHH
+ˆ˜[Y]WÛ[Ù[ÛÝ™\œšYJ\œÙY›[Ù[ÛÝ™\œšYJBˆYˆ\œÙY›[Ù[ÛÝ™\œšYH\È›Ý›Û™Bˆ[ÙH›Û™Bˆ
+BˆÈ›Ý[™ËXÚXÚÈH˜]]™K]\›Z[˜[\™ÜÎÈ˜Z\Ù\È˜[YQ\œ›Ü‚ˆÈ
+Ü˜\Y™[ÝÊHÛˆHX[›Ü›YYÜˆÝ™\œÚ^™Y\Ý‚ˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊ\œÙY\›Z[˜[Û][˜ÚØ\™ÜÊBˆ™]\›ˆ\œÙY›[Ù[ØÛÜJˆ\]O^Âˆœ™X\ÛÛš[™×ÙY™›ÜŽˆ™X\ÛÛš[™×ÙY™›Üˆ›[Ù[ÛÝ™\œšYHŽˆ[Ù[ÛÝ™\œšYKˆBˆ
+Bˆ^Ù\
+˜[Y][Û‘\œ›Ü‹˜[YQ\œ›ÜŠH\È^Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆš[˜[YÙ\ÜÚ[ÛˆY]Y]NˆÙ^ßH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+Hœ›ÛH^Â‚‚™YˆÛ][\\ÛZ\ÜÚ[™×Ù]Z[
+šY[ˆÝŠHOˆXÝÜÝ‹[žWN‚ˆˆˆ‚ˆZ[H˜\ÝTK\Ý[HZ\ÜÚ[™È][\\šY[\œ›Ü‹‚‚ˆœ\˜[HšY[ˆZ\ÜÚ[™È›Ü›HšY[˜[YKK™Ëˆ˜[™H˜‚ˆœ™]\›œÎˆH˜[Y][Û‹Y]Z[XÝ›ÜˆŒˆ™\ÜÛœÙ\Ë‚ˆˆˆ‚ˆ™]\›ˆÂˆ\HŽˆ›Z\ÜÚ[™È‹ˆ›ØÈŽˆÈ˜›ÙH‹šY[Kˆ›\ÙÈŽˆ‘šY[™\]Z\™Y‹ˆš[œ]Žˆ›Û™KˆB‚‚™YˆÜ™\]Z\™WÚÜÝØÛÛ›—Ù›Ü—ÝÛÜšÝ™YJÜÝÚYˆÝˆ›Û™K™\]Y\Ýˆ™\]Y\Ý
+HOˆÜÝÛÛ›™XÝ[ÛŽ‚ˆˆˆ‚ˆ™\ÛÛ™HH]™HÜÝÛÛ›™XÝ[Ûˆ›ÜˆHÛÜšÝ™YHÜ\˜][Û‹‚‚ˆœ\˜[HÜÝÚYˆ\™Ù]ÜÝYœ›ÛHHÙ\ÜÚ[Ûˆ™\]Y\ÝK™Ë‚ˆšÜÝØLXŒ˜ÌÙ‹‹ˆ˜ˆ›Û™X\È™Z™XÝY8 %Ú]ÛÜšÝ™YBˆÜ™X][Ûˆ™\]Z\™\ÈHÜÝ
+HÙ\™\ˆ\È›Èš[\Þ\Ý[JK‚ˆœ\˜[H™\]Y\Ýˆ˜\ÝTH™\]Y\ÝØ\œžZ[™È\œÝ]KšÜÝÜ™YÚ\ÝžX‚ˆœ™]\›œÎˆH]™H˜Û\ÜÎ˜ÜÝÛÛ›™XÝ[Û˜›ÜˆÜÝÚY‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ[˜[YÚ[œ]Ú[ˆÜÝÚY\Âˆ›Û™XÈ[\›˜[Ù\œ›Ü˜Ú[ˆ›ÈÜÝ™YÚ\ÝžH\ÂˆÛÛ™šYÝ\™YÈÛÛ™›XÝÚ[ˆHÜÝ\ÈÙ™›[™K‚ˆˆˆ‚ˆYˆÜÝÚY\È›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™Ú]ÛÜšÝ™YHÜ™X][Ûˆ™\]Z\™\ÈÜÝÚY‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÜÝÜ™YÚ\ÝžHHØ\Ý
+ÜÝ™YÚ\ÝžH›Û™KÙ]]Š™\]Y\Ý˜\œÝ]KšÜÝÜ™YÚ\ÝžH‹›Û™JJBˆYˆÜÝÜ™YÚ\ÝžH\È›Û™N‚ˆÈÙ\™\ˆZ\ØÛÛ™šYÝ\˜][Û‹›Ý˜YÛY[[œ]8 %Z\œ›Ü‚ˆÈÝ˜[Y]WÜÙ\ÜÚ[Û—ÝÛÜšÜÜXÙKÚXÚ[ÛÈ™]\›œÈ[\›˜[Ù\œ›Ü‹‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆšÜÝ™YÚ\ÝžH\È›ÝÛÛ™šYÝ\™YÈØ[››ÝÜ™X]HHÛÜšÝ™YH‹ˆÛÙOQ\œ›ÜÛÙK’S•T“SÑT”“Ô‹ˆ
+BˆÜÝØÛÛ›ˆHÜÝÜ™YÚ\ÝžK™Ù]
+ÜÝÚY
+BˆYˆÜÝØÛÛ›ˆ\È›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆšÜÝÚÜÝÚY\ŸH\ÈÙ™›[™NÈ™XÛÛ›™XÝHÜÝ[™žHYØZ[ˆ‹ˆÛÙOQ\œ›ÜÛÙKÓÓ‘“PÕˆ
+Bˆ™]\›ˆÜÝØÛÛ›‚‚‚˜\Þ[˜ÈYˆØÜ™X]WÜÙ\ÜÚ[Û—ÝÛÜšÝ™YJˆ
+‹ˆÜÝÚYˆÝˆ›Û™KˆÛÝ\˜ÙWÜ™\ÎˆÝˆ›Û™KˆÚ]ˆÙ\ÜÚ[Û‘Ú]Ü[ÛœËˆ™\]Y\Ýˆ™\]Y\ÝŠHOˆÜ™X]YÛÜšÝ™YN‚ˆˆˆ‚ˆÜ™X]HHÚ]ÛÜšÝ™YHÛˆHÜÝ›ÜˆH™]ÈÙ\ÜÚ[Ûˆœ˜[˜Ú‚‚ˆ˜[Y]\ÈHœ˜[˜Ú˜[YHÙ\™\‹\ÚYH
+HÜÝ™K]˜[Y]\ÊK[‚ˆ›ÞY\ÈÜÝ˜Ü™X]WÝÛÜšÝ™YXˆH™]\›™YÛÜšÝ™YH]ˆ™XÛÛY\ÈHÙ\ÜÚ[ÛˆÛÜšÜÜXÙXˆÙYBˆ\ÚYÛœËÔÑTÔÒSÓ—ÑÒUÕÓÔ’Õ‘QK›Y‚‚ˆœ\˜[HÜÝÚYˆ\™Ù]ÜÝYK™ËˆšÜÝØLXŒ˜ÌÙ‹‹ˆ˜‚ˆ™\]Z\™Y
+ÛÜšÝ™YHÜ™X][Ûˆ™YYÈHÜÝ
+K‚ˆœ\˜[HÛÝ\˜ÙWÜ™\ÎˆØ[›ÛšXØ[]ÙˆHXÚÙYÛÝ\˜ÙH™\È
+Bˆ›Ý[™\žK]˜[Y]YÛÜšÜÜXÙJKK™Ëˆ‹Õ\Ù\œËØ[XÙKÛ^\™\È˜‚ˆ›Û™X\ÈH›ÙÜ˜[[Z[™È\œ›Üˆ[™˜Z[ÈÝY‚ˆœ\˜[HÚ]ˆ˜[Y]YÚ]Ü[ÛœÈ
+œ˜[˜ÚÛ˜[YXÜ[Û˜[ˆ˜\ÙWØœ˜[˜Ú
+K‚ˆœ\˜[H™\]Y\Ýˆ˜\ÝTH™\]Y\ÝØ\œžZ[™ÈHÜÝ™YÚ\ÝžK‚ˆœ™]\›œÎˆHÜ™X]YÛÜšÝ™YIÜÈÛÜšÝ™YWÜ]
+ÈÝÜ™H\ÂˆÛÜšÜÜXÙX
+H[™œ˜[˜Ú
+ÈÝÜ™H\ÈÚ]Øœ˜[˜Ú
+K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ[˜[YÚ[œ]›ÜˆH˜Yœ˜[˜Ú˜[YKˆZ\ÜÚ[™ÈÛÝ\˜ÙH™\ËÜˆHÜÝ\™\ÜYÚ]˜Z[\™H
+\XØ]Bˆœ˜[˜Ú˜Y˜\ÙH™Y‹›ÝH™\ÊNÈÛÛ™›XÝÚ[ˆHÜÝ\ÂˆÙ™›[™HÜˆ[œ™\ÜÛœÚ]™NÈ[\›˜[Ù\œ›Ü˜Ú[ˆ›ÈÜÝ™YÚ\ÝžBˆ\ÈÛÛ™šYÝ\™Y‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[šÜÝ™Ú]ÝÛÜšÝ™YH[\ÜÛÜšÝ™YQ\œ›Ü‹˜[Y]WØœ˜[˜ÚÛ˜[YBˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\Ë—ÚÜÝÝÛÜšÝ™YH[\Ü
+ˆÛÜšÝ™YRÜÝ[˜]˜Z[X›Q\œ›Ü‹ˆÛÜšÝ™YT›ÞQ\œ›Ü‹ˆÜ™X]WÝÛÜšÝ™YWÛÛ—ÚÜÝˆ
+B‚ˆYˆÛÝ\˜ÙWÜ™\È\È›Û™NˆÈ˜YÛXNˆ›ÈÛÝ™\ˆ8 %ÜÝÚYÝX\˜[Y\ÈHÛÜšÜÜXÙBˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆ™Ú]ÛÜšÝ™YHÜ™X][Ûˆ™\]Z\™\ÈHÛÝ\˜ÙH™\ÜÚ]ÜžHÛÜšÜÜXÙH‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆžN‚ˆ˜[Y]WØœ˜[˜ÚÛ˜[YJÚ]˜œ˜[˜ÚÛ˜[YJBˆ^Ù\ÛÜšÝ™YQ\œ›Üˆ\È^Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠ^Ë›Y\ÜØYÙKÛÙOQ\œ›ÜÛÙK’S•SQÒS”U
+Hœ›ÛH^Â‚ˆÜÝØÛÛ›ˆHÜ™\]Z\™WÚÜÝØÛÛ›—Ù›Ü—ÝÛÜšÝ™YJÜÝÚY™\]Y\Ý
+BˆÜÝÜ™YÚ\ÝžHH™\]Y\Ý˜\œÝ]KšÜÝÜ™YÚ\ÝžBˆžN‚ˆ™]\›ˆ]ØZ]Ü™X]WÝÛÜšÝ™YWÛÛ—ÚÜÝ
+ˆÜÝÜ™YÚ\ÝžOZÜÝÜ™YÚ\ÝžKˆÜÝØÛÛ›ZÜÝØÛÛ›‹ˆ™\×Ü]\ÛÝ\˜ÙWÜ™\Ëˆœ˜[˜ÚÛ˜[YOYÚ]˜œ˜[˜ÚÛ˜[YKˆ˜\ÙWØœ˜[˜ÚYÚ]˜˜\ÙWØœ˜[˜Úˆ^\Ý[™×Øœ˜[˜ÚYÚ]™^\Ý[™×Øœ˜[˜Úˆ
+Bˆ^Ù\ÛÜšÝ™YRÜÝ[˜]˜Z[X›Q\œ›Üˆ\È^Î‚ˆÈÜÝÙ™›[™HÈ[œ™\ÜÛœÚ]™H8 %[™œ˜K›Ý\Ù\ˆ[œ]‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠ^Ë›Y\ÜØYÙKÛÙOQ\œ›ÜÛÙKÓÓ‘“PÕ
+Hœ›ÛH^Âˆ^Ù\ÛÜšÝ™YT›ÞQ\œ›Üˆ\È^Î‚ˆÈÜÝ\™\ÜYÚ]˜Z[\™H
+\œ˜[˜Ú˜Y˜\ÙK›ÝH™\ÊH8 %ˆÈ\Ù\‹XÛÜœ™XÝX›H[œ]‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠ^Ë›Y\ÜØYÙKÛÙOQ\œ›ÜÛÙK’S•SQÒS”U
+Hœ›ÛH^Â‚‚ˆÈÜZ[ˆÙ[]WØœ˜[˜Ú]YXØ[››Ý™XXÚÚ]Ú[ˆHÜÝ[›™[ˆÈ\ÈÝÛˆ
+\Ù\œÈ\XØ[HÙYH\È\È[›™\—ÛÛ›[™Nˆ˜[ÙX
+Kˆ™Y\ÙBˆÈH[]H[œÝXYÙˆ	Ú[™ÈÜˆÚ[[HÚÚ\[™ÈÛX[\‚—ÑSUWÕÓÔ’Õ‘QWÓÑ‘“S‘WÓQTÔÐQÑHH
+ˆØ[››Ý[]HÛÜšÝ™YH8 %[›™\ˆÙ™›[™Kˆ‚ˆ‘[]HÙ\ÜÚ[ÛˆÛ›H
+[]WØœ˜[˜ÚY˜[ÙJHÜˆØZ]›ÜˆH[›™\ˆÈ™XÛÛ›™XÝˆ‚ŠB‚‚˜\Þ[˜ÈYˆÜ™[[Ý™WÜÙ\ÜÚ[Û—ÝÛÜšÝ™YWØ™\ÝÙY™›Ü
+ˆ
+‹ˆÜÝÚYˆÝ‹ˆÛÜšÝ™YWÜ]ˆÝ‹ˆœ˜[˜ÚˆÝ‹ˆ[]WØœ˜[˜Úˆ›ÛÛˆ™\]Y\Ýˆ™\]Y\Ýˆ™X\ÛÛŽˆÝ‹ˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™H›Û™HH›Û™Kˆ^ÛYWØÛÛ™\œØ][Û—ÚYˆÝˆ›Û™HH›Û™Kˆ˜Z[ÚY—Ý[˜]˜Z[X›Nˆ›ÛÛH˜[ÙKŠHOˆ›Û™N‚ˆˆˆ‚ˆ™\ÝYY™›Ü™[[Ý˜[ÙˆHÙ\ÜÚ[Û‰ÜÈÚ]ÛÜšÝ™YK‚‚ˆ\ÙY›ÜˆÜ™X]K\›Û˜XÚÈ
+Üœ[ˆÛX[\
+H[™ÜZ[ˆÙ\ÜÚ[Û‹Y[]BˆÛX[\ˆÜÝ\™\ÜYÚ]˜Z[\™\È\™HÙÙÙYÛÈHØ[\‰ÜÂˆš[X\žHÜ\˜][ÛˆÝ[ÛÛ\]\ËˆÚ[ˆ˜Z[ÚY—Ý[˜]˜Z[X›X\ÂˆÙ][ˆ[œ™XXÚX›HÜÝ˜Z\Ù\ÈÓÓ‘“PÕ[œÝXYÙˆÚÚ\[™È8 %ˆHÙ\ÜÚ[Ûˆ\ÈY[ˆXÙHÛÈHØ[\ˆØ[ˆ™]žHÚ]Ý]ˆÛÜšÝ™YHÛX[\‚‚ˆœ\˜[HÜÝÚYˆÜÝ]ÝÛœÈHÛÜšÝ™YKK™Ë‚ˆšÜÝØLXŒ˜ÌÙ‹‹ˆ˜‚ˆœ\˜[HÛÜšÝ™YWÜ]ˆXœÛÛ]HÛÜšÝ™YH\™XÝÜžHÈ™[[Ý™HÛˆBˆÜÝK™Ëˆ‹Õ\Ù\œËØ[XÙKÛ^\™\Ë]ÛÜšÝ™Y\ËÙ™X]\™K[ÙÚ[ˆ˜‚ˆœ\˜[Hœ˜[˜Úˆœ˜[˜ÚÚXÚÙYÝ][ˆHÛÜšÝ™YKK™Ë‚ˆ™™X]\™KÛÙÚ[ˆ˜‚ˆœ\˜[H[]WØœ˜[˜ÚˆÚ[ˆYX[ÛÈ[ˆÚ]œ˜[˜ÚQˆY\ˆ™[[Ýš[™ÈHÛÜšÝ™YH\™XÝÜžK‚ˆœ\˜[H™\]Y\Ýˆ˜\ÝTH™\]Y\ÝØ\œžZ[™ÈHÜÝ™YÚ\ÝžK‚ˆœ\˜[H™X\ÛÛŽˆÚÜX™[›ÜˆÙÈ[™\ËK™Ë‚ˆ˜Ü™X]K\›Û˜XÚÈ˜ÜˆœÙ\ÜÚ[Û‹Y[]H˜‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H\ÙYÈÚXÚÈÚ]\ˆ[›Ý\ˆ]™BˆÙ\ÜÚ[ÛˆÚ\™\È\È\™XÝÜžKˆ›Û™XÚÚ\ÈHÚXÚÈ8 %ÛÜœ™XÝˆ›ÜˆÜ™X]K\›Û˜XÚËÚÜÙHÛÜšÝ™YHØ\ÈXYH[ÛY[ÈYÛÈ[ˆBˆØ[YH™\]Y\Ý[™Ø[››Ý™H™Y™\™[˜ÙYžH[ž][™È[ÙK‚ˆœ\˜[H^ÛYWØÛÛ™\œØ][Û—ÚYˆHÛÛ™\œØ][ÛˆÚÜÙH[]HšYÙÙ\™Yˆ\È™[[Ý˜[^ÛYYœ›ÛH]ÚXÚËˆ™\]Z\™YÚ]ˆ
+˜ÛÛ™\œØ][Û—ÜÝÜ™J‹‚ˆœ\˜[H˜Z[ÚY—Ý[˜]˜Z[X›NˆÚ[ˆYX˜Z\ÙHÓÓ‘“PÕYˆBˆÜÝØ[››Ý™H™XXÚYÈ[ˆÚ]ˆÜ™X]K\›Û˜XÚÈX]™\È\Âˆ˜[ÙXÛÈH˜Z[YÜ™X]HÝ[Ý\™˜XÙ\È]ÈÜšYÚ[˜[\œ›Ü‹‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\Ë—ÚÜÝÝÛÜšÝ™YH[\Ü
+ˆÛÜšÝ™YRÜÝ[˜]˜Z[X›Q\œ›Ü‹ˆÛÜšÝ™YT›ÞQ\œ›Ü‹ˆ™[[Ý™WÝÛÜšÝ™YWÛÛ—ÚÜÝˆ
+B‚ˆÈH›ÜšÈ™]\Ú[™ÈHÛÝ\˜ÙIÜÈ\™XÝÜžKÜˆÙ]™\˜[Ù\ÜÚ[ÛœÈ]XÚYÂˆÈÛ™H^\Ý[™ÈÛÜšÝ™YK[[ˆ[ˆHØ[YHÝÙˆ™[[Ýš[™È][™\ˆ[BˆÈX]™\ÈZ\ˆ[›™\œÈÛˆH[]Y\™XÝÜžKÛÈX]™HHÚ\™YÛÜšÝ™YBˆÈ[Û™H[™]H\ÝÙ\ÜÚ[ÛˆÝ]ÛX[ˆ]\ˆÚXÚÙY™Y›Ü™HÜÝˆÈ™XXÚXš[]HÛÈ[ˆÙ™›[™HÜÝÙ\È›ÝHH[]H]ÛÝ[›ÝˆÈ]™HÝXÚYH\™XÝÜžH[ž]Ø^K‚ˆYˆÛÛ™\œØ][Û—ÜÝÜ™H\È›Ý›Û™H[™^ÛYWØÛÛ™\œØ][Û—ÚY\È›Ý›Û™N‚ˆÚ\™YH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™Kš\×ÛÝ\—Û]™WÜÙ\ÜÚ[Û—Ú[—ÝÛÜšÜÜXÙKˆÜÝÚYZÜÝÚYˆÛÜšÜÜXÙO]ÛÜšÝ™YWÜ]ˆ^ÛYWØÛÛ™\œØ][Û—ÚYY^ÛYWØÛÛ™\œØ][Û—ÚYˆ
+BˆYˆÚ\™Y‚ˆÛÙÙÙ\‹š[™›Êˆ’ÙY\[™ÈÛÜšÝ™YH	\È
+	\ÊNˆ[›Ý\ˆ]™HÙ\ÜÚ[ÛˆÝ[[œÈ\™H‹ˆÛÜšÝ™YWÜ]ˆ™X\ÛÛ‹ˆ
+Bˆ™]\›‚‚ˆÜÝÜ™YÚ\ÝžHHÙ]]Š™\]Y\Ý˜\œÝ]KšÜÝÜ™YÚ\ÝžH‹›Û™JBˆYˆÜÝÜ™YÚ\ÝžH\È›Û™N‚ˆYˆ˜Z[ÚY—Ý[˜]˜Z[X›N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆšÜÝ™YÚ\ÝžH\È›ÝÛÛ™šYÝ\™YÈØ[››Ý[]HHÛÜšÝ™YH‹ˆÛÙOQ\œ›ÜÛÙK’S•T“SÑT”“Ô‹ˆ
+Bˆ™]\›‚ˆÜÝØÛÛ›ˆHÜÝÜ™YÚ\ÝžK™Ù]
+ÜÝÚY
+BˆYˆÜÝØÛÛ›ˆ\È›Û™N‚ˆYˆ˜Z[ÚY—Ý[˜]˜Z[X›N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆÑSUWÕÓÔ’Õ‘QWÓÑ‘“S‘WÓQTÔÐQÑKˆÛÙOQ\œ›ÜÛÙKÓÓ‘“PÕˆ
+BˆÛÙÙÙ\‹Ø\›š[™Êˆ”ÚÚ\[™ÈÛÜšÝ™YH™[[Ý˜[
+	\ÊH›Üˆ	\ÎˆÜÝ	\ÈÙ™›[™H‹ˆ™X\ÛÛ‹ˆÛÜšÝ™YWÜ]ˆÜÝÚYˆ
+Bˆ™]\›‚ˆžN‚ˆ]ØZ]™[[Ý™WÝÛÜšÝ™YWÛÛ—ÚÜÝ
+ˆÜÝÜ™YÚ\ÝžOZÜÝÜ™YÚ\ÝžKˆÜÝØÛÛ›ZÜÝØÛÛ›‹ˆÛÜšÝ™YWÜ]]ÛÜšÝ™YWÜ]ˆœ˜[˜ÚXœ˜[˜Úˆ[]WØœ˜[˜ÚY[]WØœ˜[˜Úˆ
+Bˆ^Ù\ÛÜšÝ™YRÜÝ[˜]˜Z[X›Q\œ›Üˆ\È^Î‚ˆYˆ˜Z[ÚY—Ý[˜]˜Z[X›N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆÑSUWÕÓÔ’Õ‘QWÓÑ‘“S‘WÓQTÔÐQÑKˆÛÙOQ\œ›ÜÛÙKÓÓ‘“PÕˆ
+Hœ›ÛH^ÂˆÛÙÙÙ\‹Ø\›š[™Êˆ™\ÝYY™›ÜÛÜšÝ™YH™[[Ý˜[
+	\ÊH˜Z[Y›Üˆ	\ÎˆÜÝ	\È[˜]˜Z[X›H‹ˆ™X\ÛÛ‹ˆÛÜšÝ™YWÜ]ˆÜÝÚYˆ
+Bˆ^Ù\ÛÜšÝ™YT›ÞQ\œ›ÜŽ‚ˆÛÙÙÙ\‹Ø\›š[™Êˆ™\ÝYY™›ÜÛÜšÝ™YH™[[Ý˜[
+	\ÊH˜Z[Y›Üˆ	\È‹ˆ™X\ÛÛ‹ˆÛÜšÝ™YWÜ]ˆ^×Ú[™›ÏUYKˆ
+B‚‚™YˆÜ™\ÛÛ™WÜÝX˜YÙ[ÜÜXÊˆ
+‹ˆYÙ[ˆYÙ[ˆÝX—ØYÙ[Û˜[YNˆÝ‹ˆYÙ[ØØXÚNˆYÙ[ØXÚH›Û™KŠHOˆYÙ[ÜXÈ›Û™N‚ˆˆˆ‚ˆØYH\™[[™H[™™\ÛÛ™HHÚ[ÝX‹XYÙ[	ÜÈ\ÝYÜXË‚‚ˆ\È\ÈHÚ[™ÛH\ÝYÛÝ\˜ÙH›Üˆ[žH\‹\ÝX‹XYÙ[][˜ÚÚ\š[™ÂˆHÙ\™\ˆ\š]™\È]Ü™X]H[YH
+\›Z[˜[Yš\œÝX™[ËSÓÂˆ\ÜË]›ÝYÚ\™ÜÊKˆHÜXÈÛÛY\Èœ›ÛHHÙ\™\‹[ØYY\™[ˆ[™H8 %™]™\ˆœ›ÛHØ[\‹\Ý\YY™\]Y\ÝšY[È8 %ÛÈHØ[\‚ˆØ[››ÝÛ]YÙÛH[ˆ][˜ÚÛÛ™šYÈHÝX‹XYÙ[	ÜÈÝÛˆ[™HY›ÝˆXÛ\™K‚‚ˆœ\˜[HYÙ[ˆH\™[YÙ[›ÝËK™ËˆHÛXÜ˜Ú\Ý˜]Ü‹ˆÚÜÙH[™HÛÛZ[œÈHÝX‹XYÙ[ÜXÜË‚ˆœ\˜[HÝX—ØYÙ[Û˜[YNˆH\Ü]ÚYÝX‹XYÙ[	ÜÈ˜[YKK™Ë‚ˆ˜Û]YWØÛÙH˜‚ˆœ\˜[HYÙ[ØØXÚNˆØXÚH›ÜˆØY[™ÈH\œÙY\™[[™Kˆ›Û™Xˆ\ØX›\È™\ÛÛ][Ûˆ
+™]\›œÈ›Û™X
+K‚ˆœ™]\›œÎˆHX]Ú[™ÈÚ[˜Û\ÜÎ˜YÙ[ÜXØÜˆ›Û™XÚ[ˆBˆØXÚH\ÈXœÙ[H[™H˜Z[ÈÈØYÜˆ›ÈÝX‹XYÙ[X]Ú\Ë‚ˆˆˆ‚ˆYˆYÙ[ØØXÚH\È›Û™N‚ˆ™]\›ˆ›Û™Bˆœ›ÛHÛ[šYÙ[œ[[YKÛÜšÙ›ÝÈ[\ÜÙš[™ÜÜX×ØžWÛ˜[YB‚ˆžN‚ˆ\™[ÜÜXÈHYÙ[ØØXÚK›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+KœÜXÂˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÈH[™H]˜Z[ÈÈØY\™H]\Ý›Ýœ™XZÈÙ\ÜÚ[Û‚ˆÈÜ™X][ÛŽÈHÙ\ÜÚ[ÛˆÝ[ÛÜšÜË\ÝÚ]Ý]BˆÈ\š]™YX™[ÈÈ][˜Ú\™ÜË‚ˆÛÙÙÙ\‹Ø\›š[™ÊˆÛÝ[›ÝØY[™H›ÜˆYÙ[	\ÈÈ™\ÛÛ™HÝX‹XYÙ[	\ˆÜXÈ‹ˆYÙ[šYˆÝX—ØYÙ[Û˜[YKˆ^×Ú[™›ÏUYKˆ
+Bˆ™]\›ˆ›Û™Bˆ™]\›ˆÙš[™ÜÜX×ØžWÛ˜[YJ\™[ÜÜXËÝX—ØYÙ[Û˜[YJB‚‚™YˆÜ™\]Z\™WÙXÛ\™YÜÝX˜YÙ[
+ˆ
+‹ˆYÙ[ˆYÙ[ˆÝX—ØYÙ[Û˜[YNˆÝ‹ˆYÙ[ØØXÚNˆYÙ[ØXÚH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ™Z™XÝHÝX—ØYÙ[Û˜[YXH\™[	ÜÈÜXÈÙ\È›ÝXÛ\™K‚‚ˆÔÕÝŒKÜÙ\ÜÚ[ÛœØ\œÚ\ÝÈÝX—ØYÙ[Û˜[YX™\˜˜][K[™›ÂˆÝÛœÝ™X[HÜXË\ÝØ\Ú]H™Z™XÝÈ[ˆ[œ™\ÛÛ˜X›HÛ™NˆXXÚØ\›œÈ[™ˆ[œÈHÙ\ÜÚ[ÛˆYØZ[œÝHT‘S•ÜXÈ[œÝXYˆ[ˆ[™XÛ\™Y˜[YBˆÛÝ[\™Y›Ü™H™HÝÜ™YÛ˜ÙH[™[œÝÙ\™YžHH\™[›ÜˆBˆÙ\ÜÚ[Û‰ÜÈÚÛHY™KÚ]HØ\›š[™È\ÈHÛ›HÚYÛ‹ˆ\ÈØ]H™Z™XÝÂˆ]\œ›Û™Y›Ü™H[žH›ÝÈ\È\œÚ\ÝYZ\œ›Üš[™È›Ü›X[\Ü]Úˆ
+ÛÛÙ\Ü]Ú™Z™XÝÈ[ˆ[™XÛ\™YYÙ[
+H[™BˆQÑS•ÔPË›YÛÛ˜XÝ][›\ÝY˜[Y\È\™H™Z™XÝY‚‚ˆ]˜\œ›ÝÜË]Ù\È›Ý›Ý[™Ú]Ø[ˆ™XXÚHÝÛœÝ™X[H˜[˜XÚË‚ˆHÚXÚÈ[œÈÛ›HÚ[ˆH[™HÐQÈ[™H˜[YH\ÈÜÚ]]™[BˆXœÙ[ˆÚ]›ÈYÙ[ØXÚKÜˆÛˆ[žHØY˜Z[\™K]™]\›œÈÚ]Ý]ˆYYXØ][™ËÛÈH™]™\‹YXÛ\™Y˜[YHÝ[™XXÚ\ÈHÝØ\Ú]HžBˆZ]\ˆ›Ý]KˆÚ]HØ]HÝX\˜[Y\È\ÈÛ™H\™XÝ[ÛˆÛ›H8 %H˜[YBˆ\ÈÚXÚÈ‘R‘PÕQ™]™\ˆÙ]È\œÚ\ÝY‚‚ˆœ\˜[HYÙ[ˆH\™[YÙ[›ÝÈÚÜÙH[™HXÛ\™\ÈBˆÝX‹XYÙ[Ë‚ˆœ\˜[HÝX—ØYÙ[Û˜[YNˆH™\]Y\ÝYÝX‹XYÙ[˜[YHÈ˜[Y]K‚ˆœ\˜[HYÙ[ØØXÚNˆØXÚH›ÜˆØY[™ÈH\œÙY\™[[™K‚ˆ›Û™XÚÚ\ÈHÚXÚÈ
+Ø[››Ý™\ÛÛ™HH™YJK‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆ“ÕÑ“ÕS‘Ú[ˆH[™HØYÈ[™ˆXÛ\™\È›ÈÝX‹XYÙ[˜[YYÝX—ØYÙ[Û˜[YX‚ˆˆˆ‚ˆYˆYÙ[ØØXÚH\È›Û™N‚ˆ™]\›‚ˆœ›ÛHÛ[šYÙ[œ[[YKÛÜšÙ›ÝÈ[\ÜÙš[™ÜÜX×ØžWÛ˜[YB‚ˆžN‚ˆ\™[ÜÜXÈHYÙ[ØØXÚK›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+KœÜXÂˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÈØ[‰ÝØYH[™HOˆØ[‰Ý›Ý™HH˜[YH\È[™XÛ\™Y‚ˆÈX]™H]ÈH[›™\‹ÚXÚØ\›œÈ[™[œÈHÙ\ÜÚ[ÛˆÛˆBˆÈ\™[ÜXË˜]\ˆ[ˆ™Z™XÝ[™ÈHÜ™X]HÙHØ[››ÝYYXØ]K‚ˆ™]\›‚ˆYˆÙš[™ÜÜX×ØžWÛ˜[YJ\™[ÜÜXËÝX—ØYÙ[Û˜[YJH\È›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ”ÝX‹XYÙ[›ÝXÛ\™Y[ˆ\™[ÜXÎˆÜÝX—ØYÙ[Û˜[YH\ŸH‹ˆÛÙOQ\œ›ÜÛÙK““ÕÑ“ÕS‘ˆ
+B‚‚™YˆÜÜX×Ú\›™\ÜÊÜXÎˆYÙ[ÜXÊHOˆÝŽ‚ˆˆˆ‚ˆ™]\›ˆHØ[›ÛšXØ[\›™\ÜÈY[YšY\ˆ›ÜˆH™\ÛÛ™YÜXË‚‚ˆœ\˜[HÜXÎˆH\œÙYYÙ[ÈÝX‹XYÙ[ÜXË‚ˆœ™]\›œÎˆHØ[›ÛšXØ[\›™\ÜÈYK™Ëˆ˜Û]YK[˜]]™H˜Ü‚ˆ˜ÛÙ^[˜]]™H˜È˜[È˜XÚÈÈ^XÝ]Ü‹\XÚ[ˆ›Âˆ\›™\ÜØ\ÈXÛ\™Y‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[š\›™\Ü×Ø[X\Ù\È[\ÜØ[›ÛšXØ[^™WÚ\›™\ÜÂ‚ˆ\›™\ÜÈHÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+š\›™\ÜÈŠHÜˆÜXË™^XÝ]Ü‹\Bˆ™]\›ˆØ[›ÛšXØ[^™WÚ\›™\ÜÊ\›™\ÜÊHÜˆ\›™\ÜÂ‚‚™YˆÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ\ØX›Y
+ÜXÎˆYÙ[ÜXËÙ^NˆÝŠHOˆ›ÛÛ‚ˆˆˆ‚ˆ™]\›ˆÚ]\ˆ[ˆ^XÝ]Ü‹˜ÛÛ™šYØ›YÈ\È^XÚ]HÙ]˜[ÙK‚‚ˆHÜXÈ\œÙ\ˆÝš[™ÚYšY\È]™\žH^XÝ]Ü‹˜ÛÛ™šYØ˜[YH
+ÙYBˆÛ[šYÙ[ÜÜXËÜ\œÙ\‹œX8 %ÜÝŠÊNˆÝŠŠH‹‹ŸX
+KÛÈHPSSˆ[ÛÎˆ˜[ÙX\œš]™\È\™H\ÈHÝš[™È‘˜[ÙH˜ˆH˜Z]™Bˆ›Ý›ÛÛ
+˜[YJX\ÈÜ›Û™Îˆ›ÛÛ
+‘˜[ÙHŠX\ÈYX
+ÛÈBˆ˜Z]™H][™\ÜÈ\ÝÛÝ[™XY‘˜[ÙH˜\È[˜X›Y
+Kˆ\ÂˆÛÛ\\™\ÈYØZ[œÝH˜[Ù^HÜ[[™ÜÈ^XÚ]HÛÈÛ›H[‚ˆ[[[Û˜[˜[ÙXÈ˜[ÙXÛÝ[È\È\ØX›Y8 %[ˆXœÙ[Ù^BˆÜˆ[žHÝ\ˆ˜[YH\È“Õ\ØX›Y‚‚ˆ\ÙY›ÜˆÜSÕUÙ[X[XÜÎˆH™[]˜[›YÈY˜][ÈÈ[˜X›Y[™ˆ[ˆ^XÚ]˜[ÙX\ÈH\ØØ\H]Ú
+ÙYHHÛÙ^[˜]]™Hœ˜[˜ÚˆÙˆ™[˜Î˜Ù\š]™WÝ\›Z[˜[Û][˜ÚØ\™Ü×Ùœ›ÛWÜÜXØ
+K‚‚ˆœ\˜[HÜXÎˆH\œÙYÝX‹XYÙ[ÜXË‚ˆœ\˜[HÙ^NˆH^XÝ]Ü‹˜ÛÛ™šYØÙ^HÈ™XYK™Ëˆž[ÛÈ˜‚ˆœ™]\›œÎˆYXÛ›HÚ[ˆH˜[YH\ÈH›ÛÛX[ˆ˜[ÙXÜˆBˆÝš[™È™˜[ÙH˜
+Ø\ÙKZ[œÙ[œÚ]]™JNÈ˜[ÙXÝ\Ú\ÙBˆ
+[˜ÛY[™ÈÚ[ˆHÙ^H\ÈXœÙ[
+K‚ˆˆˆ‚ˆ˜[YHHÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+Ù^JBˆYˆ\Ú[œÝ[˜ÙJ˜[YK›ÛÛ
+N‚ˆ™]\›ˆ˜[YH\È˜[ÙBˆ™]\›ˆ\Ú[œÝ[˜ÙJ˜[YKÝŠH[™˜[YKœÝš\
+
+K›ÝÙ\Š
+HOH™˜[ÙH‚‚‚™YˆÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ[˜X›Y
+ÜXÎˆYÙ[ÜXËÙ^NˆÝŠHOˆ›ÛÛ‚ˆˆˆ‚ˆ™]\›ˆÚ]\ˆ[ˆ^XÝ]Ü‹˜ÛÛ™šYØ›YÈ\È^XÚ]HÙ]YK‚‚ˆHZ\œ›ÜˆÙˆ™[˜Î˜ÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ\ØX›Y\ÙY›Ü‚ˆÜRSˆÙ[X[XÜÎˆH›YÈY˜][ÈÈÙ™ˆ[™Û›H[ˆ[[[Û˜[ˆYXÈYX[˜X›\È]ˆ[˜X›[™È˜[Y\È\™HX]ÚYÚ]Ý]ˆÚ]\ÜXÙHÛ\˜[˜ÙH
+H˜[YK[X]Ú[™ÈÛXÞHÙ‚ˆ™[˜Î˜Ù\š]™WÝ\›Z[˜[Û][˜ÚØ\™Ü×Ùœ›ÛWÜÜXØ
+KÛÈˆYH˜Ù\Âˆ›Ý[˜X›K‚‚ˆœ\˜[HÜXÎˆH\œÙYYÙ[ÈÝX‹XYÙ[ÜXË‚ˆœ\˜[HÙ^NˆH^XÝ]Ü‹˜ÛÛ™šYØÙ^HÈ™XYK™Ëˆž[ÛÈ˜‚ˆœ™]\›œÎˆYXÛ›HÚ[ˆH˜[YH\ÈH›ÛÛX[ˆYXÜˆBˆØ\ÙKZ[œÙ[œÚ]]™HÝš[™ÈYH˜È˜[ÙXÝ\Ú\ÙH
+[˜ÛY[™ÂˆÚ[ˆHÙ^H\ÈXœÙ[
+K‚ˆˆˆ‚ˆ˜[YHHÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+Ù^JBˆYˆ\Ú[œÝ[˜ÙJ˜[YK›ÛÛ
+N‚ˆ™]\›ˆ˜[YH\ÈYBˆ™]\›ˆ\Ú[œÝ[˜ÙJ˜[YKÝŠH[™˜[YK›ÝÙ\Š
+HOHYH‚‚‚™YˆÙ\š]™WÝ\›Z[˜[Û][˜ÚØ\™Ü×Ùœ›ÛWÜÜXÊˆÜXÎˆYÙ[ÜXË
+‹XY\Ü×ÙY˜][Îˆ›ÛÛHYBŠHOˆ\ÝÜÝ—H›Û™N‚ˆˆˆ‚ˆ\š]™H˜]]™K]\›Z[˜[SÓÈ\ÜË]›ÝYÚ\™ÜÈœ›ÛHH\ÝYÝX‹\ÜXË‚‚ˆÛIÜÈ˜]]™HÛÜšÙ\œÈ
+Û]YK[˜]]™HÈÛÙ^[˜]]™HÈÝ\œÛÜ‹[˜]]™HÂˆÚ[ZK[˜]]™HÈ[YÜ˜]š]K[˜]]™JBˆ][˜Ú[ˆHXY\ÜÈ[™HÚ\™H›È[X[ˆØ[ˆ[œÝÙ\ˆ[ˆ\›Ý˜[Ø\™ÛÂˆ]™\žHY]ÕÜš]KÐ˜\Ú]›Û\ÈÝ[ÈHÛÜšÙ\‹ˆ\È˜[œÛ]\ÈBˆÛÜšÙ\ˆ[™IÜÈXÛ\™Y[Xž\\ÜÈ[[[ÈH\‹\Ù\ÜÚ[Û‚ˆ\›Z[˜[Û][˜ÚØ\™ÜØH[›™\ˆ[™XYH\[™ÈÈH˜]]™HÓBˆ\™ÝŽ‚‚ˆHÛ]YK[˜]]™H
+È^XÝ]Ü‹˜ÛÛ™šYËœ\›Z\ÜÚ[Û—Û[ÙXÙ]O‚ˆÈ‹K\\›Z\ÜÚ[Û‹[[ÙH‹˜[YOˆ—XˆH˜[YH\È\ÜÙY›ÝYÚˆ™\˜˜][HÛÈ›Û‹VSÓÈ[Ù\È
+XØÙ\Y]Ø[˜‹‹ŠHÛÜšÈÛÎÂˆSÓÈ\Ù\Èž\\ÜÔ\›Z\ÜÚ[ÛœØ‚ˆHÛÙ^[˜]]™HOˆÈ‹KY[™Ù\›Ý\ÛKXž\\ÜËX\›Ý˜[ËX[™\Ø[™›Þ—XˆžHQUSˆHXY\ÜÈÛÙ^ÛÜšÙ\ˆ\È›È[X[ˆÈ[œÝÙ\ˆÛÙ^	ÜÂˆ\›Ý˜[›Û\Ë[™ÛÙ^	ÜÈÝÛˆÛÛ[X[™Ø[™›ÞÙ[ˆØ[››Ý]™[‚ˆÝ\
+K™Ëˆ[œÚYHH\™[™YÛÛZ[™\ŠKÛÈÛÙ^	ÜÈY˜][ˆ\›Ý˜[ÜÛXÞO[Û‹\™\]Y\Ý
+ÈÝÛ‹\Ø[™›ÞÝ[˜ÙHÝ[ÈBˆÛÜšÙ\ˆÛˆ]Èš\œÝY]ÕÜš]KÐ˜\Úˆ[ž\\ÜÈ\ÈHÛ›Bˆ›Û‹\Ý[[™ÈÝ[˜ÙH›ÜˆHXY\ÜÈÙX[H
+HÛÛZ[™\ˆÈÛÜšÝ™YBˆ\ÈH™X[›Ý[™\žKX]Ú[™ÈÛ]YK[˜]]™IÜÈž\\ÜÔ\›Z\ÜÚ[ÛœØˆ[™HÛÙ^\ÙÈ^XÝ]Ü‰ÜÈ\›Ý˜[ÛXÞOH›™]™\ˆ˜
+Kˆ[ˆ^XÚ]ˆ^XÝ]Ü‹˜ÛÛ™šYËž[ÛÎˆ˜[ÙXÜÈ˜XÚÈÝ]›ÜˆH™XY[Û›HÈ]\ÝˆZÙY\\›Û\[™ÈÝX‹XYÙ[ˆÙYH\ÜÝYHÌMÌK‚ˆHÝ\œÛÜ‹[˜]]™HOˆÈ‹K^[ÛÈ—XžHQUSˆXY\ÜÈÝ\œÛÜˆÛÜšÙ\œÂˆÝ\Ú\ÙHÝ[ÛˆÝ\œÛÜ‹XYÙ[	ÜÈ[‹]\›Z[˜[\›Ý˜[›Û\È
+[ÛÂˆZ\œ›Ü™Y\ÈÙXˆ[XÚ]][ÛˆØ\™ÊKˆK^[ÛØ\ÈÝ\œÛÜ‹XYÙ[	ÜÂˆÛ‰ÝX\ÚÈÈ[Xž\\ÜÈ›YÈ
+KX]]Ë\™]šY]ØÝ[›Û\È›Ü‚ˆÛÛYHØ[ÊKˆ[ˆ^XÚ]^XÝ]Ü‹˜ÛÛ™šYËž[ÛÎˆ˜[ÙXÜÈ˜XÚÂˆÝ]ˆÚ[ˆ^XÝ]Ü‹˜ÛÛ™šYËœ\›Z\ÜÚ[Û—Û[ÙXÈ^X×Û[ÙX\ÈÙ]ˆÈ]]ØÜˆ]]Ë\™]šY]Ø[Z]È‹KX]]Ë\™]šY]È—X[œÝXYˆ
+ÛX\]]ÊHÛÈH[™HØ[ˆÚÛÜÙHÛ]YK\Ý[H]]ÈÚ]Ý][ˆ[ÛË‚ˆHÚ[ZK[˜]]™H
+È^XÝ]Ü‹˜ÛÛ™šYËž[ÛÎˆYXOˆÈ‹K^[ÛÈ—Xˆ
+Ú[ZIÜÈ]]ËX\›Ý™K]ÛÛÈ›YÎÈKX]]Ø[]]Û›Û^H\È“ÕˆX\Y
+KˆÜRSŽˆXœÙ[È˜[ÙHX]™\È\™ÜÈ[œÙ]‚ˆH[YÜ˜]š]K[˜]]™H
+È^XÝ]Ü‹˜ÛÛ™šYËœ\›Z\ÜÚ[Û—Û[ÙN‚ˆž\\ÜÔ\›Z\ÜÚ[ÛœØOˆÈ‹KY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœÈ—XYÞIÜÂˆÛ›H™KY[\]™H\›Z\ÜÚ[ÛˆÛÛ›ÛˆÜRSˆZÙHÛ]YK[˜]]™NÂˆÝ\ˆÈXœÙ[[Ù\ÈX]™H\™ÜÈ[œÙ]‚‚ˆ˜[YK[X]Ú[™ÈÛXÞNˆ[˜X›[™È˜[Y\È\™HX]ÚYÚ]Ý]Ú]\ÜXÙBˆÛ\˜[˜ÙKˆ›YË]˜[YYÙ^\È
+[ÛØ
+HXØÙ\H™X[›ÛÛÜˆBˆØ\ÙKZ[œÙ[œÚ]]™HÝš[™ÜÈYH˜È™˜[ÙH˜ˆ[ÙK]˜[YYÙ^\Âˆ
+\›Z\ÜÚ[Û—Û[ÙX
+H\™HX]ÚY^XÝKZ\œ›Üš[™ÈÛ]YK[˜]]™IÜÂˆ™\˜˜][H\ÜË]›ÝYÚ[™H[›™\‰ÜÈ^XÝž\\ÜÔ\›Z\ÜÚ[ÛœØˆÛÛ\\š\ÛÛˆ
+ÚÝ[ÜÚÚ\Ü\›Z\ÜÚ[ÛœØ[‚ˆ›[Ù˜Û[šYÙ[š\›™\ÜÙ\Ë˜[YÜ˜]š]WÛ˜]]™K›][˜Ú
+KˆH™\Ù[X]][œ™XÛÙÛš^™Yˆ˜[YHÙÜÈ]XYÈ[™X]™\È\™ÜÈ[œÙ]‚‚ˆÛ›HÜÙH˜]]™H\›™\ÜÙ\È\™H˜[œÛ]YÈ›Üˆ[žHÝ\ˆ\›™\ÜÂˆ
+K™ËˆÛ]YK\ÙØÈÝ\œÛÜ˜ÚÜÙHž\\ÜÈ\ÈÙ]šXHHÑÂˆ\›Z\ÜÚ[Û“[ÙXÈ]]×Ü™]šY]ØÜ]Ûˆ]›ÝH\›Z[˜[›YÊBˆ\È™]\›œÈ›Û™XÛÈ›È\›Z[˜[\™ÜÈ\™HÙ]ˆ›Û™X\È[ÛÂˆ™]\›™YÚ[ˆH™[]˜[šY[\ÈXœÙ[È˜[Ù^K‚‚ˆXY\Ü×ÙY˜][ØÙ[XÝÈHÝ[˜ÙH›ÜˆHÜXÈ]XÛ\™\Âˆ›Ý[™Îˆ˜[YY]ÛÜšÙ\ˆÈ[™YXÚ[Ü™X]\ÈÙY\HXY\ÜÂˆY˜][X›Ý™H
+ÛÙ^[˜]]™HÈÝ\œÛÜ‹[˜]]™Hž\\ÜÈžHQUS™XØ]\ÙBˆ›Ø›ÙHØ[ˆ[œÝÙ\ˆZ\ˆ›Û\ÊKˆÜ[]™[[™Ù[‹\™\ÛÛ™YXYÙ[ˆÜ™X]\È\ÜÈXY\Ü×ÙY˜][ÏQ˜[ÙXˆÜÙHÙ\ÜÚ[ÛœÈ\™Bˆ[\˜XÝ]™H8 %H[X[ˆØ[ˆ[œÝÙ\ˆ[ˆ\›Ý˜[Ø\™8 %ÛÈÛ›HHÜXÉÜÂˆVPÒUXÛ\˜][ÛœÈ\™HÛ›Ü™Y
+[ÛÎˆYXBˆ\›Z\ÜÚ[Û—Û[ÙXÈ^X×Û[ÙX˜[YJH[™[ˆ[™XÛ\™YÜXÂˆÙY\ÈH\›™\ÜÉÜÈÝÛˆY˜][\›Ý˜[Ý[˜ÙK‚‚ˆœ\˜[HÜXÎˆH\ÝYÙ\™\‹[ØYYÜXÎˆH˜[YYÛÜšÙ\‰ÜÈÝX‹\ÜXÂˆ
+šXH™[˜Î˜Ü™\ÛÛ™WÜÝX˜YÙ[ÜÜXØ
+KH[™YÚ[	ÜÈÜXËÜˆ8 %ˆÚ]XY\Ü×ÙY˜][ÏQ˜[ÙX8 %HÙ\ÜÚ[Û‰ÜÈÝÛˆYÙ[ÜXË‚ˆœ\˜[HXY\Ü×ÙY˜][ÎˆÚ]\ˆ[ˆ[™XÛ\™YÛÙ^[˜]]™HÂˆÝ\œÛÜ‹[˜]]™HÜXÈ˜[È˜XÚÈÈHXY\ÜÈ[Xž\\ÜÈY˜][‚ˆYX›ÜˆXY\ÜÈÛÜšÙ\ˆÜ™X]\ÎÈ˜[ÙX›ÜˆÜ[]™[ÂˆÙ[‹\™\ÛÛ™YÜ™X]\ËÚ\™HÛ›H^XÚ]ÜZ[œÈ˜[œÛ]K‚ˆœ™]\›œÎˆH›]ÓKX\™È\ÝÈÝÜ™H\ÈHÚ[Ù\ÜÚ[Û‰ÜÂˆ\›Z[˜[Û][˜ÚØ\™ÜØÜˆ›Û™XÚ[ˆ›Ý[™ÈÚÝ[™HÙ]‚ˆœ˜Z\Ù\È˜[YQ\œ›ÜŽˆYˆHÜXËY\š]™Y\™Ý[Y[š[Û]\ÈHØ[YBˆ›Ý[™È[™›Ü˜ÙY›Üˆ™\]Y\Ý\Ý\YY\›Z[˜[Û][˜ÚØ\™ÜØ‚ˆˆˆ‚ˆ\›™\ÜÈHÜÜX×Ú\›™\ÜÊÜXÊBˆYˆ\›™\ÜÈOHÐÓUQWÓUU‘WÒT“‘TÔÎ‚ˆ\›Z\ÜÚ[Û—Û[ÙHHÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+œ\›Z\ÜÚ[Û—Û[ÙHŠBˆYˆ\›Z\ÜÚ[Û—Û[ÙN‚ˆ™]\›ˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊÈ‹K\\›Z\ÜÚ[Û‹[[ÙH‹ÝŠ\›Z\ÜÚ[Û—Û[ÙJWJBˆ™]\›ˆ›Û™BˆYˆ\›™\ÜÈOHÐÓÑVÓUU‘WÒT“‘TÔÎ‚ˆÈXY\ÜÈY˜][ˆ[ž\\ÜËˆH\›Z[˜[Û][˜ÚØ\™ÜÈÙ]BˆÈÛÙ^K\™[[ÝHRIÜÈ][˜Ú›YÜËÚXÚ\ÈÚ]Ü™X]\ÈBˆÈ\\Ù\™\ˆ™XY[™š^\È]È\›Ý˜[ÜØ[™›ÞÝ[˜ÙH›ÜˆBˆÈÙ\ÜÚ[ÛŽÈHÛ[šYÙ[^XÝ]Ü‰ÜÈ]\ˆ\›‹ÜÝ\[š\š]È]ˆÈÝ[˜ÙH
+ÛÙ^Û˜]]™WÙ^XÝ]Ü‹œ[—Ý\›ˆØ\œšY\È›È\‹]\›‚ˆÈ\›Ý˜[ÜØ[™›Þ
+KˆÚ]Ý]H›YÈH™XY\ÈÜ™X]Y]ˆÈÛÙ^	ÜÈÛ‹\™\]Y\Ý
+ÈÝÛ‹\Ø[™›ÞY˜][[™HXY\ÜÈÛÜšÙ\‚ˆÈÝ[Ëˆ[ˆ^XÚ][ÛÎˆ˜[ÙX\ÈHÜ[Ý]ˆÙYHÌMÌK‚ˆYˆÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ\ØX›Y
+ÜXËž[ÛÈŠN‚ˆ™]\›ˆ›Û™BˆYˆ›ÝXY\Ü×ÙY˜][È[™›ÝÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ[˜X›Y
+ÜXËž[ÛÈŠN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊÈ‹KY[™Ù\›Ý\ÛKXž\\ÜËX\›Ý˜[ËX[™\Ø[™›Þ—JBˆYˆ\›™\ÜÈOHÐÕT”ÓÔ—ÓUU‘WÒT“‘TÔÎ‚ˆÈ™Y™\ˆ[ˆ^XÚ]ÛX\]]È[ÙHÚ[ˆH[™H\ÚÜÈ›Üˆ]ˆÈ
+Z\œ›ÜœÈÛ]YIÜÈ\›Z\ÜÚ[Û—Û[ÙNˆ]]Ø
+K[ÙH[K^[ÛÂˆÈžHY˜][ÛÈXY\ÜÈÛHÛÜšÙ\œÈÛ‰ÝÝ[ÛˆZ\œ›Ü™YˆÈ\›Ý˜[Ø\™Ëˆ[ÛÎˆ˜[ÙX\ÈHÙY\\›Û\[™ÈÜ[Ý]‚ˆ[ÙHH
+ˆÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+œ\›Z\ÜÚ[Û—Û[ÙHŠBˆÜˆÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+™^X×Û[ÙHŠBˆÜˆˆ‚ˆ
+Bˆ[ÙWÛ›Ü›HHÝŠ[ÙJKœÝš\
+
+K›ÝÙ\Š
+BˆYˆ[ÙWÛ›Ü›H[ˆ
+˜]]È‹˜]]Ë\™]šY]ÈŠN‚ˆ™]\›ˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊÈ‹KX]]Ë\™]šY]È—JBˆYˆÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ\ØX›Y
+ÜXËž[ÛÈŠN‚ˆ™]\›ˆ›Û™BˆYˆ›ÝXY\Ü×ÙY˜][È[™›ÝÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ[˜X›Y
+ÜXËž[ÛÈŠN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊÈ‹K^[ÛÈ—JBˆYˆ\›™\ÜÈOHÒÒSRWÓUU‘WÒT“‘TÔÎ‚ˆÈÜRSˆ
+[›ZÙHÛÙ^ØÝ\œÛÜ‰ÜÈXY\ÜÈY˜][Xž\\ÜÊKˆH›ÛÛˆÈ\›HÛÝ™\œÈ›ÙÜ˜[[X]XØ[HZ[ÜXÜÎÈHÝš[™È\›HÛÝ™\œÈBˆÈ\œÙ\‰ÜÈÝš[™ÚYšYY•YH˜
+ÙYHH˜[YK[X]Ú[™ÈÛXÞJK‚ˆ[ÛÈHÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+ž[ÛÈŠBˆYˆ[ÛÈ\ÈYHÜˆ
+\Ú[œÝ[˜ÙJ[ÛËÝŠH[™[ÛË›ÝÙ\Š
+HOHYHŠN‚ˆ™]\›ˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊÈ‹K^[ÛÈ—JBˆYˆ
+ˆ[ÛÈ\È›Ý›Û™Bˆ[™[ÛÈ\È›Ý˜[ÙBˆ[™›ÝÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ\ØX›Y
+ÜXËž[ÛÈŠBˆ
+N‚ˆÛÙÙÙ\‹™XYÊˆšÚ[ZK[˜]]™HÝX‹\ÜXÈ\È[œ™XÛÙÛš^™Y[ÛÏI\ŽÈ][˜Ú[™ÈÚ]Ý]K^[ÛËˆ‹ˆ[ÛËˆ
+Bˆ™]\›ˆ›Û™BˆYˆ\›™\ÜÈOHÐS•QÔU’UWÓUU‘WÒT“‘TÔÎ‚ˆÈÜRS‹X]ÚY^XÝHZÙHH[›™\‰ÜÈÚÝ[ÜÚÚ\Ü\›Z\ÜÚ[ÛœÎÂˆÈÝ\ˆ[Ù\È]™H›ÈYÞH[˜[ÙÝYH[™X]™H\™ÜÈ[œÙ]‚ˆ[ÙHHÜXË™^XÝ]Ü‹˜ÛÛ™šYË™Ù]
+œ\›Z\ÜÚ[Û—Û[ÙHŠBˆYˆ\Ú[œÝ[˜ÙJ[ÙKÝŠN‚ˆYˆ[ÙHOH˜ž\\ÜÔ\›Z\ÜÚ[ÛœÈŽ‚ˆ™]\›ˆÝ˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÊÈ‹KY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœÈ—JBˆYˆ[ÙN‚ˆÛÙÙÙ\‹™XYÊˆ˜[YÜ˜]š]K[˜]]™HÝX‹\ÜXÈ\›Z\ÜÚ[Û—Û[ÙOI\ˆ\È›ÈYÞH[˜[ÙÝYNÈ‚ˆ›][˜Ú[™ÈÚ]Ý]KY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœËˆ‹ˆ[ÙKˆ
+Bˆ[Yˆ[ÙH\È›Ý›Û™N‚ˆÛÙÙÙ\‹™XYÊˆ˜[YÜ˜]š]K[˜]]™HÝX‹\ÜXÈ\È[œ™XÛÙÛš^™Y\›Z\ÜÚ[Û—Û[ÙOI\ŽÈ‚ˆ›][˜Ú[™ÈÚ]Ý]KY[™Ù\›Ý\ÛK\ÚÚ\\\›Z\ÜÚ[ÛœËˆ‹ˆ[ÙKˆ
+Bˆ™]\›ˆ›Û™Bˆ™]\›ˆ›Û™B‚‚™YˆÛ˜]]™WÜÝX˜YÙ[ÝÜ˜\\—ÛX™[×Ùœ›ÛWÜÜXÊÝX—ÜÜXÎˆYÙ[ÜXÊHOˆXÝÜÝ‹Ý—N‚ˆˆˆ‚ˆ™\ÛÛ™H\›Z[˜[Yš\œÝÜ˜\\ˆX™[Èœ›ÛH[ˆ[™XYK[ØYYÝX‹\ÜXË‚‚ˆœ\˜[HÝX—ÜÜXÎˆ\ÝYÚ[ÝX‹XYÙ[ÜXÈ™\ÛÛ™Yœ›ÛHBˆ\™[[™K‚ˆœ™]\›œÎˆÝÜ˜\\—ÚÙ^Nˆ˜[YKZWÚÙ^Nˆ\›Z[˜[ŸX›ÜˆH˜]]™BˆÝX‹XYÙ[ÜˆßXÚ[ˆHÝX‹XYÙ[\È›Ý˜]]™K‚ˆˆˆ‚ˆ\›™\ÜÈHÜÜX×Ú\›™\ÜÊÝX—ÜÜXÊBˆ˜]]™WØYÙ[H˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—Ú\›™\ÜÊ\›™\ÜÊBˆYˆ˜]]™WØYÙ[\È›Ý›Û™N‚ˆ™]\›ˆÂˆÐÓUQWÓUU‘WÕÔTT—ÓP‘SÒÑVNˆ˜]]™WØYÙ[Ü˜\\—ÛX™[ˆÐÓUQWÓUU‘WÕRWÓP‘SÒÑVNˆÐÓUQWÓUU‘WÕRWÓP‘SÕSQKˆBˆ™]\›ˆßB‚‚™YˆÜ™\Ý\›Z[˜[ÝZWÛX™[Êˆ
+‹ˆYÙ[ˆYÙ[ˆYÙ[ØØXÚNˆYÙ[ØXÚH›Û™Kˆ\›™\Ü×ÛÝ™\œšYNˆÝˆ›Û™KŠHOˆXÝÜÝ‹Ý—N‚ˆˆˆ‚ˆ™\ÛÛ™HH\›Z[˜[]šY]ÈX™[›ÜˆHÙ\ÜÚ[Ûˆ]Ù]ÈH‘T\›Z[˜[‚‚ˆH›Û‹[˜]]™HÙ\ÜÚ[Û‰ÜÈ[›™\ˆ]]ËXÜ™X]\ÈHÛ[šYÙ[‘Tˆ\›Z[˜[[™Ý[\ÈÛ[šYÙ[ZNˆ\›Z[˜[Û›H
+˜Y\Šˆ]ˆ\›Z[˜[^\ÝËˆHÙXˆRIÜÈ”Ý\[™È\8 )ˆˆ[™XØ]Üˆ™YYÈBˆX™[Ú[HH\›Z[˜[\ÈÝ[Z\ÜÚ[™ËÛÈ]Ú[™ÝÈ\È[\HžBˆÛÛœÝXÝ[Ûˆ[™ÝXÚÙ\ÜÚ[ÛœÈ˜[˜XÚÈÈH\ÜÚ]™HÛÛ›™XÝ[™ø )ˆ‚ˆ˜[™[œÝXYˆÝ[\[™ÈHØ[YHX™[]Ü™X][ÛˆÛÜÙ\ÈHØ\‚‚ˆZ\œ›ÜœÈH[›™\‰ÜÈÝÛˆ]]ËXÜ™X]H™YXØ]H
+›Û‹[˜]]™H\›™\ÜËˆÜ[]™[Ù\ÜÚ[Ûˆ8 %ÙYHØ]]×ØÜ™X]WÜ™\Ý\›Z[˜[	ÜÈØ[Ú]H[‚ˆÛ[šYÙ[Ü[›™\‹Ø\œX
+NÈHØ[\ˆYÈHÜÝX›Ý[™ÚXÚË‚‚ˆœ\˜[HYÙ[ˆHYÙ[›ÝÈ˜XÚÚ[™ÈHÙ\ÜÚ[Û‹‚ˆœ\˜[HYÙ[ØØXÚNˆØXÚH\ÙYÈØYH\œÙY[™Kˆ›Û™Xˆ\ØX›\È™\ÛÛ][Ûˆ
+™]\›œÈ[ˆ[\HXÝ
+K‚ˆœ\˜[H\›™\Ü×ÛÝ™\œšYNˆHÙ\ÜÚ[Û‰ÜÈÝÜ™Y\›™\ÜÈÝ™\œšYKY‚ˆ[žKˆ˜]]È˜Y™\œÈH\›™\ÜÈÈHš\œÝ[Y\ÜØYÙH›Ý]\‹ˆÛÈ›Ý[™È\ÈÝ[\Y‚ˆœ™]\›œÎˆÝZWÚÙ^Nˆ\›Z[˜[ŸXÚ[ˆH[›™\ˆÚ[ÜÝH‘Tˆ\›Z[˜[[ÙHßX‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[š\›™\Ü×Ø[X\Ù\È[\Ü\×Û˜]]™WÚ\›™\ÜÂ‚ˆYˆYÙ[ØØXÚH\È›Û™HÜˆ\›™\Ü×ÛÝ™\œšYHOH˜]]ÈŽ‚ˆ™]\›ˆßBˆYˆ\›™\Ü×ÛÝ™\œšYN‚ˆ\›™\ÜÈH\›™\Ü×ÛÝ™\œšYBˆ[ÙN‚ˆžN‚ˆÜXÈHYÙ[ØØXÚK›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+KœÜXÂˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÈØ[‰Ý™\ÛÛ™HH\›™\ÜÈOˆX]™HHX™[ÈH[›™\‰ÜÂˆÈÝÛˆ]\ˆÝ[\˜]\ˆ[ˆÝY\ÜÚ[™È]Ü™X][Û‹‚ˆ™]\›ˆßBˆ\›™\ÜÈHÜÜX×Ú\›™\ÜÊÜXÊBˆYˆ\×Û˜]]™WÚ\›™\ÜÊ\›™\ÜÊN‚ˆ™]\›ˆßBˆ™]\›ˆ×ÐÓUQWÓUU‘WÕRWÓP‘SÒÑVNˆÐÓUQWÓUU‘WÕRWÓP‘SÕSQ_B‚‚™YˆÜ™Z™XÝÜ™\Ù\™YØÛÜÝØÛÛ›ÛÛX™[ÜÙYY
+X™[ÎˆXÝÜÝ‹Ý—JHOˆ›Û™N‚ˆˆˆ‚ˆ™Z™XÝHÙ\ÜÚ[Û‹XÜ™X]H›ÙH]ÙYYÈÛXÞK[ÝÛ™YX™[Ë‚‚ˆÛÜÝØÛÛ›ÛŠ˜\ÈHÛÜÝYš\ÛÜ‰ÜÈ[[Y]žH˜[Y\ÜXÙH[™]ÂˆÛ›HYÚ][X]HÜš]\ˆ\ÈHÙ\ÜÚ[Û‰ÜÈ›Ý[™[›™\ˆ8 %ÚXÚØ[››Ýˆ^\ÝY]]Ü™X]H[YKÛÈHÙYY\È[Ø^\ÈH›Ü™Ù\žK‚‚ˆœ\˜[HX™[ÎˆHÛY[\Ý\YY[š]X[X™[ËK™Ë‚ˆÈX[HŽˆ›[ŸX‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆÚ[ˆ[žHÛÜÝØÛÛ›ÛŠ˜Ù^H\Âˆ™\Ù[‚ˆˆˆ‚ˆ™\Ù\™YH™\Ù\™YØÛÜÝØÛÛ›ÛÚÙ^\ÊX™[ÊBˆYˆ™\Ù\™Y‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ›X™[ÈÉË	Ëš›Ú[Š™\ŠÙ^JH›ÜˆÙ^H[ˆ™\Ù\™Y
+_H‚ˆˆ˜\™H[ˆHÛXÞK[ÝÛ™YÐÓÔÕÐÓÓ•“ÓÓP‘SÓSQTÔPÑ_Jˆ‚ˆ›˜[Y\ÜXÙH[™Ø[››Ý™HÙ]]Ù\ÜÚ[ÛˆÜ™X][Ûˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+B‚‚™YˆÜ™Z™XÝÜÙ\™\—Ü™\Ù\™YÛX™[ÜÙYY
+X™[ÎˆXÝÜÝ‹Ý—H›Û™JHOˆ›Û™N‚ˆˆˆ‚ˆ™Z™XÝHÛY[\Ý\YYX™[X\]ÝXÚ\ÈÙ\™\‹Z[\›˜[Ù^\Ë‚‚ˆÙ^\È[ˆ\ÈÙ]\™HÜš][ˆ^Û\Ú]™[HžHÙ\™\ˆ[\›˜[È[™]\Ýˆ›Ý™HÛY[\Ù]X›H8 %Ú[™ÈÛÈÛÝ[]Ø[\œÈ›Ü™ÙHÙXÝ\š]KBˆÜš]XØ[Y]Y]H
+K™ËˆHÛXÞKY]˜[X][ÛˆXÝÜˆY[]JK‚‚ˆœ\˜[HX™[ÎˆHÛY[\Ý\YYX™[X\[™ËÜˆ›Û™X‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆÚ[ˆ[žH™\Ù\™YÙ^H\È™\Ù[‚ˆˆˆ‚ˆYˆ›ÝX™[Î‚ˆ™]\›‚ˆYˆÕT“—ÐPÕÔ—ÓP‘S[ˆX™[Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ›X™[×ÕT“—ÐPÕÔ—ÓP‘S\ŸH\ÈÙ\™\‹Z[\›˜[[™Ø[››Ý™HÙ]žHÛY[È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÈH\˜Ú]™H[Y\Ý[\\ÈÝ[\YžHHÙ\™\ˆÛˆH\˜Ú]™H˜[œÚ][Û‚ˆÈÛ›NÈHÛY[Üš]HÛÝ[›Ü™ÙHH™][[ÛˆÛØÚË[˜ÛY[™ÈÛˆÚ\™YˆÈÙ\ÜÚ[ÛœÈHØ[\ˆÙ\È›ÝÝÛ‹‚ˆYˆTÒU‘QÐUÓP‘SÒÑVH[ˆX™[Î‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ›X™[ÐTÒU‘QÐUÓP‘SÒÑVH\ŸH\ÈÙ\™\‹Z[\›˜[[™Ø[››Ý™HÙ]žHÛY[È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÈ[œÈ\™H\‹]\Ù\ŽˆHÛY[X^HÛ›HÜš]HH˜\™HØ[›ÛšXØ[ˆÈÛ[šYÙ[œ[›™YÙ^H
+ÚXÚH›Ý]H™]Üš]\ÈÈHÐST‰ÜÈ\‹]\Ù\‚ˆÈÙ^JKˆHÝY™š^YÛ[šYÙ[œ[›™Y\Ù\˜\ÈÙ\™\‹Y\š]™Y8 %XØÙ\[™ÂˆÈÛ™Hœ›ÛHHÛY[ÛÝ[]HØ[\ˆ[‹Ý[œ[ˆHÚ\™YÙ\ÜÚ[Ûˆ›Ü‚ˆÈ[›Ý\ˆ\Ù\‹Üˆ›Ü™ÙH\˜š]˜\žH\‹]\Ù\ˆ[ˆ›ÝÜËY™X][™ÈH\‹]\Ù\‚ˆÈ\ÛÛ][Û‹ˆ™Z™XÝ[žHÝY™š^Y›Ü›NÈÛ›HH˜\™HÙ^H\ÈÛY[]Üš]X›K‚ˆÝY™š^YÜ[ˆH™^
+ˆ
+È›ÜˆÈ[ˆX™[ÈYˆËœÝ\ÝÚ]
+ˆžÔS“‘QÓP‘SÒÑV_KˆŠJKˆ›Û™Kˆ
+BˆYˆÝY™š^YÜ[ˆ\È›Ý›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ›X™[ÜÝY™š^YÜ[ˆ\ŸH\ÈÙ\™\‹Y\š]™YÈÙ]H˜\™H‚ˆˆžÔS“‘QÓP‘SÒÑVH\ŸHÙ^HÈ[ˆ›Üˆ[Ý\œÙ[ˆ‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÈØ[™›ÞY™XÞXÛHX™[È\™HÜš][ˆÛ›HžHÙ\™\ˆ[\›˜[È[™™K\™XYˆÈXÜ›ÜÜÈH™[][˜ÚÈ™XZ[H[›™\ˆÙ
+K™ËˆH™\ÜÚ]ÜžH]ˆÈ™KXÛÛ™\ÊKˆHÛY[ÙYY\™HÛÝ[›Ü™ÙH]™XÛÛœÝXÝ[ÛˆÝ]KÛÂˆÈ™\Ù\™HHÚÛH˜[Y\ÜXÙH8 %]™\žHÝ\œ™[[™]\™HÙ^H[™\ˆ]8 %ˆÈ˜]\ˆ[ˆ[[Y\˜][™ÈÛ™HÙ^H]H[YK‚ˆØ[™›ÞÚÙ^HH™^
+ˆ
+È›ÜˆÈ[ˆX™[ÈYˆËœÝ\ÝÚ]
+PSQÑQÔÐS‘“ÖÓP‘SÓSQTÔPÑJJKˆ›Û™Kˆ
+BˆYˆØ[™›ÞÚÙ^H\È›Ý›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ›X™[ÜØ[™›ÞÚÙ^H\ŸH\È[ˆHÙ\™\‹Z[\›˜[‚ˆˆžÓPSQÑQÔÐS‘“ÖÓP‘SÓSQTÔPÑ_Jˆ˜[Y\ÜXÙH[™Ø[››Ý™HÙ]žHÛY[È‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+B‚‚™YˆÜ™\]Z\™WØÛÜÝØÛÛ›ÛÛX™[Ø]]Üš]Jˆ
+‹ˆ™\Ù\™YÚÙ^\ÎˆÙ\]Y[˜ÙVÜÝ—Kˆ[›™[ÝÚÙ[ŽˆÝˆ›Û™Kˆ›Ý[™Ü[›™\—ÚYˆÝˆ›Û™Kˆ[ÝÙYÝ[›™[ÝÚÙ[œÎˆœ›Þ™[œÙ]ÜÝ—H›Û™Kˆ][WÝ\Ù\Žˆ›ÛÛŠHOˆ›Û™N‚ˆˆˆ‚ˆ]]Üš^™HHX™[Üš]HÝXÚ[™ÈHÛXÞK[ÝÛ™YÛÜÝØÛÛ›ÛŠ˜Ù^\Ë‚‚ˆ\ÙH\™HHÛÜÝYš\ÛÜ‰ÜÈ[[Y]žHX™[ËÛÈÜ™[˜\žHÙ\ÜÚ[Û‚ˆY]ÜœÈ]\Ý›ÝÙ][HšXHUÒÈHYš\ÛÜ‰ÜÈ\œÚ\Ý›Ý™\Âˆ]Ù[ˆÚ]H[›™\ˆ[›™[š[™[™ÈÚÙ[ˆ
+[ÝË[\ÝYÜˆ›Ý[™ˆÈ\ÈÙ\ÜÚ[Û‰ÜÈ[›™\ˆY8 %H[›™[›Ý]IÜÈ\Ý[Ù[
+K‚ˆÚ[™ÛK]\Ù\ˆÙ\™\œÈÚÚ\HÚXÚÎˆÛÜ˜XÚÈ[›™\œÈX^H™YÚ\Ý\‚ˆ[™\ˆÝX›HYÈ[œ™[]YÈ[žHÚÙ[‹[™\™H\È›ÈÙXÛÛ™ˆY[]HÈ›Ü™ÙHYØZ[œÝ‚‚ˆœ\˜[H™\Ù\™YÚÙ^\ÎˆHÛÜÝØÛÛ›ÛŠ˜Ù^\ÈH™\]Y\ÝšY\ÂˆÈÜš]KK™Ëˆ
+˜ÛÜÝØÛÛ›Ûœ[ˆ‹
+Xˆ][ÝY[ˆH\œ›Ü‹‚ˆœ\˜[H[›™[ÝÚÙ[Žˆ˜[YHÙˆHSÛ[šYÙ[T[›™\‹U[›™[UÚÙ[˜ˆ™\]Y\ÝXY\‹Üˆ›Û™XÚ[ˆXœÙ[‚ˆœ\˜[H›Ý[™Ü[›™\—ÚYˆHÙ\ÜÚ[Û‰ÜÈÝ\œ™[[›™\—ÚYÜ‚ˆ›Û™XÚ[ˆ›È[›™\ˆ\È›Ý[™‚ˆœ\˜[H[ÝÙYÝ[›™[ÝÚÙ[œÎˆHÙ\™\‰ÜÈ[›™[]ÚÙ[ˆ[ÝË[\ÝˆÜˆ›Û™XÚ[ˆ›ÝÛÛ™šYÝ\™Y‚ˆœ\˜[H][WÝ\Ù\ŽˆYXÚ[ˆHÙ\™\ˆ[™›Ü˜Ù\È\‹]\Ù\‚ˆ\›Z\ÜÚ[ÛœÈ
+H\›Z\ÜÚ[ÛˆÝÜ™H\ÈÛÛ™šYÝ\™Y
+K‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆÈÚ[ˆHØ[\ˆ™\Ù[È›ÈXØÙ\X›Bˆ[›™\ˆ›ÛÙˆÛˆH][K]\Ù\ˆÙ\™\‹‚ˆˆˆ‚ˆYˆ›Ý][WÝ\Ù\Ž‚ˆ™]\›‚ˆÙ^\ÈH‹‹š›Ú[Š™\ŠÙ^JH›ÜˆÙ^H[ˆ™\Ù\™YÚÙ^\ÊBˆÚÙ[ˆH
+[›™[ÝÚÙ[ˆÜˆˆŠKœÝš\
+
+BˆYˆÚÙ[Ž‚ˆYˆ[ÝÙYÝ[›™[ÝÚÙ[œÈ\È›Ý›Û™H[™ÚÙ[ˆ[ˆ[ÝÙYÝ[›™[ÝÚÙ[œÎ‚ˆ™]\›‚ˆYˆ›Ý[™Ü[›™\—ÚY\È›Ý›Û™H[™ÚÙ[—Ø›Ý[™Ü[›™\—ÚY
+ÚÙ[ŠHOH›Ý[™Ü[›™\—ÚY‚ˆ™]\›‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆ›X™[ÈÚÙ^\ßH\™H[ˆHÛXÞK[ÝÛ™Y‚ˆˆžÐÓÔÕÐÓÓ•“ÓÓP‘SÓSQTÔPÑ_Jˆ˜[Y\ÜXÙNÈÛ›HHÙ\ÜÚ[Û‰ÜÈ‚ˆ˜›Ý[™[›™\ˆX^HÜš]H[H‹ˆÛÙOQ\œ›ÜÛÙK‘“Ô’QS‹ˆ
+B‚‚™YˆÜ\œÚ\ÝÜÝÜ™YÜÙ\ÜÚ[Û—Ø[™JˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™Kˆ\Y˜XÝÜÝÜ™Nˆ\Y˜XÝÝÜ™KˆY]Y]NˆÙ\ÜÚ[ÛÜ™X]SY]Y]Kˆ
+‹ˆYÙ[ÚYˆÝ‹ˆYÙ[Û˜[YNˆÝ‹ˆYÙ[Ø[™WÛØØ][ÛŽˆÝ‹ˆYÙ[Ù\ØÜš\[ÛŽˆÝˆ›Û™Kˆ[›™\—ÚYˆÝˆ›Û™HH›Û™KŠHOˆÜ™X]YÙ\ÜÚ[Û”™\ÜÛœÙN‚ˆˆˆ‚ˆ\œÚ\Ý]X˜\ÙH›ÝÜÈ›ÜˆH[™H[™XYHÜš][ˆÈ\Y˜XÝË‚‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H]ÝÛœÈH]ÛZXÂˆÛÛ™\œØ][Û‹\\ËXYÙ[˜[œØXÝ[Û‹‚ˆœ\˜[H\Y˜XÝÜÝÜ™NˆÝÜ™H›Üˆ[][™ÈH[™HÛˆ˜Z[\™K‚ˆœ\˜[HY]Y]Nˆ˜[Y]YÙ\ÜÚ[ÛˆY]Y]KˆHÙ]ˆ\™[ÜÙ\ÜÚ[Û—ÚYÜ™X]\ÈHÛÛ™\œØ][Ûˆ\ÈBˆÝX‹XYÙ[Ú[Ùˆ]Ù\ÜÚ[Û‹‚ˆœ\˜[HYÙ[ÚYˆ™]ÈYÙ[YK™Ëˆ˜Y×ØX˜ÌLŒÈ˜‚ˆœ\˜[HYÙ[Û˜[YNˆYÙ[˜[YHØYYœ›ÛHH\ØYYÜXË‚ˆœ\˜[HYÙ[Ø[™WÛØØ][ÛŽˆ\Y˜XÝÙ^H›ÜˆHÝÜ™Y[™K‚ˆœ\˜[HYÙ[Ù\ØÜš\[ÛŽˆÜ[Û˜[\ØÜš\[Ûˆœ›ÛHHÜXË‚ˆœ\˜[H[›™\—ÚYˆÜ[Û˜[[›™\ˆš[™[™È[š\š]Yœ›ÛHBˆ\™[Ù\ÜÚ[Û‹K™Ëˆœ[›™\—ØX˜ÌLŒÈ˜‚ˆœ™]\›œÎˆ™\ÜÛœÙHÚ]H™]ÈÙ\ÜÚ[ÛˆY‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆHYÙ[[œÙ\š[Û]\È[YÜš]BˆÚXÚÜÈÜˆH\™[Ù\ÜÚ[Ûˆ›ÈÛ™Ù\ˆ^\ÝË‚ˆœ˜Z\Ù\ÈÔS[Ú[^Q\œ›ÜŽˆYˆH]X˜\ÙH˜[œØXÝ[Ûˆ˜Z[È›Ü‚ˆ[žH›Û‹Z[YÜš]H™X\ÛÛ‹‚ˆˆˆ‚ˆžN‚ˆÜ™X]YHÛÛ™\œØ][Û—ÜÝÜ™K˜Ü™X]WÜÙ\ÜÚ[Û—ÝÚ]ØYÙ[
+ˆYÙ[ÚYXYÙ[ÚYˆYÙ[Û˜[YOXYÙ[Û˜[YKˆYÙ[Ø[™WÛØØ][ÛXYÙ[Ø[™WÛØØ][Û‹ˆYÙ[Ù\ØÜš\[ÛXYÙ[Ù\ØÜš\[Û‹ˆ]O[Y]Y]K]KˆX™[Ï[Y]Y]K›X™[Ëˆ™X\ÛÛš[™×ÙY™›Ü[Y]Y]Kœ™X\ÛÛš[™×ÙY™›Üˆ[Ù[ÛÝ™\œšYO[Y]Y]K›[Ù[ÛÝ™\œšYKˆÛÜšÜÜXÙO[Y]Y]KÛÜšÜÜXÙKˆ\›Z[˜[Û][˜ÚØ\™ÜÏ[Y]Y]K\›Z[˜[Û][˜ÚØ\™ÜËˆ\™[ØÛÛ™\œØ][Û—ÚY[Y]Y]Kœ\™[ÜÙ\ÜÚ[Û—ÚYˆ[›™\—ÚY\[›™\—ÚYˆ›Ú™XÝÚY[Y]Y]Kœ›Ú™XÝÚYˆÜÝÚY[Y]Y]KšÜÝÚYˆ
+Bˆ^Ù\ÛÛ™\œØ][Û“›Ý›Ý[™\œ›Üˆ\È^Î‚ˆÈ\™[Ø\È]]Üš^™YžHHØ[\ˆ]˜[š\ÚY
+[]Y
+BˆÈ™Y›Ü™HH[œÙ\˜[œØXÝ[Ûˆ˜[‹‚ˆÙ[]WÜÝÜ™YÜÙ\ÜÚ[Û—Ø[™WØY\—Ù˜Z[\™Jˆ\Y˜XÝÜÝÜ™KˆYÙ[Ø[™WÛØØ][Û‹ˆ
+Bˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆÝŠ^ÊKˆÛÙOQ\œ›ÜÛÙK““ÕÑ“ÕS‘ˆ
+Hœ›ÛH^Âˆ^Ù\[YÜš]Q\œ›Üˆ\È^Î‚ˆÙ[]WÜÝÜ™YÜÙ\ÜÚ[Û—Ø[™WØY\—Ù˜Z[\™Jˆ\Y˜XÝÜÝÜ™KˆYÙ[Ø[™WÛØØ][Û‹ˆ
+BˆÈ^XÝY[YÜš]H˜Z[\™\È\™H\™H[š\]Y[™\ÜÈÛÛ\Ú[ÛœÎ‚ˆÈÙ[™\˜]YYÙ[YÙ[™\˜]YÛÛ™\œØ][ÛˆYÜ‚ˆÈYÙ[ËœÙ\ÜÚ[Û—ÚYˆH›Ý]HX\ÈÜÙHÈK‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆœÙ\ÜÚ[ÛˆYÙ[Üš]H˜Z[Y[YÜš]HÚXÚÜÎˆÙ^Ë›ÜšYßH‹ˆÛÙOQ\œ›ÜÛÙKS‘PQWÑVTÕËˆ
+Hœ›ÛH^Âˆ^Ù\ÔS[Ú[^Q\œ›ÜŽ‚ˆÙ[]WÜÝÜ™YÜÙ\ÜÚ[Û—Ø[™WØY\—Ù˜Z[\™Jˆ\Y˜XÝÜÝÜ™KˆYÙ[Ø[™WÛØØ][Û‹ˆ
+Bˆ˜Z\ÙB‚ˆÈHÜ™X]H™\]Y\Ý\È›ÈÛÛˆY[ˆ]ÈT“ÈÝ[\HZ[YYÛÂˆÈHÜ™X]HÜ[ˆ›Ú[œÈHÙ\ÜÚ[Û‰ÜÈÙ\ÜÚ[Û‹šYÜ›Ý\‚ˆœ›ÛHÛ[šYÙ[œ[[YH[\Ü[[Y]žB‚ˆ[[Y]žKœÙ]ÜÙ\ÜÚ[Û—ÚY
+Ü™X]Y˜ÛÛ™\œØ][Û‹šY
+Bˆ™]\›ˆÜ™X]YÙ\ÜÚ[Û”™\ÜÛœÙJˆÙ\ÜÚ[Û—ÚYXÜ™X]Y˜ÛÛ™\œØ][Û‹šYˆYÙ[ÚYXYÙ[ÚYˆYÙ[Û˜[YOXYÙ[Û˜[YKˆ
+B‚‚™YˆÙ[]WÜÝÜ™YÜÙ\ÜÚ[Û—Ø[™WØY\—Ù˜Z[\™Jˆ\Y˜XÝÜÝÜ™Nˆ\Y˜XÝÝÜ™KˆYÙ[Ø[™WÛØØ][ÛŽˆÝ‹ŠHOˆ›Û™N‚ˆˆˆ‚ˆ[]H[ˆ\ØYY[™HY\ˆ]X˜\ÙHÜ™X][Ûˆ˜Z[Ë‚‚ˆÛX[\˜Z[\™\È\™HÙÙÙY]Ý\™\ÜÙYÛÈHÜšYÚ[˜[ˆ^Ù\[Ûˆ™[XZ[œÈH\œ›ÜˆÙY[ˆžHØ[\œË‚‚ˆœ\˜[H\Y˜XÝÜÝÜ™NˆÝÜ™H]ÛÛZ[œÈH\ØYY[™K‚ˆœ\˜[HYÙ[Ø[™WÛØØ][ÛŽˆ\Y˜XÝÙ^HÈ[]KK™Ë‚ˆ˜Y×ØX˜ÌLŒËØLXŒ˜ÌÙ˜‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆžN‚ˆ\Y˜XÝÜÝÜ™K™[]JYÙ[Ø[™WÛØØ][ÛŠBˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÛÙÙÙ\‹Ø\›š[™Êˆ‘˜Z[YÈ[]H\ØYYÙ\ÜÚ[Ûˆ[™H	\ÈY\ˆ›Û˜XÚÈ‹ˆYÙ[Ø[™WÛØØ][Û‹ˆ^×Ú[™›ÏUYKˆ
+B‚‚˜\Þ[˜ÈYˆØ]]Üš^™WØ[™YÜ\™[Ø[™Ú[š\š]Ü[›™\Šˆ\™[ÜÙ\ÜÚ[Û—ÚYˆÝ‹ˆ
+‹ˆ\Ù\—ÚYˆÝˆ›Û™Kˆ\›Z\ÜÚ[Û—ÜÝÜ™Nˆ\›Z\ÜÚ[Û”ÝÜ™H›Û™KˆÛÛ™\œØ][Û—ÜÝÜ™NˆÛÛ™\œØ][Û”ÝÜ™Kˆ[›™\—Ü›Ý]\Žˆ[›™\”›Ý]\ˆ›Û™KŠHOˆ\VÜÝˆ›Û™KÝˆ›Û™WN‚ˆˆˆ‚ˆ]]Üš^™HH[™YÜ™X]IÜÈ\™[[šÈ[™™\ÛÛ™H[›™\ˆY™š[š]K‚‚ˆHØ[\ˆ]\Ý]™H‘PQXØÙ\ÜÈÈH\™[Ù\ÜÚ[Û‚ˆ™Y›Ü™H[š\š][™È[ž][™ËZ\œ›Üš[™ÈH”ÓÓˆÜ™X]H]8 %ˆÚ]Ý]\ËH›Ü™ÙY\™[[šÈ]ÈHØ[\ˆ[š\š][›™\‚ˆš[™[™ÜÈ[™\™[HÙ\ÜÚ[Ûˆ^HÛ‰ÝÛÛ›ÛˆÛˆÝXØÙ\ÜÈBˆ\™[	ÜÈ[›™\ˆš[™[™È\È[š\š]Y
+ÝX‹XYÙ[ÛË[ØØ][ÛŠKˆÝXš™XÝÈHY™[œÙKZ[‹Y\ÝÛ™\œÚ\ÚXÚÎˆH[›™\ˆBˆØ[\ˆÙ\Û‰ÝÝÛˆ\È›Ý[š\š]Y‚‚ˆœ\˜[H\™[ÜÙ\ÜÚ[Û—ÚYˆH™\]Y\ÝY\™[Ù\ÜÚ[ÛˆYˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H\Ù\—ÚYˆ]][XØ]YØ[\‹K™Ëˆ˜[XÙP^[\K˜ÛÛH˜‚ˆœ\˜[H\›Z\ÜÚ[Û—ÜÝÜ™Nˆ\›Z\ÜÚ[ÛˆÝÜ™H›ÜˆHXØÙ\ÜÂˆÚXÚÎÈ›Û™X[ˆÚ[™ÛK]\Ù\ˆÈ›ËX]][ÙK‚ˆœ\˜[HÛÛ™\œØ][Û—ÜÝÜ™NˆÝÜ™H›ÜˆH\™[XÛÛ™\œØ][Ûˆ™XY‚ˆœ\˜[H[›™\—Ü›Ý]\Žˆ›Ý]\ˆ›ÜˆH[›™\‹[ÝÛ™\œÚ\ÚXÚÎÂˆ›Û™XÚÚ\È]‚ˆœ™]\›œÎˆH\HÙˆH[š\š]Y[›™\ˆY[™™X\ÛÛš[™ÈY™›ÜˆXXÚˆ˜[YH\È›Û™XÚ[ˆH\™[\È›ÈÛÜœ™\ÜÛ™[™ÈÙ][™ÈÜ‚ˆÝÛ™\œÚ\\Ø[ÝÜÈ[š\š][˜ÙK‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆËÍÚ[ˆHØ[\ˆX^H›ÝXØÙ\ÜÈBˆ\™[Ù\ÜÚ[Û‹‚ˆˆˆ‚ˆ]ØZ]Ü™\]Z\™WØXØÙ\ÜÊˆ\Ù\—ÚYˆ\™[ÜÙ\ÜÚ[Û—ÚYˆU‘SÔ‘PQˆ\›Z\ÜÚ[Û—ÜÝÜ™KˆÛÛ™\œØ][Û—ÜÝÜ™Kˆ
+Bˆ\™[ØÛÛˆH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+ˆÛÛ™\œØ][Û—ÜÝÜ™K™Ù]ØÛÛ™\œØ][Û‹ˆ\™[ÜÙ\ÜÚ[Û—ÚYˆ
+BˆYˆ\™[ØÛÛˆ\È›Û™N‚ˆ™]\›ˆ›Û™K›Û™Bˆ[š\š]YÜ[›™\—ÚYH\™[ØÛÛ‹œ[›™\—ÚYˆYˆ[š\š]YÜ[›™\—ÚY\È›Ý›Û™H[™\Ù\—ÚY\È›Ý›Û™H[™[›™\—Ü›Ý]\ˆ\È›Ý›Û™N‚ˆ[›™\—ÛÝÛ™\ˆH[›™\—Ü›Ý]\‹œ[›™\—ÛÝÛ™\Š[š\š]YÜ[›™\—ÚY
+BˆYˆ[›™\—ÛÝÛ™\ˆ\È›Ý›Û™H[™[›™\—ÛÝÛ™\ˆOH\Ù\—ÚY‚ˆ[š\š]YÜ[›™\—ÚYH›Û™Bˆ™]\›ˆ[š\š]YÜ[›™\—ÚY\™[ØÛÛ‹œ™X\ÛÛš[™×ÙY™›Ü‚‚˜\Þ[˜ÈYˆÛ›ÝYžWÜ[›™\—ÛÙ—Ø[™YØÚ[
+ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆYÙ[ÚYˆÝ‹ˆ[›™\—Ü›Ý]\Žˆ[›™\”›Ý]\ˆ›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ›ÝYžHH[š\š]Y[›™\ˆ]H[™YÚ[Ù\ÜÚ[Ûˆ^\ÝË‚‚ˆ]ÈH[›™\ˆ[š]X[^™H\‹\Ù\ÜÚ[ÛˆÝ]H
+[˜›Þ]Y]YKˆYÙ[ZYØXÚJH™Y›Ü™HHš\œÝ›ÜØ\™Y]™[Z\œ›Üš[™ÈBˆ”ÓÓˆÜ™X]H]	ÜÈÜÝXÜ™X]H›ÝYžKˆ˜Z[\™\È\™HÙÙÙY[™ˆÝØ[ÝÙY8 %H›ÝYžH\ÈY]]™H[™]\Ý›Ý˜Z[HÜ™X]K‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆH™]ÈÚ[Ù\ÜÚ[ÛˆYK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[HYÙ[ÚYˆHÚ[	ÜÈÙ\ÜÚ[Û‹\ØÛÜYYÙ[YˆK™Ëˆ˜Y×ØX˜ÌLŒÈ˜‚ˆœ\˜[H[›™\—Ü›Ý]\Žˆ›Ý]\ˆ\ÙYÈ™\ÛÛ™HH›Ý[™[›™\‰ÜÂˆÛY[È›Û™X˜[È˜XÚÈÈH[‹\›ØÙ\ÜÈ[›™\‹‚ˆœ™]\›œÎˆ›Û™K‚ˆˆˆ‚ˆ[›™\—ØÛY[H]ØZ]ÙÙ]Ü[›™\—ØÛY[
+Ù\ÜÚ[Û—ÚY[›™\—Ü›Ý]\ŠBˆYˆ[›™\—ØÛY[\È›Û™N‚ˆ™]\›‚ˆžN‚ˆ]ØZ][›™\—ØÛY[œÜÝ
+ˆ‹ÝŒKÜÙ\ÜÚ[ÛœÈ‹ˆœÛÛ^ÂˆœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYˆ˜YÙ[ÚYŽˆYÙ[ÚYˆœÝX—ØYÙ[Û˜[YHŽˆ›Û™KˆKˆ[Y[Ý]LLŒˆ
+Bˆ^Ù\
+’\œ›Ü‹ÛÛ›™XÝ[Û‘\œ›ÜŠN‚ˆÛÙÙÙ\‹Ø\›š[™Êˆ‘˜Z[YÈ›ÝYžH[›™\ˆX›Ý][™YÙ\ÜÚ[Ûˆ	\È‹ˆÙ\ÜÚ[Û—ÚYˆ^×Ú[™›ÏUYKˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+B‚‚™YˆÜ™YÚ\Ý\™YÜ[›™\—ÚY
+ˆ[›™\—Ü›Ý]\Žˆ[›™\”›Ý]\ˆ›Û™Kˆ˜]×Ü[›™\—ÚYˆÝ‹ˆ
+‹ˆ\Ù\—ÚYˆÝˆ›Û™HH›Û™KŠHOˆÝŽ‚ˆˆˆ‚ˆ˜[Y]HH[›™\ˆYœ›ÛHUÒÝŒKÜÙ\ÜÚ[ÛœËÞÚYX‚‚ˆÚ[ˆ\Ù\—ÚY\È›ÝšYYH[˜Ý[Ûˆ[ÛÈ[™›Ü˜Ù\È[›™\‚ˆÝÛ™\œÚ\ˆÛ›HH\Ù\ˆÚÈ\ÝX›\ÚYH[›™[X^Bˆš[™Ù\ÜÚ[ÛœÈÈ][›™\‹‚‚ˆœ\˜[H[›™\—Ü›Ý]\Žˆ›Ý]\ˆ˜XÚÙYžHH]™H[›™[™YÚ\ÝžK‚ˆ›Û™XYX[œÈ\ÈÙ\™\ˆØ[››Ýš[™[›™\œË‚ˆœ\˜[H˜]×Ü[›™\—ÚYˆ[›™\ˆYœ›ÛHH™\]Y\Ý›ÙKK™Ë‚ˆœ[›™\—ØX˜ÌLŒÈ˜‚ˆœ\˜[H\Ù\—ÚYˆ]][XØ]YØ[\‹K™Ë‚ˆ˜[XÙP^[\K˜ÛÛH˜ˆ›Û™XÚÚ\ÈHÝÛ™\œÚ\ˆÚXÚÈ
+Ú[™ÛK]\Ù\ˆÈ›ËX]][ÙJK‚ˆœ™]\›œÎˆš[[YY™YÚ\Ý\™Y[›™\ˆY‚ˆœ˜Z\Ù\ÈÛ[šYÙ[\œ›ÜŽˆYˆHY\È[\KH›Ý]\ˆ\Âˆ[˜]˜Z[X›KH[›™\ˆ\È›Ý™YÚ\Ý\™YÜˆHØ[\‚ˆÙ\È›ÝÝÛˆH[›™\‹‚ˆˆˆ‚ˆ[›™\—ÚYH˜]×Ü[›™\—ÚYœÝš\
+
+BˆYˆ›Ý[›™\—ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆœ[›™\—ÚY]\Ý›Ý™H[\H‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆYˆ[›™\—Ü›Ý]\ˆ\È›Û™N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆœ[›™\ˆ›Ý]\ˆ\È›ÝÛÛ™šYÝ\™Y‹ˆÛÙOQ\œ›ÜÛÙK’S•T“SÑT”“Ô‹ˆ
+BˆYˆ›Ý[›™\—Ü›Ý]\‹œ[›™\—Ú\×ÛÛ›[™J[›™\—ÚY
+N‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆœ[›™\ˆÜ[›™\—ÚY\ŸH\È›Ý™YÚ\Ý\™Y‹ˆÛÙOQ\œ›ÜÛÙK’S•SQÒS”Uˆ
+BˆÈ[™›Ü˜ÙH[›™\ˆÝÛ™\œÚ\ˆHØ[\ˆ]\ÝÝÛˆH[›™\‚ˆÈ^H\™HžZ[™ÈÈš[™ÈHÙ\ÜÚ[Û‹‚ˆYˆ\Ù\—ÚY\È›Ý›Û™N‚ˆ[›™\—ÛÝÛ™\ˆH[›™\—Ü›Ý]\‹œ[›™\—ÛÝÛ™\Š[›™\—ÚY
+BˆYˆ[›™\—ÛÝÛ™\ˆ\È›Ý›Û™H[™[›™\—ÛÝÛ™\ˆOH\Ù\—ÚY‚ˆ˜Z\ÙHÛ[šYÙ[\œ›ÜŠˆˆœ[›™\ˆÜ[›™\—ÚY\ŸH\È›ÝÝÛ™YžHH™\]Y\Ý[™È\Ù\ˆ‹ˆÛÙOQ\œ›ÜÛÙK‘“Ô’QS‹ˆ
+Bˆ™]\›ˆ[›™\—ÚY‚‚™YˆÛ]\ÝÛY\ÜØYÙWÜ™]šY]Êˆ][\Îˆ\ÝÐÛÛ™\œØ][Û’][WKˆ[Z]ØÚ\œÎˆ[HÐÒSÔ‘U’QU×ÓSRUŠHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ™]\›ˆHÚ[™ÛK[[™H^™]šY]Èœ›ÛH™]Ù\ÝYš\œÝY\ÜØYÙH][\Ë‚‚ˆÝÙ\œÈHÝX‹XYÙ[˜Z[›ÝÉÜÈÝ]\È[™HÛÈH\Ù\ˆØ[ˆÙYHÚ]ˆHÚ[\ÈØ^Z[™ÈÚ]Ý]Ü[š[™È]ˆHØ[\ˆÝ\Y\ÈBˆ˜]ÚY™]Ù\ÝYš\œÝY\ÜØYÙH\Ý›ÜˆÛ™HÚ[È\È[˜Ý[Ûˆ›Ú[œÂˆ[œ]Ý^ÈÝ]]Ý^›ØÚÜÈœ›ÛHHš\œÝ›Û‹[Y]BˆY\ÜØYÙHÚ]^ÛÛ\Ù\ÈÚ]\ÜXÙK[™[˜Ø]\ÈÂˆ[Z]ØÚ\œØˆY[ˆY]HY\ÜØYÙ\ÈØ\œžH\˜X›H[›™\ˆÛÛ^ˆ[™]\Ý™]™\ˆ™HÚÝÛˆ\È\Ù\‹Y˜XÚ[™È™]šY]ÜË‚‚ˆœ\˜[H][\Îˆ™]Ù\ÝYš\œÝY\ÜØYÙH][\È›ÜˆÛ™HÛÛ™\œØ][Û‹‚ˆœ\˜[H[Z]ØÚ\œÎˆX^™]šY]È[™Ý[ˆÚ\˜XÝ\œËˆK™ËˆML‚ˆœ™]\›œÎˆ[˜Ø]YÚ[™ÛK[[™H™]šY]È^K™Ë‚ˆ’IÛÙX\˜ÚHÛÙX˜\ÙH›Üˆ™Y™\™[˜Ù\ø )ˆ˜Üˆ›Û™X‚ˆˆˆ‚ˆ›Üˆ][H[ˆ][\Î‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ][K™]KY\ÜØYÙQ]JHÜˆ][K™]Kš\×ÛY]N‚ˆÛÛ[YBˆ\Îˆ\ÝÜÝ—HH×Bˆ›Üˆ›ØÚÈ[ˆ][K™]K˜ÛÛ[‚ˆ›ØÚ×Ý\HH›ØÚË™Ù]
+\HŠBˆ^H›ØÚË™Ù]
+^ŠBˆYˆ›ØÚ×Ý\H[ˆ
+š[œ]Ý^‹›Ý]]Ý^ŠH[™\Ú[œÝ[˜ÙJ^ÝŠN‚ˆ\Ë˜\[™
+^
+BˆÛÛ\ÙYHˆ‹š›Ú[Šˆ‹š›Ú[Š\ÊKœÜ]
+
+JBˆYˆ›ÝÛÛ\ÙY‚ˆÛÛ[YBˆYˆ[ŠÛÛ\ÙY
+HH[Z]ØÚ\œÎ‚ˆ™]\›ˆÛÛ\ÙYˆÈš[HÈÛ™HÚ\ˆ\ÜÈ[ˆH[Z]ÛÈH˜Z[[™È[\Ú\ÂˆÈÙY\ÈHšY[][Z]ØÚ\œØÝ[‚ˆ™]\›ˆÛÛ\ÙYÎˆX^
+[Z]ØÚ\œÈHJWKœœÝš\
+
+H
+È¸ )ˆ‚ˆ™]\›ˆ›Û™B‚‚™YˆØÚ[ÜÙ\ÜÚ[Û—ØÝ\œ™[Ý\Ú×ÜÝ]\×Ùœ›ÛWØØXÚYÜÝ]\ÊÝ]\ÎˆØš™XÝ
+HOˆÝˆ›Û™N‚ˆˆˆ‚ˆX\ØXÚYÙ\ÜÚ[ÛˆY™XÞXÛHÝ]\ÈÛÈÚ[\Ý[[X\žH\ÚÈÝ]\Ë‚‚ˆœ\˜[HÝ]\ÎˆØXÚYÙ\ÜÚ[Û‹œÝ]\Ø˜[YK‚ˆœ™]\›œÎˆX›XÈÚ[Ù\ÜÚ[Û”Ý[[X\žK˜Ý\œ™[Ý\Ú×ÜÝ]\Ø˜[YK‚ˆˆˆ‚ˆYˆÝ]\È[ˆ
+œ[›š[™È‹ØZ][™ÈŠN‚ˆ™]\›ˆš[—Ü›ÙÜ™\ÜÈ‚ˆYˆÝ]\ÈOHšYHŽ‚ˆ™]\›ˆ˜ÛÛ\]Y‚ˆYˆÝ]\ÈOH™˜Z[YŽ‚ˆ™]\›ˆ™˜Z[Y‚ˆ™]\›ˆ›Û™B‚‚™YˆØÚ[ÜÙ\ÜÚ[Û—ÜÝ[[X\žWÙœ›ÛWØÛÛ™\œØ][ÛŠˆÛÛŽˆÛÛ™\œØ][Û‹ˆ\™[ÜÙ\ÜÚ[Û—ÚYˆÝ‹ˆ\ÝÛY\ÜØYÙWÜ™]šY]ÎˆÝˆ›Û™Kˆ\™[Ü™X\ÛÛš[™×ÙY™›ÜˆÝˆ›Û™HH›Û™Kˆ\™[Û[Ù[ˆÝˆ›Û™HH›Û™Kˆ
+‹ˆØXÚYÜÝ]\ÎˆÝˆ›Û™HH›Û™KŠHOˆÚ[Ù\ÜÚ[Û”Ý[[X\žN‚ˆˆˆ‚ˆZ[H˜Û\ÜÎ˜Ú[Ù\ÜÚ[Û”Ý[[X\žXœ›ÛHHÚ[ÛÛ™\œØ][Û‹‚‚ˆ\œÙ\ÈHØ[›ÛšXØ[ÝX‹XYÙ[]H›Ü›X]ˆžØYÙ[Ý\_NžÜÙ\ÜÚ[Û—Û˜[Y_H˜Üš][ˆžBˆ™[˜Î˜Û[šYÙ[ÛÛË˜Z[[œËœÜ]Û‹—ÜÜ]Û—ÛÛ™X\ÈBˆË\ÙYÛY[ZNžØYÙ[Û˜[Y_NžÝ\Ù\—ÛX™[H˜›Ü›HÜš][ˆžHBˆÙXˆRHYYÙ[ˆ›ÝÈ
+Ý\™˜XÙY\ÈÛÛ^ØYÙ[Û˜[Y_X[™ˆÙ\ÜÚ[Û—Û˜[YO^Ý\Ù\—ÛX™[X
+KˆÛ\˜]\ÈX[›Ü›YYÛYØXÞH›ÝÜÎ‚ˆYˆH]H\È›Û™XÜˆ\È›ÈÛÛÛ‹ÛÛ˜[È˜XÚÈÂˆH˜]È]H[™Ù\ÜÚ[Û—Û˜[YX\È›Û™X8 %H›ÝÈ\ÈÝ[ˆÝ\™˜XÙYÛÈXYÈšY]ÜÈØ[ˆ[™\ÝYØ]K‚‚ˆ˜]]™KZ\›™\ÜÈÚ[™[ˆ\™HH^Ù\[ÛŽˆZ\ˆ]\È\™Bˆ[š\]Y[™\ÜÈÙ^\ÈZ[œ›ÛHÜ\]YH[[YHYËÛÈÛÙ^[™Û]YBˆ›ÝÜÈZÙHÛÛœ›ÛHZ\ˆX™[È[œÝXYÙˆH]K‚‚ˆ\ÞX\È\š]™Yœ›ÛHH™[^KY™YÜÙ\ÜÚ[Û—ÜÝ]\×ØØXÚXˆ
+H\ÚÜÈX›H\È™Y[ˆ™[[Ý™Y
+KˆYÙ[ÚY[™YÙ[Û˜[YXˆ\™H™XYœ›ÛHHÛÛ™\œØ][Ûˆ›ÝÈ\™XÝK‚‚ˆœ\˜[HÛÛŽˆHÚ[˜Û\ÜÎ˜ÛÛ™\œØ][Û˜›ÝÂˆ
+Ú[™HœÝX—ØYÙ[˜
+Hœ›ÛBˆ›Y]˜ÛÛ™\œØ][Û”ÝÜ™K›\ÝØÛÛ™\œØ][ÛœØ‚ˆœ\˜[H\™[ÜÙ\ÜÚ[Û—ÚYˆH\™[Ù\ÜÚ[ÛˆYœ›ÛHBˆ›Ý]KK™Ëˆ˜ÛÛ—Ü\™[NÈ˜ˆ\ÜÙY[ˆ˜]\ˆ[‚ˆ™K\™XY[™Èœ›ÛHÛÛ‹œ\™[ØÛÛ™\œØ][Û—ÚYÈÙY\ˆH[\ˆ[™Y™™\™[ÈYØXÞH›ÝÜÈÚ\™HH’ÈZYÚˆ™HZ\ÜÚ[™Ë‚ˆœ\˜[H\ÝÛY\ÜØYÙWÜ™]šY]Îˆ™]šY]È^\š]™Yœ›ÛHH˜]ÚYˆÚ[[Y\ÜØYÙHÛÚÝ\Üˆ›Û™XÚ[ˆ›Èš\ÚX›HY\ÜØYÙH^\ÝË‚ˆœ\˜[H\™[Ü™X\ÛÛš[™×ÙY™›Üˆ\™[8 &\È\œÚ\ÝYY™›Ü\ÙY\ÈBˆ\Ü^H˜[˜XÚÈ›ÜˆÛ\ˆ˜]]™HÚ[›ÝÜÈÜ™X]Y™Y›Ü™H˜]]™BˆÚ[[š\š][˜ÙHØ\È\œÚ\ÝY‚ˆœ\˜[H\™[Û[Ù[ˆ\™[8 &\ÈY™™XÝ]™H[Ù[\ÙY\ÈH\Ü^H˜[˜XÚÂˆ›ÜˆÛ\ˆÚ[›ÝÜÈÚÜÙH˜]]™HÜ˜\\‹ÜÜXÈ^ÜÙ\È›È[Ù[‚ˆœ\˜[HØXÚYÜÝ]\ÎˆÙ\ÜÚ[ÛˆÝ]\ÈÈ\š]™H\ÞXÂˆÝ\œ™[Ý\Ú×ÜÝ]\Øœ›ÛKK™Ëˆœ[›š[™È˜ˆ›Û™X™XYÈBˆ]™HÜÙ\ÜÚ[Û—ÜÝ]\×ØØXÚXÈHÝ]\ËYYÙHX›\Ú\ˆ\ÜÙ\ÈBˆYÙIÜÈÝÛˆ˜[YHÛÈH\œÝÙˆ˜[œÚ][ÛœÈ˜[œÈÝ]Û™HÝ[[X\žH\‚ˆYÙH[œÝXYÙˆH]\ÝÝ]\È™\X]Y‚ˆœ™]\›œÎˆHÜ[]Y˜Û\ÜÎ˜Ú[Ù\ÜÚ[Û”Ý[[X\žX‚ˆˆˆ‚ˆ\Ü^WÝ]HH]WÝÚ]Ý]ØÛÜÙYÛX\šÙ\ŠÛÛ‹]JBˆÈÚ[Ù\ÜÚ[ÛœÈ\™[‰Ý[›˜X›H
+H[ˆY™›Ü™[˜ÙH]™\ÈÛˆÜ[]™[ˆÈÚYX˜\ˆ›ÝÜÈÛ›JK]Ýš\[žH\‹]\Ù\ˆÛ[šYÙ[œ[›™Y\Ù\˜Ù^\ÂˆÈY™[œÚ]™[HÛÈHÚ\™YÚ[	ÜÈÝ[[X\žHØ[ˆ™]™\ˆ^ÜÙH[›Ý\ˆšY]Ù\‰ÜÂˆÈ[ˆÙ^Kˆ›ÈÛÛ\ÙK]ËXØ[›ÛšXØ[\™Nˆ\™IÜÈ›È[ˆÈÝ\™˜XÙK‚ˆ˜]×ÛX™[ÈHÚÎˆˆ›ÜˆËˆ[ˆÛÛ‹›X™[Ëš][\Ê
+HYˆ›ÝËœÝ\ÝÚ]
+ˆžÔS“‘QÓP‘SÒÑV_KˆŠ_BˆX™[ÈHX™[×ÝÚ]ØÛÜÙYÜÝ]\Ê˜]×ÛX™[ËÛÛ‹]JBˆÛÛˆÝˆ›Û™BˆÙ\ÜÚ[Û—Û˜[YNˆÝˆ›Û™BˆYˆÚ\×ØÛÙ^Û˜]]™WÜÝX˜YÙ[
+ÛÛŠN‚ˆÈÛÙ^[˜]]™HÚ[ˆÝ\™˜XÙHHÛÙ^X\ÜÚYÛ™YšXÚÛ˜[YKÜ›ÛH\ÂˆÈÛÛ[™H˜]È™XYY\ÈÙ\ÜÚ[Û—Û˜[YX›ÜˆÛÜœ™[][Û‹‚ˆÛÛHØÛÙ^ÜÝX˜YÙ[Ù\Ü^WÝÛÛ
+X™[ÊBˆÙ\ÜÚ[Û—Û˜[YHHX™[Ë™Ù]
+ÐÓÑVÓUU‘WÔÕPQÑS•Õ‘PQÒQÓP‘SÒÑVJBˆ[YˆÚ\×ØÛ]YWÛ˜]]™WÜÝX˜YÙ[
+ÛÛŠN‚ˆÈÛ]YK[˜]]™HÚ[ˆH]H\ÈžØYÙ[\_NžÜÝX˜YÙ[ÚYHˆ8 %[‚ˆÈÜ\]YH[š\]Y[™\ÜÈÙ^HÚÜÙH[™\È\™H›Ý[œ™XYX›HÛ˜ÙHBˆÈYÙ[\H\ÈYÚ[‹[˜[Y\ÜXÙYˆÝ\™˜XÙHH\ÚÈ\ØÜš\[Ûˆ
+Ü‚ˆÈH˜\™HYÙ[˜[YJH\ÈÛÛ[™ÙY\H˜]ÈÛ]YHY\ÂˆÈÙ\ÜÚ[Û—Û˜[YX›ÜˆÛÜœ™[][Û‹‚ˆÛÛHØÛ]YWÜÝX˜YÙ[Ù\Ü^WÝÛÛ
+ÛÛ‹X™[ÊBˆÙ\ÜÚ[Û—Û˜[YHHX™[Ë™Ù]
+ÐÓUQWÓUU‘WÔÕPQÑS•ÒQÓP‘SÒÑVJBˆ[Yˆ\Ü^WÝ]H[™Žˆˆ[ˆ\Ü^WÝ]N‚ˆXYËZ[H\Ü^WÝ]Kœ\][ÛŠŽˆŠBˆYˆXYOHÕRWÐQQÐQÑS•ÕUWÔ‘Q’V[™Žˆˆ[ˆZ[‚ˆÈ\Ù\‹XYYYÙ[ˆZNYÙ[Û˜[YOŽ\Ù\—ÛX™[ˆ‹ˆÝ\™˜XÙHBˆÈ›Ý[™YÙ[\ÈÛÛ[™H\Ù\‰ÜÈX™[\ÈÙ\ÜÚ[Û—Û˜[YXˆÈÛÈHYÙ[È˜Z[™[™\œÈ]ZÙH[žHÝ\ˆÚ[›ÝË‚ˆYÙ[Û˜[YKË\Ù\—ÛX™[HZ[œ\][ÛŠŽˆŠBˆÛÛHYÙ[Û˜[YBˆÙ\ÜÚ[Û—Û˜[YHH\Ù\—ÛX™[ˆ[ÙN‚ˆÛÛHXYˆÙ\ÜÚ[Û—Û˜[YHHZ[ˆ[ÙN‚ˆÛÛH\Ü^WÝ]HÜˆ›Û™BˆÙ\ÜÚ[Û—Û˜[YHH›Û™B‚ˆÈ\š]™H\ÞHœ›ÛHH™[^KY™YØXÚNÈ\ÚÜÈX›H\ÈÛÛ™K‚ˆYˆØXÚYÜÝ]\È\È›Û™N‚ˆØXÚYÜÝ]\ÈHÜÙ\ÜÚ[Û—ÜÝ]\×ØØXÚK™Ù]
+ÛÛ‹šY
+BˆYˆØXÚYÜÝ]\È[ˆ
+œ[›š[™È‹ØZ][™ÈŠN‚ˆ\ÞHHYBˆ[ÙN‚ˆ\ÞHH˜[ÙBˆ\ÝÝ\Ú×Ù\œ›ÜˆHÛ\ÝÝ\Ú×Ù\œ›Ü—Ùœ›ÛWÛX™[ÊX™[ÊBˆÝ\œ™[Ý\Ú×ÜÝ]\ÈHØÚ[ÜÙ\ÜÚ[Û—ØÝ\œ™[Ý\Ú×ÜÝ]\×Ùœ›ÛWØØXÚYÜÝ]\ÊØXÚYÜÝ]\ÊBˆYˆ\ÝÝ\Ú×Ù\œ›Üˆ\È›Ý›Û™N‚ˆÝ\œ™[Ý\Ú×ÜÝ]\ÈH™˜Z[Y‚‚ˆÈ›ÜˆÛÙ^Ú[™[‹˜[˜XÚÈÈH›Û\X™[\È™]šY]ÈÚ[ˆBˆÈ™X[˜[œØÜš\\È›Ý\œš]™YY]8 %]›ÚYÈÞ[\Ú^š[™ÈH\Ù\ˆY\ÜØYÙBˆÈ\ÝÛÈH˜Z[\ÈÛÛY][™ÈÈÚÝË‚ˆYˆ\ÝÛY\ÜØYÙWÜ™]šY]È\È›Û™H[™Ú\×ØÛÙ^Û˜]]™WÜÝX˜YÙ[
+ÛÛŠN‚ˆ˜]×Ü›Û\HX™[Ë™Ù]
+ÐÓÑVÓUU‘WÔÕPQÑS•Ô“ÓTÓP‘SÒÑVJBˆYˆ˜]×Ü›Û\‚ˆÛÛ\ÙYHˆ‹š›Ú[Š˜]×Ü›Û\œÜ]
+
+JBˆ\ÝÛY\ÜØYÙWÜ™]šY]ÈHÛÛ\ÙYÎ—ÐÒSÔ‘U’QU×ÓSRUHÜˆ›Û™B‚ˆ›Ý][™×ÙXÚ\Ú[Û—ÚYHÛÛ‹›X™[Ë™Ù]
+“ÕUS‘×ÑPÒTÒSÓ—ÓP‘SÒÑVJBˆ™X\ÛÛš[™×ÙY™›ÜHÛÛ‹œ™X\ÛÛš[™×ÙY™›ÜˆYˆ™X\ÛÛš[™×ÙY™›Ü\È›Û™H[™Ú\×ØÛÙ^Û˜]]™WÜÝX˜YÙ[
+ÛÛŠN‚ˆ™X\ÛÛš[™×ÙY™›ÜH\™[Ü™X\ÛÛš[™×ÙY™›ÜˆWÛ[Ù[HÛÛ˜Ü™]WÜ™\ÜYÛ[Ù[
+ÛÛ‹œ™\ÜYÛ[Ù[
+HÜˆØÚ[ÛWÛ[Ù[Ùœ›ÛWØÛÛ™\œØ][ÛŠˆÛÛ‚ˆ
+BˆYˆWÛ[Ù[\È›Û™H[™ÛÛ‹›[Ù[ÛÝ™\œšYH\È›Ý›Û™N‚ˆWÛ[Ù[HÛÛ‹›[Ù[ÛÝ™\œšYBˆYˆWÛ[Ù[\È›Û™N‚ˆWÛ[Ù[H\™[Û[Ù[ˆ™]\›ˆÚ[Ù\ÜÚ[Û”Ý[[X\žJˆYXÛÛ‹šYˆ\™[ÜÙ\ÜÚ[Û—ÚY\\™[ÜÙ\ÜÚ[Û—ÚYˆ]OY\Ü^WÝ]Kˆ\Ú×ÜÝ[[X\žOXÛÛ‹\Ú×ÜÝ[[X\žKˆÛÛ]ÛÛˆÙ\ÜÚ[Û—Û˜[YO\Ù\ÜÚ[Û—Û˜[YKˆÜ™X]YØ]XÛÛ‹˜Ü™X]YØ]ˆ\]YØ]XÛÛ‹\]YØ]ˆÈYÙ[ÚYÛÛY\Èœ›ÛHHÛÛ™\œØ][Ûˆ›ÝÎÈYÙ[Û˜[YH[™\Ú×ÚYˆÈ\™H›ÈÛ™Ù\ˆ]˜Z[X›Hœ›ÛHH
+™[[Ý™Y
+H\ÚÜÈX›K‚ˆYÙ[ÚYXÛÛ‹˜YÙ[ÚYˆYÙ[Û˜[YOS›Û™KˆÝ\œ™[Ý\Ú×ÚYS›Û™KˆÝ\œ™[Ý\Ú×ÜÝ]\ÏXÝ\œ™[Ý\Ú×ÜÝ]\Ëˆ\ÞOX\ÞKˆX™[Ï[X™[Ëˆ\ÝÝ\Ú×Ù\œ›Ü[\ÝÝ\Ú×Ù\œ›Ü‹ˆ\ÝÛY\ÜØYÙWÜ™]šY]Ï[\ÝÛY\ÜØYÙWÜ™]šY]ËˆÈÝ\™˜XÙHHÝX‹XYÙ[	ÜÈ\šÙYY[XÚ]][ÛˆÛÝ[œ›ÛHHØ[YBˆÈ[‹[Y[[ÜžH[™^]™YYÈHÚYX˜\ˆ˜YÙKÛÈHYÙ[ÂˆÈ˜Z[Ø[ˆ›YÈHÚ[]	ÜÈ]ØZ][™È\Ù\ˆ[œ]‚ˆ[™[™×Ù[XÚ]][Ûœ×ØÛÝ[\[™[™×Ù[XÚ]][ÛœË˜ÛÝ[Ù›ÜŠÛÛ‹šY
+KˆÈH[Ù[›Ý][™ÈXÚÙY›Üˆ\ÈÚ[™\ÜYÛ›HÚ[ˆBˆÈXÚ\Ú[ÛˆXÝX[H›ÙXÙY]ˆH\Ù\‹\[›™Y[Ù[ÛÝ™\œšYH\È›ÝBˆÈ›Ý]Y[Ù[[™™\Ü[™ÈÛ™HÚ]H[XÚ\Ú[ÛˆYXZÙ\ÈBˆÈÛÈšY[ÈÛÛ˜YXÝXXÚÝ\‹ˆHXÚ\Ú[Ûˆ\È›Ú[™Y›ÝYÚBˆÈÛÛ™\œØ][ÛˆX™[˜]\ˆ[ˆH™]ÈÛÛ[[‹‚ˆ›Ý]YÛ[Ù[XÛÛ‹›[Ù[ÛÝ™\œšYHYˆ›Ý][™×ÙXÚ\Ú[Û—ÚY\È›Ý›Û™H[ÙH›Û™Kˆ[Ù[ÛÝ™\œšYOXÛÛ‹›[Ù[ÛÝ™\œšYKˆWÛ[Ù[[WÛ[Ù[ˆ™X\ÛÛš[™×ÙY™›Ü\™X\ÛÛš[™×ÙY™›Üˆ›Ý][™×ÙXÚ\Ú[Û—ÚY\›Ý][™×ÙXÚ\Ú[Û—ÚYˆ
+B‚‚™YˆØÚ[ÛWÛ[Ù[Ùœ›ÛWØÛÛ™\œØ][ÛŠÛÛŽˆÛÛ™\œØ][Ûˆ›Û™JHOˆÝˆ›Û™N‚ˆˆˆ‚ˆ™\ÛÛ™HHÚ[ÛÛ™\œØ][Û‰ÜÈY™™XÝ]™HÜXÈ[Ù[‚‚ˆZ\œ›ÜœÈHÙ\ÜÚ[Û‹\Û˜\ÚÝ™\ÛÛ™\ˆ
+ÜXË™^XÝ]Ü‹›[Ù[Ú]ˆÝX—ØYÙ[Û˜[YXÜXÈÛÚÝ\
+HÛÈHYÙ[È˜Z[™\ÜÈHØ[YBˆ[Ù[HÛÛ\ÜÙ\ˆ™XY[Ý]ÚÝÜÈ›ÜˆÜXËYY˜][YÚ[™[ˆ]ˆØ\œžH™Z]\ˆH[Ù[ÛÝ™\œšYX›ÜˆH›Ý][™È[ˆ8 %K™Ëˆ˜]]™BˆÜ[˜ÛÙHÝX‹XYÙ[ÈÚÜÙH[Ù[ÛÛY\Èœ›ÛHH\™[›Ùš[K‚‚ˆœ\˜[HÛÛŽˆHÚ[ÛÛ™\œØ][Û‹Üˆ›Û™X‚ˆœ™]\›œÎˆH[Ù[Y
+K™Ëˆ›Ü[˜ÛÙKYÛËÙY\ÙYZË]Y›\Ú˜
+KÜ‚ˆ›Û™XÚ[ˆHÚ[\È›È™\ÛÛ˜X›HYÙ[ÜXË‚ˆˆˆ‚ˆYˆÛÛˆ\È›Û™HÜˆÛÛ‹˜YÙ[ÚY\È›Û™N‚ˆ™]\›ˆ›Û™BˆžN‚ˆÈ[\ÜY]Ø[[YHZÙHÜ™\ÛÛ™WÛWÛ[Ù[ÛÈH˜XØYHÜ‚ˆÈ[[YH]Ú\ÈÛ›Ü™YžH\È[Ù[IÜÈ^žKYÛØ˜[ÛÚÝ\Ë‚ˆœ›ÛHÛ[šYÙ[œ[[YH[\ÜÙ]ØYÙ[ØØXÚBˆœ›ÛHÛ[šYÙ[œ[[YK—ÙÛØ˜[È[\ÜØYÙ[ÜÝÜ™Bˆœ›ÛHÛ[šYÙ[œ[[YKÛÜšÙ›ÝÈ[\ÜÙš[™ÜÜX×ØžWÛ˜[YB‚ˆYˆØYÙ[ÜÝÜ™H\È›Û™N‚ˆ™]\›ˆ›Û™BˆYÙ[HØYÙ[ÜÝÜ™K™Ù]
+ÛÛ‹˜YÙ[ÚY
+BˆYˆYÙ[\È›Û™HÜˆYÙ[˜[™WÛØØ][Ûˆ\È›Û™N‚ˆ™]\›ˆ›Û™BˆØYYHÙ]ØYÙ[ØØXÚJ
+K›ØY
+ˆYÙ[šYYÙ[˜[™WÛØØ][Û‹^[™Ù[XYÙ[œÙ\ÜÚ[Û—ÚY\È›Û™Bˆ
+BˆÜXÈHØYYœÜXÂˆYˆÛÛ‹œÝX—ØYÙ[Û˜[YN‚ˆÚ[ÜÜXÈHÙš[™ÜÜX×ØžWÛ˜[YJÜXËÛÛ‹œÝX—ØYÙ[Û˜[YJBˆYˆÚ[ÜÜXÈ\È›Ý›Û™N‚ˆÜXÈHÚ[ÜÜXÂˆ™]\›ˆÜXË™^XÝ]Ü‹›[Ù[ˆ^Ù\
+ˆÙ^Q\œ›Ü‹ˆ]šX]Q\œ›Ü‹ˆ˜[YQ\œ›Ü‹ˆ[\Ü\œ›Ü‹ˆÔÑ\œ›Ü‹ˆ[[YQ\œ›Ü‹ˆÝ][Y[\œ›Ü‹ˆ
+N‚ˆÈ™\ÝYY™›Ü\Ü^H™\ÛÛ™\ˆZÙHÜ™\ÛÛ™WÛWÛ[Ù[ˆ[‚ˆÈ[š[š]X[^™Y[[YHÜˆZ\ÜÚ[™È[™HYÜ˜Y\ÈÈ›[Ù[ˆÈ[šÛ›ÝÛˆˆ˜]\ˆ[ˆ˜Z[[™ÈHÚÛHÚ[\Ý‚ˆ™]\›ˆ›Û™B‚‚™YˆÛXÜÝÛÛÜ™\Ý[
+œ×ÚYˆ[Ýˆ›Û™K^ˆÝŠHOˆ™\ÜÛœÙN‚ˆˆˆ‚ˆÜ˜\HZ[‹]^ÛÛ™\Ý[[ˆH”ÓÓ‹T”È‹ŒPÔÛÛËØØ[™\ÜÛœÙK‚‚ˆœ\˜[Hœ×ÚYˆH”ÓÓ‹T”È™\]Y\ÝY
+X^H™H[Ý‹Üˆ›Û™Xˆ›Üˆ›ÝYšXØ][ÛœÊKK™ËˆX‚ˆœ\˜[H^ˆHÛÛÝ]]^È[X™Y[ˆHÛÛ[›ØÚË‚ˆœ™]\›œÎˆH˜Û\ÜÎ˜™\ÜÛœÙXÚ]ÛÛ[U\Nˆ\XØ][Û‹ÚœÛÛ˜ˆØ\œžZ[™ÈH”ÓÓ‹T”È‹Œ[™[ÜHÚ]HÚ[™ÛH^ÛÛ[›ØÚË‚ˆˆˆ‚ˆ›ÙHHœÛÛ‹™[\ÊˆÈšœÛÛœœÈŽˆŒ‹Œ‹šYŽˆœ×ÚYœ™\Ý[ŽˆÈ˜ÛÛ[ŽˆÞÈ\HŽˆ^‹^Žˆ^W__Bˆ
+Bˆ™]\›ˆ™\ÜÛœÙJÛÛ[X›ÙKYYXWÝ\OH˜\XØ][Û‹ÚœÛÛˆŠB‚‚˜\Þ[˜ÈYˆÚ[™WØYš\ÙWÛ[Ù[×ÛXÜ
+ˆœ×ÚYˆ[Ýˆ›Û™KˆÛÛŽˆ[žKˆ\™Ý[Y[ÎˆXÝÜÝ‹[žWKˆYÙ[ÜÝÜ™Nˆ[žKˆ
+‹ˆÙ\ÜÚ[Û—ÚYˆÝˆ›Û™HH›Û™Kˆ[›™\—Ü›Ý]\Žˆ[žHH›Û™KŠHOˆ™\ÜÛœÙN‚ˆˆˆ‚ˆÙ\™\‹\ÚYH[™\ˆ›ÜˆÞ\×ØYš\ÙWÛ[Ù[ØPÔÛÛØ[Ë‚‚ˆ[\˜Ù\ÈHØ[™Y›Ü™HH[›™\ˆ›ÜØ\™™XØ]\ÙHH\Þ[Y[	ÜÂˆ›Ý][™È˜XÚÙ[™È]™H[ˆHÙ\™\ˆ›ØÙ\ÜË‚‚ˆœ\˜[Hœ×ÚYˆH”ÓÓ‹T”È™\]Y\ÝY‚ˆœ\˜[HÛÛŽˆH˜Û\ÜÎ˜ÛÛ™\œØ][Û˜›Üˆ\ÈÙ\ÜÚ[Û‹‚ˆœ\˜[H\™Ý[Y[Îˆ\œÙYÛÛ\™Ý[Y[Èœ›ÛHHK‚ˆœ\˜[HYÙ[ÜÝÜ™NˆÝÜ™H›ÜˆYÙ[ÛÚÝ\
+\ÙYÈ™\ÛÛ™HÝX‹XYÙ[\›™\ÜÙ\ÊK‚ˆœ™]\›œÎˆH”ÓÓ‹T”È‹ŒÛÛËØØ[™\Ý[™\ÜÛœÙK‚ˆˆˆ‚ˆ\ÚÜÈH\™Ý[Y[Ë™Ù]
+\ÚÜÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ\ÚÜË\Ý
+N‚ˆ™]\›ˆÛXÜÝÛÛÜ™\Ý[
+ˆœ×ÚYœÛÛ‹™[\ÊÈ™\œ›ÜˆŽˆ\ÚÜÈ]\Ý™HH\Ý‹œ›Ý]\—ÛÛˆŽˆ˜[Ù_JBˆ
+B‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý][™×Ø˜XÚÙ[™[\Ü˜XÚÙ[™×Ùœ›ÛWØØ\Â‚ˆØ\ÈHÙ]ØØ\Ê
+Bˆ›Ý][™×ØÛY[H˜XÚÙ[™×Ùœ›ÛWØØ\ÊØ\ÊK˜[žJ
+BˆYˆ›Ý][™×ØÛY[\È›Û™N‚ˆ™]\›ˆÛXÜÝÛÛÜ™\Ý[
+œ×ÚYœÛÛ‹™[\ÊÈœ›Ý]\—ÛÛˆŽˆ˜[ÙKœ™XÛÛ[Y[™][ÛœÈŽˆ×_JJB‚ˆœ›ÛHÛ[šYÙ[›[Ù[Ë›[Ù[ØØ][ÙÈ[\ÜÜX×Ú\›™\ÜÂˆœ›ÛHÛ[šYÙ[œÙ\™\‹œÛX\Ü›Ý][™È[\ÜÕÓÔ’ÑT—ÓSQWÕ×ÒT“‘TÔË™]ÚÜ[›™\—Û[Ù[Â‚ˆÈ™]Ú]™H[Ù[Ø][ÙÈœ›ÛHH[›™\ˆÛ˜ÙNÈ\ÙY™[ÝÈÈÜ[]BˆÈ\‹XYÙ[[Ù[\ÝÈÚ[ˆHØ[\ˆÛZ]È^XÚ][Ù[Ë‚ˆÈÙ^\È\™HÛÜšÙ\ˆ˜[Y\È
+œÙ[ˆ‹˜Û]YWØÛÙH‹]ËŠH\È™]\›™YžBˆÈØ][Ù×Ù›Ü—ÜÜXËˆ›Û™HÚ[ˆ[›™\ˆ\ØÛÝ™\žH\È[˜]˜Z[X›K‚ˆÜ[›™\—ØØ][ÙÎˆXÝÜÝ‹\ÝÜÝ—WH›Û™HH›Û™BˆYˆÙ\ÜÚ[Û—ÚY\È›Ý›Û™H[™[›™\—Ü›Ý]\ˆ\È›Ý›Û™N‚ˆÜ[›™\—ØÛY[H]ØZ]ÙÙ]Ü[›™\—ØÛY[
+Ù\ÜÚ[Û—ÚY[›™\—Ü›Ý]\ŠBˆYˆÜ[›™\—ØÛY[\È›Ý›Û™N‚ˆÜ[›™\—ØØ][ÙÈH]ØZ]™]ÚÜ[›™\—Û[Ù[ÊÙ\ÜÚ[Û—ÚYÜ[›™\—ØÛY[
+B‚ˆÈ™\ÛÛ™HH\™[YÙ[ÜXÈÈÛÚÈ\ÝX‹XYÙ[\›™\ÜÙ\Ë‚ˆÜXÎˆ[žH›Û™HH›Û™BˆYˆÛÛ‹˜YÙ[ÚY\È›Ý›Û™N‚ˆYÙ[ÛØšˆH]ØZ]\Þ[˜Ú[Ë×Ý™XY
+YÙ[ÜÝÜ™K™Ù]ÛÛ‹˜YÙ[ÚY
+BˆYˆYÙ[ÛØšˆ\È›Ý›Û™N‚ˆžN‚ˆÜXÈH
+ˆÙ]ØYÙ[ØØXÚJ
+Bˆ›ØY
+ˆYÙ[ÛØš‹šYˆYÙ[ÛØš‹˜[™WÛØØ][Û‹ˆ^[™Ù[XYÙ[ÛØš‹œÙ\ÜÚ[Û—ÚY\È›Û™Kˆ
+BˆœÜXÂˆ
+Bˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LBˆÛÙÙÙ\‹™XYÊˆ—Ú[™WØYš\ÙWÛ[Ù[×ÛXÜˆ˜Z[YÈØYÜXÈ›ÜˆYÙ[I\È‹ÛÛ‹˜YÙ[ÚYˆ
+B‚ˆYˆÜ™\ÛÛ™WÚ\›™\Ü×Ù›Ü—ÝÛÜšÙ\ŠYÙ[ˆÝŠHOˆÝˆ›Û™N‚ˆYˆÜXÈ\È›Ý›Û™N‚ˆÝX—ØYÙ[ÈHÙ]]ŠÜXËœÝX—ØYÙ[È‹›Û™JHÜˆ×Bˆ›ÜˆÝXˆ[ˆÝX—ØYÙ[Î‚ˆYˆÙ]]ŠÝX‹›˜[YH‹›Û™JHOHYÙ[‚ˆHÜX×Ú\›™\ÜÊÝXŠBˆYˆ‚ˆ™]\›ˆˆœ™XZÂˆ™]\›ˆÕÓÔ’ÑT—ÓSQWÕ×ÒT“‘TÔË™Ù]
+YÙ[
+B‚ˆ™XÛÛ[Y[™][ÛœÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ\ÚÈ[ˆ\ÚÜÎ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ\ÚËXÝ
+N‚ˆÛÛ[YBˆ]HH\ÚË™Ù]
+]H‹ˆŠBˆ\Ú×Ý^H\ÚË™Ù]
+\ÚÈ‹ˆŠBˆYÙ[×ÜÜXÈH\ÚË™Ù]
+˜YÙ[ÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJYÙ[×ÜÜXË\Ý
+HÜˆ›ÝYÙ[×ÜÜXÎ‚ˆÛÛ[YB‚ˆÈZ[\›™\Üø¡¤›[Ù[ÈX\›ÜˆH›Ý][™ÈÛY[\ÈÛÈ™]™\œÙBˆÈX\È›Üˆ™\ÛÛš[™ÈHÚÜÙ[ˆYÙ[Y\ˆH™\™XÝ‚ˆÈH\›™\Ü×Ý×ØYÙ[ˆ™Y™\œ™Y]Ú[ˆHYÙHXÚÜÈH\›™\ÜÂˆÈH[Ù[Ý×ØYÙ[ˆ˜[˜XÚÈÚ[ˆ\›™\ÜÈ\ÈXœÙ[Üˆ[œ™XÛÙÛš\ÙYˆÈ[œÙ\[ÛˆÜ™\ˆ\È™\Ù\™YÈš\œÝXYÙ[]Ú[œÈY\\Y\ÈÚ[‚ˆÈHØ[YH[Ù[\X\œÈ[ˆ][\H\›™\ÜÈ\ÝË‚ˆ[Ù[Ý×ØYÙ[ˆXÝÜÝ‹Ý—HHßBˆ\›™\Ü×Ý×ØYÙ[ˆXÝÜÝ‹Ý—HHßBˆ\›™\Ü×Û[Ù[ÎˆXÝÜÝ‹\ÝÜÝ—WHHßBˆ›ÜˆYÙ[Ù[žH[ˆYÙ[×ÜÜXÎ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJYÙ[Ù[žKXÝ
+N‚ˆÛÛ[YBˆYÙ[HYÙ[Ù[žK™Ù]
+˜YÙ[‹ˆŠBˆ^XÚ]Û[Ù[Îˆ\ÝÜÝ—H›Û™HHYÙ[Ù[žK™Ù]
+›[Ù[ÈŠBˆYˆ^XÚ]Û[Ù[È\È›Ý›Û™H[™›Ý\Ú[œÝ[˜ÙJ^XÚ]Û[Ù[Ë\Ý
+N‚ˆ^XÚ]Û[Ù[ÈH›Û™BˆYˆ^XÚ]Û[Ù[Î‚ˆ\›™\Ü×ÚÙ^HHYÙ[È\ÙHYÙ[˜[YH\ÈÙ^HÚ[ˆ[Ù[È\™H^XÚ]ˆØ[™Y]\ÈH^XÚ]Û[Ù[Âˆ[ÙN‚ˆ\›™\Ü×ÚÙ^HHÜ™\ÛÛ™WÚ\›™\Ü×Ù›Ü—ÝÛÜšÙ\ŠYÙ[
+HÜˆYÙ[ˆÈ™Y™\ˆHÛÜšÙ\ˆ˜[YK[ˆ]È›Ü›X[^™Y\›™\ÜÈÙ^K‚ˆØ[™Y]\ÈH
+ˆ
+Ü[›™\—ØØ][ÙÈÜˆßJK™Ù]
+YÙ[
+BˆÜˆ
+Ü[›™\—ØØ][ÙÈÜˆßJK™Ù]
+\›™\Ü×ÚÙ^JBˆÜˆ×Bˆ
+BˆYˆØ[™Y]\Î‚ˆ\›™\Ü×Û[Ù[ËœÙ]Y˜][
+\›™\Ü×ÚÙ^K×JBˆ\›™\Ü×Ý×ØYÙ[œÙ]Y˜][
+\›™\Ü×ÚÙ^KYÙ[
+Bˆ›ÜˆH[ˆØ[™Y]\Î‚ˆYˆH›Ý[ˆ[Ù[Ý×ØYÙ[‚ˆ[Ù[Ý×ØYÙ[ÛWHHYÙ[ˆ\›™\Ü×Û[Ù[ÖÚ\›™\Ü×ÚÙ^WK˜\[™
+JB‚ˆYˆ›Ý\›™\Ü×Û[Ù[Î‚ˆ™XÛÛ[Y[™][ÛœË˜\[™
+ˆÈ]HŽˆ]K˜YÙ[Žˆ›Û™K›[Ù[Žˆ›Û™Kœ˜][Û˜[HŽˆ››ÈØ[™Y]\ÈŸBˆ
+BˆÛÛ[YBˆžN‚ˆ™\™XÝH]ØZ]›Ý][™×ØÛY[œ›Ý]J\Ú×Ý^\›™\Ü×Û[Ù[ÊBˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LHÈ›Ý][™È˜Z[\™\È]\Ý›ÝÜ˜\ÚHYš\ÛÜ‚ˆÛÙÙÙ\‹™^Ù\[ÛŠ—Ú[™WØYš\ÙWÛ[Ù[×ÛXÜˆ›Ý]H˜Z[Y\ÚÏI\ˆ‹]JBˆ™\™XÝH›Û™BˆYˆ™\™XÝ\È›Û™N‚ˆ™XÛÛ[Y[™][ÛœË˜\[™
+ˆÂˆ]HŽˆ]Kˆ˜YÙ[Žˆ›Û™Kˆ›[Ù[Žˆ›Û™Kˆœ˜][Û˜[HŽˆœ›Ý]\ˆ™]\›™Y›È™\™XÝ‹ˆBˆ
+Bˆ[ÙN‚ˆÈ™Y™\ˆHYÙIÜÈ\›™\ÜÈXÚÎÈ˜[˜XÚÈÈ[Ù[ÝÛ™\œÚ\‚ˆÚÜÙ[—ØYÙ[H
+ˆ\›™\Ü×Ý×ØYÙ[™Ù]
+™\™XÝš\›™\ÜÊHYˆ™\™XÝš\›™\ÜÈ[ÙH›Û™Bˆ
+HÜˆ[Ù[Ý×ØYÙ[™Ù]
+™\™XÝ›[Ù[
+Bˆ™XÛÛ[Y[™][ÛœË˜\[™
+ˆÂˆ]HŽˆ]Kˆ˜YÙ[ŽˆÚÜÙ[—ØYÙ[ˆ›[Ù[Žˆ™\™XÝ›[Ù[ˆœ˜][Û˜[HŽˆ™\™XÝœ˜][Û˜[KˆBˆ
+B‚ˆ™]\›ˆÛXÜÝÛÛÜ™\Ý[
+ˆœ×ÚYœÛÛ‹™[\ÊÈœ›Ý]\—ÛÛˆŽˆYKœ™XÛÛ[Y[™][ÛœÈŽˆ™XÛÛ[Y[™][ÛœßJBˆ
+B‚‚™YˆÛXÜÛÚ×Ü™\ÜÛœÙJœ×ÚYˆ[Ýˆ›Û™K™\Ý[ˆXÝÜÝ‹[žWJHOˆ™\ÜÛœÙN‚ˆˆˆ‚ˆÜ˜\
+œ™\Ý[
+ˆ[ˆH”ÓÓ‹T”È‹ŒÝXØÙ\ÜÈ™\ÜÛœÙK‚‚ˆœ\˜[Hœ×ÚYˆH”ÓÓ‹T”È™\]Y\ÝY
+X^H™H[Ý‹Üˆ›Û™Xˆ›Üˆ›ÝYšXØ][ÛœÊKK™ËˆX‚ˆœ\˜[H™\Ý[ˆH”ÓÓ‹\Ù\šX[\ØX›H™\Ý[^[ØYK™Ë‚ˆÈÛÛÈŽˆË‹‹—_X‚ˆœ™]\›œÎˆH˜Û\ÜÎ˜™\ÜÛœÙXÚ]ÛÛ[U\Nˆ\XØ][Û‹ÚœÛÛ˜ˆØ\œžZ[™ÈH”ÓÓ‹T”È‹Œ[™[ÜK‚ˆˆˆ‚ˆ›ÙHHœÛÛ‹™[\ÊÈšœÛÛœœÈŽˆŒ‹Œ‹šYŽˆœ×ÚYœ™\Ý[Žˆ™\Ý[JBˆ™]\›ˆ™\ÜÛœÙJÛÛ[X›ÙKYYXWÝ\OH˜\XØ][Û‹ÚœÛÛˆŠB‚‚™YˆÛXÜÙ\œ›Ü—Ü™\ÜÛœÙJˆœ×ÚYˆ[Ýˆ›Û™KˆÛÙNˆ[ˆY\ÜØYÙNˆÝ‹ŠHOˆ™\ÜÛœÙN‚ˆˆˆ‚ˆÜ˜\[ˆ\œ›Üˆ[ˆH”ÓÓ‹T”È‹Œ\œ›Üˆ™\ÜÛœÙK‚‚ˆœ\˜[Hœ×ÚYˆH”ÓÓ‹T”È™\]Y\ÝYˆ\ÙH›Û™XÚ[ˆHYˆÛÝ[›Ý™H\œÙYK™Ëˆ›Û™X‚ˆœ\˜[HÛÙNˆ”ÓÓ‹T”È\œ›ÜˆÛÙKK™ËˆLÌŒX
+Y]Ù›Ý›Ý[™
+BˆÜˆLÌŒ
+\XØ][Ûˆ\œ›ÜŠK‚ˆœ\˜[HY\ÜØYÙNˆ[X[‹\™XYX›H\œ›Üˆ\ØÜš\[Û‹ˆK™Ëˆ“Y]Ù›Ý›Ý[™ˆ	Ý[œÝ\ÜYÛY]Ù	È˜‚ˆœ™]\›œÎˆH˜Û\ÜÎ˜™\ÜÛœÙXÚ]ÛÛ[U\Nˆ\XØ][Û‹ÚœÛÛ˜ˆØ\œžZ[™ÈH”ÓÓ‹T”È‹Œ\œ›Üˆ[™[ÜK‚ˆˆˆ‚ˆ›ÙHHœÛÛ‹™[\ÊˆÂˆšœÛÛœœÈŽˆŒ‹Œ‹ˆšYŽˆœ×ÚYˆ™\œ›ÜˆŽˆÈ˜ÛÙHŽˆÛÙK›Y\ÜØYÙHŽˆY\ÜØYÙ_KˆBˆ
+Bˆ™]\›ˆ™\ÜÛœÙJÛÛ[X›ÙKYYXWÝ\OH˜\XØ][Û‹ÚœÛÛˆŠB‚‚™YˆÛXÜÚ[œ]Ü™\]Z\™YÜ™\ÜÛœÙJˆœ×ÚYˆ[Ýˆ›Û™Kˆ[XÚ]][Û—ÚYˆÝ‹ˆY\ÜØYÙNˆÝ‹ˆ™\]Y\ÝÜÝ]NˆÝ‹ˆÙ\ÜÚ[Û—ÚYˆÝˆ›Û™HH›Û™KŠHOˆ™\ÜÛœÙN‚ˆˆˆ‚ˆ™]\›ˆ[ˆPÔ[œ]™\]Z\™Y™\Ý[\ÚÚ[™ÈH[›™\ˆÈÛÛXÝˆ\Ù\ˆ\›Ý˜[™Y›Ü™H™]žZ[™ÈHÛÛØ[‚‚ˆ›ÛÝÜÈH][H›Ý[™Uš\™\]Y\ÝÈ
+T•ŠHÜXÎ‚ˆÎ‹ËÛ[Ù[ÛÛ^›ÝØÛÛš[ËÜÜXÚYšXØ][Û‹Ù˜YØ˜\ÚXËÝ][]Y\ËÛ\˜‚ˆH[XÚ]][Û—ÚY\È\ÙY\ÈHÙ^H[ˆ[œ]™\]Y\ÝØÛÈBˆ[›™\ˆØ[ˆY[YžHH\›Ý˜[]\™HÚ]Ý][œÜXÝ[™ÈHÜ\]YBˆ™\]Y\ÝÝ]XˆÚ[ˆT“[[ÙH\ÈXÝ]™H[™Ù\ÜÚ[Û—ÚY\ÂˆÛ›ÝÛ‹YÈ[ÙXØ\›È\˜[\Ë‚‚ˆœ\˜[Hœ×ÚYˆH”ÓÓ‹T”È™\]Y\ÝYK™ËˆX‚ˆœ\˜[H[XÚ]][Û—ÚYˆÙ\™\‹[Z[Y[XÚ]][ÛˆY\ÙY›Ý\ÈBˆ[œ]™\]Y\ÝØÙ^H[™[œÚYHHÜ\]YH™\]Y\ÝÝ]XˆK™Ëˆ™[XÚ]ØX˜ÌLŒÈ˜‚ˆœ\˜[HY\ÜØYÙNˆ[X[‹\™XYX›H›Û\ÚÝÛˆÈH\Ù\‹ˆK™Ëˆ[ÝÈÛÛÞ\×ÛÜ×ÜÚ[È˜‚ˆœ\˜[H™\]Y\ÝÜÝ]NˆÜ\]YHÝ]H›ØˆHÛY[XÚÙ\ÈÛˆ™]žK‚ˆÛÛZ[œÈH[XÚ]][Û—ÚY[™Ù\ÜÚ[Û—ÚYÛÈHÙ\™\‚ˆØ[ˆ™\šYžH]][XÚ]HÛˆ™]žHÚ]Ý]Ù\™\‹\ÚYHÝÜ˜YÙK‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY›ÜˆÛÛœÝXÝ[™ÈBˆ\›Ý˜[YÙHT“K™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜ˆ›Û™XÛZ]ÈBˆT“
+›Ü›H[ÙJK‚ˆœ™]\›œÎˆH˜Û\ÜÎ˜™\ÜÛœÙXØ\œžZ[™ÈH”ÓÓ‹T”È‹Œˆ[œ]™\]Z\™Y™\Ý[[™[ÜK‚ˆˆˆ‚‚ˆ\˜[\ÎˆXÝÜÝ‹[žWHHÂˆ›Y\ÜØYÙHŽˆY\ÜØYÙKˆœ™\]Y\ÝYØÚ[XHŽˆÂˆ\HŽˆ›Øš™XÝ‹ˆœ›Ü\Y\ÈŽˆÈ˜\›Ý™YŽˆÈ\HŽˆ˜›ÛÛX[ˆŸ_Kˆœ™\]Z\™YŽˆÈ˜\›Ý™Y—KˆKˆBˆYˆÙ\ÜÚ[Û—ÚY\È›Ý›Û™H[™ÑSPÒUUSÓ—ÓSÑHOH\›Ž‚ˆ\˜[\ÖÈ›[ÙH—HH\›‚ˆ\˜[\ÖÈ\›—HHˆ‹Ø\›Ý™KÞÜÙ\ÜÚ[Û—ÚYKÞÙ[XÚ]][Û—ÚYH‚ˆ[ÙN‚ˆ\˜[\ÖÈ›[ÙH—HH™›Ü›H‚‚ˆ›ÙHHœÛÛ‹™[\ÊˆÂˆšœÛÛœœÈŽˆŒ‹Œ‹ˆšYŽˆœ×ÚYˆœ™\Ý[ŽˆÂˆœ™\Ý[\HŽˆš[œ]Ü™\]Z\™Y‹ˆš[œ]™\]Y\ÝÈŽˆÂˆ[XÚ]][Û—ÚYˆÂˆ›Y]ÙŽˆ™[XÚ]][Û‹ØÜ™X]H‹ˆœ\˜[\ÈŽˆ\˜[\ËˆBˆKˆœ™\]Y\ÝÝ]HŽˆ™\]Y\ÝÜÝ]KˆKˆBˆ
+Bˆ™]\›ˆ™\ÜÛœÙJÛÛ[X›ÙKYYXWÝ\OH˜\XØ][Û‹ÚœÛÛˆŠB‚‚˜\Þ[˜ÈYˆÚ[™WÛXÜÝÛÛ×Û\Ý
+ˆœ×ÚYˆ[Ýˆ›Û™KˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[›™\—Ü›Ý]\Žˆ[›™\”›Ý]\ˆ›Û™KŠHOˆ™\ÜÛœÙN‚ˆˆˆ‚ˆ[™HHÛÛËÛ\Ý”ÓÓ‹T”È™\]Y\Ý›ÜˆHPÔ›ÞH[™Ú[‚‚ˆ[YØ]\È^XÝ][ÛˆÈH[›™\‰ÜÈÔÕˆÝŒKÜÙ\ÜÚ[ÛœËÞÚYKÛXÜÙ^XÝ]X[™Ú[ÛÈ]Ý[ÈPÔˆÝXœ›ØÙ\ÜÙ\ÈÜ]ÛˆÛˆH[›™\‰ÜÈXXÚ[™H
+ÛÜœ™XÝÝÙˆ[‹[™ÛÛ[™ÊKˆHÛ[šYÙ[Ù\™\‰ÜÈ›ÛH\™H\È›Ý][™ÈÛ›H8 %ˆÛXÞH]˜[X][Ûˆ\[œÈ[ˆÛÛËØØ[‚‚ˆœ\˜[Hœ×ÚYˆH”ÓÓ‹T”È™\]Y\ÝYK™ËˆX‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆHÙ\ÜÚ[ÛˆYÚÜÙHYÙ[	ÜÈÛÛÈÈ\ÝˆK™Ëˆ˜ÛÛ—ØX˜ÌLŒÈ˜‚ˆœ\˜[H[›™\—Ü›Ý]\Žˆ›Ý]\ˆ\ÙYÈÙ][ˆÛY[Ú[Yˆ]HÙ\ÜÚ[Û‰ÜÈ[›™\‹ˆ›Û™X™]\›œÈ[ˆ\œ›Ü‹‚ˆœ™]\›œÎˆH”ÓÓ‹T”È‹ŒÛÛËÛ\Ý™\Ý[™\ÜÛœÙKÜˆ[‚ˆ\œ›Üˆ™\ÜÛœÙHÚ[ˆH[›™\ˆ\È[˜]˜Z[X›K‚ˆˆˆ‚ˆ[›™\—ØÛY[H]ØZ]ÙÙ]Ü[›™\—ØÛY[
+Ù\ÜÚ[Û—ÚY[›™\—Ü›Ý]\ŠBˆYˆ[›™\—ØÛY[\È›Û™N‚ˆÈ˜[˜XÚÈÈH[‹\›ØÙ\ÜÈ[›™\ˆÛY[
+ØØ[Ú[™ÛK]\Ù\ˆ[ÙJK‚ˆœ›ÛHÛ[šYÙ[œ[[YH[\ÜÙ]Ü[›™\—ØÛY[‚ˆ[›™\—ØÛY[HØ\Ý
+š\Þ[˜ÐÛY[›Û™H‹Ù]Ü[›™\—ØÛY[
+
+JBˆYˆ[›™\—ØÛY[\È›Û™N‚ˆ™]\›ˆÛXÜÙ\œ›Ü—Ü™\ÜÛœÙJœ×ÚYLÌŒˆ“›È[›™\ˆ›Ý[™›ÜˆÙ\ÜÚ[ÛˆÜÙ\ÜÚ[Û—ÚY\ŸHŠBˆÛÙÙÙ\‹™XYÊˆ“PÔÛÛËÛ\Ýˆ[YØ][™ÈÈ[›™\ˆ^XÝ]H›ÜˆÙ\ÜÚ[ÛI\ˆ‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+BˆžN‚ˆ™\ÜH]ØZ][›™\—ØÛY[œÜÝ
+ˆˆ‹ÝŒKÜÙ\ÜÚ[ÛœËÞÜÙ\ÜÚ[Û—ÚYKÛXÜÙ^XÝ]H‹ˆœÛÛ^È›Y]ÙŽˆÛÛËÛ\Ý‹œ\˜[\ÈŽˆß_Kˆ[Y[Ý]LÌŒˆ
+Bˆ™\Üœ˜Z\ÙWÙ›Ü—ÜÝ]\Ê
+Bˆ]HH™\ÜšœÛÛŠ
+Bˆ^Ù\^Ù\[Ûˆ\È^ÎˆÈ›ÜXNˆ“LBˆÛÙÙÙ\‹Ø\›š[™Ê”[›™\ˆPÔ^XÝ]H˜Z[Yˆ	\È‹^Ë^×Ú[™›ÏUYJBˆ™]\›ˆÛXÜÙ\œ›Ü—Ü™\ÜÛœÙJœ×ÚYLÌŒ”[›™\ˆPÔ^XÝ]H˜Z[YˆŠB‚ˆYˆ™\œ›Üˆˆ[ˆ]N‚ˆ\œˆH]VÈ™\œ›Üˆ—Bˆ™]\›ˆÛXÜÙ\œ›Ü—Ü™\ÜÛœÙJˆœ×ÚY\œ‹™Ù]
+˜ÛÙH‹LÌŒ
+K\œ‹™Ù]
+›Y\ÜØYÙH‹[šÛ›ÝÛˆ\œ›ÜˆŠBˆ
+B‚ˆ™\Ý[H]K™Ù]
+œ™\Ý[‹ßJBˆÈØÚ[X\È\™H[™XYH[ˆÜ[RH[˜Ý[Û‹]ÛÛ›Ü›X]œ›ÛH[›™\“XÜX[˜YÙ\ŽÂˆÈÛÛ™\˜XÚÈÈPÔ[œ]ØÚ[XH›Ü›X]›ÜˆHÛÛËÛ\Ý™\ÜÛœÙHÚ[˜ÙBˆÈ›ÞSXÜX[˜YÙ\ˆÛˆH[›™\ˆ^XÝÈPÔ\Ú\YÛÛËÛ\ÝÝ]]‚ˆØÚ[X\Îˆ\ÝÙXÝÜÝ‹[žWWHH™\Ý[™Ù]
+œØÚ[X\È‹×JBˆÛÛÈH×Bˆ›ÜˆØÚ[XH[ˆØÚ[X\Î‚ˆÈØÚ[XHÚ\NˆÈ\HŽˆ™[˜Ý[Ûˆ‹›˜[YHŽˆœÜ—×ÝÛÛ‹ˆÈ™\ØÜš\[ÛˆŽˆ‹‹‹ˆ‹œ\˜[Y]\œÈŽˆË‹‹Ÿ_BˆÛÛË˜\[™
+ˆÂˆ›˜[YHŽˆØÚ[XK™Ù]
+›˜[YH‹ˆŠKˆ™\ØÜš\[ÛˆŽˆØÚ[XK™Ù]
+™\ØÜš\[Ûˆ‹ˆŠKˆš[œ]ØÚ[XHŽˆØÚ[XK™Ù]
+œ\˜[Y]\œÈŠHÜˆÈ\HŽˆ›Øš™XÝ‹œ›Ü\Y\ÈŽˆß_KˆBˆ
+B‚ˆ˜Z[\™\ÎˆXÝÜÝ‹Ý—HH™\Ý[™Ù]
+™˜Z[\™\È‹ßJBˆ›ÜˆÜ‹\ÙÈ[ˆ˜Z[\™\Ëš][\Ê
+N‚ˆÛÙÙÙ\‹Ø\›š[™Êœ[›™\ˆPÔÙ\™\ˆ	\ˆ[˜]˜Z[X›Nˆ	\È‹Ü‹\ÙÊB‚ˆÛÙÙÙ\‹™XYÊˆ“PÔÛÛËÛ\ÝˆÙ\ÜÚ[ÛI\ˆ™]\›š[™È	YÛÛË	Y˜Z[\™\È‹ˆÙ\ÜÚ[Û—ÚYˆ[ŠÛÛÊKˆ[Š˜Z[\™\ÊKˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ™]\›ˆÛXÜÛÚ×Ü™\ÜÛœÙJœ×ÚYÈÛÛÈŽˆÛÛßJB‚‚˜\Þ[˜ÈYˆÜ™XYÝ\ØYØØ\Y
+š[Nˆ\ØYš[K[Z]Øž]\Îˆ[
+HOˆž]\Î‚ˆˆˆ‚ˆ™XY[ˆ\ØYYš[H[ÈY[[ÜžKX›Ü[™ÈYˆ]^ÙYYÈ
+›[Z]Øž]\Ê‹‚‚ˆ™XYÈ[ˆ™]N˜ÕTÐQÔ‘PQÐÒS’×Ð–UTØÚ[šÜÈ[™˜Z\Ù\ÈLÈ\ÂˆÛÛÛˆ\ÈHØ\\ÈÜ›ÜÜÙYÛÈ[ˆÝ™\œÚ^™Y\ØY™]™\ˆY™™\œÈ[Ü™Bˆ[ˆÛ™HÚ[šÈ\ÝH[Z]‚‚ˆœ\˜[Hš[NˆH][\\\ØY‚ˆœ\˜[H[Z]Øž]\ÎˆX^[][H[ÝÙYÚ^™H[ˆž]\Ë‚ˆœ™]\›œÎˆH[š[HÛÛ[‚ˆœ˜Z\Ù\È^Ù\[ÛŽˆLÈÚ[ˆH\ØY^ÙYYÈ
+›[Z]Øž]\Ê‹‚ˆˆˆ‚ˆÚ[šÜÎˆ\ÝØž]\×HH×BˆÝ[HˆÚ[HYN‚ˆÚ[šÈH]ØZ]š[Kœ™XY
+ÕTÐQÔ‘PQÐÒS’×Ð–UTÊBˆYˆ›ÝÚ[šÎ‚ˆœ™XZÂˆÝ[
+ÏH[ŠÚ[šÊBˆYˆÝ[ˆ[Z]Øž]\Î‚ˆ˜Z\ÙH^Ù\[ÛŠˆÝ]\×ØÛÙOMLËˆ]Z[Jˆˆ]XÚY[^ÙYYÈHÛ[Z]Øž]\ÈËÈ
+L
+ˆL
+_HPˆ‚ˆ›[Z]›Üˆ\Èš[H\Kˆ‚ˆ
+Kˆ
+BˆÚ[šÜË˜\[™
+Ú[šÊBˆ™]\›ˆˆˆ‹š›Ú[ŠÚ[šÜÊB‚‚˜\Þ[˜ÈYˆÛØYÜ[›™\—ÜÚÚ[Êˆ[›™\—ØÛY[ˆ\Þ[˜ÐÛY[ˆÙ\ÜÚ[Û—ÚYˆÝ‹ŠHOˆ›Û™N‚ˆˆˆ˜XÚÙÜ›Ý[™Ú[™ÛKY›YÚ™]ÚÙˆHÙ\ÜÚ[Û‰ÜÈ[›™\‹[ÝÛ™YÚÚ[Ë‚‚ˆÜ[]\È™]N˜Ü[›™\—ÜÚÚ[×ØØXÚXÛˆÝXØÙ\ÜÈÛÈÝXœÙ\]Y[ˆÛ˜\ÚÝÛÈÙ\™HÚÚ[ÈÚ]Ý]H\‹\Û[›™\ˆ›Ý[™]š\ˆ[œÂˆÙ™ˆHÛ˜\ÚÝ	ÜÈÜš]XØ[]
+ÙYH™[˜Î˜Ù™]ÚÜ[›™\—ÜÚÚ[Ø
+K‚ˆ™\ÝYY™›Üˆ˜[œÜÜ\œ›ÜœÈÈ›Û‹LŒÈX[›Ü›YY^[ØYÈX]™HBˆØXÚH[œÙ]ÛÈH]\ˆÛ™]šY\Ë‚‚ˆœ\˜[H[›™\—ØÛY[ˆÛY[Ú[Y]H›Ý[™[›™\‹‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜È˜‚ˆˆˆ‚ˆžN‚ˆ™\ÜH]ØZ][›™\—ØÛY[™Ù]
+ˆˆ‹ÝŒKÜÙ\ÜÚ[ÛœËÞÜÙ\ÜÚ[Û—ÚYKÜÚÚ[È‹ˆ[Y[Ý]MKŒˆ
+Bˆ^Ù\
+’\œ›Ü‹ÛÛ›™XÝ[Û‘\œ›ÜŠN‚ˆÛÙÙÙ\‹™XYÊˆ”[›™\ˆÚÚ[È]Y\žH˜Z[Y›Üˆ	\È‹Ù\ÜÚ[Û—ÚY^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYBˆ
+Bˆ™]\›‚ˆYˆ™\ÜœÝ]\×ØÛÙHOHŒ‚ˆ™]\›‚ˆžN‚ˆ˜]ÈH™\ÜšœÛÛŠ
+K™Ù]
+œÚÚ[È‹×JBˆÚÚ[ÈHÔÚÚ[Ý[[X\žJ˜[YO\ÖÈ›˜[YH—K\ØÜš\[Û\ÖÈ™\ØÜš\[Ûˆ—JH›ÜˆÈ[ˆ˜]×Bˆ^Ù\
+˜[YQ\œ›Ü‹]šX]Q\œ›Ü‹Ù^Q\œ›Ü‹\Q\œ›ÜŠN‚ˆÛÙÙÙ\‹™XYÊˆ”[›™\ˆÚÚ[È^[ØYX[›Ü›YY›Üˆ	\È‹Ù\ÜÚ[Û—ÚY^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYBˆ
+Bˆ™]\›‚ˆÜ[›™\—ÜÚÚ[×ØØXÚVÜÙ\ÜÚ[Û—ÚYHHÚÚ[ÂˆÜ[›™\—ÜÚÚ[×ÜÝ[K™\ØØ\™
+Ù\ÜÚ[Û—ÚY
+BˆÈYÙH[žHÝXœØÜšX™YÛY[È™K\™XYH
+›ÝË]Ø\›JHÛ˜\ÚÝÛÂˆÈ]ÈÛ\ÚXÛÛ[X[™Y[Hš[ÈÚ]Ý]ØZ][™È›ÜˆH™^š[™‚ˆÜX›\ÚÜ[›™\—ÜÚÚ[ÊÙ\ÜÚ[Û—ÚY
+B‚‚™YˆÛ[Ù[ÛÜ[Ûœ×Ùœ›ÛWÝÚ\™J˜]×Û[Ù[Îˆ[žJHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆˆˆ‚ˆ˜[Y]H[›™\‹\™]\›™Y˜]È˜]]™H[Ù[Û\Ý]K‚‚ˆœ\˜[H˜]×Û[Ù[Îˆ”ÓÓˆ˜[YHœ›ÛHH[›™\‰ÜÂˆÈ›[Ù[ÈŽˆË‹‹—_X™\ÜÛœÙKK™ËˆH\ÝÙˆ[Ù[XÝË‚ˆœ™]\›œÎˆ˜]È[Ù[Ü[ÛœÈ›ÜˆHÙ\ÜÚ[ÛˆÛ˜\ÚÝÈX[›Ü›YY›ÝÜÂˆ\™HÚÚ\YÛÈÛ™H˜Y›ÝšY\ˆ›ÝÈØ[››Ý›[šÈHXÚÙ\‹‚ˆœ˜Z\Ù\È˜[YQ\œ›ÜŽˆYˆH^[ØY\È›ÝH\Ý‚ˆˆˆ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Û[Ù[Ë\Ý
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“˜]]™H[Ù[Ü[ÛœÈ^[ØY]\Ý™HH\ÝŠBˆÜ[ÛœÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ˜]×Û[Ù[[ˆ˜]×Û[Ù[Î‚ˆÈÚÚ\X[›Ü›YY›ÝÜÈ[œÝXYÙˆ\ØØ\™[™ÈHÚÛHØ][ÙÎˆÛ™BˆÈ›ÝšY\‹\Ý\YYÙ]H]\Ý›Ý›[šÈHXÚÙ\ˆ›ÜˆHÙ\ÜÚ[Û‹‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]×Û[Ù[XÝ
+N‚ˆÛÛ[YBˆžN‚ˆÜ[ÛˆH˜]]™S[Ù[Ü[Û‹›[Ù[Ý˜[Y]J˜]×Û[Ù[
+Bˆ^Ù\˜[Y][Û‘\œ›ÜŽ‚ˆÛÙÙÙ\‹™XYÊ”ÚÚ\[™ÈX[›Ü›YY˜]]™H[Ù[Ü[ÛŽˆ	\ˆ‹˜]×Û[Ù[
+BˆÛÛ[YBˆÜ[ÛœË˜\[™
+Ü[Û‹›[Ù[Ù[\
+^ÛYWÙY˜][ÏUYK^ÛYWÛ›Û™OUYJJBˆ™]\›ˆÜ[ÛœÂ‚‚˜\Þ[˜ÈYˆÛØYÛ[Ù[ÛÜ[ÛœÊˆ[›™\—ØÛY[ˆ\Þ[˜ÐÛY[ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ]ˆÝ‹ˆ˜[˜XÚ×Ü]ˆÝˆ›Û™HH›Û™KŠHOˆ›Û™N‚ˆˆˆ‚ˆ˜XÚÙÜ›Ý[™Ú[™ÛKY›YÚ™]ÚÙˆHÙ\ÜÚ[Û‰ÜÈ˜]]™H[Ù[Ø][ÙË‚‚ˆœ\˜[H[›™\—ØÛY[ˆÛY[Ú[Y]H›Ý[™[›™\‹‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜È˜‚ˆœ\˜[H]ˆ[›™\ˆ›Ý]HÈ]Y\žH8 %H[šYšYYˆ‹ÝŒKÜÙ\ÜÚ[ÛœËØÛÛ—ØX˜ËÛ[Ù[[Ü[ÛœÈ˜‚ˆœ\˜[H˜[˜XÚ×Ü]ˆYØXÞH\›™\ÜË[˜[YY›Ý]HÈ˜[˜XÚÈÈÚ[‚ˆ
+œ]
+ˆÈ
+[ˆÛ\ˆ[›™\ˆÚ]Ý]H[šYšYY›Ý]JKK™Ë‚ˆ‹ÝŒKÜÙ\ÜÚ[ÛœËØÛÛ—ØX˜ËØÝ\œÛÜ‹[[Ù[[Ü[ÛœÈ˜ˆ›Û™X\ØX›\ÂˆH˜[˜XÚË‚ˆˆˆ‚ˆÈ™XYH™]žHØÚY[HÙ™ˆH˜XØYHÛÈ\ÝÈ]Ú[™ÂˆÈÙ\ÜÚ[ÛœË—ÓSÑSÓÔSÓ”×Ô‘U–WÑSVT×ÔØ™XXÚ\È[\‚ˆ[\ÜÛ[šYÙ[œÙ\™\‹œ›Ý]\ËœÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ[^\ÈHÙ˜XØYK—ÓSÑSÓÔSÓ”×Ô‘U–WÑSVT×ÔÂˆ›Üˆ][\[ˆ˜[™ÙJ[Š[^\ÊH
+ÈJN‚ˆžN‚ˆ™\ÜH]ØZ][›™\—ØÛY[™Ù]
+][Y[Ý]MKŒ
+Bˆ^Ù\
+’\œ›Ü‹ÛÛ›™XÝ[Û‘\œ›ÜŠN‚ˆÛÙÙÙ\‹™XYÊˆ”[›™\ˆ[Ù[[Ü[ÛœÈ]Y\žH˜Z[Y›Üˆ	\È‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ™]\›‚ˆYˆ™\ÜœÝ]\×ØÛÙHOHŒ‚ˆÈ[ˆÛ\ˆ[›™\ˆ\È›È[šYšYY›Ý]NÈ›ÜÈH\›™\ÜË[˜[YYˆÈÛ™HÚ]Ý]ÛÛœÝ[Z[™ÈH™]žK‚ˆYˆ™\ÜœÝ]\×ØÛÙHOH[™˜[˜XÚ×Ü][™]OH˜[˜XÚ×Ü]‚ˆ]H˜[˜XÚ×Ü]ˆÛÛ[YBˆÈLÈYX[œÈH˜]]™H˜XÚÙ[™
+ÛÙ^\\Ù\™\ˆœšYÙHÈÝ\œÛÜ‚ˆÈÙÚ[ŠH\ÈÝ[›ÛÝ[™ËˆÙY\H˜XÚÙÜ›Ý[™Ú[™ÛKY›YÚ[]™BˆÈÛÈHÙXˆXÚÙ\ˆš[ÈÚ]Ý]HÙXÛÛ™X[X[™Yœ™\Ú‚ˆYˆ™\ÜœÝ]\×ØÛÙHOHLÈ[™][\[Š[^\ÊN‚ˆ]ØZ]\Þ[˜Ú[ËœÛY\
+[^\ÖØ][\JBˆÛÛ[YBˆ™]\›‚ˆžN‚ˆÜ[ÛœÈHÛ[Ù[ÛÜ[Ûœ×Ùœ›ÛWÝÚ\™J™\ÜšœÛÛŠ
+K™Ù]
+›[Ù[È‹×JJBˆ^Ù\
+˜[YQ\œ›Ü‹Ù^Q\œ›Ü‹\Q\œ›Ü‹˜[Y][Û‘\œ›ÜŠN‚ˆÛÙÙÙ\‹™XYÊˆ”[›™\ˆ[Ù[[Ü[ÛœÈ^[ØYX[›Ü›YY›Üˆ	\È‹ˆÙ\ÜÚ[Û—ÚYˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+Bˆ™]\›‚ˆYˆ›ÝÜ[ÛœÎ‚ˆÈÛ\ˆ[›™\œÈ™]\›™YŒ
+È×H›ÜˆHØ[YH›Ý\™XYHÚ[™ÝË‚ˆÈÈ›ÝØXÚH][\HØ][ÙÎÈ™]žK[ˆX]™HHØXÚBˆÈÛÛÛÈH]\ˆÛ˜\ÚÝØ[ˆžHYØZ[‹‚ˆYˆ][\[Š[^\ÊN‚ˆ]ØZ]\Þ[˜Ú[ËœÛY\
+[^\ÖØ][\JBˆÛÛ[YBˆ™]\›‚ˆÛ[Ù[ÛÜ[Ûœ×ØØXÚVÜÙ\ÜÚ[Û—ÚYHHÜ[ÛœÂˆÛ[Ù[ÛÜ[Ûœ×ÜÝ[K™\ØØ\™
+Ù\ÜÚ[Û—ÚY
+BˆÜX›\ÚÛ[Ù[ÛÜ[ÛœÊÙ\ÜÚ[Û—ÚY
+Bˆ™]\›‚‚‚ˆÎˆÝÈX[žHÙ\ÜÚ[ÛœÈX^HØ\›HZ\ˆØ][ÙÜÈ]Û˜ÙKˆH[›™[›\™XÛÛ›™XÝÂˆÎˆ]™\žHÙ\ÜÚ[Ûˆ›Ý[™ÈH[›™\ˆ]Û˜ÙK[™XXÚØ\›K]\ÛÜÝÈH[›™\‚ˆÎˆ›Ý[™š\\ÈH›ÝšY\ˆ\Ý[™ÈÛˆHÛÜšÙ\ˆ™XYÈHØ\ÙY\È]ˆÎˆ\œÝÙ™ˆH^XÝ]ÜˆHÛÛ˜Ý\œ™[Ù\ÜÚ[Ûˆ™KZ[š]™YYË‚—ÐÐUSÑ×Ô‘Q‘UÒÐÓÓÕT”‘SÖHH‚ˆÎˆÛ™HÙ[X\Ü™H\ˆ]™[ÛÜˆHÙ\™\ˆ[œÈHÚ[™ÛHÛÜ][ˆ\Þ[˜Ú[ÂˆÎˆš[Z]]™HØ[››Ý™HÚ\™YXÜ›ÜÜÈHÛÜÈH\ÝÝZ]HÜ™X]\Ë‚—ØØ][Ù×Ü™Y™]ÚÜÙ[X\Ü™\ÎˆÙXZÜ™Y‹•ÙXZÒÙ^QXÝ[Û˜\žVÂˆ\Þ[˜Ú[ËXœÝ˜XÝ]™[ÛÜ\Þ[˜Ú[Ë”Ù[X\Ü™B—HHÙXZÜ™Y‹•ÙXZÒÙ^QXÝ[Û˜\žJ
+B‚‚™YˆØØ][Ù×Ü™Y™]ÚÜÙ[X\Ü™J
+HOˆ\Þ[˜Ú[Ë”Ù[X\Ü™N‚ˆˆˆ‚ˆ™]\›ˆ\ÈÛÜ	ÜÈØ][ÙË\™Y™]ÚÛÛ˜Ý\œ™[˜ÞHØ]K‚‚ˆœ™]\›œÎˆHÙ[X\Ü™H›Ý[™[™ÈÛÛ˜Ý\œ™[™Y™]Ú\Ë‚ˆˆˆ‚ˆÛÜH\Þ[˜Ú[Ë™Ù]Ü[›š[™×ÛÛÜ
+
+BˆÙ[X\Ü™HHØØ][Ù×Ü™Y™]ÚÜÙ[X\Ü™\Ë™Ù]
+ÛÜ
+BˆYˆÙ[X\Ü™H\È›Û™N‚ˆÙ[X\Ü™HH\Þ[˜Ú[Ë”Ù[X\Ü™JÐÐUSÑ×Ô‘Q‘UÒÐÓÓÕT”‘SÖJBˆØØ][Ù×Ü™Y™]ÚÜÙ[X\Ü™\ÖÛÛÜHHÙ[X\Ü™Bˆ™]\›ˆÙ[X\Ü™B‚‚˜\Þ[˜ÈYˆÜ[—ØØ][Ù×Ü™Y™]Ú
+ˆÛÜ›ÎˆÛÜ›Ý][™VÐ[žK[žK[žWKˆÙ\ÜÚ[Û—ÚYˆÝ‹ŠHOˆ›Û™N‚ˆˆˆ‚ˆ[ˆÛ™H™\ÝYY™›ÜØ][ÙÈ™Y™]Ú[™\ˆHÛÛ˜Ý\œ™[˜ÞHØ\‚‚ˆ™]šY]™\È]ÈÝÛˆ^Ù\[ÛŽˆH™Y™]Ú\Èš\™KX[™Y›Ü™Ù]ÛÈ[ž][™È]ˆ˜Z\Ù\È
+H[›™\ˆ›Ý[™š\Ü›ˆÝÛˆZYY›YÚØ^JHÛÝ[Ý\Ú\ÙBˆÝ\™˜XÙH\È[ˆ[œ™]šY]™Y]\ÚÈØ\›š[™È[™›ÝÛˆ™X[\œ›ÜœËˆH˜Z[\™Bˆ\™H\ÝX]™\ÈHÛÛØXÚKÚXÚ]™\žH™XY\ˆ[™XYH[™\Ë‚‚ˆœ\˜[HÛÜ›ÎˆH™Y™]ÚÛÜ›Ý][™HÈ[‹‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹›ÜˆHÙÈ[™K‚ˆˆˆ‚ˆžN‚ˆ\Þ[˜ÈÚ]ØØ][Ù×Ü™Y™]ÚÜÙ[X\Ü™J
+N‚ˆ]ØZ]ÛÜ›Âˆ^Ù\\Þ[˜Ú[ËØ[˜Ù[Y\œ›ÜŽ‚ˆÛÜ›Ë˜ÛÜÙJ
+Bˆ˜Z\ÙBˆ^Ù\^Ù\[ÛŽˆÈ›ÜXNˆ“LHH™\ÝYY™›ÜØ\›K]\ÈHÛÛØXÚH\Èš[™K‚ˆÛÙÙÙ\‹™XYÊˆØ][ÙÈ™Y™]Ú˜Z[Y›Üˆ	\È‹ˆÙ\ÜÚ[Û—ÚYˆ^×Ú[™›ÏUYKˆ^˜O^ÈœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYKˆ
+B‚‚™Yˆ™Y™]ÚÜÙ\ÜÚ[Û—Ü›Ý][™×ØØ][ÙÜÊˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛŽˆÛÛ™\œØ][Û‹ˆ[›™\—ØÛY[ˆ\Þ[˜ÐÛY[ŠHOˆ›Û™N‚ˆˆˆ‚ˆØ\›HHØ][ÙÜÈ›Ý][™È™XYË]Ù\ÜÚ[Ûˆ][˜Ú[œÝXYÙˆ]\›ˆ[YK‚‚ˆ›Ý\™H[›™\‹Y\š]™Y[™^Z[™È›Üˆ[HÚ[HH\Ù\‰ÜÈ›Û\\È[ˆ\ÈÚ]XYHHš\œÝ›Ý]YY\ÜØYÙHÛÝÎˆH˜]]™HXÚÙ\ˆ›ØØX[\žH\Âˆ]ØZ]YžHH\›ˆ]Ú[ˆ]ÈØXÚY[žH\ÈÝ[K[™H[›™\‚ˆ[Ù[Ø][ÙÈ\ÈH›Ý[™š\\ˆ\›ˆ›Üˆ[™\È]]™H›ÈXÚÙ\‚ˆ›ØØX[\žKˆÝ\YÚ[ˆH[›™\ˆš[™Ë›Ý[™Ù[™Y›Ü™HHš\œÝˆ›Û\ÈH\›ˆ\œš]š[™È™Y›Ü™H^Hš[š\ÚÝ[˜[È˜XÚÈÈ]ÈÝÛ‚ˆ[›[™H™]ÚÛÈ\ÈÛ›H]™\ˆ™[[Ý™\ÈØZ][™Ë‚‚ˆÛ›H›Ý]Y]™HÙ\ÜÚ[ÛœÈØ\›H[ž][™ËˆÛX\›Ý][™È\ÈHÛÛH™XY\‚ˆÙˆ\ÙHØXÚ\Ë[™HØ[\ˆ™XÛÛ›™XÝÈ
+™]™\žJˆÙ\ÜÚ[Ûˆ›Ý[™ÈBˆ[›™\ˆ8 %HZ[‹\Ù\ÜÚ[ÛˆÜÝÚ]H›\[™È[›™[ÛÝ[Ý\Ú\ÙHÜ[™ˆÛÈ[›™\ˆ›Ý[™š\È\ˆ[™KÛˆ›Ý[™ËÚ[HHÙ\ÜÚ[Ûˆ™KZ[š]ˆ[›š[™È[Û™ÜÚYH]ØZ]È›ÜˆHØ[YH^XÝ]Ü‹ˆ\˜Ú]™YÙ\ÜÚ[ÛœÈ\™BˆÚÚ\Y›ÜˆHØ[YH™X\ÛÛŽˆ›Ý[™È\ÈÛÚ[™ÈÈ›Ý]HH\›ˆÛˆ[K‚‚ˆš\™KX[™Y›Ü™Ù]ˆH˜Z[Y™Y™]Ú\ÈHÛÛØXÚKÚXÚ]™\žH™XY\‚ˆ[™XYH[™\Ë‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜È˜‚ˆœ\˜[HÛÛŽˆÛÛ™\œØ][Ûˆ›ÝË™XY›ÜˆH›Ý][™ÈÝ]H[™HÜ˜\\‚ˆX™[‚ˆœ\˜[H[›™\—ØÛY[ˆÛY[Ú[Y]H™]ÛH›Ý[™[›™\‹‚ˆˆˆ‚ˆœ›ÛHÛ[šYÙ[œ[›™\‹œÝX˜YÙ[Ü›Ý][™È[\Ü›Ý][™×ØÛ\Ü×Ùœ›ÛWÜÛ˜\ÚÝˆœ›ÛHÛ[šYÙ[œÙ\™\‹œÛX\Ü›Ý][™È[\Ü™Y™]ÚÜ[›™\—ØØ][ÙÂ‚ˆYˆÛÛ‹˜\˜Ú]™Y‚ˆ™]\›‚ˆ›Ý][™×ØÛ\ÜÈH›Ý][™×ØÛ\Ü×Ùœ›ÛWÜÛ˜\ÚÝ
+ˆÛÜÝØÛÛ›ÛÛ[ÙOXÛÛ‹˜ÛÜÝØÛÛ›ÛÛ[ÙWÛÝ™\œšYKˆ\›™\Ü×ÛÝ™\œšYOXÛÛ‹š\›™\Ü×ÛÝ™\œšYKˆX™[ÏXÛÛ‹›X™[Ëˆ
+BˆYˆ›Ý›Ý][™×ØÛ\ÜËœ›Ý][™×Ù[˜X›Y‚ˆ™]\›‚‚ˆ[™Ú[HÓSÑSÓÔSÓ”×ÑS‘ÒS•Ð–WÕÔTT‹™Ù]
+ˆÛÛ‹›X™[Ë™Ù]
+ÐÓUQWÓUU‘WÕÔTT—ÓP‘SÒÑVJHÜˆˆ‚ˆ
+BˆYˆ[™Ú[\È›Ý›Û™H[™Ù\ÜÚ[Û—ÚY›Ý[ˆÛ[Ù[ÛÜ[Ûœ×Ú[™›YÚ‚ˆÜ[Ûœ×Ý\ÚÈH\Þ[˜Ú[Ë˜Ü™X]WÝ\ÚÊˆÜ[—ØØ][Ù×Ü™Y™]Ú
+ˆÛØYÛ[Ù[ÛÜ[ÛœÊˆ[›™\—ØÛY[ˆÙ\ÜÚ[Û—ÚYˆˆ‹ÝŒKÜÙ\ÜÚ[ÛœËÞÜÙ\ÜÚ[Û—ÚYKÛ[Ù[[Ü[ÛœÈ‹ˆ˜[˜XÚ×Ü]Yˆ‹ÝŒKÜÙ\ÜÚ[ÛœËÞÜÙ\ÜÚ[Û—ÚYKÞÙ[™Ú[H‹ˆ
+KˆÙ\ÜÚ[Û—ÚYˆ
+Bˆ
+BˆÛ[Ù[ÛÜ[Ûœ×Ú[™›YÚÜÙ\ÜÚ[Û—ÚYHHÜ[Ûœ×Ý\ÚÂˆÜ[Ûœ×Ý\ÚË˜YÙÛ™WØØ[˜XÚÊˆ[X™HÝ\ÚËÚY\Ù\ÜÚ[Û—ÚYˆÛ[Ù[ÛÜ[Ûœ×Ú[™›YÚœÜ
+ÚY›Û™JBˆ
+BˆØØ][Ù×Ü™Y™]ÚÝ\ÚÜË˜Y
+ˆ\ÚÈH\Þ[˜Ú[Ë˜Ü™X]WÝ\ÚÊˆÜ[—ØØ][Ù×Ü™Y™]Ú
+™Y™]ÚÜ[›™\—ØØ][ÙÊÙ\ÜÚ[Û—ÚY[›™\—ØÛY[
+KÙ\ÜÚ[Û—ÚY
+Bˆ
+Bˆ
+Bˆ\ÚË˜YÙÛ™WØØ[˜XÚÊØØ][Ù×Ü™Y™]ÚÝ\ÚÜË™\ØØ\™
+B‚‚˜\Þ[˜ÈYˆÚÜÝÛ[Ù[ÛÜ[Ûœ×ÝšXWÜ™YÚ\ÝžJÜÝÚYˆÝŠHOˆ\ÝÙXÝÜÝ‹[žWWH›Û™N‚ˆˆˆ‚ˆ™\ÛÛ™HHÜÝ	ÜÈ™K[][˜ÚÛ]YHØ][ÙÈÝ™\ˆ]È]™H[›™[‚‚ˆÙ\ÜÚ[Û‹\ÚYH™]\ÙHÙˆH™]Ë\Ù\ÜÚ[ÛˆXÚÙ\‰ÜÈÛÝ\˜ÙBˆ
+Ù]ÚÜÝÛ[Ù[ÛÜ[ÛœØ[ˆ›Ý]\ËÚÜÝËœX
+NˆHÜÝ™\ÛÛ™\ÂˆHØ][ÙÈØØ[KÛÈ›È[›™\ˆ\È™YYY‚‚ˆœ\˜[HÜÝÚYˆÜÝY[YšY\‹K™ËˆšÜÝØLXŒ˜ÌÈ˜‚ˆœ™]\›œÎˆ˜]È[Ù[›ÝÜËÜˆ›Û™XÚ[ˆHÜÝ\È›ÝÛÛ›™XÝYˆ™Z™XÝÈH™\]Y\ÝÜˆ[Y\ÈÝ]‚ˆˆˆ‚ˆ™YÚ\ÝžHHÙ]ÜÙ\™\—ÚÜÝÜ™YÚ\ÝžJ
+BˆYˆ™YÚ\ÝžH\È›Û™N‚ˆ™]\›ˆ›Û™BˆÛÛ›ˆH™YÚ\ÝžK™Ù]
+ÜÝÚY
+BˆYˆÛÛ›ˆ\È›Û™N‚ˆ™]\›ˆ›Û™BˆÈØØ[[\ÜˆÙY\È›Ý]\ËšÜÝÈÝ]Ùˆ\È[Ù[IÜÈ[\ÜÜ˜\‚ˆœ›ÛHÛ[šYÙ[œÙ\™\‹œ›Ý]\ËšÜÝÈ[\ÜÜ›ÞWÛ[Ù[ÛÜ[ÛœÂ‚ˆžN‚ˆ™\Ý[H]ØZ]Ü›ÞWÛ[Ù[ÛÜ[ÛœÊˆÜÝÜ™YÚ\ÝžO\™YÚ\ÝžKˆÜÝØÛÛ›XÛÛ›‹ˆ\›™\ÜÏH˜Û]YK[˜]]™H‹ˆ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ›Û™BˆYˆ™\Ý[™Ù]
+œÝ]\ÈŠHOH›ÚÈŽ‚ˆ™]\›ˆ›Û™Bˆ[Ù[ÈH™\Ý[™Ù]
+›[Ù[ÈŠBˆ™]\›ˆ[Ù[ÈYˆ\Ú[œÝ[˜ÙJ[Ù[Ë\Ý
+H[ÙH›Û™B‚‚˜\Þ[˜ÈYˆÛØYÛ[Ù[ÛÜ[Ûœ×Ùœ›ÛWÚÜÝ
+Ù\ÜÚ[Û—ÚYˆÝ‹ÜÝÚYˆÝŠHOˆ›Û™N‚ˆˆˆ‚ˆ˜XÚÙÜ›Ý[™Ø][ÙÈš[›Üˆ[ˆ\ÛY\Û]YK[˜]]™HÙ\ÜÚ[Û‹‚‚ˆÚ]›È[›™\ˆ›Ý[™[™HÛÛØXÚH
+K™ËˆHÙ\™\ˆ™\Ý\YÚ[BˆHÙ\ÜÚ[ÛˆÛ\
+KHÙ\ÜÚ[Û‰ÜÈÜÝØ[ˆÝ[™\ÛÛ™HHÛ]YBˆØ][ÙÈ8 %HØ[YH™K[][˜ÚÛÝ\˜ÙHH™]Ë\Ù\ÜÚ[ÛˆXÚÙ\ˆ\Ù\Ëˆš[ÂˆHØXÚHÝ[K[X\šÙYÛÈH™^]™H[›™\ˆ™\XÙ\È]Ú]]Âˆ][˜ÚY^XÝÛ˜\ÚÝ[™X›\Ú\ÈÙ\ÜÚ[Û‹›[Ù[ÛÜ[ÛœØÛÈÜ[‚ˆXœÈ™K\™XY‚‚ˆœ\˜[HÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û‹ØÛÛ™\œØ][ÛˆY[YšY\‹K™Ëˆ˜ÛÛ—ØX˜È˜‚ˆœ\˜[HÜÝÚYˆHÙ\ÜÚ[Û‰ÜÈ›Ý[™ÜÝK™ËˆšÜÝØLXŒ˜ÌÈ˜‚ˆˆˆ‚ˆÈ™XY›ÝYÚH˜XØYHÛÈ\ÝÈ]Ú[™ÂˆÈÙ\ÜÚ[ÛœË—ÚÜÝÛ[Ù[ÛÜ[Ûœ×ÝšXWÜ™YÚ\ÝžX™XXÚ\È[\‚ˆ[\ÜÛ[šYÙ[œÙ\™\‹œ›Ý]\ËœÙ\ÜÚ[ÛœÈ\ÈÙ˜XØYB‚ˆ˜]ÈH]ØZ]Ù˜XØYK—ÚÜÝÛ[Ù[ÛÜ[Ûœ×ÝšXWÜ™YÚ\ÝžJÜÝÚY
+BˆYˆ›Ý˜]Î‚ˆ™]\›‚ˆžN‚ˆÜ[ÛœÈHÛ[Ù[ÛÜ[Ûœ×Ùœ›ÛWÝÚ\™J˜]ÊBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›‚ˆYˆ›ÝÜ[ÛœÎ‚ˆ™]\›‚ˆÛ[Ù[ÛÜ[Ûœ×ØØXÚVÜÙ\ÜÚ[Û—ÚYHHÜ[ÛœÂˆÛ[Ù[ÛÜ[Ûœ×ÜÝ[K˜Y
+Ù\ÜÚ[Û—ÚY
+BˆÜX›\ÚÛ[Ù[ÛÜ[ÛœÊÙ\ÜÚ[Û—ÚY
+B‚‚—×Ø[×ÈHÂˆ‘’SWÐÓÓ•S•ÐÐPÒWÐÓÓ•“Ó‹ˆ”Ù\ÜÚ[Û“]™[™\ÜÈ‹ˆ—ÒÜÝ][˜Ú][\‹ˆ—Ó˜]]™U\›Z[˜[[œÝ\™SÝ]ÛÛYH‹ˆ—Ô[›™\‘›ÜØ\™™\Ý[‹ˆ—ÔÙ\ÜÚ[Û‘]™[\Ü]Ú™\Ý[‹ˆ—ØYÛ[Ù[Ý\ØYÙWÙ[H‹ˆ—ØYÙ[ØØ\œšY\×ØÝ\œÛÜ—Ù›Üš×Ú\ÝÜžH‹ˆ—ØYÙ[ØØ\œšY\×Û˜]]™WÙ›Üš×Ú\ÝÜžH‹ˆ—ØYÙ[ØØ\œšY\×Û˜]]™WÙ›Üš×Ú\ÝÜžWÚ[\‹ˆ—ØYÙ[Ú\×Û˜]]™H‹ˆ—ØYÙ[Ú\×Û˜]]™WÚ[\‹ˆ—ØYÙ[Ü›ÝšY\—Ù˜[Z[H‹ˆ—Ø[Ý×Ø[ÙY]×Ù[YÚX›H‹ˆ—Ø[Ý×Ü™[Y[X™\—Ù[YÚX›H‹ˆ—Ø[˜Ù\ÝÜ—ÜÙ\ÜÚ[Û—ÚYÈ‹ˆ—Ø[››Ý[˜ÙWÜÙ\ÜÚ[Û—ØYY‹ˆ—Ø[YÜ˜]š]WÜÝX˜YÙ[ÛX™[×Ùœ›ÛWØ›ÙH‹ˆ—Ø[YÜ˜]š]WÜÝX˜YÙ[Ý]H‹ˆ—Ø\WÛ]™[™\Ü×Ý×Ú][\È‹ˆ—Ø\WÜ[™[™×ÜÛXÞWØ\Ú×ÝÜš]\È‹ˆ—Ø]XÚY[Ù\ÜÜÚ][Ûˆ‹ˆ—Ø]]Üš^™WØ[™YÜ\™[Ø[™Ú[š\š]Ü[›™\ˆ‹ˆ—Ø]ØZ]ÜÙ]YÛX[˜YÙYÛ][˜Ú‹ˆ—Ø˜XÚÙÜ›Ý[™Ý\Ú×Ù[]™\žWÜÝ]\È‹ˆ—ØZ[ØXÝÜˆ‹ˆ—ØZ[Ù]˜[X][Û—ØÛÛ^‹ˆ—ØZ[Û™]×Ú][H‹ˆ—ØZ[ÜÛXÞWÙ[™Ú[™WÙœ›ÛWÜÜXÈ‹ˆ—ØZ[ÜÚÚ[ÜÛ\ÚØÛÛ[X[™ÜÛXÞWØ›ÙH‹ˆ—ØØ[›ÛšXØ[ÝÛÛÚ[œ]‹ˆ—ØÚ[ÜÙ\ÜÚ[Û—ØÝ\œ™[Ý\Ú×ÜÝ]\×Ùœ›ÛWØØXÚYÜÝ]\È‹ˆ—ØÚ[ÜÙ\ÜÚ[Û—ÜÝ[[X\žWÙœ›ÛWØÛÛ™\œØ][Ûˆ‹ˆ—ØÛ]YWÛ˜]]™WÜ™[Y[X™\—ÚÜÝ‹ˆ—ØÛ]YWÜÝX˜YÙ[Ù\Ü^WÝÛÛ‹ˆ—ØÛY[ÜÝ\YYÚÛÚ×Ù[XÚ]][Û—ÚY‹ˆ—ØÛÙ^Ü[—Û[ÙWÙ[˜X›Y‹ˆ—ØÛÙ^ÜÝX˜YÙ[Ù\Ü^WÝÛÛ‹ˆ—ØÛÙ^ÜÝX˜YÙ[ÛX™[×Ùœ›ÛWØ›ÙH‹ˆ—ØÛÙ\˜ÙWØÝ[][]]™WÙšY[‹ˆ—ØÛÛXÝÙ\ØÙ[™[ØÛÛ™\œØ][Û—ÚYÈ‹ˆ—ØÛÛœÝ[YWÜ™WÜ™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][Ûˆ‹ˆ—ØÜ™X]WØ[™ÜX›\ÚØ[YÜ˜]š]WØÚ[‹ˆ—ØÜ™X]WØ[™ÜX›\ÚØÛÙ^ØÚ[‹ˆ—ØÜ™X]WÜÙ\ÜÚ[Û—ÝÛÜšÝ™YH‹ˆ—Ù[]WÜÝÜ™YÜÙ\ÜÚ[Û—Ø[™WØY\—Ù˜Z[\™H‹ˆ—Ù\š]™WÝ\›Z[˜[Û][˜ÚØ\™Ü×Ùœ›ÛWÜÜXÈ‹ˆ—Ù\ØÙ[™[ÜÙ\ÜÚ[ÛœÈ‹ˆ—Ù\ØÛÝ™\žWÚÙ^H‹ˆ—Ù\Ü]ÚÜÚÚ[ÜÛ\ÚØÛÛ[X[™Ý×Ü[›™\ˆ‹ˆ—Ù[Z]ÜÙ\™\—Ü›Ý][™×ÙXÚ\Ú[Ûˆ‹ˆ—Ù\œ›Ü—Ú][WÙœ›ÛWÜÜÙH‹ˆ—Ù]˜[X]WÛÝ]]ÜÛXÞH‹ˆ—Ù^˜XÝØ\ÜÚ\Ý[Ý^Ùœ›ÛWÙ]™[‹ˆ—Ù^˜XÝØÛ]YWÛ˜]]™WÜ[›™\—Ù˜Z[\™H‹ˆ—Ù^˜XÝÜ\œÚ\Ý[Ú][WÙœ›ÛWÜÜÙH‹ˆ—Ù^˜XÝÝ\Ù\—Ý^Ù›Ü—Ü›Ý][™È‹ˆ—Ù^˜XÝÝ\Ù\—Ý^Ùœ›ÛWÙ]™[‹ˆ—Ùš[WØÛÛ[Ù]YÈ‹ˆ—Ùš[™ØÛ]YWÛ˜]]™WÜÝX˜YÙ[ØÚ[‹ˆ—Ùš[™ØÛÙ^Û˜]]™WÜÝX˜YÙ[ØÚ[‹ˆ—Ùš[™ÜÝX˜YÙ[ØÚ[ØžWÝ]H‹ˆ—Ù›\ÚÜ™[^WÝ^‹ˆ—Ù›Ü›X]ÜÜÙH‹ˆ—Ù›ÜØ\™Ø\›Ý˜[Ý×Ü[›™\ˆ‹ˆ—Ù›ÜØ\™ÜÙ\ÜÚ[Û—ØÚ[™ÙWÝ×Ü[›™\ˆ‹ˆ—ÙÙ]Ü[›™\—ØÛY[‹ˆ—ÙÙ]Ü[›™\—ØÛY[Ù›Ü—Ü™\ÛÝ\˜ÙWØXØÙ\ÜÈ‹ˆ—Ú[™WØYš\ÙWÛ[Ù[×ÛXÜ‹ˆ—Ú[™WÙ^\›˜[ÜÙ\ÜÚ[Û—ÝÙÜÈ‹ˆ—Ú[™WÛXÜÝÛÛ×Û\Ý‹ˆ—ÚÜÝÛ[Ù[ÛÜ[Ûœ×ÝšXWÜ™YÚ\ÝžH‹ˆ—ÚY—Û›Û™WÛX]ÚÛX]Ú\È‹ˆ—Ú[˜[Y]WÜ[›™\—Ø˜XÚÙYÜÛ˜\ÚÝÜÝ]H‹ˆ—Ú\×ØÛ]YWÛ˜]]™WÜÝX˜YÙ[‹ˆ—Ú\×ØÛÙ^Û˜]]™WÜÝX˜YÙ[‹ˆ—Ú\×ÚÚ\›×Û˜]]™WÜÙ\ÜÚ[Ûˆ‹ˆ—Û\ÝÝ\Ú×Ù\œ›Ü—Ùœ›ÛWÛX™[È‹ˆ—Û]\ÝØ\ÜÚ\Ý[Ý^Ùœ›ÛWÜÝÜ™H‹ˆ—Û]\ÝÛY\ÜØYÙWÜ™]šY]È‹ˆ—Û][˜ÚÜ[›™\—ÛÛ—ÚÜÝ‹ˆ—ÛØYØYÙ[ÜÜX×Ù›Ü—ÜÙ\ÜÚ[Ûˆ‹ˆ—ÛØYÛ[Ù[ÛÜ[ÛœÈ‹ˆ—ÛØYÛ[Ù[ÛÜ[Ûœ×Ùœ›ÛWÚÜÝ‹ˆ—ÛØYÜ[›™\—ÜÚÚ[È‹ˆ—ÛXÜÙ\œ›Ü—Ü™\ÜÛœÙH‹ˆ—ÛXÜÚ[œ]Ü™\]Z\™YÜ™\ÜÛœÙH‹ˆ—ÛXÜÛÚ×Ü™\ÜÛœÙH‹ˆ—ÛXÜÝÛÛÜ™\Ý[‹ˆ—ÛY\™ÙWØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™ÜÈ‹ˆ—ÛY\™ÙWÜ[™[™×Ùš[WØ›ØÚÜÈ‹ˆ—ÛY\ÜØYÙWÝ^‹ˆ—Û[Ù[ÛÜ[Ûœ×Ùœ›ÛWÝÚ\™H‹ˆ—Û[Ù[Ý\ØYÙWØXÚÙ]‹ˆ—Û][\\ÛZ\ÜÚ[™×Ù]Z[‹ˆ—Û˜]]™WØ\Ú×ÙØ]WÛØÚÈ‹ˆ—Û˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—ØYÙ[‹ˆ—Û˜]]™WØÛÙ[™×ØYÙ[Ù›Ü—ÜÙ\ÜÚ[Ûˆ‹ˆ—Û˜]]™WÜÝX˜YÙ[ÝÜ˜\\—ÛX™[×Ùœ›ÛWÜÜXÈ‹ˆ—Û˜]]™WÝ\›Z[˜[Ù[œÝ\™WÝ˜[œÜÜÙ\œ›Üˆ‹ˆ—Û˜]]™WÝ\›Z[˜[Ù˜Z[\™WÙœ›ÛWÜ[›™\—Ü™\ÜÛœÙH‹ˆ—Û˜]]™WÝ\›Z[˜[Û˜[YWÙ›Ü—Ú\›™\ÜÈ‹ˆ—Û›ÝYžWÜ[›™\—ÛÙ—Ø[™YØÚ[‹ˆ—ÛÝÛ™\—Ùœ›ÛWÙÜ˜[È‹ˆ—Ü\œÙWÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙH‹ˆ—Ü\œÙWÙ^\›˜[ØÛÛ™\œØ][Û—Ú][H‹ˆ—Ü\œÙWÜÙ\ÜÚ[Û—ØÜ™X]WÛY]Y]H‹ˆ—Ü\œÙWÜÚÚ[ÜÛ\ÚØÛÛ[X[™‹ˆ—Ü[™[™×Ù[XÚ]][Û—ÜÛ˜\ÚÝÙ›Ü—ÜÙ\ÜÚ[Ûˆ‹ˆ—Ü\›Z\ÜÚ[Û—Û]™[Ùœ›ÛWÙÜ˜[È‹ˆ—Ü\œÚ\ÝÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙH‹ˆ—Ü\œÚ\ÝÙ^\›˜[ØÛÙ^Ø\›Ý˜[Û[ÙWØÚ[™ÙH‹ˆ—Ü\œÚ\ÝÙ^\›˜[ØÛÙ^ØÛÛX›Ü˜][Û—Û[ÙWØÚ[™ÙH‹ˆ—Ü\œÚ\ÝÙ^\›˜[Û[Ù[ØÚ[™ÙH‹ˆ—Ü\œÚ\ÝÙ^\›˜[Û[Ù[ÛÜ[ÛœÈ‹ˆ—Ü\œÚ\ÝÙ^\›˜[Ü\›Z\ÜÚ[Û—Û[ÙWØÚ[™ÙH‹ˆ—Ü\œÚ\ÝÙ^\›˜[Ü™X\ÛÛš[™×ÙY™›ÜØÚ[™ÙH‹ˆ—Ü\œÚ\ÝÙ^\›˜[ÜÙ\ÜÚ[Û—Ý]H‹ˆ—Ü\œÚ\ÝÙ^\›˜[ÜÝX˜YÙ[ÜÝ\‹ˆ—Ü\œÚ\ÝÛ˜]]™WÜÛXÞWÛ›ÝXÙH‹ˆ—Ü\œÚ\ÝÜÛXÞWÙ[žWÜÙ[[™[‹ˆ—Ü\œÚ\ÝÜÙ\ÜÚ[Û—ÜÝ]\×Ù\œ›Ü—ÛX™[È‹ˆ—Ü\œÚ\ÝÜÝÜ™YÜÙ\ÜÚ[Û—Ø[™H‹ˆ—Ü[—ØÛ]YWÜ\›Z\ÜÚ[Û—Û][˜ÚØ\™ÜÈ‹ˆ—ÜÛXÞWÛ›ÝXÙWÙœ›ÛWÙ[œÝ\™WÜ™\ÜÛœÙH‹ˆ—ÜÛÜ™\]Y\ÝÙ\ØÛÛ›™XÝ‹ˆ—Ü™\Ù[][Û—ÛX™[×Ù›Ü—ØYÙ[‹ˆ—Ü™\Ù[][Û—ÛX™[×Ù›Ü—ØYÙ[Ú[\‹ˆ—ÜšXÙYØÛÜÝÙ›Ü—Ù\Ü^H‹ˆ—Ü›Ýš\Ú[Û—ÛX[˜YÙYÜØ[™›Þ‹ˆ—Ü›ÞWÙÙ]ÜÙ\ÜÚ[Û—Ü™\ÛÝ\˜Ù\×Ý×Ü[›™\ˆ‹ˆ—Ü[™WÜ™WÜ™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][ÛœÈ‹ˆ—Ü[™WÜÙ\ÜÚ[Û—Ü™XYÜÝ]H‹ˆ—ÜX›\ÚØ[™Ü\œÚ\ÝÜ™\ÛÝ\˜ÙWÙ]™[‹ˆ—ÜX›\ÚØ×ÜÚYXÚ]‹ˆ—ÜX›\ÚØÚ[™ÙYÙš[\×Ú[˜[Y]Y‹ˆ—ÜX›\ÚØÛÙ^Ø\›Ý˜[Û[ÙH‹ˆ—ÜX›\ÚØÛÛX›Ü˜][Û—Û[ÙH‹ˆ—ÜX›\ÚØÛÛ\XÝ[Û—ØÛÛ\]Y‹ˆ—ÜX›\ÚØÛÛ\XÝ[Û—Ù˜Z[Y‹ˆ—ÜX›\ÚØÛÛ\XÝ[Û—Ú[—Ü›ÙÜ™\ÜÈ‹ˆ—ÜX›\ÚÙ[XÚ]][Û—Ü™\]Y\ÝÝ×Ø[˜Ù\ÝÜœÈ‹ˆ—ÜX›\ÚÙ[XÚ]][Û—Ü™\ÛÛ™Y‹ˆ—ÜX›\ÚÙ[XÚ]][Û—Ü™\ÛÛ™YÝ×Ø[˜Ù\ÝÜœÈ‹ˆ—ÜX›\ÚÙ\œ›Ü—Ù]™[‹ˆ—ÜX›\ÚÙ^\›˜[Ø\ÜÚ\Ý[ÛY\ÜØYÙH‹ˆ—ÜX›\ÚÙ^\›˜[ØÛÛ™\œØ][Û—Ú][H‹ˆ—ÜX›\ÚÙ^\›˜[ÛÝ]]Ü™X\ÛÛš[™×Ù[H‹ˆ—ÜX›\ÚÙ^\›˜[ÛÝ]]Ý^Ù[H‹ˆ—ÜX›\ÚÙ^\›˜[ÝÛÛÛÝ]]Ù[H‹ˆ—ÜX›\ÚÚ[œ]ØÛÛœÝ[YY‹ˆ—ÜX›\ÚÚ[œ]Ù[žWÝ\›Z[˜[‹ˆ—ÜX›\ÚÚ[\œ\Y‹ˆ—ÜX›\ÚÛXÜÜÝ\\‹ˆ—ÜX›\ÚÛ[Ù[ÛÜ[ÛœÈ‹ˆ—ÜX›\ÚÜ\›Z\ÜÚ[Û—Û[ÙH‹ˆ—ÜX›\ÚÜÛXÞWÙ[šYY‹ˆ—ÜX›\ÚÜÛXÞWÙ[žH‹ˆ—ÜX›\ÚÜ[›™\—ÜÚÚ[È‹ˆ—ÜX›\ÚÜØ[™›ÞÜÝ]\È‹ˆ—ÜX›\ÚÜÙ\ÜÚ[Û—ØÜ™X]Y‹ˆ—ÜX›\ÚÜÙ\ÜÚ[Û—ÜÝ\\œÙYY‹ˆ—ÜX›\ÚÜÝ]\È‹ˆ—ÜX›\ÚÝ\›Z[˜[Ü[™[™È‹ˆ—Ü]Y\žWÚÜÝÜ[›™\—ÜÝ]\È‹ˆ—Ü™XYÜÝ]WÙ[žH‹ˆ—Ü™XYÝ\ØYØØ\Y‹ˆ—Ü™XÛÜ™ÙZ[WØÛÜÝ‹ˆ—Ü™YÚ\Ý\™YÜ[›™\—ÚY‹ˆ—Ü™Z™XÝÜ™\Ù\™YØÛÜÝØÛÛ›ÛÛX™[ÜÙYY‹ˆ—Ü™Z™XÝÜÙ\™\—Ü™\Ù\™YÛX™[ÜÙYY‹ˆ—Ü™[^WÜ\œÚ\Ý‹ˆ—Ü™[^WÜ\œÚ\ÝÙ\œ›Ü—ÛÛ˜ÙH‹ˆ—Ü™[[Ý™WÜÙ\ÜÚ[Û—ÝÛÜšÝ™YWØ™\ÝÙY™›Ü‹ˆ—Ü™\Ý\›Z[˜[ÝZWÛX™[È‹ˆ—Ü™\XÙWÝ^Ú[—ÛY\ÜØYÙWØ›ÙH‹ˆ—Ü™\]Z\™WØÛÙ^Ø\›Ý˜[Û[ÙWÙ›ÜØ\™‹ˆ—Ü™\]Z\™WØÛÛX›Ü˜][Û—Û[ÙWÙ›ÜØ\™‹ˆ—Ü™\]Z\™WØÛÜÝØÛÛ›ÛÛX™[Ø]]Üš]H‹ˆ—Ü™\]Z\™WÙXÛ\™YÜÝX˜YÙ[‹ˆ—Ü™\]Z\™WÙ^\›˜[ÜÝ]\×Ù›ÜØ\™‹ˆ—Ü™\]Z\™WÚÜÝØÛÛ›—Ù›Ü—ÝÛÜšÝ™YH‹ˆ—Ü™\]Z\™WÜ\›Z\ÜÚ[Û—Û[ÙWÙ›ÜØ\™‹ˆ—Ü™\Ù]Ü[›™\—Ü™\ÛÝ\˜Ù\×ØY\—ÜÝÚ]Ú‹ˆ—Ü™\Ù]Ü[›™\—Ü™\ÛÝ\˜Ù\×ØY\—ÜÝÚ]ÚÚ[\‹ˆ—Ü™\ÛÛ™WÚ\›™\ÜÈ‹ˆ—Ü™\ÛÛ™WÛWÛ[Ù[‹ˆ—Ü™\ÛÛ™WÜÚÚ[ÛY]WÝ^ÝšXWÜ[›™\ˆ‹ˆ—Ü™\ÛÛ™WÜÝX˜YÙ[ÜÜXÈ‹ˆ—Ü™\ÛÝ\˜ÙWÙ]™[Ú][WÙœ›ÛWÜÜÙH‹ˆ—Ü›Ý][™×ÙXÚ\Ú[Û—Ú][WÙœ›ÛWÜÜÙH‹ˆ—ÜØ[YWÜ›ÝšY\—Ù˜[Z[H‹ˆ—ÜØ[YWÜ›ÝšY\—Ù˜[Z[WÚ[\‹ˆ—ÜÙYYÛZ\ÜÚ[™×Ý]H‹ˆ—ÜÙYYÛZ\ÜÚ[™×Ý]WÙœ›ÛWÝ\Ù\—ÛY\ÜØYÙH‹ˆ—ÜÙ\ÜÚ[Û—ÜÝ]\×Ùœ›ÛWØØXÚH‹ˆ—ÜÙ\ÜÚ[Û—ÜÝ]\×ÝÚ]ØÚ[Ü›Û\‹ˆ—ÜÙ]Ü™XYÜÝ]H‹ˆ—ÜÚYÛ˜[Ú\›™\Ü×Ù[XÚ]][Û—Ü™\ÛÛ™YØžWÚY‹ˆ—ÜÚYÛ˜[Ý\›Z[˜[Ü™\ÛÛ™YÚ\›™\Ü×Ù[XÚ]][Ûˆ‹ˆ—ÜÜX×ØÛÛ™šY×Ù›Y×Ù^XÚ]WÙ\ØX›Y‹ˆ—ÜÜX×Ú\›™\ÜÈ‹ˆ—ÜÝÜÜÙ\ÜÚ[Û—ÚÜÝÜ[›™\ˆ‹ˆ—ÜÝÜÜÙ\ÜÚ[Û—ÝšXWÜ[›™\ˆ‹ˆ—ÜÝÜ™YÙš[WÝ×Ü™\ÛÝ\˜ÙH‹ˆ—ÜÝ™X[WÛ]™WÙ]™[È‹ˆ—ÜÝXÝ\™YØ\Ú×Ý\Ù\—Ü]Y\Ý[Ûˆ‹ˆ—Ý\™Ù]YÙ[XÚ]][Û—Ù]™[‹ˆ—Ý]WØÛÛ[Ùœ›ÛWÚ][H‹ˆ—Ý[˜Ø]WÛX™[‹ˆ—Ý\ØYÙWØžWÛ[Ù[Ù›Ü—Ù\Ü^H‹ˆ—Ý]×Ù^H‹ˆ—Ý˜[Y]WÙ^\›˜[Ü™X\ÛÛš[™×ÙY™›Ü‹ˆ—Ý˜[Y]WÜÙ\ÜÚ[Û—ÝÛÜšÜÜXÙH‹ˆ—Ý˜[Y]WÝ\›Z[˜[Û][˜ÚØ\™ÜÈ‹ˆ—Ý˜[Y]YØÛÜÝØÛÛ›ÛÛ[ÙWÛÝ™\œšYH‹ˆ—Ý˜[Y]YÚ\›™\Ü×ÛÝ™\œšYH‹ˆ—Ý˜[Y]YÚ\›™\Ü×ÛÝ™\œšYWÙ^XÝ]Ü—Ý\H‹ˆ—Ý˜[Y]YÜÜX×ÜÛX\Ü›Ý][™×Ú\›™\ÜÈ‹ˆ—Ý˜[Y]YÜÝX˜YÙ[Ü›Ý][™×ÛÝ™\œšYH‹ˆ—ÝØZ]Ù›Ü—ÛX[˜YÙYÜ[›™\—Ý[›™[‹ˆ—ÝØZ]Ù›Ü—Ü[›™\—ØÛY[‹ˆ˜[››Ý[˜ÙWÚÜÝ×ØÚ[™ÙY‹ˆ˜Ø[˜Ù[ÛX[˜YÙYÛ][˜ÚÝ\ÚÜÈ‹ˆœ™Y™]ÚÜÙ\ÜÚ[Û—Ü›Ý][™×ØØ][ÙÜÈ‹—B
