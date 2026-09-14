@@ -1293,6 +1293,33 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert host._unreported_exits == {}
 
 
+async def test_serve_frames_stamps_registration_on_owned_record(tmp_path: Path) -> None:
+    """The hello landing on the tunnel stamps the daemon's registry record.
+
+    The CLI's background-spawn readiness gate trusts this stamp when its
+    secondary server status read diverges, so a daemon that registered is
+    never torn down as "never registered".
+    """
+    import json
+    import os
+
+    from omnigent.host.daemon_lifecycle import DaemonLifecycleLock, daemon_record_path
+
+    target = "https://server.example.com"
+    record_path = daemon_record_path(target, base_dir=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps({"pid": os.getpid(), "target": target, "mode": "server"}))
+    host = _make_host_process()
+    host._lifecycle_lock = DaemonLifecycleLock.for_target(target, base_dir=tmp_path)
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    payload = json.loads(record_path.read_text())
+    assert isinstance(payload["registered_at"], int)
+
+
 async def test_capability_probe_timeout_does_not_block_connection(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
