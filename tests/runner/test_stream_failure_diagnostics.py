@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -37,9 +38,12 @@ _AGENT_ID = "965906f5d9fb596610dda599a80faaee"
 class _StreamErrorHarnessClient(_ScriptedHarnessClient):
     """Harness client that emits its scripted frames, then drops mid-stream."""
 
-    def __init__(self, sse_frames: list[str], *, cause: str) -> None:
+    def __init__(
+        self, sse_frames: list[str], *, cause: str, fail_before_headers: bool = False
+    ) -> None:
         super().__init__(sse_frames)
         self._cause = cause
+        self._fail_before_headers = fail_before_headers
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Return a context manager whose stream errors after the frames."""
@@ -47,11 +51,14 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
         self.posted_bodies.append(json)
         frames = self._sse_frames
         cause = self._cause
+        fail_before_headers = self._fail_before_headers
 
         class _ErrCtx:
             status_code = 200
 
             async def __aenter__(self) -> _StreamErrorHarnessClient._ErrHandle:
+                if fail_before_headers:
+                    raise httpx.ConnectError(cause)
                 return _StreamErrorHarnessClient._ErrHandle(frames, cause)
 
             async def __aexit__(self, *_: Any) -> None:
@@ -74,11 +81,20 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
             raise httpx.ReadError(self._cause)
 
 
-def _make_app(*, cause: str, terminal_registry: TerminalRegistry | None = None) -> Any:
+def _make_app(
+    *,
+    cause: str,
+    terminal_registry: TerminalRegistry | None = None,
+    frames: list[str] | None = None,
+    fail_before_headers: bool = False,
+) -> Any:
     """Build a runner app whose harness stream drops with *cause* mid-turn."""
     harness_client = _StreamErrorHarnessClient(
-        [_sse({"type": "response.created", "response": {"id": "resp_drop"}})],
+        frames
+        if frames is not None
+        else [_sse({"type": "response.created", "response": {"id": "resp_drop"}})],
         cause=cause,
+        fail_before_headers=fail_before_headers,
     )
     pm = _FakeProcessManager(harness_client)
     spec = AgentSpec(spec_version=1, name="plain-agent")
@@ -133,6 +149,48 @@ async def _failed_event_message(app: Any, conv_id: str) -> tuple[dict[str, Any],
     message = failed[0].get("error", {}).get("message", "")
     assert isinstance(message, str)
     return failed[0], message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["connect", "before_frames", "after_frames"])
+async def test_stream_failure_logs_delivery_progress(
+    failure_point: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Connection and mid-stream failures retain distinct, payload-free context."""
+    after_frames = failure_point == "after_frames"
+    frames = (
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_drop"}}),
+            _sse({"type": "response.output_text.delta", "delta": "private reply"}),
+        ]
+        if after_frames
+        else []
+    )
+    app = _make_app(
+        cause="private transport detail",
+        frames=frames,
+        fail_before_headers=failure_point == "connect",
+    )
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        failed, _ = await _failed_event_message(app, _CONV_ID)
+
+    records = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "harness_stream_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.session_id == _CONV_ID
+    assert record.attributes["harness"] == "openai-agents"
+    assert record.attributes["exception_type"] == (
+        "ConnectError" if failure_point == "connect" else "ReadError"
+    )
+    assert record.attributes["http_status"] == (None if failure_point == "connect" else 200)
+    assert record.attributes["response_id"] == ("resp_drop" if after_frames else None)
+    assert record.attributes["stream_frames_received"] == len(frames)
+    assert record.attributes["stream_elapsed_ms"] >= 0
+    assert "private" not in str(record.attributes)
+    assert record.exc_info is not None
+    assert failed["error"]["code"] == "connection_error"
 
 
 @pytest.mark.asyncio

@@ -8365,6 +8365,9 @@ def create_runner_app(
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
+            _stream_started_at = time.monotonic()
+            _stream_http_status: int | None = None
+            _stream_frames_received = 0
             try:
                 async with client.stream(
                     "POST",
@@ -8372,6 +8375,7 @@ def create_runner_app(
                     json=event_body,
                     timeout=None,
                 ) as harness_resp:
+                    _stream_http_status = harness_resp.status_code
                     if harness_resp.status_code != 200:
                         _logger.error(
                             "harness rejected turn delivery for %s with status %d",
@@ -8418,6 +8422,7 @@ def create_runner_app(
                         _buffer += chunk
                         while "\n\n" in _buffer:
                             frame, _, _buffer = _buffer.partition("\n\n")
+                            _stream_frames_received += 1
                             raw_sse_bytes = (frame + "\n\n").encode("utf-8")
 
                             data_line = next(
@@ -8795,7 +8800,20 @@ def create_runner_app(
                     "proxy stream connection error for %s: %s",
                     conv_id,
                     exc,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "harness_stream_failed",
+                        "attributes": {
+                            "harness": harness_name,
+                            "exception_type": type(exc).__name__,
+                            "http_status": _stream_http_status,
+                            "response_id": _response_id,
+                            "stream_frames_received": _stream_frames_received,
+                            "stream_elapsed_ms": int(
+                                (time.monotonic() - _stream_started_at) * 1000
+                            ),
+                        },
+                    },
                 )
                 _error = {
                     "code": "connection_error",
