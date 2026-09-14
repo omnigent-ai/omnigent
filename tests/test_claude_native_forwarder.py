@@ -9447,7 +9447,10 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
     assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
 
 
-def test_forward_failures_escalate_to_degraded_once() -> None:
+@pytest.mark.parametrize("http_status", [None, 403, 503])
+def test_forward_failures_escalate_to_degraded_once(
+    http_status: int | None, caplog: pytest.LogCaptureFixture
+) -> None:
     """
     Sustained forward failures flip the degraded latch exactly once (#1120).
 
@@ -9456,22 +9459,45 @@ def test_forward_failures_escalate_to_degraded_once() -> None:
     re-fire per dropped item.
     """
     forwarder._reset_forward_health()
+    tracker = forwarder._PostRetryTracker()
+    request = httpx.Request("POST", "https://example.test/events?secret=private")
+    exc = (
+        httpx.ConnectError("private connection detail", request=request)
+        if http_status is None
+        else httpx.HTTPStatusError(
+            "private rejection detail",
+            request=request,
+            response=httpx.Response(http_status, request=request, text="private body"),
+        )
+    )
 
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
-        forwarder._note_forward_failure("item:source-1")
+        tracker.record_failure("item:source-1", exc)
     # Below threshold: not yet degraded.
     assert forwarder._forward_health.degraded_logged is False
 
-    forwarder._note_forward_failure("item:source-1")  # crosses threshold
+    tracker.record_failure("item:source-1", exc)  # crosses threshold
     assert forwarder._forward_health.degraded_logged is True
     assert forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD
 
     # The latch holds — further failures keep counting but don't re-escalate.
-    forwarder._note_forward_failure("item:source-1")
+    tracker.record_failure("item:source-1", exc)
     assert forwarder._forward_health.degraded_logged is True
     assert (
         forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD + 1
     )
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_forward_sync_degraded"
+    ]
+    assert len(records) == 1
+    assert records[0].attributes == {
+        "exception_type": type(exc).__name__,
+        "http_status": http_status,
+    }
+    assert "private" not in records[0].getMessage()
+    assert records[0].exc_info is None
 
 
 def test_forward_success_resets_degraded_state() -> None:
@@ -9482,7 +9508,7 @@ def test_forward_success_resets_degraded_state() -> None:
     """
     forwarder._reset_forward_health()
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
-        forwarder._note_forward_failure("status:idle")
+        forwarder._note_forward_failure("status:idle", httpx.ConnectError("unreachable"))
     assert forwarder._forward_health.degraded_logged is True
 
     forwarder._note_forward_success()
