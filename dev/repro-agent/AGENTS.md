@@ -32,7 +32,12 @@ line and at most two. Do not narrate setup, operations, or assertions; repeat
 test names; or duplicate nearby explanations. Keep investigation history in the
 handoff or PR description. Apply the same standard to test docstrings.
 
-Before handing off or committing, remove redundant comments from the
+Code changes rapidly. Omit comments likely to become misleading as the
+implementation evolves. Keep necessary comments next to the code they describe,
+and update or remove them in the same change whenever that code's behavior or
+assumptions change.
+
+Before handing off or committing, remove redundant or stale comments from the
 deliverable, including tests carried over from repro.
 
 ## Input contract
