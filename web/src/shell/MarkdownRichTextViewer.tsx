@@ -380,6 +380,10 @@ function MarkdownRichTextViewerInner({
     contentType: "markdown",
     editable: canEdit,
     onUpdate: ({ editor: ed, transaction }) => {
+      // A transaction that changed no document is a no-op for our purposes (e.g.
+      // setEditable's synthetic update). It can't have altered the markdown, so
+      // re-baselining on it would only clobber an unsaved edit — skip entirely.
+      if (transaction && !transaction.docChanged) return;
       const markdown = ed.getMarkdown();
       // Only a genuine user edit should flag dirty. The first update, or any
       // update before the user focuses, is TipTap re-serialising the freshly
@@ -455,9 +459,11 @@ function MarkdownRichTextViewerInner({
     };
   }, [editor, setContentRef, setDirty, path]);
 
-  // Keep editor editable flag in sync with canEdit changes.
+  // Keep editor editable flag in sync with canEdit changes. Pass emitUpdate:
+  // false so toggling editability doesn't fire a doc-less "update" (which the
+  // onUpdate guard also ignores, but there's no reason to emit it at all).
   useEffect(() => {
-    editor?.setEditable(canEdit);
+    editor?.setEditable(canEdit, false);
   }, [editor, canEdit]);
 
   return (
