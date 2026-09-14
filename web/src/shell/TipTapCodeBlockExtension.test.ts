@@ -20,6 +20,7 @@ import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspace
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
+import { CODE_BLOCK_LANGUAGE_EDIT_META, isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
 import type { Comment } from "@/hooks/useComments";
 
@@ -143,6 +144,33 @@ describe("commenting on mermaid source text", () => {
     const range = findPmRangeForComment(editor.state.doc, comment, MD);
     expect(range).not.toBeNull();
     expect(editor.state.doc.textBetween(range!.from, range!.to, "\n")).toBe("graph TD");
+  });
+});
+
+// A language change from the picker dispatches while the editor is blurred (the
+// native <select> holds focus), so it must be recognized as a user edit — not a
+// load-time re-baseline — or the change is silently dropped on reload.
+describe("code-block language edit persistence", () => {
+  it("treats a focused update as a user edit and a blurred plain update as not", () => {
+    editor = makeEditor("plain text");
+    expect(isUserEditUpdate(true, editor.state.tr)).toBe(true);
+    expect(isUserEditUpdate(false, editor.state.tr)).toBe(false);
+  });
+
+  it("recognizes a blurred language-edit transaction as a user edit and persists it", () => {
+    editor = makeEditor("```python\nprint(1)\n```");
+    const tr = editor.state.tr
+      .setNodeAttribute(0, "language", "mermaid")
+      .setMeta(CODE_BLOCK_LANGUAGE_EDIT_META, true);
+
+    // The editor is not focused (never mounted into the document), exactly as
+    // when the picker dispatches — the flag is what saves the change.
+    expect(editor.isFocused).toBe(false);
+    expect(isUserEditUpdate(editor.isFocused, tr)).toBe(true);
+
+    editor.view.dispatch(tr);
+    expect(editor.state.doc.child(0).attrs.language).toBe("mermaid");
+    expect(editor.getMarkdown()).toContain("```mermaid");
   });
 });
 

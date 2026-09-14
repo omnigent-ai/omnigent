@@ -6,8 +6,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { NodeViewContent, NodeViewWrapper, type NodeViewProps } from "@tiptap/react";
 import { MermaidPreview } from "./MermaidPreview";
 import { CODE_BLOCK_LANGUAGES } from "./codeBlockLanguages";
+import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
 
-export function TipTapCodeBlockView({ node, updateAttributes, editor }: NodeViewProps) {
+export function TipTapCodeBlockView({ node, editor, getPos }: NodeViewProps) {
   const language = (node.attrs.language as string | null) ?? "";
   // Hand-authored fences may be cased (```Mermaid); match case-insensitively.
   const isMermaid = language.toLowerCase() === "mermaid";
@@ -40,14 +41,17 @@ export function TipTapCodeBlockView({ node, updateAttributes, editor }: NodeView
     (e: React.ChangeEvent<HTMLSelectElement>) => {
       // Programmatic commands bypass the read-only DOM guard, so re-check here.
       if (!editor.isEditable) return;
-      // The native <select> stole focus from the editor, so updateAttributes
-      // would fire an update while blurred — which the autosave/dirty wiring
-      // treats as a load-time re-baseline and never persists. Refocus first so
-      // the language change saves like any edit.
-      editor.commands.focus();
-      updateAttributes({ language: e.target.value || null });
+      const pos = getPos();
+      if (typeof pos !== "number") return;
+      // The native <select> holds focus, so this update reaches the editor while
+      // it is blurred. Flag the transaction as a user edit so autosave persists
+      // it — refocusing programmatically is unreliable (TipTap defers focus).
+      const tr = editor.view.state.tr
+        .setNodeAttribute(pos, "language", e.target.value || null)
+        .setMeta(CODE_BLOCK_LANGUAGE_EDIT_META, true);
+      editor.view.dispatch(tr);
     },
-    [editor, updateAttributes],
+    [editor, getPos],
   );
 
   return (
