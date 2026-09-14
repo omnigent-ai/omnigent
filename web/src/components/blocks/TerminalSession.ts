@@ -343,6 +343,58 @@ export function parseTerminalClipboardMessage(message: string): string | null {
   return decodeTerminalClipboardBase64((value as { data: string }).data);
 }
 
+/**
+ * Largest grid the server is allowed to impose on xterm.js. tmux itself caps
+ * panes far below this; the bound just keeps a malformed frame from asking for
+ * an allocation the renderer cannot survive.
+ */
+export const TERMINAL_MAX_GRID_DIMENSION = 2000;
+
+/** An authoritative pane grid announced by the server. */
+export interface TerminalPaneSize {
+  cols: number;
+  rows: number;
+}
+
+/**
+ * Parse the strict server→browser ``pane-size`` control message.
+ *
+ * tmux's window size is shared by every client attached to the session and is
+ * resolved by tmux's ``window-size`` policy, so the size this browser proposed
+ * with its ``resize`` frame is not necessarily the size the pane ends up with —
+ * a second client (``tmux attach`` over ssh, say) can win the race. The server
+ * therefore announces the real geometry and the browser adopts it; otherwise
+ * output laid out for the new width wraps inside the stale grid and overwrites
+ * the row below, which is what "the web terminal is garbled but ssh is fine"
+ * looks like.
+ *
+ * :param message: The raw text frame body.
+ * :returns: The announced grid, or ``null`` when the frame is not a
+ *     well-formed ``pane-size`` message.
+ */
+export function parseTerminalPaneSizeMessage(message: string): TerminalPaneSize | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const { type, cols, rows } = value as { type?: unknown; cols?: unknown; rows?: unknown };
+  if (type !== "pane-size") return null;
+  if (!isTerminalGridDimension(cols) || !isTerminalGridDimension(rows)) return null;
+  return { cols, rows };
+}
+
+function isTerminalGridDimension(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value > 0 &&
+    value <= TERMINAL_MAX_GRID_DIMENSION
+  );
+}
+
 /** Whether a clipboard event is attributable to recent input on this attach. */
 export function hadRecentTerminalInput(lastInputAt: number, now: number): boolean {
   return (
@@ -639,6 +691,11 @@ export class TerminalSession {
             onActivity?.();
           }
         } else if (typeof ev.data === "string") {
+          const paneSize = parseTerminalPaneSizeMessage(ev.data);
+          if (paneSize !== null) {
+            this.applyPaneSize(paneSize);
+            return;
+          }
           const text = parseTerminalClipboardMessage(ev.data);
           if (text !== null) this.requestClipboardWrite(text);
           // Unknown text frames stay ignored for protocol forward compatibility.
@@ -825,6 +882,26 @@ export class TerminalSession {
       cols,
       rows,
     };
+  }
+
+  /**
+   * Adopt the pane geometry tmux actually settled on.
+   *
+   * The grid the browser proposed is only a proposal: tmux shares one window
+   * size across every attached client. Painting bytes laid out for a different
+   * width into this grid wraps them onto the row below and corrupts the
+   * screen, so the server's announcement wins over the fitted size.
+   *
+   * ``lastSentSize`` is deliberately left alone — it records what *this* client
+   * asked for, and a container resize must still be able to ask again.
+   */
+  private applyPaneSize({ cols, rows }: TerminalPaneSize): void {
+    if (this.term.cols === cols && this.term.rows === rows) return;
+    try {
+      this.term.resize(cols, rows);
+    } catch (err) {
+      console.warn("[terminal-attach] server pane-size resize failed", err);
+    }
   }
 
   private sendResize(): void {

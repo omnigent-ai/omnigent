@@ -19,6 +19,7 @@ import {
   loadWebglRenderer,
   openTerminalLink,
   parseTerminalClipboardMessage,
+  parseTerminalPaneSizeMessage,
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
@@ -729,6 +730,42 @@ describe("TerminalSession", () => {
     expect(socket.closed).toBe(false);
   });
 
+  it("adopts the pane size the server announces", () => {
+    // WHY: tmux shares one window size across every attached client, so the
+    // size this browser proposed is only a proposal — a second client
+    // (`tmux attach` over ssh) can win it. If xterm.js keeps its old grid, the
+    // pane's output is laid out for a different width, wraps, and overwrites
+    // the row below: the "web terminal garbled, ssh fine" bug. The server's
+    // announcement must therefore win over the fitted size.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const resizeSpy = vi.spyOn(term, "resize");
+
+    socket.open();
+    socket.emit("message", {
+      data: JSON.stringify({ type: "pane-size", cols: 132, rows: 50 }),
+    });
+
+    expect(resizeSpy).toHaveBeenCalledWith(132, 50);
+    session.dispose();
+  });
+
+  it("ignores a pane-size announcement that matches the current grid", () => {
+    // WHY: tmux re-announces geometry on notifications that did not actually
+    // change it; a redundant resize would churn the renderer and the reflow.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const resizeSpy = vi.spyOn(term, "resize");
+
+    socket.emit("message", {
+      data: JSON.stringify({ type: "pane-size", cols: term.cols, rows: term.rows }),
+    });
+
+    expect(resizeSpy).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
   it("observes the container for resize", () => {
     // WHY: layout changes (window resize, font load) must propagate a resize
     // frame, so the session must register a ResizeObserver on its container.
@@ -736,5 +773,35 @@ describe("TerminalSession", () => {
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
     session.dispose();
+  });
+});
+
+describe("parseTerminalPaneSizeMessage", () => {
+  it("accepts a well-formed announcement", () => {
+    expect(
+      parseTerminalPaneSizeMessage(JSON.stringify({ type: "pane-size", cols: 120, rows: 40 })),
+    ).toEqual({ cols: 120, rows: 40 });
+  });
+
+  it("rejects other frame types, bad shapes, and unusable dimensions", () => {
+    // WHY: the frame drives a renderer allocation, so anything but a positive,
+    // bounded integer grid must be dropped rather than coerced.
+    expect(parseTerminalPaneSizeMessage("not json")).toBeNull();
+    expect(parseTerminalPaneSizeMessage(JSON.stringify({ type: "clipboard-write" }))).toBeNull();
+    expect(
+      parseTerminalPaneSizeMessage(JSON.stringify({ type: "pane-size", cols: 0, rows: 40 })),
+    ).toBeNull();
+    expect(
+      parseTerminalPaneSizeMessage(JSON.stringify({ type: "pane-size", cols: -1, rows: 40 })),
+    ).toBeNull();
+    expect(
+      parseTerminalPaneSizeMessage(JSON.stringify({ type: "pane-size", cols: 1.5, rows: 40 })),
+    ).toBeNull();
+    expect(
+      parseTerminalPaneSizeMessage(JSON.stringify({ type: "pane-size", cols: 99999, rows: 40 })),
+    ).toBeNull();
+    expect(
+      parseTerminalPaneSizeMessage(JSON.stringify({ type: "pane-size", cols: "120", rows: 40 })),
+    ).toBeNull();
   });
 });
