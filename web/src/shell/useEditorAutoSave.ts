@@ -11,6 +11,7 @@ import type { RefObject } from "react";
 import { useWriteFileContent } from "@/hooks/useWriteFileContent";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { retrySession } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { useAutoSave } from "./useAutoSave";
 
@@ -194,6 +195,23 @@ export function useEditorAutoSave({
     prevAutoSaveEnabledRef.current = autoSaveEnabled;
     if (!wasEnabled && autoSaveEnabled && isDirty) autoSave.flush();
   }, [autoSaveEnabled, isDirty, autoSave]);
+
+  // A dirty editor while the runner reads offline is reconnect intent: post the
+  // retry_session wake (the same ladder a chat message rides); the reconnect
+  // flush above then saves the edit. One wake per offline episode; failures and
+  // reconnects re-arm. Best-effort: a non-wakeable session keeps offline UX.
+  const wakeRequestedRef = useRef(false);
+  useEffect(() => {
+    if (runnerOnline !== false) {
+      if (runnerOnline === true) wakeRequestedRef.current = false;
+      return;
+    }
+    if (!canEdit || !isDirty || wakeRequestedRef.current) return;
+    wakeRequestedRef.current = true;
+    retrySession(conversationId).catch(() => {
+      wakeRequestedRef.current = false;
+    });
+  }, [runnerOnline, canEdit, isDirty, conversationId]);
 
   return { autoSave, saveDisabled, writeFile };
 }
