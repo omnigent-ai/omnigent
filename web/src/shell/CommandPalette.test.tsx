@@ -113,6 +113,63 @@ describe("CommandPalette — sessions", () => {
     renderPalette({ sessionsOnly: true });
     expect(fetchNextPage).not.toHaveBeenCalled();
     expect(screen.getByRole("status").textContent).toContain("Couldn't load");
+    expect(screen.queryByText("No results found")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])(
+    "shows initial fetch errors with a retry (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      const refetch = vi.fn();
+      useConversations.mockReturnValue({ isError: true, isFetching: false, refetch });
+      renderPalette({ sessionsOnly });
+      expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+      expect(screen.queryByText("No results found")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(refetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("shows only one loading message during the initial session fetch", () => {
+    setSessions([], true);
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
+    expect(screen.queryByText("Searching…")).toBeNull();
+    expect(screen.queryByText("No results found")).toBeNull();
+  });
+
+  it("bounds automatic pagination and lets the user search older sessions", () => {
+    const fetchNextPage = vi.fn();
+    useConversations.mockReturnValue({
+      data: {
+        pages: Array.from({ length: 10 }, () => ({ data: [conv("repeated", "Repeated page")] })),
+      },
+      hasNextPage: true,
+      isFetching: false,
+      fetchNextPage,
+    });
+    renderPalette({ sessionsOnly: true });
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    expect(screen.getAllByText("Repeated page")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Search older sessions" }));
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it("bounds rendered rows while searching every loaded session", () => {
+    setSessions(Array.from({ length: 100 }, (_, i) => conv(`c${i}`, `Session ${i}`)));
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getAllByRole("option")).toHaveLength(50);
+    expect(screen.getByRole("status").textContent).toContain("Showing 50 of 100 matches.");
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "Session" } });
+    expect(screen.getAllByRole("option")).toHaveLength(50);
+    expect(document.querySelector("mark")?.textContent).toBe("Session");
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "Session 99" },
+    });
+    expect(labelRow("Session 99")).toBeTruthy();
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c99");
   });
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);

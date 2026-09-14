@@ -99,6 +99,8 @@ function HighlightedText({ text, query }: { text: string; query: string }): Reac
 /** How many recent sessions to show before the user types, so the Actions
     group stays visible without scrolling. Typing lifts the cap. */
 const IDLE_SESSION_LIMIT = 5;
+const SESSION_SEARCH_PAGE_BATCH = 10;
+const SESSION_SEARCH_RESULT_LIMIT = 50;
 
 export function CommandPalette({
   sessionsOnly = false,
@@ -111,12 +113,14 @@ export function CommandPalette({
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
 
   // Reset the query when the palette closes so it reopens clean.
   useEffect(() => {
     if (!open) {
       setQuery("");
       setDebouncedQuery("");
+      setPageLimit(SESSION_SEARCH_PAGE_BATCH);
     }
   }, [open]);
 
@@ -187,16 +191,32 @@ export function CommandPalette({
 
   // includeArchived=true shares the sidebar's cache key; archived rows are
   // filtered out below so the palette only lists active sessions.
-  const { data, isFetching, hasNextPage, fetchNextPage, isFetchNextPageError } = useConversations(
-    sessionsOnly ? "" : debouncedQuery,
-    !sessionsOnly,
-    { enabled: open },
-  );
+  const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
+    useConversations(sessionsOnly ? "" : debouncedQuery, !sessionsOnly, { enabled: open });
+  const loadedPages = data?.pages.length ?? 0;
   useEffect(() => {
-    if (open && sessionsOnly && hasNextPage && !isFetching && !isFetchNextPageError) {
+    if (
+      open &&
+      sessionsOnly &&
+      hasNextPage &&
+      loadedPages < pageLimit &&
+      !isFetching &&
+      !isError &&
+      !isFetchNextPageError
+    ) {
       void fetchNextPage();
     }
-  }, [open, sessionsOnly, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
+  }, [
+    open,
+    sessionsOnly,
+    hasNextPage,
+    loadedPages,
+    pageLimit,
+    isFetching,
+    isError,
+    isFetchNextPageError,
+    fetchNextPage,
+  ]);
 
   const sessions = useMemo(() => {
     const seen = new Set<string>();
@@ -229,6 +249,8 @@ export function CommandPalette({
     }
     return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
   }, [data, debouncedQuery, query, sessionsOnly]);
+  const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
+  const loadError = isError || isFetchNextPageError;
 
   const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
   const placeholder = sessionsOnly
@@ -313,26 +335,33 @@ export function CommandPalette({
             />
           )}
           <CommandList className={isMobile ? "max-h-none flex-1" : undefined}>
-            {sessionsOnly && (isFetching || isFetchNextPageError) && (
+            {(loadError || (sessionsOnly && isFetching)) && (
               <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
-                {isFetchNextPageError ? "Couldn't load more sessions." : "Loading sessions…"}
-                {isFetchNextPageError && (
+                {loadError
+                  ? isFetchNextPageError
+                    ? "Couldn't load more sessions."
+                    : "Couldn't load sessions."
+                  : "Loading sessions…"}
+                {loadError && (
                   <button
                     type="button"
                     className="ml-2 underline"
-                    onClick={() => void fetchNextPage()}
+                    disabled={isFetching}
+                    onClick={() => void (isFetchNextPageError ? fetchNextPage() : refetch())}
                   >
                     Retry
                   </button>
                 )}
               </p>
             )}
-            <CommandEmpty>
-              {isFetching && (sessionsOnly || debouncedQuery) ? "Searching…" : "No results found"}
-            </CommandEmpty>
+            {!loadError && !(sessionsOnly && isFetching) && (
+              <CommandEmpty>
+                {isFetching && debouncedQuery ? "Searching…" : "No results found"}
+              </CommandEmpty>
+            )}
             {sessions.length > 0 && (
               <CommandGroup heading="Sessions">
-                {sessions.map((s) => (
+                {visibleSessions.map((s) => (
                   // pl-6 indents the label to line up with the icon-prefixed
                   // Action rows below (their 16px icon + 8px gap), so the two
                   // groups read as one aligned column.
@@ -344,7 +373,10 @@ export function CommandPalette({
                   >
                     <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                       <span className="truncate text-left">
-                        <HighlightedText text={s.label} query={debouncedQuery} />
+                        <HighlightedText
+                          text={s.label}
+                          query={sessionsOnly ? query : debouncedQuery}
+                        />
                       </span>
                       {s.snippet && (
                         // Where the match was found in the chat body — the
@@ -358,6 +390,22 @@ export function CommandPalette({
                   </CommandItem>
                 ))}
               </CommandGroup>
+            )}
+            {sessionsOnly && sessions.length > visibleSessions.length && (
+              <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
+                Showing {visibleSessions.length} of {sessions.length} matches. Type more to narrow
+                your search.
+              </p>
+            )}
+            {sessionsOnly && hasNextPage && loadedPages >= pageLimit && !loadError && (
+              <Button
+                variant="ghost"
+                className="w-full"
+                disabled={isFetching}
+                onClick={() => setPageLimit(loadedPages + SESSION_SEARCH_PAGE_BATCH)}
+              >
+                Search older sessions
+              </Button>
             )}
             {filteredActions.length > 0 && (
               <CommandGroup heading="Actions">
