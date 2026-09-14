@@ -1812,6 +1812,20 @@ aside[aria-label="Workspace"][data-maximized] {
   background: none;
   padding: 0;
 }
+/* Code-block node view (TipTapCodeBlockView): the wrapper owns the block
+   spacing; the inner <pre> loses its own margin so the language selector and
+   the mermaid preview sit flush with the source. */
+.tiptap-md-content .ProseMirror .tiptap-code-block {
+  margin: 0.75em 0;
+}
+.tiptap-md-content .ProseMirror .tiptap-code-block pre {
+  margin: 0;
+}
+.tiptap-md-content .ProseMirror .tiptap-mermaid-preview {
+  border-top: 1px solid var(--border);
+  margin-top: 0.5em;
+  padding-top: 0.5em;
+}
 .tiptap-md-content .ProseMirror a {
   color: var(--primary);
   text-decoration: underline;

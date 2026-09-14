@@ -43,9 +43,7 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import rehypeSlug from "rehype-slug";
-import { mermaid } from "@streamdown/mermaid";
-import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
-import { Streamdown } from "streamdown";
+import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -149,20 +147,6 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
 ];
-
-const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
-
-function MermaidPreview({ source }: { source: string }) {
-  return (
-    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
-      <MarkdownErrorBoundary source={source}>
-        <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
-          {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
-        </Streamdown>
-      </MarkdownErrorBoundary>
-    </div>
-  );
-}
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).

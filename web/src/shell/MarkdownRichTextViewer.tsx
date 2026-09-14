@@ -43,6 +43,7 @@ import {
   type SearchDecorationState,
 } from "./TipTapSearchExtension";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
+import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import {
@@ -331,8 +332,16 @@ function MarkdownRichTextViewerInner({
       // listItem: false — replaced by SafeListItem (content: block+) so a list
       // item whose first child is a non-paragraph block doesn't build a
       // schema-invalid doc that crashes the panel. See SafeListItem above.
-      StarterKit.configure({ link: false, blockquote: false, listItem: false }),
+      // codeBlock: false — replaced by CodeBlockWithLanguage, which adds a
+      // language picker and a live mermaid preview via a React node view.
+      StarterKit.configure({
+        link: false,
+        blockquote: false,
+        listItem: false,
+        codeBlock: false,
+      }),
       SafeListItem,
+      CodeBlockWithLanguage,
       // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
       // BulletList/OrderedList/ListItem but NOT TaskList/TaskItem, so without
       // these two the markdown parser drops the checkbox and renders a plain

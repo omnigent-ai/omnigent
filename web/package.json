@@ -51,6 +51,7 @@
     "@tanstack/react-virtual": "^3.14.10",
     "@tiptap/core": "3.30.5",
     "@tiptap/extension-blockquote": "3.30.5",
+    "@tiptap/extension-code-block": "3.30.5",
     "@tiptap/extension-image": "3.30.5",
     "@tiptap/extension-link": "3.30.5",
     "@tiptap/extension-list": "3.30.5",
