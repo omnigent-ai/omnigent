@@ -18,6 +18,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import type { Comment } from "@/hooks/useComments";
 
 // ── Mock heavy child components ───────────────────────────────────────────────
@@ -29,18 +30,22 @@ vi.mock("./CodeViewer", () => ({
   // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
   CodeViewer: ({
     viewMode,
+    path,
     searchOpen,
     onDirtyChange,
   }: {
     viewMode: string;
+    path: string;
     searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => (
     <div
       data-testid="code-viewer"
       data-view-mode={viewMode}
+      className={path.endsWith(".py") ? "monaco-editor" : undefined}
       data-search-open={String(!!searchOpen)}
     >
+      {path.endsWith(".py") ? <input aria-label={`editor ${path}`} /> : null}
       <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
     </div>
   ),
@@ -130,6 +135,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   })),
 }));
 
+const viewport = vi.hoisted(() => ({ isDesktop: true }));
 vi.mock("@/hooks/useResizablePanel", () => ({
   useResizablePanel: vi.fn(() => ({
     panelWidth: 400,
@@ -141,7 +147,7 @@ vi.mock("@/hooks/useResizablePanel", () => ({
       "aria-label": "Resize panel",
       tabIndex: 0,
     },
-    isDesktop: true,
+    isDesktop: viewport.isDesktop,
   })),
 }));
 
@@ -203,6 +209,7 @@ function LocationDisplay() {
 interface RenderProps {
   open?: boolean;
   path?: string;
+  frameless?: boolean;
   /**
    * Initial URL search string (without leading "?"), e.g. "diff=1" or
    * "comment=c1". Defaults to empty (no URL params).
@@ -214,6 +221,7 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  onCloseTab?: () => void;
 }
 
 /**
@@ -227,25 +235,33 @@ interface RenderProps {
 function viewerTree({
   open = false,
   path = "file1.py",
+  frameless,
   initialSearch = "",
   onClose = vi.fn(),
   sort,
   onNavigateTo,
+  onCloseTab,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[url]}>
-        <LocationDisplay />
-        <FileViewer
-          open={open}
-          conversationId="conv_1"
-          path={path}
-          onClose={onClose}
-          sort={sort}
-          onNavigateTo={onNavigateTo}
-        />
+        <ActionsProvider>
+          <KeybindingDispatcher />
+          <LocationDisplay />
+          <FileViewer
+            open={open}
+            frameless={frameless}
+            actionActive={open}
+            conversationId="conv_1"
+            path={path}
+            onClose={onClose}
+            onCloseTab={onCloseTab}
+            sort={sort}
+            onNavigateTo={onNavigateTo}
+          />
+        </ActionsProvider>
       </MemoryRouter>
     </QueryClientProvider>
   );
@@ -258,6 +274,7 @@ function renderViewer(props: RenderProps = {}) {
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
 beforeEach(() => {
+  viewport.isDesktop = true;
   useCommentsMock.mockReset();
   useOptionalCommentSenderMock.mockReturnValue(null);
   // FileViewer persists global view preferences (diff/layout/preview) to
@@ -1446,6 +1463,77 @@ describe("FileViewer collapsed-toolbar overflow menu", () => {
   });
 });
 
+describe("FileViewer centralized find action", () => {
+  beforeEach(() => useCommentsMock.mockReturnValue(makeCommentsQuery([])));
+
+  it("keeps the CSS-hidden mobile viewer inactive on desktop", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/"]}>
+          <ActionsProvider>
+            <KeybindingDispatcher />
+            <FileViewer
+              frameless
+              open
+              conversationId="conv_1"
+              path="desktop.py"
+              onClose={vi.fn()}
+            />
+            <FileViewer open conversationId="conv_1" path="mobile.py" onClose={vi.fn()} />
+          </ActionsProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.keyDown(document.body, { key: "f", ctrlKey: true });
+    const viewers = screen.getAllByTestId("code-viewer");
+    expect(viewers[0]).toHaveAttribute("data-search-open", "true");
+    expect(viewers[1]).toHaveAttribute("data-search-open", "false");
+  });
+
+  it("keeps the CSS-hidden desktop viewer inactive on mobile", () => {
+    viewport.isDesktop = false;
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/"]}>
+          <ActionsProvider>
+            <KeybindingDispatcher />
+            <FileViewer
+              frameless
+              open
+              conversationId="conv_1"
+              path="desktop.py"
+              onClose={vi.fn()}
+            />
+            <FileViewer open conversationId="conv_1" path="mobile.py" onClose={vi.fn()} />
+          </ActionsProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.keyDown(document.body, { key: "f", ctrlKey: true });
+    const viewers = screen.getAllByTestId("code-viewer");
+    expect(viewers[0]).toHaveAttribute("data-search-open", "false");
+    expect(viewers[1]).toHaveAttribute("data-search-open", "true");
+  });
+
+  it("opens search on primary+F and closes search before the file on Escape", () => {
+    const onCloseTab = vi.fn();
+    renderViewer({ open: true, frameless: true, onCloseTab });
+    fireEvent.keyDown(document.body, { key: "f", ctrlKey: true });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+    const editor = screen.getByRole("textbox", { name: "editor file1.py" });
+    editor.focus();
+    expect(fireEvent.keyDown(editor, { key: "f", ctrlKey: true })).toBe(false);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "false");
+    expect(onCloseTab).not.toHaveBeenCalled();
+    editor.blur();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCloseTab).toHaveBeenCalledOnce();
+  });
+});
+
 describe("FileViewer keyboard shortcut — Alt+← / Alt+→", () => {
   const multipleFiles = [
     { path: "a.py", bytes: 1, modified_at: 100, name: "a.py", status: "modified" as const },
@@ -1595,14 +1683,14 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
     expect(searchOpenOf("code-viewer")).toBe("false");
   });
 
-  it("leaves the markdown editor surface to CodeViewer's own find handler", () => {
+  it("opens the markdown search widget through the same centralized action", () => {
     // Markdown defaults to the rich-text editor — a non-Monaco surface whose
     // Cmd+F is owned by CodeViewer, so FileViewer's handler must stay inert
     // (the mocked CodeViewer never flips searchOpen on its own).
     renderViewer({ open: true, path: "notes.md" });
     expect(screen.getByTestId("code-viewer").getAttribute("data-view-mode")).toBe("editor");
     fireEvent.keyDown(window, { key: "f", metaKey: true });
-    expect(searchOpenOf("code-viewer")).toBe("false");
+    expect(searchOpenOf("code-viewer")).toBe("true");
   });
 
   const insideButton = () =>
@@ -1689,13 +1777,17 @@ describe("FileViewer Escape closes the active tab", () => {
     return render(
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={["/"]}>
-          <FileViewer
-            open
-            conversationId="conv_1"
-            path="file1.py"
-            onClose={vi.fn()}
-            onCloseTab={onCloseTab}
-          />
+          <ActionsProvider>
+            <KeybindingDispatcher />
+            <FileViewer
+              open
+              actionActive
+              conversationId="conv_1"
+              path="file1.py"
+              onClose={vi.fn()}
+              onCloseTab={onCloseTab}
+            />
+          </ActionsProvider>
         </MemoryRouter>
       </QueryClientProvider>,
     );

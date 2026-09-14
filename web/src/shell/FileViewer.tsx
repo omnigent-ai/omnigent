@@ -47,6 +47,13 @@ import {
   Trash2Icon,
   WrapTextIcon,
 } from "lucide-react";
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  useRegisterAction,
+} from "@/actions";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
@@ -299,6 +306,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Explicitly gate keyboard ownership when a CSS-mounted viewer is hidden. */
+  actionActive?: boolean;
   /** Called when the user presses Escape to close the active file tab. */
   onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
@@ -339,6 +348,7 @@ function FileViewerBody({
   onNavigateTo,
   permissionLevel,
   frameless,
+  actionActive,
   onCommentsOpenChange,
   sort = "recent",
 }: FileViewerProps) {
@@ -585,6 +595,7 @@ function FileViewerBody({
 
   // Find-in-file state lifted here so the toolbar button can open it.
   const [searchOpen, setSearchOpen] = useState(false);
+  const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const openSearch = useCallback(() => {
     setSearchOpen((prev) => {
@@ -593,52 +604,66 @@ function FileViewerBody({
       return true;
     });
   }, [searchInputRef]);
-
-  // Keyboard shortcut: Alt+← / Alt+→ to navigate between changed files.
-  useEffect(() => {
-    if (!open || !onNavigateTo || currentNavIdx === -1) return;
-    const handler = (e: KeyboardEvent) => {
-      if (!e.altKey) return;
-      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-      // Don't hijack word-navigation when the user is typing in an input.
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
-      if (e.key === "ArrowLeft" && prevPath) {
-        e.preventDefault();
-        guardDirty(() => onNavigateTo(prevPath));
-      } else if (e.key === "ArrowRight" && nextPath) {
-        e.preventDefault();
-        guardDirty(() => onNavigateTo(nextPath));
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
-
-  // Escape closes the active file tab (when search is not open).
-  useEffect(() => {
-    if (!open || !onCloseTab) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.defaultPrevented) return;
-      if (searchOpen) return;
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
-      e.preventDefault();
+  const showSearch = useCallback(() => {
+    setSearchOpen(true);
+    setTimeout(() => searchInputRef.current?.focus(), 0);
+  }, [searchInputRef]);
+  const fileScope = useActionScopeRegistration({
+    mode: "fileViewer",
+    active: actionActive ?? (open && (frameless ? isDesktop : !isDesktop)),
+    context: { fileSearchOpen: searchOpen, fileFindAvailable: viewerIsActiveSurface },
+  });
+  useRegisterAction("file.action.find", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    priority: 20,
+    isEnabled: ({ context }) =>
+      open &&
+      (isMonacoFindSurface ||
+        lang === "markdown" ||
+        (viewMode === "preview" && isNotebookPath(path))) &&
+      context.fileFindAvailable,
+    run: () => {
+      showSearch();
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.closeSearch", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!searchOpen) return NOT_HANDLED;
+      setSearchOpen(false);
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.openPreviousChanged", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open || !onNavigateTo || !prevPath) return NOT_HANDLED;
+      guardDirty(() => onNavigateTo(prevPath));
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.openNextChanged", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open || !onNavigateTo || !nextPath) return NOT_HANDLED;
+      guardDirty(() => onNavigateTo(nextPath));
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.close", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open || !onCloseTab || searchOpen) return NOT_HANDLED;
       guardDirty(onCloseTab);
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [open, onCloseTab, searchOpen, guardDirty]);
+      return HANDLED;
+    },
+  });
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -749,19 +774,7 @@ function FileViewerBody({
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
-  // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
-  // source/editor and the diff view). Those surfaces would otherwise rely on
-  // Monaco's own Cmd+F keybinding, which needs editor DOM focus and does not
-  // fire inside the managed (same-root embed) host — so cmd+f silently did
-  // nothing there. Driving `searchOpen` runs Monaco's find action imperatively
-  // instead, matching how the Shiki/markdown surfaces (handled by their own
-  // window listeners in CodeViewer) already open find. Gated to the Monaco
-  // surfaces so it never double-handles the CodeViewer-owned ones.
-  // The find toggle only reaches a Monaco surface: the diff view, or a non-diff
-  // file that CodeViewer renders in Monaco. Exclude the surfaces CodeViewer
-  // returns *before* the Monaco block — markdown (rich editor / its own find
-  // bar), previews, and the image/PDF/model/binary viewers — otherwise Cmd+F
-  // would swallow the browser's find-in-page with no find widget to show.
+  // Only claim Find when the current surface can display an in-file search widget.
   const isMonacoFindSurface =
     diffViewActive ||
     (lang !== "markdown" && viewMode !== "preview" && !isImage && !isPdf && !isModel && !isBinary);
@@ -773,12 +786,11 @@ function FileViewerBody({
   // the last surface the user interacted with: seeded to the viewer (opening a
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
-  const viewerIsActiveSurfaceRef = useRef(true);
   useEffect(() => {
     // Opening the viewer (or switching files within it) makes it the active
     // surface again. Keyed on `open` too, so reopening the same path after the
     // user had clicked into the chat re-seeds the ref instead of staying stale.
-    if (open) viewerIsActiveSurfaceRef.current = true;
+    if (open) setViewerIsActiveSurface(true);
   }, [open, path]);
   useEffect(() => {
     if (!open) return;
@@ -786,7 +798,7 @@ function FileViewerBody({
       const root = viewerRootRef.current;
       const target = e.target;
       if (root !== null && target instanceof Node) {
-        viewerIsActiveSurfaceRef.current = root.contains(target);
+        setViewerIsActiveSurface(root.contains(target));
       }
     };
     window.addEventListener("mousedown", track, true);
@@ -796,22 +808,6 @@ function FileViewerBody({
       window.removeEventListener("focusin", track, true);
     };
   }, [open]);
-  useEffect(() => {
-    if (!open || !isMonacoFindSurface) return;
-    const handler = (e: KeyboardEvent) => {
-      if (!((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "f")) return;
-      if (!viewerIsActiveSurfaceRef.current) return;
-      e.preventDefault();
-      e.stopPropagation();
-      setSearchOpen(true);
-    };
-    // Capture phase so the embed claims Cmd+F ahead of the host page's own
-    // listeners and the browser's native find (which would search the whole
-    // host page, not the file).
-    window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
-  }, [open, isMonacoFindSurface, setSearchOpen]);
-
   // Reset the toggle when find is closed from inside Monaco (Escape or the
   // widget's ✕) so the next Cmd+F re-opens it instead of no-opping. Shared by
   // the diff view; the non-diff CodeViewer resets its own copy internally.
@@ -1660,10 +1656,11 @@ function FileViewerBody({
     return (
       <div
         ref={setViewerRoot}
+        {...fileScope.rootProps}
         data-testid="file-viewer"
         className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
       >
-        {innerContent}
+        <ActionScopeProvider scope={fileScope}>{innerContent}</ActionScopeProvider>
       </div>
     );
   }
@@ -1671,6 +1668,7 @@ function FileViewerBody({
   return (
     <aside
       ref={setViewerRoot}
+      {...fileScope.rootProps}
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
@@ -1693,7 +1691,7 @@ function FileViewerBody({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {open && innerContent}
+      {open && <ActionScopeProvider scope={fileScope}>{innerContent}</ActionScopeProvider>}
     </aside>
   );
 }

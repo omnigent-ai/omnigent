@@ -1082,6 +1082,7 @@ function WorkspacePanelImpl({
           <FileViewer
             frameless
             open
+            actionActive={inert ? false : undefined}
             conversationId={conversationId}
             path={selectedFilePath}
             onClose={onShowScopeView}

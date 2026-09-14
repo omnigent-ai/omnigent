@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActionRegistry } from "./actionRegistry";
 import { EMPTY_ACTION_CONTEXT } from "./context";
-import { HANDLED, NOT_HANDLED } from "./types";
+import { HANDLED, NOT_HANDLED, type ActionScopeId } from "./types";
 
 const resolution = {
   context: EMPTY_ACTION_CONTEXT,
-  focusedScopeIds: [] as string[],
+  focusedScopeIds: [] as ActionScopeId[],
 };
 
 describe("ActionRegistry", () => {
@@ -79,9 +79,43 @@ describe("ActionRegistry", () => {
       },
     });
 
-    const focused = { ...resolution, focusedScopeIds: ["editor", "file"] };
+    const focused = {
+      ...resolution,
+      focusedScopeIds: ["editor", "file"] as ActionScopeId[],
+    };
     expect(registry.execute({ action: "file.action.find", source: "api" }, focused)).toBe(HANDLED);
     expect(calls).toEqual(["editor"]);
+  });
+
+  it("routes save to the higher-priority editor handler in one file scope", () => {
+    const registry = new ActionRegistry();
+    registry.registerScope({
+      id: "file",
+      parentId: null,
+      mode: "fileViewer",
+      active: true,
+      context: {},
+    });
+    const markdown = vi.fn(() => HANDLED);
+    const monaco = vi.fn(() => HANDLED);
+    registry.registerAction({
+      action: "file.action.save",
+      scopeId: "file",
+      run: markdown,
+    });
+    const unregisterMonaco = registry.registerAction({
+      action: "file.action.save",
+      scopeId: "file",
+      priority: 10,
+      run: monaco,
+    });
+    const focused = { ...resolution, focusedScopeIds: ["file"] as ActionScopeId[] };
+    registry.execute({ action: "file.action.save", source: "api" }, focused);
+    expect(monaco).toHaveBeenCalledOnce();
+    expect(markdown).not.toHaveBeenCalled();
+    unregisterMonaco();
+    registry.execute({ action: "file.action.save", source: "api" }, focused);
+    expect(markdown).toHaveBeenCalledOnce();
   });
 
   it("skips inactive scoped handlers and disabled handlers", () => {
@@ -186,7 +220,9 @@ describe("ActionRegistry", () => {
       active: true,
       context: {},
     });
-    expect(registry.getFocusedModes(["file"])).toEqual(new Set(["global", "fileViewer"]));
+    expect(registry.getFocusedModes(["file" as ActionScopeId])).toEqual(
+      new Set(["global", "fileViewer"]),
+    );
     expect(registry.getActiveModes()).toEqual(new Set(["global", "fileViewer", "terminal"]));
   });
 });

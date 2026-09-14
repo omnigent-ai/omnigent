@@ -6,6 +6,7 @@ import type {
   ActionInvocation,
   ArglessActionId,
   ActionResult,
+  ActionScopeId,
   ContextPatch,
   ContextSnapshot,
   KeybindingMode,
@@ -35,6 +36,8 @@ export interface ActionHandlerRegistration<A extends ActionId = ActionId> {
   ) => ActionResult | void | Promise<ActionResult | void>;
   isEnabled?: (context: ActionHandlerContext) => boolean;
   isVisible?: (context: ActionHandlerContext) => boolean;
+  /** Break ties between handlers registered in the same action scope. */
+  priority?: number;
   /** Opt in only when the action's legacy shortcut has migrated. */
   acceptsKeybindings?: boolean;
 }
@@ -49,6 +52,7 @@ interface RegisteredHandler {
   isEnabled?: (context: ActionHandlerContext) => boolean;
   isVisible?: (context: ActionHandlerContext) => boolean;
   acceptsKeybindings: boolean;
+  priority: number;
   token: number;
   order: number;
 }
@@ -56,7 +60,7 @@ interface RegisteredHandler {
 export interface ActionResolution {
   context: ContextSnapshot;
   /** Inner-most scope first. */
-  focusedScopeIds: readonly string[];
+  focusedScopeIds: readonly ActionScopeId[];
 }
 
 export interface AvailableAction extends ActionDefinition {
@@ -150,6 +154,7 @@ export class ActionRegistry {
       isEnabled: registration.isEnabled,
       isVisible: registration.isVisible,
       acceptsKeybindings: registration.acceptsKeybindings ?? false,
+      priority: registration.priority ?? 0,
       token,
       order: this.nextOrder++,
     };
@@ -189,7 +194,7 @@ export class ActionRegistry {
   }
 
   /** Expand DOM markers through React scope parents, including across portals. */
-  expandFocusedScopeIds(domScopeIds: readonly string[]): string[] {
+  expandFocusedScopeIds(domScopeIds: readonly ActionScopeId[]): ActionScopeId[] {
     const activeElement = typeof document === "undefined" ? null : document.activeElement;
     const rememberedFocusIsCurrent = Boolean(
       this.focusedScopeId &&
@@ -203,13 +208,13 @@ export class ActionRegistry {
         : rememberedFocusIsCurrent && this.focusedScopeId
           ? [this.focusedScopeId]
           : [];
-    const expanded: string[] = [];
+    const expanded: ActionScopeId[] = [];
     const seen = new Set<string>();
     for (const seed of seeds) {
       let current = this.scopes.get(seed);
       while (current && !seen.has(current.id)) {
         seen.add(current.id);
-        expanded.push(current.id);
+        expanded.push(current.id as ActionScopeId);
         current = current.parentId ? this.scopes.get(current.parentId) : undefined;
       }
     }
@@ -222,13 +227,26 @@ export class ActionRegistry {
     return modes;
   }
 
-  getFocusedModes(focusedScopeIds: readonly string[]): ReadonlySet<KeybindingMode> {
+  getFocusedModes(focusedScopeIds: readonly ActionScopeId[]): ReadonlySet<KeybindingMode> {
     const modes = new Set<KeybindingMode>(["global"]);
     for (const id of focusedScopeIds) {
       const scope = this.scopes.get(id);
       if (scope?.active) modes.add(scope.mode);
     }
     return modes;
+  }
+
+  getFocusedModeRanks(
+    focusedScopeIds: readonly ActionScopeId[],
+  ): ReadonlyMap<KeybindingMode, number> {
+    const ranks = new Map<KeybindingMode, number>([["global", 0]]);
+    focusedScopeIds.forEach((id, index) => {
+      const scope = this.scopes.get(id);
+      if (scope?.active && !ranks.has(scope.mode)) {
+        ranks.set(scope.mode, focusedScopeIds.length - index);
+      }
+    });
+    return ranks;
   }
 
   contextForResolution(resolution: ActionResolution): ContextSnapshot {
@@ -277,7 +295,7 @@ export class ActionRegistry {
       if (handler.scopeId === null) {
         rank = 10_000;
       } else {
-        const focusedRank = focusedRanks.get(handler.scopeId);
+        const focusedRank = focusedRanks.get(handler.scopeId as ActionScopeId);
         if (focusedRank !== undefined) rank = focusedRank;
         else if (this.scopes.get(handler.scopeId)?.active) rank = 20_000;
         else continue;
@@ -289,7 +307,10 @@ export class ActionRegistry {
       ranked.push({ handler, context, rank });
     }
     return ranked.sort(
-      (left, right) => right.rank - left.rank || right.handler.order - left.handler.order,
+      (left, right) =>
+        right.rank - left.rank ||
+        right.handler.priority - left.handler.priority ||
+        right.handler.order - left.handler.order,
     );
   }
 
@@ -363,8 +384,8 @@ export type ActionRegistrationFor<A extends ActionId> = Omit<
   ActionHandlerRegistration<A>,
   "action" | "scopeId"
 > & {
-  /** Force app-wide ownership even when rendered under a focused scope. */
-  scope?: "global";
+  /** Force app-wide ownership or target an explicitly registered scope id. */
+  scope?: "global" | ActionScopeId;
 };
 
 export type ActionArgsFor<A extends ActionId> = ActionArgs<A>;

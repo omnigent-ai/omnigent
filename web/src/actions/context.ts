@@ -17,13 +17,14 @@ export const CONTEXT_KEYS = {
   terminalFocus: "terminalFocus",
   monacoFocus: "monacoFocus",
   commandPaletteFocus: "commandPaletteFocus",
+  markdownEditorFocus: "markdownEditorFocus",
   eventMeta: "eventMeta",
   composerStreaming: "composerStreaming",
   composerSuggestionsOpen: "composerSuggestionsOpen",
   composerEnterInserts: "composerEnterInserts",
   composerSubmitWithModEnter: "composerSubmitWithModEnter",
   fileSearchOpen: "fileSearchOpen",
-  shikiSourceView: "shikiSourceView",
+  fileFindAvailable: "fileFindAvailable",
 } as const satisfies Record<ContextKey, ContextKey>;
 
 /** Complete baseline; active scopes and the current event overlay patches. */
@@ -37,13 +38,14 @@ export const EMPTY_ACTION_CONTEXT: ContextSnapshot = {
   terminalFocus: false,
   monacoFocus: false,
   commandPaletteFocus: false,
+  markdownEditorFocus: false,
   eventMeta: false,
   composerStreaming: false,
   composerSuggestionsOpen: false,
   composerEnterInserts: false,
   composerSubmitWithModEnter: false,
   fileSearchOpen: false,
-  shikiSourceView: false,
+  fileFindAvailable: true,
 };
 
 export function when(key: BooleanContextKey): ContextExpression {

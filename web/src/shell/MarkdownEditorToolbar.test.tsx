@@ -9,6 +9,7 @@
 // call on save are exercised.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { ActionScope, ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tiptap/react", () => ({
@@ -49,15 +50,22 @@ function renderToolbar(
 ) {
   const onSave = overrides.onSave ?? vi.fn();
   render(
-    <ToolbarPlugin
-      editor={editorStub}
-      onSave={onSave}
-      isSaving={overrides.isSaving ?? false}
-      isDirty={overrides.isDirty ?? false}
-      saveError={overrides.saveError ?? false}
-      saveDisabled={overrides.saveDisabled ?? false}
-      hasExternalUpdate={overrides.hasExternalUpdate ?? false}
-    />,
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <ActionScope mode="fileViewer">
+        <div>
+          <ToolbarPlugin
+            editor={editorStub}
+            onSave={onSave}
+            isSaving={overrides.isSaving ?? false}
+            isDirty={overrides.isDirty ?? false}
+            saveError={overrides.saveError ?? false}
+            saveDisabled={overrides.saveDisabled ?? false}
+            hasExternalUpdate={overrides.hasExternalUpdate ?? false}
+          />
+        </div>
+      </ActionScope>
+    </ActionsProvider>,
   );
   return { onSave };
 }

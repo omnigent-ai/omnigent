@@ -16,7 +16,7 @@ export function useRegisterAction<A extends ActionId>(
 ): void {
   const actions = useInternalActionRuntime();
   const currentScopeId = useCurrentActionScopeId();
-  const scopeId = registration.scope === "global" ? null : currentScopeId;
+  const scopeId = registration.scope === "global" ? null : (registration.scope ?? currentScopeId);
   const latest = useRef(registration);
   latest.current = registration;
 
@@ -31,7 +31,8 @@ export function useRegisterAction<A extends ActionId>(
         isEnabled: (context) => latest.current.isEnabled?.(context) !== false,
         isVisible: (context) => latest.current.isVisible?.(context) !== false,
         acceptsKeybindings: registration.acceptsKeybindings,
+        priority: registration.priority,
       }),
-    [action, actions.registry, registration.acceptsKeybindings, scopeId],
+    [action, actions.registry, registration.acceptsKeybindings, registration.priority, scopeId],
   );
 }

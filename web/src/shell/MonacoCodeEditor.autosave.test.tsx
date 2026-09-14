@@ -10,6 +10,7 @@
 // assert the PUT fires with the edited content.
 
 import { act, render } from "@testing-library/react";
+import { ActionScope, ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Captured callbacks the component registers on the editor, so tests can drive
@@ -163,9 +164,17 @@ function makeEditor() {
 
 // Render and flush the ready promise so <Editor> mounts and onMount fires.
 async function renderMounted(el: React.ReactElement) {
-  const utils = render(el);
+  const wrap = (child: React.ReactElement) => (
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <ActionScope mode="fileViewer">
+        <div>{child}</div>
+      </ActionScope>
+    </ActionsProvider>
+  );
+  const utils = render(wrap(el));
   await act(async () => {});
-  return utils;
+  return { ...utils, rerender: (next: React.ReactElement) => utils.rerender(wrap(next)) };
 }
 
 // Drive a user edit: update the buffer, then fire the captured onChange.
@@ -199,8 +208,8 @@ afterEach(() => {
 describe("MonacoCodeEditor auto-save wiring (integration)", () => {
   it("debounced save fires after an edit (onChange → schedule → write)", async () => {
     await renderMounted(makeEditor());
-    // onMount must have registered the ⌘S command and blur listener.
-    expect(h.cmdS).not.toBeNull();
+    // Save is centralized; Monaco only keeps the blur listener.
+    expect(h.cmdS).toBeNull();
     expect(h.blur).not.toBeNull();
 
     await fireEdit(EDITED);
@@ -277,7 +286,14 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
 
     // Manual ⌘S while the auto-save PUT is still unresolved.
     await act(async () => {
-      h.cmdS!();
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "s",
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
     });
     // Single-flight coalesced it — still one write. A direct call → 2.
     expect(calls).toBe(1);

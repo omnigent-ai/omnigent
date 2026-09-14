@@ -29,6 +29,7 @@ export type {
   ActionId,
   ActionInvocation,
   ActionResult,
+  ActionScopeId,
   ActionIconName,
   ArglessActionId,
   ActionSource,

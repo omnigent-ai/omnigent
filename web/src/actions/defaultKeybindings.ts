@@ -57,6 +57,11 @@ const sessionNavigationFocusAllowed = and(
   not(when(CONTEXT_KEYS.commandPaletteFocus)),
 );
 const dictationFocusAllowed = and(notMonacoFocus, notTerminalFocus);
+const fileCommandFocusAllowed = or(
+  notInputFocus,
+  when(CONTEXT_KEYS.monacoFocus),
+  when(CONTEXT_KEYS.markdownEditorFocus),
+);
 
 // Native shells own plain primary+digit. Browser tabs reserve that chord, so
 // web adds Alt and matches physical DigitN (Alt rewrites e.key on macOS).
@@ -252,32 +257,46 @@ export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
     allowRepeat: true,
   }),
 
-  rule("file.find", "file.action.find", "primary+f", { mode: "fileViewer" }),
+  rule("file.find", "file.action.find", "primary+f", {
+    mode: "fileViewer",
+    activation: "active",
+    when: and(fileCommandFocusAllowed, when(CONTEXT_KEYS.fileFindAvailable)),
+    phase: "capture",
+    stopPropagation: true,
+  }),
   rule("file.save", "file.action.save", "primary+s", {
     mode: "fileViewer",
+    activation: "active",
+    when: fileCommandFocusAllowed,
     phase: "capture",
+    stopPropagation: true,
   }),
   rule("file.selectAllContent", "file.action.selectAllContent", "primary+a", {
     mode: "fileViewer",
-    when: and(when(CONTEXT_KEYS.shikiSourceView), notInputFocus),
+    activation: "active",
+    when: notInputFocus,
   }),
   rule("file.openPreviousChanged", "file.action.openPreviousChanged", "alt+arrowleft", {
     mode: "fileViewer",
+    activation: "active",
     when: notInputFocus,
     allowRepeat: true,
   }),
   rule("file.openNextChanged", "file.action.openNextChanged", "alt+arrowright", {
     mode: "fileViewer",
+    activation: "active",
     when: notInputFocus,
     allowRepeat: true,
   }),
   rule("file.closeSearch", "file.action.closeSearch", "escape", {
     mode: "fileViewer",
+    activation: "active",
     when: when(CONTEXT_KEYS.fileSearchOpen),
     priority: 100,
   }),
   rule("file.close", "file.action.close", "escape", {
     mode: "fileViewer",
+    activation: "active",
     when: and(not(when(CONTEXT_KEYS.fileSearchOpen)), notInputFocus),
   }),
 

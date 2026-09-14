@@ -5,6 +5,8 @@ export interface KeybindingEnvironment {
   context: ContextSnapshot;
   focusedModes: ReadonlySet<KeybindingMode>;
   activeModes: ReadonlySet<KeybindingMode>;
+  /** Higher values identify deeper focused modes; active modes rank below all. */
+  focusedModeRanks?: ReadonlyMap<KeybindingMode, number>;
   contextsForRule?: (rule: KeybindingRule) => readonly ContextSnapshot[];
 }
 
@@ -63,7 +65,14 @@ export function matchingKeybindingRules(
   environment: KeybindingEnvironment,
 ): KeybindingRule[] {
   return rules
-    .map((rule, index) => ({ rule, index }))
+    .map((rule, index) => ({
+      rule,
+      index,
+      scopeRank:
+        (rule.activation ?? "focused") === "active"
+          ? -1
+          : (environment.focusedModeRanks?.get(rule.mode) ?? (rule.mode === "global" ? 0 : 1)),
+    }))
     .filter(({ rule }) => (rule.phase ?? "bubble") === phase)
     .filter(({ rule }) => rule.allowDefaultPrevented === true || !event.defaultPrevented)
     .filter(({ rule }) => rule.allowRepeat === true || !event.repeat)
@@ -78,7 +87,10 @@ export function matchingKeybindingRules(
       ),
     )
     .sort(
+      // Focus ownership wins before explicit priority so an active background
+      // surface cannot steal a key from the deepest focused mode.
       (left, right) =>
+        right.scopeRank - left.scopeRank ||
         (right.rule.priority ?? 0) - (left.rule.priority ?? 0) ||
         contextSpecificity(right.rule.when) - contextSpecificity(left.rule.when) ||
         right.index - left.index,

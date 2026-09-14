@@ -187,13 +187,13 @@ const definitions = [
     id: "file.action.find",
     title: "Find in file",
     category: "Files",
-    palette: true,
+    palette: false,
   },
   {
     id: "file.action.save",
     title: "Save file",
     category: "Files",
-    palette: true,
+    palette: false,
   },
   {
     id: "file.action.selectAllContent",
@@ -205,13 +205,13 @@ const definitions = [
     id: "file.action.openPreviousChanged",
     title: "Open previous changed file",
     category: "Files",
-    palette: true,
+    palette: false,
   },
   {
     id: "file.action.openNextChanged",
     title: "Open next changed file",
     category: "Files",
-    palette: true,
+    palette: false,
   },
   {
     id: "file.action.closeSearch",
@@ -223,7 +223,7 @@ const definitions = [
     id: "file.action.close",
     title: "Close file",
     category: "Files",
-    palette: true,
+    palette: false,
   },
   {
     id: "terminal.action.sendSequence",
