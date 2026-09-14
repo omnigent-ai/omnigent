@@ -8,6 +8,7 @@ import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
 // beside the component, keeps the route table clean and means no route ships
@@ -79,6 +80,17 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
     );
   }
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
+
+// The shared standalone/embed shell boundary owns application actions once,
+// while auth/setup/approval-only routes deliberately remain outside it.
+function ActionShell() {
+  return (
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <AppShell />
+    </ActionsProvider>
+  );
 }
 
 interface AppProps {
@@ -165,7 +177,7 @@ function App({ basename }: AppProps = {}) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
-        <Route element={<AppShell />}>
+        <Route element={<ActionShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
