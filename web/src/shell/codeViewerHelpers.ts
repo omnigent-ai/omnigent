@@ -51,6 +51,32 @@ export const MONACO_SPLIT_BREAKPOINT = 900;
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
+/**
+ * Character cap above which a markdown buffer loses its rich surfaces (the
+ * TipTap editor and the rendered preview) and renders in Monaco instead. The
+ * markdown block lexer runs backtracking regexes over the whole buffer and
+ * overflows the call stack on multi-MiB content (observed from ~8 MiB), which
+ * killed the viewer outright; rich rendering is unusably slow well before
+ * that. Monaco renders oversized source with virtualized lines, exactly like
+ * every other large file type.
+ */
+export const MAX_RICH_MARKDOWN_CHARS = 1024 * 1024;
+
+/**
+ * True when a markdown buffer is too large for the rich editor/preview and
+ * must render as Monaco-backed source instead.
+ *
+ * @param lang Detected language of the file (from `detectLang`).
+ * @param contentLength Length of the file content in UTF-16 code units.
+ * @returns Whether the rich markdown surfaces must be bypassed.
+ */
+export function isMarkdownTooLargeForRichView(
+  lang: BundledLanguage | "text",
+  contentLength: number,
+): boolean {
+  return lang === "markdown" && contentLength > MAX_RICH_MARKDOWN_CHARS;
+}
+
 // ---------------------------------------------------------------------------
 // File-type helpers
 // ---------------------------------------------------------------------------

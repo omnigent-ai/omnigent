@@ -160,12 +160,14 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useComments } from "@/hooks/useComments";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
+import { useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { MAX_RICH_MARKDOWN_CHARS } from "./codeViewerHelpers";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
@@ -1392,6 +1394,58 @@ describe("FileViewer view-settings menu", () => {
 
 // ── Collapsed toolbar overflow "⋯" menu ─────────────────────────────────────
 //
+// ── Oversized markdown fallback ─────────────────────────────────────────────
+//
+// The markdown block lexer overflows the call stack on multi-MiB buffers, so a
+// markdown file above the rich-view cap must resolve to the plain source
+// surface (Monaco) and drop the Preview/Edit/Source picker entirely — the rich
+// modes would crash the viewer.
+
+describe("FileViewer oversized markdown fallback", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(useFileContent).mockReturnValue({
+      data: {
+        content: "y".repeat(MAX_RICH_MARKDOWN_CHARS + 1),
+        encoding: "utf-8",
+        truncated: true,
+      },
+    } as ReturnType<typeof useFileContent>);
+  });
+
+  afterEach(() => {
+    // Restore the module default so later suites see the empty file again
+    // (clearAllMocks only clears call history, not mockReturnValue).
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: "", path: "file1.py" },
+    } as unknown as ReturnType<typeof useFileContent>);
+  });
+
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+
+  it("resolves oversized markdown to the source surface, not the rich editor", () => {
+    renderViewer({ open: true, path: "big.md" });
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("resolves to source even when the sticky preference is 'preview'", () => {
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    renderViewer({ open: true, path: "big.md" });
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("hides the markdown view-mode picker (the rich modes are unreachable)", () => {
+    renderViewer({ open: true, path: "big.md" });
+    expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
+  });
+});
+
 // When the header is too narrow for the inline action buttons, they all fold
 // into one "⋯" ("More actions") overflow menu. The settings menu's items
 // (Find, Download, and the diff-only wrap/whitespace toggles) are already
