@@ -25,6 +25,7 @@ from omnigent.inner.terminal import (
     _is_utf8_locale_value,
     create_terminal_instance,
 )
+from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
@@ -1841,7 +1842,11 @@ def _write_instance_dir(root: Path, name: str, owner_pid: int | None) -> Path:
     instance_dir = root / name
     instance_dir.mkdir()
     if owner_pid is not None:
-        (instance_dir / "owner.pid").write_text(str(owner_pid), encoding="utf-8")
+        owner_claim.write_owner_claim(instance_dir)
+        marker = instance_dir / "owner.pid"
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        lines[0] = str(owner_pid)
+        marker.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return instance_dir
 
 
