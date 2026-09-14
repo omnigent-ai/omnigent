@@ -7065,12 +7065,14 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(event_type: str) -> None:
+def _note_forward_failure(event_type: str, result: _PostResult, session_id: str) -> None:
     """
     Record a permanent forward failure; escalate once when sync degrades.
 
     :param event_type: Session event type that failed to post, e.g.
         ``"external_conversation_item"``.
+    :param result: Classified outcome of the latest failed post.
+    :param session_id: Session whose event failed to post.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -7084,6 +7086,17 @@ def _note_forward_failure(event_type: str) -> None:
             "(latest type=%s)",
             _forward_health.consecutive_failures,
             event_type,
+            extra={
+                "session_id": session_id,
+                "event_name": "codex_forward_sync_degraded",
+                "attributes": {
+                    "http_status": result.response.status_code
+                    if result.response is not None
+                    else None,
+                    "transport_error": result.transport_error,
+                    "delivered_ambiguous": result.delivered_ambiguous,
+                },
+            },
         )
         _forward_health.degraded_logged = True
 
@@ -7218,7 +7231,7 @@ async def _post_session_event(
     if response is not None and response.status_code < 400:
         _note_forward_success()
     else:
-        _note_forward_failure(event_type)
+        _note_forward_failure(event_type, result, session_id)
         dl_dir = _dead_letter_dir.get()
         if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
             http_status = response.status_code if response is not None else None
