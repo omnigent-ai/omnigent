@@ -11,6 +11,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.spec.tar_utils import ExtractionError
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 # Minimal valid config.yaml for a spec_version=1 agent
@@ -163,6 +164,43 @@ def test_load_invalid_spec_raises_omnigent_error(
 
     with pytest.raises(OmnigentError, match="invalid agent spec"):
         agent_cache.load("bad-agent", loc)
+
+
+@pytest.mark.parametrize(
+    ("bundle", "error"),
+    [
+        pytest.param(b"not a tarball", ExtractionError, id="invalid-archive"),
+        pytest.param(
+            _make_bundle_bytes({"partial.txt": "incomplete bundle"}),
+            FileNotFoundError,
+            id="missing-config",
+        ),
+        pytest.param(
+            _make_bundle_bytes(
+                {"config.yaml": "spec_version: 99\nname: invalid\n", "partial.txt": "stale"}
+            ),
+            OmnigentError,
+            id="invalid-spec",
+        ),
+    ],
+)
+def test_load_retries_after_failed_bundle_is_repaired(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    bundle: bytes,
+    error: type[Exception],
+) -> None:
+    """A failed load must not leave a disk entry that poisons later attempts."""
+    location = "repairable-agent/v1"
+    artifact_store.put(location, bundle)
+    with pytest.raises(error):
+        agent_cache.load("repairable-agent", location)
+
+    _store_bundle(artifact_store, location)
+    loaded = agent_cache.load("repairable-agent", location)
+
+    assert loaded.spec.name == "test-agent"
+    assert sorted(path.name for path in loaded.workdir.iterdir()) == ["config.yaml"]
 
 
 def test_evict_clears_both_tiers(
