@@ -2000,13 +2000,56 @@ describe("Composer asynchronous skills", () => {
       conversationId: "conv_loading_skills",
       skills: [],
       skillsStatus: "loading",
+      terminalPending: false,
     });
   });
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
-    useChatStore.setState({ skills: [], skillsStatus: null });
+    useChatStore.setState({ skills: [], skillsStatus: null, terminalPending: false });
     vi.useRealTimers();
+  });
+
+  it.each([
+    { runnerStarting: true, terminalPending: false },
+    { runnerStarting: false, terminalPending: true },
+  ])("waits for skills while the session starts: %j", ({ runnerStarting, terminalPending }) => {
+    useChatStore.setState({ skillsStatus: "unavailable", terminalPending });
+    const props = composerProps({ runnerStarting });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    expect(screen.queryByText("Skills unavailable while disconnected.")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    act(() =>
+      useChatStore.setState({
+        skills: [{ name: "code-review", description: "Review code" }],
+        skillsStatus: "ready",
+      }),
+    );
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/code-review ");
+  });
+
+  it("stops showing startup loading when the runner stays disconnected", () => {
+    useChatStore.setState({ skillsStatus: "unavailable" });
+    const props = composerProps({ runnerStarting: true });
+    const { rerender } = render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    rerender(<Composer {...props} runnerStarting={false} />);
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    expect(screen.getByText("Skills unavailable while disconnected.")).toBeVisible();
+  });
+
+  it("shows discovery errors even when the session is still starting", () => {
+    useChatStore.setState({ skillsStatus: "error" });
+    render(<Composer {...composerProps({ runnerStarting: true })} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    expect(screen.getByText("Couldn’t load skills.")).toBeVisible();
   });
 
   it("dismisses a loading-only menu before interrupting a running session", () => {

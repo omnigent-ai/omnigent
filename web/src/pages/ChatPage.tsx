@@ -1798,6 +1798,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
             runnerOnline={runnerOnline}
+            runnerStarting={
+              sandboxStatus?.stage !== "failed" &&
+              (sandboxLaunching || liveness.kind === "starting")
+            }
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
@@ -1918,6 +1922,8 @@ interface ComposerProps {
   showGoalControl?: boolean;
   /** Whether the active session's runner tunnel is connected. */
   runnerOnline?: boolean;
+  /** The session is launching or waking its runner or managed sandbox. */
+  runnerStarting?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
@@ -2255,6 +2261,7 @@ function ComposerImpl(
     showCodexApprovalMode = false,
     showGoalControl = false,
     runnerOnline,
+    runnerStarting = false,
     showClaudeGoalControl = false,
     showPollyCodexGoalControl = false,
     isTerminalFirst = false,
@@ -2555,7 +2562,13 @@ function ComposerImpl(
   // on bind and populate the suggestions menu as ``/skill-name``
   // entries alongside the built-ins.
   const skills = useChatStore((s) => s.skills);
-  const skillsStatus = useChatStore((s) => s.skillsStatus);
+  const reportedSkillsStatus = useChatStore((s) => s.skillsStatus);
+  const terminalPending = useChatStore((s) => s.terminalPending);
+  // Discovery cannot start until the runner connects; its launch is still loading.
+  const skillsStatus =
+    reportedSkillsStatus === "unavailable" && (runnerStarting || terminalPending)
+      ? "loading"
+      : reportedSkillsStatus;
   const refreshSkills = useChatStore((s) => s.refreshSkills);
   // ``/model`` writes ``conv.model_override`` (the same column the REPL's
   // ``/model`` and native pickers write). In-process harnesses re-resolve
