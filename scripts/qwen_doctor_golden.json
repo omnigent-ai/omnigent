@@ -1,0 +1,10 @@
+{
+  "qwen_version": "0.23.0-dev.code-mode-only-10377.20260907.9739b6ee09",
+  "captured_at_checks": {
+    "A. qwen on PATH": true,
+    "B. raw ACP handshake": true,
+    "C. isolated gateway routing (QwenExecutor)": true,
+    "D. ambient-settings canary (informational)": false
+  },
+  "note": "Reference snapshot from a known-good qwen_doctor.py run. Regenerate with --capture after confirming a fresh run is genuinely healthy."
+}

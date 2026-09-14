@@ -28,6 +28,8 @@ import json
 import logging
 import os
 import secrets
+import shutil
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
@@ -226,7 +228,12 @@ class QwenExecutor(Executor):
             of qwen's ambient CLI auth.
         :param gateway_auth_command: Shell command that prints a bearer token to
             stdout (from ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND``); run once at
-            process start to snapshot ``OPENAI_API_KEY``.
+            process start to snapshot ``OPENAI_API_KEY``. When set, the executor
+            also spawns qwen with an isolated, private ``$HOME`` (see
+            :meth:`_isolated_home_dir`) so a pre-existing ``~/.qwen/settings.json``
+            on the host can't silently override these vars and reroute the
+            session to a different model/provider — qwen has no config-dir
+            flag, so HOME isolation is the only lever.
         """
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
@@ -247,6 +254,10 @@ class QwenExecutor(Executor):
         self._qwen_path = qwen_path or "qwen"
         self._gateway_base_url = gateway_base_url
         self._gateway_auth_command = gateway_auth_command
+        # Isolated $HOME for the qwen subprocess, created lazily the first time
+        # a gateway is configured (see :meth:`_isolated_home_dir`). ``None``
+        # when no gateway is wired — the CLI's ambient auth path is untouched.
+        self._isolated_home: Path | None = None
 
         # Asyncio subprocess (created on first run_turn call).
         self._proc: asyncio.subprocess.Process | None = None
@@ -395,11 +406,14 @@ class QwenExecutor(Executor):
             if not sandbox.active:
                 return self._qwen_path
             # qwen is an npm CLI: it must read its own install + node_modules
-            # and write its config dir (~/.qwen) and /tmp, or it can't start
-            # inside the jail.
+            # and write its config dir and /tmp, or it can't start inside the
+            # jail. The config dir lives under whichever $HOME the subprocess
+            # actually gets — the isolated one when a gateway is wired (see
+            # _isolated_home_dir), the real one otherwise.
             qwen_dir = Path(self._qwen_path).resolve().parent.parent
+            qwen_home = self._isolated_home if self._isolated_home is not None else Path.home()
             sandbox = with_additional_read_roots(sandbox, [qwen_dir])
-            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen", Path("/tmp")])
+            sandbox = with_additional_write_roots(sandbox, [qwen_home / ".qwen", Path("/tmp")])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(self._qwen_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -422,8 +436,31 @@ class QwenExecutor(Executor):
             allow_prefixes=("QWEN_", "OPENAI_", "DASHSCOPE_"),
             extra_allowed=declared_passthrough(self._os_env),
         )
-        env.update(await self._resolve_gateway_env())
+        gateway_env = await self._resolve_gateway_env()
+        env.update(gateway_env)
+        if gateway_env:
+            # A gateway is wired: qwen's own ~/.qwen/settings.json would
+            # otherwise take precedence over the OPENAI_* vars above and
+            # silently reroute the session (see docs/QWEN_FOLLOWUPS.md §
+            # Provider routing pending work). Give the subprocess a $HOME
+            # with no settings.json so it falls through to env-var auth.
+            env["HOME"] = str(self._isolated_home_dir())
         return env
+
+    def _isolated_home_dir(self) -> Path:
+        """Return this executor's isolated $HOME, creating it on first use.
+
+        Created once and reused across subprocess restarts within the same
+        executor instance (a ``/model`` switch or a ``Session not found``
+        reset calls :meth:`_start_process` again) so qwen doesn't lose its
+        freshly-isolated config between restarts. Removed in :meth:`close`.
+
+        :returns: Path to a private temp directory holding no
+            ``.qwen/settings.json``.
+        """
+        if self._isolated_home is None:
+            self._isolated_home = Path(tempfile.mkdtemp(prefix="omnigent-qwen-home-"))
+        return self._isolated_home
 
     async def _resolve_gateway_env(self) -> dict[str, str]:
         """Build the OpenAI-compatible env qwen reads from the gateway config.
@@ -1593,3 +1630,8 @@ class QwenExecutor(Executor):
                     _proc.kill_tree(self._proc)
             finally:
                 self._proc = None
+
+        if self._isolated_home is not None:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(self._isolated_home, ignore_errors=True)
+            self._isolated_home = None

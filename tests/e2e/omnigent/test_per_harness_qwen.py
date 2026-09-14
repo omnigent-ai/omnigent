@@ -1,11 +1,9 @@
 """Phase 0 characterization test — qwen harness, one-shot prompt.
 
 Runs ``omnigent run hello_world.yaml --harness qwen --model
-<model> -p "..."`` as a real subprocess and snapshots structural
-observations (exit code, stderr cleanliness, assistant text
-length). Captured against current Omnigent; re-run unchanged
-in later phases to prove the integration preserves behavior for
-the qwen harness.
+<mock-model> -p "..."`` as a real subprocess against the mock LLM
+server and snapshots structural observations (exit code, stderr
+cleanliness, assistant text length).
 
 **What breaks if this fails:**
 - Omnigent' ``QwenExecutor`` regresses (the ``qwen --acp``
@@ -17,23 +15,31 @@ the qwen harness.
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0
 per-harness suite.
+
+**History:** this test previously requested an ``omnigent_credentials_env``
+fixture that PR #802 deleted (migrating every *other* per-harness e2e test —
+antigravity, claude-sdk, codex, openai-agents-sdk, pi — to
+``mock_credentials_env``). This one was missed, so it hard-errored at fixture
+setup instead of running or skipping cleanly. Fixed by adopting the same
+mock-LLM-server pattern as ``test_per_harness_codex.py`` — the qwen ACP
+executor already honors ``OPENAI_BASE_URL`` for gateway routing (see
+``docs/QWEN_FOLLOWUPS.md`` § Provider / gateway routing), so no new plumbing
+was needed, only wiring this test up to the existing mechanism.
 """
 
 from __future__ import annotations
 
 import subprocess
+import uuid
 from pathlib import Path
+from shutil import which
 from typing import Any
 
 import pytest
 
-from tests._model_pools import resolve_model
-from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.omnigent._snapshot import compare_snapshot
+from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
-# Model + harness are hardcoded because the test name advertises
-# "qwen harness".
-_MODEL = resolve_model("qwen/qwen-plus", key=__name__)
 _HARNESS = "qwen"
 _PROMPT = "say hi in 5 words"
 
@@ -46,34 +52,62 @@ _MIN_ASSISTANT_CHARS = 4
 # 120s should be enough for init + first turn.
 _RUN_TIMEOUT_SEC = 120
 
-_pytest_qwen_unavailable = cli_unavailable_reason("qwen")
-pytestmark = pytest.mark.skipif(
-    _pytest_qwen_unavailable is not None,
-    reason=(
-        "qwen harness e2e requires a runnable 'qwen' CLI; "
-        f"{_pytest_qwen_unavailable}. Install/fix Qwen to run this test."
-    ),
-)
+
+@pytest.fixture
+def qwen_available() -> bool:
+    """
+    Availability probe for the qwen harness prerequisites.
+
+    ``QwenExecutor`` shells out to the ``qwen`` CLI binary. Without
+    it the executor raises immediately on session start. CI
+    environments commonly lack the binary.
+
+    :returns: True when ``qwen`` is on PATH.
+    """
+    return which("qwen") is not None
 
 
 def test_per_harness_qwen_one_shot(
     omnigent_repo_root: Path,
     omnigent_python: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
+    qwen_available: bool,
 ) -> None:
     """
     ``omnigent run hello_world.yaml --harness qwen -p <prompt>``
     exits 0 and emits a non-trivial assistant reply.
 
+    Uses the mock LLM server (via ``OPENAI_BASE_URL`` in
+    ``mock_credentials_env``) so the test runs without real API
+    credentials or a Databricks workspace. The qwen ACP executor
+    honors ``OPENAI_BASE_URL`` for its subprocess model routing.
+
     :param omnigent_python: Interpreter with omnigent
         installed and importable.
     :param omnigent_repo_root: Cwd for the subprocess so the
         YAML spec and example tool modules resolve on sys.path.
-    :param omnigent_credentials_env: Env vars with
-        ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` /
-        ``DATABRICKS_CONFIG_PROFILE`` populated from
-        ``--llm-api-key``.
+    :param mock_credentials_env: Env vars pointing at the mock
+        LLM server.
+    :param mock_llm_server_url: Base URL of the mock server for
+        configuring canned responses.
+    :param qwen_available: True when the ``qwen`` CLI is present.
+        On False the test skips — CI hosts commonly lack it.
     """
+    if not qwen_available:
+        pytest.skip(
+            "qwen harness prerequisite missing: the 'qwen' CLI "
+            "binary must be installed on PATH. Skipping — binary absent."
+        )
+
+    model = f"mock-harness-qwen-{uuid.uuid4().hex[:8]}"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Hello there, how are you today?"}],
+        key=model,
+    )
+
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
     result = subprocess.run(
@@ -84,7 +118,7 @@ def test_per_harness_qwen_one_shot(
             "run",
             str(yaml_path),
             "--model",
-            _MODEL,
+            model,
             "--harness",
             _HARNESS,
             "-p",
@@ -92,7 +126,7 @@ def test_per_harness_qwen_one_shot(
             "--no-log",
             "--no-session",
         ],
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,

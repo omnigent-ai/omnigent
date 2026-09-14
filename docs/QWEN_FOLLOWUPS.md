@@ -3,6 +3,44 @@
 Tracks pending work and known limitations for the Qwen Code harness
 (`harness: qwen`, driving `qwen --acp`).
 
+## Quick health check
+
+`scripts/qwen_doctor.py` is a standalone, isolated smoke test — no pytest, no
+dependency on (or mutation of) `~/.omnigent/config.yaml` or `~/.qwen/`. Run it
+any time something about qwen feels off, especially after a `qwen` CLI
+upgrade:
+
+```bash
+uv run python scripts/qwen_doctor.py            # health check
+uv run python scripts/qwen_doctor.py --capture  # also refresh the golden reference
+```
+
+It checks, in order: the `qwen` binary + version (vs. the last-known-good
+version in `scripts/qwen_doctor_golden.json`), the raw ACP protocol shape
+(bypassing Omnigent's own code, to isolate "qwen changed" from "Omnigent
+regressed"), the actual `QwenExecutor` gateway-routing path against a local
+mock LLM server, and — informational only, never fails the run — whether
+*this machine's* ambient `~/.qwen/settings.json` would hijack an *unisolated*
+gateway request right now (see the settings-precedence item below for why
+that matters). Exit 0 means healthy; each failing check prints a `heal:`
+hint pointing at the relevant section of this doc.
+
+## Known limitation: slash commands are invisible to the web UI (qwen-native)
+
+`qwen-native`'s forwarder (`qwen_native_forwarder.py`) mirrors the transcript
+by tailing qwen's `--json-file` event stream. qwen handles its **local slash
+commands** (`/model`, presumably others) entirely client-side inside the TUI
+and never emits a `--json-file` event for them — verified live: submitting
+`{"type":"submit","text":"/model <name>"}` via the same `--input-file`
+mechanism the web UI uses does switch the model (confirmed against a
+subsequent real turn's `assistant.message.model`), but produces **zero**
+output on `--json-file`. So a user typing `/model <name>` in the web chat
+sees their message with no confirmation bubble below it, even though the
+switch silently took effect. Not fixable from Omnigent's side without qwen
+itself emitting an event for local commands (out of scope here); worth a
+small UI affordance (e.g. an optimistic "command sent" indicator) if this
+trips people up in practice.
+
 ## What works today
 
 - `omnigent run --harness qwen` / `executor.harness: qwen` (alias `qwen-code`).
@@ -243,18 +281,31 @@ comments; this is the *what*, not the *how*.)
     forwarded as `external_session_usage` (see the "Composer status line" item) —
     the recording's `newTokenCount` could feed that.
 
-- [ ] **Provider routing: settings.json precedence + token refresh.** The
-  base injection now works (see What works today), but two gaps remain before
-  it's robust on a developer machine:
-  - **Ambient settings win.** qwen prefers a user-level `~/.qwen/settings.json`
-    (`security.auth.selectedType` + `modelProviders`) over the injected
-    `OPENAI_*` env vars, so on a host where someone ran `qwen /auth`, the spec's
-    gateway is silently ignored. qwen exposes no config-dir flag, so making the
-    gateway authoritative needs HOME / config-dir isolation for the subprocess.
-  - **No token refresh.** The bearer token is snapshotted once at session start;
-    qwen has no refresh hook, so a short-lived rotating token (Databricks
-    gateway) can expire over a long session. Static keys / stable gateways are
-    unaffected.
+- [x] **Provider routing: settings.json precedence.** Fixed — when a gateway
+  is wired (`gateway_base_url` + `gateway_auth_command` set), `QwenExecutor`
+  now spawns the `qwen --acp` subprocess with an isolated, private `$HOME`
+  (`_isolated_home_dir`, a fresh temp dir with no `.qwen/settings.json`),
+  created once and reused across in-process restarts (`/model` switch,
+  `Session not found` reset), removed in `close()`. Verified live: without
+  isolation, a host with an ambient `~/.qwen/settings.json` (`modelProviders`
+  pointing at a Databricks AI Gateway model catalog) silently discarded the
+  injected `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` and routed
+  `session/prompt` to a real model instead of the intended gateway/mock
+  endpoint — not just "ignored" as originally described here, but an active
+  session hijack (observed: `session/new` returned a live Databricks model
+  catalog, and a turn produced an ~90KB unrelated response instead of the
+  expected text). With isolation, the same request correctly reaches the
+  configured endpoint. The sandboxed-launch write-root grant
+  (`_sandbox_launch_path`) was updated to match — it now grants qwen write
+  access to the isolated home's `.qwen` dir, not the real one, when isolation
+  is active (a sandboxed run would otherwise get a permission error writing
+  its own config/cache dir under the isolated `$HOME`). No-op when no gateway
+  is configured — the CLI's ambient auth path is untouched. Regression check:
+  `scripts/qwen_doctor.py` (see Quick health check at the top of this doc).
+  - **No token refresh** remains open. The bearer token is snapshotted once at
+    session start; qwen has no refresh hook, so a short-lived rotating token
+    (Databricks gateway) can expire over a long session. Static keys / stable
+    gateways are unaffected.
 - [ ] **Databricks path.** Verify the `databricks-*` profile route end-to-end
   (the env plumbing exists; only the OpenAI-compatible gateway has been tested).
   The profile route derives the base URL + auth from **ucode state**, so it
