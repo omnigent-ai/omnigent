@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceContextResultFrame,
+    HostWorkspaceContextStreamFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -750,6 +752,45 @@ async def _receive_loop(
             detect_future = conn.pending_credential_detects.pop(frame.request_id, None)
             if detect_future is not None and not detect_future.done():
                 detect_future.set_result({"credentials": frame.credentials})
+            continue
+
+        if isinstance(frame, HostWorkspaceContextResultFrame):
+            context_future = conn.pending_workspace_contexts.pop(frame.request_id, None)
+            if context_future is not None and not context_future.done():
+                context_future.set_result(
+                    {
+                        "status": frame.status,
+                        "payload": frame.payload,
+                        "error_status": frame.error_status,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostWorkspaceContextStreamFrame):
+            stream = conn.workspace_context_streams.get(frame.channel_id)
+            if stream is not None:
+                try:
+                    stream.put_nowait(frame)
+                except asyncio.QueueFull:
+                    # A stalled viewer must not grow the host tunnel's memory.
+                    conn.workspace_context_streams.pop(frame.channel_id, None)
+                    while not stream.empty():
+                        stream.get_nowait()
+                    stream.put_nowait(
+                        HostWorkspaceContextStreamFrame(
+                            channel_id=frame.channel_id,
+                            close_code=1013,
+                        )
+                    )
+                    host_registry.send_text(
+                        conn,
+                        encode_host_frame(
+                            HostWorkspaceContextStreamFrame(
+                                channel_id=frame.channel_id, close_code=1013
+                            )
+                        ),
+                    )
             continue
 
         if isinstance(frame, HostFsResultFrame):

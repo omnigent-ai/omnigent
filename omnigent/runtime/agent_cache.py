@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
+import weakref
+from _thread import LockType
 from pathlib import Path
 
 from omnigent.entities import LoadedAgent
@@ -23,6 +26,7 @@ class AgentCache:
 
     On cache miss the bundle is downloaded from the ArtifactStore,
     extracted to disk, parsed, validated, and stored in both tiers.
+    Operations on the same agent are serialized within this cache instance.
 
     This is an **execution** load path, so it loads with
     ``prune_invalid_sub_agents=True``: a sub-agent that fails
@@ -47,6 +51,19 @@ class AgentCache:
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
+        self._locks_guard = threading.Lock()
+        self._agent_locks: weakref.WeakValueDictionary[str, LockType] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def _lock_for_agent(self, agent_id: str) -> LockType:
+        """Share one lock among active operations on an agent."""
+        with self._locks_guard:
+            lock = self._agent_locks.get(agent_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._agent_locks[agent_id] = lock
+            return lock
 
     def _cache_path(self, agent_id: str, *, suffix: str = "") -> Path:
         """Return a direct child of the cache root for an agent id."""
@@ -100,24 +117,24 @@ class AgentCache:
             on-disk working directory.
         """
         workdir = self._cache_path(agent_id)
+        with self._lock_for_agent(agent_id):
+            # Tier 1: in-memory spec. The cached spec was parsed with the
+            # *expand_env* value of whichever caller populated it first.
+            # That is consistent across callers because *expand_env* is
+            # derived from the agent's immutable ``session_id`` provenance,
+            # which never changes for a given ``agent_id``.
+            if agent_id in self._specs:
+                return LoadedAgent(spec=self._specs[agent_id], workdir=workdir)
 
-        # Tier 1: in-memory spec. The cached spec was parsed with the
-        # *expand_env* value of whichever caller populated it first.
-        # That is consistent across callers because *expand_env* is
-        # derived from the agent's immutable ``session_id`` provenance,
-        # which never changes for a given ``agent_id``.
-        if agent_id in self._specs:
-            return LoadedAgent(spec=self._specs[agent_id], workdir=workdir)
+            # Tier 2: disk cache (directory already extracted)
+            if workdir.is_dir():
+                spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
+                self._specs[agent_id] = spec
+                return LoadedAgent(spec=spec, workdir=workdir)
 
-        # Tier 2: disk cache (directory already extracted)
-        if workdir.is_dir():
-            spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
-            self._specs[agent_id] = spec
-            return LoadedAgent(spec=spec, workdir=workdir)
-
-        # Cache miss — download bundle, write to temp file, extract
-        bundle_bytes = self._artifact_store.get(bundle_location)
-        return self._extract_and_cache(agent_id, bundle_bytes, workdir, expand_env=expand_env)
+            # Cache miss — download bundle, write to temp file, extract
+            bundle_bytes = self._artifact_store.get(bundle_location)
+            return self._extract_and_cache(agent_id, bundle_bytes, workdir, expand_env=expand_env)
 
     def replace(
         self,
@@ -130,10 +147,10 @@ class AgentCache:
         """
         Warm-swap an agent's cached spec and disk directory.
 
-        Extracts the new bundle to a temp directory, swaps the
-        in-memory spec entry, renames into the cache location, and
-        cleans up the old directory. Concurrent readers see either
-        the old spec or the new spec, never an empty cache.
+        Extracts the new bundle to a staging directory, removes the
+        old directory, renames the staging directory into place, then
+        publishes the new spec. Concurrent readers see either the old
+        spec or the new spec, never an empty cache.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
@@ -152,31 +169,29 @@ class AgentCache:
         """
         workdir = self._cache_path(agent_id)
         staging_dir = self._cache_path(agent_id, suffix="_staging")
+        with self._lock_for_agent(agent_id):
+            # Extract new bundle to staging directory
+            tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
+            os.close(tmp_fd)
+            tmp_path = Path(tmp_name)
+            try:
+                tmp_path.write_bytes(bundle_bytes)
+                spec = load_spec(
+                    tmp_path,
+                    dest=staging_dir,
+                    expand_env=expand_env,
+                    prune_invalid_sub_agents=True,
+                )
+            finally:
+                tmp_path.unlink()
 
-        # Extract new bundle to staging directory
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
-        try:
-            tmp_path.write_bytes(bundle_bytes)
-            spec = load_spec(
-                tmp_path,
-                dest=staging_dir,
-                expand_env=expand_env,
-                prune_invalid_sub_agents=True,
-            )
-        finally:
-            tmp_path.unlink()
+            # Replace disk directory: remove old, rename staging into place
+            if workdir.is_dir():
+                shutil.rmtree(workdir)
+            staging_dir.rename(workdir)
+            self._specs[agent_id] = spec
 
-        # Swap in-memory entry (atomic dict assignment)
-        self._specs[agent_id] = spec
-
-        # Replace disk directory: remove old, rename staging into place
-        if workdir.is_dir():
-            shutil.rmtree(workdir)
-        staging_dir.rename(workdir)
-
-        return LoadedAgent(spec=spec, workdir=workdir)
+            return LoadedAgent(spec=spec, workdir=workdir)
 
     def evict(self, agent_id: str) -> None:
         """
@@ -187,9 +202,10 @@ class AgentCache:
             e.g. ``"ag_abc123"``.
         """
         workdir = self._cache_path(agent_id)
-        self._specs.pop(agent_id, None)
-        if workdir.is_dir():
-            shutil.rmtree(workdir)
+        with self._lock_for_agent(agent_id):
+            self._specs.pop(agent_id, None)
+            if workdir.is_dir():
+                shutil.rmtree(workdir)
 
     def _extract_and_cache(
         self,
@@ -216,12 +232,17 @@ class AgentCache:
         tmp_path = Path(tmp_name)
         try:
             tmp_path.write_bytes(bundle_bytes)
-            spec = load_spec(
-                tmp_path,
-                dest=workdir,
-                expand_env=expand_env,
-                prune_invalid_sub_agents=True,
-            )
+            try:
+                spec = load_spec(
+                    tmp_path,
+                    dest=workdir,
+                    expand_env=expand_env,
+                    prune_invalid_sub_agents=True,
+                )
+            except Exception:
+                if workdir.is_dir() and not workdir.is_symlink():
+                    shutil.rmtree(workdir)
+                raise
         finally:
             tmp_path.unlink()
 

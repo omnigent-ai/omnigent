@@ -29,6 +29,7 @@ import { TruncatedBanner } from "./TruncatedBanner";
 
 interface HtmlCommentViewerProps {
   conversationId: string;
+  readOnly?: boolean;
   /** Raw HTML source — rendered in the iframe and searched for comment anchors. */
   content: string;
   truncated: boolean;
@@ -74,13 +75,14 @@ function activePayload(content: string, sel: ActiveSelection | null) {
 
 export function HtmlCommentViewer({
   conversationId,
+  readOnly = false,
   content,
   truncated,
   comments,
   activeSelection,
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canEdit = useCanEdit(conversationId) && !readOnly;
 
   // A fresh nonce + srcDoc per content load. Changing srcDoc reloads the iframe
   // document, which re-runs the bridge and (via the new nonce) re-establishes

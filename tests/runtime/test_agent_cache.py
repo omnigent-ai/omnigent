@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import io
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -108,6 +111,83 @@ def test_load_memory_cache_hit(
     # Same spec object (identity check — memory cache returns same ref)
     assert first.spec is second.spec
     assert first.workdir == second.workdir
+
+
+def test_concurrent_cold_load_waits_for_complete_extraction(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second load must not parse a partially extracted directory."""
+    agent_id = "concurrent-agent"
+    location = f"{agent_id}/bundle"
+    _store_bundle(artifact_store, location)
+    other_location = "other-agent/bundle"
+    _store_bundle(artifact_store, other_location)
+    extraction_started = threading.Event()
+    allow_extraction = threading.Event()
+    second_at_cache_path = threading.Event()
+    second_thread = threading.local()
+    original_extract = agent_cache._extract_and_cache
+    original_cache_path = agent_cache._cache_path
+
+    def paused_extract(*args: Any, **kwargs: Any) -> Any:
+        if args[0] != agent_id:
+            return original_extract(*args, **kwargs)
+        workdir = cache_dir / agent_id
+        workdir.mkdir(parents=True)
+        extraction_started.set()
+        assert allow_extraction.wait(timeout=5)
+        workdir.rmdir()
+        return original_extract(*args, **kwargs)
+
+    def observed_cache_path(agent_id: str, *, suffix: str = "") -> Path:
+        path = original_cache_path(agent_id, suffix=suffix)
+        if getattr(second_thread, "active", False):
+            second_at_cache_path.set()
+        return path
+
+    def second_load() -> Any:
+        second_thread.active = True
+        return agent_cache.load(agent_id, location)
+
+    monkeypatch.setattr(agent_cache, "_extract_and_cache", paused_extract)
+    monkeypatch.setattr(agent_cache, "_cache_path", observed_cache_path)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(agent_cache.load, agent_id, location)
+        try:
+            assert extraction_started.wait(timeout=5)
+            second = pool.submit(second_load)
+            assert second_at_cache_path.wait(timeout=5)
+            other = pool.submit(agent_cache.load, "other-agent", other_location)
+            assert other.result(timeout=5).spec.name == "test-agent"
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            allow_extraction.set()
+
+        first_loaded = first.result()
+        second_loaded = second.result()
+
+    assert first_loaded.spec is second_loaded.spec
+    assert (cache_dir / agent_id / "config.yaml").exists()
+
+
+def test_failed_cold_load_removes_partial_directory_for_retry(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    location = "retry-agent/bundle"
+    _store_bundle(artifact_store, location, {"config.yaml": ""})
+
+    with pytest.raises(OmnigentError, match=r"config\.yaml must be a YAML mapping"):
+        agent_cache.load("retry-agent", location)
+
+    assert not (cache_dir / "retry-agent").exists()
+    _store_bundle(artifact_store, location)
+    assert agent_cache.load("retry-agent", location).spec.name == "test-agent"
 
 
 def test_load_disk_cache_hit(

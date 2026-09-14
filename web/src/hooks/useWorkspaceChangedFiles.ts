@@ -21,6 +21,13 @@ import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
+import {
+  normalizeWorkspaceResourceTarget,
+  workspaceResourceUrl,
+  workspaceTargetKey,
+  workspaceTargetSessionId,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
 import { useChatStore } from "@/store/chatStore";
 
 /** True when `id` is the focused conversation and its agent loop is live. */
@@ -44,7 +51,10 @@ export function useSessionActive(conversationId: string | undefined): boolean {
  * to let it run — matching the tri-state semantics the query `enabled`
  * gates expect.
  */
-export function useWorkspaceServeable(conversationId: string | undefined): boolean | undefined {
+export function useWorkspaceServeable(
+  target: WorkspaceResourceTarget | undefined,
+): boolean | undefined {
+  const conversationId = workspaceTargetSessionId(target);
   const runnerOnline = useSessionRunnerOnline(conversationId);
   const hostOnline = useSessionHostOnline(conversationId);
   if (runnerOnline !== false) return runnerOnline; // online or unknown → serve
@@ -66,10 +76,12 @@ export function useWorkspaceServeable(conversationId: string | undefined): boole
  * the user having to reload the page.
  */
 export function useTrailingInvalidate(
-  conversationId: string | undefined,
+  target: WorkspaceResourceTarget | undefined,
   sessionActive: boolean,
   queryKeyPrefix: string,
 ) {
+  const conversationId = workspaceTargetSessionId(target);
+  const targetKey = workspaceTargetKey(target);
   const queryClient = useQueryClient();
   const prev = useRef<{ id: string | undefined; active: boolean }>({
     id: conversationId,
@@ -80,15 +92,23 @@ export function useTrailingInvalidate(
     const justWentIdle = sameSession && prev.current.active && !sessionActive;
     prev.current = { id: conversationId, active: sessionActive };
     if (justWentIdle && conversationId) {
-      queryClient.invalidateQueries({ queryKey: [queryKeyPrefix, conversationId] });
+      queryClient.invalidateQueries({ queryKey: [queryKeyPrefix, ...targetKey] });
     }
-  }, [conversationId, sessionActive, queryClient, queryKeyPrefix]);
+  }, [conversationId, sessionActive, queryClient, queryKeyPrefix, targetKey]);
 }
 
 // The primary workspace environment is always "default".  Terminals also each
 // expose an environment (id: "terminal_<name>_<session_key>"), but the files
 // panel and file viewer target the primary workspace only.
 const DEFAULT_ENVIRONMENT_ID = "default";
+
+function normalizeTarget(
+  target: WorkspaceResourceTarget | undefined,
+): ReturnType<typeof normalizeWorkspaceResourceTarget> {
+  const normalized = normalizeWorkspaceResourceTarget(target);
+  if (normalized?.kind === "session" && isTempConvId(normalized.sessionId)) return undefined;
+  return normalized;
+}
 
 interface WorkspaceQueryOptions {
   enabled?: boolean;
@@ -212,10 +232,10 @@ interface ChangedFilesResponse {
 }
 
 async function fetchWorkspaceChangedFiles(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
 ): Promise<WorkspaceChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/changes`,
+    workspaceResourceUrl(target, `environments/${DEFAULT_ENVIRONMENT_ID}/changes`),
   );
   if (res.status === 404) {
     return { available: false, data: [] };
@@ -262,25 +282,25 @@ async function fetchWorkspaceChangedFiles(
  * OS environment for this session (404).
  */
 export function useWorkspaceChangedFiles(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   options: WorkspaceQueryOptions = {},
 ) {
+  const target = normalizeTarget(rawTarget);
+  const conversationId = workspaceTargetSessionId(target);
+  const targetKey = workspaceTargetKey(target);
   const queryEnabled = options.enabled ?? true;
-  const serveable = useWorkspaceServeable(conversationId);
+  const serveable = useWorkspaceServeable(target);
   const recovering = useRunnerRecovering(conversationId);
-  const environmentQuery = useWorkspaceEnvironment(conversationId, {
+  const environmentQuery = useWorkspaceEnvironment(target, {
     enabled: queryEnabled,
   });
   const sessionActive = useSessionActive(conversationId);
-  useTrailingInvalidate(conversationId, sessionActive, "workspace-changed-files");
+  useTrailingInvalidate(target, sessionActive, "workspace-changed-files");
   return useQuery({
-    queryKey: ["workspace-changed-files", conversationId],
-    queryFn: () => fetchWorkspaceChangedFiles(conversationId!),
+    queryKey: ["workspace-changed-files", ...targetKey],
+    queryFn: () => fetchWorkspaceChangedFiles(target!),
     enabled:
-      queryEnabled &&
-      !!conversationId &&
-      serveable !== false &&
-      environmentQuery.data?.available === true,
+      queryEnabled && !!target && serveable !== false && environmentQuery.data?.available === true,
     retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     // No polling: the SSE ``session.changed_files.invalidated`` event
@@ -353,7 +373,7 @@ function mapFilesystemEntries(
 }
 
 async function fetchWorkspaceAllFiles(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   location = "",
 ): Promise<WorkspaceAllFilesResult> {
   const segment = browseLocationSegment(location);
@@ -361,7 +381,11 @@ async function fetchWorkspaceAllFiles(
   const base = browseLocationBase(location);
   if (base) params.set("base", base);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?${params}`,
+    workspaceResourceUrl(
+      target,
+      `environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}`,
+      params,
+    ),
   );
   if (res.status === 404) {
     return { available: false, data: [] };
@@ -399,26 +423,26 @@ async function fetchWorkspaceAllFiles(
  * session (404).
  */
 export function useWorkspaceAllFiles(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   options: WorkspaceQueryOptions = {},
   location = "",
 ) {
+  const target = normalizeTarget(rawTarget);
+  const conversationId = workspaceTargetSessionId(target);
+  const targetKey = workspaceTargetKey(target);
   const queryEnabled = options.enabled ?? true;
-  const serveable = useWorkspaceServeable(conversationId);
+  const serveable = useWorkspaceServeable(target);
   const recovering = useRunnerRecovering(conversationId);
-  const environmentQuery = useWorkspaceEnvironment(conversationId, {
+  const environmentQuery = useWorkspaceEnvironment(target, {
     enabled: queryEnabled,
   });
   const sessionActive = useSessionActive(conversationId);
-  useTrailingInvalidate(conversationId, sessionActive, "workspace-all-files");
+  useTrailingInvalidate(target, sessionActive, "workspace-all-files");
   return useQuery({
-    queryKey: ["workspace-all-files", conversationId, location],
-    queryFn: () => fetchWorkspaceAllFiles(conversationId!, location),
+    queryKey: ["workspace-all-files", ...targetKey, location],
+    queryFn: () => fetchWorkspaceAllFiles(target!, location),
     enabled:
-      queryEnabled &&
-      !!conversationId &&
-      serveable !== false &&
-      environmentQuery.data?.available === true,
+      queryEnabled && !!target && serveable !== false && environmentQuery.data?.available === true,
     retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     // Keep the tree warm on revisits: within staleTime a return to a
@@ -514,7 +538,7 @@ export function relativizeToWorkspace(
 // ── Recursive file search ──────────────────────────────────────────────────────
 
 async function fetchWorkspaceFileSearch(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   query: string,
   include: string,
   exclude: string,
@@ -528,7 +552,11 @@ async function fetchWorkspaceFileSearch(
   const base = browseLocationBase(location);
   if (base) params.set("base", base);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
+    workspaceResourceUrl(
+      target,
+      `environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}`,
+      params,
+    ),
   );
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
@@ -554,30 +582,31 @@ async function fetchWorkspaceFileSearch(
  * @param exclude Comma-separated exclude globs, e.g. ``"**\/node_modules"``.
  */
 export function useWorkspaceFileSearch(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   query: string,
   include: string | undefined = undefined,
   exclude: string | undefined = undefined,
   options: WorkspaceQueryOptions = {},
   location = "",
 ) {
-  const serveable = useWorkspaceServeable(conversationId);
+  const target = normalizeTarget(rawTarget);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
   const trimmed = query.trim();
   const trimmedInclude = include?.trim() ?? "";
   const trimmedExclude = exclude?.trim() ?? "";
   return useQuery({
     queryKey: [
       "workspace-file-search",
-      conversationId,
+      ...targetKey,
       trimmed,
       trimmedInclude,
       trimmedExclude,
       location,
     ],
     queryFn: () =>
-      fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude, location),
-    enabled:
-      (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,
+      fetchWorkspaceFileSearch(target!, trimmed, trimmedInclude, trimmedExclude, location),
+    enabled: (options.enabled ?? true) && !!target && trimmed.length > 0 && serveable !== false,
     staleTime: 5_000,
     placeholderData: (prev) => prev,
   });
@@ -586,7 +615,7 @@ export function useWorkspaceFileSearch(
 // ── Directory contents (lazy, on-demand) ──────────────────────────────────────
 
 async function fetchWorkspaceDirectory(
-  conversationId: string,
+  targetResource: WorkspaceResourceTarget,
   dirPath: string,
   location = "",
 ): Promise<WorkspaceFile[]> {
@@ -596,7 +625,11 @@ async function fetchWorkspaceDirectory(
   const base = browseLocationBase(target);
   if (base) params.set("base", base);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?${params}`,
+    workspaceResourceUrl(
+      targetResource,
+      `environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}`,
+      params,
+    ),
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // The tree addresses children relative to the location it is rooted at, one
@@ -710,16 +743,19 @@ function hasUnsafeSegments(rel: string): boolean {
 }
 
 async function fetchDirEntriesTolerant(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   dirPath: string,
 ): Promise<WorkspaceFile[]> {
   // An empty dirPath is the workspace root — its listing lives at the bare
   // ``/filesystem`` endpoint, not ``/filesystem/`` (a root-level file like
   // ``foo.md`` resolves to a "" parent).
-  const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
   const encodedPath = dirPath.split("/").map(encodeURIComponent).join("/");
   const res = await authenticatedFetch(
-    dirPath === "" ? `${base}?limit=1000&order=asc` : `${base}/${encodedPath}?limit=1000&order=asc`,
+    workspaceResourceUrl(
+      target,
+      `environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${dirPath === "" ? "" : `/${encodedPath}`}`,
+      { limit: "1000", order: "asc" },
+    ),
   );
   // 404 = the directory (or the whole OS environment) is absent, so the file
   // can't exist. Degrade to "no entries" rather than surfacing an error.
@@ -747,11 +783,13 @@ async function fetchDirEntriesTolerant(
  *   (``foo.md``, no interior slash) that the heuristic would reject.
  */
 export function useWorkspaceFileExists(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   path: string | null,
   trusted = false,
 ): boolean {
-  const serveable = useWorkspaceServeable(conversationId);
+  const target = normalizeTarget(rawTarget);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
   const candidate = path && (trusted || looksLikeWorkspaceFilePath(path)) ? path : null;
   // Parent of a root-level file (no slash) is "" — the workspace root listing.
   const parentDir = candidate
@@ -763,9 +801,9 @@ export function useWorkspaceFileExists(
     // Distinct prefix from `useWorkspaceDirectory` ("workspace-dir") because
     // this query tolerates 404 and that one throws — they must not share a
     // cache entry with conflicting queryFns.
-    queryKey: ["workspace-dir-listing", conversationId, parentDir],
-    queryFn: () => fetchDirEntriesTolerant(conversationId!, parentDir!),
-    enabled: !!conversationId && parentDir !== null && serveable !== false,
+    queryKey: ["workspace-dir-listing", ...targetKey, parentDir],
+    queryFn: () => fetchDirEntriesTolerant(target!, parentDir!),
+    enabled: !!target && parentDir !== null && serveable !== false,
     // Longer TTL than the root/changed-files queries (5s): a referenced file's
     // existence rarely changes mid-conversation, and this fires per inline
     // path span, so a 30s cache keeps repeated mentions from re-listing.
@@ -813,9 +851,11 @@ export interface WorkspaceReach {
   roots: WorkspaceReachRoot[];
 }
 
-async function fetchWorkspaceEnvironment(conversationId: string): Promise<WorkspaceEnvironment> {
+async function fetchWorkspaceEnvironment(
+  target: WorkspaceResourceTarget,
+): Promise<WorkspaceEnvironment> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}`,
+    workspaceResourceUrl(target, `environments/${DEFAULT_ENVIRONMENT_ID}`),
   );
   if (res.status === 404) {
     return { available: false, root: null, home: null, reachable: null };
@@ -845,19 +885,21 @@ async function fetchWorkspaceEnvironment(conversationId: string): Promise<Worksp
  * (``metadata.root`` absent in the 200 response).
  */
 export function useWorkspaceEnvironment(
-  rawConversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   options: WorkspaceQueryOptions = {},
 ) {
   // A `temp:*` id (navigate-first new-chat window) has no server workspace —
   // normalize to undefined so nothing (env, and the changed/all-files queries
   // that gate on its result) hits `/v1/sessions/temp:*/resources/*`.
-  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
-  const serveable = useWorkspaceServeable(conversationId);
+  const target = normalizeTarget(rawTarget);
+  const conversationId = workspaceTargetSessionId(target);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
   const recovering = useRunnerRecovering(conversationId);
   return useQuery({
-    queryKey: ["workspace-environment", conversationId],
-    queryFn: () => fetchWorkspaceEnvironment(conversationId!),
-    enabled: (options.enabled ?? true) && !!conversationId && serveable !== false,
+    queryKey: ["workspace-environment", ...targetKey],
+    queryFn: () => fetchWorkspaceEnvironment(target!),
+    enabled: (options.enabled ?? true) && !!target && serveable !== false,
     retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 60_000,
@@ -872,15 +914,17 @@ export function useWorkspaceEnvironment(
  * `dirPath` is null (collapsed or not yet requested).
  */
 export function useWorkspaceDirectory(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   dirPath: string | null,
   location = "",
 ) {
-  const serveable = useWorkspaceServeable(conversationId);
+  const target = normalizeTarget(rawTarget);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
   return useQuery({
-    queryKey: ["workspace-dir", conversationId, dirPath, location],
-    queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!, location),
-    enabled: !!conversationId && !!dirPath && serveable !== false,
+    queryKey: ["workspace-dir", ...targetKey, dirPath, location],
+    queryFn: () => fetchWorkspaceDirectory(target!, dirPath!, location),
+    enabled: !!target && !!dirPath && serveable !== false,
     staleTime: 5_000,
   });
 }
@@ -904,12 +948,14 @@ export interface DirectoryResult {
  * hook (identical query keys).
  */
 export function useWorkspaceDirectories(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   dirPaths: string[],
   location = "",
 ): Map<string, DirectoryResult> {
-  const serveable = useWorkspaceServeable(conversationId);
-  const enabled = !!conversationId && serveable !== false;
+  const target = normalizeTarget(rawTarget);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
+  const enabled = !!target && serveable !== false;
   // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
   // reference check on the combine fn (`combine !== lastCombine`), so the
   // callback must be stable — an inline closure is a fresh fn every render and
@@ -932,8 +978,8 @@ export function useWorkspaceDirectories(
   );
   return useQueries({
     queries: dirPaths.map((dirPath) => ({
-      queryKey: ["workspace-dir", conversationId, dirPath, location],
-      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
+      queryKey: ["workspace-dir", ...targetKey, dirPath, location],
+      queryFn: () => fetchWorkspaceDirectory(target!, dirPath, location),
       enabled,
       staleTime: 5_000,
     })),

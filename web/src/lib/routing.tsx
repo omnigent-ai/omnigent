@@ -40,6 +40,7 @@ import {
   type To,
   useLocation as useRRLocation,
   useNavigate as useRRNavigate,
+  useNavigationType as useRRNavigationType,
   useParams as useRRParams,
   useSearchParams as useRRSearchParams,
 } from "react-router-dom";
@@ -63,6 +64,8 @@ export interface RoutingApi {
   useParams: typeof useRRParams;
   useSearchParams: typeof useRRSearchParams;
   useLocation: typeof useRRLocation;
+  /** Optional for hosts whose router does not expose history actions. */
+  useNavigationType?: typeof useRRNavigationType;
   Link: ComponentType<OmnigentLinkProps & RefAttributes<HTMLAnchorElement>>;
   Outlet: typeof RROutlet;
   /**
@@ -98,6 +101,7 @@ export const reactRouterRouting: RoutingApi = {
   useParams: useRRParams,
   useSearchParams: useRRSearchParams,
   useLocation: useRRLocation,
+  useNavigationType: useRRNavigationType,
   Link: StandaloneLink,
   Outlet: RROutlet,
   rebasePath: (path) => path,
@@ -202,6 +206,9 @@ export const useSearchParams: typeof useRRSearchParams = (defaultInit) =>
   useRouting().useSearchParams(defaultInit);
 
 export const useLocation: typeof useRRLocation = () => useRouting().useLocation();
+
+export const useNavigationType = (): ReturnType<typeof useRRNavigationType> | undefined =>
+  useRouting().useNavigationType?.();
 
 /**
  * The active `rebasePath` primitive. Identity standalone; prepends `basename`

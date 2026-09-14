@@ -84,6 +84,7 @@ const SafeListItem = ListItem.extend({ content: "block+" });
 interface MarkdownRichTextViewerProps {
   content: string;
   conversationId: string;
+  readOnly?: boolean;
   path: string;
   isSettled: boolean;
   /**
@@ -109,6 +110,7 @@ interface MarkdownRichTextViewerProps {
 export function MarkdownRichTextViewer({
   content,
   conversationId,
+  readOnly = false,
   path,
   isSettled,
   truncated = false,
@@ -122,7 +124,7 @@ export function MarkdownRichTextViewer({
   searchInputRef,
 }: MarkdownRichTextViewerProps) {
   // A truncated buffer must never be editable, regardless of permission.
-  const canEdit = useCanEdit(conversationId) && !truncated;
+  const canEdit = useCanEdit(conversationId) && !readOnly && !truncated;
 
   // Callback registered by the inner component once its TipTap editor is ready.
   // The sync hook calls this instead of remounting (setEditorKey) when an
@@ -380,6 +382,7 @@ function MarkdownRichTextViewerInner({
     contentType: "markdown",
     editable: canEdit,
     onUpdate: ({ editor: ed, transaction }) => {
+      if (!canEdit) return;
       // A transaction that changed no document is a no-op for our purposes (e.g.
       // setEditable's synthetic update). It can't have altered the markdown, so
       // re-baselining on it would only clobber an unsaved edit — skip entirely.

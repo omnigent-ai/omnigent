@@ -22,7 +22,11 @@ const h = vi.hoisted(() => ({
     };
   } | null,
   onMount: null as DiffOnMount | null,
-  commentOptions: null as { editorRef: { current: unknown }; mounted: boolean } | null,
+  commentOptions: null as {
+    editorRef: { current: unknown };
+    mounted: boolean;
+    canComment: boolean;
+  } | null,
 }));
 vi.mock("@monaco-editor/react", () => ({
   DiffEditor: (props: {
@@ -45,7 +49,11 @@ vi.mock("./monacoSetup", () => ({
 // Capture the comment-layer options so we can assert the diff wires the
 // modified editor into it; return null so render works.
 vi.mock("./useMonacoCommentLayer", () => ({
-  useMonacoCommentLayer: (opts: { editorRef: { current: unknown }; mounted: boolean }) => {
+  useMonacoCommentLayer: (opts: {
+    editorRef: { current: unknown };
+    mounted: boolean;
+    canComment: boolean;
+  }) => {
     h.commentOptions = opts;
     return null;
   },
@@ -65,6 +73,7 @@ function renderDiff(props: {
   wrapLines?: boolean;
   searchOpen?: boolean;
   onSearchHandled?: () => void;
+  readOnly?: boolean;
 }) {
   return render(
     <MonacoDiffViewer
@@ -75,6 +84,7 @@ function renderDiff(props: {
       hideWhitespace={props.hideWhitespace ?? false}
       wrapLines={props.wrapLines ?? false}
       conversationId="conv_1"
+      readOnly={props.readOnly}
       comments={[]}
       activeSelection={null}
       onSetActiveSelection={() => {}}
@@ -145,6 +155,12 @@ afterEach(() => {
 });
 
 describe("MonacoDiffViewer", () => {
+  it("disables comment creation when explicitly read-only", async () => {
+    renderDiff({ before: "old", after: "new", layout: "unified", readOnly: true });
+    await waitFor(() => expect(h.commentOptions).not.toBeNull());
+    expect(h.commentOptions?.canComment).toBe(false);
+  });
+
   it("feeds before→original and after→modified into the diff editor", async () => {
     renderDiff({ before: "old line\n", after: "new line\n", layout: "split" });
     await waitFor(() => expect(h.diffProps).not.toBeNull());
@@ -224,6 +240,7 @@ describe("MonacoDiffViewer", () => {
     // stop working in the diff.
     expect(h.commentOptions?.editorRef.current).toBe(fakeModified);
     expect(h.commentOptions?.mounted).toBe(true);
+    expect(h.commentOptions?.canComment).toBe(true);
     // CRLF "after" → model EOL set to CRLF (1) so comment offsets stay aligned.
     expect(setEOL).toHaveBeenCalledWith(1);
   });

@@ -1,3 +1,4 @@
+import { readLandingWorkspaceState, writeLandingWorkspacePanel } from "@/lib/landingWorkspaceState";
 // Resize hook for the always-visible right inline panel (the aside in
 // AppShell that holds FilesPanel + SessionRail). Uses a separate
 // module-level width store so the inline panel's preferred width doesn't
@@ -78,7 +79,9 @@ const listeners = new Set<() => void>();
 function persistWidth(value: number | null) {
   preferredWidth = value;
   if (currentSessionId !== null && value !== null) {
-    writeSessionWorkspaceState(currentSessionId, { widthPx: value });
+    if (currentSessionId.startsWith("draft-workspace:"))
+      writeLandingWorkspacePanel({ widthPx: value });
+    else writeSessionWorkspaceState(currentSessionId, { widthPx: value });
   }
 }
 
@@ -109,7 +112,12 @@ function loadSession(sessionId: string | null): void {
   if (sessionId === currentSessionId) return;
   currentSessionId = sessionId;
   preferredWidth =
-    sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
+    sessionId !== null
+      ? ((sessionId.startsWith("draft-workspace:")
+          ? readLandingWorkspaceState().panel
+          : readSessionWorkspaceState(sessionId)
+        ).widthPx ?? null)
+      : null;
   setStoredWidthRaw(preferredWidth);
 }
 
@@ -169,7 +177,12 @@ export function useResizableInlinePanel(
   let effectiveRaw = raw;
   if (sessionId !== currentSessionId) {
     effectiveRaw =
-      sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
+      sessionId !== null
+        ? ((sessionId.startsWith("draft-workspace:")
+            ? readLandingWorkspaceState().panel
+            : readSessionWorkspaceState(sessionId)
+          ).widthPx ?? null)
+        : null;
   }
   // Clamped at render time only — the store keeps the user's preferred width, so
   // a temporary squeeze (sidebar opening) is undone when the space returns.

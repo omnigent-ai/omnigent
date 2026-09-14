@@ -1,16 +1,43 @@
-import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act } from "react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
 
-afterEach(cleanup);
+let inbound: ((event: MessageEvent) => void) | null;
 
-function renderViewer(content: string, truncated = false) {
+beforeEach(() => {
+  inbound = null;
+  vi.stubGlobal(
+    "MessageChannel",
+    class {
+      port1 = {
+        onmessage: null as ((event: MessageEvent) => void) | null,
+        postMessage: vi.fn(),
+        close: vi.fn(),
+      };
+      port2 = { close: vi.fn() };
+
+      constructor() {
+        inbound = (event) => this.port1.onmessage?.(event);
+      }
+    },
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  cleanup();
+});
+
+function renderViewer(content: string, truncated = false, readOnly = false) {
   return render(
     <HtmlCommentViewer
       conversationId="conv_1"
+      readOnly={readOnly}
       content={content}
       truncated={truncated}
       comments={[]}
@@ -21,6 +48,36 @@ function renderViewer(content: string, truncated = false) {
 }
 
 describe("HtmlCommentViewer", () => {
+  async function selectPreviewText(readOnly: boolean) {
+    const { container } = renderViewer("<body><p>doc</p></body>", false, readOnly);
+    const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
+    const postMessage = vi.spyOn(iframe.contentWindow!, "postMessage").mockImplementation(() => {});
+    fireEvent.load(iframe);
+    const init = postMessage.mock.calls[0][0] as { nonce: string };
+    await act(async () => {
+      inbound?.({
+        data: {
+          source: BRIDGE_SOURCE,
+          nonce: init.nonce,
+          type: BRIDGE_MSG.selection,
+          text: "doc",
+          occ: 0,
+          rect: { left: 10, top: 10, right: 30, bottom: 20 },
+        },
+      } as MessageEvent);
+    });
+  }
+
+  it("offers comments after a selection for an editable session", async () => {
+    await selectPreviewText(false);
+    expect(document.querySelector("[data-add-comment-btn]")).not.toBeNull();
+  });
+
+  it("offers no comment control after a selection when explicitly read-only", async () => {
+    await selectPreviewText(true);
+    expect(document.querySelector("[data-add-comment-btn]")).toBeNull();
+  });
+
   it("renders the preview in a sandboxed iframe that still withholds allow-same-origin", () => {
     const { container } = renderViewer("<html><body><p>doc</p></body></html>");
     const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;

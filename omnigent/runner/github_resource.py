@@ -75,7 +75,8 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 # non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
 # both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
 _PR_VIEW_FIELDS = (
-    "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+    "number,title,state,url,isDraft,author,baseRefName,headRefName,headRefOid,baseRefOid,"
+    "statusCheckRollup,body,comments"
 )
 
 
@@ -251,22 +252,6 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return rc == 0, []
 
 
-def _resolved_base_nwo(root: str) -> str | None:
-    """Return the gh-resolved base repo ``owner/repo`` for the checkout, or ``None``.
-
-    Reads ``gh repo set-default --view`` — a local git-config read (no network),
-    the same base ``gh`` itself resolves PRs against. ``None`` when no default is
-    set (``--view`` exits non-zero) or the output isn't an ``owner/repo``.
-    """
-    rc, out, _ = _gh(["repo", "set-default", "--view"], cwd=root)
-    if rc != 0:
-        return None
-    value = out.strip()
-    if value and "/" in value and " " not in value:
-        return value
-    return None
-
-
 def _workspace_key(root: str) -> str | None:
     """Return the stable per-workspace key for the account preference, or ``None``.
 
@@ -294,7 +279,9 @@ def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | Non
     return out.strip() or None
 
 
-def _account_token_for(root: str, workspace_key: str | None = None) -> str | None:
+def _account_token_for(
+    root: str, workspace_key: str | None = None, host: str = "github.com"
+) -> str | None:
     """Return the GH_TOKEN to run ``gh`` as this workspace's preferred account.
 
     ``None`` (use ``gh``'s active auth) inside a sandbox (single broker identity),
@@ -311,7 +298,7 @@ def _account_token_for(root: str, workspace_key: str | None = None) -> str | Non
     login = _config.github_account_preference(key)
     if not login:
         return None
-    return _gh_auth_token(root, login)
+    return _gh_auth_token(root, login, host)
 
 
 # Cap the per-check list so a pathological rollup can't bloat the payload; the
@@ -535,12 +522,6 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     if resolved is None:
         return None
     number, base_repo = resolved
-    # First-run convenience: point gh's default at the PR's real base so the
-    # agent's own `gh` in the terminal targets it too. Only when unset, so a
-    # manual `gh repo set-default` is never overridden; best-effort — resolution
-    # itself doesn't need it (the explicit ``-R`` below carries the base).
-    if not _resolved_base_nwo(root):
-        _gh(["repo", "set-default", base_repo], cwd=root, token=token)
     rc, out, _ = _gh(
         ["pr", "view", str(number), "-R", base_repo, "--json", fields], cwd=root, token=token
     )
@@ -608,15 +589,18 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
     if data is not None:
         author = data.get("author")
         body = data.get("body")
+        pr_url = data.get("url")
         payload["pr"] = {
             "number": data.get("number"),
             "title": data.get("title"),
             "state": data.get("state"),
-            "url": data.get("url"),
+            "url": pr_url,
             "is_draft": data.get("isDraft", False),
             "author": author.get("login") if isinstance(author, dict) else None,
             "base_ref": data.get("baseRefName"),
             "head_ref": data.get("headRefName"),
+            "head_sha": data.get("headRefOid"),
+            "base_sha": data.get("baseRefOid"),
             "checks": _summarize_checks(data.get("statusCheckRollup")),
             # PR description + conversation comments feed the Summary tab; an
             # empty body is null so the UI shows its "no description" state.
@@ -625,7 +609,9 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         }
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
-        payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
+        payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(pr_url)}
+        if isinstance(pr_url, str):
+            payload["selected_pr_url"] = pr_url
         return payload
 
     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
@@ -662,7 +648,7 @@ def _selected_pr(session_id: str, pr_url: str) -> PullRequestRef:
 
 def _default_pr(session_id: str | None, pr_url: str | None) -> PullRequestRef | None:
     if session_id is None:
-        return None
+        return PullRequestRef.from_url(pr_url) if pr_url else None
     if pr_url:
         return _selected_pr(session_id, pr_url)
     entries = SessionPrRegistry(session_id).list()
@@ -676,6 +662,14 @@ def _pr_token(root: str, reference: PullRequestRef) -> str | None:
     if login:
         return _gh_auth_token(root, login, reference.host)
     return None
+
+
+def _github_read_token(
+    root: str, session_id: str | None, reference: PullRequestRef | None
+) -> str | None:
+    if session_id is None:
+        return _account_token_for(root, host=reference.host if reference else "github.com")
+    return _pr_token(root, reference) if reference else _account_token_for(root)
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
@@ -714,7 +708,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info["selected_account"] = _config.github_account_preference(reference.repo_argument) or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
-    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
+    data = _pr_json(root, reference, _PR_VIEW_FIELDS)
     if data is None:
         return info
     author = data.get("author")
@@ -766,6 +760,7 @@ def github_info(
                 info["selected_pr_url"] = reference.url
             else:
                 info["pr"] = None
+                info.pop("selected_pr_url", None)
     info["prs"] = [entry.model_dump() for entry in entries]
     info["tracking_available"] = True
     return info
@@ -880,19 +875,27 @@ _GH_STATUS_MAP = {
 }
 
 
-def _pr_number(root: str, *, token: str | None = None) -> int | None:
-    """Return the PR number for the workspace's branch, or ``None``.
+def _workspace_pr_reference(root: str, *, token: str | None = None) -> PullRequestRef | None:
+    """Return the PR identity for the workspace's branch, or ``None``.
 
     :param root: Absolute workspace path.
     :param token: Optional GH_TOKEN to run ``gh`` as the selected account.
-    :returns: The associated PR's number, or ``None`` when no PR resolves (none
-        for the branch, ``gh`` missing, or not authenticated).
+    :returns: The associated PR's host/repository/number identity, or ``None``
+        when no PR resolves (none for the branch, ``gh`` missing, or not
+        authenticated).
     """
-    data = _pr_view_json(root, "number", token=token)
+    data = _pr_view_json(root, "number,url", token=token)
     if data is None:
         return None
     number = data.get("number")
-    return number if isinstance(number, int) else None
+    url = data.get("url")
+    if not isinstance(number, int) or not isinstance(url, str):
+        return None
+    try:
+        reference = PullRequestRef.from_url(url)
+    except ValueError:
+        return None
+    return reference if reference.number == number else None
 
 
 def github_changed_files(
@@ -909,20 +912,21 @@ def github_changed_files(
         / ``status`` / ``lines_added`` / ``lines_removed``.
     """
     empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
-    reference = _default_pr(session_id, pr_url)
-    token = _pr_token(root, reference) if reference else _account_token_for(root)
-    number = reference.number if reference else _pr_number(root, token=token)
-    if number is None:
+    tracked_reference = _default_pr(session_id, pr_url)
+    token = _github_read_token(root, session_id, tracked_reference)
+    reference = tracked_reference or _workspace_pr_reference(root, token=token)
+    if session_id is None and tracked_reference is None and reference is not None:
+        token = _github_read_token(root, session_id, reference)
+    if reference is None:
         return empty
-    repository = reference.repository if reference else "{owner}/{repo}"
-    host_args = _host_args(root, reference) if reference else []
+    host_args = _host_args(root, reference)
     rc, out, _ = _gh(
         [
             "api",
             *host_args,
             "--paginate",
-            *(["--slurp"] if reference else []),
-            f"repos/{repository}/pulls/{number}/files?per_page=100",
+            "--slurp",
+            f"repos/{reference.repository}/pulls/{reference.number}/files?per_page=100",
         ],
         cwd=root,
         token=token,
@@ -936,10 +940,7 @@ def github_changed_files(
     if not isinstance(entries, list):
         return empty
 
-    if reference:
-        entries = [
-            entry for page in entries for entry in (page if isinstance(page, list) else [page])
-        ]
+    entries = [entry for page in entries for entry in (page if isinstance(page, list) else [page])]
     data: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -984,6 +985,11 @@ def github_file_diff(
         ``None`` for a deleted file).
     """
     reference = _default_pr(session_id, pr_url)
+    token = _github_read_token(root, session_id, reference)
+    if reference is None and session_id is None:
+        reference = _workspace_pr_reference(root, token=token)
+        if reference is not None:
+            token = _github_read_token(root, session_id, reference)
     if reference:
         return _pr_file_contents(
             root,
@@ -992,6 +998,7 @@ def github_file_diff(
             previous_path=previous_path,
             head_sha=head_sha,
             base_sha=base_sha,
+            token=token,
         )
     resolved = resolve_base_ref(root, base or None)
     diff_base = _resolve_diff_base(root, resolved) if resolved else None
@@ -1022,24 +1029,28 @@ def github_pr_diff(
 
     ``gh pr diff <number>`` yields the PR's "Files changed" patch (server-computed
     against the base's merge-base), which the web view parses client-side into
-    per-file diffs. The PR is resolved by number first (via :func:`_pr_number`,
-    which handles fork / triangular heads a bare ``gh pr diff`` can't); empty when
-    the branch has no PR.
+    per-file diffs. The PR's full host/repository/number identity is resolved
+    first, which handles fork / triangular heads a bare ``gh pr diff`` can't;
+    empty when the branch has no PR.
 
     :param root: Absolute workspace path.
     :returns: A ``session.github.pr_diff`` object with the ``patch`` text
         (empty when there's no PR / no changes).
     """
     empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
-    reference = _default_pr(session_id, pr_url)
-    token = _pr_token(root, reference) if reference else _account_token_for(root)
-    number = reference.number if reference else _pr_number(root, token=token)
-    if number is None:
+    tracked_reference = _default_pr(session_id, pr_url)
+    token = _github_read_token(root, session_id, tracked_reference)
+    reference = tracked_reference or _workspace_pr_reference(root, token=token)
+    if session_id is None and tracked_reference is None and reference is not None:
+        token = _github_read_token(root, session_id, reference)
+    if reference is None:
         return empty
-    if reference:
-        _host_args(root, reference)
-    repo_args = ["-R", reference.repo_argument] if reference else []
-    rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
+    _host_args(root, reference)
+    rc, out, _ = _gh(
+        ["pr", "diff", str(reference.number), "-R", reference.repo_argument],
+        cwd=root,
+        token=token,
+    )
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
 
 
@@ -1051,11 +1062,13 @@ def _host_args(root: str, reference: PullRequestRef) -> list[str]:
     return ["--hostname", reference.host]
 
 
-def _pr_api(root: str, reference: PullRequestRef, endpoint: str) -> dict[str, Any]:
+def _pr_api(
+    root: str, reference: PullRequestRef, endpoint: str, *, token: str | None
+) -> dict[str, Any]:
     rc, out, _ = _gh(
         ["api", *_host_args(root, reference), endpoint],
         cwd=root,
-        token=_pr_token(root, reference),
+        token=token,
     )
     if rc != 0:
         raise ValueError("GitHub could not load the selected PR's file content")
@@ -1087,11 +1100,14 @@ def _pr_file_contents(
     previous_path: str | None,
     head_sha: str | None,
     base_sha: str | None,
+    token: str | None,
 ) -> dict[str, Any]:
     for candidate in (path, previous_path or path):
         if candidate.startswith("/") or any(p in {"", ".."} for p in candidate.split("/")):
             raise ValueError("Invalid repository-relative path")
-    pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
+    pr = _pr_api(
+        root, reference, f"repos/{reference.repository}/pulls/{reference.number}", token=token
+    )
     current_head = _api_string(pr, "head", "sha")
     current_base = _api_string(pr, "base", "sha")
     if (head_sha and head_sha != current_head) or (base_sha and base_sha != current_base):
@@ -1104,6 +1120,7 @@ def _pr_file_contents(
         root,
         reference,
         f"repos/{reference.repository}/compare/{current_base}...{current_head}",
+        token=token,
     )
     merge_base = _api_string(comparison, "merge_base_commit", "sha")
 
@@ -1113,7 +1130,7 @@ def _pr_file_contents(
         rc, out, err = _gh(
             ["api", *_host_args(root, reference), endpoint],
             cwd=root,
-            token=_pr_token(root, reference),
+            token=token,
         )
         if rc != 0:
             if "HTTP 404" in err:

@@ -1,8 +1,8 @@
 /**
- * Per-conversation WebContentsView registry.
+ * Session and draft-workspace WebContentsView registry.
  *
- * Keyed by `conversationId` for Omnigent's session model. Each entry owns its
- * own bounds controller so per-conversation state never cross-contaminates.
+ * Keyed by opaque browser view IDs. Each entry owns its bounds controller
+ * so session and draft-workspace views never share positioning state.
  *
  * Pure factory — no Electron imports at module scope. All deps are injected
  * so a unit test can drive create/swap/close/closeAll/cap behavior with a
@@ -13,16 +13,33 @@
  *    background agent's view isn't blanked by panel mounts). Creation goes only
  *    through `getOrCreate` / `openOrNavigate`, both cap-enforcing and non-throwing.
  *  - The old active entry is detached before the new one attaches. Inactive
- *    entries stay alive (JS + agent IPCs still run), just not painting; they're
- *    detached on hide and destroyed only on explicit close.
+ *    entries stay alive (JS + agent IPCs still run), just not painting. Draft
+ *    entries expire when their renderer stops renewing the draft lease.
  */
 
 const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
+const DEFAULT_DRAFT_LEASE_MS = 10 * 60 * 1000;
+const DRAFT_WORKSPACE_PATTERN = /^draft-workspace:[a-zA-Z0-9-]+$/;
+
+function draftWorkspaceIdFor(conversationId) {
+  if (typeof conversationId !== "string") return null;
+  if (DRAFT_WORKSPACE_PATTERN.test(conversationId)) return conversationId;
+  const prefix = "browser-tab:";
+  if (!conversationId.startsWith(prefix)) return null;
+  const separator = conversationId.indexOf(":", prefix.length);
+  if (separator === -1) return null;
+  try {
+    const workspaceId = decodeURIComponent(conversationId.slice(prefix.length, separator));
+    return DRAFT_WORKSPACE_PATTERN.test(workspaceId) ? workspaceId : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * Storage partition for one conversation's browser view. Every view MUST get
+ * Storage partition for one session or draft browser view. Every view MUST get
  * its own partition: with none, Electron places the view on
  * `session.defaultSession`, sharing one cookie/localStorage/cache store across
  * all agents and the main window (agent A's login bleeds into agent B's view).
@@ -36,8 +53,8 @@ const DEFAULT_CAP = 10;
  * server — two windows connected to different servers could carry the same
  * conversationId and would otherwise share a cookie jar.
  *
- * `conversationId` is interpolated raw. Production ids are opaque 32-character
- * UUID hex strings; encode them if that contract ever loosens.
+ * `conversationId` is an opaque session, draft-workspace, or manual-tab view ID.
+ * Adoption keeps the original partition so the live page retains its login.
  *
  * @param {string} scope Registry-unique namespace (one per shell window).
  * @param {string} conversationId
@@ -66,17 +83,73 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   cap = DEFAULT_CAP,
+  draftLeaseMs = DEFAULT_DRAFT_LEASE_MS,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
+  const draftLeaseTimers = new Map();
+  const expiringDrafts = new Set();
   let activeConversationId = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
+
+  function clearDraftLease(workspaceId) {
+    const timer = draftLeaseTimers.get(workspaceId);
+    if (timer === undefined) return;
+    clearTimeoutFn(timer);
+    draftLeaseTimers.delete(workspaceId);
+  }
+
+  function hasDraftEntries(workspaceId) {
+    for (const conversationId of entries.keys()) {
+      if (draftWorkspaceIdFor(conversationId) === workspaceId) return true;
+    }
+    return false;
+  }
+
+  function ensureDraftLease(workspaceId) {
+    if (!workspaceId || expiringDrafts.has(workspaceId)) return;
+    if (!hasDraftEntries(workspaceId)) {
+      clearDraftLease(workspaceId);
+      return;
+    }
+    if (draftLeaseTimers.has(workspaceId)) return;
+    const timer = setTimeoutFn(() => {
+      draftLeaseTimers.delete(workspaceId);
+      expiringDrafts.add(workspaceId);
+      try {
+        for (const conversationId of [...entries.keys()]) {
+          if (draftWorkspaceIdFor(conversationId) === workspaceId) {
+            close(conversationId, "draft-lease-expired");
+          }
+        }
+      } finally {
+        expiringDrafts.delete(workspaceId);
+      }
+    }, draftLeaseMs);
+    timer?.unref?.();
+    draftLeaseTimers.set(workspaceId, timer);
+  }
+
+  function renewDraftLease(workspaceId) {
+    if (typeof workspaceId !== "string" || !DRAFT_WORKSPACE_PATTERN.test(workspaceId)) {
+      return { ok: false, error: "Invalid draft workspace id" };
+    }
+    if (!hasDraftEntries(workspaceId)) {
+      clearDraftLease(workspaceId);
+      return { ok: true, renewed: false };
+    }
+    clearDraftLease(workspaceId);
+    ensureDraftLease(workspaceId);
+    return { ok: true, renewed: true };
+  }
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -105,7 +178,7 @@ function createBrowserViewRegistry({
         getDisplayScaleFactor: getHostDisplayScaleFactor,
         setBounds: (bounds) => {
           // Only paint the active entry; inactive views are detached (no-op).
-          if (activeConversationId === conversationId) {
+          if (activeConversationId === entry.conversationId) {
             try {
               view.setBounds(bounds);
             } catch {
@@ -158,7 +231,8 @@ function createBrowserViewRegistry({
     entries.set(conversationId, entry);
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
-    attachAgentNavGuard(conversationId, entry);
+    attachAgentNavGuard(entry);
+    ensureDraftLease(draftWorkspaceIdFor(conversationId));
     return { ok: true, entry, created: true };
   }
 
@@ -244,7 +318,7 @@ function createBrowserViewRegistry({
   // `entry.agentNavLocked` (set per-navigation from opts.agent), so user-typed
   // URL-bar browsing — including legitimate auth-redirect chains to internal
   // hosts — stays permissive.
-  function attachAgentNavGuard(conversationId, entry) {
+  function attachAgentNavGuard(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
@@ -257,7 +331,7 @@ function createBrowserViewRegistry({
           /* event shape without preventDefault — nothing to cancel */
         }
         sendToRenderer("browser-nav-blocked", {
-          conversationId,
+          conversationId: entry.conversationId,
           url: targetUrl,
           error: verdict.error,
         });
@@ -394,6 +468,7 @@ function createBrowserViewRegistry({
   function close(conversationId, reason) {
     const entry = entries.get(conversationId);
     if (!entry) return { ok: true, removed: false };
+    const draftWorkspaceId = draftWorkspaceIdFor(conversationId);
     if (activeConversationId === conversationId) {
       try {
         detachFromHost(entry.view);
@@ -430,8 +505,49 @@ function createBrowserViewRegistry({
       /* already destroyed */
     }
     entries.delete(conversationId);
+    ensureDraftLease(draftWorkspaceId);
     sendToRenderer("browser-view-closed", { conversationId, reason: reason || null });
     return { ok: true, removed: true };
+  }
+
+  function adoptDraft(sourceId, targetId) {
+    if (
+      typeof sourceId !== "string" ||
+      !DRAFT_WORKSPACE_PATTERN.test(sourceId) ||
+      typeof targetId !== "string" ||
+      !/^[a-zA-Z0-9_-]+$/.test(targetId)
+    ) {
+      return { ok: false, error: "Invalid draft or session id" };
+    }
+    const sourcePrefix = `browser-tab:${encodeURIComponent(sourceId)}:`;
+    const targetPrefix = `browser-tab:${encodeURIComponent(targetId)}:`;
+    const transfers = [];
+    for (const [id, entry] of entries) {
+      const nextId =
+        id === sourceId
+          ? targetId
+          : id.startsWith(sourcePrefix)
+            ? targetPrefix + id.slice(sourcePrefix.length)
+            : null;
+      if (!nextId) continue;
+      if (entries.has(nextId) || entry.designModeListener || entry.designModeInputListener) {
+        return { ok: false, error: "Browser destination occupied or draft design mode active" };
+      }
+      transfers.push({ id, nextId, entry });
+    }
+    // Validate the entire transfer before moving any live views.
+    for (const { id, nextId, entry } of transfers) {
+      entries.delete(id);
+      entry.conversationId = nextId;
+      entries.set(nextId, entry);
+      if (activeConversationId === id) activeConversationId = nextId;
+      sendToRenderer("browser-view-created", { conversationId: nextId });
+    }
+    clearDraftLease(sourceId);
+    if (transfers.length) {
+      sendToRenderer("browser-host-active-changed", { conversationId: activeConversationId });
+    }
+    return { ok: true, transferred: transfers.length };
   }
 
   function closeAll(reason) {
@@ -449,6 +565,8 @@ function createBrowserViewRegistry({
     setSuppressed,
     close,
     closeAll,
+    adoptDraft,
+    renewDraftLease,
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,

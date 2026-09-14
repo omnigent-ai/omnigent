@@ -1,8 +1,25 @@
 import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { MemoryRouter, type To } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { basenamedRouting, Link as RoutingLink, reactRouterRouting } from "./routing";
+import type { ReactNode } from "react";
+import {
+  basenamedRouting,
+  Link as RoutingLink,
+  reactRouterRouting,
+  RoutingProvider,
+  useNavigationType,
+} from "./routing";
 import { setOmnigentHostConfig } from "@/lib/host";
+
+it("allows custom routing adapters without navigation actions", () => {
+  const adapter = { ...reactRouterRouting, useNavigationType: undefined };
+  const { result } = renderHook(() => useNavigationType(), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <RoutingProvider value={adapter}>{children}</RoutingProvider>
+    ),
+  });
+  expect(result.current).toBeUndefined();
+});
 
 // `basenamedRouting` is the embed seam: it rebases web's absolute
 // navigation targets under the host mount path so links land under

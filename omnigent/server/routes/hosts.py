@@ -580,6 +580,17 @@ def create_hosts_router(
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
+    from omnigent.server.routes._host_workspace_resources import (
+        register_host_workspace_resource_routes,
+    )
+
+    register_host_workspace_resource_routes(
+        router,
+        host_registry=host_registry,
+        host_store=host_store,
+        auth_provider=auth_provider,
+    )
+
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
         """List all hosts owned by the authenticated user.

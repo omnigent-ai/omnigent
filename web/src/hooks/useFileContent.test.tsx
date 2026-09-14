@@ -60,6 +60,11 @@ function Probe({ id, path }: { id: string | undefined; path: string | null }) {
   return null;
 }
 
+function HostProbe({ workspace, path }: { workspace: string; path: string }) {
+  useFileContent({ kind: "host", hostId: "host/a", workspace }, path);
+  return null;
+}
+
 async function flushMicrotasks() {
   await new Promise((resolve) => {
     setTimeout(resolve, 10);
@@ -110,6 +115,23 @@ afterEach(() => {
   // `document.createElement` spy is recaptured as the "original" by the next
   // test and recurses infinitely.
   vi.restoreAllMocks();
+});
+
+describe("host workspace file content", () => {
+  it("reads through the host target without constructing a session URL", async () => {
+    stubChatStore();
+    render(<HostProbe workspace="/repo one" path="src/a b.ts" />, { wrapper: Wrap });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/v1/hosts/host%2Fa/workspace/resources/environments/default/filesystem/src/a%20b.ts?workspace=%2Frepo+one",
+        expect.anything(),
+      ),
+    );
+    expect(onlineMock).toHaveBeenCalledWith(undefined);
+    expect(hostOnlineMock).toHaveBeenCalledWith(undefined);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/v1/sessions/"))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

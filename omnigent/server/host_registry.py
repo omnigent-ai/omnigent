@@ -312,6 +312,10 @@ class HostConnection:
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_workspace_contexts: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    workspace_context_streams: dict[str, asyncio.Queue[Any]] = field(default_factory=dict)
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
@@ -402,6 +406,7 @@ class HostRegistry:
                     host_id,
                 )
                 old.outbound_queue.put_nowait(None)
+                self._close_workspace_context_channels(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -410,6 +415,23 @@ class HostRegistry:
             else:
                 self._interactive_shells.pop(host_id, None)
         return conn
+
+    @staticmethod
+    def _close_workspace_context_channels(conn: HostConnection) -> None:
+        """Wake requests and viewers when their tunnel generation is replaced."""
+        from omnigent.host.frames import HostWorkspaceContextStreamFrame
+
+        for future in conn.pending_workspace_contexts.values():
+            if not future.done():
+                future.set_exception(ConnectionError("host connection lost"))
+        conn.pending_workspace_contexts.clear()
+        for channel_id, queue in conn.workspace_context_streams.items():
+            while not queue.empty():
+                queue.get_nowait()
+            queue.put_nowait(
+                HostWorkspaceContextStreamFrame(channel_id=channel_id, close_code=1012)
+            )
+        conn.workspace_context_streams.clear()
 
     def deregister(
         self,
@@ -443,6 +465,7 @@ class HostRegistry:
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
+        self._close_workspace_context_channels(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

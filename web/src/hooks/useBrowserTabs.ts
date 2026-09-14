@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { readLandingWorkspaceState, writeLandingWorkspacePanel } from "@/lib/landingWorkspaceState";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
@@ -14,7 +15,9 @@ interface BrowserTabsState {
 }
 
 function readBrowserTabsState(conversationId: string): BrowserTabsState {
-  const saved = readSessionWorkspaceState(conversationId);
+  const saved = conversationId.startsWith("draft-workspace:")
+    ? readLandingWorkspaceState().panel
+    : readSessionWorkspaceState(conversationId);
   const tabs = saved.openBrowsers ?? [];
   return {
     tabs,
@@ -26,15 +29,23 @@ export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
+      if (
+        conversationId.startsWith("draft-workspace:") &&
+        readLandingWorkspaceState().browserNamespace !== conversationId
+      )
+        return;
       const next = mutate(readBrowserTabsState(conversationId));
-      writeSessionWorkspaceState(conversationId, {
-        openBrowsers: next.tabs,
-        selectedBrowserId: next.selected,
-      });
+      const patch = { openBrowsers: next.tabs, selectedBrowserId: next.selected };
+      if (conversationId.startsWith("draft-workspace:")) writeLandingWorkspacePanel(patch);
+      else writeSessionWorkspaceState(conversationId, patch);
       setState(next);
     },
     [conversationId],
   );
+
+  useEffect(() => {
+    setState(readBrowserTabsState(conversationId));
+  }, [conversationId]);
 
   const select = (selected: string | null) => {
     update((current) => ({ ...current, selected }));

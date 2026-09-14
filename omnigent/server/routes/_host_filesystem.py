@@ -56,6 +56,10 @@ class HostFsUnavailableError(Exception):
     through to the next resolver link / 502).
     """
 
+    def __init__(self, message: str, *, status: int = 502) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 async def read_workspace_from_host(
     *,
@@ -111,7 +115,8 @@ async def read_workspace_from_host(
             )
             raise HostFsUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to fs read within "
-                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"
+                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)",
+                status=504,
             ) from exc
     finally:
         host_conn.pending_fs_requests.pop(request_id, None)
@@ -188,7 +193,8 @@ async def write_workspace_from_host(
             )
             raise HostFsUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to fs write within "
-                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"
+                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)",
+                status=504,
             ) from exc
     finally:
         host_conn.pending_fs_requests.pop(request_id, None)

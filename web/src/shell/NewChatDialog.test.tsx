@@ -71,6 +71,7 @@ import {
 } from "@/lib/newChatPickerCache";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { setLandingWorkspaceBusy } from "@/lib/landingWorkspaceState";
 
 describe("ComposerAddMenu", () => {
   it("groups real actions and opens the existing attachment picker only after selection", () => {
@@ -1641,6 +1642,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
   });
   afterEach(() => {
     cleanup();
+    resetLandingDraft();
     localStorage.clear();
     getCurrentUserIdMock.mockReturnValue(null);
     setOmnigentHostConfig({});
@@ -2112,6 +2114,24 @@ describe("NewChatLandingScreen cached picker preview", () => {
       expect(resolveIdentityMock).toHaveBeenCalledOnce();
     },
   );
+
+  it("drops the previous account's cached picker when the landing scope changes", () => {
+    const snapshot = seedResolvedPicker();
+    mockAgents(undefined);
+    mockHosts(undefined);
+    mockModelQueries(() => pendingModels);
+    renderLanding();
+    expectCachedPicker(snapshot);
+
+    getCurrentUserIdMock.mockReturnValue("other-picker-user@example.test");
+    act(() => setLandingWorkspaceBusy(true));
+
+    expect(screen.getByRole("status", { name: "Loading session configuration" })).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-agent-select")).toBeNull();
+    expect(
+      readNewChatPickerCache(getNewChatPickerCacheKey("", "other-picker-user@example.test")),
+    ).toBeNull();
+  });
 
   it.each(["agents", "hosts", "models"] as const)(
     "stops showing the cached display when the live %s request fails",

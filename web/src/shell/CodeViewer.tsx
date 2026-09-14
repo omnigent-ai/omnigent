@@ -378,6 +378,8 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 
 export interface CodeViewerProps {
   conversationId: string;
+  /** Disable every file mutation even if session permissions would allow it. */
+  readOnly?: boolean;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
   comments: Comment[];
@@ -421,6 +423,7 @@ export interface CodeViewerProps {
 
 export function CodeViewer({
   conversationId,
+  readOnly = false,
   path,
   fileQuery,
   comments,
@@ -439,7 +442,7 @@ export function CodeViewer({
   onTocToggle,
   onRequestEditMode,
 }: CodeViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canEdit = useCanEdit(conversationId) && !readOnly;
   const activeCommentId = activeSelection?.comment_id;
   const previewComments = useMemo(
     () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],
@@ -748,6 +751,7 @@ export function CodeViewer({
         <PdfViewer
           data={fileQuery.data}
           conversationId={conversationId}
+          readOnly={readOnly}
           comments={previewComments}
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
@@ -781,6 +785,7 @@ export function CodeViewer({
       <MarkdownRichTextViewer
         content={content}
         conversationId={conversationId}
+        readOnly={readOnly}
         path={path}
         isSettled={fileQuery.isSuccess}
         truncated={truncated}
@@ -803,6 +808,7 @@ export function CodeViewer({
     return (
       <HtmlCommentViewer
         conversationId={conversationId}
+        readOnly={readOnly}
         content={content}
         truncated={truncated}
         comments={previewComments}
@@ -827,7 +833,7 @@ export function CodeViewer({
         tocOpen={tocOpen}
         onTocOpenChange={(open) => !open && onTocToggle?.()}
         commentHint={
-          !isNotebook && onRequestEditMode
+          canEdit && !isNotebook && onRequestEditMode
             ? { conversationId, onSwitchToEdit: onRequestEditMode }
             : undefined
         }
@@ -847,6 +853,7 @@ export function CodeViewer({
         <MonacoCodeEditor
           content={content}
           conversationId={conversationId}
+          readOnly={readOnly}
           path={path}
           isSettled={fileQuery.isSuccess}
           truncated={truncated}

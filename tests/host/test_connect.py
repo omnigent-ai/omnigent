@@ -109,8 +109,10 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
 
 
+@pytest.mark.parametrize("has_cli_login", [False, True])
 async def test_handle_model_options_serves_the_claude_catalog(
     monkeypatch: pytest.MonkeyPatch,
+    has_cli_login: bool,
 ) -> None:
     """The launch picker is the harness-probed catalog, resolved on the host.
 
@@ -119,6 +121,16 @@ async def test_handle_model_options_serves_the_claude_catalog(
     served from the fingerprint store — the harness is probed once.
     """
     from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.models import model_catalog
+
+    monkeypatch.setattr(
+        model_catalog,
+        "resolve_model_provider",
+        lambda spec, harness: model_catalog.ResolvedModelProvider(
+            kind="subscription" if has_cli_login else "none",
+            cli="claude" if has_cli_login else None,
+        ),
+    )
 
     config = claude_native.ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://gw.example"},
@@ -158,17 +170,23 @@ async def test_handle_model_options_serves_the_claude_catalog(
         HostModelOptionsFrame(request_id="req_2", harness="claude-native"),
     )
 
+    expected_model: dict[str, object] = {
+        "id": "sonnet",
+        "model": "system.ai.claude-sonnet-5",
+        "displayName": "Sonnet 5",
+        "isDefault": True,
+    }
+    if has_cli_login:
+        expected_model["source"] = {
+            "kind": "subscription",
+            "label": "Subscription",
+            "name": "claude",
+        }
+
     assert first == HostModelOptionsResultFrame(
         request_id="req_1",
         status="ok",
-        models=[
-            {
-                "id": "sonnet",
-                "model": "system.ai.claude-sonnet-5",
-                "displayName": "Sonnet 5",
-                "isDefault": True,
-            }
-        ],
+        models=[expected_model],
         routable_models=[
             "system.ai.claude-sonnet-5",
             "system.ai.claude-sonnet-5[1m]",
@@ -361,6 +379,58 @@ def _cleanup_host(host: HostProcess) -> None:
     host._cleanup_runners()
     for task in host._watcher_tasks:
         task.cancel()
+
+
+@pytest.mark.parametrize(
+    ("wire_session_id", "helper_session_id"),
+    [("", None), ("conv_owned", "conv_owned")],
+)
+async def test_dispatch_fs_github_ops_normalize_workspace_session_id(
+    wire_session_id: str,
+    helper_session_id: str | None,
+) -> None:
+    """Pre-session GitHub reads must not share the empty-id PR registry."""
+    calls: list[tuple[str, str | None]] = []
+
+    def github_info(session_id: str | None, _pr_url: str | None) -> dict[str, object]:
+        calls.append(("info", session_id))
+        return {}
+
+    def github_changes(session_id: str | None, _pr_url: str | None) -> dict[str, object]:
+        calls.append(("changes", session_id))
+        return {}
+
+    def github_file_diff(
+        _base: str | None,
+        _path: str,
+        *,
+        session_id: str | None,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        calls.append(("file_diff", session_id))
+        return {}
+
+    def github_pr_diff(session_id: str | None, _pr_url: str | None) -> dict[str, object]:
+        calls.append(("pr_diff", session_id))
+        return {}
+
+    reader = SimpleNamespace(
+        github_info=github_info,
+        github_changes=github_changes,
+        github_file_diff=github_file_diff,
+        github_pr_diff=github_pr_diff,
+    )
+    HostProcess._dispatch_fs_op(reader, "github_info", wire_session_id, {})
+    HostProcess._dispatch_fs_op(reader, "github_changes", wire_session_id, {})
+    HostProcess._dispatch_fs_op(reader, "github_diff", wire_session_id, {"path": "README.md"})
+    HostProcess._dispatch_fs_op(reader, "github_pr_diff", wire_session_id, {})
+
+    assert calls == [
+        ("info", helper_session_id),
+        ("changes", helper_session_id),
+        ("file_diff", helper_session_id),
+        ("pr_diff", helper_session_id),
+    ]
 
 
 async def test_handle_launch_spawns_subprocess(
@@ -4416,8 +4486,17 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"
 
 
+@pytest.fixture
+def _without_ambient_model_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness",
+        lambda harness: None,
+    )
+
+
 async def test_handle_model_options_serves_codex_probe_rows_and_caches(
     monkeypatch: pytest.MonkeyPatch,
+    _without_ambient_model_source: None,
 ) -> None:
     """A Databricks-routed Codex request is answered by the harness probe.
 
@@ -4471,6 +4550,7 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
 
 async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
     monkeypatch: pytest.MonkeyPatch,
+    _without_ambient_model_source: None,
 ) -> None:
     """SDK-mode Claude is a pass-through client, so the endpoint listing is
     the harness truth — served in the exact wire spelling the SDK sends."""
@@ -4509,6 +4589,7 @@ async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
 
 async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_list_nothing(
     monkeypatch: pytest.MonkeyPatch,
+    _without_ambient_model_source: None,
 ) -> None:
     """A subscription SDK launch serves the claude CLI's probed rows.
 
@@ -4554,6 +4635,7 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
 
 async def test_model_options_frame_replies_off_the_receive_loop(
     monkeypatch: pytest.MonkeyPatch,
+    _without_ambient_model_source: None,
 ) -> None:
     """A slow probe must not stall the tunnel receive loop.
 

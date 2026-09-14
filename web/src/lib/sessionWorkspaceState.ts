@@ -61,7 +61,7 @@ interface StoredEntry {
 
 type Store = StoredEntry[];
 
-function sanitize(entry: unknown): SessionWorkspaceState {
+export function sanitizeWorkspaceState(entry: unknown): SessionWorkspaceState {
   if (typeof entry !== "object" || entry === null) return {};
   const record = entry as Record<string, unknown>;
   const state: SessionWorkspaceState = {};
@@ -110,7 +110,7 @@ function readStore(): Store {
       if (typeof item !== "object" || item === null) continue;
       const record = item as Record<string, unknown>;
       if (typeof record.id !== "string") continue;
-      store.push({ id: record.id, state: sanitize(record.state) });
+      store.push({ id: record.id, state: sanitizeWorkspaceState(record.state) });
     }
     return store;
   } catch {

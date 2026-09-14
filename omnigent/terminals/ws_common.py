@@ -9,6 +9,8 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Final
 
+from omnigent.util.subprocess_ownership import create_subprocess_exec
+
 if TYPE_CHECKING:
     from fastapi import WebSocket
 
@@ -44,7 +46,8 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
     configured with ``remain-on-exit``. Probe errors fail closed.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_subprocess_exec(
+            asyncio.create_subprocess_exec,
             "tmux",
             "-S",
             socket_path,
@@ -76,7 +79,8 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
 async def _check_pane_dead_definitive(socket_path: str, tmux_target: str) -> bool | None:
     """Return pane liveness, or ``None`` when the probe is inconclusive."""
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_subprocess_exec(
+            asyncio.create_subprocess_exec,
             "tmux",
             "-S",
             socket_path,

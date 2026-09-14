@@ -115,6 +115,9 @@ class HostFrameKind(str, Enum):
     STORE_SECRET_RESULT = "host.store_secret_result"
     DETECT_CREDENTIALS = "host.detect_credentials"
     DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
+    WORKSPACE_CONTEXT_REQUEST = "host.workspace_context_request"
+    WORKSPACE_CONTEXT_RESULT = "host.workspace_context_result"
+    WORKSPACE_CONTEXT_STREAM = "host.workspace_context_stream"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
     FS_WRITE_REQUEST = "host.fs_write_request"
@@ -167,6 +170,7 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     gateway_inference: dict[str, bool] | None = None
     interactive_shells: list[str] | None = None
+    workspace_contexts: bool = False
     telemetry_opt_out: bool = False
     installation_id: str | None = None
 
@@ -924,6 +928,38 @@ class HostFsResultFrame:
 
 
 @dataclass
+class HostWorkspaceContextRequestFrame:
+    """Server → host: operate on an owner-scoped pre-chat workspace."""
+
+    request_id: str
+    op: str
+    user_id: str
+    context_id: str = ""
+    params: _JsonObject = field(default_factory=dict)
+
+
+@dataclass
+class HostWorkspaceContextResultFrame:
+    """Host → server: a workspace context operation result."""
+
+    request_id: str
+    status: str
+    payload: _JsonObject | None = None
+    error_status: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostWorkspaceContextStreamFrame:
+    """Bidirectional terminal channel; binary payloads use base64."""
+
+    channel_id: str
+    data: str = ""
+    binary: bool = False
+    close_code: int | None = None
+
+
+@dataclass
 class HostModelOptionsFrame:
     """Server → host: resolve pre-launch model choices for a harness."""
 
@@ -1071,6 +1107,9 @@ HostFrame = (
     | HostFsRequestFrame
     | HostFsResultFrame
     | HostFsWriteFrame
+    | HostWorkspaceContextRequestFrame
+    | HostWorkspaceContextResultFrame
+    | HostWorkspaceContextStreamFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
     | HostImportLocalFrame
@@ -1116,6 +1155,26 @@ def encode_host_frame(frame: HostFrame) -> str:
     :returns: JSON string for the WebSocket text message.
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
+    if isinstance(
+        frame,
+        (
+            HostWorkspaceContextRequestFrame,
+            HostWorkspaceContextResultFrame,
+            HostWorkspaceContextStreamFrame,
+        ),
+    ):
+        from dataclasses import asdict
+
+        kinds = {
+            HostWorkspaceContextRequestFrame: HostFrameKind.WORKSPACE_CONTEXT_REQUEST,
+            HostWorkspaceContextResultFrame: HostFrameKind.WORKSPACE_CONTEXT_RESULT,
+            HostWorkspaceContextStreamFrame: HostFrameKind.WORKSPACE_CONTEXT_STREAM,
+        }
+        payload = {"kind": kinds[type(frame)].value, **asdict(frame)}
+        # Terminal bytes may contain secrets; keep them out of trace body capture.
+        if isinstance(frame, HostWorkspaceContextStreamFrame):
+            return json.dumps(payload)
+        return _encode_payload(payload)
     if isinstance(frame, HostHelloFrame):
         return _encode_payload(
             {
@@ -1124,6 +1183,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "frame_protocol_version": frame.frame_protocol_version,
                 "name": frame.name,
                 "runners": list(frame.runners),
+                "workspace_contexts": frame.workspace_contexts,
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
                 "interactive_shells": frame.interactive_shells,
@@ -1555,6 +1615,41 @@ def _decode_known_host_frame(
     :raises ValueError: If the kind is unexpectedly unhandled.
     """
     match kind:
+        case HostFrameKind.WORKSPACE_CONTEXT_REQUEST:
+            params = msg.get("params", {})
+            if not isinstance(params, dict):
+                raise ValueError("workspace context params must be an object")
+            return HostWorkspaceContextRequestFrame(
+                request_id=_required_str(msg, "request_id"),
+                op=_required_str(msg, "op"),
+                user_id=_required_str(msg, "user_id"),
+                context_id=_required_str(msg, "context_id"),
+                params=params,
+            )
+        case HostFrameKind.WORKSPACE_CONTEXT_RESULT:
+            payload = msg.get("payload")
+            if payload is not None and not isinstance(payload, dict):
+                raise ValueError("workspace context payload must be an object")
+            error_status = msg.get("error_status")
+            if error_status is not None:
+                error_status = _required_int(msg, "error_status")
+            return HostWorkspaceContextResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                payload=payload,
+                error_status=error_status,
+                error=_optional_nullable_str(msg, "error"),
+            )
+        case HostFrameKind.WORKSPACE_CONTEXT_STREAM:
+            close_code = msg.get("close_code")
+            if close_code is not None:
+                close_code = _required_int(msg, "close_code")
+            return HostWorkspaceContextStreamFrame(
+                channel_id=_required_str(msg, "channel_id"),
+                data=_required_str(msg, "data"),
+                binary=_required_bool(msg, "binary"),
+                close_code=close_code,
+            )
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
         case HostFrameKind.CONNECTION_ERROR:
@@ -1654,6 +1749,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
             if msg.get("interactive_shells") is not None
             else None
         ),
+        workspace_contexts=msg.get("workspace_contexts") is True,
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )

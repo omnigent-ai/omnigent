@@ -62,6 +62,7 @@ from omnigent.terminals.ws_common import (
     _monotonic,
     _tmux_session_alive,
 )
+from omnigent.util.subprocess_ownership import create_subprocess_exec
 
 _logger = logging.getLogger(__name__)
 
@@ -159,7 +160,8 @@ async def _read_tmux_buffer(
     :returns: Raw buffer bytes, or ``None`` when unavailable/oversized.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_subprocess_exec(
+            asyncio.create_subprocess_exec,
             tmux,
             "-S",
             socket_path,
@@ -297,7 +299,8 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     if meta is not None and not meta.alternate_on:
         capture_args += ["-S", "-"]
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_subprocess_exec(
+            asyncio.create_subprocess_exec,
             tmux,
             "-S",
             socket_path,
@@ -433,7 +436,8 @@ async def _capture_pane_metadata(
     :returns: The parsed :class:`_PaneMetadata`, or ``None`` if unavailable.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_subprocess_exec(
+            asyncio.create_subprocess_exec,
             tmux,
             "-S",
             socket_path,
@@ -554,7 +558,8 @@ async def bridge_tmux_control_to_websocket(
     argv += ["-t", tmux_target]
 
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_subprocess_exec(
+            asyncio.create_subprocess_exec,
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,

@@ -88,6 +88,8 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceContextRequestFrame,
+    HostWorkspaceContextStreamFrame,
     decode_host_frame,
     encode_host_frame,
     workspace_missing_message,
@@ -996,6 +998,11 @@ class HostProcess:
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
         """
+        from omnigent.host.workspace_contexts import WorkspaceContextManager
+
+        self._workspace_contexts = WorkspaceContextManager(
+            tunnel_is_live=lambda tunnel: self._ws is tunnel
+        )
         self._identity = identity
         self._server_url = server_url.rstrip("/")
         self._interactive_shells = normalize_interactive_shells(
@@ -1152,9 +1159,12 @@ class HostProcess:
         its status out from under the manager, confusing ``is_running()`` /
         ``stop()``.
 
-        :returns: Set of live tracked pids (runners + the zygote).
+        Terminal subprocesses are protected until asyncio collects their status.
+
+        :returns: Set of owned child pids (runners, zygote, and terminal clients).
         """
         pids = {h.proc.pid for h in self._runners.values()}
+        pids.update(self._workspace_contexts.subprocess_ownership.pids)
         zygote_pid = self._zygote.pid if self._zygote is not None else None
         if zygote_pid is not None:
             pids.add(zygote_pid)
@@ -1199,27 +1209,16 @@ class HostProcess:
         a bogus exit 0 (verified) — the crash cause is lost. So the reaper
         must drain orphans while leaving tracked runners' status intact.
 
-        Two implementations, same guarantee:
-
-        * **Linux/POSIX with** ``os.waitid`` — *peek* at the next reapable
-          child with ``WNOWAIT`` (does not consume). Reap it only if it is
-          not a tracked runner; if it is, stop the sweep and let the runner's
-          own Popen reaper (``_watch_runner``) consume it. Cleanest: a tracked
-          runner's status is never touched.
-        * **Platforms without** ``os.waitid`` **(e.g. macOS)** — ``waitpid``
-          has no peek, so reap with ``WNOHANG`` and, if the reaped pid is a
-          tracked runner, re-inject its exit status onto the ``Popen`` so
-          ``_watch_runner`` still reports the true code. Safe because
-          ``_reap_orphans_once`` runs to completion on the event loop without
-          awaiting, so it cannot interleave with ``_watch_runner`` /
-          ``_handle_stop``.
-
-        This runs only when the host is PID 1 (container) or a child
-        subreaper (:func:`_install_child_subreaper`); otherwise no orphan
-        ever reparents here and every sweep is a no-op.
+        On Linux, ``waitid(WNOWAIT)`` peeks before reaping; owned children
+        remain available to their own Popen or asyncio waiter. Platforms
+        without that API enumerate immediate children and call ``waitpid``
+        only for unowned PIDs. Pending terminal spawns briefly pause sweeps
+        until their PIDs can be registered.
 
         :returns: Count of orphan (non-runner) processes reaped this sweep.
         """
+        if self._workspace_contexts.subprocess_ownership.spawning:
+            return 0
         if self._owned_subprocess_ops > 0:
             # A host-owned subprocess (e.g. a git worktree command) is running
             # in a worker thread. Its child is a DIRECT child of this process
@@ -1300,45 +1299,28 @@ class HostProcess:
         return reaped
 
     def _reap_orphans_waitpid(self) -> int:
-        """Reap with ``waitpid(WNOHANG)``, re-injecting tracked-runner status.
+        """Reap individual unowned children on platforms without waitid(WNOWAIT)."""
+        import psutil
 
-        Fallback for platforms without ``os.waitid`` (no peek). See
-        :meth:`_reap_orphans_once` for why re-injection is race-free.
-
-        :returns: Count of orphan (non-runner) processes reaped.
-        """
+        protected = self._tracked_runner_pids()
         reaped = 0
-        while True:
-            try:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-            except (ChildProcessError, OSError):
-                break
-            if pid == 0:
-                break  # children exist but none ready
-            handle = self._runner_handle_for_pid(pid)
-            if handle is not None:
-                # A tracked runner — do NOT count it as an orphan. Re-inject
-                # the status so its Popen (and thus _watch_runner) reports the
-                # true exit code instead of ECHILD → bogus 0.
-                if handle.proc.returncode is None:
-                    handle.proc.returncode = os.waitstatus_to_exitcode(status)
+        try:
+            children = psutil.Process().children()
+        except psutil.Error:
+            _logger.debug("Could not enumerate orphan children", exc_info=True)
+            return 0
+        for child in children:
+            if child.pid in protected:
                 continue
-            reaped += 1
+            try:
+                pid, _status = os.waitpid(child.pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                continue
+            if pid:
+                reaped += 1
         if reaped:
             _logger.debug("orphan reaper reaped %d process(es)", reaped)
         return reaped
-
-    def _runner_handle_for_pid(self, pid: int) -> _RunnerHandle | None:
-        """Return the tracked runner handle owning *pid*, or ``None``.
-
-        :param pid: An OS process id observed by the reaper.
-        :returns: The matching :class:`_RunnerHandle`, or ``None`` if *pid*
-            is not a tracked runner (i.e. an orphan to reap).
-        """
-        for handle in self._runners.values():
-            if handle.proc.pid == pid:
-                return handle
-        return None
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -3062,26 +3044,28 @@ class HostProcess:
         if op == "search":
             return r.search(
                 str(params.get("q", "")),
+                path=str(params.get("path", "")),
                 include=cast("str | None", params.get("include")),
                 exclude=cast("str | None", params.get("exclude")),
                 limit=_coerce_int(params.get("limit", 500)),
             )
+        github_session_id = session_id or None
         if op == "github_info":
-            return r.github_info(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_info(github_session_id, cast("str | None", params.get("pr_url")))
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(github_session_id, cast("str | None", params.get("pr_url")))
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
-                session_id=session_id,
+                session_id=github_session_id,
                 pr_url=cast("str | None", params.get("pr_url")),
                 previous_path=cast("str | None", params.get("previous_path")),
                 head_sha=cast("str | None", params.get("head_sha")),
                 base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_pr_diff(github_session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3681,6 +3665,7 @@ class HostProcess:
             for watcher in list(self._watcher_tasks):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher
+            await self._workspace_contexts.shutdown()
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
@@ -3821,10 +3806,11 @@ class HostProcess:
                 ),
                 resumed_from_suspend=self._woke_from_suspend,
             )
+            self._ws = None
+            await self._workspace_contexts.disconnect(ws)
             # Drop the watcher tasks' send target — exit reports raised
             # between connections park in _unreported_exits instead of
             # racing a half-closed socket.
-            self._ws = None
             # Close the tunnel context whether the serve loop returned
             # normally or raised (disconnect → reconnect). Mirrors the
             # ``async with`` this replaced; the manual enter is only so the
@@ -3956,6 +3942,7 @@ class HostProcess:
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
+            workspace_contexts=True,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
             configured_harnesses=self._configured_harnesses,
@@ -4143,6 +4130,10 @@ class HostProcess:
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
             return
+        if isinstance(frame, HostWorkspaceContextStreamFrame):
+            # Keystrokes and terminal output must not become telemetry message bodies.
+            self._workspace_contexts.receive(frame, tunnel=ws)
+            return
         # Handle the frame inside a CONSUMER span parented on the trace
         # context the server stamped into the frame envelope, so the
         # host's work (and the result frame it sends back) nests under
@@ -4219,6 +4210,19 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostWorkspaceContextRequestFrame):
+
+            async def send_context_stream(stream: HostWorkspaceContextStreamFrame) -> None:
+                await ws.send(encode_host_frame(stream))
+
+            context_result = await self._workspace_contexts.handle(
+                frame,
+                send=send_context_stream,
+                tunnel=ws,
+            )
+            await ws.send(encode_host_frame(context_result))
+        elif isinstance(frame, HostWorkspaceContextStreamFrame):
+            self._workspace_contexts.receive(frame, tunnel=ws)
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.

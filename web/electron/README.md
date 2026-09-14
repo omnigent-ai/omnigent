@@ -248,7 +248,8 @@ dismisses.
 ## Embedded browser pane
 
 The desktop shell hosts an **embedded browser pane**: a real Chromium page the
-user can drive (URL bar + toolbar) and point-and-prompt in design mode. This PR
+user can drive (URL bar + toolbar), with point-and-prompt design mode available
+once a session exists. This PR
 covers that user-facing pane plus the Electron/renderer plumbing; the
 agent-facing builtin `browser_*` tools (navigate / snapshot / click / type /
 screenshot) that can also drive the pane land in a separate PR. A
@@ -280,11 +281,14 @@ against its local Chromium, and the result is posted back.
 
 **Pieces:**
 
-- `src/browserViewRegistry.js` — a per-**conversation** `Map` of
-  `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
+- `src/browserViewRegistry.js` — a `Map` of session and draft-workspace browser
+  view IDs to `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
   and **detaches (does not destroy)** the previous one, so a background
-  conversation's page keeps running when the user switches away; views are
-  destroyed only on explicit close or window teardown. Each child view keeps
+  conversation's page keeps running when the user switches away. Views close
+  explicitly or on window teardown; draft views also expire without renderer
+  lease renewal (see [Workspace before Start](../../README.md#workspace-before-start)).
+  Draft adoption rekeys existing views without recreating their pages or storage
+  partitions. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
@@ -297,7 +301,8 @@ against its local Chromium, and the result is posted back.
 - `src/browserIpc.js` — the whole `ipcMain.handle('omnigent:browser-*')` surface,
   extracted out of `main.js` so that file stays bounded:
   `open-or-navigate`, `set-active`, `resize`, `screenshot`
-  (`capturePage().toPNG()` → base64), `execute`, `has-view`, `close`, plus the
+  (`capturePage().toPNG()` → base64), `execute`, `has-view`, `close`,
+  `adopt-draft`, `renew-draft-lease`, plus the
   toolbar handlers `go-back`, `go-forward`, `reload`, and `open-devtools`
   (toggle, docked bottom), plus the design-mode handlers
   `enable-design-mode` / `disable-design-mode` / `signal-design-result`
@@ -310,7 +315,8 @@ against its local Chromium, and the result is posted back.
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
 - `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
-  `Execute/Close` + `browserHasView`, the toolbar methods
+  `Execute/Close` + `browserHasView`, `browserAdoptDraft`,
+  `browserRenewDraftLease`, the toolbar methods
   `browserGoBack/GoForward/Reload` + `openBrowserDevTools`, the design-mode
   methods `browserEnableDesignMode/DisableDesignMode/SignalDesignResult`, and the
   subscriptions `onBrowserViewCreated` / `onBrowserHostActiveChanged` /

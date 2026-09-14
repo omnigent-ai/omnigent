@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -247,6 +248,32 @@ def test_search_matches_by_substring(tmp_path: Path) -> None:
     assert paths == {"alpha.py"}
 
 
+def test_search_path_limits_walk_but_keeps_workspace_relative_results(tmp_path: Path) -> None:
+    """A scoped search never visits siblings and keeps root-relative paths."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "target.py").write_text("x")
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "target.md").write_text("y")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target", path="src")
+
+    assert result["base"] == str(src)
+    assert [entry["path"] for entry in result["data"]] == ["src/target.py"]
+
+
+def test_search_path_cannot_escape_workspace(tmp_path: Path) -> None:
+    """A scoped search rejects parent traversal before walking the filesystem."""
+    reader = WorkspaceReader(tmp_path)
+
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.search("secret", path="../outside")
+
+    assert excinfo.value.status == 400
+
+
 def test_search_blank_query_returns_empty(tmp_path: Path) -> None:
     """A whitespace-only query returns nothing instead of walking the tree.
 
@@ -375,6 +402,60 @@ def test_changes_lists_git_working_tree_modifications(tmp_path: Path) -> None:
     assert by_path["new.txt"]["lines_removed"] is None
 
 
+def test_pre_session_git_reads_do_not_enable_untracked_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    untracked_cache_start: None,
+) -> None:
+    """Host-backed Files and Changes reads leave Git configuration unchanged."""
+    _git_repo(tmp_path)
+    probe = subprocess.run(
+        ["git", "update-index", "--test-untracked-cache"],
+        cwd=tmp_path,
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("Git does not support the untracked-cache probe on this filesystem")
+    subprocess.run(
+        ["git", "config", "core.untrackedCache", "false"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "committed.txt").write_text("modified\n")
+    (tmp_path / "new.txt").write_text("added\n")
+
+    class SynchronousThread:
+        def __init__(self, *, target: Callable[[], None], **_: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            self._target()
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.threading.Thread", SynchronousThread)
+    reader = WorkspaceReader(tmp_path)
+
+    def untracked_cache_setting() -> bytes:
+        return subprocess.run(
+            ["git", "config", "--bool", "--get", "core.untrackedCache"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        ).stdout.strip()
+
+    assert untracked_cache_setting() == b"false"
+    files = reader.list_or_read("", limit=100, order="asc")
+    assert {entry["path"] for entry in files["data"]} >= {"committed.txt", "new.txt"}
+    assert untracked_cache_setting() == b"false"
+
+    changes = reader.changes("")
+    assert {entry["path"]: entry["status"] for entry in changes["data"]} == {
+        "committed.txt": "modified",
+        "new.txt": "created",
+    }
+    assert untracked_cache_setting() == b"false"
+
+
 def test_diff_returns_before_and_after_for_modified_file(tmp_path: Path) -> None:
     """``diff`` returns committed ``before`` and on-disk ``after`` content.
 
@@ -472,11 +553,13 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
 
     def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, '{"number": 3}', "")
+            return (0, '{"number": 3, "url": "https://github.com/upstream/repo/pull/3"}', "")
         if tuple(argv[:1]) == ("api",):
+            assert argv[-1] == "repos/upstream/repo/pulls/3/files?per_page=100"
             return (
                 0,
-                '[{"filename": "app.txt", "status": "modified", "additions": 1, "deletions": 1}]',
+                '[[{"filename": "app.txt", "status": "modified", '
+                '"additions": 1, "deletions": 1}]]',
                 "",
             )
         return (1, "", "")
@@ -509,8 +592,9 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
 
     def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, '{"number": 3}', "")
+            return (0, '{"number": 3, "url": "https://github.com/upstream/repo/pull/3"}', "")
         if tuple(argv[:2]) == ("pr", "diff"):
+            assert argv[2:] == ["3", "-R", "github.com/upstream/repo"]
             return (0, "diff --git a/app.txt b/app.txt\n+changed\n", "")
         return (1, "", "")
 
