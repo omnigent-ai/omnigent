@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
@@ -692,6 +693,47 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
     )
+
+
+def _remap_item_file_references(
+    item_data: dict[str, Any],
+    file_id_map: Mapping[str, str],
+    fork_conversation_id: str,
+) -> bool:
+    """
+    Rewrite a copied item's file references to the fork's own file copies.
+
+    Handles the two payload shapes that reference session-scoped files:
+    message content blocks carrying a raw ``file_id`` (pre-resolution
+    attachments) and file ``resource_event`` payloads (``resource_id``
+    plus the embedded resource object).
+
+    :param item_data: Decoded item ``data`` JSON, mutated in place.
+    :param file_id_map: Source file id → fork-owned file id.
+    :param fork_conversation_id: The fork's conversation id, stamped into
+        a remapped resource object's ``session_id``.
+    :returns: Whether anything was rewritten.
+    """
+    changed = False
+    content = item_data.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_file_id = block.get("file_id")
+            if isinstance(block_file_id, str) and block_file_id in file_id_map:
+                block["file_id"] = file_id_map[block_file_id]
+                changed = True
+    if item_data.get("resource_type") == "file":
+        resource_id = item_data.get("resource_id")
+        if isinstance(resource_id, str) and resource_id in file_id_map:
+            item_data["resource_id"] = file_id_map[resource_id]
+            resource = item_data.get("resource")
+            if isinstance(resource, dict):
+                resource["id"] = file_id_map[resource_id]
+                resource["session_id"] = fork_conversation_id
+            changed = True
+    return changed
 
 
 def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
@@ -3898,6 +3940,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: Mapping[str, str] | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -4017,6 +4060,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             unfiled. The caller resolves whether the fork keeps the
             source's project — projects are owner-private, so the route
             passes the source's id only when the forker owns it.
+        :param file_id_map: Source file id → fork-owned file id for the
+            session-scoped file resources the caller copies into the fork.
+            Copied items referencing a mapped id are rewritten to the
+            fork's copy; ``None`` or empty copies every payload verbatim.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -4046,6 +4093,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             presentation_labels=presentation_labels,
             up_to_response_id=up_to_response_id,
             project_id=project_id,
+            file_id_map=file_id_map,
         )
 
     def _fork_conversation_with_id(
@@ -4073,6 +4121,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: Mapping[str, str] | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4199,12 +4248,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for src_item in source_items
             }
             # Copied rows reuse the source's already-encoded payload bytes (the
-            # encode transform depends only on item data); only compaction
-            # payloads change, remapped via one batch decode + one batch encode
-            # so a store whose encode is a per-call RPC never pays one
-            # round-trip per copied item. Preparation happens here, before the
-            # insert transaction, so a CockroachDB 40001 replay repeats SQL
-            # only — never ID generation or the encode/decode hooks.
+            # encode transform depends only on item data); only payloads that
+            # embed an id needing remapping change (compaction boundary item
+            # ids, session-scoped file references), each remapped via one
+            # batch decode + one batch encode so a store whose encode is a
+            # per-call RPC never pays one round-trip per copied item.
+            # Preparation happens here, before the insert transaction, so a
+            # CockroachDB 40001 replay repeats SQL only — never ID generation
+            # or the encode/decode hooks.
             compaction_positions = [
                 pos
                 for pos, src_item in enumerate(source_items)
@@ -4231,12 +4282,45 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
 
+            # Copied items reference session-scoped files by file_id
+            # (message attachment blocks, file resource events) that the
+            # fork does not own. When the caller copied those files into
+            # the fork, rewrite the references to the fork's own copies.
+            remapped_file_data: dict[int, str] = {}
+            if file_id_map:
+                file_ref_positions = [
+                    pos
+                    for pos, src_item in enumerate(source_items)
+                    if decode_item_type(src_item.type) in ("message", "resource_event")
+                ]
+                if file_ref_positions:
+                    decoded_payloads = self._decode_item_data_batch(
+                        [source_items[pos].data for pos in file_ref_positions]
+                    )
+                    changed_positions: list[int] = []
+                    changed_payloads: list[str] = []
+                    for ref_pos, decoded_payload in zip(
+                        file_ref_positions, decoded_payloads, strict=True
+                    ):
+                        item_data = json.loads(decoded_payload)
+                        if _remap_item_file_references(item_data, file_id_map, new_conv_id):
+                            changed_positions.append(ref_pos)
+                            changed_payloads.append(json.dumps(item_data))
+                    if changed_payloads:
+                        remapped_file_data = dict(
+                            zip(
+                                changed_positions,
+                                self._encode_item_data_batch(changed_payloads),
+                                strict=True,
+                            )
+                        )
+
             prepared_item_rows: list[dict[str, Any]] = []
             fts_rows: list[tuple[str, str, str]] = []
             for pos, src_item in enumerate(source_items):
                 # src_item.type/status/data are copied verbatim to the new row;
-                # compaction data alone is rewritten (the sole payload that
-                # contains an item ID).
+                # only compaction payloads (embedded item id) and file-
+                # referencing payloads (mapped file ids) are rewritten.
                 new_item_id = copied_item_ids[src_item.id]
                 # Forked items keep the source item's original timestamp
                 # (#6924); only the conversation row itself is stamped `now`.
@@ -4249,7 +4333,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "status": src_item.status,
                         "position": pos,
                         "type": src_item.type,
-                        "data": remapped_compaction_data.get(pos, src_item.data),
+                        "data": remapped_compaction_data.get(
+                            pos, remapped_file_data.get(pos, src_item.data)
+                        ),
                         "search_text": src_item.search_text,
                         "created_by": src_item.created_by,
                     }

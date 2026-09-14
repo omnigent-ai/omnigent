@@ -40,6 +40,23 @@ def test_create_with_content_type(file_store: SqlAlchemyFileStore) -> None:
     assert f.content_type == "image/png"
 
 
+def test_create_with_caller_chosen_id(file_store: SqlAlchemyFileStore) -> None:
+    """A caller-chosen file_id is stored verbatim (fork copy pre-allocation)."""
+    chosen = "5b2f8f0f36cd08e10b2f3a89ab6a41d7"
+    f = file_store.create(
+        filename="copy.png",
+        bytes=2048,
+        content_type="image/png",
+        session_id=_SID,
+        file_id=chosen,
+    )
+    assert f.id == chosen
+
+    fetched = file_store.get(chosen, session_id=_SID)
+    assert fetched is not None
+    assert fetched.filename == "copy.png"
+
+
 def test_delete(file_store: SqlAlchemyFileStore) -> None:
     f = file_store.create(filename="temp.txt", bytes=10)
     assert file_store.delete(f.id) is True

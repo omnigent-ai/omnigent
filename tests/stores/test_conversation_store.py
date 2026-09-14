@@ -23,6 +23,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ReasoningData,
+    ResourceEventData,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.session_import import (
@@ -4026,6 +4027,120 @@ def test_fork_conversation_copies_items(
         assert fork_item.response_id == src_item.response_id
         # Data content is identical.
         assert fork_item.data == src_item.data
+
+
+def test_fork_conversation_remaps_file_references(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A fork given a file-id map rewrites copied file references to it.
+
+    Attachment blocks and file resource events referencing a mapped id
+    must point at the fork's own file copy; unmapped ids, non-file
+    resource events, and the source's items stay untouched.
+    """
+    agent_store.create(
+        agent_id="971f31bb0aac3f2d93931ee788150527",
+        name="fork-test",
+        bundle_location="971f31bb0aac3f2d93931ee788150527/fakehash",
+    )
+    source = conversation_store.create_conversation(
+        agent_id="971f31bb0aac3f2d93931ee788150527",
+        title="Original",
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="resource_event",
+                response_id="resp_001",
+                data=ResourceEventData(
+                    event_type="session.resource.created",
+                    resource_id="file_mapped",
+                    resource_type="file",
+                    resource={
+                        "id": "file_mapped",
+                        "object": "session.resource",
+                        "type": "file",
+                        "session_id": source.id,
+                        "name": "photo.png",
+                    },
+                ),
+            ),
+            NewConversationItem(
+                type="resource_event",
+                response_id="resp_001",
+                data=ResourceEventData(
+                    event_type="session.resource.created",
+                    resource_id="terminal_bash_s1",
+                    resource_type="terminal",
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_text", "text": "What is in this image?"},
+                        {
+                            "type": "input_image",
+                            "file_id": "file_mapped",
+                            "filename": "photo.png",
+                        },
+                        {"type": "input_file", "file_id": "file_unmapped"},
+                    ],
+                ),
+            ),
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.id,
+        file_id_map={"file_mapped": "file_fork_copy"},
+    )
+
+    fork_items = {item.type: item for item in conversation_store.list_items(fork.id).data}
+    file_event = next(
+        item.data
+        for item in conversation_store.list_items(fork.id).data
+        if isinstance(item.data, ResourceEventData) and item.data.resource_type == "file"
+    )
+    terminal_event = next(
+        item.data
+        for item in conversation_store.list_items(fork.id).data
+        if isinstance(item.data, ResourceEventData) and item.data.resource_type == "terminal"
+    )
+    message = fork_items["message"].data
+    assert isinstance(message, MessageData)
+
+    # The mapped attachment block points at the fork's copy; unmapped
+    # blocks keep their (possibly dangling) source reference.
+    blocks = {block["type"]: block for block in message.content if isinstance(block, dict)}
+    assert blocks["input_image"]["file_id"] == "file_fork_copy"
+    assert blocks["input_image"]["filename"] == "photo.png"
+    assert blocks["input_file"]["file_id"] == "file_unmapped"
+
+    # The file resource event follows the copy — including the embedded
+    # resource object's identity — while the terminal event is untouched.
+    assert file_event.resource_id == "file_fork_copy"
+    assert file_event.resource is not None
+    assert file_event.resource["id"] == "file_fork_copy"
+    assert file_event.resource["session_id"] == fork.id
+    assert file_event.resource["name"] == "photo.png"
+    assert terminal_event.resource_id == "terminal_bash_s1"
+
+    # The source conversation's items are untouched.
+    source_message = next(
+        item.data
+        for item in conversation_store.list_items(source.id).data
+        if item.type == "message"
+    )
+    assert isinstance(source_message, MessageData)
+    source_blocks = {
+        block["type"]: block for block in source_message.content if isinstance(block, dict)
+    }
+    assert source_blocks["input_image"]["file_id"] == "file_mapped"
 
 
 @pytest.mark.parametrize("up_to_response_id", [None, "resp_001", "resp_002"])

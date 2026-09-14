@@ -39,9 +39,10 @@ class FileStore(ABC):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        file_id: str | None = None,
     ) -> StoredFile:
         """
-        Record a new file. Generates a unique file_id.
+        Record a new file. Generates a unique file_id unless given one.
 
         :param filename: Original filename,
             e.g. ``"report.pdf"``.
@@ -50,6 +51,10 @@ class FileStore(ABC):
             e.g. ``"application/pdf"``.
         :param session_id: Owning session/conversation id. When
             set, the file is session-scoped; ``None`` for global.
+        :param file_id: Caller-chosen id for the new row. A fork
+            pre-allocates ids so the copied conversation items can
+            reference the copies it creates afterwards. ``None``
+            (default) generates a fresh id.
         :returns: The newly created :class:`StoredFile`.
         """
         ...
