@@ -137,6 +137,13 @@ describe("harnessUnavailableReasonOnHost", () => {
     expect(harnessUnavailableReasonOnHost("jcode", hostWith(null))).toBe(null);
     expect(harnessUnavailableReasonOnHost("jcode", hostWith({}))).toBe(null);
   });
+
+  it("never treats the Smart Routing auto sentinel as unconfigured", () => {
+    // "auto" is a client-only sentinel — the daemon never reports a readiness key
+    // for it, so the missing-key branch must not sweep it in (else Smart Routing
+    // gets a spurious "needs setup" badge and is hidden under the toggle).
+    expect(harnessUnavailableReasonOnHost("auto", hostWith({ codex: false }))).toBe(null);
+  });
 });
 
 describe("harnessUnconfiguredOnHost", () => {

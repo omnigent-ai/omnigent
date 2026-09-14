@@ -8,7 +8,7 @@
  * (API key, gateway) add step kinds server-side and appear here for free.
  */
 
-import type { SetupStepWire } from "@/lib/agentLabels";
+import { isAutoHarness, type SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 
@@ -83,9 +83,15 @@ export function harnessUnavailableReasonOnHost(
   // predating a newly-added harness (jcode on a pre-jcode host, which reports
   // devin/grok but omits jcode). Treat it as unconfigured so "hide unconfigured"
   // hides it, instead of failing open and offering a harness the host can't run.
+  // Excludes the client-only Smart Routing "auto" sentinels: the daemon never
+  // reports a readiness key for those, so they must stay selectable and unbadged.
   // An absent/empty map still fails open (the guard above, plus the size check),
   // so a host that reports no readiness at all is never emptied out.
-  if (availability === undefined && Object.keys(host.configured_harnesses).length > 0) {
+  if (
+    availability === undefined &&
+    !isAutoHarness(harness) &&
+    Object.keys(host.configured_harnesses).length > 0
+  ) {
     return "unconfigured";
   }
   return null;
