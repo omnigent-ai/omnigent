@@ -105,6 +105,9 @@ const SAME_AS_SOURCE = "__same__";
 // their own `text-ui`, so the option font is shrunk via a descendant selector
 // on the dropdown content rather than plain inheritance.
 const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
+// The Model row renders cmdk items (command-item), not Radix select items,
+// so it needs its own variant of the same font-size override.
+const FORK_COMMAND_ITEM_SM = "[&_[data-slot=command-item]]:text-sm";
 
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
@@ -474,7 +477,7 @@ function ForkRunConfig({
             models={modelSelectOptions}
             defaultLabel={defaultModelLabel(modelOptions)}
             triggerClassName="text-sm"
-            contentClassName={FORK_SELECT_ITEM_SM}
+            contentClassName={FORK_COMMAND_ITEM_SM}
             componentId="fork_session.config.model"
           >
             {modelsLoading && (
