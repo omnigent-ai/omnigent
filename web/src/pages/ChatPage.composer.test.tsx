@@ -2062,16 +2062,25 @@ describe("Composer asynchronous skills", () => {
     expect(screen.queryByText("Loading skills…")).toBeNull();
   });
 
-  it("recovers a missed notification while loading and stops checking once ready", () => {
+  it("recovers a missed notification once without polling while discovery stays loading", async () => {
     vi.useFakeTimers();
     const original = useChatStore.getState().refreshSkills;
-    const refreshSkills = vi.fn(async () => {});
+    const refreshSkills = vi.fn(async () => {
+      await Promise.resolve();
+      useChatStore.setState({ skills: [], skillsStatus: "loading" });
+    });
     useChatStore.setState({ refreshSkills });
     try {
       render(<Composer {...composerProps()} />);
       fireEvent.change(textarea(), { target: { value: "/review" } });
-      act(() => vi.advanceTimersByTime(5_000));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
       expect(refreshSkills).toHaveBeenCalledExactlyOnceWith(false);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(refreshSkills).toHaveBeenCalledOnce();
       act(() => useChatStore.setState({ skillsStatus: "ready" }));
       act(() => vi.advanceTimersByTime(5_000));
       expect(refreshSkills).toHaveBeenCalledOnce();

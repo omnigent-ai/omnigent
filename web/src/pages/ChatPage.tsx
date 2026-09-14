@@ -2648,10 +2648,10 @@ function ComposerImpl(
 
   useEffect(() => {
     if (!menuOpen || skillsStatus !== "loading") return;
-    // Recover a missed SSE nudge while the user is waiting for this menu.
+    // Recover a missed SSE nudge once while the user is waiting for this menu.
     const timer = window.setTimeout(() => void refreshSkills(false), 5_000);
     return () => window.clearTimeout(timer);
-  }, [menuOpen, skillsStatus, skills, refreshSkills]);
+  }, [menuOpen, skillsStatus, refreshSkills]);
 
   // "@"-mention is a drill-down file/folder browser. The token after "@"
   // doubles as a path: text up to the last "/" is the directory being
