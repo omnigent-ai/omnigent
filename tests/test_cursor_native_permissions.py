@@ -1060,3 +1060,110 @@ class _FakeAsyncCM:
 
     async def __aexit__(self, *_exc: object) -> bool:
         return False
+
+
+async def test_supervise_transcript_follows_session_rotation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A TUI ``/clear`` rebinds the mirror: release old cards, re-park on the new id.
+
+    The forwarder's rotation handshake writes the replacement conversation into
+    ``bridge.json``. This loop must notice, release the card parked against the
+    superseded conversation (its verdict would type into a pane now showing a
+    different chat), re-discover the store, and re-park the still-pending call
+    against the conversation that owns the pane.
+    """
+    monkeypatch.setattr(cnb, "_BRIDGE_ROOT", tmp_path / "omnigent-test" / "cursor-native")
+    bridge_dir = cnb.bridge_dir_for_session_id("conv_old")
+    cnb.write_mcp_bridge_config(bridge_dir)
+    cnb.write_active_session_id(bridge_dir, "conv_old")
+
+    store_old = tmp_path / "old" / "store.db"
+    store_new = tmp_path / "new" / "store.db"
+    for store in (store_old, store_new):
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_bytes(b"")  # exists() check
+    discovered: list[Path] = []
+
+    def _discover(*_a: object, **_k: object) -> Path:
+        # The pane moved to a new chat, so discovery must follow the rebind.
+        store = store_new if cnb.read_active_session_id(bridge_dir) == "conv_new" else store_old
+        discovered.append(store)
+        return store
+
+    monkeypatch.setattr(cnp, "_discover_store", _discover)
+    # The same gate stays pending across the rotation.
+    monkeypatch.setattr(
+        cnp,
+        "read_cursor_pending_tool_calls",
+        lambda _s: [CursorPendingToolCall("call_r", "Delete", {"path": "/x"})],
+    )
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
+
+    posts: list[tuple[str, dict]] = []
+    release = asyncio.Event()
+
+    class _Resp:
+        status_code = 200
+        content = b""
+
+        def json(self) -> dict:
+            return {}
+
+    class _Client:
+        async def post(self, url: str, json: dict | None = None, **_k: object):
+            posts.append((url, json or {}))
+            if "hooks/cursor-permission-request" in url:
+                # No web verdict: stay parked so the card is still active when
+                # the rotation lands.
+                await release.wait()
+            return _Resp()
+
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(_Client()))
+
+    task = asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            poll_interval_s=0.01,
+            settle_s=0.0,  # surface immediately; debounce covered separately
+        )
+    )
+
+    async def _wait(predicate: Callable[[], bool]) -> None:
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if predicate():
+                return
+
+    def _parks(session_id: str) -> list[dict]:
+        url = f"/v1/sessions/{session_id}/hooks/cursor-permission-request"
+        return [body for posted, body in posts if posted == url]
+
+    await _wait(lambda: bool(_parks("conv_old")))
+    assert _parks("conv_old"), "the pending call was never parked against conv_old"
+    old_elicitation = _parks("conv_old")[0]["elicitation_id"]
+
+    # The forwarder's rotation handshake rebinds the pane mid-flight.
+    cnb.write_active_session_id(bridge_dir, "conv_new")
+    await _wait(lambda: bool(_parks("conv_new")))
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    release.set()
+
+    resolved = [
+        (url, body) for url, body in posts if body.get("type") == "external_elicitation_resolved"
+    ]
+    # The verdict is released against whichever conversation parked the card.
+    assert [url for url, _ in resolved] == ["/v1/sessions/conv_old/events"]
+    assert resolved[0][1]["data"]["elicitation_id"] == old_elicitation
+    new_parks = _parks("conv_new")
+    assert new_parks, "the pending call was not re-parked against conv_new"
+    assert new_parks[0]["elicitation_id"] != old_elicitation
+    assert len(_parks("conv_old")) == 1, "conv_old was parked more than once"
+    assert store_new in discovered, "the store was not re-discovered after the rotation"

@@ -371,3 +371,164 @@ class TestForwardLoop:
         # A failed flush must NOT advance persisted state — the turn stays unseen
         # so the next poll retries it (no silent loss).
         assert usage._read_usage_state(tmp_path).seen == set()
+
+
+_TURN3 = {
+    "generation_id": "g3",
+    "model": "claude-4-sonnet",
+    "status": "completed",
+    "input_tokens": 900,
+    "output_tokens": 30,
+    "cache_read_tokens": 800,
+    "cache_write_tokens": 10,
+}
+
+
+def test_reset_totals_keeps_seen_and_model() -> None:
+    """Zeroing the bill must not re-open already-counted turns."""
+    acc = usage._UsageAccumulator(
+        input_tokens=10, output_tokens=2, cache_read_tokens=5, seen={"g1"}, model="m"
+    )
+    acc.reset_totals()
+    assert (acc.input_tokens, acc.output_tokens, acc.cache_read_tokens) == (0, 0, 0)
+    assert acc.seen == {"g1"}
+    assert acc.model == "m"
+
+
+@pytest.mark.asyncio
+async def test_usage_totals_reset_on_session_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``/clear`` rotation re-aims usage at the new conversation, from zero.
+
+    ``external_session_usage`` is cumulative, so carrying the accumulator over
+    would bill the new conversation for the cleared chat's spend. The rotated-to
+    conversation starts at zero while ``seen`` keeps the old turns out of the
+    count, and the zeroed state is persisted immediately so a supervisor restart
+    cannot replay the old totals.
+    """
+    from omnigent.harnesses.cursor_native import bridge as cursor_bridge
+
+    monkeypatch.setattr(
+        cursor_bridge, "_BRIDGE_ROOT", tmp_path / "omnigent-test" / "cursor-native"
+    )
+    bridge_dir = cursor_bridge.bridge_dir_for_session_id("conv_1")
+    cursor_bridge.write_mcp_bridge_config(bridge_dir)
+    cursor_bridge.write_active_session_id(bridge_dir, "conv_1")
+
+    usage.record_usage_payload(bridge_dir, _TURN1)
+    client = _CtxRecordingClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client)
+    task = asyncio.create_task(
+        usage.forward_cursor_usage_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_1",
+            bridge_dir=bridge_dir,
+            poll_interval_s=0.01,
+        )
+    )
+
+    async def _wait(predicate) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline:
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("usage loop condition was not met before timeout")
+
+    try:
+        await _wait(lambda: _usage_posts(client))
+        pre_rotation = len(_usage_posts(client))
+        # The forwarder's rotation handshake rebinds the bridge config; the usage
+        # loop only ever sees this file change.
+        cursor_bridge.write_active_session_id(bridge_dir, "conv_new")
+        usage.record_usage_payload(bridge_dir, _TURN3)
+        await _wait(lambda: len(_usage_posts(client)) > pre_rotation)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    url, body = _usage_posts(client)[-1]
+    assert url == "/v1/sessions/conv_new/events"
+    # Only the post-rotation turn is billed to the new conversation.
+    assert body["data"] == {
+        "cumulative_input_tokens": _TURN3["input_tokens"],
+        "cumulative_output_tokens": _TURN3["output_tokens"],
+        "cumulative_cache_read_input_tokens": _TURN3["cache_read_tokens"],
+        "model": "claude-4-sonnet",
+    }
+    # The cleared chat's turn stays counted-and-closed, so re-reading the
+    # append-only log can never fold it into the new conversation.
+    persisted = usage._read_usage_state(bridge_dir)
+    assert persisted.seen == {"g1", "g3"}
+    assert persisted.input_tokens == _TURN3["input_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_restart_after_rotation_keeps_the_new_conversation_totals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A supervisor restart after a rotation must not re-zero the new totals.
+
+    The supervisor always restarts the loop with the launch-time ``session_id``,
+    which after a rotation is the superseded one. Seeding ``current_session_id``
+    from that would read the already-completed rotation as a fresh one on the
+    first poll and zero totals the new conversation has already been billed —
+    and because ``seen`` keeps those generations, they could never be re-added,
+    so the next cumulative report would move token counts backwards.
+    """
+    from omnigent.harnesses.cursor_native import bridge as cursor_bridge
+
+    monkeypatch.setattr(
+        cursor_bridge, "_BRIDGE_ROOT", tmp_path / "omnigent-test" / "cursor-native"
+    )
+    bridge_dir = cursor_bridge.bridge_dir_for_session_id("conv_old")
+    cursor_bridge.write_mcp_bridge_config(bridge_dir)
+    # The rotation already happened and the new conversation already reported.
+    cursor_bridge.write_active_session_id(bridge_dir, "conv_new")
+    usage.record_usage_payload(bridge_dir, _TURN1)
+    acc = usage._UsageAccumulator()
+    for line in usage._read_usage_lines(bridge_dir):
+        acc.add_line(line)
+    usage._write_usage_state(bridge_dir, acc)
+    assert acc.input_tokens == _TURN1["input_tokens"]
+
+    client = _CtxRecordingClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client)
+    task = asyncio.create_task(
+        usage.forward_cursor_usage_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            poll_interval_s=0.01,
+        )
+    )
+
+    async def _wait(predicate) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline:
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("usage loop condition was not met before timeout")
+
+    try:
+        # A new turn lands after the restart; it must add to the existing totals.
+        usage.record_usage_payload(bridge_dir, _TURN3)
+        await _wait(lambda: _usage_posts(client))
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    url, body = _usage_posts(client)[-1]
+    assert url == "/v1/sessions/conv_new/events"
+    assert body["data"]["cumulative_input_tokens"] == (
+        _TURN1["input_tokens"] + _TURN3["input_tokens"]
+    )
+    assert usage._read_usage_state(bridge_dir).seen == {"g1", "g3"}

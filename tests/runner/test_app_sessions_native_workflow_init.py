@@ -17,7 +17,9 @@ import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native.bridge import CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
@@ -30,12 +32,14 @@ from omnigent.runner.app import (
 from omnigent.runner.native import (
     NativeLaunchContext,
     _cursor_native_bridge_id_for_session,
+    _cursor_native_terminal_arrives_via_transfer,
     _resolve_native_spawn_env,
 )
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
+from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
     _build_app_with_mcp_tool,
     _build_interrupt_app,
@@ -278,6 +282,146 @@ async def test_cursor_native_bridge_id_uses_supplied_labels_without_a_lookup() -
         )
 
     assert bridge_id == "conv_launcher"
+
+
+def _cursor_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bridge_id: str) -> Path:
+    """Point the cursor bridge root at *tmp_path* and return *bridge_id*'s dir."""
+    monkeypatch.setattr(
+        cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "omnigent-test" / "cursor-native"
+    )
+    return cursor_native_bridge.bridge_dir_for_bridge_id(bridge_id)
+
+
+def _cursor_labels_client(bridge_id: str) -> httpx.AsyncClient:
+    """Client whose label lookup names *bridge_id* as the launching conversation."""
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id}})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(_labels_handler), base_url="http://ap")
+
+
+def _registry_owning_cursor_main(owner: str | None, tmp_path: Path) -> SessionResourceRegistry:
+    """Resource registry whose terminal registry has *owner*'s live ``cursor:main``."""
+    terminal_registry = TerminalRegistry()
+    if owner is not None:
+        terminal_registry._by_conversation[owner] = {
+            ("cursor", "main"): TerminalInstance(
+                name="cursor",
+                session_key="main",
+                socket_path=tmp_path / "tmux.sock",
+                private_dir=tmp_path,
+                running=True,
+            )
+        }
+    return SessionResourceRegistry(terminal_registry=terminal_registry)
+
+
+@pytest.mark.asyncio
+async def test_cursor_transfer_guard_true_when_another_session_owns_the_pane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Mid-rotation the bridge still names the terminal-owning conversation.
+
+    The rotation rewrites ``active_session_id`` only AFTER the transfer, so a
+    runner binding the replacement session must skip auto-create — a second
+    ``cursor:main`` would 409 the transfer and loop the rotation.
+    """
+    bridge_dir = _cursor_bridge_dir(monkeypatch, tmp_path, "conv_old")
+    cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+    cursor_native_bridge.write_active_session_id(bridge_dir, "conv_old")
+
+    async with _cursor_labels_client("conv_old") as client:
+        arrives = await _cursor_native_terminal_arrives_via_transfer(
+            server_client=client,
+            session_id="conv_new",
+            resource_registry=_registry_owning_cursor_main("conv_old", tmp_path),
+        )
+
+    assert arrives is True
+
+
+@pytest.mark.asyncio
+async def test_cursor_transfer_guard_false_when_the_session_already_owns_the_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unrotated (or already-rebound) session launches its own pane."""
+    bridge_dir = _cursor_bridge_dir(monkeypatch, tmp_path, "conv_old")
+    cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+    cursor_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+
+    async with _cursor_labels_client("conv_old") as client:
+        arrives = await _cursor_native_terminal_arrives_via_transfer(
+            server_client=client,
+            session_id="conv_new",
+            resource_registry=_registry_owning_cursor_main("conv_new", tmp_path),
+        )
+
+    assert arrives is False
+
+
+@pytest.mark.asyncio
+async def test_cursor_transfer_guard_false_without_a_live_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stale bridge whose pane is gone must not stop auto-create forever."""
+    bridge_dir = _cursor_bridge_dir(monkeypatch, tmp_path, "conv_old")
+    cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+    cursor_native_bridge.write_active_session_id(bridge_dir, "conv_old")
+
+    async with _cursor_labels_client("conv_old") as client:
+        arrives = await _cursor_native_terminal_arrives_via_transfer(
+            server_client=client,
+            session_id="conv_new",
+            resource_registry=_registry_owning_cursor_main(None, tmp_path),
+        )
+
+    assert arrives is False
+
+
+@pytest.mark.asyncio
+async def test_cursor_transfer_guard_false_for_a_fresh_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No bridge config at all (a cold launch) means nothing transfers in."""
+    _cursor_bridge_dir(monkeypatch, tmp_path, "conv_own")
+
+    async with _cursor_labels_client("conv_own") as client:
+        arrives = await _cursor_native_terminal_arrives_via_transfer(
+            server_client=client,
+            session_id="conv_own",
+            resource_registry=_registry_owning_cursor_main("conv_own", tmp_path),
+        )
+
+    assert arrives is False
+
+
+@pytest.mark.asyncio
+async def test_cursor_transfer_guard_false_without_client_or_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Neither the label lookup nor the terminal probe can be skipped."""
+    bridge_dir = _cursor_bridge_dir(monkeypatch, tmp_path, "conv_old")
+    cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+    cursor_native_bridge.write_active_session_id(bridge_dir, "conv_old")
+
+    assert (
+        await _cursor_native_terminal_arrives_via_transfer(
+            server_client=None,
+            session_id="conv_new",
+            resource_registry=_registry_owning_cursor_main("conv_old", tmp_path),
+        )
+        is False
+    )
+    async with _cursor_labels_client("conv_old") as client:
+        assert (
+            await _cursor_native_terminal_arrives_via_transfer(
+                server_client=client,
+                session_id="conv_new",
+                resource_registry=SessionResourceRegistry(terminal_registry=None),
+            )
+            is False
+        )
 
 
 @pytest.mark.asyncio
@@ -2709,3 +2853,34 @@ def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
     assert src.index("clear_kimi_bridge_state(bridge_dir)") < src.rindex(
         "supervise_kimi_forwarder("
     )
+
+
+@pytest.mark.asyncio
+async def test_cursor_transfer_guard_uses_supplied_labels_instead_of_a_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Labels from the init envelope remove the guard's fail-open window.
+
+    Resolving the bridge id over the wire has a one-second budget, and a timeout
+    resolves to the replacement session's own (empty) bridge dir — reporting
+    "no transfer inbound" for a rotation that is in fact inbound, auto-creating a
+    second ``cursor:main``, and 409ing the transfer. The runner already holds the
+    labels, so the common path must not depend on that lookup at all.
+    """
+    bridge_dir = _cursor_bridge_dir(monkeypatch, tmp_path, "conv_old")
+    cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+    cursor_native_bridge.write_active_session_id(bridge_dir, "conv_old")
+
+    def _failing_lookup(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("the guard must not look up labels it was handed")
+
+    transport = httpx.MockTransport(_failing_lookup)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        arrives = await _cursor_native_terminal_arrives_via_transfer(
+            server_client=client,
+            session_id="conv_new",
+            resource_registry=_registry_owning_cursor_main("conv_old", tmp_path),
+            session_labels={CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: "conv_old"},
+        )
+
+    assert arrives is True

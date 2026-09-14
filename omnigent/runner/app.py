@@ -122,6 +122,7 @@ from omnigent.runner.native import (
     _codex_session_needs_runner_terminal,
     _CodexNativeModelOptionsNotReady,
     _cursor_native_bridge_id_for_session,
+    _cursor_native_terminal_arrives_via_transfer,
     _delete_native_bridge_dirs,
     _ensure_native_terminal,
     _ensure_orchestrator_skills_in_bundle,
@@ -4161,7 +4162,35 @@ def create_runner_app(
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
-            elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
+            elif harness_name == "cursor-native":
+                _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
+                    session_id
+                )
+
+                async def _cursor_pre_launch(has_terminal: bool) -> PreLaunchResult:
+                    if not has_terminal:
+                        inbound = await _cursor_native_terminal_arrives_via_transfer(
+                            server_client=server_client,
+                            session_id=session_id,
+                            resource_registry=resource_registry,
+                            # The rotation's bridge label is already here, so the
+                            # guard never falls back to this session's own empty
+                            # bridge dir when a label lookup would have failed.
+                            session_labels=init_context.labels,
+                        )
+                        _logger.info(
+                            "Cursor terminal transfer-inbound check: session=%s "
+                            "terminal_inbound=%s",
+                            session_id,
+                            inbound,
+                            extra={"session_id": session_id},
+                        )
+                        if inbound:
+                            return PreLaunchResult(skip=True)
+                    return PreLaunchResult()
+
+                _launch_pre = _cursor_pre_launch
+            elif harness_name in ("opencode-native", "kimi-native"):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
                 )

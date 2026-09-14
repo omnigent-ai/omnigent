@@ -48,7 +48,11 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cursor_pane_keys
+from omnigent.harnesses.cursor_native.bridge import (
+    capture_cursor_pane,
+    read_active_session_id,
+    send_cursor_pane_keys,
+)
 
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
@@ -261,6 +265,30 @@ async def _post_external_elicitation_resolved(
             )
     except httpx.HTTPError:
         _logger.exception("cursor external_elicitation_resolved POST failed")
+
+
+async def _release_parked_elicitations(
+    client: httpx.AsyncClient, active: dict[str, dict[str, object]]
+) -> None:
+    """Cancel and release every parked card, emptying *active*.
+
+    Called when the pane rotates into a new chat: a card still parked against the
+    superseded conversation would deliver its verdict as keystrokes into a pane
+    that is now showing a different chat.
+
+    :param client: Omnigent HTTP client.
+    :param active: The surfaced-call registry, cleared in place.
+    :returns: None.
+    """
+    for tool_call_id, entry in list(active.items()):
+        task = entry.get("task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+        owner = str(entry.get("session_id") or "")
+        elicitation_id = str(entry.get("elicitation_id") or "")
+        if owner and elicitation_id:
+            await _post_external_elicitation_resolved(client, owner, elicitation_id)
+        active.pop(tool_call_id, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -865,8 +893,25 @@ async def supervise_cursor_transcript_elicitations(
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+        # Which conversation owns the pane right now; re-read every poll below.
+        # Seeded from the bridge so a restart after a ``/clear`` rotation starts
+        # aligned rather than replaying it against the launch-time id.
+        current_session_id = read_active_session_id(bridge_dir) or session_id
         while True:
             try:
+                rotated_from = current_session_id
+                current_session_id = read_active_session_id(bridge_dir) or session_id
+                if current_session_id != rotated_from:
+                    _logger.info(
+                        "cursor elicitation mirror following session rotation; old=%s new=%s",
+                        rotated_from,
+                        current_session_id,
+                    )
+                    await _release_parked_elicitations(client, active)
+                    first_seen.clear()
+                    auto_accept_attempts.clear()
+                    # The pane is on a different chat now; re-discover it.
+                    store_path = None
                 if store_path is None or not store_path.exists():
                     store_path = await asyncio.to_thread(
                         _discover_store, workspace, launch_epoch_ms
@@ -885,7 +930,7 @@ async def supervise_cursor_transcript_elicitations(
                     task = entry["task"]
                     if isinstance(task, asyncio.Task) and not task.done():
                         await _post_external_elicitation_resolved(
-                            client, session_id, str(entry["elicitation_id"])
+                            client, str(entry["session_id"]), str(entry["elicitation_id"])
                         )
                 # Calls that vanished before settling were auto-approved — drop
                 # their debounce timer silently (no card was ever shown).
@@ -895,7 +940,7 @@ async def supervise_cursor_transcript_elicitations(
                         "cursor elicitation: pending call resolved within settle window "
                         "(%.2fs) — no card; session=%s tool_call_id=%s",
                         pending_for,
-                        session_id,
+                        current_session_id,
                         tool_call_id.splitlines()[0],
                     )
                 for tool_call_id in [
@@ -917,7 +962,7 @@ async def supervise_cursor_transcript_elicitations(
                             "session=%s tool_call_id=%s",
                             call.tool_name,
                             settle_s,
-                            session_id,
+                            current_session_id,
                             call.tool_call_id.splitlines()[0],
                         )
                     if now - first < settle_s:
@@ -929,7 +974,7 @@ async def supervise_cursor_transcript_elicitations(
                         outcome = await _yolo_auto_accept(
                             call,
                             bridge_dir=bridge_dir,
-                            session_id=session_id,
+                            session_id=current_session_id,
                             now=now,
                             attempts_by_call=auto_accept_attempts,
                             allow_send=not auto_accepted_this_pass,
@@ -937,17 +982,19 @@ async def supervise_cursor_transcript_elicitations(
                         if outcome is not _YoloAccept.SURFACE_CARD:
                             auto_accepted_this_pass |= outcome is _YoloAccept.SENT
                             continue
-                    elicitation_id = cursor_tool_call_elicitation_id(session_id, call.tool_call_id)
+                    elicitation_id = cursor_tool_call_elicitation_id(
+                        current_session_id, call.tool_call_id
+                    )
                     _logger.debug(
                         "cursor elicitation: surfacing %s; session=%s tool_call_id=%s",
                         call.tool_name,
-                        session_id,
+                        current_session_id,
                         call.tool_call_id.splitlines()[0],
                     )
                     if _is_question_call(call):
                         coro = _run_one_question(
                             client,
-                            session_id=session_id,
+                            session_id=current_session_id,
                             bridge_dir=bridge_dir,
                             call=call,
                             elicitation_id=elicitation_id,
@@ -955,7 +1002,7 @@ async def supervise_cursor_transcript_elicitations(
                     else:
                         coro = _run_one_approval(
                             client,
-                            session_id=session_id,
+                            session_id=current_session_id,
                             bridge_dir=bridge_dir,
                             prompt=_prompt_from_pending(call),
                             elicitation_id=elicitation_id,
@@ -964,6 +1011,9 @@ async def supervise_cursor_transcript_elicitations(
                     active[call.tool_call_id] = {
                         "elicitation_id": elicitation_id,
                         "task": task,
+                        # The card's verdict must be released against whichever
+                        # conversation parked it, not whatever owns the pane later.
+                        "session_id": current_session_id,
                     }
                     first_seen.pop(call.tool_call_id, None)
             except asyncio.CancelledError:
@@ -971,7 +1021,7 @@ async def supervise_cursor_transcript_elicitations(
             except Exception:
                 _logger.exception(
                     "cursor transcript elicitation poll failed; session=%s bridge_dir=%s",
-                    session_id,
+                    current_session_id,
                     bridge_dir,
                 )
             await asyncio.sleep(poll_interval_s)
