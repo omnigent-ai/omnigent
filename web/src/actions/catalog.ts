@@ -135,6 +135,11 @@ const definitions = [
     palette: false,
   },
   {
+    id: "composer.action.dismissSidechat",
+    title: "Dismiss side chat",
+    category: "Composer",
+  },
+  {
     id: "composer.action.stop",
     title: "Stop response",
     category: "Composer",

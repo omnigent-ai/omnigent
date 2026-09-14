@@ -17,7 +17,13 @@ import {
 } from "@testing-library/react";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ActionsProvider, KeybindingDispatcher } from "@/actions";
+import {
+  ActionScope,
+  ActionsProvider,
+  HANDLED,
+  KeybindingDispatcher,
+  useRegisterAction,
+} from "@/actions";
 import { useChatStore } from "@/store/chatStore";
 import {
   clearSessionDrafts,
@@ -227,6 +233,49 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
 }
 
 describe("Composer Escape interrupt", () => {
+  it("dismisses a settled /btw overlay before closing the focused file", () => {
+    const original = useChatStore.getState();
+    const props = composerProps();
+    const closeFile = vi.fn(() => HANDLED);
+    const dismiss = vi.fn(() => useChatStore.setState({ btwSidechat: null }));
+    function FileCloseAction() {
+      useRegisterAction("file.action.close", { acceptsKeybindings: true, run: closeFile });
+      return null;
+    }
+    useChatStore.setState({
+      btwSidechat: { question: "/btw hi", answer: "Hi!", truncated: false },
+      dismissBtwSidechat: dismiss,
+    });
+    try {
+      render(
+        <>
+          <Composer {...props} />
+          <ActionScope mode="fileViewer" context={{ fileSearchOpen: false }}>
+            <div>
+              <FileCloseAction />
+              <button type="button">Focused file</button>
+            </div>
+          </ActionScope>
+        </>,
+      );
+      const file = screen.getByRole("button", { name: "Focused file" });
+      act(() => file.focus());
+      fireEvent.keyDown(file, { key: "Escape" });
+      expect(dismiss).toHaveBeenCalledOnce();
+      expect(closeFile).not.toHaveBeenCalled();
+      expect(props.onStop).not.toHaveBeenCalled();
+      expect(useChatStore.getState().btwSidechat).toBeNull();
+      fireEvent.keyDown(file, { key: "Escape" });
+      expect(closeFile).toHaveBeenCalledOnce();
+    } finally {
+      cleanup();
+      useChatStore.setState({
+        btwSidechat: original.btwSidechat,
+        dismissBtwSidechat: original.dismissBtwSidechat,
+      });
+    }
+  });
+
   beforeEach(() => {
     clearSessionDrafts();
     useChatStore.setState({ conversationId: "conv_escape", blocks: [] });
@@ -435,7 +484,7 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
-    expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
+    expect(tooltipKeys(tooltip)).toEqual(["Ctrl+↵"]);
   });
 
   it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {

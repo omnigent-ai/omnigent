@@ -1,9 +1,11 @@
 // Compact, read-only reference for the live effective keymap. Editing lives in Settings.
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   ACTION_CATALOG,
   HANDLED,
+  and,
   contextsMayOverlap,
+  equals,
   isMacKeyboardPlatform,
   isReservedEscapeSequence,
   keybindingEnvironmentExpression,
@@ -19,33 +21,38 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { useIsEmbedded } from "@/lib/embedded";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { KEYBINDING_MODE_LABELS, KeybindingSequence } from "./keybindings/KeybindingSequence";
-
-export const KEYBOARD_SHORTCUTS_EVENT = "omnigent:open-keyboard-shortcuts";
-
-/** Dispatch the open event — used by menu entries that can't reach the state. */
-export function openKeyboardShortcuts(): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
-}
 
 function useCompactEffectiveBindings() {
   const snapshot = useKeybindingSnapshot();
   const native = isNativeShell();
   const embedded = useIsEmbedded();
   const isMac = isMacKeyboardPlatform();
+  const submitWithModEnter = readSubmitWithModEnter();
   return useMemo(() => {
     const environment = keybindingEnvironmentExpression({
       isMac,
       isNativeShell: native,
       isEmbedded: embedded,
     });
+    const composerSendEnvironment = and(
+      environment,
+      equals("composerSuggestionsOpen", false),
+      equals("composerEnterInserts", false),
+      equals("composerSubmitWithModEnter", submitWithModEnter),
+    );
     const firstByAction = new Map<ActionId, KeybindingRule>();
     const customizedActions = new Set<ActionId>();
     for (const rule of snapshot.effectiveRules) {
-      if (isReservedEscapeSequence(rule.sequence) || !contextsMayOverlap(rule.when, environment))
+      const ruleEnvironment =
+        rule.action === "composer.action.send" ? composerSendEnvironment : environment;
+      if (
+        isReservedEscapeSequence(rule.sequence) ||
+        !contextsMayOverlap(rule.when, ruleEnvironment)
+      )
         continue;
       if (!firstByAction.has(rule.action)) firstByAction.set(rule.action, rule);
       if (rule.origin === "user") customizedActions.add(rule.action);
@@ -57,7 +64,7 @@ function useCompactEffectiveBindings() {
       }
       return [{ definition, rule }];
     });
-  }, [embedded, isMac, native, snapshot.effectiveRules]);
+  }, [embedded, isMac, native, snapshot.effectiveRules, submitWithModEnter]);
 }
 
 /** Effective shortcut reference grouped by catalog category. */
@@ -116,12 +123,6 @@ export function KeyboardShortcutsDialog() {
       return HANDLED;
     },
   });
-
-  useEffect(() => {
-    const onOpenEvent = () => setOpen(true);
-    window.addEventListener(KEYBOARD_SHORTCUTS_EVENT, onOpenEvent);
-    return () => window.removeEventListener(KEYBOARD_SHORTCUTS_EVENT, onOpenEvent);
-  }, []);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>

@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -255,6 +256,7 @@ export function CommentsPanel({
                   if (pendingBodyRef) pendingBodyRef.current = e.target.value;
                 }}
                 onKeyDown={(e) => {
+                  if (isImeCompositionKeyEvent(e)) return;
                   if (e.key === "Enter" && !e.shiftKey && body.trim()) {
                     e.preventDefault();
                     onAddComment(body.trim());
@@ -442,8 +444,17 @@ function CommentCard({
             value={editBody}
             onChange={(e) => setEditBody(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) saveEdit();
-              if (e.key === "Escape") setEditing(false);
+              if (isImeCompositionKeyEvent(e)) return;
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                e.stopPropagation();
+                saveEdit();
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setEditing(false);
+              }
             }}
           />
           <div className="flex gap-1.5">

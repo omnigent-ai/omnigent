@@ -129,6 +129,7 @@ describe("default keybindings", () => {
         "chat.action.acceptApproval",
         "composer.action.commitDictation",
         "composer.action.cancelDictation",
+        "composer.action.dismissSidechat",
         "file.action.find",
         "file.action.save",
         "terminal.action.sendSequence",

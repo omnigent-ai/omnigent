@@ -84,6 +84,7 @@ export type {
   ActionIconName,
   ArglessActionId,
   ActionSource,
+  ContextExpression,
   ContextPatch,
   ContextSnapshot,
   JsonValue,

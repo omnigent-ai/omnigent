@@ -250,6 +250,14 @@ export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
     mode: "composer",
     when: composerEnterSends,
   }),
+  rule("composer.dismissSidechat", "composer.action.dismissSidechat", "escape", {
+    mode: "composer",
+    activation: "active",
+    when: when(CONTEXT_KEYS.composerSidechatOpen),
+    phase: "capture",
+    priority: 300,
+    stopPropagation: true,
+  }),
   rule("composer.stop", "composer.action.stop", "escape", {
     mode: "composer",
     when: when(CONTEXT_KEYS.composerStreaming),

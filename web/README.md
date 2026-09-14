@@ -152,6 +152,8 @@ alone.
 - shadcn/ui (`radix-nova` preset, neutral base, CSS variables)
 - TanStack Query, Zustand, React Router v7
 - streamdown (+ `@streamdown/code`, `@streamdown/math`, `@streamdown/mermaid`),
-  shiki, framer-motion, cmdk, react-hotkeys-hook, use-stick-to-bottom,
+  shiki, framer-motion, cmdk, use-stick-to-bottom,
   next-themes, react-hook-form, zod
 - Lint: oxlint. Format: prettier.
+
+Application commands and keyboard routing are documented in [`src/actions/README.md`](src/actions/README.md).

@@ -19,6 +19,7 @@ export const ACTION_IDS = [
   "chat.action.openNextMessage",
   "composer.action.send",
   "composer.action.stop",
+  "composer.action.dismissSidechat",
   "composer.action.recallPrevious",
   "composer.action.recallNext",
   "composer.action.selectPreviousSuggestion",
@@ -155,6 +156,7 @@ export interface ActionContextValues {
   markdownEditorFocus: boolean;
   eventMeta: boolean;
   composerStreaming: boolean;
+  composerSidechatOpen: boolean;
   composerSuggestionsOpen: boolean;
   composerEnterInserts: boolean;
   composerSubmitWithModEnter: boolean;

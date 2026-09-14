@@ -28,18 +28,19 @@ import {
   XIcon,
 } from "lucide-react";
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useFormattedActionKeybinding } from "@/hooks/useFormattedActionKeybinding";
 import {
   ActionScopeProvider,
   HANDLED,
+  and,
+  equals,
   NOT_HANDLED,
   useActionScopeRegistration,
+  useRegisterAction,
   type ActionSource,
 } from "@/actions";
 import { ComposerActionBindings } from "@/components/ComposerActionBindings";
-import {
-  composerSendShortcutKeys,
-  KeyboardShortcutTooltipContent,
-} from "@/components/KeyboardShortcut";
+import { KeyboardShortcutTooltipContent } from "@/components/KeyboardShortcut";
 import { useNavigate, useParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
@@ -2345,20 +2346,6 @@ function ComposerImpl(
   // the side chat is modal (like the terminal overlay), so the next input is
   // Esc / ✕ to dismiss it, not a new message.
   const composerLockedByBtw = btwSidechat !== null;
-  // The composer's own Escape handler can't fire while the textarea is
-  // disabled (disabled inputs emit no keydown), so close the overlay from a
-  // document-level Escape while it's open — matching native Claude Code.
-  useEffect(() => {
-    if (!composerLockedByBtw) return;
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        dismissBtwSidechat();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [composerLockedByBtw, dismissBtwSidechat]);
   // The conversation whose draft the composer's value/files currently hold.
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
@@ -2546,6 +2533,14 @@ function ComposerImpl(
   const isMobile = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
   const preventsKeyboardSubmit = isMobile || isCoarsePointer;
+  const sendShortcut = useFormattedActionKeybinding("composer.action.send", {
+    mode: "composer",
+    context: and(
+      equals("composerSuggestionsOpen", false),
+      equals("composerEnterInserts", preventsKeyboardSubmit),
+      equals("composerSubmitWithModEnter", submitWithModEnter),
+    ),
+  });
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 
@@ -3250,9 +3245,19 @@ function ComposerImpl(
     mode: "composer",
     context: {
       composerStreaming: Boolean(btwSidechat) || (isWorking && !isReadOnly),
+      composerSidechatOpen: composerLockedByBtw,
       composerSuggestionsOpen: mentionOpen || slashSuggestionsVisible,
       composerEnterInserts: preventsKeyboardSubmit,
       composerSubmitWithModEnter: submitWithModEnter,
+    },
+  });
+  useRegisterAction("composer.action.dismissSidechat", {
+    scope: composerScope.id,
+    acceptsKeybindings: true,
+    isEnabled: () => composerLockedByBtw,
+    run: () => {
+      dismissBtwSidechat();
+      return HANDLED;
     },
   });
   const isComposingRef = useRef(false);
@@ -3769,7 +3774,7 @@ function ComposerImpl(
                     {!showInterruptButton && !preventsKeyboardSubmit && (
                       <KeyboardShortcutTooltipContent
                         label="Send"
-                        keys={composerSendShortcutKeys(submitWithModEnter)}
+                        keys={sendShortcut ? [sendShortcut] : []}
                       />
                     )}
                   </Tooltip>

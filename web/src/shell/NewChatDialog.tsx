@@ -99,11 +99,14 @@ import { randomUUID } from "@/lib/randomUUID";
 import {
   ActionScopeProvider,
   HANDLED,
+  and,
+  equals,
   NOT_HANDLED,
   useActionScopeRegistration,
   type ActionSource,
 } from "@/actions";
 import { ComposerActionBindings } from "@/components/ComposerActionBindings";
+import { useFormattedActionKeybinding } from "@/hooks/useFormattedActionKeybinding";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -294,10 +297,7 @@ import { PoweredByOmnigent } from "@/components/PoweredByOmnigent";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
-import {
-  composerSendShortcutKeys,
-  KeyboardShortcutTooltipContent,
-} from "@/components/KeyboardShortcut";
+import { KeyboardShortcutTooltipContent } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
@@ -2089,6 +2089,14 @@ export function NewChatLandingScreen() {
   const isCoarsePointer = useIsCoarsePointer();
   const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
+  const sendShortcut = useFormattedActionKeybinding("composer.action.send", {
+    mode: "composer",
+    context: and(
+      equals("composerSuggestionsOpen", false),
+      equals("composerEnterInserts", preventsKeyboardSubmit),
+      equals("composerSubmitWithModEnter", submitWithModEnter),
+    ),
+  });
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
   // submit the form and would otherwise bypass the Button entirely.
@@ -6375,7 +6383,7 @@ export function NewChatLandingScreen() {
                           ) : !creating && !preventsKeyboardSubmit ? (
                             <KeyboardShortcutTooltipContent
                               label="Start session"
-                              keys={composerSendShortcutKeys(submitWithModEnter)}
+                              keys={sendShortcut ? [sendShortcut] : []}
                             />
                           ) : null}
                         </Tooltip>
