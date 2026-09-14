@@ -22,14 +22,28 @@ a scan of built container images or a replacement for the contributor security
 scan below. A separate `dev-tools` scan covers `dev/omnidev/Cargo.lock`, because
 Trivy excludes root-level `dev/` directories from its filesystem traversal.
 
-The initial rollout is **report-only**: vulnerabilities do not fail CI, but
-scanner or report-generation errors do. A green check does not mean there are
-no CVEs. Open the workflow's **Trivy CVE Scan** jobs to read the tables, or
-download the **trivy-cve-report-repository** and **trivy-cve-report-dev-tools**
-artifacts (retained for 30 days) for text, JSON, and SARIF reports. SARIF is
-provided as an artifact, not uploaded to GitHub code scanning; this keeps the
-workflow read-only and usable on fork PRs without additional security-product
-configuration or credentials.
+The initial rollout is **report-only**: vulnerabilities do not fail the Trivy
+jobs, but scanner, report-generation, or upload errors do. A green check does
+not mean there are no CVEs. SARIF results are published to
+[Security > Code scanning](https://github.com/omnigent-ai/omnigent/security/code-scanning)
+with stable categories `trivy-repository` and `trivy-dev-tools`. Source paths
+resolve against the scanned directory so development-tool alerts link to files
+under `dev/`. Uploading alerts does not itself configure a merge-blocking rule;
+any existing repository code-scanning rules still apply.
+
+Only the scan jobs request `security-events: write`; the contributor security
+gate remains read-only. Uploads use the built-in GitHub token, including the
+supported `pull_request` upload path for read-only fork tokens, never
+`pull_request_target` or a personal access token. Maintainers must allow code
+scanning in repository settings. Public repositories do not need a paid Code
+Security license; private forks require the applicable feature access.
+
+Open the workflow's **Trivy CVE Scan** jobs to read the tables, or download the
+**trivy-cve-report-repository** and **trivy-cve-report-dev-tools** artifacts
+(retained for 30 days) for text, JSON, and SARIF reports. Artifacts are uploaded
+before code-scanning submission, so reports remain available if GitHub rejects
+SARIF or code scanning is unavailable. An upload failure stays visible as a
+failed check rather than silently hiding missing Security-tab results.
 
 To reproduce locally with Trivy **v0.74.0**, from the repository root:
 

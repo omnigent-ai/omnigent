@@ -24,6 +24,9 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
     strategy:
       fail-fast: false
       matrix:
@@ -62,14 +65,29 @@ jobs:
       - name: Render vulnerability reports
         env:
           REPORT_DIR: ${{ runner.temp }}
+          SCAN_PATH: ${{ matrix.path }}
         run: |
           trivy convert --scanners vuln --format table --output "$REPORT_DIR/trivy-results.txt" "$REPORT_DIR/trivy-results.json"
           trivy convert --format sarif --output "$REPORT_DIR/trivy-results.sarif" "$REPORT_DIR/trivy-results.json"
+          # Converted SARIF must resolve paths against the scanned source, not the JSON file.
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["REPORT_DIR"]) / "trivy-results.sarif"
+          report = json.loads(path.read_text())
+          source = Path(os.environ["GITHUB_WORKSPACE"]) / os.environ["SCAN_PATH"]
+          for run in report["runs"]:
+              run["originalUriBaseIds"]["ROOTPATH"]["uri"] = source.resolve().as_uri() + "/"
+          path.write_text(json.dumps(report) + "\n")
+          PY
           cat "$REPORT_DIR/trivy-results.txt"
           {
             echo '## Trivy CVE scan (report-only)'
             echo
             echo 'Findings do not fail this check. All severities, unfixed vulnerabilities, and development dependencies are included.'
+            echo 'Successful SARIF uploads appear under **Security > Code scanning**, categorized as **trivy-repository** and **trivy-dev-tools**.'
             echo 'Download the **trivy-cve-report-repository** and **trivy-cve-report-dev-tools** artifacts for readable tables, JSON inventories, and SARIF reports.'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -84,3 +102,12 @@ jobs:
             ${{ runner.temp }}/trivy-results.sarif
           if-no-files-found: error
           retention-days: 30
+
+      # pull_request uploads also support GitHub's read-only token for fork PRs.
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@c35d1b164463ee62a100735382aaaa525c5d3496  # codeql-bundle-v2.25.6
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-results.sarif
+          checkout_path: ${{ github.workspace }}
+          category: trivy-${{ matrix.scope }}
+          wait-for-processing: true
