@@ -91,3 +91,23 @@ async def test_forward_side_chat_turn_falls_through_without_thread_or_parent() -
     assert await orch._forward_codex_side_chat_turn(conv_no_parent, body, client) is None
 
     assert client.posts == []  # nothing forwarded when it should fall through
+
+
+def test_codex_subagent_labels_mark_a_side_chat_child() -> None:
+    # The harness sends `side_chat: True` for a /side fork; the server stamps a
+    # dedicated label so the child can be classified in session.created. An
+    # ordinary sub-agent carries no such label.
+    from omnigent.server.routes._sessions import helpers
+    from omnigent.server.routes._sessions.common import (
+        _CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY,
+    )
+
+    side = helpers._codex_subagent_labels_from_body(
+        "thread_side", SimpleNamespace(data={"side_chat": True, "agent_nickname": "Side chat"})
+    )
+    assert side[_CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY] == "true"
+
+    normal = helpers._codex_subagent_labels_from_body(
+        "thread_x", SimpleNamespace(data={"agent_nickname": "gpt"})
+    )
+    assert _CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY not in normal

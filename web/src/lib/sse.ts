@@ -861,6 +861,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       childSessionId,
       agentId: typeof data.agent_id === "string" ? data.agent_id : null,
       parentSessionId: typeof data.parent_session_id === "string" ? data.parent_session_id : null,
+      ...(typeof data.is_side_chat === "boolean" ? { isSideChat: data.is_side_chat } : {}),
     } satisfies SessionCreatedEvent;
   }
   if (eventType === "session.superseded") {

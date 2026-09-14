@@ -6716,6 +6716,44 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(parent.get().sideChatRailRequest).toBeNull();
     });
 
+    it("ignores a concurrent normal sub-agent (isSideChat false) and keeps the latch armed", () => {
+      // A /side is pending on this parent, but the event that arrives first is
+      // an ORDINARY sub-agent (isSideChat false). It must not consume the latch
+      // or navigate — the real side-chat child (isSideChat true) still will.
+      const parent = bindConversationForTest("conv_race", {
+        awaitingSideChatFor: "conv_race",
+        sideChatRailRequest: null,
+      });
+      useChatStore.setState({ redirectToConversationId: null });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_race",
+        childSessionId: "conv_normal_subagent",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_race",
+        isSideChat: false,
+      } as SessionCreatedEvent);
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      expect(parent.get().sideChatRailRequest).toBeNull();
+      expect(parent.get().awaitingSideChatFor).toBe("conv_race"); // still armed
+
+      // The real side-chat fork (isSideChat true) then opens it.
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_race",
+        childSessionId: "conv_side",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_race",
+        isSideChat: true,
+      } as SessionCreatedEvent);
+
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_side");
+      expect(parent.get().sideChatRailRequest).toBe("conv_side");
+      expect(parent.get().awaitingSideChatFor).toBeNull();
+    });
+
     it("is a no-op (sub-agent rendering is future work — R8)", () => {
       useChatStore.setState({ awaitingSideChatFor: null });
       const before = useChatStore.getState();
