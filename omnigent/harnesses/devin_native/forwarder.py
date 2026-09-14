@@ -47,11 +47,12 @@ from omnigent.harnesses.devin_native.bridge import (
     write_forwarder_ready,
 )
 from omnigent.harnesses.devin_native.subagents import (
-    completed_agent_ids,
+    chain_index_for_report,
+    completed_agent_reports,
     devin_sessions_db_path,
     load_message_nodes,
     parse_spawned_agent_id,
-    reconstruct_transcript_nodes,
+    reconstruct_transcript_chains,
     transcript_items,
 )
 from omnigent.native._native_post_delivery import post_external_session_status
@@ -424,21 +425,30 @@ async def _mirror_completed_subagents(
     nodes = load_message_nodes(db_path, state.devin_session_id)
     if not nodes:
         return
-    completed: set[str] = set()
+    reports: dict[str, str] = {}
     for node in nodes:
         message = node.get("chat_message")
         content = message.get("content") if isinstance(message, Mapping) else None
         if isinstance(content, str) and "subagent_completion_notification" in content:
-            completed.update(completed_agent_ids(content))
+            reports.update(completed_agent_reports(content))
+    # Sub-agents sharing a task text each own one chain, so claim a chain per
+    # agent (by its own report) instead of mirroring one chain into every child.
+    chains_by_task: dict[str, list[list[_JsonObject]]] = {}
+    claimed_by_task: dict[str, set[int]] = {}
     for agent_id, info in pending.items():
-        if agent_id not in completed:
+        if agent_id not in reports:
             continue
         task = info.get("task")
         if not isinstance(task, str):
             continue
-        chain = reconstruct_transcript_nodes(nodes, task)
-        if not chain:
+        if task not in chains_by_task:
+            chains_by_task[task] = reconstruct_transcript_chains(nodes, task)
+        claimed = claimed_by_task.setdefault(task, set())
+        index = chain_index_for_report(chains_by_task[task], reports[agent_id], claimed)
+        if index is None:
             continue
+        claimed.add(index)
+        chain = chains_by_task[task][index]
         try:
             child_id = await _start_subagent_child(
                 client,

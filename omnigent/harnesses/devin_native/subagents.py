@@ -20,11 +20,15 @@ sub-agents):
   ``<subagent_completion_notification>``; sub-agent nodes carry no id of their
   own. So ``(task -> agent_id)`` comes from the tool stream and keys the chain.
 * The forest also stores compaction/streaming snapshots — several dead-end
-  copies of the same task root. Walking ``parent_node_id`` *up* from a chain's
-  leaf sidesteps that entirely: a leaf has exactly one ancestor path, so the
-  canonical (executed) chain is simply the **longest** leaf-chain whose ancestry
-  contains the task. ``subagent_heads`` (the live ``agent_id -> head`` table) is
-  empty once a background sub-agent has been collected, so it is not relied on.
+  copies of the same task root. Walking ``parent_node_id`` *up* from a leaf
+  sidesteps that: a leaf has exactly one ancestor path, so per task root the
+  **longest** leaf-chain is the executed one.
+* Sub-agents spawned with the SAME task text get one chain each, so the chains
+  are kept apart (:func:`reconstruct_transcript_chains`) and matched to their
+  ``agent_id`` by the final report the parent's
+  ``<subagent_completion_notification>`` quotes — the only place the two meet.
+  ``subagent_heads`` (the live ``agent_id -> head`` table) is empty once a
+  background sub-agent has been collected, so it is not relied on.
 
 The pure functions here (:func:`reconstruct_transcript_nodes`,
 :func:`transcript_items`, the parsers) are exercised against a captured fixture
@@ -38,7 +42,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -53,6 +57,14 @@ READ_SUBAGENT_TOOL = "read_subagent"
 _SPAWNED_ID_RE = re.compile(r"agent_id=([0-9A-Za-z_-]+)")
 # The parent's completion notification names the finished sub-agent.
 _COMPLETED_ID_RE = re.compile(r"\[Background subagent with agent_id=([0-9A-Za-z_-]+) completed\]")
+#: One completion notification's ``agent_id`` plus the report body after it, up to
+#: the next notification or the closing tag. That body is the sub-agent's own
+#: final text, so it says which chain belongs to which agent.
+_COMPLETION_REPORT_RE = re.compile(
+    r"\[Background subagent with agent_id=([0-9A-Za-z_-]+) completed\]\s*(.*?)"
+    r"(?=\[Background subagent with agent_id=|</subagent_completion_notification>|\Z)",
+    re.DOTALL,
+)
 
 
 def devin_sessions_db_path(source_env: Mapping[str, str]) -> Path | None:
@@ -94,6 +106,22 @@ def completed_agent_ids(text: str | None) -> list[str]:
     :returns: Every completed sub-agent id found, in order.
     """
     return _COMPLETED_ID_RE.findall(text or "")
+
+
+def completed_agent_reports(text: str | None) -> dict[str, str]:
+    """Return ``{agent_id: final report}`` for the completions named in *text*.
+
+    A sub-agent's own chain carries no id, so its report — quoted verbatim in the
+    parent's notification — is what identifies its chain when several sub-agents
+    share one task.
+
+    :param text: A ``<subagent_completion_notification>`` body (or any text that
+        embeds one).
+    :returns: Completed sub-agent id -> its report text (possibly empty).
+    """
+    return {
+        agent_id: report.strip() for agent_id, report in _COMPLETION_REPORT_RE.findall(text or "")
+    }
 
 
 def load_message_nodes(db_path: Path, session_id: str) -> list[_JsonObject]:
@@ -153,23 +181,29 @@ def _role(node: Mapping[str, object]) -> str:
     return ""
 
 
-def reconstruct_transcript_nodes(nodes: Sequence[_JsonObject], task: str) -> list[_JsonObject]:
-    """Return the canonical node chain for the sub-agent whose task is *task*.
+def reconstruct_transcript_chains(
+    nodes: Sequence[_JsonObject], task: str
+) -> list[list[_JsonObject]]:
+    """Return every executed sub-agent chain whose first user node is *task*.
 
-    Walks ``parent_node_id`` up from every leaf and keeps the longest chain whose
-    ancestry contains a ``user`` node equal to *task* — the executed chain, not a
-    compaction snapshot. The result is sliced to start at that task node, so the
-    boilerplate ``"You are a subagent"`` system prefix is dropped and the child
-    transcript opens with the sub-agent's own prompt.
+    One list per sub-agent: Devin gives each ``run_subagent`` delegate its own
+    chain, so N delegates launched with the SAME task text produce N chains that
+    only their content tells apart. Chains are grouped by their task node (the
+    chain root) and the longest leaf-walk per root wins — a root's compaction
+    snapshots are strictly shorter than the chain they copied. Roots that never
+    produced assistant text are dropped (snapshot stubs, not runs). Each chain is
+    sliced to start at its task node, so the ``"You are a subagent"`` system
+    prefix is dropped and the child transcript opens with the sub-agent's prompt.
 
     :param nodes: A session's ``message_nodes`` (as :func:`load_message_nodes`
-        returns).
+        returns), in ``node_id`` order.
     :param task: The ``run_subagent`` ``task`` text, which equals the sub-agent's
         first user message verbatim.
-    :returns: The transcript nodes from the task node to the chain leaf, or ``[]``
-        when no chain matches (e.g. the sub-agent has not run yet).
+    :returns: Chains in Devin's append order (i.e. spawn order), or ``[]`` when
+        none has run yet.
     """
     by_id: dict[object, _JsonObject] = {n["node_id"]: n for n in nodes}
+    order: dict[object, int] = {n["node_id"]: i for i, n in enumerate(nodes)}
     has_child: set[object] = {
         n["parent_node_id"] for n in nodes if n["parent_node_id"] is not None
     }
@@ -186,23 +220,82 @@ def reconstruct_transcript_nodes(nodes: Sequence[_JsonObject], task: str) -> lis
         chain.reverse()
         return chain
 
-    best: list[object] | None = None
+    longest_by_root: dict[object, list[object]] = {}
     for leaf in leaves:
         chain = chain_up(leaf)
-        if any(_role(by_id[x]) == "user" and _content(by_id[x]) == task for x in chain):
-            if best is None or len(chain) > len(best):
-                best = chain
-    if best is None:
-        return []
-    start = next(
-        (
-            i
-            for i, x in enumerate(best)
-            if _role(by_id[x]) == "user" and _content(by_id[x]) == task
-        ),
-        0,
-    )
-    return [by_id[x] for x in best[start:]]
+        start = next(
+            (
+                i
+                for i, x in enumerate(chain)
+                if _role(by_id[x]) == "user" and _content(by_id[x]) == task
+            ),
+            None,
+        )
+        if start is None:
+            continue
+        sliced = chain[start:]
+        root = sliced[0]
+        if len(sliced) > len(longest_by_root.get(root, [])):
+            longest_by_root[root] = sliced
+    return [
+        [by_id[x] for x in sliced]
+        for _root, sliced in sorted(longest_by_root.items(), key=lambda kv: order[kv[0]])
+        if any(_role(by_id[x]) == "assistant" and _content(by_id[x]).strip() for x in sliced)
+    ]
+
+
+def reconstruct_transcript_nodes(nodes: Sequence[_JsonObject], task: str) -> list[_JsonObject]:
+    """Return one canonical node chain for the sub-agent whose task is *task*.
+
+    Convenience wrapper over :func:`reconstruct_transcript_chains` that keeps the
+    longest chain. Prefer the plural form when several sub-agents may share a task
+    text, or they all collapse onto one transcript.
+
+    :param nodes: A session's ``message_nodes``.
+    :param task: The ``run_subagent`` ``task`` text.
+    :returns: The transcript nodes from the task node to the chain leaf, or ``[]``
+        when no chain matches (e.g. the sub-agent has not run yet).
+    """
+    chains = reconstruct_transcript_chains(nodes, task)
+    return max(chains, key=len) if chains else []
+
+
+def final_assistant_text(chain: Sequence[_JsonObject]) -> str:
+    """Return *chain*'s last non-empty assistant message text."""
+    text = ""
+    for node in chain:
+        if _role(node) == "assistant" and _content(node).strip():
+            text = _content(node)
+    return text
+
+
+def chain_index_for_report(
+    chains: Sequence[Sequence[_JsonObject]],
+    report: str,
+    claimed: Collection[int] = (),
+) -> int | None:
+    """Return which of *chains* produced *report*, skipping *claimed* ones.
+
+    Same-task sub-agents are told apart only by content, and the parent's
+    completion notification quotes each one's final message — so match that against
+    each chain's last assistant text. Falls back to the first unclaimed chain
+    (spawn order) when nothing matches, so a child still mirrors a real transcript
+    rather than none.
+
+    :param chains: Candidate chains from :func:`reconstruct_transcript_chains`.
+    :param report: The agent's report from :func:`completed_agent_reports`.
+    :param claimed: Indices already assigned to other sub-agents.
+    :returns: Index into *chains*, or ``None`` when every chain is claimed.
+    """
+    wanted = " ".join(report.split())
+    if wanted:
+        for index, chain in enumerate(chains):
+            if index in claimed:
+                continue
+            final = " ".join(final_assistant_text(chain).split())
+            if final and (final == wanted or final in wanted or wanted in final):
+                return index
+    return next((i for i in range(len(chains)) if i not in claimed), None)
 
 
 def transcript_items(

@@ -15,10 +15,15 @@ import sqlite3
 from pathlib import Path
 
 from omnigent.harnesses.devin_native.subagents import (
+    SUBAGENT_ROOT_PREFIX,
+    chain_index_for_report,
     completed_agent_ids,
+    completed_agent_reports,
     devin_sessions_db_path,
+    final_assistant_text,
     load_message_nodes,
     parse_spawned_agent_id,
+    reconstruct_transcript_chains,
     reconstruct_transcript_nodes,
     transcript_items,
 )
@@ -188,3 +193,100 @@ class TestLoadMessageNodes:
 
     def test_missing_db_is_empty(self, tmp_path: Path) -> None:
         assert load_message_nodes(tmp_path / "absent.db", "s1") == []
+
+
+def _node(node_id: int, parent: int | None, role: str, content: str) -> dict[str, object]:
+    return {
+        "node_id": node_id,
+        "parent_node_id": parent,
+        "chat_message": {"role": role, "content": content},
+    }
+
+
+# Two delegates launched with the SAME task text (Devin's `run_subagent` fan-out
+# of one identical prompt), plus the two artifacts the real forest carries: a
+# duplicate streaming leaf off one chain, and a bare task node never answered.
+_SHARED_TASK = "Tell me a single short joke. Reply with just the joke."
+_JOKE_A = "Why did the scarecrow win an award? Because he was outstanding in his field."
+_JOKE_B = "Why don't scientists trust atoms? Because they make up everything."
+_SAME_TASK_NODES = [
+    _node(1, None, "system", f"{SUBAGENT_ROOT_PREFIX}. Work autonomously."),
+    _node(2, 1, "user", _SHARED_TASK),
+    _node(3, 2, "assistant", _JOKE_A),
+    _node(4, 2, "assistant", _JOKE_A),
+    _node(5, None, "system", f"{SUBAGENT_ROOT_PREFIX}. Work autonomously."),
+    _node(6, 5, "user", _SHARED_TASK),
+    _node(7, 6, "assistant", _JOKE_B),
+    _node(8, None, "user", _SHARED_TASK),
+]
+# `aaa11111` was spawned first but answered with the SECOND chain's joke, so
+# completion order is not spawn order and only the text identifies the chain.
+_NOTIFICATIONS = (
+    "<subagent_completion_notification>\n"
+    f"[Background subagent with agent_id=aaa11111 completed]\n\n{_JOKE_B}\n"
+    "</subagent_completion_notification>\n"
+    "<subagent_completion_notification>\n"
+    f"[Background subagent with agent_id=bbb22222 completed]\n\n{_JOKE_A}\n"
+    "</subagent_completion_notification>"
+)
+
+
+class TestSameTaskSubagents:
+    """Delegates sharing one task text must not share one transcript."""
+
+    def test_each_same_task_delegate_keeps_its_own_chain(self) -> None:
+        chains = reconstruct_transcript_chains(_SAME_TASK_NODES, _SHARED_TASK)
+        assert len(chains) == 2
+        assert {final_assistant_text(chain) for chain in chains} == {_JOKE_A, _JOKE_B}
+
+    def test_duplicate_leaf_and_unanswered_stub_are_not_extra_chains(self) -> None:
+        # node 4 duplicates a leaf off chain one; node 8 is a task never answered.
+        chains = reconstruct_transcript_chains(_SAME_TASK_NODES, _SHARED_TASK)
+        assert len(chains) == 2
+        assert all(final_assistant_text(chain) for chain in chains)
+
+    def test_the_report_picks_the_chain_not_spawn_order(self) -> None:
+        reports = completed_agent_reports(_NOTIFICATIONS)
+        chains = reconstruct_transcript_chains(_SAME_TASK_NODES, _SHARED_TASK)
+        claimed: set[int] = set()
+        picked: dict[str, str] = {}
+        for agent_id in ("aaa11111", "bbb22222"):
+            index = chain_index_for_report(chains, reports[agent_id], claimed)
+            assert index is not None
+            claimed.add(index)
+            picked[agent_id] = final_assistant_text(chains[index])
+        assert picked == {"aaa11111": _JOKE_B, "bbb22222": _JOKE_A}
+
+    def test_unmatchable_reports_still_claim_distinct_chains(self) -> None:
+        chains = reconstruct_transcript_chains(_SAME_TASK_NODES, _SHARED_TASK)
+        claimed: set[int] = set()
+        for _agent in range(2):
+            index = chain_index_for_report(chains, "nothing like the transcript", claimed)
+            assert index is not None
+            claimed.add(index)
+        assert claimed == {0, 1}
+
+    def test_no_chain_left_to_claim_is_none(self) -> None:
+        chains = reconstruct_transcript_chains(_SAME_TASK_NODES, _SHARED_TASK)
+        assert chain_index_for_report(chains, _JOKE_A, {0, 1}) is None
+
+    def test_singular_helper_still_returns_one_chain(self) -> None:
+        chain = reconstruct_transcript_nodes(_SAME_TASK_NODES, _SHARED_TASK)
+        assert final_assistant_text(chain) in {_JOKE_A, _JOKE_B}
+
+
+class TestCompletionReports:
+    """The notification is the only place an agent_id meets its own output."""
+
+    def test_pairs_each_id_with_its_report(self) -> None:
+        assert completed_agent_reports(_NOTIFICATIONS) == {
+            "aaa11111": _JOKE_B,
+            "bbb22222": _JOKE_A,
+        }
+
+    def test_ids_still_parse_alongside_the_reports(self) -> None:
+        assert completed_agent_ids(_NOTIFICATIONS) == ["aaa11111", "bbb22222"]
+
+    def test_no_notification_is_empty(self) -> None:
+        assert completed_agent_reports(None) == {}
+        assert completed_agent_reports("just some assistant text") == {}
