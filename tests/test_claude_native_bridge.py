@@ -4451,6 +4451,325 @@ def test_inject_user_message_raises_when_draft_never_submits(
         inject_user_message(bridge_dir, content="fix the flaky test")
 
 
+def _shrink_delivery_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Shrink the delivery-watch timings so restart tests run in milliseconds.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._DELIVERY_CONFIRM_WATCH_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._RESTART_RECEIPT_GRACE_S", 0.15)
+
+
+def _append_hook_line(bridge_dir: Path, payload: dict[str, Any]) -> None:
+    """
+    Append one raw hook envelope, bypassing state.json bookkeeping.
+
+    Models the hook log of a session whose events were written but not
+    yet reflected in the state file (or whose state file is absent),
+    which is exactly the fresh-boot window the delivery watch runs in.
+
+    :param bridge_dir: Bridge directory path.
+    :param payload: Hook payload, e.g. ``{"hook_event_name": "SessionStart"}``.
+    :returns: None.
+    """
+    with (bridge_dir / "hooks.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"recorded_at": time.time(), "payload": payload}) + "\n")
+
+
+class _RestartableFakeTui:
+    """
+    Simulated Claude pane whose Enter behavior is scripted per submit.
+
+    ``capture-pane`` returns the current pane; ``paste-buffer`` deposits
+    the draft; each ``Enter`` clears the composer (the ambiguous state a
+    submit and an in-pane restart share) and invokes the scripted
+    callback for that submit so tests can append hook records.
+
+    :param draft: Draft text a paste deposits in the composer.
+    :param on_enter: Per-submit callbacks; index is the Enter count - 1.
+        Missing indexes do nothing beyond clearing the composer.
+    """
+
+    def __init__(self, draft: str, on_enter: list[Any]) -> None:
+        self.pane = _composer_pane()
+        self.pastes = 0
+        self.enters = 0
+        self._draft = draft
+        self._on_enter = on_enter
+
+    def run(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Stand in for ``subprocess.run`` against the fake pane.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=self.pane, stderr="")
+        if "paste-buffer" in cmd:
+            self.pastes += 1
+            self.pane = _composer_pane(self._draft)
+        if cmd[-1] == "Enter":
+            self.enters += 1
+            self.pane = _composer_pane()
+            if self.enters - 1 < len(self._on_enter):
+                self._on_enter[self.enters - 1]()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def test_inject_user_message_redelivers_when_inpane_restart_swallows_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A restart with no delivery receipt triggers one re-delivery.
+
+    The first submit clears the composer, but the hook log then shows a
+    startup ``SessionStart`` under a fresh Claude session id and no
+    ``UserPromptSubmit`` — an in-pane restart flushed the keystrokes.
+    The message must be pasted again into the replacement process, and
+    the matching receipt from that second submit ends the delivery.
+    """
+    _shrink_delivery_watch(monkeypatch)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # The dying process's boot was already recorded (state.json seen-ids
+    # provide the baseline the restart's fresh id is measured against).
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "source": "startup", "session_id": "boot-1"},
+    )
+    content = "the message that must survive"
+    tui = _RestartableFakeTui(
+        content,
+        on_enter=[
+            lambda: _append_hook_line(
+                bridge_dir,
+                {"hook_event_name": "SessionStart", "source": "startup", "session_id": "boot-2"},
+            ),
+            lambda: _append_hook_line(
+                bridge_dir,
+                {"hook_event_name": "UserPromptSubmit", "session_id": "boot-2", "prompt": content},
+            ),
+        ],
+    )
+    monkeypatch.setattr("subprocess.run", tui.run)
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.pastes == 2, (
+        f"Expected the swallowed submit to be re-delivered exactly once, got {tui.pastes} pastes."
+    )
+
+
+def test_inject_user_message_missing_receipt_alone_never_redelivers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No receipt without restart evidence keeps the submit successful.
+
+    Requiring an acknowledgement for every send is the false-positive
+    trap that broke healthy sessions before: receipts can be late,
+    unmatched, or never emitted while Claude processes the message
+    fine. With no fresh startup ``SessionStart``, the watch must lapse
+    quietly — one paste, no raise.
+    """
+    _shrink_delivery_watch(monkeypatch)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    _append_hook_line(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "source": "startup", "session_id": "boot-1"},
+    )
+    tui = _RestartableFakeTui("hello there", on_enter=[])
+    monkeypatch.setattr("subprocess.run", tui.run)
+
+    inject_user_message(bridge_dir, content="hello there")
+
+    assert tui.pastes == 1, (
+        f"A missing receipt alone must not trigger a re-delivery; got {tui.pastes} pastes."
+    )
+
+
+def test_inject_user_message_late_first_boot_session_start_is_not_a_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A lone new session id with no baseline is a boot, not a restart.
+
+    On a fresh session the booting Claude's own ``SessionStart`` can be
+    recorded after the paste (hook writes race the composer render). A
+    single new id with no earlier identity to differ from must not read
+    as a restart — re-delivering here would duplicate the first message.
+    """
+    _shrink_delivery_watch(monkeypatch)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    (bridge_dir / "hooks.jsonl").touch()
+    tui = _RestartableFakeTui(
+        "first message",
+        on_enter=[
+            lambda: _append_hook_line(
+                bridge_dir,
+                {"hook_event_name": "SessionStart", "source": "startup", "session_id": "boot-1"},
+            ),
+        ],
+    )
+    monkeypatch.setattr("subprocess.run", tui.run)
+
+    inject_user_message(bridge_dir, content="first message")
+
+    assert tui.pastes == 1, (
+        f"A late-recorded first boot must not be treated as a restart; got {tui.pastes} pastes."
+    )
+
+
+def test_inject_user_message_ignores_rotation_and_subagent_session_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Deliberate rotations and subagent boots are not restart evidence.
+
+    ``/clear``-style rotations announce themselves with a non-startup
+    source, and a Task subagent's startup lives under a ``subagents/``
+    transcript. Neither means the parent pane's process died, so
+    neither may trigger a re-delivery.
+    """
+    _shrink_delivery_watch(monkeypatch)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    _append_hook_line(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "source": "startup", "session_id": "boot-1"},
+    )
+
+    def _rotation_and_subagent() -> None:
+        _append_hook_line(
+            bridge_dir,
+            {"hook_event_name": "SessionStart", "source": "clear", "session_id": "rotated-1"},
+        )
+        _append_hook_line(
+            bridge_dir,
+            {
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "session_id": "sub-1",
+                "transcript_path": str(tmp_path / "projects" / "subagents" / "sub.jsonl"),
+            },
+        )
+
+    tui = _RestartableFakeTui("summarize the diff", on_enter=[_rotation_and_subagent])
+    monkeypatch.setattr("subprocess.run", tui.run)
+
+    inject_user_message(bridge_dir, content="summarize the diff")
+
+    assert tui.pastes == 1, (
+        f"Rotation/subagent SessionStarts must not trigger a re-delivery; got {tui.pastes} pastes."
+    )
+
+
+def test_inject_user_message_raises_after_redelivery_budget_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Endless in-pane restarts fail loud once the re-delivery budget is spent.
+
+    Every submit is answered by another fresh startup ``SessionStart``
+    and never a receipt, so each delivery verifiably died with its
+    process. Returning success would silently drop the message; the
+    RuntimeError surfaces as an ExecutorError in the web UI instead.
+    """
+    _shrink_delivery_watch(monkeypatch)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    _append_hook_line(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "source": "startup", "session_id": "boot-1"},
+    )
+    counter = {"boots": 1}
+
+    def _another_restart() -> None:
+        counter["boots"] += 1
+        _append_hook_line(
+            bridge_dir,
+            {
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "session_id": f"boot-{counter['boots']}",
+            },
+        )
+
+    budget = claude_native_bridge._MESSAGE_REDELIVERY_BUDGET
+    tui = _RestartableFakeTui(
+        "does this ever land",
+        on_enter=[_another_restart] * (budget + 1),
+    )
+    monkeypatch.setattr("subprocess.run", tui.run)
+
+    with pytest.raises(RuntimeError, match="restarted in its terminal pane"):
+        inject_user_message(bridge_dir, content="does this ever land")
+
+    assert tui.pastes == budget + 1, (
+        f"Expected the initial paste plus {budget} re-deliveries, got {tui.pastes} pastes."
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_text", "matches"),
+    [
+        ("fix the flaky test", "fix the flaky test", True),
+        # CR/CRLF fold to LF: the paste payload carries interior CRs.
+        ("line one\r\nline two", "line one\nline two", True),
+        # A stripped/kept BOM or reflowed whitespace still matches.
+        ("﻿fix the flaky test", "fix the flaky test", True),
+        ("fix  the\n flaky test", "fix the flaky test", True),
+        ("a different message", "fix the flaky test", False),
+        ("", "fix the flaky test", False),
+    ],
+)
+def test_delivery_prompts_match(prompt: str, expected_text: str, matches: bool) -> None:
+    """
+    Receipt matching is lenient about rendering, strict about content.
+
+    :param prompt: Prompt text as a ``UserPromptSubmit`` hook reports it.
+    :param expected_text: Injected text (already LF-normalized).
+    :param matches: Whether the receipt should acknowledge the send.
+    """
+    assert claude_native_bridge._delivery_prompts_match(prompt, expected_text) is matches
+
+
 def test_inject_interrupt_sends_escape_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
