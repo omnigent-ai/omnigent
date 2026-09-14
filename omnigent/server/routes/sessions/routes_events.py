@@ -1455,6 +1455,7 @@ def register_events_routes(
                 session_id,
                 status,
                 status_error,
+                failure_origin="external_session_status",
                 response_id=response_id,
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
