@@ -6304,7 +6304,14 @@ async def _relay_runner_stream(
                 "Relay: runner transport lost for session=%s",
                 session_id,
                 exc_info=True,
-                extra={"session_id": session_id},
+                extra={
+                    "session_id": session_id,
+                    "event_name": "runner_stream_disconnected",
+                    "attributes": {
+                        "intentional_stop": lost.intentional,
+                        "cached_session_status": _session_status_cache.get(session_id),
+                    },
+                },
             )
             if lost.intentional:
                 # User clicked Stop: the Stop handler brought this runner's
