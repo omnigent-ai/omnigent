@@ -1176,9 +1176,10 @@ aside[aria-label="Workspace"][data-maximized] {
   font-size: 1em;
 }
 
-/* Keep download aligned with our header overlay; sticky controls otherwise
- * drift into the code body and then underneath the transcript's header fade. */
-.chat-code-block > [data-streamdown="code-block"] > .sticky {
+/* Keep Streamdown's actions aligned with our header overlays; sticky controls
+ * otherwise drift into the block body when the transcript scrolls. */
+.chat-code-block > [data-streamdown="code-block"] > .sticky,
+.chat-mermaid > [data-streamdown="mermaid-block"] > .sticky {
   position: static;
 }
 
@@ -1203,12 +1204,10 @@ aside[aria-label="Workspace"][data-maximized] {
   text-indent: -2.5rem;
 }
 
-/* Our own mermaid fullscreen button (see ChatMermaidBlock in message.tsx)
- * sits in a pill at the block's top-right. Nudge Streamdown's mermaid action
- * bar left by that pill's footprint so the two rows sit side by side rather
- * than overlapping. */
+/* Reserve the 1.5rem fullscreen button plus Streamdown's 0.5rem action gap.
+ * The fullscreen overlay sits outside the Mermaid block's 1px border. */
 .chat-mermaid [data-streamdown="mermaid-block-actions"] {
-  margin-right: 2.75rem;
+  margin-right: calc(2rem - 1px);
 }
 
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
