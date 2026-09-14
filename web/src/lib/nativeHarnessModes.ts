@@ -38,6 +38,40 @@ export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = [
   },
 ];
 
+// Devin permission modes, in increasing autonomy. Devin uses the same
+// `--permission-mode` launch flag as Claude Code, so these ride as
+// terminal_launch_args just like Claude's. "normal" is Devin's own default
+// (auto-approve read-only) and sends no flag so the CLI keeps its default.
+// Create-time only: Devin has no running-session `/permissions` switch. Keep in
+// sync with `devin --help` (auto / accept-edits / smart / dangerous).
+export const DEVIN_NATIVE_DEFAULT_PERMISSION_MODE = "normal";
+export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
+  {
+    value: "normal",
+    label: "Normal",
+    description: "Devin's default: auto-approves read-only tools, prompts for the rest",
+    args: [],
+  },
+  {
+    value: "accept-edits",
+    label: "Accept edits",
+    description: "Also auto-approves edits within the workspace",
+    args: ["--permission-mode", "accept-edits"],
+  },
+  {
+    value: "smart",
+    label: "Smart",
+    description: "Additionally auto-runs actions a fast model judges safe",
+    args: ["--permission-mode", "smart"],
+  },
+  {
+    value: "dangerous",
+    label: "Dangerous",
+    description: "Auto-approves all tools; no prompts or safety checks",
+    args: ["--permission-mode", "dangerous"],
+  },
+];
+
 // The Auto Harness's Permissions vocabulary: Default only. No cross-harness
 // permission mapping exists, so the row stays locked and the create call sends
 // no override — each CLI keeps the machine's own configuration.
