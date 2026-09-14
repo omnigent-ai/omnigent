@@ -151,18 +151,28 @@ _ALLOWED_PIL_FORMATS: dict[str, frozenset[str]] = {
 # still image always ends up at or below the raw budget.
 IMAGE_MODEL_BUDGET_BYTES: int = 3_500_000
 
-# Longest-edge cap applied before the quality search when re-encoding an
-# oversized image. Matches the provider's documented 8000 px max edge (an image
-# already under this is left at native resolution); anything larger is scaled
-# down to this first.
-IMAGE_MAX_EDGE_PX: int = 8000
+# Longest-edge cap. An oversized image is downscaled to this immediately after
+# decode — before the convert/encode work — which both bounds peak memory (a
+# full-resolution re-encode of a 40 MP image can spike to >1 GiB) and drops
+# wasted bytes: providers downsample vision inputs to ~1568 px (Anthropic) /
+# ~2048 px (OpenAI) anyway, so a larger edge is never seen by the model. 2048
+# keeps full model-visible detail with margin across providers.
+IMAGE_MAX_EDGE_PX: int = 2048
 
-# Decompression-bomb / memory guard: refuse to decode images whose pixel area is
-# implausibly large for a real screenshot/photo. Kept modest because a decoded
-# RGBA frame is 4 bytes/px (40 MP ≈ 160 MB) and several copies are live at once;
-# the supported deployments cap the server around 1 GiB. 40 MP still covers 5K/6K
-# screenshots and up to ~24 MP camera photos at full resolution.
-IMAGE_MAX_DECODED_PIXELS: int = 40 * 1024 * 1024
+# Decompression-bomb / memory guard on a format we must decode at full size
+# (PNG/WebP/GIF have no scale-decode). A decoded RGBA frame is 4 bytes/px, so
+# this caps that raw allocation (32 MP ≈ 128 MB). 32 MP still covers 8K
+# screenshots and ~24 MP camera photos.
+IMAGE_MAX_DECODED_PIXELS: int = 32 * 1024 * 1024
+
+# JPEG/MPO decode at a reduced DCT scale via Image.draft(), so a large source
+# never fully materializes — a higher source ceiling is safe (and welcome: phone
+# photos are large JPEGs). This is a bomb-sanity limit on the declared header.
+IMAGE_MAX_SOURCE_PIXELS: int = 100 * 1024 * 1024
+
+# Pillow formats whose decoder honours draft() scale-down (so the source cap,
+# not the decoded cap, applies). MPO is multi-picture JPEG.
+_DRAFTABLE_IMAGE_FORMATS: frozenset[str] = frozenset({"JPEG", "MPO"})
 
 # How many image uploads may hold their raw bytes in memory and
 # decode/re-encode concurrently. The heavy step is bounded per-op (read up to
@@ -360,12 +370,17 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     try:
         with Image.open(BytesIO(content), formats=allowed_formats) as probe:
             # Cheap header dimensions first — bail before walking frames
-            # (n_frames enumerates every GIF frame). This deterministic area
-            # check is the decompression-bomb guard (fires below Pillow's own
-            # ~89 MP warning), so no warnings.catch_warnings() is needed.
-            if probe.width * probe.height > IMAGE_MAX_DECODED_PIXELS:
-                raise ImageCompressionError("the image's dimensions are too large to process")
+            # (n_frames enumerates every GIF frame) or decoding. Draftable
+            # formats (JPEG) decode scaled-down so they get the higher source
+            # ceiling; others decode at full size, so cap the raw allocation.
             probe_format = probe.format
+            max_source_px = (
+                IMAGE_MAX_SOURCE_PIXELS
+                if probe_format in _DRAFTABLE_IMAGE_FORMATS
+                else IMAGE_MAX_DECODED_PIXELS
+            )
+            if probe.width * probe.height > max_source_px:
+                raise ImageCompressionError("the image's dimensions are too large to process")
             n_frames = int(getattr(probe, "n_frames", 1))
         # True animation can't be re-encoded here and would be rejected by the
         # provider at turn time — reject cleanly now. MPO is multi-frame but not
@@ -377,8 +392,39 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
                 "or static image instead"
             )
         with Image.open(BytesIO(content), formats=allowed_formats) as opened:
-            image = ImageOps.exif_transpose(opened)
-            image.load()
+            # draft() lets the JPEG decoder emit a DCT-downscaled frame (½/¼/⅛)
+            # directly, so a large photo never fully decodes into memory. No-op
+            # for formats that don't support it (PNG/WebP/GIF).
+            opened.draft(None, (IMAGE_MAX_EDGE_PX, IMAGE_MAX_EDGE_PX))
+            # Apply EXIF orientation in place: the copying form allocates a full
+            # extra frame even when there's no orientation to apply (the common
+            # case), which on a large image is a needless ~100 MB.
+            ImageOps.exif_transpose(opened, in_place=True)
+            opened.load()
+            # Decide the final encode mode now, before resizing: detect alpha
+            # broadly (RGBA/LA, or a palette/RGB tRNS chunk Pillow exposes via
+            # info["transparency"]) so transparency isn't lost in the resize, and
+            # convert only when the mode differs (no needless full-frame copy).
+            has_alpha = opened.mode in ("RGBA", "LA") or "transparency" in opened.info
+            target_mode = "RGBA" if has_alpha else "RGB"
+            converted = opened if opened.mode == target_mode else opened.convert(target_mode)
+            # Downscale to the edge cap before the encode work — a full-resolution
+            # re-encode is what spikes peak memory. Produce a small detached frame
+            # so the large decoded frame frees when the block closes `opened`.
+            longest = max(converted.width, converted.height)
+            if longest > IMAGE_MAX_EDGE_PX:
+                factor = IMAGE_MAX_EDGE_PX / longest
+                base = converted.resize(
+                    (
+                        max(1, round(converted.width * factor)),
+                        max(1, round(converted.height * factor)),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+            elif converted is opened:
+                base = converted.copy()
+            else:
+                base = converted
     except ImageCompressionError:
         raise
     except (
@@ -395,46 +441,29 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     ) as exc:
         raise ImageCompressionError("the file is not a readable image") from exc
 
-    # convert(), the pre-shrink resize(), and every encode share one try so a
-    # Pillow error anywhere in re-encoding becomes a clean 413, never a 500.
+    if has_alpha:
+        # Alpha-preserving encoders, best-compression first. Tried lazily so the
+        # search stops at the first candidate that fits.
+        _encodings: tuple[tuple[str, str, dict[str, Any]], ...] = (
+            ("WEBP", "image/webp", {"quality": 80, "method": 4}),
+            ("WEBP", "image/webp", {"quality": 60, "method": 4}),
+            ("PNG", "image/png", {"optimize": True}),
+        )
+    else:
+        # WebP first: at a comparable budget it keeps fine text/UI detail crisper
+        # than JPEG (which rings on screenshots), and providers accept WebP. JPEG
+        # is the final fallback.
+        _encodings = (
+            ("WEBP", "image/webp", {"quality": 82, "method": 4}),
+            ("WEBP", "image/webp", {"quality": 68, "method": 4}),
+            ("JPEG", "image/jpeg", {"quality": 75, "optimize": True, "progressive": True}),
+        )
+
+    # Largest-first over a small scale/quality grid (≤ 3 scales × 3 encodings),
+    # encoding one candidate at a time and returning at the first that fits, so a
+    # worst-case (incompressible) upload can't fan out into many eager encodes. A
+    # Pillow encode error becomes a clean 413, never a 500.
     try:
-        # Detect alpha broadly: RGBA/LA modes, and RGB/L/P images carrying a
-        # tRNS chunk (Pillow exposes it as image.info["transparency"] without
-        # changing the mode) — routing them through the alpha branch avoids
-        # flattening transparency to JPEG.
-        has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
-        if has_alpha:
-            base = image.convert("RGBA")
-            # Alpha-preserving encoders, best-compression first. Tried lazily so
-            # the search stops at the first candidate that fits.
-            _encodings: tuple[tuple[str, str, dict[str, Any]], ...] = (
-                ("WEBP", "image/webp", {"quality": 80, "method": 4}),
-                ("WEBP", "image/webp", {"quality": 60, "method": 4}),
-                ("PNG", "image/png", {"optimize": True}),
-            )
-        else:
-            base = image.convert("RGB")
-            # WebP first: at a comparable budget it keeps fine text/UI detail
-            # crisper than JPEG (which rings on screenshots), and providers
-            # accept WebP. JPEG is the final fallback.
-            _encodings = (
-                ("WEBP", "image/webp", {"quality": 82, "method": 4}),
-                ("WEBP", "image/webp", {"quality": 68, "method": 4}),
-                ("JPEG", "image/jpeg", {"quality": 75, "optimize": True, "progressive": True}),
-            )
-
-        # Pre-shrink an oversized canvas to the edge cap before the quality search.
-        longest = max(base.width, base.height)
-        if longest > IMAGE_MAX_EDGE_PX:
-            factor = IMAGE_MAX_EDGE_PX / longest
-            base = base.resize(
-                (max(1, round(base.width * factor)), max(1, round(base.height * factor))),
-                Image.Resampling.LANCZOS,
-            )
-
-        # Largest-first over a small scale/quality grid (≤ 3 scales × 3 encodings),
-        # encoding one candidate at a time and returning at the first that fits, so
-        # a worst-case (incompressible) upload can't fan out into many eager encodes.
         for scale in (1.0, 0.5, 0.25):
             if scale == 1.0:
                 frame = base
@@ -448,7 +477,6 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
                 if len(data) <= IMAGE_MODEL_BUDGET_BYTES:
                     return data, mime
     except (OSError, ValueError) as exc:
-        # A Pillow convert/resize/encode error becomes a clean 413, not a 500.
         raise ImageCompressionError("the image couldn't be re-encoded") from exc
 
     raise ImageCompressionError("the image couldn't be compressed to a supported size")

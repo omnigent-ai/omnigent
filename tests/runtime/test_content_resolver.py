@@ -1125,6 +1125,64 @@ def test_image_needs_compression_gates_thread_hop() -> None:
     assert image_needs_compression(big, "image/svg+xml") is False
 
 
+def test_compress_image_downscales_to_edge_cap() -> None:
+    """An oversized canvas is downscaled to the edge cap (bounds memory + bytes)."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MAX_EDGE_PX,
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    # 3000 px wide (> the 2048 edge cap), high-entropy so it's over budget.
+    w, h = 3000, 2000
+    buffer = BytesIO()
+    Image.frombytes("RGB", (w, h), os.urandom(w * h * 3)).save(buffer, format="PNG")
+    original = buffer.getvalue()
+    assert len(original) > IMAGE_MODEL_BUDGET_BYTES
+
+    result, _ = compress_image_attachment(original, "image/png")
+
+    with Image.open(BytesIO(result)) as out:
+        assert max(out.width, out.height) <= IMAGE_MAX_EDGE_PX
+
+
+def test_compress_image_format_aware_pixel_cap() -> None:
+    """A large JPEG is accepted (draft-decoded); a PNG over the decode cap is not."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MAX_DECODED_PIXELS,
+        IMAGE_MAX_SOURCE_PIXELS,
+        ImageCompressionError,
+        compress_image_attachment,
+    )
+
+    # ~36 MP: over the (PNG) decode cap but under the (JPEG) source cap.
+    side = 6000
+    assert IMAGE_MAX_DECODED_PIXELS < side * side < IMAGE_MAX_SOURCE_PIXELS
+    src = Image.frombytes("RGB", (side, side), os.urandom(side * side * 3))
+
+    jpeg_buf = BytesIO()
+    src.save(jpeg_buf, format="JPEG", quality=90)
+    # JPEG decodes at a reduced scale via draft(), so it's accepted and shrunk.
+    result, _ = compress_image_attachment(jpeg_buf.getvalue(), "image/jpeg")
+    assert len(result) <= IMAGE_MAX_DECODED_PIXELS  # comfortably small
+
+    png_buf = BytesIO()
+    src.save(png_buf, format="PNG")
+    # The same dimensions as PNG decode at full size, so they're rejected.
+    with pytest.raises(ImageCompressionError):
+        compress_image_attachment(png_buf.getvalue(), "image/png")
+
+
 def test_compress_image_skips_non_raster_type() -> None:
     """A non-raster image type (SVG) over the budget is passed through, not 413'd."""
     from omnigent.runtime.content_resolver import (
