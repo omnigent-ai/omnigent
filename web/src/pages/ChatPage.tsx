@@ -72,6 +72,7 @@ import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
+import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -2466,6 +2467,14 @@ function ComposerImpl(
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
+
+  // Cmd/Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
+  // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
+  // exists and the gear isn't disabled (not read-only, unreachable, or busy).
+  useModelPickerHotkey(
+    () => setPickerOpenNonce((n) => n + 1),
+    showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy,
+  );
   const composerWorkspace = composerSession?.workspace;
   // Live workspace/branch/PR status for the workspace bar (lane-3 shared hook):
   // the branch comes from the host's `git worktree list`, never a PR head.

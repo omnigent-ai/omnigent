@@ -137,6 +137,7 @@ import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import {
@@ -1352,6 +1353,7 @@ export function AgentHarnessPicker({
   autoHarnessAvailable = false,
   autoHarnessActive = false,
   onSelectAutoHarness,
+  openNonce = 0,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -1418,9 +1420,14 @@ export function AgentHarnessPicker({
    *  would look selected at once. */
   autoHarnessActive?: boolean;
   onSelectAutoHarness?: () => void;
+  /** Bump to open the menu imperatively (the landing's model-picker hotkey). */
+  openNonce?: number;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
+  // Tracks the last-applied openNonce so the imperative-open effect (below,
+  // after the drill-in state it drives) skips the initial value.
+  const appliedOpenNonce = useRef(0);
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
@@ -1483,6 +1490,21 @@ export function AgentHarnessPicker({
       setConfigAgentId(null);
     }
   }, [open]);
+
+  // The landing's model-picker hotkey (⌘⇧M) bumps openNonce. Open the menu and
+  // drill straight into the selected harness's edit submenu (Models / Effort),
+  // the same jump the row's Edit affordance performs, so the chord lands on the
+  // model list rather than the harness list. Falls back to the list when the
+  // selected entry has no config to edit.
+  useEffect(() => {
+    if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    appliedOpenNonce.current = openNonce;
+    setOpen(true);
+    if (effectiveAgentId && selectedConfigContent != null) {
+      setConfigAgentId(effectiveAgentId);
+      if (isMobile) setMenuPage("config");
+    }
+  }, [openNonce, effectiveAgentId, selectedConfigContent, isMobile]);
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
@@ -2635,6 +2657,12 @@ export function NewChatLandingScreen() {
   } | null>(null);
   // Advanced settings for agents with a configurable brain harness.
   const [configOpen, setConfigOpen] = useState(false);
+
+  // ⌘⇧M opens the agent/model picker here, the keyboard equivalent of the
+  // existing-chat model-picker shortcut. The picker owns model selection on the
+  // landing, so the hotkey bumps a nonce the picker opens on.
+  const [modelPickerOpenNonce, setModelPickerOpenNonce] = useState(0);
+  useModelPickerHotkey(() => setModelPickerOpenNonce((n) => n + 1));
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -6231,6 +6259,7 @@ export function NewChatLandingScreen() {
                       {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}
                       <AgentHarnessPicker
+                        openNonce={modelPickerOpenNonce}
                         agentEntries={agentEntries}
                         harnessEntries={harnessEntries}
                         effectiveAgentId={effectiveAgentId}

@@ -1212,6 +1212,24 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
   renderLanding(infoOverrides);
 }
 
+describe("model picker hotkey", () => {
+  beforeEach(setupLandingMocks);
+
+  it("drills into the selected harness's model submenu on Cmd/Ctrl+Shift+M", () => {
+    mockAgents(DEFAULT_LANDING_AGENTS);
+    renderLanding();
+    // Nothing open yet.
+    expect(screen.queryByTestId("new-chat-landing-agent-models")).toBeNull();
+
+    // jsdom's navigator is non-mac, so the hook expects Ctrl (not Cmd).
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+
+    // Lands directly on the selected harness's edit submenu (Models / Effort),
+    // not just the harness list.
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+  });
+});
+
 /**
  * Type *prompt* into the landing composer, submit, and read the create call.
  *
