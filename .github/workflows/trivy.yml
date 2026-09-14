@@ -1,0 +1,86 @@
+name: Trivy CVE Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 6 * * *'  # Daily: new advisories can affect unchanged lockfiles.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trivy-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
+  scan:
+    name: Trivy CVE Scan (${{ matrix.scope }})
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scope: repository
+            path: .
+          # Trivy always skips root-level dev/ as a system directory.
+          - scope: dev-tools
+            path: dev
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Scan locked dependencies
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_INCLUDE_DEV_DEPS: 'true'
+        with:
+          version: v0.74.0
+          scan-type: fs
+          scan-ref: ${{ matrix.path }}
+          scanners: vuln
+          format: json
+          output: ${{ runner.temp }}/trivy-results.json
+          # Findings are informational during baseline triage; scanner errors still fail.
+          exit-code: '0'
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          list-all-pkgs: true
+          skip-dirs: .git,**/.venv,**/node_modules
+          cache-dir: ${{ runner.temp }}/trivy-cache
+          timeout: 10m
+
+      - name: Render vulnerability reports
+        env:
+          REPORT_DIR: ${{ runner.temp }}
+        run: |
+          trivy convert --scanners vuln --format table --output "$REPORT_DIR/trivy-results.txt" "$REPORT_DIR/trivy-results.json"
+          trivy convert --format sarif --output "$REPORT_DIR/trivy-results.sarif" "$REPORT_DIR/trivy-results.json"
+          cat "$REPORT_DIR/trivy-results.txt"
+          {
+            echo '## Trivy CVE scan (report-only)'
+            echo
+            echo 'Findings do not fail this check. All severities, unfixed vulnerabilities, and development dependencies are included.'
+            echo 'Download the **trivy-cve-report-repository** and **trivy-cve-report-dev-tools** artifacts for readable tables, JSON inventories, and SARIF reports.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload vulnerability reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: trivy-cve-report-${{ matrix.scope }}
+          path: |
+            ${{ runner.temp }}/trivy-results.json
+            ${{ runner.temp }}/trivy-results.txt
+            ${{ runner.temp }}/trivy-results.sarif
+          if-no-files-found: error
+          retention-days: 30

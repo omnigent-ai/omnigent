@@ -6,6 +6,49 @@ To report a security vulnerability, use
 Please do not open a public issue for security problems, and do not include live
 credentials, tokens, or customer data in any report.
 
+## Automated dependency CVE scanning
+
+[Trivy CVE Scan](.github/workflows/trivy.yml) scans the repository on every pull
+request, push to `main`, daily at 06:23 UTC, and manual workflow dispatch. The
+scheduled scan catches newly published advisories even when dependencies have
+not changed. It runs for trusted contributors too, after the existing PR
+security gate permits CI to proceed.
+
+Trivy statically scans supported dependency manifests and lockfiles, including
+`uv.lock`, `pnpm-lock.yaml`, `Cargo.lock`, and `Gemfile.lock`, without installing
+or executing project dependencies. Development dependencies, all severities,
+and vulnerabilities without fixes are included. This is a dependency scan, not
+a scan of built container images or a replacement for the contributor security
+scan below. A separate `dev-tools` scan covers `dev/omnidev/Cargo.lock`, because
+Trivy excludes root-level `dev/` directories from its filesystem traversal.
+
+The initial rollout is **report-only**: vulnerabilities do not fail CI, but
+scanner or report-generation errors do. A green check does not mean there are
+no CVEs. Open the workflow's **Trivy CVE Scan** jobs to read the tables, or
+download the **trivy-cve-report-repository** and **trivy-cve-report-dev-tools**
+artifacts (retained for 30 days) for text, JSON, and SARIF reports. SARIF is
+provided as an artifact, not uploaded to GitHub code scanning; this keeps the
+workflow read-only and usable on fork PRs without additional security-product
+configuration or credentials.
+
+To reproduce locally with Trivy **v0.74.0**, from the repository root:
+
+```bash
+(
+  set -e
+  for target in . dev; do
+    trivy fs --scanners vuln --include-dev-deps \
+      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --ignore-unfixed=false \
+      --skip-dirs '.git,**/.venv,**/node_modules' --timeout 10m --exit-code 0 "$target"
+  done
+)
+```
+
+Review findings by affected lockfile, installed version, and available fix;
+prioritize reachable high/critical vulnerabilities. Any future blocking
+threshold or vulnerability exception should be an explicit, reviewed policy
+change rather than silently hiding the baseline.
+
 ## Contributor PR security gate
 
 CI for untrusted PRs is held behind a deterministic security scan so that
