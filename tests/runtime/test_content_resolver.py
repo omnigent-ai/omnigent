@@ -1085,6 +1085,28 @@ def test_compress_image_rejects_undecodable_over_budget() -> None:
         compress_image_attachment(garbage, "image/png")
 
 
+def test_image_compression_concurrency_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The compression-concurrency knob reads config, with a safe default."""
+    from omnigent.runtime.content_resolver import MAX_IMAGE_COMPRESSION_CONCURRENCY
+    from omnigent.server import server_config
+
+    # Default when unset.
+    monkeypatch.setattr(server_config, "load_server_config", dict)
+    assert server_config.image_compression_concurrency() == MAX_IMAGE_COMPRESSION_CONCURRENCY
+
+    # Operator override on a larger instance.
+    monkeypatch.setattr(
+        server_config, "load_server_config", lambda: {"image_compression_concurrency": 8}
+    )
+    assert server_config.image_compression_concurrency() == 8
+
+    # Invalid values fall back to the safe default, never crash.
+    monkeypatch.setattr(
+        server_config, "load_server_config", lambda: {"image_compression_concurrency": 0}
+    )
+    assert server_config.image_compression_concurrency() == MAX_IMAGE_COMPRESSION_CONCURRENCY
+
+
 def test_image_needs_compression_gates_thread_hop() -> None:
     """The route-side predicate matches the in-function short-circuit."""
     from omnigent.runtime.content_resolver import (

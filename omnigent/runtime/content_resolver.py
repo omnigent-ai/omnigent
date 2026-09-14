@@ -164,6 +164,14 @@ IMAGE_MAX_EDGE_PX: int = 8000
 # screenshots and up to ~24 MP camera photos at full resolution.
 IMAGE_MAX_DECODED_PIXELS: int = 40 * 1024 * 1024
 
+# How many image uploads may hold their raw bytes in memory and
+# decode/re-encode concurrently. The heavy step is bounded per-op (read up to
+# MAX_IMAGE_UPLOAD_BYTES + a ~IMAGE_MAX_DECODED_PIXELS bitmap and copies), so the
+# server's peak upload memory ≈ this × that per-op cost. Default sized for the
+# ~1 GiB deployments; raise it on larger instances via the
+# ``image_compression_concurrency`` server-config key.
+MAX_IMAGE_COMPRESSION_CONCURRENCY: int = 2
+
 # Copy-at-spawn limits (see the ``files:copy`` endpoint). A parent forwarding
 # files to a subagent copies them through the server, which reads each source
 # blob to re-store it under the child. Bounding the count and the summed
