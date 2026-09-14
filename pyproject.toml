@@ -476,11 +476,8 @@ testpaths = ["tests"]
 # credentials and/or extra setup (Databricks profile; npm build +
 # Playwright browsers for the UI suite; a deployed Databricks App URL
 # for the live suite). Opt-in via explicit pytest invocation.
-# structlog-config's auto-loaded pytest plugin (a transitive dev
-# dependency) stores its own tuples on item._excinfo, clobbering
-# pytest's unittest state: every failing unittest.TestCase then
-# aborts the run with INTERNALERROR. Block it until upstream stops
-# writing to pytest's private attribute.
+# structlog-config's pytest plugin clobbers unittest's private item._excinfo.
+# Disable it until the plugin stops writing to that attribute.
 addopts = "-p no:structlog_config --ignore=tests/e2e --ignore=tests/e2e_ui --ignore=tests/e2e_live --ignore=tests/integration"
 # Default per-test wallclock cap. Catches infinite hangs in any
 # suite (unit, inner, integration, e2e) without bothering tests

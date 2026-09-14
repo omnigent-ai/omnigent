@@ -1,16 +1,4 @@
-"""A failing unittest.TestCase test must yield a normal pytest failure report.
-
-Drives the contributor journey end-to-end: write a deliberately failing
-``unittest.TestCase`` test, run the dev environment's own ``pytest`` on it as
-a subprocess under the repo's pytest configuration (as a contributor's shell
-would), and assert the run ends with an ordinary ``1 failed`` report instead
-of aborting at report time with ``INTERNALERROR AttributeError: 'tuple'
-object has no attribute 'value'``, which destroys the failure output the
-contributor needs. The crash comes from structlog-config's auto-loaded pytest
-plugin storing its own tuples on ``item._excinfo``, clobbering the state
-pytest's unittest integration keeps there; the repo's pytest config must keep
-that plugin blocked (or its collision otherwise neutralized).
-"""
+"""A failing unittest.TestCase must produce a normal pytest failure report."""
 
 from __future__ import annotations
 
@@ -38,9 +26,7 @@ def test_failing_unittest_testcase_reports_normally(tmp_path: Path) -> None:
     probe = tmp_path / "test_failprobe.py"
     probe.write_text(_PROBE_SOURCE)
 
-    # Same interpreter and installed plugin set as the dev environment, run
-    # under the repo's pytest configuration; strip the outer pytest's own
-    # state so the child run is hermetic.
+    # Avoid inheriting the outer pytest process's configuration.
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     result = subprocess.run(
         [
