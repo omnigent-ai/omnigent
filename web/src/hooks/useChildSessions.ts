@@ -190,7 +190,7 @@ interface UseChildSessionsResult {
  */
 export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions?limit=1000`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
