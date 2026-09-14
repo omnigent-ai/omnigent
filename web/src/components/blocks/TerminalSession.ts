@@ -16,6 +16,11 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import {
+  readTerminalRendererMode,
+  resolveTerminalWebglEnabled,
+  type TerminalRendererMode,
+} from "@/lib/terminalRendererPreferences";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 
 // Card background colors derived from the app's CSS palette.
@@ -253,6 +258,7 @@ const INPUT_ENCODER = new TextEncoder();
 interface TerminalCore {
   _core?: {
     coreMouseService?: { activeEncoding?: string };
+    coreService?: { decPrivateModes: { cursorBlink?: boolean } };
   };
 }
 
@@ -268,16 +274,20 @@ interface TerminalCore {
  * the no-GPU and context-lost paths fall back to the DOM renderer rather
  * than freezing the canvas — see the inline comments below.
  */
-export function loadWebglRenderer(term: Terminal): WebglAddon | null {
+export function loadWebglRenderer(term: Terminal, onContextLoss?: () => void): WebglAddon | null {
   let addon: WebglAddon;
   try {
     addon = new WebglAddon();
   } catch {
     return null;
   }
-  // Dispose on context loss so xterm reverts to the DOM renderer; a
-  // disposed WebGL addon left attached would freeze on its last frame.
-  addon.onContextLoss(() => addon.dispose());
+  // Release on context loss so xterm reverts to the DOM renderer; a disposed
+  // WebGL addon left attached would freeze on its last frame. An owner that
+  // tracks the addon releases it itself, so its bookkeeping stays in sync.
+  addon.onContextLoss(() => {
+    if (onContextLoss) onContextLoss();
+    else addon.dispose();
+  });
   try {
     term.loadAddon(addon);
   } catch {
@@ -512,8 +522,11 @@ export function wheelReportPayload(
 export class TerminalSession {
   private readonly term: Terminal;
   private readonly fit: FitAddon;
-  /** WebGL renderer addon, or ``null`` when WebGL is unavailable. */
-  private readonly webgl: WebglAddon | null;
+  /**
+   * WebGL renderer addon, or ``null`` when WebGL is unavailable or the user
+   * pinned the DOM renderer. Reassigned by {@link setRenderer}.
+   */
+  private webgl: WebglAddon | null;
   private readonly ws: WebSocket;
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
@@ -603,8 +616,12 @@ export class TerminalSession {
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
     this.term.open(container);
     // Load the GPU renderer after open() (it needs the mounted canvas).
-    // Falls back to the DOM renderer when WebGL is unavailable.
-    this.webgl = loadWebglRenderer(this.term);
+    // Falls back to the DOM renderer when WebGL is unavailable, or when the
+    // user pinned the DOM renderer in Settings → Appearance; a mid-session
+    // change is applied live via setRenderer().
+    this.webgl = resolveTerminalWebglEnabled(readTerminalRendererMode())
+      ? loadWebglRenderer(this.term, () => this.disposeWebgl())
+      : null;
     try {
       this.fit.fit();
     } catch (err) {
@@ -790,6 +807,54 @@ export class TerminalSession {
   }
 
   /**
+   * Swap the renderer without reconnecting — mirrors {@link setFont}.
+   * Loading the WebGL addon takes over xterm's active renderer; disposing it
+   * hands rendering back to the DOM renderer. A no-op when the requested
+   * renderer is already active, and when WebGL is requested but unavailable
+   * (the DOM renderer stays). The two renderers measure glyphs
+   * independently, so this re-fits the grid like a font change does.
+   */
+  setRenderer(mode: TerminalRendererMode): void {
+    if (this.disposed) return;
+    if (resolveTerminalWebglEnabled(mode) === (this.webgl !== null)) return;
+    if (this.webgl) {
+      this.disposeWebgl();
+    } else {
+      this.webgl = loadWebglRenderer(this.term, () => this.disposeWebgl());
+    }
+    this.sendResize();
+  }
+
+  /**
+   * Release the WebGL addon with the cursor blink switched off, then restore it.
+   * The addon never disposes its own blink manager, so releasing it on a focused
+   * terminal would leave a timer redrawing a dead renderer. Nothing paints
+   * between the writes, so the cursor itself is unaffected.
+   */
+  private disposeWebgl(): void {
+    const addon = this.webgl;
+    if (!addon) return;
+    // Clear the field first: a failed release must not leave the session — or a
+    // later renderer switch — believing WebGL is still active.
+    this.webgl = null;
+    // eslint-disable-next-line no-underscore-dangle
+    const modes = (this.term as unknown as TerminalCore)._core?.coreService?.decPrivateModes;
+    const decCursorBlink = modes?.cursorBlink;
+    const { cursorBlink } = this.term.options;
+    try {
+      // A pane's DECSCUSR cursor style outranks the option, so clear both.
+      if (modes) modes.cursorBlink = false;
+      // Through the opposite value: the options service only notifies on a change.
+      this.term.options.cursorBlink = !cursorBlink;
+      addon.dispose();
+    } finally {
+      // DEC first, so the DOM renderer taking over reads the pane's real state.
+      if (modes) modes.cursorBlink = decCursorBlink;
+      this.term.options.cursorBlink = cursorBlink;
+    }
+  }
+
+  /**
    * Tear down the bridge. Order matters: abort listeners FIRST so
    * the cleanup's ``ws.close()`` can't fire a stale ``close``
    * event into the next mount.
@@ -812,7 +877,7 @@ export class TerminalSession {
     }
     // Dispose the WebGL renderer before the terminal so its canvas and
     // GL context are released while the terminal still owns them.
-    this.webgl?.dispose();
+    this.disposeWebgl();
     this.term.dispose();
   }
 

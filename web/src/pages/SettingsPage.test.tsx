@@ -353,6 +353,33 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("renders the Terminal renderer radiogroup with GPU selected by default", () => {
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("radiogroup", { name: "Terminal renderer" })).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-renderer-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-renderer-dom")).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:terminal-renderer")).toBeNull();
+  });
+
+  it("persists the Compatibility renderer on card click and clears it on GPU", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.click(screen.getByTestId("terminal-renderer-dom"));
+    expect(localStorage.getItem("omnigent:terminal-renderer")).toBe("dom");
+    expect(screen.getByTestId("terminal-renderer-dom")).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(screen.getByTestId("terminal-renderer-auto"));
+    expect(localStorage.getItem("omnigent:terminal-renderer")).toBeNull();
+    expect(screen.getByTestId("terminal-renderer-auto")).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("reflects a stored Compatibility renderer on mount", () => {
+    localStorage.setItem("omnigent:terminal-renderer", "dom");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("terminal-renderer-dom")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-renderer-auto")).toHaveAttribute("aria-checked", "false");
+  });
+
   it("reflects a stored light terminal theme on mount", () => {
     localStorage.setItem("omnigent:terminal-theme", "light");
     renderPage("/settings/appearance");
@@ -608,6 +635,7 @@ describe("SettingsPage", () => {
     mocks.theme = "dark";
     fireEvent.click(screen.getByTestId("theme-dark"));
     fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.click(screen.getByTestId("terminal-renderer-dom"));
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
@@ -629,6 +657,7 @@ describe("SettingsPage", () => {
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:terminal-renderer")).toBe("dom");
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
@@ -658,8 +687,11 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
+    // Terminal theme, renderer, transcript view, workspace defaults, and harness
+    // visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-renderer-auto")).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:terminal-renderer")).toBeNull();
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
       "true",

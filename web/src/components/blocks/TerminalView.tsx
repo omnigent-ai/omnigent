@@ -17,6 +17,7 @@ import { copyText } from "@/lib/clipboard";
 import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
+import { subscribeTerminalRenderer } from "@/lib/terminalRendererPreferences";
 import {
   readTerminalThemeMode,
   resolveTerminalIsDark,
@@ -663,6 +664,14 @@ export function TerminalView({
   useEffect(() => {
     return subscribeCodeFont((font) => {
       sessionRef.current?.setFont(font);
+    });
+  }, []);
+
+  // Same for the renderer choice, so switching away from WebGL fixes a
+  // garbled terminal in place instead of needing a reload.
+  useEffect(() => {
+    return subscribeTerminalRenderer((mode) => {
+      sessionRef.current?.setRenderer(mode);
     });
   }, []);
 
