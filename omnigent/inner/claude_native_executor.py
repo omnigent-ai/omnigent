@@ -253,14 +253,9 @@ class ClaudeNativeExecutor(Executor):
             await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancelled.set()
-            # CancelledError is a BaseException, not an Exception: repeated
-            # cancels re-enter this loop while worker errors stay suppressed.
             while not worker.done():
-                try:
-                    with contextlib.suppress(Exception):
-                        await asyncio.shield(worker)
-                except asyncio.CancelledError:
-                    continue
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
             self._reap_failed_turn()

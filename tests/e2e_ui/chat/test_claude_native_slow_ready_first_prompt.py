@@ -97,7 +97,6 @@ _TERMINAL_READY_TIMEOUT_MS = 120_000
 
 _ERROR_PILL = '[data-testid="error-pill"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
-_WORKING = '[data-testid="working-indicator"]'
 _TERMINAL_VIEW = '[data-testid="terminal-view"]'
 
 # Model baked into the rig's mock anthropic provider config (matches
@@ -322,14 +321,12 @@ def slow_ready_claude_session(
         while time.monotonic() < deadline:
             if server_proc.poll() is not None or runner_proc.poll() is not None:
                 break
-            try:
+            with contextlib.suppress(httpx.HTTPError):
                 if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
                     status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
                     if status.status_code == 200 and status.json().get("online"):
                         online = True
                         break
-            except httpx.HTTPError:
-                pass
             time.sleep(0.5)
         if not online:
             raise RuntimeError(

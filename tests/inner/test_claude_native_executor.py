@@ -1444,8 +1444,10 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
             await asyncio.sleep(0)
             assert not task.done()
         release.set()
+        await asyncio.wait({task}, timeout=2)
+        assert task.done(), "cancelled delivery did not finish after its capture was released"
         with pytest.raises(TimeoutError if watchdog else asyncio.CancelledError):
-            await task
+            task.result()
         assert finished.is_set()
         assert not executor._inject_lock.locked()
         assert reaped == [tmp_path / "bridge"]
@@ -1454,8 +1456,9 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
         release.set()
         if not task.done():
             task.cancel()
+        await asyncio.wait({task})
         with contextlib.suppress(asyncio.CancelledError, TimeoutError):
-            await task
+            task.result()
 
 
 @pytest.mark.asyncio
