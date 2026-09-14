@@ -11,8 +11,6 @@
   --popover-foreground: #11171c;
   --primary: #11171c;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(240, 1, 150, 0.1);
-  --selection-foreground: #651249;
   --secondary: #eceef1;
   --secondary-foreground: #27272a;
   --muted: #0000000f;
@@ -36,6 +34,8 @@
   --sidebar-ring: #2272b4;
   --sidebar-active: rgba(240, 1, 150, 0.1);
   --sidebar-active-foreground: #651249;
+  --selection-background: #11171c;
+  --selection-foreground: #ffffff;
 }
 
 :root:not(.dark):not([data-theme]) .app-shell {
@@ -57,8 +57,6 @@
   --popover-foreground: oklch(0.965 0.003 240);
   --primary: #e8ecf0;
   --primary-foreground: #11171c;
-  --selection-background: rgba(240, 1, 150, 0.15);
-  --selection-foreground: #f9a8d4;
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
   --muted: color-mix(in srgb, #92a4b3 15%, #262f36);
@@ -82,6 +80,8 @@
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
   --sidebar-active: rgba(240, 1, 150, 0.15);
   --sidebar-active-foreground: #f472b6;
+  --selection-background: #e8ecf0;
+  --selection-foreground: #000000;
 }
 
 .dark:not([data-theme]) .app-shell {
@@ -108,8 +108,6 @@
   --popover-foreground: #1e1a2b;
   --primary: #7c3aed;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(124, 58, 237, 0.15);
-  --selection-foreground: #1e1a2b;
   --secondary: #efeaf9;
   --secondary-foreground: #1e1a2b;
   --muted: #efeaf9;
@@ -133,6 +131,8 @@
   --sidebar-ring: #7c3aed;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #7c3aed;
+  --selection-foreground: #ffffff;
 }
 
 :root:not(.dark)[data-theme="dracula"] .app-shell {
@@ -154,8 +154,6 @@
   --popover-foreground: #f8f8f2;
   --primary: #bd93f9;
   --primary-foreground: #282a36;
-  --selection-background: rgba(189, 147, 249, 0.33);
-  --selection-foreground: #f8f8f2;
   --secondary: #343746;
   --secondary-foreground: #f8f8f2;
   --muted: #3b3d4d;
@@ -179,6 +177,8 @@
   --sidebar-ring: #bd93f9;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #bd93f9;
+  --selection-foreground: #000000;
 }
 
 .dark[data-theme="dracula"] .app-shell {
@@ -203,8 +203,6 @@
   --popover-foreground: #1f2328;
   --primary: #1f883d;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(31, 136, 61, 0.15);
-  --selection-foreground: #1f2328;
   --secondary: #eaeef2;
   --secondary-foreground: #1f2328;
   --muted: #eaeef2;
@@ -228,6 +226,8 @@
   --sidebar-ring: #0969da;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #1f883d;
+  --selection-foreground: #000000;
 }
 
 :root:not(.dark)[data-theme="github"] .app-shell {
@@ -249,8 +249,6 @@
   --popover-foreground: #e6edf3;
   --primary: #238636;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(35, 134, 54, 0.39);
-  --selection-foreground: #e6edf3;
   --secondary: #21262d;
   --secondary-foreground: #e6edf3;
   --muted: #21262d;
@@ -274,6 +272,8 @@
   --sidebar-ring: #58a6ff;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #238636;
+  --selection-foreground: #ffffff;
 }
 
 .dark[data-theme="github"] .app-shell {
@@ -295,8 +295,6 @@
   --popover-foreground: #4c4f69;
   --primary: #8839ef;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(136, 57, 239, 0.15);
-  --selection-foreground: #4c4f69;
   --secondary: #e6e9ef;
   --secondary-foreground: #4c4f69;
   --muted: #e6e9ef;
@@ -320,6 +318,8 @@
   --sidebar-ring: #8839ef;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #8839ef;
+  --selection-foreground: #ffffff;
 }
 
 :root:not(.dark)[data-theme="catppuccin"] .app-shell {
@@ -341,8 +341,6 @@
   --popover-foreground: #cdd6f4;
   --primary: #cba6f7;
   --primary-foreground: #1e1e2e;
-  --selection-background: rgba(203, 166, 247, 0.26);
-  --selection-foreground: #f5e0dc;
   --secondary: #313244;
   --secondary-foreground: #cdd6f4;
   --muted: #313244;
@@ -366,6 +364,8 @@
   --sidebar-ring: #cba6f7;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #cba6f7;
+  --selection-foreground: #000000;
 }
 
 .dark[data-theme="catppuccin"] .app-shell {
@@ -390,8 +390,6 @@
   --popover-foreground: #3c3836;
   --primary: #d65d0e;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(214, 93, 14, 0.18);
-  --selection-foreground: #3c3836;
   --secondary: #ebdbb2;
   --secondary-foreground: #3c3836;
   --muted: #ebdbb2;
@@ -415,6 +413,8 @@
   --sidebar-ring: #d65d0e;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #ce5a0e;
+  --selection-foreground: #000000;
 }
 
 :root:not(.dark)[data-theme="gruvbox"] .app-shell {
@@ -436,8 +436,6 @@
   --popover-foreground: #ebdbb2;
   --primary: #fe8019;
   --primary-foreground: #282828;
-  --selection-background: rgba(254, 128, 25, 0.34);
-  --selection-foreground: #ebdbb2;
   --secondary: #3c3836;
   --secondary-foreground: #ebdbb2;
   --muted: #3c3836;
@@ -461,6 +459,8 @@
   --sidebar-ring: #fe8019;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #fe8019;
+  --selection-foreground: #000000;
 }
 
 .dark[data-theme="gruvbox"] .app-shell {
@@ -485,8 +485,6 @@
   --popover-foreground: #657b83;
   --primary: #268bd2;
   --primary-foreground: #fdf6e3;
-  --selection-background: rgba(38, 139, 210, 0.15);
-  --selection-foreground: #073642;
   --secondary: #eee8d5;
   --secondary-foreground: #657b83;
   --muted: #eee8d5;
@@ -510,6 +508,8 @@
   --sidebar-ring: #268bd2;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #268bd2;
+  --selection-foreground: #000000;
 }
 
 :root:not(.dark)[data-theme="solarized"] .app-shell {
@@ -531,8 +531,6 @@
   --popover-foreground: #839496;
   --primary: #268bd2;
   --primary-foreground: #fdf6e3;
-  --selection-background: rgba(38, 139, 210, 0.42);
-  --selection-foreground: #eee8d5;
   --secondary: #073642;
   --secondary-foreground: #839496;
   --muted: #073642;
@@ -556,6 +554,8 @@
   --sidebar-ring: #268bd2;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #268bd2;
+  --selection-foreground: #000000;
 }
 
 .dark[data-theme="solarized"] .app-shell {
@@ -577,8 +577,6 @@
   --popover-foreground: #2e3440;
   --primary: #5e81ac;
   --primary-foreground: #eceff4;
-  --selection-background: rgba(94, 129, 172, 0.25);
-  --selection-foreground: #2e3440;
   --secondary: #d8dee9;
   --secondary-foreground: #2e3440;
   --muted: #d8dee9;
@@ -602,6 +600,8 @@
   --sidebar-ring: #5e81ac;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #5e80ab;
+  --selection-foreground: #000000;
 }
 
 :root:not(.dark)[data-theme="nord"] .app-shell {
@@ -623,8 +623,6 @@
   --popover-foreground: #eceff4;
   --primary: #88c0d0;
   --primary-foreground: #2e3440;
-  --selection-background: rgba(136, 192, 208, 0.25);
-  --selection-foreground: #eceff4;
   --secondary: #3b4252;
   --secondary-foreground: #eceff4;
   --muted: #434c5e;
@@ -648,6 +646,8 @@
   --sidebar-ring: #88c0d0;
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
+  --selection-background: #88c0d0;
+  --selection-foreground: #000000;
 }
 
 .dark[data-theme="nord"] .app-shell {
@@ -672,8 +672,6 @@
   --popover-foreground: var(--custom-light-popover-foreground);
   --primary: var(--custom-light-primary);
   --primary-foreground: var(--custom-light-primary-foreground);
-  --selection-background: var(--custom-light-selection-background);
-  --selection-foreground: var(--custom-light-selection-foreground);
   --secondary: var(--custom-light-secondary);
   --secondary-foreground: var(--custom-light-secondary-foreground);
   --muted: var(--custom-light-muted);
@@ -697,6 +695,8 @@
   --sidebar-ring: var(--custom-light-sidebar-ring);
   --sidebar-active: var(--custom-light-sidebar-active);
   --sidebar-active-foreground: var(--custom-light-sidebar-active-foreground);
+  --selection-background: var(--custom-light-selection-background);
+  --selection-foreground: var(--custom-light-selection-foreground);
 }
 
 :root:not(.dark)[data-theme="custom"] .app-shell {
@@ -718,8 +718,6 @@
   --popover-foreground: var(--custom-dark-popover-foreground);
   --primary: var(--custom-dark-primary);
   --primary-foreground: var(--custom-dark-primary-foreground);
-  --selection-background: var(--custom-dark-selection-background);
-  --selection-foreground: var(--custom-dark-selection-foreground);
   --secondary: var(--custom-dark-secondary);
   --secondary-foreground: var(--custom-dark-secondary-foreground);
   --muted: var(--custom-dark-muted);
@@ -743,6 +741,8 @@
   --sidebar-ring: var(--custom-dark-sidebar-ring);
   --sidebar-active: var(--custom-dark-sidebar-active);
   --sidebar-active-foreground: var(--custom-dark-sidebar-active-foreground);
+  --selection-background: var(--custom-dark-selection-background);
+  --selection-foreground: var(--custom-dark-selection-foreground);
 }
 
 .dark[data-theme="custom"] .app-shell {

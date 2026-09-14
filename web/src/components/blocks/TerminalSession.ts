@@ -16,6 +16,8 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { getThemeRoots } from "@/lib/host";
+import { selectionColors } from "@/lib/selectionColors";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 
 // Card background colors derived from the app's CSS palette.
@@ -43,15 +45,20 @@ export const WS_CLOSE_WRONG_REPLICA = 4400;
 /**
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */
-export function terminalTheme(isDark: boolean): ITheme {
+export function terminalTheme(isDark: boolean, accent = isDark ? "#22d3ee" : "#0891b2"): ITheme {
   const bg = isDark ? CARD_DARK : CARD_LIGHT;
+  const selection = selectionColors(accent, [bg]);
+  const selectionTheme = {
+    ...selection,
+    selectionInactiveBackground: selection.selectionBackground,
+  };
   return isDark
     ? {
         background: bg,
         foreground: "#e4e4e7",
         cursor: "#22d3ee",
         cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
+        ...selectionTheme,
         black: "#09090b",
         brightBlack: "#71717a",
       }
@@ -60,7 +67,7 @@ export function terminalTheme(isDark: boolean): ITheme {
         foreground: "#18181b",
         cursor: "#0891b2",
         cursorAccent: bg,
-        selectionBackground: "#0891b233",
+        ...selectionTheme,
         black: "#18181b",
         brightBlack: "#e4e4e7",
         // CLIs that assume a dark terminal paint primary text with ANSI
@@ -503,10 +510,10 @@ export function wheelReportPayload(
  *
  * The constructor performs all the setup synchronously — open the
  * terminal on the container, open the WebSocket, wire up listeners,
- * attach a ResizeObserver. {@link dispose} tears them all down in
+ * attach resize and theme observers. {@link dispose} tears them all down in
  * the same order callers expect: abort listeners first (so the
  * close event doesn't fire stale state into a remounted view),
- * disconnect the observer, dispose the xterm data subscription,
+ * disconnect the observers, dispose the xterm data subscription,
  * close the WS, dispose the terminal.
  */
 export class TerminalSession {
@@ -517,6 +524,9 @@ export class TerminalSession {
   private readonly ws: WebSocket;
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
+  private readonly themeObserver: MutationObserver;
+  private isDark: boolean;
+  private accent: string | undefined;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
   private readonly codexPalette: CodexTerminalPalette | null;
@@ -574,6 +584,8 @@ export class TerminalSession {
     focusOnConnect = true,
     adaptCodexPalette = false,
   ) {
+    this.isDark = isDark;
+    this.accent = this.readThemeAccent();
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -745,6 +757,28 @@ export class TerminalSession {
     // size events server-side, so no throttle needed here.
     this.resizeObserver = new ResizeObserver(() => this.sendResize());
     this.resizeObserver.observe(container);
+
+    // Palette and custom-accent updates must repaint even an inactive attach.
+    this.themeObserver = new MutationObserver(() => {
+      const accent = this.readThemeAccent();
+      if (this.disposed || accent === this.accent) return;
+      this.accent = accent;
+      this.term.options.theme = this.theme(this.isDark);
+    });
+    for (const root of getThemeRoots()) {
+      this.themeObserver.observe(root, {
+        attributes: true,
+        attributeFilter: ["class", "data-theme", "style"],
+      });
+    }
+  }
+
+  private readThemeAccent(): string | undefined {
+    // The inner embed root can override the scope root's light palette.
+    const root = getThemeRoots().at(-1);
+    return root
+      ? getComputedStyle(root).getPropertyValue("--primary").trim() || undefined
+      : undefined;
   }
 
   /**
@@ -752,11 +786,13 @@ export class TerminalSession {
    * Safe to call at any point after construction.
    */
   setTheme(isDark: boolean): void {
+    this.isDark = isDark;
+    this.accent = this.readThemeAccent();
     this.term.options.theme = this.theme(isDark);
   }
 
   private theme(isDark: boolean): ITheme {
-    const theme = terminalTheme(isDark);
+    const theme = terminalTheme(isDark, this.accent);
     return this.codexPalette ? codexTerminalTheme(theme, isDark) : theme;
   }
 
@@ -803,6 +839,7 @@ export class TerminalSession {
     this.disposed = true;
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
+    this.themeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
     try {

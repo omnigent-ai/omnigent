@@ -1051,7 +1051,12 @@ aside[aria-label="Workspace"][data-maximized] {
   .xterm {
     font-family: var(--font-mono);
   }
+  /* Solid selection colors keep selected text readable across palette surfaces. */
   ::selection {
+    background: var(--selection-background);
+    color: var(--selection-foreground);
+  }
+  ::-moz-selection {
     background: var(--selection-background);
     color: var(--selection-foreground);
   }

@@ -1,3 +1,4 @@
+import { selectionColors } from "./selectionColors.ts";
 // Persisted, app-global color-palette preference.
 //
 // The web UI has two independent appearance axes:
@@ -71,8 +72,6 @@ export interface PaletteTokens {
   popoverForeground: string;
   primary: string;
   primaryForeground: string;
-  selectionBackground: string;
-  selectionForeground: string;
   secondary: string;
   secondaryForeground: string;
   muted: string;
@@ -98,6 +97,8 @@ export interface PaletteTokens {
   sidebarActiveForeground: string;
   sidebarBackground: string;
   shellBackground: string;
+  selectionBackground: string;
+  selectionForeground: string;
 }
 
 export const PALETTE_TOKEN_CSS_NAMES = {
@@ -111,8 +112,6 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   popoverForeground: "popover-foreground",
   primary: "primary",
   primaryForeground: "primary-foreground",
-  selectionBackground: "selection-background",
-  selectionForeground: "selection-foreground",
   secondary: "secondary",
   secondaryForeground: "secondary-foreground",
   muted: "muted",
@@ -138,6 +137,8 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   sidebarActiveForeground: "sidebar-active-foreground",
   sidebarBackground: "sidebar-background",
   shellBackground: "shell-background",
+  selectionBackground: "selection-background",
+  selectionForeground: "selection-foreground",
 } as const satisfies Record<keyof PaletteTokens, string>;
 
 type PaletteTokenInput = Pick<
@@ -148,7 +149,6 @@ type PaletteTokenInput = Pick<
   | "cardSolid"
   | "primary"
   | "primaryForeground"
-  | "selectionBackground"
   | "secondary"
   | "muted"
   | "mutedForeground"
@@ -165,11 +165,6 @@ type PaletteTokenInput = Pick<
 
 function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
   return {
-    // Selection is a translucent wash of the palette's accent under the page
-    // foreground, never an opaque block. Dark alphas are tuned per accent: a
-    // saturated one reads heavy at low alpha, a pastel needs more; light
-    // variants use the lightest alpha that stays visible.
-    selectionForeground: tokens.foreground,
     cardForeground: tokens.foreground,
     tray: tokens.card,
     popover: tokens.cardSolid,
@@ -189,6 +184,11 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarActiveForeground: "var(--sidebar-foreground)",
     sidebarBackground: "var(--sidebar)",
     ...tokens,
+    ...selectionColors(
+      tokens.primary,
+      [tokens.background, tokens.cardSolid, tokens.codeBackground ?? tokens.cardSolid],
+      tokens.shellBackground,
+    ),
   };
 }
 
@@ -231,10 +231,6 @@ export const PALETTES: readonly PaletteMeta[] = [
         popoverForeground: "#11171c",
         primary: "#11171c",
         primaryForeground: "#ffffff",
-        // Selection is the brand tint that also marks the sidebar's active
-        // row, not an opaque primary block (near-black on this palette).
-        selectionBackground: "rgba(240, 1, 150, 0.1)",
-        selectionForeground: "#651249",
         secondary: "#eceef1",
         muted: "#0000000f",
         mutedForeground: "#71717a",
@@ -262,10 +258,6 @@ export const PALETTES: readonly PaletteMeta[] = [
         popover: "rgba(26, 33, 41, 0.8)",
         primary: "#e8ecf0",
         primaryForeground: "#11171c",
-        // pink-300 rather than the sidebar's pink-400 so selected text stays
-        // >= 4.5:1 over the tinted code and muted surfaces.
-        selectionBackground: "rgba(240, 1, 150, 0.15)",
-        selectionForeground: "#f9a8d4",
         secondary: "#1f272d",
         secondaryForeground: "#e8ecf0",
         muted: "color-mix(in srgb, #92a4b3 15%, #262f36)",
@@ -310,7 +302,6 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#f7f5fd",
-        selectionBackground: "rgba(124, 58, 237, 0.15)",
         foreground: "#1e1a2b",
         card: "#ffffff",
         cardSolid: "#ffffff",
@@ -331,7 +322,6 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282a36",
-        selectionBackground: "rgba(189, 147, 249, 0.33)",
         foreground: "#f8f8f2",
         card: "rgba(68, 71, 90, 0.5)",
         cardSolid: "#343746",
@@ -369,7 +359,6 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#f6f8fa",
-        selectionBackground: "rgba(31, 136, 61, 0.15)",
         foreground: "#1f2328",
         card: "#ffffff",
         cardSolid: "#ffffff",
@@ -389,7 +378,6 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#0d1117",
-        selectionBackground: "rgba(35, 134, 54, 0.39)",
         foreground: "#e6edf3",
         card: "rgba(22, 27, 34, 0.72)",
         cardSolid: "#161b22",
@@ -426,7 +414,6 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#eff1f5",
-        selectionBackground: "rgba(136, 57, 239, 0.15)",
         foreground: "#4c4f69",
         card: "#ffffff",
         cardSolid: "#ffffff",
@@ -447,10 +434,6 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#1e1e2e",
-        // The body text sits at the 4.5:1 edge over the wash; rosewater is the
-        // lightest Catppuccin text.
-        selectionBackground: "rgba(203, 166, 247, 0.26)",
-        selectionForeground: "#f5e0dc",
         foreground: "#cdd6f4",
         card: "rgba(49, 50, 68, 0.6)",
         cardSolid: "#282938",
@@ -487,7 +470,6 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#fbf1c7",
-        selectionBackground: "rgba(214, 93, 14, 0.18)",
         foreground: "#3c3836",
         card: "#fffdf2",
         cardSolid: "#fffdf2",
@@ -507,7 +489,6 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282828",
-        selectionBackground: "rgba(254, 128, 25, 0.34)",
         foreground: "#ebdbb2",
         card: "rgba(60, 56, 54, 0.6)",
         cardSolid: "#32302f",
@@ -550,9 +531,6 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#fdf6e3",
-        selectionBackground: "rgba(38, 139, 210, 0.15)",
-        // base02: the body text (base00) is too light over the wash.
-        selectionForeground: "#073642",
         foreground: "#657b83",
         card: "#eee8d5",
         cardSolid: "#eee8d5",
@@ -573,9 +551,6 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#002b36",
-        selectionBackground: "rgba(38, 139, 210, 0.42)",
-        // base2, for the same reason as light mode.
-        selectionForeground: "#eee8d5",
         foreground: "#839496",
         card: "#073642",
         cardSolid: "#073642",
@@ -613,7 +588,6 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#eceff4",
-        selectionBackground: "rgba(94, 129, 172, 0.25)",
         foreground: "#2e3440",
         card: "#e5e9f0",
         cardSolid: "#e5e9f0",
@@ -634,9 +608,6 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#2e3440",
-        // The body text, already the lightest Nord colour, only stays at 4.5:1
-        // over the muted surface up to here.
-        selectionBackground: "rgba(136, 192, 208, 0.25)",
         foreground: "#eceff4",
         card: "rgba(59, 66, 82, 0.6)",
         cardSolid: "#3b4252",

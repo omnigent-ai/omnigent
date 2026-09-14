@@ -8,6 +8,7 @@ import {
   type ThemePalette,
 } from "./themePalette";
 import { getStyleRoot, getThemeRoots } from "./host";
+import { parseCssColor, selectionColors, type CssColor } from "./selectionColors";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
@@ -211,30 +212,6 @@ interface GeneratedCustomTheme {
   dark: GeneratedThemeVariant;
 }
 
-interface CssColor extends Rgb {
-  alpha: number;
-}
-
-function parseCssColor(value: string): CssColor | null {
-  const hex = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(value);
-  if (hex) {
-    return {
-      ...hexToRgb(`#${hex[1]}`),
-      alpha: hex[2] ? Number.parseInt(hex[2], 16) / 255 : 1,
-    };
-  }
-  const rgb = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i.exec(
-    value,
-  );
-  if (!rgb) return null;
-  return {
-    r: Number(rgb[1]),
-    g: Number(rgb[2]),
-    b: Number(rgb[3]),
-    alpha: rgb[4] ? Number(rgb[4]) : 1,
-  };
-}
-
 function formatCssColor(color: CssColor, template: string): string {
   const rgb = rgbToHex(color);
   if (template.startsWith("#") && color.alpha === 1) return rgb;
@@ -332,26 +309,6 @@ function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
   };
 }
 
-/**
- * A custom accent tints the selection the way it tints the sidebar's active
- * row: a wash of the accent, at the stock wash's alpha, under the page
- * foreground. With the accent unchanged, each palette keeps its stock wash.
- */
-function rebaseSelection(
-  base: PaletteTokens,
-  primary: string | null,
-  foreground: string,
-): Pick<PaletteTokens, "selectionBackground" | "selectionForeground"> {
-  if (primary === null) {
-    return {
-      selectionBackground: base.selectionBackground,
-      selectionForeground: base.selectionForeground,
-    };
-  }
-  const alpha = parseCssColor(base.selectionBackground)?.alpha ?? 0.12;
-  return { selectionBackground: setAlpha(primary, alpha), selectionForeground: foreground };
-}
-
 function rebaseVariant(
   base: PaletteTokens,
   reference: GeneratedThemeVariant,
@@ -360,6 +317,12 @@ function rebaseVariant(
   translucentSidebar: boolean,
 ): DerivedThemeVariant {
   const primaryChanged = primary !== base.primary.toLowerCase();
+  const background = rebaseColor(base.background, reference.background, current.background);
+  const codeBackground = rebaseColor(
+    base.codeBackground,
+    reference.codeBackground,
+    current.codeBackground,
+  );
   const foreground = rebaseColor(base.foreground, reference.foreground, current.foreground);
   const card = rebaseColor(base.card, reference.card, current.card);
   const cardSolid = rebaseColor(base.cardSolid, reference.cardSolid, current.cardSolid);
@@ -373,7 +336,7 @@ function rebaseVariant(
   const sidebar = rebaseColor(base.sidebar, reference.sidebar, current.sidebar);
 
   return {
-    background: rebaseColor(base.background, reference.background, current.background),
+    background,
     foreground,
     card,
     cardSolid,
@@ -387,7 +350,6 @@ function rebaseVariant(
     ),
     primary: primaryChanged ? primary : base.primary,
     primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
-    ...rebaseSelection(base, primaryChanged ? primary : null, foreground),
     secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
     secondaryForeground: rebaseColor(
       base.secondaryForeground,
@@ -400,11 +362,7 @@ function rebaseVariant(
       reference.mutedForeground,
       current.mutedForeground,
     ),
-    codeBackground: rebaseColor(
-      base.codeBackground,
-      reference.codeBackground,
-      current.codeBackground,
-    ),
+    codeBackground,
     accent,
     accentForeground,
     border,
@@ -441,6 +399,7 @@ function rebaseVariant(
       : base.sidebarActiveForeground,
     sidebarBackground: base.sidebarBackground,
     shellBackground: base.shellBackground,
+    ...selectionColors(primary, [background, cardSolid, codeBackground], base.shellBackground),
   };
 }
 
