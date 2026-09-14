@@ -169,6 +169,9 @@ function CanvasSurface() {
       (viewerId === null ? MAIN_CANVAS_ID : (readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID)),
   );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  // False until the restored layout has been fitted once; the flow surface
+  // stays hidden until then so a reload never paints the default grid.
+  const [viewRestored, setViewRestored] = useState(false);
   const activeCanvasRef = useRef(activeCanvas);
   const activeCanvasViewerRef = useRef(viewerId);
   const userSelectedCanvasRef = useRef(false);
@@ -220,7 +223,11 @@ function CanvasSurface() {
   const fitCanvas = useCallback(
     (duration = 0) => {
       viewportDirtyRef.current = false;
-      void fitView({ ...FIT_VIEW, duration });
+      // fitView resolves once the fitted viewport is applied, so the first
+      // frame the reveal below paints is already the restored view.
+      void fitView({ ...FIT_VIEW, duration }).then(() => {
+        if (aliveRef.current) setViewRestored(true);
+      });
     },
     [fitView],
   );
@@ -313,6 +320,11 @@ function CanvasSurface() {
     fittedKeyRef.current = key;
     if (!viewportDirtyRef.current) fitCanvas();
   }, [fitCanvas, loaded, nodes]);
+
+  // An empty canvas has no layout to restore; show it right away.
+  useEffect(() => {
+    if (loaded && visibleSessions.length === 0) setViewRestored(true);
+  }, [loaded, visibleSessions]);
 
   // Mirror the selected canvas into the URL; Main keeps the URL clean.
   const writeCanvasParam = useCallback(
@@ -566,7 +578,14 @@ function CanvasSurface() {
       )}
       <div
         ref={flowContainerRef}
-        className="canvas-flow relative min-h-0 min-w-0 flex-1 border-t"
+        // Hidden (with layout intact, so the flow can measure and fit) until
+        // the restored view is in place: the default grid never paints. Opacity
+        // rather than visibility — React Flow puts an inline `visibility:
+        // visible` on measured nodes, which would override an inherited hidden.
+        className={cn(
+          "canvas-flow relative min-h-0 min-w-0 flex-1 border-t",
+          !viewRestored && "pointer-events-none opacity-0",
+        )}
         data-testid="canvas-flow"
       >
         <ReactFlow<SessionCardNode>
