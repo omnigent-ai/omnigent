@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      actions: read  # Required by upload-sarif in private repositories.
       security-events: write
     strategy:
       fail-fast: false
@@ -62,6 +63,7 @@ jobs:
           cache-dir: ${{ runner.temp }}/trivy-cache
           timeout: 10m
 
+      # The pinned trivy-action installs the Trivy CLI on PATH via setup-trivy.
       - name: Render vulnerability reports
         env:
           REPORT_DIR: ${{ runner.temp }}
