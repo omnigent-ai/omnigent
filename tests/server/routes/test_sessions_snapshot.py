@@ -1945,8 +1945,12 @@ async def test_session_snapshot_retries_503_model_options(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "skills", [[], [{"name": "triage-issues", "description": "Triage issues."}]]
+)
 async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     monkeypatch: pytest.MonkeyPatch,
+    skills: list[dict[str, str]],
 ) -> None:
     """
     The background runner-skills fetch publishes ``session.skills`` once
@@ -1972,9 +1976,7 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     class _FakeRunnerClient:
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             if url.endswith("/skills"):
-                return _FakeResponse(
-                    {"skills": [{"name": "triage-issues", "description": "Triage issues."}]}
-                )
+                return _FakeResponse({"skills": skills})
             return _FakeResponse({"status": "idle"})
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
@@ -1998,6 +2000,7 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     # First poll serves [] and kicks the background fetch.
     first = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
     assert first.skills == []
+    assert first.skills_status == "loading"
     await _drain_runner_skills("38aed2dc1dc1b08dbbaa1cf9592d7ae5")
 
     # Exactly one session.skills event for this session was published when
@@ -2014,6 +2017,9 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
         f"Expected exactly 1 session.skills publish on fetch resolve, "
         f"got {len(skills_events)}: {published}"
     )
+    ready = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
+    assert ready.skills_status == "ready"
+    assert [s.model_dump() for s in ready.skills] == skills
 
 
 @pytest.mark.asyncio
@@ -2044,6 +2050,7 @@ async def test_session_snapshot_skills_empty_without_runner(
     )
 
     assert snapshot.skills == []
+    assert snapshot.skills_status == "unavailable"
 
 
 @pytest.mark.asyncio

@@ -7053,6 +7053,19 @@ def create_runner_app(
                 except RuntimeError:
                     pass
 
+    def _recover_failed_tool_dispatch(
+        dispatch_task: asyncio.Task[object], *, conv_id: str, response_id: str
+    ) -> None:
+        if dispatch_task.cancelled() or dispatch_task.exception() is None:
+            return
+        # Recovery can cancel a turn awaiting this dispatch task. Run it
+        # independently so teardown cannot await or cancel itself.
+        task = asyncio.create_task(
+            _resync_turn_state(conv_id, "tool_dispatch_failed", owner_response_id=response_id)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
     async def _resync_turn_state_on_delivery_failure(
         conv_id: str, response_id: str | None
     ) -> None:
@@ -8645,6 +8658,13 @@ def create_runner_app(
                                                 )
                                             )
                                         )
+                                        _dispatch_tasks[-1].add_done_callback(
+                                            functools.partial(
+                                                _recover_failed_tool_dispatch,
+                                                conv_id=conv_id,
+                                                response_id=_response_id,
+                                            )
+                                        )
 
                                 if _evt_type == "policy_evaluation.requested":
                                     _eval_id = event.get("evaluation_id", "")
@@ -8795,7 +8815,14 @@ def create_runner_app(
                     "proxy stream connection error for %s: %s",
                     conv_id,
                     exc,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "harness_stream_failed",
+                        "attributes": {
+                            "harness": harness_name,
+                            "response_id": _response_id,
+                        },
+                    },
                 )
                 _error = {
                     "code": "connection_error",

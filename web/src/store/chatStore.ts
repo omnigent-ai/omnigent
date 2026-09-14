@@ -121,6 +121,7 @@ import type {
   SandboxStatus,
   Session,
   SessionStatus,
+  SkillsStatus,
   SkillSummary,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
@@ -878,6 +879,9 @@ export interface ConversationState {
    * suggest ``/skill-name``.
    */
   skills: SkillSummary[];
+  skillsStatus: SkillsStatus | null;
+  /** Invalidates snapshots started before a skills notification. */
+  skillsEventVersion: number;
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions: NativeModelOption[];
   /**
@@ -1186,6 +1190,8 @@ export interface ChatActions {
    * snapshot. No-ops for inactive or missing conversations.
    */
   refreshSessionState: (conversationId?: string) => Promise<void>;
+  /** Retry skill discovery without changing the composer draft. */
+  refreshSkills: (force?: boolean) => Promise<void>;
   /** Dismiss the too-many-tabs banner for the current over-budget episode. */
   dismissStreamBudgetBanner: () => void;
   /**
@@ -1756,6 +1762,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   gitBranch: null,
   todos: [],
   skills: [],
+  skillsStatus: null,
+  skillsEventVersion: 0,
   codexModelOptions: [],
   terminalPending: false,
   runnerLaunchedAt: null,
@@ -2658,6 +2666,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     await postEvent(conversationId, { type: "compact", data: {} });
   },
 
+  refreshSkills: async (force = true) => {
+    const conversationId = get().conversationId;
+    if (!conversationId) return;
+    setterFor(conversationId)((state) => ({
+      skillsStatus: "loading",
+      skillsEventVersion: state.skillsEventVersion + 1,
+    }));
+    await refetchRunnerBackedSessionState(conversationId, {
+      refreshState: force,
+      skillsResolved: true,
+    });
+  },
+
   refreshSessionState: async (conversationId) => {
     const id = conversationId ?? get().conversationId;
     if (!id) return;
@@ -3525,6 +3546,18 @@ function mcpStartupSnapshotPatch(
   };
 }
 
+function sessionSkillsPatch(
+  session: Session,
+  state: Pick<ConversationState, "skills" | "skillsStatus" | "skillsEventVersion">,
+  versionBeforeFetch: number,
+): Pick<ConversationState, "skills" | "skillsStatus"> {
+  // A live notification supersedes any snapshot already being fetched.
+  if (state.skillsEventVersion !== versionBeforeFetch) {
+    return { skills: state.skills, skillsStatus: state.skillsStatus };
+  }
+  return { skills: session.skills ?? [], skillsStatus: session.skillsStatus ?? null };
+}
+
 /**
  * Store fields derived from the session's agent binding, computed from a
  * session snapshot.
@@ -3547,9 +3580,16 @@ function sessionBindingPatch(
   session: Session,
   state: Pick<
     ConversationState,
-    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+    | "mcpStartupLaunch"
+    | "sessionModelSeeded"
+    | "llmModel"
+    | "sessionModelOverride"
+    | "skills"
+    | "skillsStatus"
+    | "skillsEventVersion"
   >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  skillsVersionBeforeFetch: number,
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
@@ -3570,6 +3610,7 @@ function sessionBindingPatch(
   | "contextWindow"
   | "gitBranch"
   | "skills"
+  | "skillsStatus"
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
@@ -3605,7 +3646,7 @@ function sessionBindingPatch(
       : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
-    skills: session.skills ?? [],
+    ...sessionSkillsPatch(session, state, skillsVersionBeforeFetch),
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
@@ -3631,6 +3672,7 @@ function sessionBindingPatch(
 async function refreshSessionBinding(id: string): Promise<void> {
   if (queryClient === null) return;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
+  const skillsVersionBeforeFetch = setterForState(id)?.skillsEventVersion ?? 0;
   let session: Session;
   try {
     session = await queryClient.fetchQuery({
@@ -3646,7 +3688,9 @@ async function refreshSessionBinding(id: string): Promise<void> {
   // an agent switch in a backgrounded conversation must still re-derive its
   // binding (most importantly `isNativeTerminalSession`, which gates the
   // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
-  setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
+  setterFor(id)((s) =>
+    sessionBindingPatch(session, s, launchBeforeFetch, skillsVersionBeforeFetch),
+  );
 }
 
 /**
@@ -3748,6 +3792,7 @@ async function bindStream(
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  const skillsVersionBeforeFetch = get().skillsEventVersion;
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -3807,7 +3852,12 @@ async function bindStream(
     let resolvedStickyModel: string | null = null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
-      const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
+      const bindingPatch = sessionBindingPatch(
+        session,
+        state,
+        launchBeforeFetch,
+        skillsVersionBeforeFetch,
+      );
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
         bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
@@ -5796,6 +5846,8 @@ interface RefetchRunnerBackedSessionStateOptions {
   applyBindingPatch?: boolean;
   /** The server has signalled that its model-options cache is populated. */
   modelOptionsResolved?: boolean;
+  /** Read the skill discovery result after its SSE notification or a retry. */
+  skillsResolved?: boolean;
 }
 
 /**
@@ -5830,9 +5882,13 @@ async function refetchRunnerBackedSessionState(
     conversationId,
     setterForState(conversationId),
   );
+  const skillsVersionBeforeFetch = setterForState(conversationId)?.skillsEventVersion ?? 0;
   let session: Session;
   try {
-    if (queryClient !== null) {
+    if (options.skillsResolved === true) {
+      // Bypass query deduplication: a bind request may still carry the cold catalog.
+      session = await getSessionSlim(conversationId, { refreshState: options.refreshState });
+    } else if (queryClient !== null) {
       session = await queryClient.fetchQuery({
         queryKey: ["session", conversationId],
         queryFn: () => getSessionSlim(conversationId, { refreshState: options.refreshState }),
@@ -5851,6 +5907,11 @@ async function refetchRunnerBackedSessionState(
   } catch {
     // The runner may have dropped again before the fetch landed. Keep
     // the existing state rather than wiping it on a transient error.
+    if (options.skillsResolved === true) {
+      setterFor(conversationId)((state) =>
+        state.skillsEventVersion === skillsVersionBeforeFetch ? { skillsStatus: "error" } : {},
+      );
+    }
     return;
   }
   // The conversation may have been backgrounded (or evicted) while the request
@@ -5860,6 +5921,12 @@ async function refetchRunnerBackedSessionState(
   // returns. `setterForState` / `setterFor` no-op once it has been evicted.
   const currentState = setterForState(conversationId);
   if (currentState === null) return;
+  if (
+    options.skillsResolved === true &&
+    currentState.skillsEventVersion === skillsVersionBeforeFetch
+  ) {
+    queryClient?.setQueryData(["session", conversationId], session);
+  }
   if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
     racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
   }
@@ -5867,10 +5934,14 @@ async function refetchRunnerBackedSessionState(
   // the reported-model semantics, so a delayed catalog only hydrates state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
-      ? sessionBindingPatch(session, currentState, launchBeforeFetch)
+      ? sessionBindingPatch(session, currentState, launchBeforeFetch, skillsVersionBeforeFetch)
       : {
-          skills: session.skills ?? [],
-          codexModelOptions: session.codexModelOptions ?? [],
+          ...(options.modelOptionsResolved === true
+            ? {}
+            : sessionSkillsPatch(session, currentState, skillsVersionBeforeFetch)),
+          ...(options.skillsResolved === true
+            ? {}
+            : { codexModelOptions: session.codexModelOptions ?? [] }),
         };
   setterFor(conversationId)(statePatch);
 }
@@ -6716,7 +6787,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // the first moment the slash-command menu can be filled. Refetch
       // the now-warm snapshot and apply its `skills`. Fire and forget —
       // refetchRunnerBackedSessionState self-guards against a stale apply.
-      void refetchRunnerBackedSessionState(event.conversationId);
+      setterFor(event.conversationId)((state) => ({
+        skillsEventVersion: state.skillsEventVersion + 1,
+      }));
+      void refetchRunnerBackedSessionState(event.conversationId, { skillsResolved: true });
       return;
     case "session_model_options":
       // A runner-owned native model catalog just resolved. Refetch the

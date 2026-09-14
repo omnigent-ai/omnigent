@@ -2,6 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import { ComposerContextRing } from "./ComposerContextRing";
 
 function renderRing(contextWindow: number | null, tokensUsed: number | null) {
@@ -27,7 +28,18 @@ describe("ComposerContextRing", () => {
   it("shows the used percentage, rounded", () => {
     renderRing(1000, 123);
     expect(screen.getByTestId("composer-context-ring")).toHaveTextContent("12%");
+    expect(screen.getByTestId("composer-context-ring")).toHaveClass("gap-1", "shrink-0");
     expect(screen.getByLabelText("12% of context used")).toBeInTheDocument();
+    // Short and informative: it stays visible when the workspace bar collapses.
+    expect(screen.getByText("12%")).not.toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
+  });
+
+  it("fits the SVG to the painted ring so its padding does not widen the label gap", () => {
+    renderRing(1000, 490);
+    const svg = screen.getByTestId("composer-context-ring").querySelector("svg");
+    expect(svg).toHaveAttribute("viewBox", "1.5 1.5 13 13");
+    expect(svg).toHaveAttribute("width", "13");
+    expect(svg).toHaveAttribute("height", "13");
   });
 
   it("clamps over-full usage to 100%", () => {

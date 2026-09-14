@@ -585,6 +585,9 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 
 
+_runner_skills_failed: set[str] = set()
+
+
 # Sessions whose cached skills need a re-fetch but should keep serving until it
 # lands. A browser reload asks for one, and dropping the entry outright would
 # empty the composer's slash-command menu for the reload that requested it.
@@ -696,6 +699,11 @@ _llm_response_denied_turns: dict[str, str] = {}
 
 
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+_policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 

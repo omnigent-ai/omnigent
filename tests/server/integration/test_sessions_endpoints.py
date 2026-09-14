@@ -9611,8 +9611,11 @@ async def test_patch_collaboration_mode_persists_label_and_forwards_event(
     plan_forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(plan_forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert plan_forwards[0].body == {"type": "plan_mode_change", "enabled": True}
-    assert [event["type"] for _, event in published] == ["session.collaboration_mode"]
-    assert published[0][1]["mode"] == "plan"
+    mode_events = [
+        event for _, event in published if event["type"] == "session.collaboration_mode"
+    ]
+    assert len(mode_events) == 1
+    assert mode_events[0]["mode"] == "plan"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
@@ -9691,7 +9694,10 @@ async def test_patch_collaboration_mode_requires_live_runner_before_persisting(
     assert resp.status_code == 503, resp.text
     assert "Could not enter Plan mode" in resp.text
     assert "omnigent.codex_native.collaboration_mode" not in snapshot["labels"]
-    assert published == []
+    mode_events = [
+        event for _, event in published if event["type"] == "session.collaboration_mode"
+    ]
+    assert mode_events == []
     if runner_status is None:
         assert captured == []
     else:
@@ -9792,8 +9798,11 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         "type": "codex_approval_mode_change",
         "approval_mode": "full-access",
     }
-    assert [event["type"] for _, event in published] == ["session.codex_approval_mode"]
-    assert published[0][1]["approval_mode"] == "full-access"
+    mode_events = [
+        event for _, event in published if event["type"] == "session.codex_approval_mode"
+    ]
+    assert len(mode_events) == 1
+    assert mode_events[0]["approval_mode"] == "full-access"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
@@ -9861,7 +9870,10 @@ async def test_patch_approval_mode_requires_live_runner_before_persisting(
     assert resp.status_code == 503, resp.text
     assert "Could not switch to full-access approval mode" in resp.text
     assert "omnigent.codex_native.approval_mode" not in snapshot["labels"]
-    assert published == []
+    mode_events = [
+        event for _, event in published if event["type"] == "session.codex_approval_mode"
+    ]
+    assert mode_events == []
 
 
 async def test_patch_approval_mode_rejects_non_codex_session(

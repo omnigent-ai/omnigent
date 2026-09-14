@@ -2338,6 +2338,9 @@ def test_server_explicit_config_overrides_omnigent_config_env(
         captured["config"] = os.environ["OMNIGENT_CONFIG"]
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
+    # Config precedence does not depend on a machine-global port being free.
+    bind_probe = Mock()
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
 
     result = CliRunner().invoke(
         cli,
@@ -2355,6 +2358,7 @@ def test_server_explicit_config_overrides_omnigent_config_env(
 
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
+    bind_probe.assert_called_once_with("127.0.0.1", 44771)
 
 
 def test_server_with_explicit_db_does_not_reuse_canonical_server(
@@ -2418,6 +2422,9 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
         raise AssertionError("explicit-DB server must not register in the shared pidfile")
 
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_register)
+    # The dedicated server is stubbed; occupied-port behavior has its own test.
+    bind_probe = Mock()
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
 
     db_path = tmp_path / "chat.db"
     result = CliRunner().invoke(
@@ -2441,6 +2448,7 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
     assert "already running" not in result.output
     assert captured.get("uvicorn_called") is True
     assert captured["uvicorn_kwargs"]["port"] == 44769
+    bind_probe.assert_called_once_with("127.0.0.1", 44769)
 
 
 def test_server_with_explicit_port_does_not_check_canonical_server(

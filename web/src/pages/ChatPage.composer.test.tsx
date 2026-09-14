@@ -17,6 +17,12 @@ import {
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import * as host from "@/lib/host";
+import * as identity from "@/lib/identity";
+import {
+  getSessionModelLabelCacheKey,
+  readSessionModelLabelCache,
+} from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
@@ -69,9 +75,16 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
+const { composerSnapshotHost } = vi.hoisted(() => ({
+  composerSnapshotHost: { id: null as string | null },
+}));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
-  useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
+  useSession: () => ({
+    session: { hostId: composerSnapshotHost.id },
+    isLoading: false,
+    error: null,
+  }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
@@ -1211,6 +1224,132 @@ describe("Composer slash-command submit routing", () => {
   });
 });
 
+describe("Composer cached model labels", () => {
+  const model = "provider/model-a";
+  const catalog = [{ id: "alias-a", model, displayName: "Team model" }];
+  const scope = {
+    sessionId: "conv_cached_label",
+    hostId: "host-a",
+    agentId: "agent-a",
+    harness: "claude-native",
+  };
+  const props = () =>
+    composerProps({
+      modelPickerKind: "claude",
+      showModels: true,
+      showEffort: false,
+      codexModelOptions: catalog,
+      modelLabelOptions: [],
+    });
+  beforeEach(() => {
+    localStorage.clear();
+    composerSnapshotHost.id = scope.hostId;
+    vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
+    useChatStore.setState({
+      conversationId: scope.sessionId,
+      sessionHostId: scope.hostId,
+      boundAgentId: scope.agentId,
+      sessionHarness: scope.harness,
+      llmModel: model,
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+      pendingModelChange: null,
+      nativeVendorOwnsModel: false,
+      costControlModeOverride: "off",
+      skills: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    composerSnapshotHost.id = null;
+    vi.restoreAllMocks();
+    localStorage.clear();
+    useChatStore.setState({ sessionModelSeeded: false, sessionHostId: null, boundAgentId: null });
+  });
+
+  it("waits for session labels while leaving host-probe menu choices usable", async () => {
+    const view = renderWithTooltips(<Composer {...props()} />);
+    const trigger = screen.getByTestId("composer-config-gear");
+    expect(screen.getByRole("status", { name: "Loading model" })).toBeInTheDocument();
+    expect(trigger).toBeEnabled();
+    expect(trigger).not.toHaveTextContent(model);
+    expect(trigger).not.toHaveTextContent("Team model");
+    expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBeNull();
+    fireEvent.focus(trigger);
+    const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tooltip).toHaveTextContent("Loading model…");
+    expect(tooltip).not.toHaveTextContent(model);
+    openSessionConfig();
+    expect(screen.getByTestId("composer-agent-model-summary")).toHaveTextContent("Loading model…");
+    fireEvent.click(screen.getByTestId("composer-agent-edit"));
+    expect(await screen.findByTestId("composer-agent-model-alias-a")).toBeEnabled();
+
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...props()} modelLabelOptions={catalog} />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+    expect(trigger).toHaveTextContent("Team model");
+  });
+
+  it("uses the cached session display name immediately on remount, not a newer host probe", async () => {
+    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBe(
+      "Team model",
+    );
+    first.unmount();
+    useChatStore.setState({ sessionHostId: null });
+    renderWithTooltips(
+      <Composer {...props()} codexModelOptions={[{ ...catalog[0], displayName: "Host name" }]} />,
+    );
+    const trigger = screen.getByTestId("composer-config-gear");
+    expect(trigger).toHaveTextContent("Team model");
+    expect(trigger).not.toHaveTextContent("Host name");
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+    await openSessionModels();
+    expect(screen.getByTestId("composer-agent-model-alias-a")).toBeEnabled();
+  });
+
+  it("uses a loading label for the synthetic current row without a catalog", async () => {
+    renderWithTooltips(<Composer {...props()} codexModelOptions={[]} />);
+    await openSessionModels();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Loading model… (current)" }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("composer-agent-config-menu")).not.toHaveTextContent(model);
+  });
+
+  it("does not reuse the creation host's cache after the snapshot host changes", () => {
+    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    composerSnapshotHost.id = "new-host";
+    first.rerender(
+      <TooltipProvider>
+        <Composer {...props()} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-model-loading")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-config-gear")).not.toHaveTextContent("Team model");
+  });
+
+  it("does not cache an optimistic creation seed until the runner confirms it", () => {
+    useChatStore.setState({ sessionModelSeeded: true, sessionModelOverride: model });
+    renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    const key = getSessionModelLabelCacheKey(scope, model);
+    expect(readSessionModelLabelCache(key)).toBeNull();
+    act(() => useChatStore.setState({ sessionModelSeeded: false }));
+    expect(readSessionModelLabelCache(key)).toBe("Team model");
+  });
+
+  it("keeps Smart Routing visible without a label-loading spinner", () => {
+    useChatStore.setState({ costControlModeOverride: "on" });
+    renderWithTooltips(<Composer {...props()} costRoutingEligible />);
+    expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Smart Routing");
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+  });
+});
+
 describe("Composer model/effort label", () => {
   beforeEach(() => {
     useChatStore.setState({
@@ -1726,7 +1865,11 @@ describe("Composer shared visible controls", () => {
     const actions = screen.getByTestId("composer-action-row");
     expect(textarea().parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
-    expect(actions.children).toHaveLength(2);
+    const [widthProbe, leading, trailing] = Array.from(actions.children);
+    expect(widthProbe).toHaveClass("h-0");
+    expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
+    expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
+    expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
     // The branch text now flows through the shared ComposerWorkspaceStatus +
     // useComposerGitStatus (covered by their own tests); here assert the shared
@@ -1986,6 +2129,140 @@ describe("rankedSlashCommandNames", () => {
     expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "")).toEqual(
       Object.keys(BUILTIN_SLASH_COMMANDS),
     );
+  });
+});
+
+describe("Composer asynchronous skills", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_loading_skills",
+      skills: [],
+      skillsStatus: "loading",
+      terminalPending: false,
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    useChatStore.setState({ skills: [], skillsStatus: null, terminalPending: false });
+    vi.useRealTimers();
+  });
+
+  it.each([
+    { runnerStarting: true, terminalPending: false },
+    { runnerStarting: false, terminalPending: true },
+  ])("waits for skills while the session starts: %j", ({ runnerStarting, terminalPending }) => {
+    useChatStore.setState({ skillsStatus: "unavailable", terminalPending });
+    const props = composerProps({ runnerStarting });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    expect(screen.queryByText("Skills unavailable while disconnected.")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    act(() =>
+      useChatStore.setState({
+        skills: [{ name: "code-review", description: "Review code" }],
+        skillsStatus: "ready",
+      }),
+    );
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/code-review ");
+  });
+
+  it("stops showing startup loading when the runner stays disconnected", () => {
+    useChatStore.setState({ skillsStatus: "unavailable" });
+    const props = composerProps({ runnerStarting: true });
+    const { rerender } = render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    rerender(<Composer {...props} runnerStarting={false} />);
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    expect(screen.getByText("Skills unavailable while disconnected.")).toBeVisible();
+  });
+
+  it("shows discovery errors even when the session is still starting", () => {
+    useChatStore.setState({ skillsStatus: "error" });
+    render(<Composer {...composerProps({ runnerStarting: true })} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    expect(screen.getByText("Couldn’t load skills.")).toBeVisible();
+  });
+
+  it("dismisses a loading-only menu before interrupting a running session", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+  });
+
+  it("recovers a missed notification once without polling while discovery stays loading", async () => {
+    vi.useFakeTimers();
+    const original = useChatStore.getState().refreshSkills;
+    const refreshSkills = vi.fn(async () => {
+      await Promise.resolve();
+      useChatStore.setState({ skills: [], skillsStatus: "loading" });
+    });
+    useChatStore.setState({ refreshSkills });
+    try {
+      render(<Composer {...composerProps()} />);
+      fireEvent.change(textarea(), { target: { value: "/review" } });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(refreshSkills).toHaveBeenCalledExactlyOnceWith(false);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(refreshSkills).toHaveBeenCalledOnce();
+      act(() => useChatStore.setState({ skillsStatus: "ready" }));
+      act(() => vi.advanceTimersByTime(5_000));
+      expect(refreshSkills).toHaveBeenCalledOnce();
+    } finally {
+      cleanup();
+      useChatStore.setState({ refreshSkills: original });
+    }
+  });
+
+  it("preserves the highlighted command when skills arrive", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    const selected = activeRow()?.textContent;
+    act(() =>
+      useChatStore.setState({
+        skills: [{ name: "review", description: "Review code" }],
+        skillsStatus: "ready",
+      }),
+    );
+    expect(screen.getByTestId("slash-menu-item-review")).toBeVisible();
+    expect(activeRow()?.textContent).toBe(selected);
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+  });
+
+  it("waits for completion instead of sending a partial skill name", () => {
+    const props = composerProps();
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("/review");
+    act(() =>
+      useChatStore.setState({
+        skills: [{ name: "code-review", description: "Review code" }],
+        skillsStatus: "ready",
+      }),
+    );
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/code-review ");
+    expect(props.onSend).not.toHaveBeenCalled();
   });
 });
 
@@ -3063,7 +3340,7 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Model:");
     expect(tip.textContent).toContain("Effort:");
     // Effort is switchable in-session; permission mode is not, so it must be absent.
-    expect(tip.textContent).not.toContain("Permissions");
+    expect(tip.textContent).not.toContain("Permission mode");
   });
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
@@ -3417,10 +3694,7 @@ describe("Composer config gear", () => {
     // while Luna's own max stays.
     await waitFor(() => expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(null));
     act(() => useChatStore.setState({ llmModel: "gpt-5.6-luna", selectedEffort: null }));
-    expect(screen.getByTestId("composer-agent-effort-default")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    expect(screen.queryByTestId("composer-agent-effort-default")).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-ultra"]')).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-max"]')).not.toBeNull();
   });

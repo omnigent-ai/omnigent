@@ -220,6 +220,35 @@ describe("terminalKeyEventPayload", () => {
     expect(payload).toBe("\x1b[13;2u");
   });
 
+  it("maps macOS Cmd line shortcuts to their readline control bytes", () => {
+    // WHY: Option+key works because xterm encodes Alt as ESC-prefixes, but
+    // Cmd (metaKey) combos reach neither xterm nor the PTY — native-terminal
+    // line editing (delete to start / home / end) silently did nothing.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true }))).toBe("\x15");
+    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true }))).toBe("\x01");
+    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowRight", metaKey: true }))).toBe("\x05");
+  });
+
+  it("keeps browser-owned Cmd combos off the mapping", () => {
+    // Cmd+C/V/K/R (copy/paste/clear/reload) and every Cmd combo with another
+    // modifier must keep their browser meaning — only the bare three
+    // line-editing combos are synthesized.
+    expect(terminalKeyEventPayload(keyEvent({ key: "c", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "v", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "k", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "r", metaKey: true }))).toBeNull();
+    // Meta combined with another modifier (e.g. Cmd+Shift+Backspace, or a
+    // Windows-flag AltGr-adjacent event) stays on the default path.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true, shiftKey: true })),
+    ).toBeNull();
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true, altKey: true })),
+    ).toBeNull();
+    // Plain, unmodified keys never hit the mapping either.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace" }))).toBeNull();
+  });
+
   it("leaves plain Enter on xterm's default path", () => {
     expect(terminalKeyEventPayload(keyEvent({ key: "Enter" }))).toBeNull();
   });
@@ -520,6 +549,7 @@ describe("TerminalSession", () => {
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
     focusOnConnect = true,
+    adaptCodexPalette = false,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -534,6 +564,7 @@ describe("TerminalSession", () => {
       clipboardEnabled,
       onClipboardRequest,
       focusOnConnect,
+      adaptCodexPalette,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
@@ -563,6 +594,141 @@ describe("TerminalSession", () => {
     socket.open();
 
     expect(focusSpy).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it.each([false, true])(
+    "updates cached Codex input and scrollback in both theme directions (starts dark: %s)",
+    async (startsDark) => {
+      const { socket, session } = makeSession(undefined, undefined, true, undefined, true, true);
+      const term = (session as unknown as { term: Terminal }).term;
+      session.setTheme(startsDark);
+      socket.open();
+      const bytes = new TextEncoder().encode(
+        "\x1b[48;2;244;244;244mhistory\x1b[0m\r\n" +
+          "output\r\n".repeat(30) +
+          "\x1b[48;2;30;30;30munsent input\x1b[0m",
+      );
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      socket.emit("message", { data });
+      await new Promise<void>((resolve) => {
+        term.write("", resolve);
+      });
+      const writes = vi.spyOn(term, "write");
+      const frames = [...socket.sent];
+      for (const isDark of [!startsDark, startsDark, !startsDark]) {
+        session.setTheme(isDark);
+        expect(term.options.theme?.extendedAnsi?.[239]).toBe(isDark ? "#2f3132" : "#f4f4f4");
+        expect(term.buffer.active.getLine(0)?.getCell(0)?.isBgPalette()).toBe(true);
+        expect(term.buffer.active.getLine(0)?.getCell(0)?.getBgColor()).toBe(255);
+        expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe("history");
+        const input = term.buffer.active.getLine(
+          term.buffer.active.baseY + term.buffer.active.cursorY,
+        );
+        expect(input?.translateToString(true)).toBe("unsent input");
+        expect(input?.getCell(0)?.getBgColor()).toBe(255);
+        expect(socket.sent).toEqual(frames);
+        expect(socket.closed).toBe(false);
+      }
+      expect(writes).not.toHaveBeenCalled();
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      session.dispose();
+    },
+  );
+
+  it.each([
+    {
+      name: "light truecolor",
+      startsDark: false,
+      stripe: "48;2;244;244;244",
+      selected: "48;2;224;224;224",
+      stripeIndex: 255,
+      selectedIndex: 254,
+    },
+    {
+      name: "light 256-color",
+      startsDark: false,
+      stripe: "48;5;255",
+      selected: "48;5;254",
+      stripeIndex: 255,
+      selectedIndex: 254,
+    },
+    {
+      name: "dark truecolor",
+      startsDark: true,
+      stripe: "48;2;31;33;35",
+      selected: "48;2;47;49;50",
+      stripeIndex: 253,
+      selectedIndex: 255,
+    },
+    {
+      name: "dark 256-color",
+      startsDark: true,
+      stripe: "48;5;234",
+      selected: "48;5;236",
+      stripeIndex: 253,
+      selectedIndex: 255,
+    },
+  ])("recolors cached $name picker rows without merging their shades", async (fixture) => {
+    const { socket, session } = makeSession(undefined, undefined, true, undefined, true, true);
+    const term = (session as unknown as { term: Terminal }).term;
+    session.setTheme(fixture.startsDark);
+    socket.open();
+    const bytes = new TextEncoder().encode(
+      `\x1b[${fixture.stripe}mother session\x1b[0m\r\n` +
+        `\x1b[${fixture.selected}mselected session\x1b[0m`,
+    );
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+    const writes = vi.spyOn(term, "write");
+    const frames = [...socket.sent];
+    const expectedColors: Record<number, { light: string; dark: string }> = {
+      253: { light: "#fafafa", dark: "#1f2123" },
+      254: { light: "#e0e0e0", dark: "#464849" },
+      255: { light: "#f4f4f4", dark: "#2f3132" },
+    };
+    for (const isDark of [fixture.startsDark, !fixture.startsDark, fixture.startsDark]) {
+      session.setTheme(isDark);
+      const stripe = term.buffer.active.getLine(0);
+      const selected = term.buffer.active.getLine(1);
+      expect(stripe?.translateToString(true)).toBe("other session");
+      expect(selected?.translateToString(true)).toBe("selected session");
+      expect(stripe?.getCell(0)?.isBgPalette()).toBe(true);
+      expect(selected?.getCell(0)?.isBgPalette()).toBe(true);
+      expect(stripe?.getCell(0)?.getBgColor()).toBe(fixture.stripeIndex);
+      expect(selected?.getCell(0)?.getBgColor()).toBe(fixture.selectedIndex);
+      const stripeColor = term.options.theme?.extendedAnsi?.[fixture.stripeIndex - 16];
+      const selectedColor = term.options.theme?.extendedAnsi?.[fixture.selectedIndex - 16];
+      expect(stripeColor).toBe(expectedColors[fixture.stripeIndex][isDark ? "dark" : "light"]);
+      expect(selectedColor).toBe(expectedColors[fixture.selectedIndex][isDark ? "dark" : "light"]);
+      expect(stripeColor).not.toBe(selectedColor);
+    }
+    expect(writes).not.toHaveBeenCalled();
+    expect(socket.sent).toEqual(frames);
+    expect(socket.closed).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("leaves non-Codex terminal colors unchanged", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const bytes = new TextEncoder().encode("\x1b[48;2;244;244;244mtext");
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+    session.setTheme(true);
+    expect(term.buffer.active.getLine(0)?.getCell(0)?.isBgRGB()).toBe(true);
+    expect(term.buffer.active.getLine(0)?.getCell(0)?.getBgColor()).toBe(0xf4f4f4);
+    expect(term.options.theme?.extendedAnsi).toBeUndefined();
     session.dispose();
   });
 

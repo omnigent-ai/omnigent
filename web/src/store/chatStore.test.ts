@@ -5340,6 +5340,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
             created_at: 0,
             items: [],
             skills,
+            skills_status: "ready",
           });
         }
         return defaultFetchHandler(input, init);
@@ -5362,6 +5363,65 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       expect(useChatStore.getState().skills).toEqual([
         { name: "grill-me", description: "Interview the user" },
+      ]);
+      expect(useChatStore.getState().skillsStatus).toBe("ready");
+    });
+
+    it.each([{ skills: [] }, { skills: [{ name: "review", description: "Review code" }] }])(
+      "settles skills before an older bind snapshot finishes: %j",
+      async ({ skills }) => {
+        const id = "conv_skills_race";
+        seedSession(id);
+        let resolveInitialSnapshot!: (response: Response) => void;
+        let snapshotCount = 0;
+        const snapshot = { id, agent_id: "agent_xyz", status: "idle", created_at: 0, items: [] };
+        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+            snapshotCount += 1;
+            if (snapshotCount === 1) {
+              return new Promise<Response>((resolve) => {
+                resolveInitialSnapshot = resolve;
+              });
+            }
+            return mockResponse({ ...snapshot, skills, skills_status: "ready" });
+          }
+          return defaultFetchHandler(input, init);
+        });
+
+        const bind = useChatStore.getState().switchTo(id);
+        await tick();
+        handleSessionEvent({ type: "session_skills", conversationId: id });
+        await tick();
+        const statusBeforeBind = useChatStore.getState().skillsStatus;
+        resolveInitialSnapshot(mockResponse({ ...snapshot, skills: [], skills_status: "loading" }));
+        await bind;
+
+        expect(snapshotCount).toBe(2);
+        expect(statusBeforeBind).toBe("ready");
+        expect(useChatStore.getState().skillsStatus).toBe("ready");
+        expect(useChatStore.getState().skills).toEqual(skills);
+      },
+    );
+
+    it("ignores a skills response superseded by a newer notification", async () => {
+      useChatStore.setState({ conversationId: "conv_abc", skillsStatus: "loading", skills: [] });
+      let resolveOlder!: (response: Response) => void;
+      fetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveOlder = resolve;
+          }),
+      );
+      handleSessionEvent({ type: "session_skills", conversationId: "conv_abc" });
+      seedSnapshotSkills("conv_abc", [{ name: "newer", description: "Latest catalog" }]);
+      handleSessionEvent({ type: "session_skills", conversationId: "conv_abc" });
+      await tick();
+      resolveOlder(mockResponse({ id: "conv_abc", skills: [], skills_status: "error" }));
+      await tick();
+      expect(useChatStore.getState().skillsStatus).toBe("ready");
+      expect(useChatStore.getState().skills).toEqual([
+        { name: "newer", description: "Latest catalog" },
       ]);
     });
 
@@ -5410,8 +5470,10 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(conversationRegistry.peek("conv_bg_skills")!.getState().skills).toEqual([
         { name: "late", description: "resolved in background" },
       ]);
+      expect(conversationRegistry.peek("conv_bg_skills")!.getState().skillsStatus).toBe("ready");
       // ...and the visible conversation was not touched.
       expect(useChatStore.getState().skills).toEqual([]);
+      expect(useChatStore.getState().skillsStatus).toBeNull();
     });
 
     it("leaves the existing skills in place when the refetch fails", async () => {
@@ -5438,6 +5500,17 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().skills).toEqual([
         { name: "kept", description: "survives the error" },
       ]);
+      expect(useChatStore.getState().skillsStatus).toBe("error");
+    });
+
+    it("retries failed discovery with a fresh runner snapshot", async () => {
+      useChatStore.setState({ conversationId: "conv_abc", skills: [], skillsStatus: "error" });
+      seedSnapshotSkills("conv_abc", []);
+      await useChatStore.getState().refreshSkills();
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes("refresh_state=true"))).toBe(
+        true,
+      );
+      expect(useChatStore.getState().skillsStatus).toBe("ready");
     });
   });
 

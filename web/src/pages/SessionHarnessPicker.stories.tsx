@@ -44,7 +44,9 @@ const meta = {
               nativeVendorOwnsModel: false,
             }}
           >
-            <div className="flex min-h-[480px] w-[620px] items-end rounded-xl border bg-card p-4">
+            {/* A column so the composer is width-constrained like its real mounts;
+                a shrink-to-fit item would collapse its labels for lack of room. */}
+            <div className="flex min-h-[480px] w-[620px] flex-col justify-end rounded-xl border bg-card p-4">
               <Story />
             </div>
           </ChatStoreSeed>

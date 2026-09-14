@@ -67,7 +67,10 @@ from omnigent.harnesses.codex_native.bridge import (
     socket_path_for_bridge_dir,
     write_bridge_state,
 )
-from omnigent.harnesses.codex_native.forwarder import supervise_forwarder
+from omnigent.harnesses.codex_native.forwarder import (
+    _replay_dead_letters_before_resume,
+    supervise_forwarder,
+)
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 from omnigent.host.daemon_launch import (
     error_text,
@@ -1904,9 +1907,11 @@ async def _ensure_local_codex_resume_rollout(
     ``resume <thread>`` reads that local rollout, so before launching a
     known-thread terminal we rewrite it from committed Omnigent items. This
     keeps the server transcript authoritative when a previous local rollout
-    has diverged. If server history is temporarily unavailable, a valid local
-    rollout remains a best-effort fallback. A successful server fetch wins
-    even when its committed history is empty or shorter than the local file;
+    has diverged. Before fetching that transcript, we best-effort replay any
+    proven-undelivered dead letters so successful recovery is reflected in the
+    same snapshot. If server history is temporarily unavailable, a valid local
+    rollout remains a best-effort fallback. A successful server fetch wins even
+    when its committed history is empty or shorter than the local file;
     local-only records are intentionally discarded.
 
     :param client: HTTP client pointed at the Omnigent server.
@@ -1941,6 +1946,7 @@ async def _ensure_local_codex_resume_rollout(
             f"Cannot resume Codex session {session_id!r}: persisted thread id "
             f"{external_session_id!r} is not a safe Codex rollout id."
         )
+    await _replay_dead_letters_before_resume(client, codex_home.parent)
     try:
         items = await _fetch_all_session_items_for_codex_resume(client, session_id)
     except _CodexResumeHistoryUnavailableError:

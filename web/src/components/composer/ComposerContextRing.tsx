@@ -38,10 +38,11 @@ export function ComposerContextRing({
       <TooltipTrigger asChild>
         <span
           data-testid="composer-context-ring"
-          className={cn("flex items-center gap-1.5 text-muted-foreground", className)}
+          className={cn("flex shrink-0 items-center gap-1 text-muted-foreground", className)}
           aria-label={`${usedPct}% of context used`}
         >
-          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+          {/* Tight stroke bounds keep the visible icon-to-label gap consistent. */}
+          <svg viewBox="1.5 1.5 13 13" width="13" height="13" fill="none" aria-hidden="true">
             {/* Track */}
             <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
             {/* Used arc — skipped at 0, where round linecaps would still paint a dot. */}
