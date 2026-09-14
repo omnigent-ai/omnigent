@@ -1549,3 +1549,89 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
+async def test_rekey_auto_forwarder_task_moves_the_registration() -> None:
+    """
+    A ``/clear`` rotation re-homes the forwarder registration onto the new session.
+
+    The SAME task keeps mirroring the pane after the rotation, but the registry
+    is keyed by the session that launched it. Without the re-key, a teardown
+    addressed at the superseded conversation (terminal re-create, or a stop
+    request) would cancel the live forwarder.
+    """
+    old_session_id = "aaaaaaaa1111111122222222bbbbbbbb"
+    new_session_id = "cccccccc3333333344444444dddddddd"
+    run = _ForwarderRun()
+
+    async def _parked() -> None:
+        """Park forever like the restart-forever supervisor."""
+        run.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(old_session_id, task)
+        await asyncio.sleep(0)
+
+        runner_app_mod._rekey_auto_forwarder_task(old_session_id, new_session_id)
+
+        assert runner_app_mod._AUTO_FORWARDER_TASKS.get(new_session_id) is task
+        assert old_session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+        # The re-key must not disturb the run — it is still mirroring the pane.
+        assert not task.done()
+
+        # A teardown aimed at the superseded conversation now finds nothing.
+        await runner_app_mod._cancel_auto_forwarder_task(old_session_id)
+        assert not task.done()
+        assert run.cancelled is False
+
+        # The new key still reaches it.
+        await runner_app_mod._cancel_auto_forwarder_task(new_session_id)
+        assert task.cancelled()
+        assert run.cancelled is True
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(old_session_id, None)
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(new_session_id, None)
+        await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_rekey_auto_forwarder_task_noops_for_same_id_or_unregistered() -> None:
+    """
+    Re-keying is a no-op when nothing moves.
+
+    The forwarder calls this on every successful rotation, including ones where
+    the registry never held the launching session (a host-spawned pane), so it
+    must never raise or invent an entry.
+    """
+    session_id = "eeeeeeee5555555566666666ffffffff"
+    run = _ForwarderRun()
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(session_id, task)
+        await asyncio.sleep(0)
+
+        runner_app_mod._rekey_auto_forwarder_task(session_id, session_id)
+        assert runner_app_mod._AUTO_FORWARDER_TASKS.get(session_id) is task
+
+        runner_app_mod._rekey_auto_forwarder_task("conv_never_registered", "conv_target")
+        assert "conv_target" not in runner_app_mod._AUTO_FORWARDER_TASKS
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop("conv_target", None)
+        await _drain_forwarder_runs([run])
