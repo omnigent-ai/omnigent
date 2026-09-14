@@ -11217,6 +11217,8 @@ def create_runner_app(
             return await get_session_cursor_model_options(session_id)
         if harness == "kiro-native":
             return await get_session_kiro_model_options(session_id)
+        if harness == "devin-native":
+            return await get_session_devin_model_options(session_id)
         return JSONResponse(status_code=200, content={"models": []})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
