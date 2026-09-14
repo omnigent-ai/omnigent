@@ -216,3 +216,79 @@ def test_token_priced_bucket_matches_flat_cost(
     # total_tokens = 200 (input) + 0 (cache) + 50 (output) = 250; cost = 2.50.
     assert usage["total_cost_usd"] == pytest.approx(2.50)
     assert usage["by_model"]["gpt-5.6"]["total_cost_usd"] == pytest.approx(2.50)
+
+
+def test_cost_by_model_weights_split_the_growth(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="fan-out", agent_id=_AGENT_ID)
+
+    # Baseline turn on the orchestrator's model (sonnet).
+    _persist_native_cumulative_usage(
+        conv.id,
+        {"cumulative_cost_usd": 0.20, "model": "claude-sonnet-4-6"},
+        store,
+    )
+    # A turn that fanned out a Task sub-agent pinned to opus: the flat
+    # cumulative total advances by 0.80, and the report carries per-model
+    # weights (the forwarder's transcript-estimated growth per model). The
+    # delta must split across the weights instead of landing on the
+    # statusLine's active model — otherwise the sub-agent's model never
+    # gets a bucket in the per-model breakdown (the bug this guards).
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_cost_usd": 1.00,
+            "model": "claude-sonnet-4-6",
+            "cost_by_model": {"claude-sonnet-4-6": 0.20, "claude-opus-4-8": 0.60},
+        },
+        store,
+    )
+
+    usage = _usage(store, conv.id)
+    by_model = usage["by_model"]
+    assert usage["total_cost_usd"] == pytest.approx(1.00)
+    # 0.80 growth split 0.20:0.60 across the weights, on top of the 0.20 baseline.
+    assert by_model["claude-sonnet-4-6"]["total_cost_usd"] == pytest.approx(0.40)
+    assert by_model["claude-opus-4-8"]["total_cost_usd"] == pytest.approx(0.60)
+    assert sum(m["total_cost_usd"] for m in by_model.values()) == pytest.approx(1.00)
+
+
+def test_cost_by_model_weights_are_proportions_not_absolutes(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="weights-scale", agent_id=_AGENT_ID)
+
+    # The transcript estimate can disagree with Claude's own billing (S): the
+    # weights sum to 1.30 here while the authoritative flat growth is 1.00.
+    # The split must scale to the flat growth so per-model buckets keep
+    # summing to the (monotonic-clamped) session total.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_cost_usd": 1.00,
+            "cost_by_model": {"claude-sonnet-4-6": 0.65, "claude-opus-4-8": 0.65},
+        },
+        store,
+    )
+
+    usage = _usage(store, conv.id)
+    by_model = usage["by_model"]
+    assert usage["total_cost_usd"] == pytest.approx(1.00)
+    assert by_model["claude-sonnet-4-6"]["total_cost_usd"] == pytest.approx(0.50)
+    assert by_model["claude-opus-4-8"]["total_cost_usd"] == pytest.approx(0.50)
+
+
+def test_cost_by_model_rejects_malformed_weights(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="weights-invalid", agent_id=_AGENT_ID)
+
+    from omnigent.errors import OmnigentError
+
+    for bad in (
+        {"cost_by_model": "not-a-dict"},
+        {"cost_by_model": {"claude-opus-4-8": "high"}},
+        {"cost_by_model": {"claude-opus-4-8": -1.0}},
+        {"cost_by_model": {"claude-opus-4-8": float("nan")}},
+        {"cost_by_model": {"": 0.5}},
+    ):
+        with pytest.raises(OmnigentError):
+            _persist_native_cumulative_usage(conv.id, {"cumulative_cost_usd": 1.0, **bad}, store)
