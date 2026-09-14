@@ -2893,6 +2893,7 @@ def create_runner_app(
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
@@ -3970,6 +3971,7 @@ def create_runner_app(
                 "hermes": _hermes_terminal_ensure_locks,
                 "qwen": _qwen_terminal_ensure_locks,
                 "kimi": _kimi_terminal_ensure_locks,
+                "devin": _devin_terminal_ensure_locks,
             }[_native_agent.key]
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
@@ -4161,7 +4163,12 @@ def create_runner_app(
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
-            elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
+            elif harness_name in (
+                "cursor-native",
+                "opencode-native",
+                "kimi-native",
+                "devin-native",
+            ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
                 )
@@ -9609,6 +9616,7 @@ def create_runner_app(
                 "hermes": _hermes_terminal_ensure_locks,
                 "qwen": _qwen_terminal_ensure_locks,
                 "kimi": _kimi_terminal_ensure_locks,
+                "devin": _devin_terminal_ensure_locks,
             }[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False
 
@@ -9709,7 +9717,7 @@ def create_runner_app(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi"):
+            elif terminal_name in ("cursor", "kimi", "devin"):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
