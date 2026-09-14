@@ -1536,6 +1536,7 @@ def register_resources_routes(
             attachment_upload_limit,
             compress_image_attachment,
             image_filename_for_content_type,
+            image_needs_compression,
         )
 
         # Resolve the type from the declared MIME + filename BEFORE reading
@@ -1572,9 +1573,10 @@ def register_resources_routes(
         )
         # Images upload at the larger image cap; shrink an oversized one under
         # the provider's per-image limit before storing, so the base64 inlined
-        # every turn always fits. Non-images pass through untouched.
+        # every turn always fits. A small image or a non-compressed type passes
+        # through untouched, and skips the worker-thread hop + semaphore.
         filename = file.filename
-        if content_type.startswith("image/"):
+        if image_needs_compression(len(content), content_type):
             try:
                 # Compression decodes + re-encodes (CPU/memory heavy). Run it off
                 # the event loop, and bound concurrency so a burst of large

@@ -272,6 +272,21 @@ def image_filename_for_content_type(filename: str, content_type: str) -> str:
         return filename
 
 
+def image_needs_compression(size: int, content_type: str) -> bool:
+    """Whether an image upload would actually be re-encoded by compression.
+
+    Lets the upload route skip the worker-thread hop and the compression
+    semaphore for images that pass through untouched — a small image (``<=``
+    :data:`IMAGE_MODEL_BUDGET_BYTES`) or a type we don't compress (SVG, …).
+    Mirrors the fast-path short-circuit in :func:`compress_image_attachment`.
+
+    :param size: The image's byte length.
+    :param content_type: The resolved image MIME.
+    :returns: ``True`` only if compression would decode/re-encode the image.
+    """
+    return size > IMAGE_MODEL_BUDGET_BYTES and content_type in _COMPRESSIBLE_IMAGE_MIMES
+
+
 def _encode_image(image: Any, image_format: str, **params: Any) -> bytes:
     """Encode *image* to *image_format*, returning the bytes."""
     from io import BytesIO
@@ -311,7 +326,7 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
         message is safe to surface to the client (no raw decoder text).
     """
     # Small enough already, or a type we don't compress (SVG etc.): leave as-is.
-    if len(content) <= IMAGE_MODEL_BUDGET_BYTES or content_type not in _COMPRESSIBLE_IMAGE_MIMES:
+    if not image_needs_compression(len(content), content_type):
         return content, content_type
 
     from io import BytesIO

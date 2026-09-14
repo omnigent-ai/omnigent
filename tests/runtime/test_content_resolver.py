@@ -1085,6 +1085,24 @@ def test_compress_image_rejects_undecodable_over_budget() -> None:
         compress_image_attachment(garbage, "image/png")
 
 
+def test_image_needs_compression_gates_thread_hop() -> None:
+    """The route-side predicate matches the in-function short-circuit."""
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        image_needs_compression,
+    )
+
+    big = IMAGE_MODEL_BUDGET_BYTES + 1
+    small = IMAGE_MODEL_BUDGET_BYTES - 1
+    # Only a large, compressible raster actually re-encodes.
+    assert image_needs_compression(big, "image/png") is True
+    assert image_needs_compression(big, "image/jpeg") is True
+    # Small compressible image → passes through, no thread hop.
+    assert image_needs_compression(small, "image/png") is False
+    # Large but non-compressible type (SVG) → passes through.
+    assert image_needs_compression(big, "image/svg+xml") is False
+
+
 def test_compress_image_skips_non_raster_type() -> None:
     """A non-raster image type (SVG) over the budget is passed through, not 413'd."""
     from omnigent.runtime.content_resolver import (
