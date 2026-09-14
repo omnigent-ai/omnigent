@@ -3927,4 +3927,12 @@ describe("shouldQueueSend", () => {
     // a direct send can't overtake a still-queued earlier one.
     expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
   });
+
+  it("sends directly for a /side command even while busy or with a queued message", () => {
+    // A codex /side forks its own side chat and is non-interrupting — it must
+    // POST now while the parent turn runs, bypassing both the busy gate and the
+    // main-thread ordering guard.
+    expect(shouldQueueSend("conv_a", "streaming", "running", [], false, true)).toBe(false);
+    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")], false, true)).toBe(false);
+  });
 });

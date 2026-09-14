@@ -100,6 +100,7 @@ import {
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { isSideChatCommand } from "@/lib/sideChat";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -350,6 +351,12 @@ export function splitSlashCommand(
  * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
  * once this conversation has a queued message it must drain in order, or a
  * direct send could overtake a still-queued earlier one on an idle flicker.
+ *
+ * ``opensSideChat`` (a codex ``/side`` command) always POSTs now. A side chat is
+ * forked onto its own thread and is non-interrupting by design — asking while
+ * the agent works is the whole point — so it must not park in the queue behind
+ * the parent's active turn. It shares no ordering with main-thread sends, so it
+ * bypasses ``hasQueued`` too.
  */
 export function shouldQueueSend(
   conversationId: string | null,
@@ -357,8 +364,10 @@ export function shouldQueueSend(
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
   alwaysSteer = false,
+  opensSideChat = false,
 ): boolean {
   if (conversationId === null) return false;
+  if (opensSideChat) return false;
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
   if (alwaysSteer) return hasQueued;
   const isBusy = status === "streaming" || sessionStatus === "running";
@@ -930,6 +939,11 @@ export function ChatPage() {
       // always-steer preference on, a mid-turn follow-up skips the queue and is
       // POSTed now instead.
       const chat = useChatStore.getState();
+      // A codex /side command opens its own side chat off the parent thread, so
+      // it must POST now even mid-turn rather than park in the queue (see the
+      // matching gate in the store's send()). Mirror that harness gate here.
+      const opensSideChat =
+        chat.sessionHarness === "codex-native" && isSideChatCommand(text.trim());
       if (
         shouldQueueSend(
           chat.conversationId,
@@ -937,6 +951,7 @@ export function ChatPage() {
           chat.sessionStatus,
           chat.queuedMessages,
           readAlwaysSteer(),
+          opensSideChat,
         )
       ) {
         chat.enqueueMessage(text, files, replyDraft);
