@@ -23,12 +23,6 @@ from omnigent.server.schemas import ErrorDetail
 # has to carry an origin.
 _NON_FAILURE_STATUSES = frozenset({"idle", "running", "waiting", "launching"})
 
-_ATTRIBUTED_MODULES = (
-    "omnigent/server/routes/_sessions/orchestration.py",
-    "omnigent/server/routes/sessions/routes_events.py",
-    "omnigent/server/routes/_sessions/helpers.py",
-)
-
 
 @pytest.fixture(autouse=True)
 def _clean_status_cache() -> None:
@@ -143,19 +137,27 @@ def _failure_publish_calls(source: str) -> list[ast.Call]:
     return calls
 
 
-@pytest.mark.parametrize("module_path", _ATTRIBUTED_MODULES)
-def test_every_failure_publish_site_names_itself(module_path: str) -> None:
+def test_every_failure_publish_site_names_itself() -> None:
     """A new failure path cannot silently rejoin the undifferentiated bucket.
 
-    The dashboard groups these ERRORs by nothing finer than the function
-    they come from, so an unattributed site is invisible among the dozen
-    other causes rather than merely under-described.
+    The dashboard groups these ERRORs by nothing finer than the function they
+    come from, so an unattributed site is invisible among the dozen other
+    causes rather than merely under-described.
+
+    Scans the whole server package rather than a list of known files: a
+    hardcoded list would stop covering the moment a failure path moves to a new
+    module, which is exactly when the guard is needed.
     """
-    root = Path(helpers.__file__).parents[4]
-    source = (root / module_path).read_text()
-    for call in _failure_publish_calls(source):
-        keywords = {kw.arg for kw in call.keywords}
-        assert "failure_origin" in keywords, (
-            f"{module_path}:{call.lineno} publishes a possible failure without "
-            "failure_origin; the ERROR it logs would be unattributable"
-        )
+    server_root = Path(helpers.__file__).parents[2]
+    checked = 0
+    for path in sorted(server_root.rglob("*.py")):
+        for call in _failure_publish_calls(path.read_text()):
+            checked += 1
+            keywords = {kw.arg for kw in call.keywords}
+            assert "failure_origin" in keywords, (
+                f"{path.relative_to(server_root)}:{call.lineno} publishes a possible "
+                "failure without failure_origin; the ERROR it logs would be "
+                "unattributable"
+            )
+    # A scan that silently matched nothing would pass forever.
+    assert checked >= 7, f"expected the known failure publish sites, found {checked}"
