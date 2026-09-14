@@ -1,11 +1,4 @@
-"""The recording docs' textual carve-out must not cover CLI console output.
-
-The lane doc's "static piece of text" carve-out once listed "a log line" as an
-example, so an agent could label a live command's console output textual and
-skip filming the exact expired-login `omnigent host` journey the doc's `cli`
-section names as filmable. These pin the scoping that closes that loophole in
-`dev/recording-lanes.md` and its restatement in the repro mandate.
-"""
+"""The recording docs' textual carve-out must not cover CLI console output."""
 
 from pathlib import Path
 
@@ -24,7 +17,6 @@ def test_lane_carveout_excludes_command_console_output() -> None:
     assert (
         '"The outcome is just a log line" never exempts a runnable command from footage.' in lanes
     )
-    # The old example list presented a log line as static text — the loophole.
     assert "an error string, a value, a log line" not in lanes
 
 

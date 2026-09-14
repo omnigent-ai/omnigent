@@ -44,20 +44,12 @@ def _normalized_resolve_instructions() -> str:
 
 
 def test_textual_carveout_scoped_to_api_and_test_asserted_values() -> None:
-    """The no-footage carve-out must not be readable as covering CLI output.
-
-    An unscoped "static line / value" carve-out once let a fix for a host's
-    misleading console error ship with ``recordings: []`` by calling the
-    command's output "a log line", though the lane doc films exactly that
-    journey.
-    """
     normalized = _normalized_resolve_instructions()
 
     assert (
         "The no-footage carve-out applies **only** to `api` facets and to "
         "values only a test asserts" in normalized
     )
-    # The old unscoped phrasing offered the loophole; it must stay gone.
     assert "just a static line, value, or the absence of an error" not in normalized
     assert "For purely textual evidence" not in normalized
 
