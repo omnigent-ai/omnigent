@@ -409,12 +409,23 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 
+A reproduction that stood up its **own live server** — for any reason the
+stock `tests/e2e_ui/` fixture can't cover — has not lost the web lane; that
+running server is itself a recording target. Build the SPA and point the
+recorder at the server you already have running (`--ui-base-url`; see
+`dev/recording-lanes.md`) and film the user-visible moment there. Citing the
+stock fixture's limits is never grounds for `recording_unavailable_reason`:
+only an attempted attach that failed, with the command and error quoted,
+justifies the skip.
+
 A clip must show a **live action producing the outcome** — a command executing
 and printing, a screen changing — never static text on screen asserting the bug.
 When a facet's whole user-visible outcome is a static piece of text (an error
 line, a value) with nothing to watch, do **not** manufacture a video of it: keep
 `recordings: []` and state the observed text in your evidence, per
-`dev/recording-lanes.md`.
+`dev/recording-lanes.md`. An error *appearing* mid-journey — a status pill
+flashing while the turn runs, a stream dying and the session recovering — is a
+screen changing, not static text: film it.
 
 ## Output — the reproduction artifacts
 
