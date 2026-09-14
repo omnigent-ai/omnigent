@@ -42,6 +42,9 @@ const modelOptionSchema = z.object({
   id: z.string(),
   model: z.string().optional(),
   displayName: z.string().optional(),
+  // Owning provider id, when the catalog reports one — kept so the cached
+  // menu can still group by provider exactly like the live query.
+  provider: z.string().optional(),
   isDefault: z.boolean().optional(),
   defaultReasoningEffort: z.string().optional(),
   supportedReasoningEfforts: z

@@ -466,11 +466,13 @@ def test_pi_native_model_options_lists_only_managed_models(
             "id": "omnigent-openai/gpt-5.6-sol",
             "model": "omnigent-openai/gpt-5.6-sol",
             "displayName": "GPT 5.6 Sol",
+            "provider": "omnigent-openai",
         },
         {
             "id": "omnigent/claude-sonnet-4-6",
             "model": "omnigent/claude-sonnet-4-6",
             "displayName": "claude-sonnet-4-6",
+            "provider": "omnigent",
         },
     ]
 
@@ -2616,11 +2618,13 @@ def test_model_options_fall_back_to_pi_own_login(
             "id": "anthropic/claude-haiku-4-5",
             "model": "anthropic/claude-haiku-4-5",
             "displayName": "claude-haiku-4-5",
+            "provider": "anthropic",
         },
         {
             "id": "anthropic/claude-sonnet-4-5",
             "model": "anthropic/claude-sonnet-4-5",
             "displayName": "Claude Sonnet 4.5",
+            "provider": "anthropic",
         },
     ]
 

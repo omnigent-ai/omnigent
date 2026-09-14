@@ -17,7 +17,10 @@ import {
   COMPOSER_HARNESS_MENU_SIZE,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
-import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerConfigSections,
+  providerGroupedChoices,
+} from "@/components/composer/ComposerConfigSections";
 import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   codexCreateApprovalOptions,
@@ -65,7 +68,6 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { iconForAgent } from "@/components/AgentCard";
 import { showToast } from "@/components/ui/toast";
@@ -76,8 +78,10 @@ import {
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
+  ModelMenuSearch,
   defaultModelLabel,
   nativeModelLabel,
+  useModelMenuFilter,
 } from "@/components/HarnessConfigControls";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import {
@@ -1348,6 +1352,7 @@ export function AgentHarnessPicker({
   triggerIcon,
   selectedConfigContent,
   isEntryConfigurable,
+  focusConfigSearch,
   entrySummaries,
   autoHarnessAvailable = false,
   autoHarnessActive = false,
@@ -1408,6 +1413,10 @@ export function AgentHarnessPicker({
   selectedConfigContent?: ReactNode;
   /** Whether an entry has model settings or a configurable agent harness. */
   isEntryConfigurable?: (agent: AvailableAgent) => boolean;
+  /** Focus hook for the config menu's search field, when it shows one.
+   *  Called instead of Radix's default focus-first-item when the sub-menu
+   *  opens, so the search input receives the first keystroke. */
+  focusConfigSearch?: () => void;
   entrySummaries?: Readonly<Record<string, string>>;
   /** Whether the top-level Smart Routing row is offered (routing enabled and
    *  both native CLIs ready). Defaults off, so an embedder that doesn't wire
@@ -1515,6 +1524,17 @@ export function AgentHarnessPicker({
         }}
         onSelect={editable ? undefined : () => onSelectAgent(agent)}
         configContent={active ? selectedConfigContent : null}
+        onConfigOpenAutoFocus={
+          focusConfigSearch
+            ? (event) => {
+                // Steer Radix's default focus-first-item into the search
+                // field when the config menu shows one, so the first typed
+                // character lands in the filter.
+                event.preventDefault();
+                focusConfigSearch();
+              }
+            : undefined
+        }
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
         label={agent.display_name}
@@ -2424,6 +2444,7 @@ export function NewChatLandingScreen() {
             id: option.id,
             model: option.model,
             displayName: nativeModelLabel(option),
+            provider: option.provider,
             source: option.source,
           })),
     [availablePiModels, sandboxSelected],
@@ -3251,7 +3272,16 @@ export function NewChatLandingScreen() {
       : selectedNativeHarness === "codex-native"
         ? codexModelOptions
         : [];
-  const [pickerModelSearch, setPickerModelSearch] = useState("");
+  const modelFilter = useModelMenuFilter(pickerModelOptions);
+  const { setQuery: setPickerModelQuery } = modelFilter;
+  // Pi keeps the search box even for empty/short catalogs — a stable
+  // affordance of the picker's authed-provider catalog (it can grow as
+  // providers log in), matching the pre-refactor behavior. Other harnesses
+  // ride the hook's length threshold alone.
+  const showPickerSearch = selectedNativeHarness === "pi-native" || modelFilter.showSearch;
+  // Switching harnesses swaps the catalog under the query; start the new
+  // harness's picker from an empty filter (restores the pre-refactor reset).
+  useEffect(() => setPickerModelQuery(""), [selectedNativeHarness, setPickerModelQuery]);
   const pickerModelsLoading =
     !sandboxSelected &&
     selectedHostId !== null &&
@@ -3360,7 +3390,6 @@ export function NewChatLandingScreen() {
   }, [pickerCacheKey, pickerLoading, permissionPreview]);
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
-  useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
     : selectedNativeHarness === "pi-native"
@@ -3442,16 +3471,7 @@ export function NewChatLandingScreen() {
                   header: "Models",
                   leading: (
                     <>
-                      {selectedNativeHarness === "pi-native" && (
-                        <Input
-                          aria-label="Search models"
-                          placeholder="Search models…"
-                          value={pickerModelSearch}
-                          onChange={(event) => setPickerModelSearch(event.target.value)}
-                          onKeyDown={(event) => event.stopPropagation()}
-                          data-testid="new-chat-landing-agent-model-search"
-                        />
-                      )}
+                      {showPickerSearch && <ModelMenuSearch filter={modelFilter} />}
                       {pickerModelsLoading && pickerModelOptions.length === 0 && (
                         <div className="px-2 py-1 text-xs text-muted-foreground">
                           Loading models…
@@ -3460,6 +3480,11 @@ export function NewChatLandingScreen() {
                       {!pickerModelsLoading && pickerModelOptions.length === 0 && (
                         <div className="px-2 py-1 text-xs text-muted-foreground">
                           {pickerModelsError?.message ?? "Models unavailable"}
+                        </div>
+                      )}
+                      {modelFilter.noResults && (
+                        <div className="px-2 py-1 text-xs text-muted-foreground">
+                          No models found
                         </div>
                       )}
                     </>
@@ -3477,17 +3502,10 @@ export function NewChatLandingScreen() {
                           },
                         ]
                       : []),
-                    ...pickerModelOptions
-                      .filter((option) =>
-                        pickerModelSearch
-                          .toLowerCase()
-                          .trim()
-                          .split(/\s+/)
-                          .every((term) =>
-                            `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
-                          ),
-                      )
-                      .map((option) => ({
+                    ...providerGroupedChoices(
+                      modelFilter.filteredOptions,
+                      pickerModelOptions,
+                      (option) => ({
                         key: option.id,
                         label: visibleModelLabel(nativeModelLabel(option)),
                         checked:
@@ -3499,7 +3517,8 @@ export function NewChatLandingScreen() {
                         testId: `new-chat-landing-agent-model-${option.id}`,
                         title: nativeModelLabel(option),
                         className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
-                      })),
+                      }),
+                    ),
                   ],
                 }
               : undefined
@@ -6271,6 +6290,7 @@ export function NewChatLandingScreen() {
                         }
                         selectedConfigContent={selectedConfigContent}
                         isEntryConfigurable={isEntryConfigurable}
+                        focusConfigSearch={showPickerSearch ? modelFilter.focusInput : undefined}
                         entrySummaries={pickerEntrySummaries}
                         autoHarnessAvailable={smartRoutingHarnessAvailable}
                         autoHarnessActive={smartRoutingHarnessSelected}

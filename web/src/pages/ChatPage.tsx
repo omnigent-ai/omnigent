@@ -202,9 +202,11 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
-import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerConfigSections,
+  providerGroupedChoices,
+} from "@/components/composer/ComposerConfigSections";
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
@@ -215,6 +217,11 @@ import {
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
 } from "@/lib/composerModelLabel";
+import {
+  ModelMenuSearch,
+  nativeModelLabel,
+  useModelMenuFilter,
+} from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -4412,6 +4419,13 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
+  const modelFilter = useModelMenuFilter(modelOptions);
+  // Reset the search when the menu closes: the picker survives warm
+  // conversation switches, and a filter left over from the last open would
+  // silently pre-filter the next conversation's catalog.
+  useEffect(() => {
+    if (!menuOpen) modelFilter.setQuery("");
+  }, [menuOpen, modelFilter]);
   const configContent = (
     <ComposerConfigSections
       models={
@@ -4419,6 +4433,14 @@ function SessionHarnessPicker({
           ? {
               testId: "composer-agent-models",
               header: "Models",
+              leading: (
+                <>
+                  {modelFilter.showSearch && <ModelMenuSearch filter={modelFilter} />}
+                  {modelFilter.noResults && (
+                    <div className="px-2 py-1 text-xs text-muted-foreground">No models found</div>
+                  )}
+                </>
+              ),
               choices: [
                 ...(!modelOptions.some((model) => model.isDefault)
                   ? [
@@ -4432,7 +4454,7 @@ function SessionHarnessPicker({
                       },
                     ]
                   : []),
-                ...modelOptions.map((model) => ({
+                ...providerGroupedChoices(modelFilter.filteredOptions, modelOptions, (model) => ({
                   key: model.id,
                   label: nativeModelLabel(model),
                   checked:
@@ -4680,6 +4702,7 @@ function useResolvedComposerModel(
     label?: string;
     displayName?: string;
     isDefault?: boolean;
+    provider?: string;
   }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 

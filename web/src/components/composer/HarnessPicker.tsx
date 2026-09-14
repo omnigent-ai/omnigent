@@ -104,6 +104,7 @@ export function HarnessPickerEntry({
   onOpenChange,
   onSelect,
   configContent,
+  onConfigOpenAutoFocus,
   editable = true,
   isMobile = false,
   disabled,
@@ -115,6 +116,9 @@ export function HarnessPickerEntry({
   onOpenChange: (open: boolean) => void;
   onSelect?: () => void;
   configContent?: ReactNode;
+  // Forwarded to the config sub-content's Radix onOpenAutoFocus — e.g. to
+  // focus a model search box mounted inside the config menu.
+  onConfigOpenAutoFocus?: (event: Event) => void;
   disabled?: boolean;
   testId?: string;
   configTestId?: string;
@@ -154,6 +158,7 @@ export function HarnessPickerEntry({
             if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
               event.preventDefault();
           }}
+          onOpenAutoFocus={onConfigOpenAutoFocus}
         >
           {configContent}
         </DropdownMenuSubContent>

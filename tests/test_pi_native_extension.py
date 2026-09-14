@@ -3133,6 +3133,9 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
   );
   // Display name falls back to the model's ``name``.
   assert.equal(models[0].displayName, "Sonnet");
+  // Provider field is carried through from the model object.
+  assert.equal(models[0].provider, "omnigent");
+  assert.equal(models[1].provider, "omnigent");
 
   // The launch model is mirrored so the pill/active-row resolve immediately.
   const changes = posted.filter((e) => e.type === "external_model_change");
