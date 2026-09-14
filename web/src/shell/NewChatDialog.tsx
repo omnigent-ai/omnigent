@@ -3394,10 +3394,14 @@ export function NewChatLandingScreen() {
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
     : selectedNativeHarness === "devin-native"
-      ? // Devin encodes effort as a model-variant suffix over exactly the
-        // Anthropic rung set; the runner recombines the pair at launch
-        // (resolve_devin_launch_model), so the picker offers the same ladder.
-        CLAUDE_NATIVE_EFFORTS
+      ? // Devin encodes effort as a model-variant suffix, and the rung set is
+        // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a
+        // different Fusion model), so derive it from the selected model's catalog
+        // entry rather than offering a fixed ladder the model can't honor.
+        codexEffortLevelsForModel(
+          devinModelOptions,
+          pickedModel || devinModelOptions.find((option) => option.isDefault)?.id,
+        ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
       : selectedNativeHarness === "pi-native"
         ? PI_NATIVE_EFFORTS
         : selectedNativeHarness === "codex-native"

@@ -4092,9 +4092,11 @@ export function effortLevelsForConv(
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "devin-native-ui":
-      // Devin encodes effort as a model-variant suffix; its rung set is the
-      // Anthropic ladder (low/medium/high/xhigh/max).
-      return CLAUDE_NATIVE_EFFORT_LEVELS;
+      // Devin encodes effort as a model-variant suffix, and the rung set is
+      // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a different
+      // Fusion model), so derive it from the selected model's catalog entry —
+      // its `supportedReasoningEfforts` — rather than a fixed ladder.
+      return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "pi-native-ui":

@@ -216,6 +216,12 @@ def list_devin_cli_model_options(
         efforts = [effort for effort in DEVIN_EFFORTS if f"{slug}-{effort}" in variants]
         if efforts:
             option["efforts"] = efforts
+            # Also emit the shared native-catalog shape (`supportedReasoningEfforts`)
+            # so the web effort picker shows only THIS model's rungs — swe-2 has
+            # only medium/high/max, and `swe-2-low` is a different (Fusion) model.
+            option["supportedReasoningEfforts"] = [
+                {"reasoningEffort": effort} for effort in efforts
+            ]
         aliases = family.get("aliases")
         if isinstance(aliases, list):
             alias_strings = [a for a in aliases if isinstance(a, str) and a]
