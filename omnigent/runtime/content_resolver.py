@@ -167,8 +167,11 @@ IMAGE_MAX_DECODED_PIXELS: int = 32 * 1024 * 1024
 
 # JPEG/MPO decode at a reduced DCT scale via Image.draft(), so a large source
 # never fully materializes — a higher source ceiling is safe (and welcome: phone
-# photos are large JPEGs). This is a bomb-sanity limit on the declared header.
-IMAGE_MAX_SOURCE_PIXELS: int = 100 * 1024 * 1024
+# photos are large JPEGs). The actual decode is bounded by the post-draft check
+# against IMAGE_MAX_DECODED_PIXELS; this is a sanity limit on the declared
+# header. Kept under Pillow's own MAX_IMAGE_PIXELS (~89.5 MP) so opening a valid
+# large photo doesn't emit its "decompression bomb" warning into server logs.
+IMAGE_MAX_SOURCE_PIXELS: int = 80 * 1024 * 1024
 
 # Pillow formats whose decoder honours draft() scale-down (so the source cap,
 # not the decoded cap, applies). MPO is multi-picture JPEG.
@@ -394,8 +397,22 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
         with Image.open(BytesIO(content), formats=allowed_formats) as opened:
             # draft() lets the JPEG decoder emit a DCT-downscaled frame (½/¼/⅛)
             # directly, so a large photo never fully decodes into memory. No-op
-            # for formats that don't support it (PNG/WebP/GIF).
-            opened.draft(None, (IMAGE_MAX_EDGE_PX, IMAGE_MAX_EDGE_PX))
+            # for formats that don't support it (PNG/WebP/GIF). The target must
+            # preserve aspect ratio: a square (E, E) box won't reduce an extreme
+            # ratio (e.g. 60000×1600, whose short side is already < E), leaving
+            # it to decode at full size, so scale the box to the image's ratio.
+            w0, h0 = opened.size
+            if w0 >= h0:
+                draft_target = (IMAGE_MAX_EDGE_PX, max(1, round(IMAGE_MAX_EDGE_PX * h0 / w0)))
+            else:
+                draft_target = (max(1, round(IMAGE_MAX_EDGE_PX * w0 / h0)), IMAGE_MAX_EDGE_PX)
+            opened.draft(None, draft_target)
+            # Hard-cap the decode on the POST-draft size, before load(), so the
+            # actual pixel allocation is bounded for every format and aspect
+            # ratio — draft() is a no-op for some inputs and can't always reach
+            # the edge cap, so the source-header check alone isn't sufficient.
+            if opened.width * opened.height > IMAGE_MAX_DECODED_PIXELS:
+                raise ImageCompressionError("the image's dimensions are too large to process")
             # Apply EXIF orientation in place: the copying form allocates a full
             # extra frame even when there's no orientation to apply (the common
             # case), which on a large image is a needless ~100 MB.

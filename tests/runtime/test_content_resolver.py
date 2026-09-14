@@ -1183,6 +1183,63 @@ def test_compress_image_format_aware_pixel_cap() -> None:
         compress_image_attachment(png_buf.getvalue(), "image/png")
 
 
+@pytest.mark.parametrize(("w", "h"), [(24000, 1200), (1200, 24000)])
+def test_compress_image_extreme_aspect_jpeg_is_draft_reduced(w: int, h: int) -> None:
+    """A wide/tall JPEG (short side < edge cap) is draft-reduced, not full-decoded.
+
+    A square draft target won't downscale an extreme aspect ratio, so without an
+    aspect-preserving target these would decode at full source size (28 MP here).
+    """
+    import os
+    import warnings
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MAX_EDGE_PX,
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    buffer = BytesIO()
+    Image.frombytes("L", (w, h), os.urandom(w * h)).save(buffer, format="JPEG", quality=92)
+    data = buffer.getvalue()
+    assert len(data) > IMAGE_MODEL_BUDGET_BYTES
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        result, _ = compress_image_attachment(data, "image/jpeg")
+
+    with Image.open(BytesIO(result)) as out:
+        assert max(out.width, out.height) <= IMAGE_MAX_EDGE_PX
+
+
+def test_compress_image_rejects_over_source_cap() -> None:
+    """A JPEG whose header exceeds the source ceiling is rejected up front."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MAX_SOURCE_PIXELS,
+        ImageCompressionError,
+        compress_image_attachment,
+    )
+
+    # A wide JPEG just over the source cap (kept under Pillow's ~89.5 MP bomb
+    # threshold so building it doesn't warn).
+    w = 55000
+    h = (IMAGE_MAX_SOURCE_PIXELS // w) + 2000
+    assert w * h > IMAGE_MAX_SOURCE_PIXELS
+    buffer = BytesIO()
+    Image.frombytes("L", (w, h), os.urandom(w * h)).save(buffer, format="JPEG", quality=85)
+
+    with pytest.raises(ImageCompressionError):
+        compress_image_attachment(buffer.getvalue(), "image/jpeg")
+
+
 def test_compress_image_skips_non_raster_type() -> None:
     """A non-raster image type (SVG) over the budget is passed through, not 413'd."""
     from omnigent.runtime.content_resolver import (
