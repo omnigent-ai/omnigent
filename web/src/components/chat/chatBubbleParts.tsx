@@ -757,7 +757,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
               nothing rather than an empty markdown block. */}
-            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+            {text && (
+              <FilePathAwareMessageResponse breaks mode="static">
+                {text}
+              </FilePathAwareMessageResponse>
+            )}
           </MessageContent>
         </div>
         {/* Skip an empty row when there is neither a timestamp nor a copy

@@ -3544,7 +3544,7 @@ function ComposerImpl(
                   <div className="mb-2">
                     <p className="mb-1 text-xs text-muted-foreground">Answer:</p>
                     <div className="prose prose-sm dark:prose-invert max-w-none text-sm">
-                      <FilePathAwareMessageResponse>
+                      <FilePathAwareMessageResponse mode="static">
                         {btwSidechat.answer}
                       </FilePathAwareMessageResponse>
                     </div>
