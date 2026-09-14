@@ -3,6 +3,7 @@ export type JsonValue =
 
 export const ACTION_IDS = [
   "workbench.action.showCommands",
+  "workbench.action.showSessionSearch",
   "workbench.action.openKeyboardShortcuts",
   "workbench.action.navigateInbox",
   "workbench.action.navigateAutomations",
@@ -147,6 +148,7 @@ export interface ActionContextValues {
   inputFocus: boolean;
   terminalFocus: boolean;
   monacoFocus: boolean;
+  commandPaletteFocus: boolean;
   eventMeta: boolean;
   composerStreaming: boolean;
   composerSuggestionsOpen: boolean;
@@ -187,6 +189,8 @@ export type KeybindingRule<A extends ActionId = ActionId> = A extends ActionId
       /** Higher values win among otherwise equally specific matching rules. */
       priority?: number;
       allowRepeat?: boolean;
+      /** Preserve legacy globals that ran after a widget called preventDefault. */
+      allowDefaultPrevented?: boolean;
       preventDefault?: boolean;
       stopPropagation?: boolean;
     } & ActionArgsField<A>

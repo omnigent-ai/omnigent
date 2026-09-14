@@ -10,12 +10,20 @@ const definitions = [
     palette: false,
   },
   {
+    id: "workbench.action.showSessionSearch",
+    title: "Find a session by name",
+    category: "General",
+    keywords: ["sessions", "search", "switch"],
+    icon: "Search",
+    palette: false,
+  },
+  {
     id: "workbench.action.openKeyboardShortcuts",
     title: "Open keyboard shortcuts",
     category: "General",
     keywords: ["keybindings", "hotkeys"],
     icon: "Keyboard",
-    palette: true,
+    palette: false,
     paletteOrder: 70,
   },
   {
