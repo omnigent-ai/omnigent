@@ -28,7 +28,7 @@ from tests.e2e_ui.conftest import _build_hello_world_bundle, open_right_rail
 
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 _MODEL_EFFORT_CUE = '[data-testid="subagent-model-effort"]'
-_COMPOSER_LABEL = '[data-testid="composer-model-effort-label"]'
+_COMPOSER_LABEL = '[data-testid="composer-agent-config-value"]'
 
 # Override persisted on the child: dashed GPT spelling that the UI renders
 # as "gpt-5.4" (badge) / "databricks-gpt-5.4" (composer), with effort "high".
@@ -95,7 +95,7 @@ def test_subagent_model_effort_cue_shows_persisted_values(
         # model and effort without picker controls.
         row.click()
         page.wait_for_url(re.compile(re.escape(f"/c/{child_id}")))
-        label = page.get_by_test_id("composer-model-effort-label")
+        label = page.locator(_COMPOSER_LABEL)
         expect(label).to_be_visible(timeout=30_000)
         expect(label).to_contain_text("databricks-gpt-5.4")
         expect(label).to_contain_text("High")
