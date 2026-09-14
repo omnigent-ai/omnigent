@@ -608,6 +608,11 @@ class ConversationStore(ABC):
             means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            item no longer exists in this conversation (e.g. deleted
+            between two page fetches) — its position is unknowable, and an
+            empty page would be indistinguishable from a completed
+            enumeration.
         """
         ...
 
@@ -796,6 +801,10 @@ class ConversationStore(ABC):
             in a single indexed query instead of fetching all children.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            conversation no longer exists (e.g. deleted between two page
+            fetches) — its sort position is unknowable, and an empty page
+            would be indistinguishable from a completed enumeration.
         """
         ...
 

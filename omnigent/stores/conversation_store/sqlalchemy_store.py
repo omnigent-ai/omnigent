@@ -78,6 +78,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.errors import StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
@@ -1952,40 +1953,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             if type is not None:
                 stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
             if after:
-                # Scope the cursor lookup to conversation_id so it lands on the
-                # (workspace_id, conversation_id, id) primary key as a point
-                # lookup. Without it, (workspace_id, id) leads no index and the
-                # subquery degrades to a workspace-wide scan every paginated page.
-                sub = (
-                    select(SqlConversationItem.position)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == conversation_id,
-                        SqlConversationItem.id == after,
-                    )
-                    .scalar_subquery()
-                )
+                after_pos = self._resolve_item_cursor_position(session, conversation_id, after)
                 # "after" = further in sort direction
                 stmt = stmt.where(
-                    SqlConversationItem.position > sub
+                    SqlConversationItem.position > after_pos
                     if is_asc
-                    else SqlConversationItem.position < sub
+                    else SqlConversationItem.position < after_pos
                 )
             if before:
-                sub = (
-                    select(SqlConversationItem.position)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == conversation_id,
-                        SqlConversationItem.id == before,
-                    )
-                    .scalar_subquery()
-                )
+                before_pos = self._resolve_item_cursor_position(session, conversation_id, before)
                 # "before" = opposite of sort direction
                 stmt = stmt.where(
-                    SqlConversationItem.position < sub
+                    SqlConversationItem.position < before_pos
                     if is_asc
-                    else SqlConversationItem.position > sub
+                    else SqlConversationItem.position > before_pos
                 )
             # Never ask the backend for more than the per-statement row cap:
             # deployed managed Postgres failed one oversized read of a large
@@ -2022,6 +2003,42 @@ class SqlAlchemyConversationStore(ConversationStore):
                 last_id=items[-1].id if items else None,
                 has_more=has_more,
             )
+
+    @staticmethod
+    def _resolve_item_cursor_position(
+        session: Session,
+        conversation_id: str,
+        cursor_id: str,
+    ) -> int:
+        """
+        Resolve an item cursor id to its ``position`` at read time.
+
+        Scoped to ``conversation_id`` so the lookup lands on the
+        ``(workspace_id, conversation_id, id)`` primary key as a point
+        lookup, and so another conversation's cursor id can never supply a
+        cutoff position. Resolving eagerly (instead of a correlated scalar
+        subquery, which yields NULL for a missing row) makes an
+        unresolvable cursor distinguishable from a completed enumeration
+        rather than silently truncating it.
+
+        :param session: Open conversation-DB session.
+        :param conversation_id: The conversation being listed.
+        :param cursor_id: The ``after``/``before`` item id.
+        :returns: The cursor item's position.
+        :raises StaleCursorError: If no such item exists in this
+            conversation — deleted between two page fetches, or a cursor
+            id from another conversation.
+        """
+        position = session.execute(
+            select(SqlConversationItem.position).where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == conversation_id,
+                SqlConversationItem.id == cursor_id,
+            )
+        ).scalar_one_or_none()
+        if position is None:
+            raise StaleCursorError(cursor_id)
+        return position
 
     def list_latest_message_items_for_conversations(
         self,
@@ -2778,6 +2795,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if after:
                 stmt = self._apply_cursor(
+                    session,
                     stmt,
                     after,
                     sort_col,
@@ -2787,6 +2805,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if before:
                 stmt = self._apply_cursor(
+                    session,
                     stmt,
                     before,
                     sort_col,
@@ -2870,6 +2889,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     @staticmethod
     def _apply_cursor(
+        session: Session,
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
         sort_col: QueryableAttribute[int],
@@ -2881,8 +2901,18 @@ class SqlAlchemyConversationStore(ConversationStore):
         Add a cursor-based WHERE clause to the query.
 
         Add a ``(sort_col, tiebreaker_col)`` composite WHERE clause so
-        that cursor pagination is consistent with the ORDER BY key.
+        that cursor pagination is consistent with the ORDER BY key. The
+        cursor row's position is resolved here with a point lookup and
+        embedded as literal bounds (a keyset cursor) rather than left as a
+        correlated scalar subquery: on a row deleted between two page
+        fetches the subquery yields NULL, every comparison evaluates to
+        NULL, and the page reads as empty with ``has_more=False`` — silent
+        truncation indistinguishable from a completed enumeration. A
+        vanished cursor row now raises instead, and a delete landing after
+        the lookup still pages from the resolved position.
 
+        :param session: Open conversation-DB session used to resolve the
+            cursor row's position.
         :param stmt: The current SELECT statement to augment.
         :param cursor_id: The conversation ID acting as the page cursor,
             e.g. ``"conv_abc123"``.
@@ -2894,42 +2924,33 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param forward: ``True`` for ``after`` cursors, ``False`` for
             ``before`` cursors.
         :returns: The statement with the cursor WHERE clause applied.
+        :raises StaleCursorError: If the cursor row no longer exists (it
+            was deleted between two page fetches).
         """
-        sub = (
-            select(sort_col)
-            .where(
+        # Point lookup on the (workspace_id, id) key. For the non-SQLite id
+        # tiebreaker this re-selects cursor_id; for SQLite it fetches rowid.
+        cursor_row = session.execute(
+            select(sort_col, tiebreaker_col).where(
                 SqlConversation.workspace_id == current_workspace_id(),
                 SqlConversation.id == cursor_id,
             )
-            .scalar_subquery()
-        )
-        # When tiebreaker_col is SqlConversation.id (non-SQLite), its value for
-        # the cursor row is cursor_id itself — no extra subquery needed.
-        # For SQLite rowid (a literal_column), we must query the DB.
-        if isinstance(tiebreaker_col, QueryableAttribute):
-            tiebreaker_val: Any = cursor_id
-        else:
-            tiebreaker_val = (
-                select(tiebreaker_col)
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.id == cursor_id,
-                )
-                .scalar_subquery()
-            )
+        ).first()
+        if cursor_row is None:
+            raise StaleCursorError(cursor_id)
+        sort_val, tiebreaker_val = cursor_row
         # "after" (forward=True) = further in sort direction;
         # "before" (forward=False) = opposite of sort direction.
         if forward:
-            ts_cmp = sort_col < sub if is_desc else sort_col > sub
+            ts_cmp = sort_col < sort_val if is_desc else sort_col > sort_val
             id_cmp = (
                 tiebreaker_col < tiebreaker_val if is_desc else tiebreaker_col > tiebreaker_val
             )
         else:
-            ts_cmp = sort_col > sub if is_desc else sort_col < sub
+            ts_cmp = sort_col > sort_val if is_desc else sort_col < sort_val
             id_cmp = (
                 tiebreaker_col > tiebreaker_val if is_desc else tiebreaker_col < tiebreaker_val
             )
-        return stmt.where(or_(ts_cmp, and_(sort_col == sub, id_cmp)))
+        return stmt.where(or_(ts_cmp, and_(sort_col == sort_val, id_cmp)))
 
     def update_conversation(
         self,
