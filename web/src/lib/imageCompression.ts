@@ -141,10 +141,8 @@ async function reencodeWithinBudget(
   const bitmap = await decodeBitmap(file);
   if (bitmap === null) return { ok: false, reason: "unreadable", file };
   try {
-    const heic = isHeicImageFile(file);
-    const preferred: ("image/jpeg" | "image/webp")[] = heic
-      ? ["image/jpeg"]
-      : ["image/webp", "image/jpeg"];
+    // Only HEIC reaches here, and HEIC always lands as JPEG.
+    const preferred: ("image/jpeg" | "image/webp")[] = ["image/jpeg"];
     const baseDimension = Math.min(maxDimension, Math.max(bitmap.width, bitmap.height));
     let encodeFailed = false;
     for (const dimensionScale of [1, ...FALLBACK_SCALE_STEPS]) {
@@ -183,21 +181,20 @@ async function reencodeWithinBudget(
 }
 
 /**
- * Make an image ready to attach: convert HEIC/HEIF to JPEG, and shrink any
- * image over `budgetBytes` to fit. Non-images and images already within
- * budget pass through unchanged.
+ * Make an image ready to attach by converting HEIC/HEIF to JPEG. Everything
+ * else passes through untouched: the server accepts a large compressible
+ * raster image and re-encodes it under the provider's per-image limit, so the
+ * browser only has to handle the format it cannot read at all.
  */
 export async function prepareImageAttachment(
   file: File,
   budgetBytes: number = MAX_IMAGE_UPLOAD_BYTES,
   maxDimension: number = MAX_IMAGE_DIMENSION,
 ): Promise<PreparedAttachment> {
-  const isImage = file.type.startsWith("image/") || isHeicImageFile(file);
-  if (!isImage) return { ok: true, file, converted: false };
+  if (!isHeicImageFile(file)) return { ok: true, file, converted: false };
+  // Decoding tens of megabytes of untrusted image in the page is the one cost
+  // worth refusing outright; the upload cap would reject it anyway.
   if (file.size > MAX_COMPRESSIBLE_SOURCE_BYTES) return { ok: false, reason: "too-large", file };
-  if (!isHeicImageFile(file) && file.size <= budgetBytes) {
-    return { ok: true, file, converted: false };
-  }
   return reencodeWithinBudget(file, budgetBytes, maxDimension);
 }
 
