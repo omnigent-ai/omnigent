@@ -20,6 +20,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { useSearchParams } from "@/lib/routing";
 import { useLoginV2 } from "@/lib/useLoginV2";
+import { ElectronWindowDragStrip } from "@/components/ElectronWindowDragStrip";
 import { AuthCardShell } from "@/pages/onboarding/AuthCardShell";
 import { JoinTeamStep } from "@/pages/onboarding/JoinTeamStep";
 import { Button } from "@/components/ui/button";
@@ -193,6 +194,7 @@ export function RegisterPage() {
         paddingBottom: "var(--omnigent-safe-bottom)",
       }}
     >
+      <ElectronWindowDragStrip />
       <div className="w-full max-w-sm space-y-6">{body}</div>
     </div>
   );
