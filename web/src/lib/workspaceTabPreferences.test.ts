@@ -6,6 +6,8 @@ import {
   writeDefaultWorkspaceTab,
 } from "./workspaceTabPreferences";
 
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
+
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 
 afterEach(() => {
@@ -27,14 +29,56 @@ describe("workspaceTabPreferences — read/write", () => {
     expect(readDefaultWorkspaceTab()).toBe("files");
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
+
+  it("applies a changed default to existing chats without closing their tabs or changing layout", () => {
+    writeSessionWorkspaceState("conv_files", {
+      open: true,
+      widthPx: 480,
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    writeSessionWorkspaceState("conv_shell", {
+      open: false,
+      rightRailTab: "changes",
+      openTerminals: ["terminal:main"],
+      selectedTerminalKey: "terminal:main",
+      openBrowsers: ["browser:one"],
+      selectedBrowserId: "browser:one",
+    });
+
+    writeDefaultWorkspaceTab("github");
+
+    expect(readDefaultWorkspaceTab()).toBe("github");
+    expect(readSessionWorkspaceState("conv_files")).toEqual({
+      open: true,
+      widthPx: 480,
+      openFiles: ["README.md"],
+    });
+    expect(readSessionWorkspaceState("conv_shell")).toEqual({
+      open: false,
+      openTerminals: ["terminal:main"],
+      openBrowsers: ["browser:one"],
+    });
+
+    writeSessionWorkspaceState("conv_files", { rightRailTab: "subagents" });
+    writeDefaultWorkspaceTab("github");
+    expect(readSessionWorkspaceState("conv_files").rightRailTab).toBe("subagents");
+
+    writeDefaultWorkspaceTab("files");
+    expect(readSessionWorkspaceState("conv_files").rightRailTab).toBeUndefined();
+  });
 });
 
 describe("normalizeDefaultWorkspaceTab", () => {
-  it.each(["files", "changes", "subagents", "browser"] as const)("passes through %s", (value) => {
+  it.each(["files", "changes", "github", "subagents"] as const)("passes through %s", (value) => {
     expect(normalizeDefaultWorkspaceTab(value)).toBe(value);
   });
 
-  it.each(["terminals", "todos", "unknown", null, undefined])("maps %s to files", (value) => {
-    expect(normalizeDefaultWorkspaceTab(value)).toBe("files");
-  });
+  it.each(["browser", "terminals", "todos", "unknown", null, undefined])(
+    "maps %s to files",
+    (value) => {
+      expect(normalizeDefaultWorkspaceTab(value)).toBe("files");
+    },
+  );
 });

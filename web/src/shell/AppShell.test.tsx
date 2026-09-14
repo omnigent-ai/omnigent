@@ -2852,67 +2852,54 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
 
-  it.each(["remembered", "default"])(
-    "preserves the %s Browser tab when the outgoing Files tab becomes unavailable",
-    (source) => {
-      vi.stubGlobal("omnigentDesktop", {
-        kind: "electron",
-        browserOpenOrNavigate: vi.fn(),
-        setBadgeCount: vi.fn(),
-      });
-      try {
-        writeSessionWorkspaceState("conv_from", { rightRailTab: "files" });
-        if (source === "remembered") {
-          writeSessionWorkspaceState("conv_to", { rightRailTab: "browser" });
-        } else {
-          localStorage.setItem("omnigent:default-workspace-tab", "browser");
-        }
-        useEnvironmentMock.mockImplementation(
-          (id) =>
-            ({
-              data: { available: id === "conv_from", root: null, home: null },
-              isLoading: false,
-            }) as ReturnType<typeof useWorkspaceEnvironment>,
-        );
-        mockConversations([
-          { id: "conv_from", permission_level: null },
-          { id: "conv_to", permission_level: null },
-        ]);
-        const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-        render(
-          <QueryClientProvider client={qc}>
-            <TooltipProvider>
-              <MemoryRouter initialEntries={["/c/conv_from"]}>
-                <Routes>
-                  <Route element={<AppShell />}>
-                    <Route
-                      path="c/:conversationId"
-                      element={<SessionNavButton to="/c/conv_to" />}
-                    />
-                  </Route>
-                </Routes>
-              </MemoryRouter>
-            </TooltipProvider>
-          </QueryClientProvider>,
-        );
-        expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
-          "aria-selected",
-          "true",
-        );
+  it("preserves a remembered Browser tab when the outgoing Files tab becomes unavailable", () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+    });
+    try {
+      writeSessionWorkspaceState("conv_from", { rightRailTab: "files" });
+      writeSessionWorkspaceState("conv_to", { rightRailTab: "browser" });
+      useEnvironmentMock.mockImplementation(
+        (id) =>
+          ({
+            data: { available: id === "conv_from", root: null, home: null },
+            isLoading: false,
+          }) as ReturnType<typeof useWorkspaceEnvironment>,
+      );
+      mockConversations([
+        { id: "conv_from", permission_level: null },
+        { id: "conv_to", permission_level: null },
+      ]);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_from"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_to" />} />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
+      expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
 
-        fireEvent.click(screen.getByTestId("nav-session"));
+      fireEvent.click(screen.getByTestId("nav-session"));
 
-        expect(screen.getByRole("tab", { name: /Browser/i })).toHaveAttribute(
-          "aria-selected",
-          "true",
-        );
-        expect(readSessionWorkspaceState("conv_to").rightRailTab).toBe("browser");
-      } finally {
-        cleanup();
-        vi.unstubAllGlobals();
-      }
-    },
-  );
+      expect(screen.getByRole("tab", { name: /Browser/i })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(readSessionWorkspaceState("conv_to").rightRailTab).toBe("browser");
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
 
   it("uses the default when navigating from Agents to a child in another tree", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
@@ -2963,8 +2950,8 @@ describe("Right workspace card visibility", () => {
     expect(readSessionWorkspaceState("conv_child").rightRailTab).toBe("changes");
   });
 
-  it("falls back to Files when the preferred tab is unavailable", () => {
-    localStorage.setItem("omnigent:default-workspace-tab", "browser");
+  it("falls back to Files when the remembered tab is unavailable", () => {
+    writeSessionWorkspaceState("conv_no_browser", { rightRailTab: "browser" });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
       isLoading: false,

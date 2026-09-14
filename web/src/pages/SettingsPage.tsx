@@ -42,6 +42,7 @@ import {
   useRef,
   useState,
 } from "react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
@@ -50,7 +51,6 @@ import {
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
-  GlobeIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -374,19 +374,19 @@ const workspacePanelCards: {
 const workspaceTabCards: {
   value: DefaultWorkspaceTab;
   label: string;
-  icon: typeof FilesIcon;
+  icon: ComponentType<{ className?: string }>;
 }[] = [
   { value: "files", label: "Files", icon: FilesIcon },
   { value: "changes", label: "Changes", icon: FileDiffIcon },
+  { value: "github", label: "GitHub", icon: GithubMono },
   { value: "subagents", label: "Agents", icon: BotIcon },
-  { value: "browser", label: "Browser", icon: GlobeIcon },
 ];
 
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: typeof SunIcon, label: string) {
+function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
     <>
-      <Icon className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
       <span className="text-ui font-medium">{label}</span>
     </>
   );
@@ -559,7 +559,7 @@ function WorkspaceTabDefaultControl() {
     <ThemeSubsection
       labelId={labelId}
       title="Default Workspace tab"
-      helper="Used when a chat has no remembered tab. Unavailable tabs fall back to Files, then the first available tab."
+      helper="Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
     >
       <CardRadioGroup<DefaultWorkspaceTab>
         labelledBy={labelId}

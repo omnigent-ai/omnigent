@@ -40,6 +40,41 @@ def test_default_workspace_tab_setting_opens_session_on_chosen_tab(
     expect(rail.get_by_role("list")).to_be_visible()
 
 
+def test_changed_default_applies_to_visited_session_after_reload(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A changed default replaces an old selection; later manual choices still persist."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    rail = page.get_by_role("complementary", name="Workspace")
+    files_tab = rail.get_by_role("tab", name="Files", exact=True)
+    expect(files_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+
+    page.goto(f"{base_url}/settings/appearance")
+    group = page.get_by_role("radiogroup", name="Default Workspace tab")
+    options = group.get_by_role("radio")
+    expect(options).to_have_count(4)
+    for index, label in enumerate(["Files", "Changes", "GitHub", "Agents"]):
+        expect(options.nth(index)).to_have_accessible_name(label)
+    github_default = page.get_by_test_id("workspace-tab-default-github")
+    github_default.click()
+    page.reload()
+    expect(github_default).to_have_attribute("aria-checked", "true", timeout=30_000)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    github_tab = rail.get_by_role("tab", name="GitHub", exact=True)
+    expect(github_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+    page.reload()
+    expect(github_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+
+    files_tab.click()
+    page.reload()
+    expect(files_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+    github_tab.click()
+    page.reload()
+    expect(github_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
+
+
 def test_agents_tab_survives_return_to_unvisited_root(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:
