@@ -35,7 +35,14 @@ function isLoginRedirect(details) {
   } catch {
     return false;
   }
-  return pathname.endsWith("/login.html") || pathname === "login.html";
+  // A managed workspace bounces an expired session to its login gate — observed
+  // as `/login/sso` (and `/login`); some deployments use `/login.html`. Match
+  // all of these. Scoped to the login path prefix so ordinary API redirects
+  // (e.g. /ajax-api/…) are left alone.
+  const p = pathname.toLowerCase();
+  return (
+    p === "/login" || p.startsWith("/login/") || p.endsWith("/login.html") || p === "login.html"
+  );
 }
 
 /**
