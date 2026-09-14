@@ -982,10 +982,15 @@ async def test_codex_reprobed_launch_catalog_joins_existing_probe(
 async def test_codex_reprobed_launch_catalog_cancels_timed_out_probe_and_preserves_cache(
     _catalog_launch: NativeCodexLaunch,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The probe deadline cancels stalled work, not just its shared-task waiter."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.models import model_catalog_store
+
+    # Traceback rendering must not consume the probe cancellation deadline.
+    monkeypatch.setattr(codex_native_app_server._logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(codex_native_app_server._logger, "propagate", False)
 
     fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
     stale = [{"id": "gpt-5.5", "isDefault": True}]
