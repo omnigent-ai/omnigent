@@ -64,23 +64,14 @@ function isLoginRedirect(details) {
  */
 function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindowsForOrigin) {
   ses.webRequest.onBeforeRedirect((details) => {
-    const login = isLoginRedirect(details);
-    // Diagnostic: every redirect the shell observes, and whether it's classed as
-    // a login bounce. Lets us see if the expiry signal is an HTTP 3xx at all (vs
-    // a client-side navigation we'd miss here).
-    console.log(
-      `[omnigent] session-expiry: redirect status=${details.statusCode} url=${details.url} -> ${details.redirectURL} login=${login}`,
-    );
-    if (!login) return;
+    if (!isLoginRedirect(details)) return;
     let origin;
     try {
       origin = new URL(details.url).origin;
     } catch {
       return;
     }
-    const connected = isConnectedServerOrigin(origin);
-    console.log(`[omnigent] session-expiry: login bounce for ${origin} connected=${connected}`);
-    if (!connected) return;
+    if (!isConnectedServerOrigin(origin)) return;
     reloadWindowsForOrigin(origin);
   });
 }

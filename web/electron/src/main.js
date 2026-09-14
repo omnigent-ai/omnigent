@@ -553,6 +553,33 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
  * — see session-expiry.js. A desktop user has no address bar to refresh out of
  * the resulting "Failed to load" state manually, so the shell does it.
  */
+/**
+ * Silently re-establish the DBAUTH cookie for a managed Databricks window that
+ * just navigated away to a login/SSO page (the expiry signal). The workspace
+ * SPA bounces an expired session via a CLIENT-SIDE navigation, which
+ * webRequest.onBeforeRedirect never sees — so this hangs off the away-watch's
+ * navigation detection instead. Re-mints from the stored token (no browser) and
+ * reloads on success; on failure it does nothing and the away banner handles it.
+ * Non-managed windows are left entirely to the banner. Throttled per window.
+ *
+ * @param {Electron.BrowserWindow} win
+ */
+function silentReauthManaged(win) {
+  if (!win || win.isDestroyed()) return;
+  const origin = pinnedOrigin(win);
+  if (!origin || !databricksOAuthConfigured() || !isDatabricksManagedServerUrl(origin)) return;
+  const now = Date.now();
+  const last = lastExpiryReloadAt.get(win) ?? 0;
+  if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) return;
+  lastExpiryReloadAt.set(win, now);
+  console.log(`[omnigent] databricks: left ${origin} (session likely expired); silent re-mint`);
+  ensureDatabricksSession(session.defaultSession, origin, { interactive: false })
+    .then(() => {
+      if (!win.isDestroyed()) win.webContents.reload();
+    })
+    .catch((err) => console.warn(`[omnigent] databricks silent re-mint failed: ${err.message}`));
+}
+
 function registerSessionExpiryAccess() {
   registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
     const now = Date.now();
@@ -1481,6 +1508,9 @@ function createWindow(targetUrl, opts = {}) {
       debugLog: (message) => console.warn(`[omnigent] ${message}`),
       onAway: (returnUrl) => returnBanner.show(win, returnUrl ?? windows.get(win)?.serverUrl),
       onReturn: () => returnBanner.hide(win),
+      // Managed Databricks: the moment we leave to a login/SSO page, try a
+      // silent cookie re-mint so the user is back before the banner would show.
+      onLeave: () => silentReauthManaged(win),
     }),
   );
   if (destination) {
