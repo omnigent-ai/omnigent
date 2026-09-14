@@ -123,6 +123,16 @@ async def _register_routes(page) -> None:
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    # The stub host has no backend model-options probe; answer instantly like
+    # test_start_session.py does. The landing picker's loading skeleton waits
+    # on this probe (pickerModelsLoading), and an unstubbed request against
+    # the live server retries for ~22s for a host it does not know — which
+    # would keep the picker trigger unrendered and fail this test for reasons
+    # unrelated to the discovery scan under measurement.
+    await page.route(
+        "**/v1/hosts/*/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
     await page.route(_AGENTS_RE, handle_agents)
     await page.route(_SCAN_RE, handle_scan)
 
