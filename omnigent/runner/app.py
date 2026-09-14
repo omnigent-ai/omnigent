@@ -6105,6 +6105,47 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_devin_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        # Devin has no separate effort flag — effort is a suffix on the model id.
+        # Compose the picked family with the session's remembered effort so a
+        # New-Chat (model, effort) pick lands on the same variant the launch path
+        # composes (compose is idempotent for an already-composed id).
+        composed = await asyncio.to_thread(
+            resolve_devin_launch_model,
+            model.strip(),
+            _session_reasoning_effort.get(conv_id),
+        )
+        if not composed:
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=composed,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
@@ -9175,6 +9216,7 @@ def create_runner_app(
                 "cursor-native",
                 "opencode-native",
                 "kiro-native",
+                "devin-native",
                 "pi-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
@@ -9205,6 +9247,11 @@ def create_runner_app(
                     )
                 if harness == "kiro-native":
                     return await _handle_kiro_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_model_change(
                         conversation_id,
                         model,
                     )
