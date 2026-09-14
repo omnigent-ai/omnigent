@@ -608,6 +608,84 @@ describe("TerminalSession", () => {
     },
   );
 
+  it.each([
+    {
+      name: "light truecolor",
+      startsDark: false,
+      stripe: "48;2;244;244;244",
+      selected: "48;2;224;224;224",
+      stripeIndex: 255,
+      selectedIndex: 254,
+    },
+    {
+      name: "light 256-color",
+      startsDark: false,
+      stripe: "48;5;255",
+      selected: "48;5;254",
+      stripeIndex: 255,
+      selectedIndex: 254,
+    },
+    {
+      name: "dark truecolor",
+      startsDark: true,
+      stripe: "48;2;31;33;35",
+      selected: "48;2;47;49;50",
+      stripeIndex: 253,
+      selectedIndex: 255,
+    },
+    {
+      name: "dark 256-color",
+      startsDark: true,
+      stripe: "48;5;234",
+      selected: "48;5;236",
+      stripeIndex: 253,
+      selectedIndex: 255,
+    },
+  ])("recolors cached $name picker rows without merging their shades", async (fixture) => {
+    const { socket, session } = makeSession(undefined, undefined, true, undefined, true, true);
+    const term = (session as unknown as { term: Terminal }).term;
+    session.setTheme(fixture.startsDark);
+    socket.open();
+    const bytes = new TextEncoder().encode(
+      `\x1b[${fixture.stripe}mother session\x1b[0m\r\n` +
+        `\x1b[${fixture.selected}mselected session\x1b[0m`,
+    );
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+    const writes = vi.spyOn(term, "write");
+    const frames = [...socket.sent];
+    const expectedColors: Record<number, { light: string; dark: string }> = {
+      253: { light: "#fafafa", dark: "#1f2123" },
+      254: { light: "#e0e0e0", dark: "#464849" },
+      255: { light: "#f4f4f4", dark: "#2f3132" },
+    };
+    for (const isDark of [fixture.startsDark, !fixture.startsDark, fixture.startsDark]) {
+      session.setTheme(isDark);
+      const stripe = term.buffer.active.getLine(0);
+      const selected = term.buffer.active.getLine(1);
+      expect(stripe?.translateToString(true)).toBe("other session");
+      expect(selected?.translateToString(true)).toBe("selected session");
+      expect(stripe?.getCell(0)?.isBgPalette()).toBe(true);
+      expect(selected?.getCell(0)?.isBgPalette()).toBe(true);
+      expect(stripe?.getCell(0)?.getBgColor()).toBe(fixture.stripeIndex);
+      expect(selected?.getCell(0)?.getBgColor()).toBe(fixture.selectedIndex);
+      const stripeColor = term.options.theme?.extendedAnsi?.[fixture.stripeIndex - 16];
+      const selectedColor = term.options.theme?.extendedAnsi?.[fixture.selectedIndex - 16];
+      expect(stripeColor).toBe(expectedColors[fixture.stripeIndex][isDark ? "dark" : "light"]);
+      expect(selectedColor).toBe(expectedColors[fixture.selectedIndex][isDark ? "dark" : "light"]);
+      expect(stripeColor).not.toBe(selectedColor);
+    }
+    expect(writes).not.toHaveBeenCalled();
+    expect(socket.sent).toEqual(frames);
+    expect(socket.closed).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    session.dispose();
+  });
+
   it("leaves non-Codex terminal colors unchanged", async () => {
     const { socket, session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;

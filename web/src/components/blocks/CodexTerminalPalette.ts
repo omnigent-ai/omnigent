@@ -1,15 +1,43 @@
 import type { ITheme } from "@xterm/xterm";
 
 export const CODEX_INPUT_BACKGROUND_INDEX = 255;
-const CODEX_CACHED_INPUT_RGB = {
-  blackTerminal: "30;30;30",
-  darkTerminal: "47;49;50",
-  lightTerminal: "244;244;244",
+const BACKGROUND_TONES = {
+  subtle: {
+    index: 253,
+    light: "#fafafa",
+    dark: "#1f2123",
+    rgb: ["14;14;14", "31;33;35"],
+    indexed: [233, 234],
+  },
+  input: {
+    index: CODEX_INPUT_BACKGROUND_INDEX,
+    light: "#f4f4f4",
+    dark: "#2f3132",
+    rgb: ["30;30;30", "47;49;50", "244;244;244"],
+    indexed: [8, 236, 255],
+  },
+  emphasis: {
+    index: 254,
+    light: "#e0e0e0",
+    dark: "#464849",
+    rgb: ["224;224;224"],
+    indexed: [254],
+  },
 };
-const INPUT_BACKGROUNDS = new Set(Object.values(CODEX_CACHED_INPUT_RGB));
-const INDEXED_INPUT_BACKGROUNDS = new Set([8, 234, 236, 255]);
+const RGB_BACKGROUND_INDICES = new Map(
+  Object.values(BACKGROUND_TONES).flatMap((tone) =>
+    tone.rgb.map((color) => [color, tone.index] as const),
+  ),
+);
+const INDEXED_BACKGROUND_INDICES = new Map(
+  Object.values(BACKGROUND_TONES).flatMap((tone) =>
+    tone.indexed.map((index) => [index, tone.index] as const),
+  ),
+);
+const RESERVED_BACKGROUND_INDICES = new Set(
+  Object.values(BACKGROUND_TONES).map((tone) => tone.index),
+);
 const THEMED_INPUT_BACKGROUND = `48;5;${CODEX_INPUT_BACKGROUND_INDEX}`;
-const ORIGINAL_INDEX_255_RGB = "238;238;238";
 const STANDARD_ANSI_COLOR_COUNT = 16;
 const EXTENDED_ANSI_COLOR_COUNT = 240;
 
@@ -36,9 +64,15 @@ const encoder = new TextEncoder();
 
 export function codexTerminalTheme(theme: ITheme, isDark: boolean): ITheme {
   const extendedAnsi = new Array<string>(EXTENDED_ANSI_COLOR_COUNT);
-  const inputBackgroundOffset = CODEX_INPUT_BACKGROUND_INDEX - STANDARD_ANSI_COLOR_COUNT;
-  extendedAnsi[inputBackgroundOffset] = isDark ? "#2f3132" : "#f4f4f4";
+  for (const tone of Object.values(BACKGROUND_TONES)) {
+    extendedAnsi[tone.index - STANDARD_ANSI_COLOR_COUNT] = isDark ? tone.dark : tone.light;
+  }
   return { ...theme, extendedAnsi };
+}
+
+function originalGrayscaleRgb(paletteIndex: number): string {
+  const gray = 8 + (paletteIndex - 232) * 10;
+  return `${gray};${gray};${gray}`;
 }
 
 function isDecimal(parameter: string | undefined): parameter is string {
@@ -49,18 +83,20 @@ function rewriteRgbColor(attribute: number, components: string[]): string | null
   if (components.length !== 3 || !components.every(isDecimal)) return null;
   const values = components.map(Number);
   if (values.some((value) => value > 255)) return null;
-  if (attribute === COLOR_ATTRIBUTE.background && INPUT_BACKGROUNDS.has(values.join(";"))) {
-    return THEMED_INPUT_BACKGROUND;
+  if (attribute === COLOR_ATTRIBUTE.background) {
+    const paletteIndex = RGB_BACKGROUND_INDICES.get(values.join(";"));
+    if (paletteIndex !== undefined) return `${attribute};${COLOR_MODE.indexed};${paletteIndex}`;
   }
   return `${attribute};${COLOR_MODE.rgb};${components.join(";")}`;
 }
 
 function rewriteIndexedColor(attribute: number, paletteIndex: number): string {
-  if (attribute === COLOR_ATTRIBUTE.background && INDEXED_INPUT_BACKGROUNDS.has(paletteIndex)) {
-    return THEMED_INPUT_BACKGROUND;
+  if (attribute === COLOR_ATTRIBUTE.background) {
+    const targetIndex = INDEXED_BACKGROUND_INDICES.get(paletteIndex);
+    if (targetIndex !== undefined) return `${attribute};${COLOR_MODE.indexed};${targetIndex}`;
   }
-  if (paletteIndex === CODEX_INPUT_BACKGROUND_INDEX) {
-    return `${attribute};${COLOR_MODE.rgb};${ORIGINAL_INDEX_255_RGB}`;
+  if (RESERVED_BACKGROUND_INDICES.has(paletteIndex)) {
+    return `${attribute};${COLOR_MODE.rgb};${originalGrayscaleRgb(paletteIndex)}`;
   }
   return `${attribute};${COLOR_MODE.indexed};${paletteIndex}`;
 }

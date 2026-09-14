@@ -48,12 +48,43 @@ describe("Codex input backgrounds", () => {
     expect(rewrite(input)).toBe(`${THEMED_INPUT_BACKGROUND}hello${RESET_STYLE}`);
   });
 
-  it.each([8, 234, 236, 255])("also adapts cached palette index %i", (index) => {
+  it.each([8, 236, 255])("also adapts cached palette index %i", (index) => {
     expect(rewrite(`${indexedBackground(index)}hello`)).toBe(`${THEMED_INPUT_BACKGROUND}hello`);
   });
 
   it("also adapts the older ANSI bright-black background", () => {
     expect(rewrite(`${sgr(100)}hello`)).toBe(`${THEMED_INPUT_BACKGROUND}hello`);
+  });
+});
+
+describe("Codex 0.153.4 picker backgrounds", () => {
+  it.each([
+    { name: "light selection", rgb: [224, 224, 224], index: 254 },
+    { name: "dark stripe", rgb: [31, 33, 35], index: 253 },
+    { name: "black-terminal stripe", rgb: [14, 14, 14], index: 253 },
+  ])("adapts the $name without using the input shade", ({ rgb, index }) => {
+    expect(rewrite(`${rgbBackground(rgb)}row`)).toBe(`${indexedBackground(index)}row`);
+  });
+
+  it.each([
+    { source: 233, target: 253 },
+    { source: 234, target: 253 },
+    { source: 254, target: 254 },
+  ])("adapts picker palette index $source to $target", ({ source, target }) => {
+    expect(rewrite(`${indexedBackground(source)}row`)).toBe(`${indexedBackground(target)}row`);
+  });
+
+  it("keeps dark 256-color stripes and selection in different palette slots", () => {
+    const input = `${indexedBackground(234)}stripe${indexedBackground(236)}selected`;
+    expect(rewrite(input)).toBe(`${indexedBackground(253)}stripe${indexedBackground(255)}selected`);
+  });
+
+  it("adapts picker colors across split colon-separated sequences", () => {
+    const input = encoder.encode(`${sgr("48:2::224:224:224")}selected${sgr("48:5:234")}stripe`);
+    const frames = Array.from(input, (byte) => Uint8Array.of(byte));
+    expect(rewriteFrames(frames)).toBe(
+      `${indexedBackground(254)}selected${indexedBackground(253)}stripe`,
+    );
   });
 });
 
@@ -86,6 +117,19 @@ describe("colors that must stay unchanged", () => {
     const input = `${sgr(38, 5, 255, 58, 5, 255, 48, 5, 255)}text`;
     const expected = `${sgr(38, 2, 238, 238, 238, 58, 2, 238, 238, 238, 48, 5, 255)}text`;
     expect(rewrite(input)).toBe(expected);
+  });
+
+  it.each([
+    { index: 253, gray: 218 },
+    { index: 254, gray: 228 },
+    { index: 255, gray: 238 },
+  ])("preserves foreground and underline colors from reserved slot $index", ({ index, gray }) => {
+    const input = `${sgr(38, 5, index, 58, 5, index)}text`;
+    expect(rewrite(input)).toBe(`${sgr(38, 2, gray, gray, gray, 58, 2, gray, gray, gray)}text`);
+  });
+
+  it("preserves an unrelated background that uses a reserved slot", () => {
+    expect(rewrite(`${indexedBackground(253)}text`)).toBe(`${rgbBackground([218, 218, 218])}text`);
   });
 
   it("does not mistake RGB components for separate background attributes", () => {
@@ -181,13 +225,18 @@ describe("streaming terminal output", () => {
 });
 
 describe("terminal theme", () => {
-  it("changes only the reserved input-background slot, without mutating the base theme", () => {
+  it("changes only the three reserved background slots, without mutating the base theme", () => {
     const original = { foreground: "#123456", background: "#abcdef", red: "#ff0044" };
     for (const isDark of [false, true]) {
       const theme = codexTerminalTheme(original, isDark);
       expect(theme).toMatchObject(original);
+      expect(theme.extendedAnsi?.[253 - 16]).toBe(isDark ? "#1f2123" : "#fafafa");
+      expect(theme.extendedAnsi?.[254 - 16]).toBe(isDark ? "#464849" : "#e0e0e0");
       expect(theme.extendedAnsi?.[255 - 16]).toBe(isDark ? "#2f3132" : "#f4f4f4");
-      expect(theme.extendedAnsi?.filter(Boolean)).toHaveLength(1);
+      expect(theme.extendedAnsi?.filter(Boolean)).toHaveLength(3);
+      expect(theme.extendedAnsi?.slice(0, 253 - 16).every((color) => color === undefined)).toBe(
+        true,
+      );
     }
     expect(original).not.toHaveProperty("extendedAnsi");
   });
