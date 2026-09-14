@@ -544,8 +544,22 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // to — shown while the merged fetch is in flight and upgraded in place when
   // the scan lands. Consumers that must not resolve stored ids against a
   // partial list read isPlaceholderData to tell this state apart.
+  //
+  // Only PROTECTED rows (`builtin !== false`: seeded built-ins plus older
+  // servers that omit the flag) feed the placeholder. A user-registered
+  // template (`builtin === false`) competes newest-wins with same-named
+  // session-discovered agents in the resolved merge (#3234), so surfacing it
+  // as launchable before the scan lands could bind a stale template id that
+  // the merge would have superseded. The harness rows this placeholder exists
+  // to deliver are all protected, so nothing user-visible is delayed.
   const placeholderData = useMemo(
-    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
+    () =>
+      catalog === undefined
+        ? undefined
+        : mergeAvailableAgents(
+            catalog.filter((agent) => agent.builtin !== false),
+            [],
+          ),
     [catalog],
   );
   return useQuery({

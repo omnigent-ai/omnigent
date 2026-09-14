@@ -1057,6 +1057,60 @@ describe("useAvailableAgents slow discovery scan", () => {
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex", "ag_custom"]);
   });
 
+  it("keeps supersedable templates (builtin: false) out of the placeholder rows", async () => {
+    // A user-registered template competes newest-wins with same-named
+    // session-discovered agents in the resolved merge (#3234). Surfacing it
+    // as launchable while the scan is still pending could bind a stale
+    // template id the merge would have superseded — so the placeholder
+    // carries protected rows only, and the template joins once the scan
+    // settles the race.
+    let releaseScan: (r: Response) => void = () => {};
+    const scanGate = new Promise<Response>((resolve) => {
+      releaseScan = resolve;
+    });
+    fetchMock.mockImplementation((url: string) => {
+      if (url === BUILTINS_URL)
+        return Promise.resolve(
+          mockResponse({
+            object: "list",
+            data: [
+              {
+                id: "ag_claude",
+                name: "claude-native-ui",
+                harness: "claude-native",
+                builtin: true,
+              },
+              { id: "ag_codex", name: "codex-native-ui", harness: "codex-native", builtin: true },
+              {
+                id: "ag_template",
+                name: "agent-a",
+                harness: "claude-sdk",
+                builtin: false,
+                created_at: 200,
+              },
+            ],
+            has_more: false,
+          }),
+        );
+      if (url === SCAN_URL) return scanGate;
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+
+    // Placeholder rows: the protected harnesses, never the template.
+    await waitFor(() =>
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex"]),
+    );
+    expect(result.current.isPlaceholderData).toBe(true);
+
+    // Once the scan lands (empty: nothing supersedes it), the template is
+    // merged in — deferred until the race is settled, not dropped.
+    releaseScan(mockResponse({ object: "list", data: [], has_more: false }));
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex", "ag_template"]);
+  });
+
   it("fetches the catalog once per mount (placeholder and merge share it)", async () => {
     routeFetch({
       [BUILTINS_URL]: catalogResponse(),
