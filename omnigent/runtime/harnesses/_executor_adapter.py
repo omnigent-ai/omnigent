@@ -21,7 +21,8 @@ from typing import Any
 
 from fastapi import Response
 
-from omnigent.errors import ElicitationDeclinedError
+from omnigent.debug_logging import phase_scope
+from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -138,8 +139,9 @@ class ExecutorAdapter(HarnessApp):
         # Per-session tracing context; created lazily on first turn and reused across turns.
         self._tracing_ctx: TracingContext | None = None
         # Detached bounded background tasks (abnormal-exit _safe_interrupt). Strongly referenced
-        # until completion; drained on shutdown. Never awaited inline to avoid blocking teardown.
-        self._bg_tasks: set[asyncio.Task[None]] = set()
+        # until completion; drained before recovery and on shutdown.
+        self._bg_tasks: set[asyncio.Task[bool]] = set()
+        self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -238,7 +240,7 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with session_scope(turn_session_id), trace_cm:
+            with session_scope(turn_session_id), phase_scope(ErrorPhase.TURN), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -365,14 +367,14 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
-            # On abnormal exit, detach and interrupt the executor synchronously before scheduling
-            # the background reap — a continuation turn must not reuse the abandoned executor.
+            # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
                 abandoned_executor = self._executor
                 self._executor = None
                 interrupt_task = asyncio.create_task(
                     self._safe_interrupt(abandoned_executor, self._session_key)
                 )
+                self._abandoned_executor_cleanup = interrupt_task
                 self._bg_tasks.add(interrupt_task)
                 interrupt_task.add_done_callback(self._bg_tasks.discard)
 
@@ -387,15 +389,20 @@ class ExecutorAdapter(HarnessApp):
             await self._executor.interrupt_session(self._session_key)
         return response
 
-    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> None:
+    async def _prepare_turn_retry(self) -> bool:
+        """Wait for confirmed teardown without cancelling the background reap."""
+        cleanup = self._abandoned_executor_cleanup
+        return cleanup is not None and await asyncio.shield(cleanup)
+
+    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> bool:
         """Best-effort bounded interrupt + close of a detached abandoned executor.
 
-        Scheduled (never awaited inline) from run_turn's finally on abnormal exit. The interrupt
+        Scheduled from run_turn's finally and awaited before any recovery retry. The interrupt
         gets a short slice; the reap (close_session + close) always runs under its own budget so
         a wedged interrupt can never starve the subprocess reap.
         """
         if executor is None:
-            return
+            return True
         try:
             await asyncio.wait_for(
                 executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
@@ -407,14 +414,25 @@ class ExecutorAdapter(HarnessApp):
                 exc_info=True,
             )
 
-        async def _reap() -> None:
-            with contextlib.suppress(Exception):
+        async def _reap() -> bool:
+            closed = True
+            try:
                 await executor.close_session(session_key)
-            with contextlib.suppress(Exception):
+            except Exception:
+                _logger.exception("abandoned executor close_session failed")
+                closed = False
+            try:
                 await executor.close()
+            except Exception:
+                _logger.exception("abandoned executor close failed")
+                closed = False
+            return closed
 
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+        try:
+            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+        except Exception:
+            _logger.exception("abandoned executor teardown failed or timed out")
+            return False
 
     async def _maybe_resync_on_orphan(self, *, force: bool = False) -> None:
         """Tier-1 SDK reset after repeated orphan callbacks (or immediately when ``force=True``).

@@ -1,7 +1,7 @@
 // Render + interaction invariants for the TurnRail minimap. The rail's
-// scroll-positioning (scrollbar-thumb tracking, load-at-bottom, fade edges)
-// depends on real layout — offsetTop/clientHeight are 0 in jsdom — so those
-// are verified live, not here. These cover the layout-independent contract:
+// scroll-positioning uses IntersectionObserver geometry so its correction and
+// interaction retry can be covered here without relying on jsdom layout.
+// These tests also cover the layout-independent contract:
 // - < 2 turns → renders nothing (nothing to navigate).
 // - one tick (button) per turn, in order, with a jump aria-label.
 // - clicking a tick scrolls the transcript to that user message.
@@ -10,8 +10,8 @@
 // - the active tick reflects the `activeTurnId` prop (the transcript computes
 //   it from the virtualizer's model; the rail no longer scans DOM anchors).
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TurnRail, type Turn } from "./TurnRail";
 
 // The rail calls scrollToUserMessage on click; stub it so we assert the call
@@ -20,6 +20,44 @@ const scrollSpy = vi.fn();
 vi.mock("@/hooks/useUserMessageNav", () => ({
   scrollToUserMessage: (...args: unknown[]) => scrollSpy(...args),
 }));
+
+interface ObserverHarness {
+  callback: IntersectionObserverCallback;
+  observer: IntersectionObserver;
+  observe: ReturnType<typeof vi.fn>;
+  disconnect: ReturnType<typeof vi.fn>;
+}
+
+const observers: ObserverHarness[] = [];
+
+beforeEach(() => {
+  observers.length = 0;
+  class MockIntersectionObserver implements IntersectionObserver {
+    readonly root: Document | Element | null;
+    readonly rootMargin: string;
+    readonly scrollMargin = "";
+    readonly thresholds: readonly number[];
+    readonly observe = vi.fn();
+    readonly unobserve = vi.fn();
+    readonly disconnect = vi.fn();
+    readonly takeRecords = () => [];
+
+    constructor(callback: IntersectionObserverCallback, options: IntersectionObserverInit = {}) {
+      this.root = options.root ?? null;
+      this.rootMargin = options.rootMargin ?? "";
+      this.thresholds = Array.isArray(options.threshold)
+        ? options.threshold
+        : [options.threshold ?? 0];
+      observers.push({
+        callback,
+        observer: this,
+        observe: this.observe,
+        disconnect: this.disconnect,
+      });
+    }
+  }
+  vi.stubGlobal("IntersectionObserver", MockIntersectionObserver);
+});
 
 function makeTurns(n: number): Turn[] {
   return Array.from({ length: n }, (_, i) => ({
@@ -46,9 +84,39 @@ function activeTicks() {
     .filter((tick) => tick.firstElementChild?.classList.contains("bg-foreground"));
 }
 
+function emitIntersection(
+  harness: ObserverHarness,
+  target: Element,
+  bounds: { rootTop: number; rootBottom: number; targetTop: number; targetBottom: number },
+) {
+  act(() => {
+    harness.callback(
+      [
+        {
+          target,
+          time: 0,
+          isIntersecting: true,
+          intersectionRatio: 1,
+          boundingClientRect: {
+            top: bounds.targetTop,
+            bottom: bounds.targetBottom,
+          } as DOMRectReadOnly,
+          intersectionRect: {} as DOMRectReadOnly,
+          rootBounds: {
+            top: bounds.rootTop,
+            bottom: bounds.rootBottom,
+          } as DOMRectReadOnly,
+        },
+      ],
+      harness.observer,
+    );
+  });
+}
+
 afterEach(() => {
   cleanup();
   scrollSpy.mockReset();
+  vi.unstubAllGlobals();
 });
 
 describe("TurnRail", () => {
@@ -107,6 +175,75 @@ describe("TurnRail", () => {
   it("highlights no tick when activeTurnId is null", () => {
     renderRail(makeTurns(3), null);
     expect(activeTicks()).toHaveLength(0);
+  });
+
+  it("uses post-layout observer geometry to keep the active tick above the bottom fade", () => {
+    const { container } = renderRail(makeTurns(3), "turn_1");
+    const rail = container.querySelector(".turn-rail-fade") as HTMLDivElement;
+    const activeTick = screen.getByLabelText("Jump to: prompt number 1");
+    const scrollBy = vi.fn();
+    Object.defineProperty(rail, "scrollBy", { configurable: true, value: scrollBy });
+
+    expect(observers).toHaveLength(1);
+    expect(observers[0]!.observe).toHaveBeenCalledWith(activeTick);
+
+    emitIntersection(observers[0]!, activeTick, {
+      rootTop: 0,
+      rootBottom: 100,
+      targetTop: 80,
+      targetBottom: 90,
+    });
+
+    expect(scrollBy).toHaveBeenCalledWith({ top: 22, behavior: "smooth" });
+  });
+
+  it("ignores an observer callback queued before cleanup", () => {
+    const { container, unmount } = renderRail(makeTurns(3), "turn_1");
+    const rail = container.querySelector(".turn-rail-fade") as HTMLDivElement;
+    const activeTick = screen.getByLabelText("Jump to: prompt number 1");
+    const scrollBy = vi.fn();
+    Object.defineProperty(rail, "scrollBy", { configurable: true, value: scrollBy });
+    const staleObserver = observers[0]!;
+
+    unmount();
+    emitIntersection(staleObserver, activeTick, {
+      rootTop: 0,
+      rootBottom: 100,
+      targetTop: 80,
+      targetBottom: 90,
+    });
+
+    expect(scrollBy).not.toHaveBeenCalled();
+  });
+
+  it("retries active-tick correction after the user stops interacting", () => {
+    const { container } = renderRail(makeTurns(3), "turn_1");
+    const wrapper = container.firstElementChild as HTMLDivElement;
+    const rail = container.querySelector(".turn-rail-fade") as HTMLDivElement;
+    const activeTick = screen.getByLabelText("Jump to: prompt number 1");
+    const scrollBy = vi.fn();
+    Object.defineProperty(rail, "scrollBy", { configurable: true, value: scrollBy });
+
+    fireEvent.mouseEnter(rail);
+    emitIntersection(observers[0]!, activeTick, {
+      rootTop: 0,
+      rootBottom: 100,
+      targetTop: 80,
+      targetBottom: 90,
+    });
+    expect(scrollBy).not.toHaveBeenCalled();
+    expect(observers[0]!.disconnect).not.toHaveBeenCalled();
+
+    fireEvent.mouseLeave(wrapper);
+    expect(observers).toHaveLength(2);
+    emitIntersection(observers[1]!, activeTick, {
+      rootTop: 0,
+      rootBottom: 100,
+      targetTop: 80,
+      targetBottom: 90,
+    });
+
+    expect(scrollBy).toHaveBeenCalledWith({ top: 22, behavior: "smooth" });
   });
 
   it("moves the highlight to the hovered tick, overriding the active one", () => {

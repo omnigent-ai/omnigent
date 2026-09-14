@@ -362,6 +362,11 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     );
   });
 
+  it("renders a cased Mermaid fence as a diagram (matches the editor)", () => {
+    renderMd("```Mermaid\nflowchart LR\n  A --> B\n```");
+    expect(screen.getByTestId("mermaid-preview")).toBeDefined();
+  });
+
   it("renders blockquotes", () => {
     const { container } = renderMd("> quoted text");
     expect(container.querySelector("blockquote")?.textContent).toContain("quoted text");

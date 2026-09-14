@@ -105,11 +105,12 @@ const updateSessionMock = vi.mocked(updateSession);
 
 function renderDialog() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  render(
     <QueryClientProvider client={client}>
       <SwitchHostDialog open onOpenChange={() => {}} sessionId="conv_1" currentHostId="host_old" />
     </QueryClientProvider>,
   );
+  return client;
 }
 
 beforeEach(() => {
@@ -135,7 +136,8 @@ afterEach(() => cleanup());
 
 describe("SwitchHostDialog", () => {
   it("releases the runner and the model override before launching on the new host", async () => {
-    renderDialog();
+    const client = renderDialog();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
 
     const button = await screen.findByTestId("switch-host-button");
     await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
@@ -157,6 +159,7 @@ describe("SwitchHostDialog", () => {
     expect(updateSessionMock.mock.invocationCallOrder[0]).toBeLessThan(
       launchRunnerMock.mock.invocationCallOrder[0],
     );
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-agent", "conv_1"] });
   });
 
   it("offers the origin host again when the launch fails after the release", async () => {

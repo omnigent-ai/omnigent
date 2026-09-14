@@ -43,6 +43,7 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import re
 import shutil
 from collections.abc import Callable
@@ -95,6 +96,13 @@ _CONTROL_READ_CHUNK: Final[int] = 256 * 1024
 # doesn't enforce a line limit, but the 64 KiB default would still bound a
 # single read; raise it so a large burst can be pulled in one wakeup.
 _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
+
+# Terminal type declared for the control-mode attach client. The real renderer
+# is the browser's xterm.js, an xterm-256color-class emulator, so this is
+# accurate rather than a guess. tmux exposes it as ``#{client_termname}``, and a
+# pane TUI (e.g. Codex) trusts that over its own $TERM; without pinning it the
+# client inherits the runner's TERM, which can be a non-interactive ``dumb``.
+_WEB_TERMINAL_TERM: Final[str] = "xterm-256color"
 
 # When the control reader ends with a send backlog still queued (a
 # burst-then-exit program), how long to let the forwarder finish draining that
@@ -551,6 +559,10 @@ async def bridge_tmux_control_to_websocket(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Pin the client's TERM so a leaked ``dumb`` from the runner env
+            # can't reach a pane TUI via ``#{client_termname}`` (see
+            # _WEB_TERMINAL_TERM).
+            env={**os.environ, "TERM": _WEB_TERMINAL_TERM},
             # Raise the stdout StreamReader buffer above the 64 KiB default so a
             # single ``read`` can pull a whole output burst (see
             # _CONTROL_STDOUT_BUFFER_LIMIT).

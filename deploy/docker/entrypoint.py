@@ -95,19 +95,23 @@ class _BuiltApp:
 
 
 def run_migrations(database_url: str) -> None:
-    """Run the Alembic upgrade against ``database_url``.
+    """Initialize or upgrade the schema at ``database_url``.
 
     The SQLAlchemy stores refuse to start on a stale schema, so this
-    runs before any store boots. Creates a throwaway engine, upgrades,
-    and disposes it.
+    runs before any store boots. The central initializer preserves the
+    normal Alembic path for existing backends and uses the safe fresh-schema
+    bootstrap for CockroachDB.
     """
-    import sqlalchemy
+    from omnigent.db.utils import (
+        _create_engine,
+        _initialize_or_verify_schema,
+        normalize_database_url,
+    )
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
-
-    migration_engine = sqlalchemy.create_engine(database_url)
+    database_url = normalize_database_url(database_url)
+    migration_engine = _create_engine(database_url)
     try:
-        _run_alembic_upgrade(migration_engine, database_url)
+        _initialize_or_verify_schema(migration_engine, database_url)
     finally:
         migration_engine.dispose()
 
@@ -535,16 +539,17 @@ def main() -> None:
 
         import uvicorn
 
-        from omnigent.runner.transports.ws_tunnel.limits import (
-            RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        )
+        from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
         uvicorn.run(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # This image serves external runners only, so every session rides a
+            # tunnel: without the keepalive budget uvicorn's 20 s default closes
+            # a busy-but-healthy one with 1011 after a client-path stall.
+            **uvicorn_tunnel_kwargs(),
         )
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())

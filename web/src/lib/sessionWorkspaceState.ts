@@ -8,14 +8,14 @@
 
 import type { RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "subagents", "browser"];
+const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "github", "subagents", "browser"];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected rail tab (Files / Changes / Agents). */
+  /** The selected Workspace navigation tab. */
   rightRailTab?: RightRailTab;
   /** Ordered list of open file tabs. */
   openFiles?: string[];
@@ -161,6 +161,18 @@ export function writeSessionWorkspaceState(
   store.push({ id: conversationId, state: next });
   if (store.length > MAX_SESSIONS) {
     store.splice(0, store.length - MAX_SESSIONS);
+  }
+  writeStore(store);
+}
+
+/** Let existing chats follow a changed default while keeping their open tabs and layout. */
+export function resetSessionWorkspaceTabSelections(): void {
+  const store = readStore();
+  for (const { state } of store) {
+    delete state.rightRailTab;
+    delete state.selectedFilePath;
+    delete state.selectedTerminalKey;
+    delete state.selectedBrowserId;
   }
   writeStore(store);
 }

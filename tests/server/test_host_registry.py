@@ -73,6 +73,29 @@ def test_register_and_get() -> None:
     assert fetched.hello.name == "test-host"
 
 
+def test_interactive_shells_survive_disconnect() -> None:
+    """A runner can outlive its host tunnel without losing the shell snapshot."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "invalid", "zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+    registry.deregister("host_shells")
+
+    assert registry.interactive_shells("host_shells") == ["zsh", "bash"]
+
+
+def test_reconnect_without_shell_inventory_clears_snapshot() -> None:
+    """An older reconnecting host cannot retain a newer host's inventory."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+
+    registry.register("host_shells", FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert registry.interactive_shells("host_shells") is None
+
+
 def test_deregister() -> None:
     """
     Verify that deregister removes the host from the registry.

@@ -506,7 +506,8 @@ class _PiNativeLaunchConfig:
         the first message.
     :param model_override: Persisted per-session ``/model`` override, e.g.
         ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
-        cursor-native launch (``--model``), ignored by pi-native.
+        cursor-native launch (``--model``) and by pi-native as the model
+        selection threaded into the launch.
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
@@ -1277,6 +1278,7 @@ async def _auto_create_opencode_terminal(
         build_opencode_model_default_config,
         build_opencode_omnigent_mcp_server,
         build_opencode_provider_config,
+        managed_connect_opencode_config,
         maybe_merge_user_provider_config,
         resolve_databricks_gateway,
         write_opencode_provider_config,
@@ -1285,6 +1287,16 @@ async def _auto_create_opencode_terminal(
     # Accumulate the synthesized opencode.json: provider/model (Databricks
     # gateway or a pinned default) + the agent's MCP servers + force-ask.
     config: dict[str, object] = {}
+    xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
+    managed_opencode_broker_cmd: str | None = None
+    # A spec/CLI-selected Databricks gateway wins first (an explicit ``--model``
+    # that names a gateway endpoint, or a spec profile), exactly as claude/codex/pi
+    # resolve the spec provider before their broker fallback.
+    # ``resolve_databricks_gateway`` returns None when no profile is selected (the
+    # bare managed-connect host); the ucode-config path below is then the last
+    # resort. On that bare host it adopts ucode's pinned served model — replacing an
+    # unrecognized explicit ``--model`` (logged below), since the workspace gateway
+    # is the only working provider there.
     gateway = resolve_databricks_gateway(
         _opencode_native_profile_from_spec(agent_spec), model_id=model_override
     )
@@ -1294,13 +1306,58 @@ async def _auto_create_opencode_terminal(
         model_override = gateway.qualified_model
         config = dict(build_opencode_provider_config(gateway))
         config["model"] = model_override
-    elif model_override:
-        # No custom provider, but a model is pinned (``omni opencode --model`` or
-        # the ``omni setup`` OpenCode default): write opencode's default model so
-        # the native TUI and the first turn use it instead of ``opencode/big-pickle``.
-        # OpenCode resolves the provider from the model-id prefix against its own
-        # auth.json, so no provider block is needed.
-        config = dict(build_opencode_model_default_config(model_override))
+    else:
+        # Managed connect host (last resort): reuse ucode's generated opencode
+        # config (provider block + served model + refreshing auth plugin), the
+        # same artifact lakebox and ucode itself use. The plugin mints per request
+        # via ``ucode auth-token`` → the broker command forwarded into the opencode
+        # env below, so no static omnigent-minted token. Offloaded to a thread: on
+        # the first launch (before the host-boot configure has written opencode's
+        # config) it may run a ``ucode configure`` subprocess, which must not block
+        # the runner's event loop. None off a managed connect host.
+        managed_config = await asyncio.to_thread(managed_connect_opencode_config, xdg_config_home)
+        if managed_config:
+            # The auth plugin needs the broker command to mint per request; derive
+            # it from the SAME sidecar the config gated on (not a separate profile
+            # read), so the two can't disagree. Only adopt the managed config when
+            # the command resolves — a provider block with no mint command can't
+            # authenticate, so without it leave opencode on its own login instead.
+            from omnigent.host.databricks_credential import (
+                _read_sidecar,
+                _sidecar_path,
+                broker_token_command,
+            )
+
+            _oc_sidecar = _read_sidecar(_sidecar_path())
+            managed_opencode_broker_cmd = (
+                broker_token_command(_oc_sidecar["workspace_host"]) if _oc_sidecar else None
+            )
+            if managed_opencode_broker_cmd:
+                config = managed_config
+                pinned = config.get("model")
+                if isinstance(pinned, str):
+                    if model_override and model_override != pinned:
+                        _logger.info(
+                            "opencode managed connect: replacing requested model %r with the "
+                            "ucode-pinned served model %r (the workspace gateway is the only "
+                            "provider on this host).",
+                            model_override,
+                            pinned,
+                        )
+                    model_override = pinned
+            else:
+                _logger.warning(
+                    "opencode managed connect: ucode config resolved but no broker command "
+                    "(sidecar missing/mismatched); leaving opencode on its own login."
+                )
+        if not config and model_override:
+            # No custom provider, but a model is pinned (``omni opencode --model``
+            # or the ``omni setup`` OpenCode default): write opencode's default
+            # model so the native TUI and first turn use it instead of
+            # ``opencode/big-pickle``. OpenCode resolves the provider from the
+            # model-id prefix against its own auth.json, so no provider block is
+            # needed.
+            config = dict(build_opencode_model_default_config(model_override))
 
     # Build opencode's ``mcp`` block: the Omnigent builtin-tool relay (so the
     # model can call sys_*/load_skill/web_fetch — the real "connects to Omnigent
@@ -1327,11 +1384,18 @@ async def _auto_create_opencode_terminal(
     # PostToolUse hooks); coordinates come from the OMNIGENT_* env stamped on
     # the server below. Only wired when there's a server to evaluate against.
     policy_env: dict[str, str] = {}
+    if managed_opencode_broker_cmd:
+        # ucode's auth plugin runs ``ucode auth-token`` → get_databricks_token,
+        # which mints from this broker command (databricks/ucode#531).
+        policy_env["DATABRICKS_BEARER_COMMAND"] = managed_opencode_broker_cmd
     runner_server_url = os.environ.get("RUNNER_SERVER_URL")
     if server_client is not None and runner_server_url:
         plugin_path = write_opencode_policy_plugin(bridge_dir)
         config.setdefault("$schema", "https://opencode.ai/config.json")
-        config["plugin"] = [str(plugin_path)]
+        existing_plugins = config.get("plugin")
+        config["plugin"] = ([*existing_plugins] if isinstance(existing_plugins, list) else []) + [
+            str(plugin_path)
+        ]
         policy_env["OMNIGENT_POLICY_URL"] = runner_server_url
         policy_env["OMNIGENT_SESSION_ID"] = session_id
         # Point the plugin at tool_relay.json so it can pick up relay
@@ -1737,16 +1801,19 @@ def _opencode_native_profile_from_spec(
     Resolve the Databricks profile from a resolved agent spec, if any.
 
     :param agent_spec: Optional resolved agent spec.
-    :returns: The spec's ``executor.config.profile``, or ``None``.
+    :returns: The spec's ``executor.config.profile``, else the ambient
+        ``DATABRICKS_CONFIG_PROFILE`` (set by the host when the owner linked
+        Databricks), or ``None``.
     """
+    env_profile = os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
     if agent_spec is None:
-        return None
+        return env_profile
     try:
         spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
         profile = spec.executor.config.get("profile")
-        return str(profile) if profile else None
+        return str(profile) if profile else env_profile
     except Exception:  # noqa: BLE001 - profile resolution is best effort.
-        return None
+        return env_profile
 
 
 def _opencode_native_mcp_servers_from_spec(
@@ -2211,13 +2278,15 @@ async def _auto_create_pi_terminal(
     # ``omnigent setup`` (Databricks gateway / API key), so a separate
     # ``pi /login`` isn't required — the parity codex-native/claude-native
     # already have. Skipped when the user pinned their own provider/model via
-    # terminal_launch_args, or when no usable provider is configured (Pi then
-    # falls back to its own login). Writes a managed per-session Pi config dir,
+    # terminal_launch_args. When no usable provider is configured Pi falls
+    # back to its own login, but a spec/session-pinned model still passes
+    # through as ``--model``. Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.harnesses.pi_native.credentials import (
             pi_native_provider_launch,
+            pi_own_login_model_arg,
             resolve_pi_native_provider,
         )
 
@@ -2243,6 +2312,15 @@ async def _auto_create_pi_terminal(
                 or provider.credential_warning
                 or launch.effort_warning
             )
+        elif spec_model:
+            # No managed provider: Pi runs on its own login, but the pinned
+            # model must still reach it — without this the pick is silently
+            # dropped and Pi opens its own default model. A managed pick that
+            # cannot be expressed for Pi's own resolver (slash-bearing model
+            # id) is refused rather than mis-routed, so Pi keeps its default.
+            own_login_model = pi_own_login_model_arg(spec_model)
+            if own_login_model is not None:
+                pi_args.extend(["--model", own_login_model])
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -3889,6 +3967,7 @@ async def _auto_create_codex_terminal(
         apply_codex_thread_effort,
         build_codex_native_server,
         build_codex_remote_args,
+        codex_remote_resume_omits_permission_args,
         codex_session_meta_model_provider,
         codex_terminal_env,
         is_unreadable_thread_error,
@@ -3896,10 +3975,12 @@ async def _auto_create_codex_terminal(
         resolve_native_codex_launch,
     )
     from omnigent.harnesses.codex_native.bridge import (
+        CodexNativeBridgeState,
         clear_bridge_state,
         codex_home_for_bridge_dir,
         prepare_bridge_dir,
         socket_path_for_bridge_dir,
+        write_bridge_state,
     )
     from omnigent.inner.codex_executor import codex_extended_catalog_env
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -4353,20 +4434,21 @@ async def _auto_create_codex_terminal(
         ws_url=codex_ws_url,
         client_name="omnigent-codex-native-auto",
     )
+    retained_resume_client: CodexAppServerClient | None = None
     if launch_config.external_session_id is not None:
-        from omnigent.harnesses.codex_native.bridge import (
-            CodexNativeBridgeState,
-            write_bridge_state,
-        )
-
         try:
-            await preload_codex_thread_for_resume(
+            retained_resume_client = await preload_codex_thread_for_resume(
                 codex_ws_url,
                 launch_config.external_session_id,
                 terminal_launch_args=launch_config.terminal_launch_args,
+                retain_client=codex_remote_resume_omits_permission_args(
+                    app_server.codex_cli_version
+                ),
             )
-        except Exception as exc:
-            if not is_unreadable_thread_error(exc):
+            if retained_resume_client is not None:
+                event_client = retained_resume_client
+        except BaseException as exc:
+            if not isinstance(exc, Exception) or not is_unreadable_thread_error(exc):
                 # The app-server started above must not outlive a refused resume:
                 # without this close, every retry stacked another live codex
                 # process (and only the newest stayed tracked for teardown).
@@ -4394,7 +4476,43 @@ async def _auto_create_codex_terminal(
                 session_id=session_id, server_client=server_client, codex_error=codex_error
             )
             launch_config = dataclasses.replace(launch_config, external_session_id=None)
-        else:
+    if launch_config.external_session_id is None:
+        try:
+            # Connect the listener BEFORE launching the TUI so it observes the
+            # ``thread/started`` the TUI emits on startup (the client buffers
+            # notifications, so there is no created-before-listening race).
+            await event_client.connect()
+        except BaseException:
+            # connect() may have half-opened the ws before the initialize
+            # handshake failed, so close the listener too — not just the
+            # app-server.
+            with contextlib.suppress(Exception):
+                await event_client.close()
+            await app_server.close()
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            raise
+
+    # Register the Codex TUI as a streamable terminal resource attached to
+    # the app-server started above (``--remote`` over its loopback ws
+    # endpoint). Without this the session can have a working chat path
+    # (driven by the forwarder) but no terminal to attach to, unlike
+    # claude-native, whose terminal IS the agent process. On failure, close
+    # the listener and app-server here: the background forwarder task (which
+    # otherwise owns their teardown) has not been created yet.
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+    # and ``parent_os_env`` below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+    # Fresh sessions pass no thread id so the TUI creates the thread and the
+    # background task adopts it. Resume sessions pass the persisted
+    # external_session_id so the runner-owned TUI reopens the existing
+    # app-server thread.
+    # The app-server and event client are live by this point, so the pre-launch
+    # setup (arg build + config resolve) shares the terminal launch's teardown
+    # below: a raise here must still close them and drop the
+    # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
+    try:
+        if launch_config.external_session_id is not None:
             write_bridge_state(
                 bridge_dir,
                 CodexNativeBridgeState(
@@ -4426,43 +4544,7 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
-    if launch_config.external_session_id is None:
-        try:
-            # Connect the listener BEFORE launching the TUI so it observes the
-            # ``thread/started`` the TUI emits on startup (the client buffers
-            # notifications, so there is no created-before-listening race).
-            await event_client.connect()
-        except Exception:
-            # connect() may have half-opened the ws before the initialize
-            # handshake failed, so close the listener too — not just the
-            # app-server.
-            with contextlib.suppress(Exception):
-                await event_client.close()
-            await app_server.close()
-            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-            raise
-
-    # Register the Codex TUI as a streamable terminal resource attached to
-    # the app-server started above (``--remote`` over its loopback ws
-    # endpoint). Without this the session can have a working chat path
-    # (driven by the forwarder) but no terminal to attach to, unlike
-    # claude-native, whose terminal IS the agent process. On failure, close
-    # the listener and app-server here: the background forwarder task (which
-    # otherwise owns their teardown) has not been created yet.
-    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
-    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
-    # and ``parent_os_env`` below, launch_terminal falls back to
-    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    agent_os_env = _agent_os_env_from_spec(agent_spec)
-    # Fresh sessions pass no thread id so the TUI creates the thread and the
-    # background task adopts it. Resume sessions pass the persisted
-    # external_session_id so the runner-owned TUI reopens the existing
-    # app-server thread.
-    # The app-server and event client are live by this point, so the pre-launch
-    # setup (arg build + config resolve) shares the terminal launch's teardown
-    # below: a raise here must still close them and drop the
-    # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
-    try:
+        agent_os_env = _agent_os_env_from_spec(agent_spec)
         codex_remote_args = build_codex_remote_args(
             codex_args=tuple(launch_config.terminal_launch_args or ()),
             thread_id=launch_config.external_session_id,
@@ -4474,6 +4556,7 @@ async def _auto_create_codex_terminal(
             # built-in (which would force the first-run login screen and block
             # thread creation).
             config_overrides=tuple(app_server.config_overrides),
+            codex_cli_version=app_server.codex_cli_version,
             # Omnigent provisions the private CODEX_HOME and vets hook sources
             # itself; skip the interactive trust prompt that headless sub-agents
             # can never answer.
@@ -4554,9 +4637,11 @@ async def _auto_create_codex_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
-    except Exception:
-        await event_client.close()
-        await app_server.close()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await event_client.close()
+        with contextlib.suppress(Exception):
+            await app_server.close()
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
@@ -4582,6 +4667,7 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
+                client=retained_resume_client,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4840,6 +4926,7 @@ async def _codex_forward_known_thread(
     bridge_dir: Path,
     codex_ws_url: str,
     thread_id: str,
+    client: CodexAppServerClient | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4852,6 +4939,7 @@ async def _codex_forward_known_thread(
         ``"ws://127.0.0.1:9876"``.
     :param thread_id: Existing Codex app-server thread id, e.g.
         ``"thread_abc123"``.
+    :param client: Retained preload subscription, owned and closed by this forwarder.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4866,11 +4954,11 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
-    server_url = _required_runner_env("RUNNER_SERVER_URL")
-    auth_factory = _make_auth_token_factory()
-    auth_token = auth_factory() if auth_factory is not None else None
-    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     try:
+        server_url = _required_runner_env("RUNNER_SERVER_URL")
+        auth_factory = _make_auth_token_factory()
+        auth_token = auth_factory() if auth_factory is not None else None
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
         await supervise_forwarder(
             base_url=server_url,
             headers=headers,
@@ -4878,9 +4966,13 @@ async def _codex_forward_known_thread(
             bridge_dir=bridge_dir,
             app_server_url=codex_ws_url,
             thread_id=thread_id,
+            client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
         )
     finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):

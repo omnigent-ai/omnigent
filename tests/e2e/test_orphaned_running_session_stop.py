@@ -7,11 +7,13 @@ pokes, no hand-written session rows):
 1. **Orphaned "running" after a server restart.** A runner-bound session with
    an in-flight turn persists ``live_status="running"`` on its conversation
    row. When the server is shut down and a replacement server comes up on the
-   same database, the replacement has no startup reconciliation and no live
-   status cache, so it falls back to the stale persisted ``running`` value.
-   ``omnigent host status --sessions`` (which reads ``GET /v1/sessions``)
-   therefore keeps reporting the session as ``running`` even though its runner
-   is gone.
+   same database, the replacement has no live status cache, so it falls back
+   to the persisted ``running`` value. A server recycle also leaves the
+   runner's liveness lease (``runner_last_seen``) in place, because the
+   replacement cannot tell a dead runner from one still reconnecting; once
+   that lease lapses (``RUNNER_LIVENESS_TTL_S``), ``omnigent host status
+   --sessions`` (which reads ``GET /v1/sessions``) must stop reporting the
+   runner-less session as ``running``.
 
 2. **``stop-session`` falsely succeeds.** ``omnigent host stop-session`` POSTs
    a ``stop_session`` event to ``POST /v1/sessions/{id}/events``. On the
@@ -25,6 +27,8 @@ The journey is faithful: we bring a runner online, create a session bound to
 it, and drive a real (blocked) turn so the framework itself persists
 ``running`` — we never fabricate the end state. Then we shut the server down,
 start a fresh one on the same DB, and observe exactly what the CLI observes.
+A server-initiated close keeps the heartbeat fresh for reconnecting runners;
+the orphan assertion waits boundedly for that production liveness window.
 
 Runs against the mock LLM server — no real credentials needed::
 
@@ -52,6 +56,7 @@ import yaml
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.runner.identity import token_bound_runner_id
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -299,6 +304,28 @@ def _persisted_live_status(db_path: Path, session_id: str) -> int | None:
     return None if row is None else row[0]
 
 
+def _expire_runner_lease(db_path: Path, runner_id: str) -> None:
+    """Age *runner_id*'s liveness lease past :data:`RUNNER_LIVENESS_TTL_S`.
+
+    A server recycle keeps the runner's ``runner_last_seen`` stamp so a
+    replacement does not mistake a reconnecting runner for a dead one. A runner
+    that never comes back is only recognised as gone once that lease lapses;
+    backdating the stamp stands in for waiting out the TTL.
+
+    :param db_path: The shared sqlite database path.
+    :param runner_id: Runner id whose sessions' lease should lapse.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE omnigent_conversation_metadata SET runner_last_seen = ? WHERE runner_id = ?",
+            (int(time.time()) - RUNNER_LIVENESS_TTL_S - 1, runner_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _runner_online(client: httpx.Client, runner_id: str) -> bool:
     """Return whether *runner_id* has a live tunnel on the server.
 
@@ -324,8 +351,9 @@ def test_runner_less_session_remains_running_after_shutdown_and_stop(
     shut the server down, start a replacement on the same DB — then asserts the
     two post-fix expectations the CLI relies on:
 
-    * Facet 1: the replacement server must not report the runner-less session
-      as ``running`` in ``GET /v1/sessions``.
+    * Facet 1: once the dead runner's liveness lease has lapsed, the replacement
+      server must not report the runner-less session as ``running`` in
+      ``GET /v1/sessions``.
     * Facet 2: ``stop_session`` must not report success (``2xx``) while leaving
       the session ``running``.
     """
@@ -455,10 +483,26 @@ def test_runner_less_session_remains_running_after_shutdown_and_stop(
             tunnel_token=tunnel_token,
         )
         client_b = httpx.Client(base_url=base_b, timeout=30.0, trust_env=False)
+        # The runner is gone for good, but the replacement honours its liveness
+        # lease until the TTL lapses (a reconnecting runner looks identical), so
+        # the shutdown must have left the lease in place and the row running.
+        item_leased = _list_session(client_b, session_id)
+        assert item_leased is not None and item_leased.get("status") == "running", (
+            "Precondition failed: the replacement settled the session before the "
+            f"runner's liveness lease lapsed (item={item_leased!r})"
+        )
+        _expire_runner_lease(db_path, runner_id)
 
         # ── 6. Observe what the CLI observes on the replacement server. ────
         item_b = _list_session(client_b, session_id)
         assert item_b is not None, f"Session {session_id} missing from replacement server list"
+        orphan_deadline = time.monotonic() + RUNNER_LIVENESS_TTL_S + 30.0
+        while item_b.get("status") == "running" and time.monotonic() < orphan_deadline:
+            time.sleep(POLL_INTERVAL_S)
+            item_b = _list_session(client_b, session_id)
+            assert item_b is not None, (
+                f"Session {session_id} disappeared while waiting for orphan reconciliation"
+            )
         status_after_restart = item_b.get("status")
         runner_still_online = _runner_online(client_b, runner_id)
 

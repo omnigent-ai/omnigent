@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -16,6 +17,8 @@ from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
     ClaudeNativeHookInterpreterMismatchError,
+    approval_wait_is_fresh,
+    approval_wait_marker_path,
     build_hook_settings,
     prepare_bridge_dir,
     read_transcript_path,
@@ -1084,20 +1087,19 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
         "PreToolUse hook not registered — native tools bypass TOOL_CALL policy evaluation"
     )
     assert "PermissionRequest" in hooks
-    # PreToolUse has two entries: the AskUserQuestion-specific hook first,
-    # then the catch-all policy evaluation hook.
-    assert len(hooks["PreToolUse"]) == 2, (
-        f"Expected 2 PreToolUse entries (AskUserQuestion + catch-all policy), "
-        f"got {len(hooks['PreToolUse'])}"
+    # PreToolUse carries only the catch-all policy hook. AskUserQuestion rides
+    # the PermissionRequest hook; a dedicated PreToolUse forwarder parked a
+    # second elicitation for the same question and the web showed two cards.
+    assert len(hooks["PreToolUse"]) == 1, (
+        f"Expected 1 PreToolUse entry (catch-all policy), got {len(hooks['PreToolUse'])}"
     )
-    # First entry: AskUserQuestion-specific hook with matcher.
-    ask_uq_entry = hooks["PreToolUse"][0]
-    assert ask_uq_entry.get("matcher") == "AskUserQuestion"
-    ask_uq_cmd = ask_uq_entry["hooks"][0]["command"]
-    assert "ask-user-question" in ask_uq_cmd
-    assert str(bridge_dir) in ask_uq_cmd
-    # Second entry: catch-all policy evaluation hook (no matcher).
-    policy_entry = hooks["PreToolUse"][1]
+    assert not any(
+        "ask-user-question" in str(hook.get("command", ""))
+        for groups in hooks.values()
+        for group in groups
+        for hook in group["hooks"]
+    ), "an AskUserQuestion forwarder hook would surface the question twice"
+    policy_entry = hooks["PreToolUse"][0]
     assert "matcher" not in policy_entry
     pre_tool_use_cmd = policy_entry["hooks"][0]["command"]
     assert "evaluate-policy" in pre_tool_use_cmd
@@ -1501,296 +1503,22 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     assert captured.err == ""
 
 
-def test_ask_user_question_hook_noop_in_non_bypass_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_ask_user_question_subcommand_is_a_silent_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """
-    ``ask-user-question`` subcommand is a no-op when not in bypassPermissions mode.
+    The retired ``ask-user-question`` forwarder exits 0 with no output.
 
-    In default / acceptEdits / plan modes the ``PermissionRequest`` hook fires
-    and owns the elicitation.  The ``ask-user-question`` PreToolUse hook must
-    return empty output (no opinion) so the form is not shown twice.
-
-    This fails if the handler forwards the payload to Omnigent in non-bypass mode —
-    which would cause a duplicate elicitation card in the web UI and race for
-    the same answer.
+    Settings written before it was retired still invoke it until the
+    terminal restarts. It must never reach the server — that parked a
+    second elicitation for the question — and must not block the tool,
+    so Claude Code proceeds to the PermissionRequest hook.
     """
-    calls: list[str] = []
-
-    class _RaisesIfCalled:
-        """HTTP client stub that fails the test if called unexpectedly."""
-
-        def __init__(self, **_kwargs: object) -> None:
-            """
-            Record unexpected construction.
-
-            :param _kwargs: Ignored constructor args.
-            :returns: None.
-            """
-            calls.append("constructed")
-
-        def __enter__(self) -> _RaisesIfCalled:
-            """
-            Enter context — should not be reached.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context — should not be reached.
-
-            :param _args: Ignored exception args.
-            :returns: None.
-            """
-
-        def post(self, *_args: object, **_kwargs: object) -> object:
-            """
-            Fail if Omnigent is called — must not happen in non-bypass mode.
-
-            :param _args: Ignored.
-            :param _kwargs: Ignored.
-            :returns: Never.
-            :raises AssertionError: Always, so the test fails visibly.
-            """
-            raise AssertionError(
-                "AP was called for ask-user-question in non-bypass mode — "
-                "PermissionRequest hook should own the elicitation instead"
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
-    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="b1", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_abc")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
-
-    for mode in ("default", "acceptEdits", "plan", None):
-        payload: dict[str, object] = {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "AskUserQuestion",
-            "tool_input": {"questions": []},
-        }
-        if mode is not None:
-            payload["permission_mode"] = mode
-        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-        exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
-        captured = capsys.readouterr()
-        # No Omnigent call, no output — "no opinion" so PermissionRequest takes over.
-        assert exit_code == 0, f"Non-zero exit for mode={mode!r}"
-        assert captured.out == "", f"Unexpected output for mode={mode!r}: {captured.out!r}"
-        assert calls == [], f"AP client was constructed for mode={mode!r}"
-
-
-def test_ask_user_question_hook_posts_and_returns_pre_tool_use_output_in_bypass_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """
-    In bypassPermissions mode the hook posts to Omnigent and returns PreToolUse output.
-
-    In bypass mode ``PermissionRequest`` never fires, so this PreToolUse hook
-    is the only opportunity to surface ``AskUserQuestion`` in the web UI.  It
-    must POST the payload to the Omnigent session's permission-request endpoint, then
-    convert the ``PermissionRequest``-format response to ``PreToolUse`` format
-    (lifting ``decision.updatedInput`` to the top-level ``updatedInput`` field).
-
-    Fails if: Omnigent is not called in bypass mode, the URL targets the wrong session,
-    the response is not converted from PermissionRequest to PreToolUse format,
-    or the user's answers are not surfaced in ``updatedInput``.
-    """
-    posted: dict[str, object] = {}
-    answers = {"q1": "Option A"}
-    server_response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {
-                "behavior": "allow",
-                "updatedInput": {
-                    "questions": [{"question": "Pick one", "options": [{"label": "Option A"}]}],
-                    "answers": answers,
-                },
-            },
-        }
-    }
-
-    class _FakeHttpxClient:
-        """
-        Minimal sync HTTP client stub for the ask-user-question hook.
-
-        :param headers: Headers passed to :class:`httpx.Client`.
-        :param timeout: Timeout passed to :class:`httpx.Client`.
-        """
-
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            """
-            Capture constructor inputs.
-
-            :param headers: HTTP headers.
-            :param timeout: Request timeout.
-            :returns: None.
-            """
-            posted["headers"] = headers
-            posted["timeout"] = timeout
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """
-            Enter context manager.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context manager.
-
-            :param _args: Ignored.
-            :returns: None.
-            """
-
-        def post(self, url: str, *, json: dict[str, object]) -> object:
-            """
-            Record the Omnigent request and return a canned PermissionRequest response.
-
-            :param url: Target URL.
-            :param json: Request body.
-            :returns: Fake HTTP response.
-            """
-            import httpx as _httpx
-
-            posted["url"] = url
-            posted["json"] = json
-            import json as _json
-
-            return _httpx.Response(
-                200,
-                text=_json.dumps(server_response),
-                request=_httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir("conv_bypass", bridge_id="b2", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_bypass")
-    build_hook_settings(
-        bridge_dir,
-        ap_server_url="http://127.0.0.1:8787",
-        ap_auth_headers={"Authorization": "Bearer token"},
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_post_hook_with_reattach",
+        lambda *_args, **_kwargs: pytest.fail("retired ask-user-question hook posted"),
     )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "AskUserQuestion",
-        "tool_input": {
-            "questions": [{"question": "Pick one", "options": [{"label": "Option A"}]}]
-        },
-        "permission_mode": "bypassPermissions",
-    }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    # Omnigent must be called with the active session's URL.
-    assert posted["url"] == (
-        "http://127.0.0.1:8787/v1/sessions/conv_bypass/hooks/permission-request"
-    )
-    # The full PreToolUse payload (including permission_mode) is
-    # forwarded verbatim, plus the minted re-attach id.
-    sent = posted["json"]
-    assert isinstance(sent, dict)
-    assert {k: v for k, v in sent.items() if k != "_omnigent_elicitation_id"} == payload
-    assert re.fullmatch(r"elicit_claude_[0-9a-f]{32}", sent["_omnigent_elicitation_id"])
-    # Auth headers from bridge config are forwarded.
-    assert posted["headers"] == {"Authorization": "Bearer token"}
-    # Output must be PreToolUse-format, NOT PermissionRequest-format.
-    result = json.loads(captured.out)
-    hs = result["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PreToolUse", (
-        "Response was not converted from PermissionRequest to PreToolUse format"
-    )
-    assert hs["permissionDecision"] == "allow"
-    # User answers must be lifted into top-level updatedInput so Claude skips
-    # its TUI picker and uses the web form's selections.
-    assert hs["updatedInput"]["answers"] == answers, (
-        "User answers were not propagated in updatedInput — Claude will fall back "
-        "to its TUI picker and ignore the web form selection"
-    )
-    assert captured.err == ""
-
-
-def test_ask_user_question_hook_returns_deny_without_updated_input(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """
-    When the user denies AskUserQuestion in bypass mode, hook output is deny with no updatedInput.
-
-    A denial blocks the tool call entirely.  There are no answers to inject, so
-    ``updatedInput`` must be absent from the PreToolUse output.
-
-    Fails if ``updatedInput`` is included on a deny (which would produce a
-    malformed output and confuse Claude), or if the denial is not surfaced.
-    """
-    server_response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {"behavior": "deny"},
-        }
-    }
-
-    class _FakeHttpxClient:
-        """Fake HTTP client returning a deny response."""
-
-        def __init__(self, **_kwargs: object) -> None:
-            """
-            Accept constructor kwargs.
-
-            :param _kwargs: Ignored.
-            :returns: None.
-            """
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """
-            Enter context.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context.
-
-            :param _args: Ignored.
-            :returns: None.
-            """
-
-        def post(self, url: str, *, json: object) -> object:
-            """
-            Return the canned deny response.
-
-            :param url: Ignored.
-            :param json: Ignored.
-            :returns: Fake HTTP response.
-            """
-            import json as _json
-
-            import httpx as _httpx
-
-            return _httpx.Response(
-                200,
-                text=_json.dumps(server_response),
-                request=_httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir("conv_deny", bridge_id="b3", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_deny")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
     payload = {
         "hook_event_name": "PreToolUse",
         "tool_name": "AskUserQuestion",
@@ -1799,18 +1527,12 @@ def test_ask_user_question_hook_returns_deny_without_updated_input(
     }
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
+    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(tmp_path)])
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    result = json.loads(captured.out)
-    hs = result["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PreToolUse"
-    assert hs["permissionDecision"] == "deny"
-    # No updatedInput on deny — answers are meaningless when the tool is blocked.
-    assert "updatedInput" not in hs, (
-        "updatedInput must not appear on a deny response — there are no answers to inject"
-    )
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
@@ -2273,7 +1995,9 @@ def _scripted_client(
       * ``"connect"`` — :class:`httpx.ConnectError` (server never reached: hard)
       * ``"severed"`` — :class:`httpx.RemoteProtocolError` (established then
         dropped: a held-poll sever iff ``held_s`` >= the floor)
-      * ``"5xx"``     — a 503 response (server sick: hard)
+      * ``"5xx"``     — a 503 response (hard iff ``held_s`` < the floor; a
+        gateway 5xx ending a held poll is a sever)
+      * ``"ok"``      — a 200 response (the human answered: final)
 
     :param script: Per-attempt ``(kind, held_s)`` plan.
     :param monkeypatch: Installs the fake clock + no-op sleep.
@@ -2310,6 +2034,8 @@ def _scripted_client(
                 raise httpx.RemoteProtocolError("server dropped the poll", request=req)
             if kind == "5xx":
                 return httpx.Response(503, text="upstream down", request=req)
+            if kind == "ok":
+                return httpx.Response(200, json={"ok": True}, request=req)
             raise AssertionError(f"unknown scripted kind {kind!r}")
 
     _ScriptedClient.calls = calls
@@ -2459,6 +2185,253 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
         "a slow human behind a severing proxy was capped — the #1782 regression"
     )
     assert len(calls) == n_severs + 1  # retried through every sever, then answered
+
+
+def test_reattach_gateway_5xx_after_held_poll_never_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway 5xx that ends a HELD poll is a sever, not a sick server.
+
+    The Databricks front door answers an idle long-poll with 504 after 300s.
+    Counting those as hard failures fail-asked a parked approval into the
+    unwatched TUI after ``cap`` severs (40 minutes). Held past the floor, a
+    5xx must reset the counter exactly like a torn connection does.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    client = _scripted_client(
+        script=[("5xx", held)] * (cap * 3) + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200, (
+        "a slow human behind a 504-answering gateway was capped"
+    )
+    assert len(client.calls) == cap * 3 + 1
+
+
+def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a held-poll sever the next re-POST waits only the initial backoff.
+
+    The server clears the approval card ``_HARNESS_ELICITATION_REPARK_GRACE_S``
+    (30s) after a severed wait unless the same id re-parks first, so a
+    backoff that kept doubling towards its 30s cap flipped the card to
+    "Resolved elsewhere" on every proxy sever. Growth is reserved for hard
+    failures.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    client = _scripted_client(
+        script=[("connect", 0.0)] * 3 + [("severed", floor + 290.0)] * 2 + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(claude_native_hook.time, "sleep", sleeps.append)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200
+    initial = claude_native_hook._PERMISSION_RETRY_INITIAL_BACKOFF_S
+    # Three hard failures double the wait; each held-poll sever resets it.
+    assert sleeps == [initial, initial * 2, initial * 4, initial, initial]
+
+
+def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked hook keeps its approval-wait marker fresh on every attempt.
+
+    A pane parked on a permission prompt emits nothing and reports no active
+    turn, so the idle pane reaper reads it as abandoned and kills the prompt.
+    This marker is the pane's only evidence of the wait, so it must be fresh
+    for every re-POST across a severed poll — and gone once the wait ends, so
+    the pane returns to normal idle accounting instead of lingering.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT", tmp_path / "approval-waits"
+    )
+    session_id = "conv_marked"
+    marker = approval_wait_marker_path(session_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    fresh_per_attempt: list[bool] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _ObservingClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _ObservingClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            fresh_per_attempt.append(approval_wait_is_fresh(session_id))
+            req = httpx.Request("POST", url)
+            if len(fresh_per_attempt) <= 2:
+                clock["t"] += held
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ObservingClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_marked/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        wait_marker=marker,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert fresh_per_attempt == [True, True, True], (
+        "the marker must read fresh on every attempt, including after a sever"
+    )
+    assert not approval_wait_marker_path(session_id).exists()
+
+
+def test_reattach_marker_stays_fresh_through_an_unsevered_held_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One long held POST keeps the marker fresh past the TTL while in flight.
+
+    A direct server (no front door) holds the poll for the whole wait, so the
+    single touch a per-attempt refresh made went stale after the TTL and the
+    idle reaper killed the parked pane an hour later. Real clock, scaled TTL.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT", tmp_path / "approval-waits"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.APPROVAL_WAIT_MARKER_REFRESH_S", 0.05
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.APPROVAL_WAIT_MARKER_TTL_S", 0.5)
+    session_id = "conv_direct"
+    marker = approval_wait_marker_path(session_id)
+    marker.parent.mkdir(parents=True)
+    freshness: list[bool] = []
+
+    class _HoldingClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _HoldingClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            for _ in range(3):
+                time.sleep(0.5)  # each hold spans a whole TTL
+                freshness.append(approval_wait_is_fresh(session_id))
+            return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _HoldingClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_direct/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        wait_marker=marker,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert freshness == [True, True, True], "the marker must stay fresh for the whole held poll"
+    assert not marker.exists()
+
+
+def test_reattach_reauths_again_after_a_held_poll_sever(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Every token lapse across a long wait is re-minted, not only the first.
+
+    A parked approval outlives the ~1h token: the server bounces the lapsed
+    bearer, the hook re-mints once, the gateway severs the next held poll, and
+    an hour later the fresh token lapses too. The held poll must re-arm the
+    one-shot re-mint, or the second bounce fail-asks into the unwatched TUI.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    # Per attempt: a bounce, a gateway sever after a held poll, a second bounce,
+    # then the verdict.
+    script = [("302", 0.0), ("severed", floor + 290.0), ("302", 0.0), ("ok", 0.0)]
+    seen_auth: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            seen_auth.append(self._headers.get("Authorization", ""))
+            kind, held_s = script[len(seen_auth) - 1]
+            clock["t"] += held_s
+            req = httpx.Request("POST", url)
+            if kind == "302":
+                return httpx.Response(
+                    302,
+                    headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+                    request=req,
+                )
+            if kind == "severed":
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    minted: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        """
+        Mint a distinguishable fresh bearer.
+
+        :returns: Headers carrying the new token.
+        """
+        minted.append(len(minted) + 1)
+        return {"Authorization": f"Bearer fresh{len(minted)}"}
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=_reauth,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert minted == [1, 2], "the second lapse must be re-minted too"
+    assert seen_auth == ["Bearer stale", "Bearer fresh1", "Bearer fresh1", "Bearer fresh2"]
 
 
 def test_reattach_fast_flapping_connection_is_hard_failure(

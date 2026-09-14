@@ -264,7 +264,10 @@ async def wait_for_user_verdict(
 
     Returns ``False`` on timeout. Cancellation propagates: if the
     caller's task is cancelled the ``finally`` still emits the
-    resolved event so the badge clears.
+    resolved event so the badge clears. An exit without a human verdict
+    (timeout, cancellation) stamps ``reason: "unanswered"`` on that event,
+    so the web card can say the prompt expired instead of implying someone
+    answered it elsewhere.
 
     :param elicitation_id: Correlation id minted by the Omnigent server's
         policy evaluator and returned in the ``pending`` verdict,
@@ -293,8 +296,10 @@ async def wait_for_user_verdict(
     # so ``has_pending`` reports it. Decremented in ``finally`` on every
     # exit path (verdict, timeout, cancellation) so the flag never leaks.
     _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
+    answered = False
     try:
         verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
+        answered = True
     except asyncio.TimeoutError:
         verdict = Verdict(approved=False)
     finally:
@@ -309,13 +314,15 @@ async def wait_for_user_verdict(
         # AP-side dispatch already cleared the entry); on timeout
         # / cancellation this event is the ONLY signal the server
         # gets, so it must fire on every exit path.
-        publish_event(
-            conversation_id,
-            {
-                "type": "response.elicitation_resolved",
-                "elicitation_id": elicitation_id,
-            },
-        )
+        resolved: dict[str, object] = {
+            "type": "response.elicitation_resolved",
+            "elicitation_id": elicitation_id,
+        }
+        if not answered:
+            # Nobody decided anything: let the card say the prompt expired
+            # rather than render the neutral "Resolved elsewhere" pill.
+            resolved["reason"] = "unanswered"
+        publish_event(conversation_id, resolved)
     return verdict
 
 

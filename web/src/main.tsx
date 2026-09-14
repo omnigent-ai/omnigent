@@ -140,7 +140,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
           <ThemeProvider>
             <TooltipProvider>
               <ImageLightboxProvider>
-                <BrowserRouter future={{ v7_startTransition: true }}>
+                <BrowserRouter>
                   <SessionUpdatesProvider>
                     <RunnerHealthProvider>
                       <QueueFlushProvider>
