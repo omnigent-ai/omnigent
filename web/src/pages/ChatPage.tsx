@@ -3574,7 +3574,7 @@ function ComposerImpl(
                     className="mb-1 flex items-center gap-1 text-xs font-medium text-brand-accent"
                   >
                     <MessagesSquareIcon className="size-3" />
-                    Ask in side chat — forks a separate chat, kept out of this conversation
+                    Ask in a side chat forked from this main conversation
                   </div>
                 ) : null}
                 <ReplyDraftBlocks
