@@ -49,3 +49,39 @@ async def test_claude_failure_output_is_not_labelled_codex(
     assert len(failed) == 1
     assert failed[0]["error"]["code"] == code
     assert failed[0]["error"]["message"] == detail
+
+
+@pytest.mark.asyncio
+async def test_claude_harness_without_wrapper_label_is_not_labelled_codex(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A custom claude-native agent carries no wrapper label; its harness
+    must still attribute the failure to Claude, not Codex."""
+    published: list[dict] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(
+        client,
+        name="custom-claude-orchestrator",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    assert "omnigent.wrapper" not in created.json().get("labels", {})
+    session_id = created.json()["id"]
+    detail = "Claude Code authentication failed. Check the Claude terminal for details."
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "output": detail},
+        },
+    )
+    assert response.status_code == 202, response.text
+    failed = [event for event in published if event.get("status") == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["error"]["code"] == "native_turn_error"
+    assert failed[0]["error"]["message"] == detail
