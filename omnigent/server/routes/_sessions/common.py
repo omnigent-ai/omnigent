@@ -570,9 +570,6 @@ _SESSION_UPDATES_MAX_WATCHED: int = 500
 _SHARED_DISCOVERY_KEY = "__all__"
 
 
-_session_todos_cache: dict[str, list[dict[str, Any]]] = {}
-
-
 _session_terminal_pending_cache: dict[str, bool] = {}
 
 
@@ -668,11 +665,15 @@ class _PendingPolicyAskWrites:
         itself, so the events handler skips write application for
         these entries to avoid double-applying non-idempotent ops
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
+    :param reviewed_arguments: Original MCP arguments shown for approval.
+    :param transformed_arguments: Policy transform stored with that approval.
     """
 
     state_updates: list[StateUpdate] | None
     set_labels: dict[str, str] | None
     from_mcp: bool = False
+    reviewed_arguments: dict[str, Any] | None = None
+    transformed_arguments: dict[str, Any] | None = None
 
 
 _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
@@ -1082,7 +1083,6 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
-    "_session_todos_cache",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
