@@ -87,11 +87,14 @@ export const CURSOR_NATIVE_EXEC_MODES: NativeHarnessMode[] = [
 // Devin's own permission vocabulary (`devin --help`), deliberately NOT Claude's:
 // Devin's rungs differ, and it reads them from `--permission-mode`. "auto" is
 // Devin's own default, so it sends no flag. Keep in sync with `devin --help`.
-export const DEVIN_NATIVE_DEFAULT_PERMISSION_MODE = "auto";
+// Values are Devin's CANONICAL names (it also accepts `auto` for `normal` and
+// `bypass`/`yolo` for `dangerous`), because a mid-session switch stores the mode
+// the pane confirmed — which is always the canonical one.
+export const DEVIN_NATIVE_DEFAULT_PERMISSION_MODE = "normal";
 export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
   {
-    value: "auto",
-    label: "Auto",
+    value: "normal",
+    label: "Normal",
     description: "Auto-approves read-only tools; prompts for anything else",
     args: [],
   },

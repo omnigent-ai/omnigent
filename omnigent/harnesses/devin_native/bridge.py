@@ -73,6 +73,7 @@ DEVIN_PERMISSION_MODES: tuple[str, ...] = (
     "auto",
     "accept-edits",
     "smart",
+    "dangerous",
     "bypass",
 )
 

@@ -101,6 +101,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
@@ -1129,7 +1130,7 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
@@ -2493,11 +2494,19 @@ function ComposerImpl(
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
   const openComposerGithubTab = useOpenGithubTab();
+  // Devin shares this control but not Claude's vocabulary: its rungs are
+  // normal / accept-edits / smart / dangerous, cycled in the TUI.
+  const devinPermissionControl = modelPickerKind === "devin";
   const permissionOptions = showClaudePermissionMode
-    ? CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+    ? devinPermissionControl
+      ? DEVIN_NATIVE_PERMISSION_MODES
+      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
   const permissionLabel = showClaudePermissionMode
-    ? claudePermissionModeLabel(claudePermissionMode)
+    ? devinPermissionControl
+      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+        claudePermissionMode)
+      : claudePermissionModeLabel(claudePermissionMode)
     : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
     if (isReadOnly || unreachable || configBusyRef.current) return;
@@ -4197,10 +4206,12 @@ export function shouldShowCodexPlanModeControl(
  *     or missing labels fails closed.
  * :returns: True only for sessions running the claude-native wrapper.
  */
-export function shouldShowClaudePermissionModeControl(
+export function shouldShowPermissionModeControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return isClaudeNativeSession(conv);
+  // Devin cycles its own rungs with Shift+Tab, which the runner drives, so it
+  // gets the same control — with its own vocabulary (see `permissionOptions`).
+  return isClaudeNativeSession(conv) || modelPickerKindForConv(conv) === "devin";
 }
 
 /**
