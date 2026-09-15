@@ -7,10 +7,13 @@ rather than a guess at it.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.devin_native.bridge import (
@@ -21,10 +24,12 @@ from omnigent.harnesses.devin_native.bridge import (
 from omnigent.harnesses.devin_native.forwarder import (
     _ForwardState,
     _handle_event,
+    _post_failure_is_permanent,
     _read_state,
     _tool_output_text,
     _TurnState,
     _write_state,
+    forward_devin_hooks_to_session,
 )
 
 _PROMPT_ID = "a288f722-4546-4b80-af63-7264e6516b5c"
@@ -65,6 +70,40 @@ _STOP = {
     "session_id": "childish-receipt",
     "prompt_id": _PROMPT_ID,
 }
+
+
+@contextlib.asynccontextmanager
+async def _null_async_context(value: Any) -> Any:
+    """Hand *value* to the forwarder in place of a real server client."""
+    yield value
+
+
+async def _drain_forward_loop(bridge_dir: Path) -> None:
+    """Run the forward loop until it has consumed the log, then stop it.
+
+    The loop never returns on its own — it polls forever — so it is cancelled
+    once the cursor stops moving. A failure inside it is re-raised.
+    """
+    task = asyncio.ensure_future(
+        forward_devin_hooks_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge_dir,
+            agent_name="devin",
+            poll_interval_s=0.001,
+        )
+    )
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if task.done() or _read_state(bridge_dir).hooks_offset >= hooks_size(bridge_dir):
+            break
+    if task.done():
+        task.result()  # surface a raised failure
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 class _FakeResponse:
@@ -393,6 +432,104 @@ class TestToolOutputText:
 
     def test_none_is_empty(self) -> None:
         assert _tool_output_text(None) == ""
+
+
+class TestPoisonEventSkip:
+    """One event the server permanently rejects must not stall the mirror.
+
+    The cursor advances only past an event that posted, and the supervisor
+    restarts the loop from that cursor — so without a skip, a single rejected
+    payload (over the 10 MiB event limit, say) re-fails forever and every later
+    turn stops reaching the conversation.
+    """
+
+    def test_a_rejected_payload_is_permanent(self) -> None:
+        for status in (400, 403, 404, 413, 422):
+            exc = httpx.HTTPStatusError(
+                "rejected",
+                request=httpx.Request("POST", "http://x"),
+                response=httpx.Response(status),
+            )
+            assert _post_failure_is_permanent(exc) is True, status
+
+    def test_a_busy_or_broken_server_is_retried(self) -> None:
+        for status in (408, 429, 500, 502, 503, 504):
+            exc = httpx.HTTPStatusError(
+                "busy",
+                request=httpx.Request("POST", "http://x"),
+                response=httpx.Response(status),
+            )
+            assert _post_failure_is_permanent(exc) is False, status
+
+    def test_a_transport_error_is_retried(self) -> None:
+        assert _post_failure_is_permanent(httpx.ConnectError("down")) is False
+
+    @pytest.mark.asyncio
+    async def test_the_loop_steps_over_a_rejected_event(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The turn after a rejected one still reaches the conversation."""
+        for payload in (_SESSION_START, _USER_PROMPT, _STOP):
+            record_hook_event(tmp_path, payload)
+
+        rejected: list[str | None] = []
+        handled: list[str | None] = []
+
+        async def _handle(client, **kwargs: Any) -> None:
+            name = kwargs["payload"].get("hook_event_name")
+            if name == "UserPromptSubmit":
+                rejected.append(name)
+                raise httpx.HTTPStatusError(
+                    "too large",
+                    request=httpx.Request("POST", "http://x"),
+                    response=httpx.Response(400),
+                )
+            handled.append(name)
+
+        monkeypatch.setattr("omnigent.harnesses.devin_native.forwarder._handle_event", _handle)
+        monkeypatch.setattr(
+            "omnigent.harnesses.devin_native.forwarder.open_server_client",
+            lambda *a, **k: _null_async_context(_FakeClient()),
+            raising=False,
+        )
+        await _drain_forward_loop(tmp_path)
+
+        assert rejected == ["UserPromptSubmit"]
+        # SessionStart before it and Stop after it both landed: the mirror did
+        # not stop at the poison event.
+        assert handled == ["SessionStart", "Stop"]
+        assert _read_state(tmp_path).hooks_offset == hooks_size(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_the_loop_stops_on_a_retryable_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 503 keeps its event, so the supervisor's restart re-posts it."""
+        for payload in (_SESSION_START, _USER_PROMPT):
+            record_hook_event(tmp_path, payload)
+
+        async def _handle(client, **kwargs: Any) -> None:
+            if kwargs["payload"].get("hook_event_name") == "UserPromptSubmit":
+                raise httpx.HTTPStatusError(
+                    "unavailable",
+                    request=httpx.Request("POST", "http://x"),
+                    response=httpx.Response(503),
+                )
+
+        monkeypatch.setattr("omnigent.harnesses.devin_native.forwarder._handle_event", _handle)
+        monkeypatch.setattr(
+            "omnigent.harnesses.devin_native.forwarder.open_server_client",
+            lambda *a, **k: _null_async_context(_FakeClient()),
+            raising=False,
+        )
+        with pytest.raises(RuntimeError, match="forwarder post failed"):
+            await _drain_forward_loop(tmp_path)
+
+        # Cursor sits at the SessionStart boundary, so the prompt is re-read.
+        offset = _read_state(tmp_path).hooks_offset
+        assert 0 < offset < hooks_size(tmp_path)
+        remaining = [p for _, p in iter_hook_events(tmp_path, start_offset=offset)]
+        assert [p["hook_event_name"] for p in remaining] == ["UserPromptSubmit"]
 
 
 class TestStatePersistence:

@@ -769,15 +769,29 @@ async def forward_devin_hooks_to_session(
                 for offset, payload in iter_hook_events(
                     bridge_dir, start_offset=state.hooks_offset
                 ):
-                    await _handle_event(
-                        client,
-                        session_id=session_id,
-                        bridge_dir=bridge_dir,
-                        agent_name=agent_name,
-                        payload=payload,
-                        state=state,
-                        turn=turn,
-                    )
+                    try:
+                        await _handle_event(
+                            client,
+                            session_id=session_id,
+                            bridge_dir=bridge_dir,
+                            agent_name=agent_name,
+                            payload=payload,
+                            state=state,
+                            turn=turn,
+                        )
+                    except httpx.HTTPError as exc:
+                        if not _post_failure_is_permanent(exc):
+                            raise
+                        # Step over an event the server will never accept. One
+                        # lost turn beats a mirror that stops here for good.
+                        _logger.error(
+                            "devin-native forwarder for %s dropped a %s event the "
+                            "server rejected (http_status=%s); mirroring continues",
+                            session_id,
+                            payload.get("hook_event_name"),
+                            exc.response.status_code,
+                            exc_info=True,
+                        )
                     state.hooks_offset = offset
                     progressed = True
                 if progressed:
@@ -788,6 +802,28 @@ async def forward_devin_hooks_to_session(
                 _write_state(bridge_dir, state)
                 raise RuntimeError(f"devin-native forwarder post failed: {exc}") from exc
             await asyncio.sleep(poll_interval_s)
+
+
+#: Statuses worth retrying: the server is busy or briefly unavailable, so the
+#: same event can still land. Every other 4xx is a verdict on the payload itself.
+_RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _post_failure_is_permanent(exc: httpx.HTTPError) -> bool:
+    """Whether re-posting *exc*'s event could ever succeed.
+
+    A transport error or a busy server is worth a restart. A payload the server
+    rejects on its merits — over the 10 MiB event limit, or malformed — is not:
+    the cursor only advances past an event that posted, so retrying one forever
+    would stall every later turn behind it.
+
+    :param exc: The failure raised while forwarding one hook event.
+    :returns: ``True`` when the event should be skipped rather than retried.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    status = exc.response.status_code
+    return status < 500 and status not in _RETRYABLE_STATUSES
 
 
 async def supervise_devin_forwarder(
