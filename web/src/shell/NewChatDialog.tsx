@@ -1506,7 +1506,7 @@ export function AgentHarnessPicker({
     }
   }, [open]);
 
-  // The landing's model-picker hotkey (⌘⇧M) bumps openNonce. Open the menu and
+  // The landing's model-picker hotkey (Ctrl+Shift+M) bumps openNonce. Open the menu and
   // drill straight into the selected harness's edit submenu (Models / Effort),
   // the same jump the row's Edit affordance performs, so the chord lands on the
   // model list rather than the harness list. Falls back to the list when the
@@ -2684,7 +2684,7 @@ export function NewChatLandingScreen() {
   // Advanced settings for agents with a configurable brain harness.
   const [configOpen, setConfigOpen] = useState(false);
 
-  // ⌘⇧M opens the agent/model picker here, the keyboard equivalent of the
+  // Ctrl+Shift+M opens the agent/model picker here, the keyboard equivalent of the
   // existing-chat model-picker shortcut. The picker owns model selection on the
   // landing, so the hotkey bumps a nonce the picker opens on.
   const [modelPickerOpenNonce, setModelPickerOpenNonce] = useState(0);

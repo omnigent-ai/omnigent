@@ -2467,7 +2467,7 @@ function ComposerImpl(
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
 
-  // Cmd/Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
+  // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
   // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
   // exists and the gear isn't disabled (not read-only, unreachable, or busy).
   useModelPickerHotkey(
