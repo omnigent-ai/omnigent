@@ -801,6 +801,9 @@ class _RecordingWS:
         self.sent.append(data)
         self.first_send.set()
 
+    async def recv(self) -> str:
+        raise asyncio.CancelledError
+
 
 async def _cancel(task: asyncio.Task[None]) -> None:
     """Cancel *task* and await its unwinding, swallowing the cancellation."""
@@ -903,6 +906,120 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
     _cleanup_host(host)
 
 
+async def test_host_publishes_codex_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot = {"captured_at": 1, "limits": [{"limit_id": "codex", "windows": [{"kind": "primary", "used_percent": 5.0, "window_duration_mins": 300}]}]}  # fmt: skip  # noqa: E501
+    monkeypatch.setattr(
+        "omnigent.host.connect.read_rate_limits",
+        lambda: asyncio.sleep(0, result=snapshot),
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    host._configured_harnesses = {"codex": True}
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), 2)
+    finally:
+        await _cancel(task)
+    assert getattr(decode_host_frame(ws.sent[0]), "codex_rate_limits", None) == snapshot
+    with pytest.raises(asyncio.CancelledError):
+        await host._serve_frames(ws)  # type: ignore[arg-type]
+    assert getattr(decode_host_frame(ws.sent[1]), "codex_rate_limits", None) == snapshot
+    host._codex_rate_limits = None
+    ws, probed = _RecordingWS(), asyncio.Event()
+
+    async def lose_readiness() -> dict[str, object]:
+        host._configured_harnesses = {"codex": False, "pi": True}
+        probed.set()
+        return snapshot
+
+    monkeypatch.setattr("omnigent.host.connect.read_rate_limits", lose_readiness)
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    await asyncio.wait_for(probed.wait(), 2)
+    await asyncio.sleep(0)
+    await _cancel(task)
+    assert ws.sent == [] and host._codex_rate_limits is None
+
+
+async def test_readiness_frames_serialized_across_publishers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both publishers share one lock so a stale quota map never lands last.
+
+    The readiness loop holds ``_readiness_publish_lock`` across its send +
+    cache update while the quota loop re-reads the map inside it (the slow
+    probe stays outside). With the readiness send wedged, the quota publish
+    must wait, re-read the newest map, and land after — never resend stale.
+    """
+    old = {"codex": True, "pi": False}
+    new = {"codex": True, "pi": True}
+    gateway = {"codex": True}
+    snapshot = {"captured_at": 1, "limits": [{"limit_id": "codex", "windows": [{"kind": "primary", "used_percent": 5.0, "window_duration_mins": 300}]}]}  # fmt: skip  # noqa: E501
+
+    class _BlockingWS:
+        """Fake tunnel whose send wedges until the test releases it."""
+
+        def __init__(self) -> None:
+            """Initialize the frame log, entry count, and release gate."""
+            self.sent: list[str] = []
+            self.entered = 0
+            self.release = asyncio.Event()
+
+        async def send(self, data: str) -> None:
+            """Park inside send until released, then record the frame."""
+            self.entered += 1
+            await self.release.wait()
+            self.sent.append(data)
+
+        async def recv(self) -> str:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", lambda: dict(new))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: dict(gateway))
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S", 3600.0)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 0.01)
+    probed = asyncio.Event()
+
+    async def _snapshot() -> dict[str, object]:
+        probed.set()
+        return snapshot  # type: ignore[return-value]
+
+    monkeypatch.setattr("omnigent.host.connect.read_rate_limits", _snapshot)
+    monkeypatch.setattr("omnigent.host.connect.REFRESH_INTERVAL_S", 3600.0)
+
+    host = _make_host_process()
+    host._configured_harnesses = dict(old)
+    host._gateway_inference = dict(gateway)
+    ws = _BlockingWS()
+
+    async def _wait_for(pred: object, timeout: float = 2.0) -> None:
+        async with asyncio.timeout(timeout):
+            while not pred():  # type: ignore[operator]
+                await asyncio.sleep(0.005)
+
+    readiness_task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        await _wait_for(lambda: ws.entered >= 1)
+        quota_task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+        try:
+            await asyncio.wait_for(probed.wait(), timeout=2.0)
+            await asyncio.sleep(0.05)
+            ws.release.set()
+            await _wait_for(lambda: len(ws.sent) >= 2)
+        finally:
+            await _cancel(quota_task)
+    finally:
+        await _cancel(readiness_task)
+
+    assert len(ws.sent) == 2
+    first = decode_host_frame(ws.sent[0])
+    last = decode_host_frame(ws.sent[-1])
+    assert isinstance(first, HostHarnessReadinessFrame)
+    assert isinstance(last, HostHarnessReadinessFrame)
+    assert first.configured_harnesses == new
+    assert last.configured_harnesses == new
+    assert getattr(last, "codex_rate_limits", None) == snapshot
+    _cleanup_host(host)
+
+
 async def test_live_host_full_refresh_detects_auth_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -940,9 +1057,12 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
 ) -> None:
     """A periodic full refresh sends nothing when the readiness map is unchanged."""
     calls = {"n": 0}
+    refreshed = threading.Event()
 
     def _unchanged_map() -> dict[str, str]:
         calls["n"] += 1
+        if calls["n"] >= 2:
+            refreshed.set()
         return {"codex": "needs-auth"}
 
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
@@ -958,11 +1078,7 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
 
     task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
-        # Let at least two full refreshes recompute-and-compare before stopping.
-        for _ in range(400):
-            if calls["n"] >= 2:
-                break
-            await asyncio.sleep(0.005)
+        assert await asyncio.to_thread(refreshed.wait, 2.0)
     finally:
         await _cancel(task)
 

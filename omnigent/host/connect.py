@@ -43,7 +43,15 @@ from omnigent.debug_logging import (
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harness_availability import (
+    CODEX_CANONICAL_HARNESSES,
+    HARNESS_BINARY_MISSING,
+    HarnessAvailability,
+)
+from omnigent.harnesses.codex_native.rate_limits_probe import (
+    REFRESH_INTERVAL_S,
+    read_rate_limits,
+)
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
@@ -1043,6 +1051,11 @@ class HostProcess:
         # refresh task keeps it current.
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._gateway_inference: dict[str, bool] | None = None
+        self._codex_rate_limits: dict[str, Any] | None = None
+        # Serializes readiness publication across the readiness refresh and
+        # the quota publisher: under send backpressure the quota loop must
+        # not resend a stale harness map after a newer readiness frame.
+        self._readiness_publish_lock = asyncio.Lock()
         self._capabilities_initialized = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
@@ -3963,6 +3976,7 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            codex_rate_limits=self._codex_rate_limits,
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -3988,6 +4002,7 @@ class HostProcess:
         # the server's watchdog counts as liveness, or it closes the tunnel
         # with ``4003 ping timeout``.
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        rate_limits_task = asyncio.create_task(self._codex_rate_limits_loop(ws))
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
         # waiting on a harness probe. Cache-fresh reconnects are a no-op.
@@ -4014,6 +4029,9 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
+            rate_limits_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await rate_limits_task
             prewarm_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await prewarm_task
@@ -4055,18 +4073,50 @@ class HostProcess:
             if new_configured is None:
                 continue
             if new_configured != configured or new_gateway != gateway:
-                await ws.send(
-                    encode_host_frame(
-                        HostHarnessReadinessFrame(
-                            configured_harnesses=new_configured,
-                            gateway_inference=new_gateway,
+                async with self._readiness_publish_lock:
+                    await ws.send(
+                        encode_host_frame(
+                            HostHarnessReadinessFrame(
+                                configured_harnesses=new_configured,
+                                gateway_inference=new_gateway,
+                            )
                         )
                     )
-                )
-                configured = new_configured
-                gateway = new_gateway
-                self._configured_harnesses = configured
-                self._gateway_inference = gateway
+                    configured = new_configured
+                    gateway = new_gateway
+                    self._configured_harnesses = configured
+                    self._gateway_inference = gateway
+
+    async def _codex_rate_limits_loop(
+        self, ws: websockets.asyncio.client.ClientConnection
+    ) -> None:
+        """Publish sanitized quota data over a mixed-version-safe frame kind."""
+        while True:
+            readiness = self._configured_harnesses or {}
+            if any(readiness.get(name) is True for name in CODEX_CANONICAL_HARNESSES):
+                try:
+                    snapshot = await read_rate_limits()
+                    async with self._readiness_publish_lock:
+                        readiness = self._configured_harnesses or {}
+                        gateway = self._gateway_inference
+                        if snapshot is not None and any(
+                            readiness.get(name) is True for name in CODEX_CANONICAL_HARNESSES
+                        ):
+                            self._codex_rate_limits = snapshot
+                            await ws.send(
+                                encode_host_frame(
+                                    HostHarnessReadinessFrame(
+                                        configured_harnesses=readiness,
+                                        gateway_inference=gateway,
+                                        codex_rate_limits=snapshot,
+                                    )
+                                )
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - advisory data cannot stop the Host
+                    _logger.debug("Codex rate-limit probe unavailable", exc_info=True)
+            await asyncio.sleep(REFRESH_INTERVAL_S)
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
