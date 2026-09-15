@@ -155,6 +155,12 @@ export function ComposerPermissionPicker({
         align="start"
         className="w-max min-w-[13.75rem] max-w-[calc(100vw-2rem)]"
         data-testid={`${testIdPrefix}-permission-menu`}
+        onCloseAutoFocus={(event) => {
+          // A closing animation must not steal focus from a newly opened menu.
+          if (document.activeElement?.closest('[role="menu"][data-state="open"]')) {
+            event.preventDefault();
+          }
+        }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
         {options.map((option) => (

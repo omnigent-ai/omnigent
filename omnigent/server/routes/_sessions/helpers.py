@@ -41,6 +41,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
@@ -68,6 +69,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
@@ -215,7 +217,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
-    _session_todos_cache,
     build_policy_engine,
     get_agent_cache,
     get_caps,
@@ -1665,7 +1666,7 @@ def _publish_input_consumed(
 # re-announces in_progress on every status poll; carrying one stable
 # started_at lets clients anchor their elapsed counter to the true start,
 # even across a page reload (the live stream has no replay).
-_compaction_started_at: dict[str, int] = {}
+_compaction_started_at: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 def _publish_compaction_in_progress(session_id: str) -> None:
@@ -2824,21 +2825,20 @@ def _pin_claude_permission_launch_args(
     return [*stripped, "--permission-mode", mode]
 
 
-def _handle_external_session_todos(
+async def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
+    conversation_store: ConversationStore,
 ) -> None:
     """
-    Cache and broadcast a todo-list update from a native forwarder.
+    Persist and broadcast a todo-list update from a native forwarder.
 
     Sent by the claude-native forwarder (from ``TodoWrite``) and the
     codex-native forwarder (from Codex plan updates); the panel is
     harness-agnostic.
 
-    Updates the in-memory ``_session_todos_cache`` so subsequent
-    ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
-    field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected web clients update their todo panel immediately.
+    Store the latest display snapshot before updating SSE clients. A replacement
+    Server can recover it without waking the harness.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -2853,20 +2853,15 @@ def _handle_external_session_todos(
             "external_session_todos requires data.todos to be a list",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Filter to well-formed items before caching so that malformed entries
-    # from a buggy forwarder version don't persist in the snapshot.  The
-    # same filter is applied by sse.ts on the live-event path; keeping the
-    # two in sync means the snapshot and live panel always show the same set.
-    valid_statuses = {"pending", "in_progress", "completed"}
-    validated: list[dict[str, Any]] = [
-        t
-        for t in todos
-        if isinstance(t, dict)
-        and isinstance(t.get("content"), str)
-        and t.get("status") in valid_statuses
-        and isinstance(t.get("activeForm"), str)
-    ]
-    _session_todos_cache[session_id] = validated
+    try:
+        validated = validate_session_todos(todos)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    persisted = await asyncio.to_thread(
+        conversation_store.set_session_todos, session_id, validated
+    )
+    if not persisted:
+        return
     event = SessionTodosEvent(
         type="session.todos",
         conversation_id=session_id,
@@ -4175,6 +4170,9 @@ def _message_text(content: list[dict[str, Any]]) -> str | None:
 def _latest_assistant_text_from_store(
     conversation_store: ConversationStore,
     session_id: str,
+    *,
+    response_id: str | None = None,
+    stop_at_user_message: bool = False,
 ) -> str | None:
     """
     Return the latest persisted assistant message text for a session.
@@ -4187,6 +4185,9 @@ def _latest_assistant_text_from_store(
     :param conversation_store: Store used to read conversation items.
     :param session_id: Session/conversation id, e.g.
         ``"conv_child123"``.
+    :param response_id: When known, only return text belonging to this turn.
+    :param stop_at_user_message: Without a response id, stop at the latest
+        non-meta user message so a failure cannot borrow an earlier reply.
     :returns: Latest assistant text, or ``None`` when none is
         persisted yet.
     """
@@ -4199,7 +4200,13 @@ def _latest_assistant_text_from_store(
     for item in page.data:
         if not isinstance(item.data, MessageData):
             continue
-        if item.data.role != "assistant" or item.data.is_meta:
+        if item.data.is_meta:
+            continue
+        if response_id is not None and item.response_id != response_id:
+            continue
+        if stop_at_user_message and response_id is None and item.data.role == "user":
+            return None
+        if item.data.role != "assistant":
             continue
         text = _message_text(item.data.content)
         if text is not None:
@@ -5406,13 +5413,15 @@ async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttemp
 # conversation (so a rider that short-circuits onto another flight's binding
 # surfaces THAT flight's structured refusal instead of a generic connect
 # timeout), and strong refs to the detached superseded-runner stops.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _relaunch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-_relaunch_last_attempt: dict[str, _HostLaunchAttempt] = {}
+_relaunch_last_attempt: WorkspaceScopedCache[str, _HostLaunchAttempt] = WorkspaceScopedCache()
 # Riders read the memo within a flight's own window (milliseconds), so it only
 # has to outlive the racing callers, not the conversation. Cap it: a
 # weak-valued map would drop entries the racers still need, and an uncapped one
 # would keep a row for every conversation this process ever relaunched.
 _RELAUNCH_MEMO_MAX = 512
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_supersede_stops: set[asyncio.Task[None]] = set()
 
 
@@ -5838,6 +5847,56 @@ async def _get_runner_client_for_resource_access_impl(
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
+# Client-safe message for a session whose bound agent no longer resolves.
+# Mirrors the native-terminal payload's wording: never forward the runner's
+# internal resolver text, which names the resolver and the raw agent id.
+_SESSION_AGENT_MISSING_CLIENT_MESSAGE = (
+    "This session's agent is no longer available; it was deleted or "
+    "replaced. Recreate the agent or start a new session, then retry."
+)
+
+
+def _raise_if_session_agent_missing_payload(payload: object) -> None:
+    """Re-raise a runner ``session_agent_missing`` error body as a typed 410.
+
+    Inspects an already-parsed runner error body for the typed
+    ``session_agent_missing`` code and re-derives the ``OmnigentError``
+    (``http_status`` 410, matching ``create_session_terminal``'s code
+    passthrough) so server proxies surface the session-lifecycle condition
+    instead of flattening it into a generic gateway failure or forwarding
+    the runner's raw message. Uses a fixed client-safe message — never the
+    runner's internal resolver text. No-op for any other body or code.
+
+    :param payload: Parsed runner response body, e.g. ``resp.json()``.
+    :raises OmnigentError: Typed ``session_agent_missing`` (HTTP 410).
+    """
+    if not isinstance(payload, dict):
+        return
+    error = payload.get("error")
+    if isinstance(error, dict) and error.get("code") == ErrorCode.SESSION_AGENT_MISSING:
+        raise OmnigentError(
+            _SESSION_AGENT_MISSING_CLIENT_MESSAGE,
+            code=ErrorCode.SESSION_AGENT_MISSING,
+        )
+
+
+def _raise_if_runner_session_agent_missing(resp: httpx.Response) -> None:
+    """Re-raise a runner ``session_agent_missing`` error as a typed 410.
+
+    Response-level wrapper over
+    :func:`_raise_if_session_agent_missing_payload` for proxies that hold
+    the raw ``httpx.Response``. No-op for a non-JSON payload.
+
+    :param resp: Runner HTTP response with a non-2xx status.
+    :raises OmnigentError: Typed ``session_agent_missing`` (HTTP 410).
+    """
+    try:
+        payload: object = resp.json()
+    except ValueError:
+        return
+    _raise_if_session_agent_missing_payload(payload)
+
+
 async def _proxy_get_session_resources_to_runner(
     runner_client: httpx.AsyncClient,
     session_id: str,
@@ -5851,7 +5910,10 @@ async def _proxy_get_session_resources_to_runner(
     :param resource_type: Optional ``?type=`` filter forwarded to the
         runner, e.g. ``"environment"``. ``None`` returns all types.
     :returns: The runner's validated resource page.
-    :raises HTTPException: 502 on runner failure or malformed response.
+    :raises OmnigentError: Typed ``session_agent_missing`` (410) re-derived
+        from the runner body when the session's agent is gone.
+    :raises HTTPException: 502 on any other runner failure or malformed
+        response.
     """
     try:
         resp = await runner_client.get(
@@ -5861,6 +5923,9 @@ async def _proxy_get_session_resources_to_runner(
             timeout=10.0,
         )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             _logger.warning(
                 "session resources: runner returned %d for session=%s",
                 resp.status_code,
@@ -6798,6 +6863,13 @@ async def _resolve_skill_meta_text_via_runner(
             code=ErrorCode.INTERNAL_ERROR,
         ) from exc
     if resp.status_code not in (200, 404):
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) instead of flattening it into an INTERNAL_ERROR 500 —
+        # the exact server-fault mis-attribution this code path must avoid.
+        # This branch is reached because SESSION_AGENT_MISSING maps to 410
+        # (non-404); if that HTTP mapping ever changed to 404, the 404 arm
+        # below would swallow it as a skill-not-found INVALID_INPUT.
+        _raise_if_runner_session_agent_missing(resp)
         raise OmnigentError(
             f"Runner failed to resolve skill {skill_name!r}: HTTP {resp.status_code}",
             code=ErrorCode.INTERNAL_ERROR,
@@ -10564,6 +10636,7 @@ _CATALOG_PREFETCH_CONCURRENCY = 4
 
 #: One semaphore per event loop: the server runs a single loop, but an asyncio
 #: primitive cannot be shared across the loops the test suite creates.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by object identity
 _catalog_prefetch_semaphores: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Semaphore
 ] = weakref.WeakKeyDictionary()

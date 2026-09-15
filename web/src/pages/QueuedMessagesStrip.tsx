@@ -39,7 +39,11 @@ interface QueuedMessagesStripProps {
    * Drives drag-to-reorder; omit to render a non-reorderable strip.
    */
   onReorder?: (queueId: string, beforeQueueId: string | null) => void;
-  /** Column-width class so the strip lines up with the composer card. */
+  /**
+   * Layout class aligning the strip with the composer surface it docks
+   * onto (its tuck only hides behind a surface at least as wide, so match
+   * that surface's width — e.g. the workspace bar's inset).
+   */
   widthClassName?: string;
 }
 
@@ -138,7 +142,8 @@ function QueuedRow({
 
 /**
  * Docked strip above the composer listing messages queued while the agent is
- * busy. Peeks above the composer card (`-mb-4` + bottom padding), mirroring
+ * busy. Peeks above the composer stack's top surface (`-mb-4` + bottom
+ * padding tuck its square bottom corners behind it), mirroring
  * `SubagentComposerTray`. Renders nothing when the queue is empty.
  *
  * Each row can be steered (sent now), edited (pulled back into the composer),

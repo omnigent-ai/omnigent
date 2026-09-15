@@ -3800,6 +3800,7 @@ def host_sandbox_is_running(
 # replica, else two host processes flap the tunnel registration. Reused across a
 # host's many idle-stop/resume cycles, so not reaped — a .pop() could also race
 # a resume still holding it; one idle Lock per host woken is negligible.
+# custom-lint: disable-next=workspace-scoped-cache -- host_id lock; collision only serializes
 _resume_locks: dict[str, asyncio.Lock] = {}
 
 

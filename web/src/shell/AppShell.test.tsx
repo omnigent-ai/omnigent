@@ -555,6 +555,7 @@ beforeEach(() => {
   // choice carries across sessions. Clear it so a stored preference from one
   // test can't change another test's default scope.
   localStorage.clear();
+  writeWorkspacePanelDefault("open");
   clearOptimisticTitles();
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
@@ -2717,11 +2718,10 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
-  it("starts open for a fresh session (no stored open-state)", () => {
+  it("starts collapsed for a fresh session (no stored open-state)", () => {
     // A brand-new session has no persisted open-state, so the Appearance
-    // Workspace panel default applies. With no preference stored that
-    // default is open — the card is mounted and the header offers Collapse,
-    // not Expand.
+    // Workspace panel product default applies.
+    writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -2730,14 +2730,13 @@ describe("Right workspace card visibility", () => {
 
     renderShell("/c/conv_fresh");
 
-    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Expand right panel" })).toBeNull();
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
   });
 
-  it("starts collapsed for a fresh session when Appearance default is collapsed", () => {
+  it("starts open for a fresh session when Appearance default is open", () => {
     // The Appearance setting only seeds sessions with no saved open-state.
-    writeWorkspacePanelDefault("collapsed");
+    writeWorkspacePanelDefault("open");
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -2746,8 +2745,8 @@ describe("Right workspace card visibility", () => {
 
     renderShell("/c/conv_fresh_collapsed");
 
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
   it("restores a saved open-state even when Appearance default is collapsed", () => {

@@ -62,6 +62,10 @@ const readyHost: Host = {
   owner: "developer",
   status: "online",
   configured_harnesses: {
+    // claude-sdk backs the polly/debby/custom (SDK) agents; a host reporting the
+    // native harnesses reports the SDK ones too, so include it or those agents
+    // read as unconfigured.
+    "claude-sdk": true,
     "claude-native": true,
     "codex-native": true,
     "cursor-native": true,
@@ -129,6 +133,9 @@ export const NeedsSetupBadges: Story = {
     host: {
       ...readyHost,
       configured_harnesses: {
+        // SDK agents (polly/debby) stay available; the intended badges here are
+        // the native codex/cursor rows below.
+        "claude-sdk": true,
         "claude-native": true,
         "codex-native": "needs-auth",
         "cursor-native": false,

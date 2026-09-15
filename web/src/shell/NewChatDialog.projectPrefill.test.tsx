@@ -827,7 +827,7 @@ describe("NewChatLandingScreen project prefill", () => {
     // Commit "Sonnet" through the agent-config modal (the user's explicit pick).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
-    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
 
@@ -858,7 +858,7 @@ describe("NewChatLandingScreen project prefill", () => {
     // unmounting (submittedRef stays false → landingDraft keeps routing "on").
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
-    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     unmount();

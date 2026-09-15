@@ -29,6 +29,7 @@ from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
     Agent,
@@ -209,7 +210,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
-    _session_todos_cache,
     get_caps,
     get_server_runner_router,
     session_stream,
@@ -701,6 +701,7 @@ async def _best_effort_stop(
 
 # Strong references to detached archive stops so the tasks can't be
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -1202,10 +1203,8 @@ def _build_session_response(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
-        # Replay the latest todo list for claude-native sessions.
-        # Populated by _handle_external_session_todos; empty list for
-        # non-claude-native sessions or before the first poll tick.
-        todos=_session_todos_cache.get(conv.id, []),
+        # Replay the last native Plan after a Server restart.
+        todos=conv.session_todos,
         skills=skills or [],
         skills_status=skills_status,
         model_options=[
@@ -1526,6 +1525,11 @@ def _persist_native_cumulative_usage(
     if cost is None and policy_cost is None and cin is None and cout is None:
         return None
 
+    # Deliberately a FRESH read — never a caller-supplied row. This row is the
+    # baseline for the monotonic clamps and the daily-rollup delta below, and
+    # ``set_session_usage`` rewrites the whole usage JSON; a row read earlier
+    # in the request would widen the forged-low-report race window and could
+    # overwrite a concurrent report's growth with stale state.
     conv = conversation_store.get_conversation(session_id)
     current: dict[str, Any] = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
@@ -1663,6 +1667,7 @@ async def _persist_external_session_usage(
     session_id: str,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    conv: Conversation | None = None,
 ) -> int | None:
     """
     Persist and broadcast a token-usage update from a terminal-backed runtime.
@@ -1674,6 +1679,14 @@ async def _persist_external_session_usage(
     :param session_id: Session/conversation identifier.
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
+    :param conv: The session's already-loaded conversation row, when the
+        caller holds one (the events route's access check reads it). Supplies
+        the tree root to the subtree roll-up and the ancestor publish — both
+        read-only, and both verify a supplied root against the tree it
+        produces — so those steps don't re-read the row. NOT passed to the
+        own-usage persist: its monotonic-clamp baseline must be a fresh read
+        (see :func:`_persist_native_cumulative_usage`). ``None`` makes each
+        step resolve the row itself.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
     :raises OmnigentError: On missing / malformed fields.
     """
@@ -1747,8 +1760,14 @@ async def _persist_external_session_usage(
     # would drop a parent's badge back to own-cost on every parent flush and
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
-    # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    # itself, so this equals own cost — one indexed tree query per flush. The
+    # caller's row supplies the root so the tree scan needs no extra row read.
+    subtree_usage = await asyncio.to_thread(
+        load_session_usage,
+        session_id,
+        conversation_store,
+        root_conversation_id=conv.root_conversation_id if conv is not None else None,
+    )
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1779,6 +1798,7 @@ async def _persist_external_session_usage(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        conv,
     )
     return raw_tokens
 
@@ -2563,11 +2583,9 @@ async def _enrich_terminal_status_with_subagent_output(
     with the terminal edge.
 
     A ``failed`` edge is filled only when the forwarder attached no detail of
-    its own. On a failed turn the latest assistant message is the harness's own
-    error report (e.g. Claude's "There's an issue with the selected model
-    (…)"), which otherwise reaches only the child's transcript while the
-    parent inbox falls back to the generic "Error: native sub-agent turn
-    failed" and the session's ``last_task_error`` stays empty.
+    its own. Its fallback must belong to the failed response, or (for older
+    forwarders without response ids) follow the latest user message. A failure
+    before any assistant output must not borrow an earlier turn's reply.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
@@ -2583,10 +2601,14 @@ async def _enrich_terminal_status_with_subagent_output(
     existing = data.get("output")
     if status == "failed" and isinstance(existing, str) and existing.strip():
         return data
+    raw_response_id = data.get("response_id") if status == "failed" else None
+    response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
         conversation_store,
         session_id,
+        response_id=response_id,
+        stop_at_user_message=status == "failed",
     )
     if output is None:
         return data
@@ -5791,7 +5813,7 @@ async def _record_create_route_prompt(
 # session list reports them as running so a booting session spins instead of
 # reading idle until the runner accepts the message. Process-local and
 # best-effort: with several replicas only the one handling the POST knows.
-_dispatch_in_flight: dict[str, int] = {}
+_dispatch_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 @contextlib.contextmanager
@@ -6913,10 +6935,22 @@ async def _relay_runner_stream_once(
                             # surfaces tokens). context_tokens/window ride on the
                             # same event so the ring updates live. Threaded: store
                             # reads + SSE fan-out.
+                            # One row read serves both the subtree sum and
+                            # the ancestor publish below (each would
+                            # otherwise re-derive the tree root itself).
+                            _usage_conv = await asyncio.to_thread(
+                                conversation_store.get_conversation,
+                                session_id,
+                            )
                             _subtree_usage = await asyncio.to_thread(
                                 load_session_usage,
                                 session_id,
                                 conversation_store,
+                                root_conversation_id=(
+                                    _usage_conv.root_conversation_id
+                                    if _usage_conv is not None
+                                    else None
+                                ),
                             )
                             _subtree_cost = _priced_cost_for_display(_subtree_usage)
                             _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -6956,6 +6990,7 @@ async def _relay_runner_stream_once(
                                         _publish_subtree_cost_to_ancestors,
                                         conversation_store,
                                         session_id,
+                                        _usage_conv,
                                     )
 
                     # Reset the turn-scoped response_id on any
@@ -9496,14 +9531,7 @@ async def _handle_mcp_tools_call(
             # Reject cross-session replay.
             return _mcp_error_response(rpc_id, -32000, "requestState session mismatch")
 
-        # ── Fail-closed: re-evaluate TOOL_CALL policy on retry ──────
-        # The original retry path trusted the caller-supplied
-        # requestState + inputResponses as proof that "policy ran and
-        # the user approved." Because requestState is unsigned JSON
-        # and inputResponses is caller-controlled, a forged retry
-        # could bypass DENY/ASK gates entirely. Re-evaluating the
-        # policy on every retry closes this vector: a DENY'd tool
-        # stays denied regardless of what the request body claims.
+        # Re-evaluate policy on every retry; approval cannot override a denial.
         retry_ctx = EvaluationContext(
             phase=Phase.TOOL_CALL,
             content={"name": namespaced_name, "arguments": arguments},
@@ -9531,36 +9559,36 @@ async def _handle_mcp_tools_call(
             )
 
         if retry_result.action == PolicyAction.ASK:
-            # Policy still requires approval — verify the elicitation
-            # was genuinely issued by the server (present in the
-            # server-side pending map) and that the user approved it.
+            # Policy still requires approval — verify the elicitation was
+            # genuinely issued by the server (present in the pending map) and
+            # that the user approved it.
             elicitation_id_from_state: str = state.get("elicitation_id", "")
             if elicitation_id_from_state not in _pending_policy_ask_writes:
-                # The elicitation_id is not in the server-side map.
-                # Either it was forged, already consumed, or expired.
-                # Check inputResponses: if the caller claims approval
-                # for an unrecognised elicitation, reject it.
                 approval: dict[str, Any] = input_responses.get(elicitation_id_from_state) or {}
                 if approval.get("action") == "accept":
-                    # Claimed approval for an elicitation the server
-                    # never issued or already consumed — reject.
                     return _mcp_error_response(
-                        rpc_id,
-                        -32000,
-                        "Elicitation not found or already resolved",
+                        rpc_id, -32000, "Elicitation not found or already resolved"
                     )
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
             approval = input_responses.get(elicitation_id_from_state) or {}
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
-            # Recover any policy-transformed args that were serialised into
-            # requestState on the initial ASK — the client re-sends the
-            # original arguments which we must not use when a transform was set.
-            if state.get("transformed_arguments") is not None:
-                arguments = state["transformed_arguments"]
-            # Apply the deciding policy's deferred writes now that the
-            # user approved (POLICIES.md §7.2: only on accept).
             _pending = _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
+            # Approval applies to the stored call and its reviewed transform.
+            # Older pending entries use the re-evaluated transform.
+            if _pending is not None and _pending.reviewed_arguments is not None:
+                if arguments != _pending.reviewed_arguments:
+                    return _mcp_error_response(
+                        rpc_id, -32000, "Retry arguments do not match the approved request"
+                    )
+                if _pending.transformed_arguments is not None:
+                    arguments = cast("dict[str, object]", _pending.transformed_arguments)
+                else:
+                    arguments = cast("dict[str, object]", _pending.reviewed_arguments)
+            elif retry_result.data is not None:
+                arguments = cast("dict[str, object]", retry_result.data)
+            # Apply the deciding policy's deferred writes now that the user
+            # approved (POLICIES.md §7.2: only on accept).
             if _pending is not None:
                 if _pending.set_labels:
                     await asyncio.to_thread(engine.apply_label_writes, _pending.set_labels)
@@ -9568,11 +9596,9 @@ async def _handle_mcp_tools_call(
                     with contextlib.suppress(ConversationNotFoundError):
                         await asyncio.to_thread(engine.apply_state_updates, _pending.state_updates)
         else:
-            # ALLOW — policy no longer requires approval (e.g. label
-            # state changed between the original ASK and this retry).
-            # Recover transformed args if present, then fall through.
-            if state.get("transformed_arguments") is not None:
-                arguments = state["transformed_arguments"]
+            # The current policy controls arguments when approval is no longer required.
+            if retry_result.data is not None:
+                arguments = cast("dict[str, object]", retry_result.data)
         # Fall through to execution.
     else:
         # ── First call: evaluate TOOL_CALL policy ────────────────────
@@ -9614,32 +9640,19 @@ async def _handle_mcp_tools_call(
                 json.dumps(arguments)[:1024],
                 conversation_store,
             )
-            # Defer the deciding policy's writes (label mutations AND
-            # state_updates such as a cost-budget checkpoint) to the
-            # approved retry path — POLICIES.md §7.2 lands them only on
-            # accept. The approval handler at the top of this function
-            # already applies both via ``apply_label_writes`` and
-            # ``apply_state_updates``. Mirrors the relay path pattern.
-            # Always store an entry even when there are no deferred
-            # writes — the retry path checks the pending map to verify
-            # the elicitation was genuinely issued by the server. A
-            # missing entry causes "Elicitation not found or already
-            # resolved" on the retry.
+            # Keep the reviewed call and deferred writes together until approval.
             _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
                 state_updates=call_result.state_updates,
                 set_labels=call_result.set_labels,
                 from_mcp=True,
+                reviewed_arguments=arguments,
+                transformed_arguments=cast("dict[str, object] | None", call_result.data),
             )
+            # The client carries identifiers; reviewed arguments stay on the server.
             request_state_payload: dict[str, Any] = {
                 "elicitation_id": elicitation_id,
                 "session_id": session_id,
             }
-            # If the policy returned transformed args alongside ASK (e.g.
-            # PII-redacted arguments), persist them so the retry path can
-            # apply them after the user approves — the client re-sends the
-            # original arguments, which would silently bypass the transform.
-            if call_result.data is not None:
-                request_state_payload["transformed_arguments"] = call_result.data
             request_state = json.dumps(request_state_payload)
             return _mcp_input_required_response(
                 rpc_id,
@@ -10273,8 +10286,15 @@ async def _get_session_snapshot(
     # displayed cost includes sub-agents — a codex/claude sub-agent's spend
     # is persisted on its own child conversation, not the parent's, so the
     # parent's own session_usage would under-report. Off the event loop
-    # because it pages the conversation tree from the store.
-    subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # because it pages the conversation tree from the store. The authorized
+    # row's root is passed so the tree root isn't re-derived with a second
+    # point read of the row this handler already holds.
+    subtree_usage = await asyncio.to_thread(
+        load_session_usage,
+        conv.id,
+        conv_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web
