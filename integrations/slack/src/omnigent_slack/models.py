@@ -89,6 +89,10 @@ class SessionRecord:
     host_id: str | None
     workspace: str | None
     host_type: HostType = "external"
+    # Whether a bot process had a live turn stream for this thread that never
+    # ended cleanly. Still True with no local stream = a restart/crash abandoned
+    # the turn, so a busy report for it is a promise nobody can keep.
+    turn_inflight: bool = False
 
 
 @dataclass(frozen=True, slots=True)
