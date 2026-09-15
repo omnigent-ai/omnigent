@@ -9809,6 +9809,9 @@ async def _notify_runner_of_bundled_child(
     if runner_client is None:
         return
     try:
+        # Bundled children keep the legacy id-only body: bundle creation plumbs
+        # no harness/model override for a session-init envelope to seed. The
+        # create and rebind notifies send the full envelope instead.
         await runner_client.post(
             "/v1/sessions",
             json={

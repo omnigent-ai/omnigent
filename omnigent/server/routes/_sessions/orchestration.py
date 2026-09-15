@@ -4524,6 +4524,11 @@ def _build_native_terminal_message_event(
         # which always includes it.
         "agent_id": conv.agent_id,
     }
+    # Carry the persisted override in-band like the non-native forwards: a
+    # runner whose session cache is cold (fresh process, missed init) must
+    # not resolve this turn from the spec and evict the override harness.
+    if conv.harness_override is not None and conv.harness_override != "auto":
+        event["harness_override"] = conv.harness_override
     # Ride the routed model in-band as ``model_override`` (extra field the
     # harness MessageEvent forwards into ExecutorConfig.model). The
     # claude-native executor applies the ``/model`` switch and the message
