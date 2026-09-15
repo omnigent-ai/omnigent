@@ -479,10 +479,6 @@ export interface Session {
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /** @deprecated Use the skills endpoint; removed in 0.15.0. */
-  skills?: SkillSummary[];
-  /** @deprecated Derive state from the skills request; removed in 0.15.0. */
-  skillsStatus?: SkillsStatus;
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
   /**

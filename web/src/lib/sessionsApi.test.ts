@@ -166,7 +166,6 @@ describe("createSession", () => {
       kind: "default",
       backgroundTaskCount: undefined,
       todos: [],
-      skills: [],
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,

@@ -885,12 +885,6 @@ export interface SessionTerminalActivityEvent {
   terminalId: string;
 }
 
-/** @deprecated No longer emitted or consumed; removed in 0.15.0. */
-export interface SessionSkillsEvent {
-  type: "session_skills";
-  conversationId: string;
-}
-
 /**
  * `session.model_options` — a runner-owned native model catalog just resolved.
  * Consumers refetch the session snapshot and apply its now-populated options.
@@ -1033,7 +1027,6 @@ export type StreamEvent =
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
-  | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent

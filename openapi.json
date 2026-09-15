@@ -4739,7 +4739,6 @@
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
-            "session.skills": "#/components/schemas/SessionSkillsEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
@@ -4793,9 +4792,6 @@
           },
           {
             "$ref": "#/components/schemas/SessionMcpStartupEvent"
-          },
-          {
-            "$ref": "#/components/schemas/SessionSkillsEvent"
           },
           {
             "$ref": "#/components/schemas/SessionModelOptionsEvent"
@@ -6843,28 +6839,6 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
-          "skills": {
-            "deprecated": true,
-            "description": "Deprecated; use GET /skills?session_id={id}. Removed in 0.15.0.",
-            "items": {
-              "$ref": "#/components/schemas/SkillSummary"
-            },
-            "title": "Skills",
-            "type": "array"
-          },
-          "skills_status": {
-            "default": "unavailable",
-            "deprecated": true,
-            "description": "Deprecated; removed in 0.15.0 with snapshot skills.",
-            "enum": [
-              "loading",
-              "ready",
-              "error",
-              "unavailable"
-            ],
-            "title": "Skills Status",
-            "type": "string"
-          },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
@@ -7065,39 +7039,6 @@
           "stage"
         ],
         "title": "SessionSandboxStatusEvent",
-        "type": "object"
-      },
-      "SessionSkillsEvent": {
-        "description": "Deprecated discovery nudge; no longer emitted. Removed in 0.15.0.",
-        "properties": {
-          "conversation_id": {
-            "title": "Conversation Id",
-            "type": "string"
-          },
-          "sequence_number": {
-            "anyOf": [
-              {
-                "format": "int64",
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Sequence Number"
-          },
-          "type": {
-            "const": "session.skills",
-            "title": "Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "type",
-          "conversation_id"
-        ],
-        "title": "SessionSkillsEvent",
         "type": "object"
       },
       "SessionStatusEvent": {
