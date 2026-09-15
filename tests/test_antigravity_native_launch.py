@@ -238,6 +238,21 @@ class TestBuildAgyLaunch:
         idx = argv.index("--model")
         assert argv[idx + 1] == "gemini-2.5-pro"
 
+    @pytest.mark.parametrize(
+        "model",
+        ("gemini-3.1-pro-high", "claude-sonnet-4-6", "gpt-oss-120b-medium"),
+        ids=("gemini", "claude", "gpt-oss"),
+    )
+    def test_model_flag_preserves_cross_vendor_catalog_id(self, fake_agy: str, model: str) -> None:
+        """Every native-catalog model reaches agy as one exact ``--model`` value."""
+        argv, _ = build_agy_launch(
+            conversation_id=None,
+            model=model,
+            resume=False,
+        )
+        assert argv.count("--model") == 1
+        assert argv[argv.index("--model") + 1] == model
+
     def test_model_flag_absent_when_none(self, fake_agy: str) -> None:
         """--model is NOT appended when model is None."""
         argv, _ = build_agy_launch(

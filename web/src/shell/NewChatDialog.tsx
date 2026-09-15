@@ -21,6 +21,10 @@ import {
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
+  antigravityModelGroupForModel,
+  antigravityModelGroups,
+} from "@/lib/antigravityNativeModels";
+import {
   codexCreateApprovalOptions,
   applyCodexApprovalSelection,
 } from "@/lib/codexApprovalOptions";
@@ -1273,6 +1277,7 @@ const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[]
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
+    nativeAgentHasCapability(agent, "launchModelPicker") ||
     nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
   );
 }
@@ -2422,6 +2427,11 @@ export function NewChatLandingScreen() {
     "pi-native",
     hostSelected,
   );
+  const {
+    data: hostAntigravityModelOptions,
+    isLoading: hostAntigravityModelsLoading,
+    error: hostAntigravityModelsError,
+  } = useHostModelOptions(selectedHostId, "antigravity-native", !sandboxSelected);
   // Only bridge this host's first fetch. Empty/error responses and host changes
   // must never inherit another catalog or keep retired choices alive.
   const cachedHostModels =
@@ -2442,6 +2452,11 @@ export function NewChatLandingScreen() {
   const availablePiModels =
     hostPiModelOptions ??
     (hostPiModelsLoading || selectedHostId === null ? cachedHostModels?.pi : undefined);
+  const availableAntigravityModels =
+    hostAntigravityModelOptions ??
+    (hostAntigravityModelsLoading || selectedHostId === null
+      ? cachedHostModels?.antigravity
+      : undefined);
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -2475,6 +2490,26 @@ export function NewChatLandingScreen() {
             source: option.source,
           })),
     [availablePiModels, sandboxSelected],
+  );
+  const antigravityModelOptions = useMemo(
+    () =>
+      sandboxSelected
+        ? []
+        : (availableAntigravityModels ?? []).map((option) => ({
+            id: option.id,
+            model: option.model,
+            displayName: nativeModelLabel(option),
+            isDefault: option.isDefault,
+            source: option.source,
+          })),
+    [availableAntigravityModels, sandboxSelected],
+  );
+  // agy advertises effort as part of some launch ids. Collapse only genuine
+  // sibling ids into a model plus effort UI; each choice still launches the
+  // exact id the CLI advertised.
+  const antigravityPickerGroups = useMemo(
+    () => antigravityModelGroups(antigravityModelOptions),
+    [antigravityModelOptions],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -3121,7 +3156,9 @@ export function NewChatLandingScreen() {
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
-  const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
+  const supportsModelPicker =
+    nativeAgentHasCapability(selectedAgent, "modelPicker") ||
+    nativeAgentHasCapability(selectedAgent, "launchModelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
@@ -3183,15 +3220,36 @@ export function NewChatLandingScreen() {
       return [{ label: "Permission mode", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsModelPicker && !supportsPermissionMode) {
+      const modelOptions =
+        selectedNativeHarness === "antigravity-native" ? antigravityModelOptions : piModelOptions;
+      const selectedAgyGroup =
+        selectedNativeHarness === "antigravity-native"
+          ? antigravityModelGroupForModel(antigravityPickerGroups, pickedModel)
+          : null;
       const modelValue =
-        piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
+        selectedAgyGroup?.displayName ??
+        modelOptions.find((model) => model.id === pickedModel)?.displayName ??
+        "Default";
       const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
+      const agyEffortValue = selectedAgyGroup?.efforts.find(
+        (effort) => effort.modelId === pickedModel,
+      )?.label;
       return [
         { label: "Model", value: modelValue },
         ...(selectedNativeHarness === "pi-native" && thinkingLevelValue
           ? [{ label: "Thinking level", value: thinkingLevelValue }]
           : []),
-        ...sourceRows(piModelOptions),
+        ...(agyEffortValue ? [{ label: "Effort", value: agyEffortValue }] : []),
+        ...(supportsAgySkipPermissions
+          ? [
+              {
+                label: "Permission mode",
+                value:
+                  AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode,
+              },
+            ]
+          : []),
+        ...sourceRows(modelOptions),
       ];
     }
     if (supportsPermissionMode) {
@@ -3292,6 +3350,8 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    antigravityModelOptions,
+    antigravityPickerGroups,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -3313,7 +3373,13 @@ export function NewChatLandingScreen() {
       ? piModelOptions
       : selectedNativeHarness === "codex-native"
         ? codexModelOptions
-        : [];
+        : selectedNativeHarness === "antigravity-native"
+          ? antigravityModelOptions
+          : [];
+  const selectedAntigravityPickerGroup = antigravityModelGroupForModel(
+    antigravityPickerGroups,
+    pickedModel,
+  );
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     !sandboxSelected &&
@@ -3324,13 +3390,17 @@ export function NewChatLandingScreen() {
         ? hostCodexModelsLoading
         : selectedNativeHarness === "pi-native"
           ? hostPiModelsLoading
-          : false);
+          : selectedNativeHarness === "antigravity-native"
+            ? hostAntigravityModelsLoading
+            : false);
   const pickerModelsError =
     selectedNativeHarness === "claude-native"
       ? hostClaudeModelsError
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
-        : null;
+        : selectedNativeHarness === "antigravity-native"
+          ? hostAntigravityModelsError
+          : null;
   const pickerDataLoading =
     agentsLoading ||
     (cachedPickerOptions !== null && (hostsLoading || info === "loading")) ||
@@ -3377,6 +3447,7 @@ export function NewChatLandingScreen() {
               claude: hostClaudeModelOptions ?? [],
               codex: hostCodexModelOptions ?? [],
               pi: hostPiModelOptions ?? [],
+              antigravity: hostAntigravityModelOptions ?? [],
             },
           }
         : null,
@@ -3389,6 +3460,7 @@ export function NewChatLandingScreen() {
       hostClaudeModelOptions,
       hostCodexModelOptions,
       hostPiModelOptions,
+      hostAntigravityModelOptions,
     ],
   );
   useEffect(() => {
@@ -3433,7 +3505,9 @@ export function NewChatLandingScreen() {
             codexModelOptions,
             pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
           ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-        : [];
+        : selectedNativeHarness === "antigravity-native"
+          ? (selectedAntigravityPickerGroup?.efforts ?? [])
+          : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({
@@ -3459,7 +3533,19 @@ export function NewChatLandingScreen() {
       rememberPickerOptions(selectedNativeHarness, { routing: "on", model: "", effort: "" });
       return;
     }
-    const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
+    const agyGroup =
+      selectedNativeHarness === "antigravity-native"
+        ? antigravityPickerGroups.find((group) => group.id === model)
+        : null;
+    const retainedAgyEffort = selectedAntigravityPickerGroup?.efforts.find(
+      (effort) => effort.modelId === pickedModel,
+    )?.value;
+    const picked =
+      model === MODEL_SELECT_DEFAULT
+        ? ""
+        : (agyGroup?.efforts.find((effort) => effort.value === retainedAgyEffort)?.modelId ??
+          agyGroup?.defaultModelId ??
+          model);
     const effort =
       selectedNativeHarness === "codex-native" &&
       !codexEffortLevelsForModel(
@@ -3467,7 +3553,9 @@ export function NewChatLandingScreen() {
         picked || codexModelOptions.find((option) => option.isDefault)?.id,
       ).includes(pickedEffort)
         ? ""
-        : pickedEffort;
+        : selectedNativeHarness === "antigravity-native"
+          ? (agyGroup?.efforts.find((candidate) => candidate.modelId === picked)?.value ?? "")
+          : pickedEffort;
     setPickedModel(picked);
     setPickedEffort(effort);
     setCostControlMode(null);
@@ -3475,6 +3563,20 @@ export function NewChatLandingScreen() {
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectedNativeHarness) return;
+    if (selectedNativeHarness === "antigravity-native") {
+      const selected = selectedAntigravityPickerGroup?.efforts.find(
+        (candidate) => candidate.value === effort,
+      );
+      if (selected === undefined) return;
+      userPickedModelRef.current = true;
+      setPickedModel(selected.modelId);
+      setPickedEffort(selected.value);
+      rememberPickerOptions(selectedNativeHarness, {
+        model: selected.modelId,
+        effort: selected.value,
+      });
+      return;
+    }
     setPickedEffort(effort);
     rememberPickerOptions(selectedNativeHarness, { effort });
   };
@@ -3540,7 +3642,10 @@ export function NewChatLandingScreen() {
                           },
                         ]
                       : []),
-                    ...pickerModelOptions
+                    ...(selectedNativeHarness === "antigravity-native"
+                      ? antigravityPickerGroups
+                      : pickerModelOptions
+                    )
                       .filter((option) =>
                         pickerModelSearch
                           .toLowerCase()
@@ -3555,10 +3660,16 @@ export function NewChatLandingScreen() {
                         label: visibleModelLabel(nativeModelLabel(option)),
                         checked:
                           !routingOn &&
-                          (pickedModel === option.id ||
+                          ((selectedNativeHarness === "antigravity-native" &&
+                            selectedAntigravityPickerGroup?.id === option.id) ||
+                            pickedModel === option.id ||
                             (pickedModel === "" && option.isDefault === true)),
                         onSelect: () =>
-                          selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+                          selectPickerModel(
+                            selectedNativeHarness !== "antigravity-native" && option.isDefault
+                              ? MODEL_SELECT_DEFAULT
+                              : option.id,
+                          ),
                         testId: `new-chat-landing-agent-model-${option.id}`,
                         title: nativeModelLabel(option),
                         className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
@@ -3616,14 +3727,24 @@ export function NewChatLandingScreen() {
             ? codexModelOptions
             : native.iconKind === "pi"
               ? piModelOptions
-              : [];
+              : native.iconKind === "antigravity"
+                ? antigravityModelOptions
+                : [];
       const model = catalog.find((option) => option.id === saved.model);
-      const label = visibleModelLabel(model ? nativeModelLabel(model) : defaultModelLabel(catalog));
+      const agyGroup =
+        native.iconKind === "antigravity"
+          ? antigravityModelGroupForModel(antigravityPickerGroups, saved.model)
+          : null;
+      const label = visibleModelLabel(
+        agyGroup?.displayName ?? (model ? nativeModelLabel(model) : defaultModelLabel(catalog)),
+      );
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
       const effort =
         native.iconKind === "codex"
           ? normalizeEffortLabel(saved.effort ?? "")
-          : efforts.find((option) => option.value === saved.effort)?.label;
+          : native.iconKind === "antigravity"
+            ? agyGroup?.efforts.find((candidate) => candidate.modelId === saved.model)?.label
+            : efforts.find((option) => option.value === saved.effort)?.label;
       return [agent.id, [compactModelTriggerLabel(label), effort].filter(Boolean).join(" ")];
     }),
   );
@@ -3708,7 +3829,9 @@ export function NewChatLandingScreen() {
         ? claudeModelOptions
         : selectedNativeHarness === "codex-native"
           ? codexModelOptions
-          : [];
+          : selectedNativeHarness === "antigravity-native"
+            ? antigravityModelOptions
+            : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -3765,6 +3888,21 @@ export function NewChatLandingScreen() {
         stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
           ? stored.effort
           : "",
+      );
+    }
+    if (selectedNativeHarness === "antigravity-native") {
+      // agy consumes the exact suffixed model id at launch. The effort UI is
+      // derived from that id, so no separate runner `reasoning_effort` exists.
+      const seededAgyModel =
+        projectSeed(antigravityModelOptions) ??
+        (stored.model != null && antigravityModelOptions.some((model) => model.id === stored.model)
+          ? stored.model
+          : "");
+      setPickedModel(seededAgyModel);
+      setPickedEffort(
+        antigravityModelGroupForModel(antigravityPickerGroups, seededAgyModel)?.efforts.find(
+          (effort) => effort.modelId === seededAgyModel,
+        )?.value ?? "",
       );
     }
     if (supportsPermissionMode) {
@@ -3840,6 +3978,8 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    antigravityModelOptions,
+    antigravityPickerGroups,
     projectDefaultModel,
   ]);
   // Smart Routing is remembered per harness alongside the mode/model
@@ -4859,7 +4999,9 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
-      const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
+      const agentSupportsModelPicker =
+        nativeAgentHasCapability(agent, "modelPicker") ||
+        nativeAgentHasCapability(agent, "launchModelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is

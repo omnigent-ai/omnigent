@@ -48,7 +48,13 @@ export type NativeCodingAgentIconKind =
   | "kimi"
   | "hermes";
 export type NativeCodingAgentCapability =
-  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
+  | "permissionMode"
+  | "approvalMode"
+  | "cursorMode"
+  | "skipPermissions"
+  | "modelPicker"
+  /** Model selection applies only before the native terminal starts. */
+  | "launchModelPicker";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -149,11 +155,8 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 50,
   },
   {
-    // Antigravity's native CLI (Gemini-family). Mirrors the server's
-    // canonical `antigravity-native` harness and the `antigravity-native-ui`
-    // wrapper the runner keys off to boot the terminal. Added ALONGSIDE the
-    // upstream in-process `antigravity` SDK harness (see BRAIN_HARNESS_LABELS
-    // in agentLabels.ts) — they are distinct rows.
+    // The native terminal wrapper is distinct from the in-process SDK row
+    // in BRAIN_HARNESS_LABELS (agentLabels.ts).
     key: "antigravity",
     agentName: "antigravity-native-ui",
     harness: "antigravity-native",
@@ -162,10 +165,9 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,
-    // agy's only pre-emptive control is the all-or-nothing
-    // `--dangerously-skip-permissions`, so it gets a two-value toggle rather
-    // than Claude's graded permissionMode selector.
-    capabilities: ["skipPermissions"],
+    // agy supports a launch-only model choice and skip-permissions bypass;
+    // `modelPicker` would expose ChatPage's unsafe live switch.
+    capabilities: ["skipPermissions", "launchModelPicker"],
   },
   {
     key: "goose",

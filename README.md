@@ -421,7 +421,18 @@ works with four kinds of credentials:
 | 🧱 | **Databricks** | A Databricks workspace profile (requires the `databricks` extra) |
 
 Defaults are per agent, so a Claude default and a Codex default coexist. You
-can also switch models in the middle of a session with the `/model` command.
+can also switch models in the middle of a session with the `/model` command
+where the harness supports it.
+
+For a new native Antigravity task in the web or desktop UI, open Antigravity's
+**Edit** control in the agent picker and choose a **Model** before starting.
+Choices come from `agy models` on the selected host; **Harness default** sends no
+model override and lets agy choose. When the catalog advertises two or more Gemini
+siblings ending in `-low`, `-medium`, or `-high`, the **Effort** picker selects an
+exact advertised model ID; it does not send a separate `reasoning_effort` value.
+Other models remain standalone choices. Omnigent does not offer an active-session
+model switch for this harness. For delegated workers, see
+[native Antigravity model selection](docs/AGENT_YAML_SPEC.md#native-antigravity).
 
 <details>
 <summary>Gateway base URLs (OpenRouter, Ollama)</summary>

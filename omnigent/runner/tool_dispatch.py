@@ -27,6 +27,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
@@ -1683,6 +1684,9 @@ async def _inherited_parent_model(
     - a parent model outside the child harness's family (e.g. a Claude
       selection dispatched to a codex worker) is not forced across vendors.
 
+    Native CLI compatibility can be narrower than model-family compatibility;
+    see the native Antigravity contract in ``docs/AGENT_YAML_SPEC.md``.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
     :param sub_agent_name: Name of the sub-agent being dispatched.
@@ -1725,6 +1729,15 @@ async def _inherited_parent_model(
             extra={"session_id": runner_primary_session_id()},
         )
         return None
+    if canonicalize_harness(child_harness) == "antigravity-native":
+        from omnigent.harnesses.antigravity_native.models import list_agy_cli_model_options
+
+        try:
+            options = await asyncio.to_thread(list_agy_cli_model_options)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if not any(option["id"] == parent_model for option in options):
+            return None
     return parent_model
 
 
@@ -2185,6 +2198,10 @@ def _normalize_subagent_model(
     # resolve_model_provider is total — undeterminable providers come
     # back as kind "none", which normalize passes through.
     provider = resolve_model_provider(sub_spec, harness)
+    # Preserve the native CLI catalog's ids instead of applying gateway
+    # spelling rules before agy sees them at terminal creation.
+    if provider.cli == "agy":
+        return model
     normalized = normalize_model_for_provider(model, provider.kind)
     if normalized != model:
         _logger.info(

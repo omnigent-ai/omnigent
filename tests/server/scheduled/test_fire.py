@@ -18,7 +18,6 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -810,20 +809,25 @@ async def test_on_fire_returns_before_launch_completes() -> None:
     """on_fire must return fast so the scheduler timer re-arms immediately."""
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
     release = asyncio.Event()
+    launch_started = asyncio.Event()
+    launch_completed = asyncio.Event()
 
     async def _slow_launch(conv: Any, task: Any) -> None:
+        launch_started.set()
         await release.wait()
+        launch_completed.set()
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_slow_launch)
 
-    t0 = time.monotonic()
-    await on_fire(0, "task_1")
-    elapsed = time.monotonic() - t0
-
-    # Returned without waiting on the (still-blocked) launch.
-    assert elapsed < 0.5
-    release.set()
-    await _drain()
+    try:
+        # The timeout is a deadlock guard. The assertion below, rather than a
+        # wall-clock threshold, proves that the callback did not await launch.
+        await asyncio.wait_for(on_fire(0, "task_1"), timeout=5)
+        await asyncio.wait_for(launch_started.wait(), timeout=5)
+        assert not launch_completed.is_set()
+    finally:
+        release.set()
+        await _drain()
 
 
 @pytest.mark.asyncio

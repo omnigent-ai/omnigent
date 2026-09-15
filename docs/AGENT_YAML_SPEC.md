@@ -92,10 +92,11 @@ TUI/flag actions. See `kiro-native-elicitation.md`.
 
 `harness: antigravity` runs the agent through Google's
 [Antigravity SDK](https://pypi.org/project/google-antigravity/)
-(`pip install "omnigent[antigravity]"`). It defaults to **Gemini 3.5 Flash**
-and can also drive Claude / GPT-OSS. Authenticate with an Antigravity /
-Gemini API key, or Vertex AI (`project` / `location`) — the SDK is
-Gemini-native and has no OpenAI-compatible gateway / Databricks path.
+(`pip install "omnigent[antigravity]"`). Omitting `model` leaves the installed
+SDK's default in effect. This harness is Gemini-restricted; Claude / GPT-OSS
+selection belongs to the [native harness](#native-antigravity). Authenticate
+with an Antigravity / Gemini API key, or Vertex AI (`project` / `location`) —
+the SDK has no OpenAI-compatible gateway / Databricks path.
 
 ```yaml
 executor:
@@ -105,6 +106,24 @@ executor:
     type: api_key
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
+
+### Native Antigravity
+
+`harness: antigravity-native` wraps the installed `agy` CLI. For the new-task
+picker, see [Choose & switch models](../README.md#3-choose--switch-models).
+
+For delegated workers, `sys_list_models` discovers the CLI's catalog and reports
+successful listings as `source: cli`, `verified: true`. Discovery failures return
+an unverified empty list and can be retried; Omnigent supplies no fallback model
+choices. Use an advertised ID in `sys_session_send`'s `args.model` to select a
+model when creating a worker. Explicit IDs are preserved through `model_override`
+to `agy --model`, without gateway spelling conversions or inferred reasoning
+effort.
+
+When `args.model` is omitted and the worker spec has no pinned `executor.model`,
+the worker inherits the parent's model only if that exact ID appears in a fresh
+native CLI catalog. An absent ID or discovery failure leaves the worker default
+in effect. Gateway IDs are not translated into native IDs for inheritance.
 
 ### GitHub Copilot
 

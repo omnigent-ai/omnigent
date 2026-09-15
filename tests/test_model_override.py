@@ -179,6 +179,11 @@ class TestModelFamilyMismatch:
             ("antigravity", "gemini-2.5-pro"),
             ("kiro-native", "claude-sonnet-4.5"),
             ("native-kiro", "gpt-5.4-mini"),
+            ("antigravity-native", "gemini-3.1-pro-high"),
+            ("antigravity-native", "claude-sonnet-4-6"),
+            ("native-antigravity", "gpt-oss-120b-medium"),
+            ("agy-native", "claude-opus-4-6-thinking"),
+            ("native-agy", "gpt-oss-120b-medium"),
         ],
     )
     def test_compatible_pairs_pass(self, harness: str, model: str) -> None:

@@ -61,6 +61,10 @@ const options: NewChatPickerOptions = {
       },
     ],
     pi: [],
+    antigravity: [
+      { id: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)" },
+      { id: "gemini-3.8-flash-low", displayName: "Gemini 3.8 Flash (Low)" },
+    ],
   },
 };
 let key: string;
@@ -121,6 +125,7 @@ describe("newChatPickerCache", () => {
         codex: [{ id: "coding-model", supportedReasoningEfforts: ["high"] }],
       },
     },
+    { ...options, models: { ...options.models, antigravity: [{ id: 42 }] } },
   ])("ignores malformed menu data", (invalidOptions) => {
     writeNewChatPickerOptionsCache(key, options);
     const record = JSON.parse(localStorage.getItem(`${key}:options`)!);

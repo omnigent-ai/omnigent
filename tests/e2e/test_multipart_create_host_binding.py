@@ -48,6 +48,23 @@ def _stop_daemon(proc: subprocess.Popen[bytes]) -> None:
         proc.wait()
 
 
+def _wait_for_host_tunnel(
+    client: httpx.Client,
+    host_id: str,
+    timeout: float = 30.0,
+) -> None:
+    """Wait until this server has the host's in-memory tunnel registration."""
+    deadline = time.monotonic() + timeout
+    response: httpx.Response | None = None
+    while time.monotonic() < deadline:
+        response = client.get(f"/v1/hosts/{host_id}")
+        if response.status_code == 200 and response.json().get("interactive_shells") is not None:
+            return
+        time.sleep(POLL_INTERVAL_S)
+    detail = response.text if response is not None else "no response"
+    raise AssertionError(f"Host {host_id!r} did not register its local tunnel: {detail}")
+
+
 def test_multipart_create_binds_host_and_launches_runner(
     live_server: str,
     http_client: httpx.Client,
@@ -78,6 +95,7 @@ def test_multipart_create_binds_host_and_launches_runner(
     )
     try:
         _wait_for_host_online(http_client, daemon.host_id, timeout=30.0)
+        _wait_for_host_tunnel(http_client, daemon.host_id, timeout=30.0)
 
         workspace = tmp_path / "ws"
         workspace.mkdir()

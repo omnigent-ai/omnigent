@@ -180,7 +180,7 @@ drift alarm.
 | `SUPPORTED` | ✓ | probe ran, behavior confirmed |
 | `UNSUPPORTED` | ✗ | probe ran, capability absent (and expected absent) |
 | `PARTIAL` | ~ | works with caveats (e.g. "TUI-only", "hook-DENY only") |
-| `NOT_APPLICABLE` | — | dimension does not apply (e.g. model override on agy self-select) |
+| `NOT_APPLICABLE` | — | dimension does not apply |
 | `UNKNOWN` | ? | never probed / no probe written yet |
 | `SKIPPED` | | CLI / creds / transport unavailable in this environment |
 | `DRIFT` | !! | observed verdict disagrees with the declared flag / manifest |

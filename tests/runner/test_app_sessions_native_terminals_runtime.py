@@ -1927,6 +1927,7 @@ async def _run_antigravity_auto_create(
 
     monkeypatch.setattr(launch_mod, "build_agy_launch", _fake_build_agy_launch)
     monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    monkeypatch.setattr(bridge_mod, "seed_isolated_agy_home", lambda *_args, **_kwargs: {})
     # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
     # ``supervise_reader`` at its definition module (the helper imports it lazily)
     # so the test does not start a real one. The reader is wrapped in
@@ -2123,6 +2124,31 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     # Bypass must come only from the pass-through args on this attended path.
     assert call["permission_mode"] is None
     assert call["headless"] is False
+
+
+@pytest.mark.parametrize(
+    "model",
+    ("gemini-3.1-pro-high", "claude-sonnet-4-6", "gpt-oss-120b-medium"),
+    ids=("gemini", "claude", "gpt-oss"),
+)
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_forwards_catalog_model_to_agy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    """The runner passes each selected native-catalog model to agy's launcher."""
+    launch_calls: list[dict[str, Any]] = []
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=f"82b5f9222c7ac0f45ba2736b57b51f{model[-2:]}",
+        snapshot={"model_override": model},
+        candidate_ports=[52549],
+        build_agy_launch_calls=launch_calls,
+    )
+    assert len(launch_calls) == 1
+    assert launch_calls[0]["model"] == model
 
 
 @pytest.mark.asyncio
@@ -2661,6 +2687,7 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
     from omnigent.runner import app as runner_app_mod
 
     session_id = "b68c3f1da613f48fb4126e965ab594a3"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -2842,6 +2869,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     from omnigent.runner import app as runner_app_mod
 
     session_id = "1fd85439049bbfc88cbf04221bad5079"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -2984,6 +3012,7 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     from omnigent.runner import app as runner_app_mod
 
     session_id = "976793baf55bcdf96830aa376e394f80"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))

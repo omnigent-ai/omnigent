@@ -73,6 +73,13 @@ def test_model_family_matches_model_override_sets() -> None:
             assert family is ModelFamily.MULTI, harness
 
 
+def test_antigravity_native_declares_multi_model_catalog() -> None:
+    """The native agy CLI can launch every model its own catalog advertises."""
+    capability = harness_capabilities()["antigravity-native"]
+    assert capability.model_family is ModelFamily.MULTI
+    assert capability.as_dict()["model_family"] == "multi"
+
+
 def test_subagents_matches_its_implementing_mechanism() -> None:
     """``subagents`` is derivable — from the two mechanisms that implement it.
 

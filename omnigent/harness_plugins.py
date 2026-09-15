@@ -422,7 +422,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _EL.NONE,
         _RS.WARM_REATTACH,
         _EF.GEMINI,
-        _MF.GEMINI,
+        _MF.MULTI,
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,

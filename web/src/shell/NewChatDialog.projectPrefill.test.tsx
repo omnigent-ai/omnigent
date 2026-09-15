@@ -839,6 +839,63 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.model_override).toBe("sonnet");
   });
 
+  it("preserves an explicit Antigravity effort over the project default after catalog refresh", async () => {
+    const agentId = "ag_antigravity";
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent({
+          id: agentId,
+          name: "antigravity-native-ui",
+          display_name: "Antigravity",
+          harness: "antigravity-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    let catalog = {
+      data: [
+        { id: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)" },
+        { id: "gemini-3.8-flash-low", displayName: "Gemini 3.8 Flash (Low)" },
+      ],
+    };
+    const emptyCatalog = { data: [] };
+    vi.mocked(useHostModelOptions).mockImplementation(
+      (_hostId, harness) =>
+        (harness === "antigravity-native" ? catalog : emptyCatalog) as ReturnType<
+          typeof useHostModelOptions
+        >,
+    );
+    setProjectConfig({
+      host_id: "host_1",
+      agent_id: agentId,
+      model: "gemini-3.8-flash-high",
+    });
+    const { rerender } = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Antigravity/,
+      ),
+    );
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+    expect(screen.getByRole("menuitemcheckbox", { name: "High", checked: true })).toBeVisible();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Low" }));
+    expect(screen.getByRole("menuitemcheckbox", { name: "Low", checked: true })).toBeVisible();
+
+    catalog = {
+      data: [...catalog.data, { id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6" }],
+    };
+    rerender(<NewChatLandingScreen />);
+    expect(screen.getByRole("menuitemcheckbox", { name: "Claude Sonnet 4.6" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Low", checked: true })).toBeVisible();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("gemini-3.8-flash-low");
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("lets the project default win over a landing draft that restored Smart Routing on", async () => {
     // Cross-review edge (OMNI-5841 Polly note #1): a parked landing draft can
     // restore costControlMode="on". On the remount, the project default must

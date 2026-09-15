@@ -3504,12 +3504,6 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
     ("native_name", "mode", "mode_label", "launch_args"),
     [
         ("cursor", "plan", "Plan", ["--mode", "plan"]),
-        (
-            "antigravity",
-            "skip",
-            "Skip permissions",
-            ["--dangerously-skip-permissions"],
-        ),
     ],
 )
 def test_start_session_native_permissions_without_empty_edit(

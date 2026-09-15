@@ -66,6 +66,7 @@ const pickerOptionsSchema = z.object({
     claude: z.array(modelOptionSchema),
     codex: z.array(modelOptionSchema),
     pi: z.array(modelOptionSchema),
+    antigravity: z.array(modelOptionSchema).optional(),
   }),
 });
 
