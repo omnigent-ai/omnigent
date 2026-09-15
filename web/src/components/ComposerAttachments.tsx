@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useState } from "react";
 import { FileTextIcon, XIcon } from "lucide-react";
 
 import { attachmentKey } from "@/lib/attachments";
@@ -30,18 +30,20 @@ export function ComposerAttachments({
   );
 }
 
-/** Blob URL for an image preview, revoked on change/unmount so it doesn't leak.
- *  Guarded: jsdom (tests) doesn't implement createObjectURL. */
+/** Blob URL for an image preview, created and revoked inside one effect so the
+ *  URL the committed <img> points at is never revoked early (StrictMode double
+ *  mount) and never leaks. Guarded: jsdom (tests) lacks createObjectURL. */
 function useObjectUrl(file: File | null): string | undefined {
-  const url = useMemo(() => {
-    if (!file || typeof URL.createObjectURL !== "function") return undefined;
-    return URL.createObjectURL(file);
-  }, [file]);
+  const [url, setUrl] = useState<string>();
   useEffect(() => {
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [url]);
+    if (!file || typeof URL.createObjectURL !== "function") {
+      setUrl(undefined);
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file]);
   return url;
 }
 
@@ -85,7 +87,12 @@ function RemoveButton({
   className?: string;
 }) {
   return (
-    <button type="button" onClick={onRemove} aria-label={`Remove ${name}`} className={className}>
+    <button
+      type="button"
+      onClick={onRemove}
+      aria-label={`Remove ${name}`}
+      className={cn("cursor-pointer", className)}
+    >
       <XIcon className="size-3" />
     </button>
   );
