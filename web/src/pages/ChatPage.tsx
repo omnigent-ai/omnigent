@@ -101,6 +101,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
@@ -847,6 +848,7 @@ export function ChatPage() {
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  const sessionModelOverrideForEffort = useChatStore((s) => s.sessionModelOverride);
   // Pre-catalog fallback: a fresh native session's own catalog only arrives
   // once its CLI is up (codex answers model/list after app-server boot,
   // ~15s cold), which left the gear's Model list sparse and its Effort row
@@ -864,7 +866,9 @@ export function ChatPage() {
       ? "codex-native"
       : fallbackPickerKind === "claude"
         ? "claude-native"
-        : null;
+        : fallbackPickerKind === "devin"
+          ? "devin-native"
+          : null;
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
@@ -1007,7 +1011,11 @@ export function ChatPage() {
   // stable identity across the switch's re-render burst.
   const capabilitySource = useMemo(() => {
     if (activeSession)
-      return { labels: activeSession.labels ?? {}, harness: activeSession.harness };
+      return {
+        labels: activeSession.labels ?? {},
+        harness: activeSession.harness,
+        parentSessionId: activeSession.parentSessionId ?? null,
+      };
     // Keep the seeded native identity through the temp-to-real ID handoff,
     // until the session snapshot can supply its wrapper label and harness.
     if (
@@ -1015,12 +1023,16 @@ export function ChatPage() {
       (composerSessionModelSeeded && activeConversationId === urlConvId)
     ) {
       const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
+      const seededLabels: Record<string, string | null> = nativeAgent
+        ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel }
+        : {};
       return {
-        labels: nativeAgent ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel } : {},
+        labels: seededLabels,
         harness: composerSessionHarness,
+        parentSessionId: null,
       };
     }
-    return { labels: activeConv?.labels ?? {}, harness: null };
+    return { labels: activeConv?.labels ?? {}, harness: null, parentSessionId: null };
   }, [
     activeSession,
     activeConv,
@@ -1030,15 +1042,23 @@ export function ChatPage() {
     activeConversationId,
   ]);
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
-  // Effort ladders key on the model the session is actually on — the
-  // reported `llmModel` — falling back to the sticky preference only
-  // before the first report lands. Memoized because codex-native resolves
-  // via codexEffortLevelsForModel, which returns a fresh array each call;
-  // a new identity here would defeat the memo() on MainAgentSurface/Composer
-  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  // Effort ladders key on the model the session is actually on — the reported
+  // `llmModel` — then the session's pinned `model_override`, and only then the
+  // sticky preference. The override matters for a harness that never reports a
+  // concrete model (devin pins the family there): without it the lookup finds no
+  // catalog row and a per-model ladder comes back empty, hiding the picker.
+  // Memoized because codex-native resolves via codexEffortLevelsForModel, which
+  // returns a fresh array each call; a new identity here would defeat the memo()
+  // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
+  // codexModelOptions rationale).
   const effortLevels = useMemo(
-    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
-    [capabilitySource, codexModelOptions, llmModel, selectedModel],
+    () =>
+      effortLevelsForConv(
+        capabilitySource,
+        codexModelOptions,
+        llmModel ?? sessionModelOverrideForEffort ?? selectedModel,
+      ),
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -1107,7 +1127,7 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
@@ -2108,6 +2128,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "cursor") return "Cursor";
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
+  if (modelPickerKind === "devin") return "Devin";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -2486,11 +2507,19 @@ function ComposerImpl(
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
   const openComposerGithubTab = useOpenGithubTab();
+  // Devin shares this control but not Claude's vocabulary: its rungs are
+  // normal / accept-edits / smart / dangerous, cycled in the TUI.
+  const devinPermissionControl = modelPickerKind === "devin";
   const permissionOptions = showClaudePermissionMode
-    ? CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+    ? devinPermissionControl
+      ? DEVIN_NATIVE_PERMISSION_MODES
+      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
   const permissionLabel = showClaudePermissionMode
-    ? claudePermissionModeLabel(claudePermissionMode)
+    ? devinPermissionControl
+      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+        claudePermissionMode)
+      : claudePermissionModeLabel(claudePermissionMode)
     : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
     if (isReadOnly || unreachable || configBusyRef.current) return;
@@ -4058,7 +4087,7 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4099,30 +4128,63 @@ export function readOnlyReasonForSessionLabels(
  * mid-session overrides — keeps the label authoritative and skips the
  * fallback.
  */
-function isLabelLessCodexNative(
+/**
+ * The wrapper label a session behaves as: its own, else the one its harness
+ * implies.
+ *
+ * A session created before its harness was renamed carries no
+ * ``omnigent.wrapper`` label — the ACP-era Devin rows are the live example — so
+ * every label-driven surface below (model picker, effort ladder, permission mode)
+ * would read it as non-native even though the runner resolves it to a native
+ * harness and gives it a pane. Deriving from the harness fixes that for any
+ * rename, and subsumes the codex-only special case this replaces.
+ *
+ * A sub-agent child is excluded: it owns no PTY and takes no input, so it must
+ * not gain a picker just because its harness is native.
+ */
+function effectiveWrapperLabel(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
-): boolean {
-  return conv?.labels?.["omnigent.wrapper"] == null && conv?.harness === "codex-native";
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
+): string | undefined {
+  const label = conv?.labels?.["omnigent.wrapper"];
+  if (label != null) return label;
+  if (conv?.parentSessionId != null) return undefined;
+  return nativeCodingAgentForHarness(conv?.harness)?.wrapperLabel;
 }
 
 export function effortLevelsForConv(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
-  switch (conv?.labels?.["omnigent.wrapper"]) {
+  switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
+    case "devin-native-ui":
+      // Devin encodes effort as a model-variant suffix, and the rung set is
+      // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a different
+      // Fusion model), so derive it from the selected model's catalog entry —
+      // its `supportedReasoningEfforts` — rather than a fixed ladder.
+      return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return isLabelLessCodexNative(conv)
-        ? codexEffortLevelsForModel(codexModelOptions, currentModel)
-        : EFFORT_LEVELS;
+      return EFFORT_LEVELS;
   }
 }
 
@@ -4135,9 +4197,15 @@ export function effortLevelsForConv(
  */
 export function modelPickerKindForConv(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
 ): NativeModelPickerKind | null {
-  switch (conv?.labels?.["omnigent.wrapper"]) {
+  switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
@@ -4154,6 +4222,10 @@ export function modelPickerKindForConv(
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "devin-native-ui":
+      // Like opencode/pi: Devin mirrors its live model into ``model_override``
+      // (the executor types ``/model`` when a routed model changes).
+      return "devin";
     case "pi-native-ui":
       // Like cursor: the runner types a model switch into the live Pi process
       // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
@@ -4161,7 +4233,7 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
-      return isLabelLessCodexNative(conv) ? "codex" : null;
+      return null;
   }
 }
 
@@ -4202,10 +4274,12 @@ export function shouldShowCodexPlanModeControl(
  *     or missing labels fails closed.
  * :returns: True only for sessions running the claude-native wrapper.
  */
-export function shouldShowClaudePermissionModeControl(
+export function shouldShowPermissionModeControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return isClaudeNativeSession(conv);
+  // Devin cycles its own rungs with Shift+Tab, which the runner drives, so it
+  // gets the same control — with its own vocabulary (see `permissionOptions`).
+  return isClaudeNativeSession(conv) || modelPickerKindForConv(conv) === "devin";
 }
 
 /**
@@ -4718,7 +4792,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
-    modelPickerKind === "opencode";
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "devin";
   const modelOptions: readonly {
     id: string;
     model?: string;
@@ -4768,7 +4843,7 @@ function useResolvedComposerModel(
     : nativeVendorOwnsModel
       ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
         ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi"
+        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker

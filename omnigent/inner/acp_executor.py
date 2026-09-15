@@ -367,7 +367,7 @@ class AcpExecutor(Executor):
             sandbox (bwrap/seatbelt) at spawn — see :meth:`_sandbox_launch_path`.
         :param extension: Vendor behavior for the agent being driven, injected by
             that vendor's harness wrap (e.g.
-            :mod:`omnigent.inner.devin.harness`). The default is protocol-only,
+            a vendor wrap). The default is protocol-only,
             so the generic ``acp`` harness reads no vendor field.
         """
         self._config = config

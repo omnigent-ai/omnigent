@@ -294,6 +294,7 @@ for _builder_name in (
     "_auto_create_claude_terminal",
     "_auto_create_codex_terminal",
     "_auto_create_cursor_terminal",
+    "_auto_create_devin_terminal",
     "_auto_create_goose_terminal",
     "_auto_create_hermes_terminal",
     "_auto_create_kimi_terminal",
@@ -2705,6 +2706,32 @@ class _BodyRequest:
         return self._body
 
 
+def _require_full_native_lock_coverage(
+    dispatch: dict[str, dict[str, asyncio.Lock]],
+) -> dict[str, dict[str, asyncio.Lock]]:
+    """Fail fast if the native terminal lock dispatch is missing a harness.
+
+    The launch and ensure paths index this map by ``agent.key``; a native
+    harness absent from it raises ``KeyError`` mid terminal-ensure and surfaces
+    to the user as a "malformed runner response (HTTP 500)". Asserting coverage
+    at app construction catches a newly-added native harness that was not wired
+    here immediately, rather than only when someone starts that harness.
+
+    Scoped to the BUILT-IN native providers, not the merged registry: a
+    community-contributed native harness wires its own launcher and must not be
+    forced into this built-in dispatch (that would turn a localized per-launch
+    failure into the whole runner failing to construct).
+    """
+    from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
+
+    missing = {provider.key for provider in _BUILTIN_NATIVE_PROVIDERS} - set(dispatch)
+    if missing:
+        raise RuntimeError(
+            f"native terminal lock dispatch is missing built-in harness(es): {sorted(missing)}"
+        )
+    return dispatch
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -2919,6 +2946,7 @@ def create_runner_app(
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
@@ -3984,19 +4012,22 @@ def create_runner_app(
             # (claude/codex/antigravity) add a pre_launch check and, for
             # claude/codex, a build_context enrichment. All wire the comment
             # relay (pi/opencode route their policy hook through it).
-            _launch_locks = {
-                "claude": _claude_terminal_ensure_locks,
-                "codex": _codex_terminal_ensure_locks,
-                "pi": _pi_terminal_ensure_locks,
-                "cursor": _cursor_terminal_ensure_locks,
-                "kiro": _kiro_terminal_ensure_locks,
-                "antigravity": _antigravity_terminal_ensure_locks,
-                "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
-                "hermes": _hermes_terminal_ensure_locks,
-                "qwen": _qwen_terminal_ensure_locks,
-                "kimi": _kimi_terminal_ensure_locks,
-            }[_native_agent.key]
+            _launch_locks = _require_full_native_lock_coverage(
+                {
+                    "claude": _claude_terminal_ensure_locks,
+                    "codex": _codex_terminal_ensure_locks,
+                    "pi": _pi_terminal_ensure_locks,
+                    "cursor": _cursor_terminal_ensure_locks,
+                    "kiro": _kiro_terminal_ensure_locks,
+                    "antigravity": _antigravity_terminal_ensure_locks,
+                    "opencode": _opencode_terminal_ensure_locks,
+                    "goose": _goose_terminal_ensure_locks,
+                    "hermes": _hermes_terminal_ensure_locks,
+                    "qwen": _qwen_terminal_ensure_locks,
+                    "kimi": _kimi_terminal_ensure_locks,
+                    "devin": _devin_terminal_ensure_locks,
+                }
+            )[_native_agent.key]
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -4187,7 +4218,12 @@ def create_runner_app(
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
-            elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
+            elif harness_name in (
+                "cursor-native",
+                "opencode-native",
+                "kimi-native",
+                "devin-native",
+            ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
                 )
@@ -6095,6 +6131,140 @@ def create_runner_app(
                 },
             )
         return Response(status_code=204)
+
+    async def _handle_devin_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        # Devin has no separate effort flag — effort is a suffix on the model id.
+        # Compose the picked family with the session's remembered effort so a
+        # New-Chat (model, effort) pick lands on the same variant the launch path
+        # composes (compose is idempotent for an already-composed id).
+        composed = await asyncio.to_thread(
+            resolve_devin_launch_model,
+            model.strip(),
+            _session_reasoning_effort.get(conv_id),
+        )
+        if not composed:
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=composed,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
+    async def _handle_devin_native_permission_mode_change(
+        conv_id: str,
+        mode: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_permission_mode,
+        )
+
+        if mode is None or not mode.strip():
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            settled = await asyncio.to_thread(
+                inject_permission_mode,
+                bridge_dir,
+                mode=mode.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_permission_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="devin-native permission mode change"
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"permission_mode": settled})
+
+    async def _handle_devin_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+
+        # Devin has no `/effort`: effort is a suffix on the model id, so an effort
+        # switch is a `/model <family+effort>` re-inject. Re-compose the session's
+        # pinned model with the new effort. With no pinned model there is nothing
+        # to re-inject now — the executor still composes it on the next turn.
+        model = await _fetch_session_model_override(conv_id)
+        if not model or not model.strip():
+            return Response(status_code=204)
+        composed = await asyncio.to_thread(resolve_devin_launch_model, model.strip(), effort)
+        if not composed:
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=composed,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_effort_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native effort change"),
+                },
+            )
+        return Response(status_code=204)
+
+    async def _handle_devin_native_compact(conv_id: str) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_slash_command,
+        )
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_slash_command,
+                bridge_dir,
+                command="/compact",
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native compact"),
+                },
+            )
+        return Response(status_code=200)
 
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
@@ -9141,7 +9311,7 @@ def create_runner_app(
                 _session_reasoning_effort[conversation_id] = effort
             else:
                 _session_reasoning_effort.pop(conversation_id, None)
-            if harness in ("claude-native", "codex-native", "pi-native"):
+            if harness in ("claude-native", "codex-native", "pi-native", "devin-native"):
                 if harness == "codex-native":
                     return await _handle_codex_native_settings_update(
                         conversation_id,
@@ -9149,6 +9319,11 @@ def create_runner_app(
                     )
                 if harness == "pi-native":
                     return await _handle_pi_native_effort_change(
+                        conversation_id,
+                        effort,
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_effort_change(
                         conversation_id,
                         effort,
                     )
@@ -9166,6 +9341,7 @@ def create_runner_app(
                 "cursor-native",
                 "opencode-native",
                 "kiro-native",
+                "devin-native",
                 "pi-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
@@ -9196,6 +9372,11 @@ def create_runner_app(
                     )
                 if harness == "kiro-native":
                     return await _handle_kiro_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -9230,7 +9411,7 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
-            if harness == "claude-native":
+            if harness in ("claude-native", "devin-native"):
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if mode is not None and not isinstance(mode, str):
                     return JSONResponse(
@@ -9239,6 +9420,11 @@ def create_runner_app(
                             "error": "invalid_input",
                             "detail": "Body 'permission_mode' must be a string or null",
                         },
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_permission_mode_change(
+                        conversation_id,
+                        mode,
                     )
                 return await _handle_claude_native_permission_mode_change(
                     conversation_id,
@@ -9294,6 +9480,8 @@ def create_runner_app(
                 return await _handle_hermes_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "qwen-native":
                 return await _handle_qwen_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "devin-native":
+                return await _handle_devin_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "claude-sdk":
                 return await _handle_claude_sdk_compact(conversation_id)
             return Response(status_code=204)
@@ -9623,19 +9811,22 @@ def create_runner_app(
             # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
             # via build_context; codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
-            _ensure_locks = {
-                "claude": _claude_terminal_ensure_locks,
-                "codex": _codex_terminal_ensure_locks,
-                "pi": _pi_terminal_ensure_locks,
-                "cursor": _cursor_terminal_ensure_locks,
-                "kiro": _kiro_terminal_ensure_locks,
-                "antigravity": _antigravity_terminal_ensure_locks,
-                "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
-                "hermes": _hermes_terminal_ensure_locks,
-                "qwen": _qwen_terminal_ensure_locks,
-                "kimi": _kimi_terminal_ensure_locks,
-            }[_ensure_agent.key]
+            _ensure_locks = _require_full_native_lock_coverage(
+                {
+                    "claude": _claude_terminal_ensure_locks,
+                    "codex": _codex_terminal_ensure_locks,
+                    "pi": _pi_terminal_ensure_locks,
+                    "cursor": _cursor_terminal_ensure_locks,
+                    "kiro": _kiro_terminal_ensure_locks,
+                    "antigravity": _antigravity_terminal_ensure_locks,
+                    "opencode": _opencode_terminal_ensure_locks,
+                    "goose": _goose_terminal_ensure_locks,
+                    "hermes": _hermes_terminal_ensure_locks,
+                    "qwen": _qwen_terminal_ensure_locks,
+                    "kimi": _kimi_terminal_ensure_locks,
+                    "devin": _devin_terminal_ensure_locks,
+                }
+            )[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False
 
             def _publish_ensure_event(event_session_id: str, event: _JsonObject) -> None:
@@ -9735,7 +9926,7 @@ def create_runner_app(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi"):
+            elif terminal_name in ("cursor", "kimi", "devin"):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -10992,6 +11183,30 @@ def create_runner_app(
             content={"models": _with_model_configuration_source(session_id, models)},
         )
 
+    @app.get("/v1/sessions/{session_id}/devin-model-options")
+    async def get_session_devin_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "devin-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
+
+        try:
+            models = await asyncio.to_thread(list_devin_cli_model_options)
+        except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+            _logger.warning(
+                "Devin-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_model_options_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native model options"),
+                },
+            )
+        return JSONResponse(status_code=200, content={"models": models})
+
     @app.get("/v1/sessions/{session_id}/cursor-model-options")
     async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "cursor-native":
@@ -11140,6 +11355,8 @@ def create_runner_app(
             return await get_session_cursor_model_options(session_id)
         if harness == "kiro-native":
             return await get_session_kiro_model_options(session_id)
+        if harness == "devin-native":
+            return await get_session_devin_model_options(session_id)
         return JSONResponse(status_code=200, content={"models": []})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
