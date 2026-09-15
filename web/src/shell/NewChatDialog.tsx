@@ -4243,9 +4243,10 @@ export function NewChatLandingScreen() {
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
-    hostId: selectedHostId,
-    harness: skillsHarness,
-    path: workspaceTrimmed,
+    target:
+      selectedHostId && skillsHarness && workspaceTrimmed
+        ? { hostId: selectedHostId, harness: skillsHarness, path: workspaceTrimmed }
+        : null,
     enabled: canDiscoverHostSkills,
     starting: !sandboxSelected && (hostsLoading || agentsLoading),
   });

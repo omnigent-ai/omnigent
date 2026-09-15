@@ -2598,12 +2598,19 @@ function ComposerImpl(
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
-    sessionId: composerSession?.id,
-    hostId: composerSession?.hostId,
-    harness: composerSession?.harness,
-    path: composerSession?.workspace,
-    agentId: composerSession?.agentId,
-    subAgentName: composerSession?.subAgentName,
+    target:
+      composerSession?.id && composerSession.hostId && composerSession.workspace
+        ? {
+            sessionId: composerSession.id,
+            scope: {
+              hostId: composerSession.hostId,
+              harness: composerSession.harness,
+              workspace: composerSession.workspace,
+              agentId: composerSession.agentId,
+              subAgentName: composerSession.subAgentName,
+            },
+          }
+        : null,
     enabled: !isReadOnly && hostOnline !== false,
     starting: !isReadOnly && (runnerStarting || terminalPending),
   });
