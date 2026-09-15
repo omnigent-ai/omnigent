@@ -50,6 +50,11 @@ export interface Agent {
    * the spec couldn't be loaded. Only populated by `useSessionAgent`
    * (the sessions-derived `useAgents` list leaves it undefined). */
   harness?: string | null;
+  /** Raw spec `icon`: an emoji grapheme, a relative image path (served via
+   * `GET /v1/agents/{id}/icon`), or null. Only populated by `useSessionAgent`;
+   * lets the Agents rail honour a custom icon for the session's own agent via
+   * `resolveAgentIcon`. */
+  icon?: string | null;
   /** MCP server declarations from the agent spec. Empty when none configured. */
   mcp_servers?: McpServerSummary[];
   /** Whether the active session's agent bundle can be edited through the UI. */
@@ -127,6 +132,11 @@ interface AgentObjectWire {
   name: string;
   description?: string | null;
   harness?: string | null;
+  /** Raw spec ``icon``: an emoji grapheme, a relative image path (served via
+   * ``GET /v1/agents/{id}/icon``), or null. Only populated by
+   * ``useSessionAgent``; lets the Agents rail honour a custom icon for the
+   * session's own agent via ``resolveAgentIcon``. */
+  icon?: string | null;
   mcp_servers?: McpServerSummary[];
   mcp_servers_editable?: boolean;
   policies?: PolicySummary[];
@@ -148,6 +158,7 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
     name: json.name,
     description: json.description,
     harness: json.harness ?? null,
+    icon: json.icon ?? null,
     mcp_servers: json.mcp_servers,
     mcp_servers_editable: json.mcp_servers_editable,
     policies: json.policies,
