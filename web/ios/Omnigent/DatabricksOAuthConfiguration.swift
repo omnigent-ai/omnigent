@@ -56,6 +56,7 @@ enum DatabricksOAuthError: Error, Equatable, LocalizedError {
   case authenticationFailed
   case networkUnavailable
   case tokenExchangeFailed
+  case invalidRefreshGrant
   case invalidTokenResponse
 
   var errorDescription: String? {
@@ -72,6 +73,7 @@ enum DatabricksOAuthError: Error, Equatable, LocalizedError {
     case .authenticationFailed: "Databricks browser sign-in failed."
     case .networkUnavailable: "Could not reach Databricks. Please try again."
     case .tokenExchangeFailed: "Databricks could not complete sign-in. Please sign in again."
+    case .invalidRefreshGrant: "The saved Databricks session has expired. Please sign in again."
     case .invalidTokenResponse: "Databricks returned an invalid token response."
     }
   }

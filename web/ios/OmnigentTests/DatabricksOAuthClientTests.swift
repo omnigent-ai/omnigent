@@ -117,6 +117,90 @@ final class DatabricksOAuthClientTests: XCTestCase {
     }
   }
 
+  func testRefreshFormAndRotatedResponse() async throws {
+    let server = OAuthTestServer { request in
+      XCTAssertEqual(request.httpMethod, "POST")
+      XCTAssertEqual(request.url?.path, "/oidc/v1/token")
+      XCTAssertNil(request.url?.query)
+      XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+      let form = try Self.form(request)
+      XCTAssertEqual(
+        form,
+        [
+          "grant_type": "refresh_token", "client_id": "test-client",
+          "refresh_token": "old+/=&refresh",
+        ])
+      return .init(data: OAuthTestServer.tokenData)
+    }
+    let scope = try server.attempt().credentialScope
+    let tokens = try await DatabricksOAuthClient(session: server.session).refresh(
+      "old+/=&refresh", for: scope)
+    XCTAssertEqual(tokens.refreshToken, "opaque-refresh")
+  }
+
+  func testRefreshRetainsOmittedTokenButRejectsMalformedReplacement() throws {
+    let data = Data(#"{"access_token":"new-access","token_type":"Bearer","expires_in":120}"#.utf8)
+    let tokens = try DatabricksOAuthClient.tokens(
+      from: data, requestedAt: Date(), previousRefreshToken: "old-refresh")
+    XCTAssertEqual(tokens.refreshToken, "old-refresh")
+    assertInvalid(data)
+    for invalid: Any in ["", " ", NSNull(), 42] {
+      let response: [String: Any] = [
+        "access_token": "new-access", "token_type": "Bearer", "expires_in": 120,
+        "refresh_token": invalid,
+      ]
+      let data = try JSONSerialization.data(withJSONObject: response)
+      XCTAssertThrowsError(
+        try DatabricksOAuthClient.tokens(
+          from: data, requestedAt: Date(), previousRefreshToken: "old-refresh")
+      ) {
+        XCTAssertEqual($0 as? DatabricksOAuthError, .invalidTokenResponse)
+      }
+    }
+  }
+
+  func testOnlyValidatedInvalidGrantResponseInvalidatesRefresh() async throws {
+    for (status, body, expected): (Int, String, DatabricksOAuthError) in [
+      (400, #"{"error":"invalid_grant","error_description":"private"}"#, .invalidRefreshGrant),
+      (400, #"{"error":"invalid_client"}"#, .tokenExchangeFailed),
+      (401, #"{"error":"invalid_client"}"#, .tokenExchangeFailed),
+      (403, "denied", .tokenExchangeFailed),
+      (429, "rate limited", .tokenExchangeFailed),
+      (500, #"{"error":"invalid_grant"}"#, .tokenExchangeFailed),
+      (400, "not json", .tokenExchangeFailed),
+    ] {
+      let server = OAuthTestServer { _ in .init(status: status, data: Data(body.utf8)) }
+      do {
+        _ = try await DatabricksOAuthClient(session: server.session).refresh(
+          "old-refresh", for: server.attempt().credentialScope)
+        XCTFail("Expected refresh error")
+      } catch {
+        XCTAssertEqual(error as? DatabricksOAuthError, expected)
+        XCTAssertFalse(error.localizedDescription.contains("private"))
+      }
+    }
+  }
+
+  private static func form(_ request: URLRequest) throws -> [String: String] {
+    var data = request.httpBody ?? Data()
+    if let stream = request.httpBodyStream {
+      stream.open()
+      defer { stream.close() }
+      var buffer = [UInt8](repeating: 0, count: 1024)
+      while true {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count <= 0 { break }
+        data.append(buffer, count: count)
+      }
+    }
+    let body = try XCTUnwrap(String(data: data, encoding: .utf8))
+    return Dictionary(
+      uniqueKeysWithValues: body.split(separator: "&").map {
+        let pair = $0.split(separator: "=", maxSplits: 1).map(String.init)
+        return (pair[0], pair[1].removingPercentEncoding!)
+      })
+  }
+
   private func assertInvalid(_ data: Data, file: StaticString = #filePath, line: UInt = #line) {
     XCTAssertThrowsError(
       try DatabricksOAuthClient.tokens(from: data, requestedAt: Date()), file: file, line: line

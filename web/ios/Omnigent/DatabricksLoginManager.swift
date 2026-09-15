@@ -17,6 +17,7 @@ final class DatabricksLoginManager {
   ) -> any DatabricksAuthenticationSession
 
   private let client: DatabricksOAuthClient
+  private let tokenManager: DatabricksTokenManager
   private let makeSession: SessionFactory
   private var activeID: UUID?
   private var operation: Task<DatabricksOAuthTokens, Error>?
@@ -27,9 +28,12 @@ final class DatabricksLoginManager {
   var isInFlight: Bool { activeID != nil }
 
   init(
-    client: DatabricksOAuthClient = DatabricksOAuthClient(), sessionFactory: SessionFactory? = nil
+    client: DatabricksOAuthClient = DatabricksOAuthClient(),
+    tokenManager: DatabricksTokenManager = .shared,
+    sessionFactory: SessionFactory? = nil
   ) {
     self.client = client
+    self.tokenManager = tokenManager
     makeSession =
       sessionFactory ?? { url, callback, provider, completion in
         let session = ASWebAuthenticationSession(
@@ -50,12 +54,20 @@ final class DatabricksLoginManager {
     let id = UUID()
     activeID = id
     let operation = Task {
-      let callback = try await self.callbackURL(for: attempt, anchor: anchor, id: id)
-      try Task.checkCancellation()
-      let code = try attempt.authorizationCode(from: callback)
-      let tokens = try await self.client.exchange(code: code, for: attempt)
-      try Task.checkCancellation()
-      return tokens
+      let signIn = try await self.tokenManager.beginSignIn(for: attempt.credentialScope)
+      do {
+        let callback = try await self.callbackURL(for: attempt, anchor: anchor, id: id)
+        try Task.checkCancellation()
+        let code = try attempt.authorizationCode(from: callback)
+        let tokens = try await self.client.exchange(code: code, for: attempt)
+        try Task.checkCancellation()
+        try await self.tokenManager.save(tokens, for: signIn)
+        try Task.checkCancellation()
+        return tokens
+      } catch {
+        await self.tokenManager.endSignIn(signIn)
+        throw error
+      }
     }
     self.operation = operation
     defer { cancel(id: id) }

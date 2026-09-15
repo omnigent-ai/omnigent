@@ -50,6 +50,10 @@
 		B2000000000000000000000A /* DatabricksOAuthTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* DatabricksOAuthTests.swift */; };
 		B2000000000000000000000B /* DatabricksOAuthClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* DatabricksOAuthClientTests.swift */; };
 		B2000000000000000000000C /* DatabricksLoginManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* DatabricksLoginManagerTests.swift */; };
+		B1000000000000000000001E /* DatabricksCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001E /* DatabricksCredentialStore.swift */; };
+		B1000000000000000000001F /* DatabricksTokenManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001F /* DatabricksTokenManager.swift */; };
+		B2000000000000000000000D /* DatabricksCredentialStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* DatabricksCredentialStoreTests.swift */; };
+		B2000000000000000000000E /* DatabricksTokenManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000E /* DatabricksTokenManagerTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -118,6 +122,10 @@
 		A2000000000000000000000A /* DatabricksOAuthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthTests.swift; sourceTree = "<group>"; };
 		A2000000000000000000000B /* DatabricksOAuthClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthClientTests.swift; sourceTree = "<group>"; };
 		A2000000000000000000000C /* DatabricksLoginManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksLoginManagerTests.swift; sourceTree = "<group>"; };
+		A1000000000000000000001E /* DatabricksCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksCredentialStore.swift; sourceTree = "<group>"; };
+		A1000000000000000000001F /* DatabricksTokenManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksTokenManager.swift; sourceTree = "<group>"; };
+		A2000000000000000000000D /* DatabricksCredentialStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksCredentialStoreTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000000E /* DatabricksTokenManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksTokenManagerTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -192,6 +200,8 @@
 				A1000000000000000000001A /* DatabricksOAuthAttempt.swift */,
 				A1000000000000000000001B /* DatabricksOAuthClient.swift */,
 				A1000000000000000000001C /* DatabricksLoginManager.swift */,
+				A1000000000000000000001E /* DatabricksCredentialStore.swift */,
+				A1000000000000000000001F /* DatabricksTokenManager.swift */,
 				A1000000000000000000001D /* Omnigent.entitlements */,
 				A1000000000000000000000D /* Assets.xcassets */,
 				A10000000000000000000013 /* PrivacyInfo.xcprivacy */,
@@ -216,6 +226,8 @@
 				A2000000000000000000000A /* DatabricksOAuthTests.swift */,
 				A2000000000000000000000B /* DatabricksOAuthClientTests.swift */,
 				A2000000000000000000000C /* DatabricksLoginManagerTests.swift */,
+				A2000000000000000000000D /* DatabricksCredentialStoreTests.swift */,
+				A2000000000000000000000E /* DatabricksTokenManagerTests.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -393,6 +405,8 @@
 				B1000000000000000000001A /* DatabricksOAuthAttempt.swift in Sources */,
 				B1000000000000000000001B /* DatabricksOAuthClient.swift in Sources */,
 				B1000000000000000000001C /* DatabricksLoginManager.swift in Sources */,
+				B1000000000000000000001E /* DatabricksCredentialStore.swift in Sources */,
+				B1000000000000000000001F /* DatabricksTokenManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -412,6 +426,8 @@
 				B2000000000000000000000A /* DatabricksOAuthTests.swift in Sources */,
 				B2000000000000000000000B /* DatabricksOAuthClientTests.swift in Sources */,
 				B2000000000000000000000C /* DatabricksLoginManagerTests.swift in Sources */,
+				B2000000000000000000000D /* DatabricksCredentialStoreTests.swift in Sources */,
+				B2000000000000000000000E /* DatabricksTokenManagerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
