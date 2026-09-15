@@ -103,9 +103,13 @@ KIRO_KEY = "kiro"
 # - claude: `--mcp-config` (required by the native bridge) introduced long
 #   before 2026-06-01. The first Claude Code release after the cutoff is
 #   2.1.161, so use that as the supported floor.
-# - codex: native policy hook requires >= 0.129.0, but that shipped before
-#   2026-06-01. The first Codex release after the cutoff is 0.137.0. The
-#   subagent-router ``PreToolUse`` hook needs 0.145.0, but that is enforced
+# - codex: the floor is the capability requirement, not the 2026-06-01 date
+#   cutoff the sibling floors use: the native policy hook's trust protocol
+#   needs >= 0.129.0 (``codex_native/app_server._MIN_POLICY_HOOK_CODEX_VERSION``).
+#   This floor also feeds the host readiness map and launch gate, so anything
+#   above the capability requirement flags a working, managed codex install
+#   as "outdated" in the picker and refuses every codex launch on that host.
+#   The subagent-router ``PreToolUse`` hook needs 0.145.0, but that is enforced
 #   where the hook is registered
 #   (``codex_native_app_server._CODEX_ROUTING_HOOK_MIN_VERSION``) so an older
 #   CLI loses only smart-routing spawn gating, not the ability to launch.
@@ -118,7 +122,7 @@ KIRO_KEY = "kiro"
 # - hermes: parent_session_id schema introduced in v0.17.0. Hermes reports a
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
-_CODEX_MIN_VERSION = "0.137.0"
+_CODEX_MIN_VERSION = "0.129.0"
 _PI_MIN_VERSION = "0.84.2"
 _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"

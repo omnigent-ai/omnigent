@@ -1300,7 +1300,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
-        (OPENAI_FAMILY, "0.137.0", None),
+        (OPENAI_FAMILY, "0.129.0", None),
         (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
@@ -1396,6 +1396,31 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
         if len(argv) >= 2 and argv[1] == "--version":
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout="codex-cli 0.139.0\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
+
+
+def test_the_codex_floor_is_the_policy_hook_capability_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex at or above the policy-hook floor must read as installed.
+
+    The floor feeds the host readiness map and launch gate, not just setup:
+    a floor above the capability requirement (0.129.0, the hook-trust
+    protocol) makes the picker flag a working codex "outdated" and the host
+    refuse every codex launch. Managed installs pinned between the
+    capability floor and a newer release are exactly the reported case, so
+    pin the floor to the capability, not a date cutoff.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="codex-cli 0.133.0\n", stderr=""
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
