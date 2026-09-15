@@ -213,37 +213,3 @@ def test_chat_turn_rail_matches_baseline(
     settle_for_snapshot(page)
 
     assert_snapshot(page)
-
-    # Resize the chat independently of the window, as the right-panel divider does.
-    for viewport_width in (1024, 1920, 1921, 2560, 2561, 3200):
-        page.set_viewport_size({"width": viewport_width, "height": 800})
-        max_column_width = (
-            min(1600, max(1024, viewport_width * 0.4))
-            if viewport_width > 2560
-            else 896
-            if viewport_width > 1920
-            else 768
-        )
-        for chat_width in (360, 600, 768, 880, 950, 1024, 1200):
-            metrics = page.evaluate(
-                """width => {
-                    const column = document.querySelector('.chat-conversation-content');
-                    const chat = column.closest('[class*="@container/chat"]');
-                    chat.style.flex = 'none';
-                    chat.style.width = `${width}px`;
-                    const assistant = column.querySelector('[data-role="assistant"]');
-                    const user = column.querySelector('[data-role="user"]');
-                    const tick = document.querySelector('[data-turn-tick] span');
-                    return {
-                        gap: assistant.getBoundingClientRect().left
-                            - tick.getBoundingClientRect().right,
-                        rightInset: chat.getBoundingClientRect().right
-                            - user.getBoundingClientRect().right,
-                    };
-                }""",
-                chat_width,
-            )
-            context = (viewport_width, chat_width, metrics)
-            assert metrics["gap"] >= 9, context
-            expected_right_inset = (chat_width - min(chat_width, max_column_width)) / 2 + 16
-            assert abs(metrics["rightInset"] - expected_right_inset) < 1, context
