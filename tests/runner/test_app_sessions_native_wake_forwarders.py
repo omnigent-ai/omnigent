@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -739,22 +740,25 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         await _drain_forwarder_runs(runs)
 
 
+@pytest.mark.parametrize(
+    "recovery_state",
+    [
+        "live",
+        "exited",
+        "forwarder_done",
+        "missing_bridge",
+        "different_thread",
+        "launch_error",
+        "launch_cancelled",
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
+async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_session(
+    recovery_state: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Re-running codex terminal auto-create leaves exactly one live forwarder.
-
-    Codex flavor of the claude double-mirror regression: the codex spawn
-    registered its forwarder task in the same unkeyed set, so an ensure
-    re-create for an existing session leaked the prior known-thread
-    forwarder alongside the new one.
-
-    :param tmp_path: Temporary directory for isolated bridge state.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """A lost TUI preserves a healthy backend; stale backends get one replacement."""
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
@@ -812,12 +816,16 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
             self.config_overrides: list[str] = []
+            self.proc = SimpleNamespace(returncode=None)
+            self.closed = False
 
         async def start(self) -> None:
             """:returns: None."""
 
         async def close(self) -> None:
-            """:returns: None."""
+            self.closed = True
+
+    app_servers: list[_FakeCodexAppServer] = []
 
     def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
         """
@@ -828,6 +836,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         """
         app_server = _FakeCodexAppServer()
         app_server.codex_home = kwargs["codex_home"]
+        app_servers.append(app_server)
         return app_server
 
     class _UnexpectedDiscoveryClient:
@@ -877,6 +886,8 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             run.cancelled = True
             raise
 
+    launched_specs: list[Any] = []
+
     class _FakeResourceRegistry:
         """Returns a terminal resource view without launching tmux."""
 
@@ -891,7 +902,13 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view for the codex TUI."""
-            del terminal_name, session_key, spec, resource_role
+            del terminal_name, session_key, resource_role
+            launched_specs.append(spec)
+            if len(launched_specs) > 1:
+                if recovery_state == "launch_error":
+                    raise RuntimeError("terminal launch failed")
+                if recovery_state == "launch_cancelled":
+                    raise asyncio.CancelledError
             return SessionResourceView(
                 id="terminal_codex_main",
                 type="terminal",
@@ -931,28 +948,64 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         )
         await asyncio.sleep(0)
 
-        await runner_app_mod._auto_create_codex_terminal(
+        original_server = app_servers[0]
+        original_forwarder = runner_app_mod._AUTO_FORWARDER_TASKS[session_id]
+        bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+        bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
+        assert bridge_state is not None
+        if recovery_state == "exited":
+            original_server.proc.returncode = 1
+        elif recovery_state == "forwarder_done":
+            original_forwarder.cancel()
+            await asyncio.gather(original_forwarder, return_exceptions=True)
+        elif recovery_state == "missing_bridge":
+            codex_native_bridge.clear_bridge_state(bridge_dir)
+        elif recovery_state == "different_thread":
+            codex_native_bridge.write_bridge_state(
+                bridge_dir,
+                codex_native_bridge.CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path=bridge_state.socket_path,
+                    thread_id="another-thread",
+                    codex_home=bridge_state.codex_home,
+                    cwd=bridge_state.cwd,
+                ),
+            )
+
+        recovery = runner_app_mod._auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
         )
+        if recovery_state == "launch_error":
+            with pytest.raises(RuntimeError, match="terminal launch failed"):
+                await recovery
+        elif recovery_state == "launch_cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await recovery
+        else:
+            await recovery
         await asyncio.sleep(0)
 
-        assert len(runs) == 2, (
-            f"Expected 2 forwarder spawns (one per auto-create), got {len(runs)}."
-        )
-        # The first forwarder was cancelled by the re-create — a False here
-        # means two live tasks mirror the same codex thread into the session.
-        assert runs[0].cancelled is True, (
-            "Re-creating the codex terminal must cancel the prior session "
-            "forwarder; it survived, so transcript records would be "
-            "double-posted."
-        )
-        # The recovery's own forwarder survives — cancelled here means the
-        # re-create killed its replacement and the session mirrors nothing.
-        assert runs[1].cancelled is False
+        reused = recovery_state in {"live", "launch_error", "launch_cancelled"}
+        assert len(app_servers) == (1 if reused else 2)
+        assert len(runs) == (1 if reused else 2)
+        assert runs[0].cancelled is not reused
+        if reused:
+            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is original_server
+            assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is original_forwarder
+            assert not original_server.closed
+            assert codex_native_bridge.read_bridge_state(bridge_dir) == bridge_state
+        else:
+            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is app_servers[1]
+            assert runs[1].cancelled is False
+        assert len(launched_specs) == 2
+        for spec in launched_specs:
+            assert spec.keep_alive_after_exit is True
+            assert thread_id in spec.args
+            assert spec.env["CODEX_HOME"] == str(original_server.codex_home)
         live_runs = [run for run in runs if not run.cancelled]
         # Exactly one live forwarder mirrors the thread for the session.
         assert len(live_runs) == 1

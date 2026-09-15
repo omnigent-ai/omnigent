@@ -804,8 +804,8 @@ class TerminalEnvSpec:
         the pane's inner process exits (``remain-on-exit`` / ``exit-empty
         off``), so a single CLI exit no longer reaps the server and cascades
         into ``no server running``. Opt-in because it changes the
-        ``has-session``-means-alive contract; enabled for the claude-native
-        agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
+        ``has-session``-means-alive contract; enabled for runner-owned Claude
+        and Codex terminals, whose liveness is decided by ``#{pane_dead}``.
     """
 
     command: str | None = None
