@@ -64,6 +64,9 @@ class _HeartbeatStreamResponse:
         """
         del exc_type, exc, traceback
 
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
     async def aiter_text(self) -> AsyncIterator[str]:
         """
         Yield a ready heartbeat, then finish after release.
@@ -200,6 +203,9 @@ class _ScriptedStreamResponse:
         :returns: None.
         """
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         """
@@ -517,6 +523,9 @@ class _TunnelCloseStreamResponse:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         yield 'data: {"type": "session.heartbeat"}\n\n'
@@ -905,6 +914,9 @@ class _ScriptedThenDropStreamResponse:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         # The heartbeat comes first so the caller's readiness wait resolves,
