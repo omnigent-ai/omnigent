@@ -2132,6 +2132,76 @@ describe("rankedSlashCommandNames", () => {
   });
 });
 
+describe("Composer native skill menu", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_skill_menu",
+      sessionHarness: "codex-native",
+      skills: [{ name: "review", description: "Review the current change" }],
+      skillsStatus: "ready",
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    useChatStore.setState({ sessionHarness: null, skills: [], skillsStatus: null });
+  });
+
+  it.each([
+    { trigger: "$", selection: "Tab" },
+    { trigger: "/", selection: "click" },
+  ])("opens with $trigger and selects a skill with $selection", ({ trigger, selection }) => {
+    const props = composerProps({ isNativeWrapper: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: trigger } });
+    expect(screen.getByTestId("slash-menu-item-help")).toHaveTextContent("/help");
+    expect(screen.getByTestId("slash-menu-item-review")).toHaveTextContent("$review");
+
+    fireEvent.change(textarea(), { target: { value: `${trigger}rev` } });
+    if (selection === "click") {
+      fireEvent.click(screen.getByTestId("slash-menu-item-review"));
+    } else {
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+    }
+    expect(textarea()).toHaveValue("$review ");
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+
+    fireEvent.change(textarea(), { target: { value: "$review focus on tests" } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay).toHaveTextContent("$review focus on tests");
+    expect(overlay.querySelector(".text-brand-accent")?.textContent).toBe("$review");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("$review focus on tests", undefined);
+  });
+
+  it("keeps built-in commands slash-prefixed when opened with a dollar sign", () => {
+    const props = composerProps({ isNativeWrapper: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "$eff" } });
+    expect(screen.getByTestId("slash-menu-item-effort")).toHaveTextContent("/effort");
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/effort ");
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it.each(["claude-native", "claude-sdk"])(
+    "keeps slash-only skill completion for %s",
+    (harness) => {
+      useChatStore.setState({ sessionHarness: harness });
+      render(<Composer {...composerProps({ isNativeWrapper: harness === "claude-native" })} />);
+      fireEvent.change(textarea(), { target: { value: "$rev" } });
+      expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+      expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+
+      fireEvent.change(textarea(), { target: { value: "/rev" } });
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue("/review ");
+    },
+  );
+});
+
 describe("Composer asynchronous skills", () => {
   beforeEach(() => {
     clearSessionDrafts();
