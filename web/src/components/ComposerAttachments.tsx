@@ -72,7 +72,11 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
       <FileTextIcon className="size-4 shrink-0" />
       <span className="max-w-[160px] truncate">{name}</span>
       {ext && <span className="shrink-0 text-xs opacity-70">{ext}</span>}
-      <RemoveButton name={name} onRemove={onRemove} className="ml-0.5 rounded-full hover:text-foreground" />
+      <RemoveButton
+        name={name}
+        onRemove={onRemove}
+        className="ml-0.5 rounded-full hover:text-foreground"
+      />
     </span>
   );
 }
