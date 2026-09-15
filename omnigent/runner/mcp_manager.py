@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,55 @@ from omnigent.tools.mcp import McpServerConnection
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+
+# Matches a URL's userinfo section (``scheme://user:secret@host``), so
+# embedded credentials can be stripped from connect-failure messages.
+_URL_USERINFO = re.compile(r"([a-z][a-z0-9+.-]*://)[^/\s'\"@]+@", re.IGNORECASE)
+
+# Matches a URL's query string and/or fragment (any scheme, e.g. wss://),
+# so it can be stripped from connect-failure messages.
+_URL_QUERY_OR_FRAGMENT = re.compile(
+    r"([a-z][a-z0-9+.-]*://[^\s'\"]+?)[?#][^\s'\"]*", re.IGNORECASE
+)
+
+# Matches ``name: value`` / ``name=value`` pairs whose name is a common
+# credential carrier (an echoed header dump, a key=value in an error body).
+_CREDENTIAL_PAIR = re.compile(
+    r"((?:authorization|proxy-authorization|x-api-key|api[-_]?key|access[-_]?token"
+    r"|client[-_]?secret)\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)[^\s'\"]+",
+    re.IGNORECASE,
+)
+
+
+def _describe_connect_error(exc: Exception) -> str:
+    """
+    Render *exc* for logging and UI surfacing, with common credential
+    carriers scrubbed.
+
+    Some MCP servers require a credential in the URL itself (e.g.
+    ``?api_key=...``) rather than an ``Authorization`` header, and httpx
+    — the HTTP transport underneath :class:`McpServerConnection` —
+    commonly includes the full request URL verbatim in its exception
+    messages. This message ends up in ``server.error``, which is both
+    logged and forwarded to the browser through the session's MCP
+    startup events.
+
+    Scrubbed carriers: URL userinfo (``user:secret@host``), URL query
+    strings/fragments (any scheme), and ``name: value`` / ``name=value``
+    pairs whose name is credential-bearing (``Authorization``,
+    ``api_key``, ``access_token``, …). This is a best-effort scrub of
+    the shapes transport errors actually produce, not a proof the result
+    is secret-free — e.g. a token embedded in a URL *path* survives it.
+
+    :param exc: The exception raised while connecting.
+    :returns: ``"{ExceptionType}: {message}"`` with matched credential
+        carriers replaced by ``<redacted>`` placeholders.
+    """
+    message = f"{type(exc).__name__}: {exc}"
+    message = _URL_USERINFO.sub(r"\1<redacted>@", message)
+    message = _URL_QUERY_OR_FRAGMENT.sub(r"\1?<redacted>", message)
+    return _CREDENTIAL_PAIR.sub(r"\1<redacted>", message)
 
 
 def _schema_requires_fields(params: ElicitRequestParams) -> bool:
@@ -819,7 +869,7 @@ class RunnerMcpManager:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     async with self._lock:
-                        server.error = f"{type(exc).__name__}: {exc}"
+                        server.error = _describe_connect_error(exc)
                         server.connection = None
                         server.tools = []
                     _logger.warning(

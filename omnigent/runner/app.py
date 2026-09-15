@@ -7949,7 +7949,14 @@ def create_runner_app(
                         )
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
-                    _session_mcp_spec_hash[conv] = _mcp_hash
+                    # A degraded listing latches a poisoned hash so the next
+                    # turn re-issues tools/list: a server that recovers with
+                    # an unchanged config (refreshed token, service back up)
+                    # then clears the diagnostics banner instead of leaving
+                    # a stale error and a partial schema set.
+                    _session_mcp_spec_hash[conv] = (
+                        _mcp_hash if not mcp_result.failures else f"{_mcp_hash}:degraded"
+                    )
                 except (
                     httpx.HTTPError,
                     RuntimeError,
@@ -7961,6 +7968,40 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
+        elif cached_spec is not None and conv in _session_mcp_spec_hash:
+            # The last MCP server was removed since the previous listing;
+            # issue one more proxied tools/list so the server folds any
+            # retained startup failures to ready instead of leaving a stale
+            # warning, then forget the hash so this runs once.
+            try:
+                await ProxyMcpManager(
+                    conv,
+                    server_client,
+                    execution_registry=mcp_execution_registry,
+                ).schemas_for(cached_spec, sync_when_empty=True)
+            except (
+                httpx.HTTPError,
+                RuntimeError,
+                ValueError,
+            ):
+                _logger.warning(
+                    "MCP empty-config sync failed for %s",
+                    conv,
+                    exc_info=True,
+                    extra={"session_id": conv},
+                )
+            else:
+                _session_mcp_spec_hash.pop(conv, None)
+                # Stop advertising the removed servers' namespaced tools.
+                _session_tool_schemas[conv] = [
+                    t
+                    for t in _session_tool_schemas.get(conv, [])
+                    if not (
+                        isinstance(t, dict)
+                        and isinstance(t.get("name"), str)
+                        and "__" in cast(str, t.get("name"))
+                    )
+                ]
 
         _spec_tools = _session_tool_schemas.get(conv) or []
         # Request-driven harnesses should not advertise browser tools when no

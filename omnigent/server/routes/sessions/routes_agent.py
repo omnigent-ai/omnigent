@@ -434,6 +434,8 @@ def register_agent_routes(
                 rpc_id,
                 session_id,
                 runner_router,
+                conversation_store=conversation_store,
+                agent_store=agent_store,
             )
 
         if method == "tools/call":

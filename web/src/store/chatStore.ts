@@ -924,14 +924,28 @@ export interface ConversationState {
    */
   sandboxStatus: SandboxStatus | null;
   /**
-   * Native MCP startup progress, cleared when startup settles or live
-   * assistant text arrives. Failures/cancellations stay in host diagnostics,
-   * not the conversation. Null for harnesses that report no MCP startup.
+   * Per-MCP-server startup map for the bound session. Fed by native
+   * harnesses (via `external_mcp_startup`) and by the runner `tools/list`
+   * path SDK harnesses like claude-sdk use. Cleared when startup settles
+   * or live assistant text arrives. Settled failures/cancellations are
+   * never conversation content — they land in `mcpStartupFailures` for
+   * the diagnostics surface instead. Null for harnesses that report no
+   * MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
   /**
-   * Only native harnesses report MCP startup. Track launch pending separately
-   * from the terminal pill so metadata cannot consume its rearm signal.
+   * MCP servers whose startup failed, as server name → error detail.
+   * Derived from the same `session.mcp_startup` intake as `mcpStartup`,
+   * but retained after the round settles so the agent-info diagnostics
+   * surface (never the conversation viewport) can name the failing
+   * servers. Cleared back to `null` when a later map carries no failed
+   * server — e.g. the runner reports a recovered server, or a fresh
+   * startup round begins. Always `null` when nothing is failing.
+   */
+  mcpStartupFailures: Record<string, string> | null;
+  /**
+   * Track launch pending separately from the terminal pill so metadata
+   * cannot consume its rearm signal.
    */
   mcpStartupLaunch: { pending: boolean; dismissed: boolean };
   /**
@@ -1770,6 +1784,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
+  mcpStartupFailures: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
   historyGeneration: 0,
@@ -3534,7 +3549,7 @@ function mcpStartupSnapshotPatch(
   session: Session,
   state: Pick<ConversationState, "mcpStartupLaunch">,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
-): Pick<ConversationState, "mcpStartup" | "mcpStartupLaunch"> {
+): Pick<ConversationState, "mcpStartup" | "mcpStartupLaunch" | "mcpStartupFailures"> {
   // Fresh text creates a new latch object; older snapshots cannot rearm it.
   const launch =
     state.mcpStartupLaunch === launchBeforeFetch
@@ -3543,6 +3558,9 @@ function mcpStartupSnapshotPatch(
   return {
     mcpStartupLaunch: launch,
     mcpStartup: activeMcpStartup(session.mcpStartup, launch.dismissed),
+    // Failures ignore the dismissal latch: dismissal hides the in-flight
+    // band, while failures live on the diagnostics surface until recovery.
+    mcpStartupFailures: settledMcpFailures(session.mcpStartup),
   };
 }
 
@@ -3556,6 +3574,28 @@ function sessionSkillsPatch(
     return { skills: state.skills, skillsStatus: state.skillsStatus };
   }
   return { skills: session.skills ?? [], skillsStatus: session.skillsStatus ?? null };
+}
+
+/**
+ * An MCP startup map reduced to its failures: server name → error detail
+ * for every `failed` entry, else `null`. This is what the agent-info
+ * diagnostics surface shows — unlike `activeMcpStartup` it survives the
+ * round settling, so a failed server stays visible until a later map
+ * reports it recovered (or a fresh round starts it over). Applied at both
+ * intake points (SSE event and session snapshot) so a reload keeps the
+ * failure visible off the snapshot's cached map.
+ */
+function settledMcpFailures(
+  servers: Record<string, McpServerStartup> | null | undefined,
+): Record<string, string> | null {
+  if (!servers) return null;
+  const failures: Record<string, string> = {};
+  for (const [name, record] of Object.entries(servers)) {
+    // Truthiness (not nullish) fallback: an empty-string error would render
+    // a blank detail line while the pill styling treats it as healthy.
+    if (record.status === "failed") failures[name] = record.error || "startup failed";
+  }
+  return Object.keys(failures).length > 0 ? failures : null;
 }
 
 /**
@@ -3615,6 +3655,7 @@ function sessionBindingPatch(
   | "terminalPending"
   | "sandboxStatus"
   | "mcpStartup"
+  | "mcpStartupFailures"
   | "mcpStartupLaunch"
 > {
   const retainModelSeed = state.sessionModelSeeded && session.llmModel == null;
@@ -6108,12 +6149,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round
-      // is in flight; cleared once no server is still `starting`.
-      // Failures/cancellations are setup diagnostics (host logs), not
-      // conversation content — retaining them rendered an inline notice
-      // in the chat viewport and pinned the message-flow branch open.
+      // is in flight; cleared once no server is still `starting` (or the
+      // launch was dismissed by live text). Failures are never conversation
+      // content — they split into `mcpStartupFailures` for the agent-info
+      // diagnostics surface (cleared when a later map reports recovery).
       applyToConversation((s) => ({
         mcpStartup: activeMcpStartup(event.servers, s.mcpStartupLaunch.dismissed),
+        mcpStartupFailures: settledMcpFailures(event.servers),
       }));
       return;
     }

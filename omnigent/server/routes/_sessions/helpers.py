@@ -4848,9 +4848,11 @@ def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) 
     Publish a typed :class:`SessionMcpStartupEvent` to the live stream.
 
     Fired when a native forwarder reports harness MCP-server startup
-    progress via ``external_mcp_startup``, so the web UI can show
-    per-server startup state while the harness boots instead of an
-    apparently hung session. Also updates the snapshot cache so a client
+    progress via ``external_mcp_startup``, or when the runner path
+    (see :func:`_publish_runner_mcp_startup_failures`) reports a
+    ``tools/list`` failure, so the web UI can show per-server startup
+    state while the harness boots instead of an apparently hung
+    session. Also updates the snapshot cache so a client
     opening the session mid-startup seeds the band from the snapshot's
     ``mcp_startup`` field; a map with nothing left to show — empty, or
     every server ``ready`` — evicts the cache entry, mirroring the web
@@ -4872,6 +4874,93 @@ def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) 
         servers=servers,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_runner_mcp_startup_failures(session_id: str, failures: dict[str, str]) -> None:
+    """
+    Publish runner-reported MCP ``tools/list`` failures as a
+    :class:`SessionMcpStartupEvent`.
+
+    Native harnesses report MCP startup via ``external_mcp_startup``
+    (see :func:`_publish_mcp_startup`); SDK-harness sessions instead
+    go through the runner's ``tools/list`` proxy path, which never
+    published anything and left failures as a log line only. This
+    routes that same data into the existing event/cache pipeline the
+    web UI's diagnostics surface reads.
+
+    Shares ``_session_mcp_startup_cache`` with :func:`_publish_mcp_startup`.
+    The two publishers must never mix for one session: this function's
+    fold loop cannot distinguish "healthy and not in *failures*" from
+    "not this publisher's server to report on", so it could fold a native
+    forwarder's cached ``"starting"`` entry to ``"ready"``. Callers
+    enforce that — :func:`_handle_mcp_tools_list` skips this publish for
+    native-harness sessions (see
+    :func:`_runner_owns_mcp_startup_publish`).
+
+    Unlike the native forwarder, the runner has no explicit startup
+    sequence to mirror — only a snapshot of which servers failed
+    this call. Previously-failed servers absent from the new
+    *failures* map are folded in as ``"ready"`` so a recovered
+    server (e.g. a refreshed token) clears the diagnostics surface
+    instead of leaving a stale error.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param failures: Server name to error message for servers that
+        failed this call, e.g. ``{"pipeshub": "401 Unauthorized"}``.
+        Empty when every configured server responded.
+    """
+    previous = _session_mcp_startup_cache.get(session_id, {})
+    if not failures and not previous:
+        return
+    servers = {
+        name: McpServerStartup(status="failed", error=error) for name, error in failures.items()
+    }
+    for name in previous:
+        if name not in servers:
+            servers[name] = McpServerStartup(status="ready", error=None)
+    if servers == previous:
+        return
+    _publish_mcp_startup(session_id, servers)
+
+
+async def _runner_owns_mcp_startup_publish(
+    session_id: str,
+    conversation_store: ConversationStore | None,
+    agent_store: AgentStore | None,
+) -> bool:
+    """
+    Whether the runner ``tools/list`` path may publish MCP startup state
+    for *session_id*.
+
+    Native harnesses publish their own startup snapshots through
+    ``external_mcp_startup`` (see :func:`_publish_mcp_startup`) yet still
+    drive the runner's per-turn ``tools/list`` proxy call, so without a
+    gate both publishers would write one session's cache entry — the
+    corruption :func:`_publish_runner_mcp_startup_failures` documents.
+
+    Sessions that can't be resolved (no store wired, unknown id, spec
+    load failure) default to publishing: the proxy endpoint is driven by
+    the runner's SDK-harness path, so unresolvable is overwhelmingly SDK,
+    and skipping would silently regress the diagnostics surface.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store for the conversation row, or ``None``.
+    :param agent_store: Store used to resolve the bound agent's harness.
+    :returns: ``False`` when the session resolves to a native harness.
+    """
+    if conversation_store is None:
+        return True
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 — an unresolvable session must not break tools/list
+        return True
+    harness = _resolve_harness(conv, agent_store=agent_store)
+    if harness is None:
+        return True
+    from omnigent.harness_aliases import is_native_harness
+
+    return not is_native_harness(harness)
 
 
 def _publish_runner_skills(session_id: str) -> None:
@@ -10287,6 +10376,9 @@ async def _handle_mcp_tools_list(
     rpc_id: int | str | None,
     session_id: str,
     runner_router: RunnerRouter | None,
+    *,
+    conversation_store: ConversationStore | None = None,
+    agent_store: AgentStore | None = None,
 ) -> Response:
     """
     Handle a ``tools/list`` JSON-RPC request for the MCP proxy endpoint.
@@ -10302,6 +10394,11 @@ async def _handle_mcp_tools_list(
         e.g. ``"conv_abc123"``.
     :param runner_router: Router used to get an httpx client pointed
         at the session's runner. ``None`` returns an error.
+    :param conversation_store: Store used to resolve the session's
+        harness for the startup-failure publish gate. ``None`` skips
+        resolution (publishes).
+    :param agent_store: Store used with *conversation_store* to resolve
+        the bound agent's harness.
     :returns: A JSON-RPC 2.0 ``tools/list`` result response, or an
         error response when the runner is unavailable.
     """
@@ -10356,6 +10453,8 @@ async def _handle_mcp_tools_list(
     failures: dict[str, str] = result.get("failures", {})
     for srv, msg in failures.items():
         _logger.warning("runner MCP server %r unavailable: %s", srv, msg)
+    if await _runner_owns_mcp_startup_publish(session_id, conversation_store, agent_store):
+        _publish_runner_mcp_startup_failures(session_id, failures)
 
     _logger.debug(
         "MCP tools/list: session=%r returning %d tools, %d failures",
@@ -10364,7 +10463,14 @@ async def _handle_mcp_tools_list(
         len(failures),
         extra={"session_id": session_id},
     )
-    return _mcp_ok_response(rpc_id, {"tools": tools})
+    result_payload: dict[str, Any] = {"tools": tools}
+    if failures:
+        # MCP-legal result metadata: tells the runner's ProxyMcpManager the
+        # listing was degraded, so it re-issues tools/list next turn instead
+        # of latching the partial schema set (which would also leave the
+        # diagnostics banner stale after the server recovers).
+        result_payload["_meta"] = {"omnigent/mcpFailures": failures}
+    return _mcp_ok_response(rpc_id, result_payload)
 
 
 async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
