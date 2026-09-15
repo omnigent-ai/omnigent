@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from functools import partial
 
@@ -125,6 +125,7 @@ def _tunnel_route_app(
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    on_runner_disconnect: Callable[[str], Awaitable[None]] | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -136,6 +137,8 @@ def _tunnel_route_app(
     :param resolve_managed_runner_owner: Optional ``runner_id -> owner``
         resolver for server-managed sandbox runners (binding-token auth,
         no user session). ``None`` disables the managed-runner lookup.
+    :param on_runner_disconnect: Optional async callback fired when the
+        runner tunnel tears down. ``None`` skips the disconnect hook.
     :returns: The FastAPI app and registry owned by its route.
     """
     registry = TunnelRegistry()
@@ -147,6 +150,7 @@ def _tunnel_route_app(
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
             resolve_managed_runner_owner=resolve_managed_runner_owner,
+            on_runner_disconnect=on_runner_disconnect,
         ),
         prefix="/v1",
     )
@@ -314,6 +318,30 @@ async def test_ws_tunnel_route_round_trips_request_to_runner(
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+async def test_on_runner_disconnect_fires_once_per_teardown() -> None:
+    """Tunnel teardown invokes ``on_runner_disconnect`` exactly once.
+
+    A helper-task disconnect passes through task cleanup and route-level
+    exception handling but still represents one teardown.
+    """
+    disconnect_calls: list[str] = []
+
+    async def _on_disconnect(runner_id: str) -> None:
+        disconnect_calls.append(runner_id)
+
+    route_app = _tunnel_route_app(on_runner_disconnect=_on_disconnect)
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    await _send_hello(communicator, route_app.registry)
+    assert route_app.registry.online_runner_ids() == [_RUNNER_ID]
+
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+    with contextlib.suppress(asyncio.TimeoutError):
+        await communicator.wait(timeout=1.0)
+
+    assert disconnect_calls == [_RUNNER_ID]
+    assert route_app.registry.get(_RUNNER_ID) is None
 
 
 async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
@@ -1235,3 +1263,31 @@ async def test_ping_loop_restamps_runner_liveness(
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=1.0)
         session_live_state.configure(None)
+
+
+async def test_ws_tunnel_pre_hello_failure_keeps_live_generation_registered() -> None:
+    """A connection failing before hello must not pop a live tunnel.
+
+    A stale/broken handshake (e.g. malformed hello JSON) errors out
+    between ``accept()`` and ``registry.register()``; its teardown owns
+    no registration and must leave the other generation untouched.
+    """
+    route_app = _tunnel_route_app()
+    registry = route_app.registry
+
+    live = await _connect_route(route_app.app, _TUNNEL_PATH)
+    await _send_hello(live, registry)
+    live_session = registry.get(_RUNNER_ID)
+    assert live_session is not None
+
+    stale = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await stale.send_input({"type": "websocket.receive", "text": "not-json"})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await stale.wait(timeout=1.0)
+
+        assert registry.get(_RUNNER_ID) is live_session
+    finally:
+        await live.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await live.wait(timeout=1.0)
