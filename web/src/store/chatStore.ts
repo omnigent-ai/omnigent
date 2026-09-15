@@ -3834,7 +3834,9 @@ async function bindStream(
       stickyEffort != null &&
       !stickyApplyBlocked()
     ) {
-      updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
+      // silent: persist only. A live forward would type /effort into the
+      // pane of any session the user merely opens (see the pre-bind seed).
+      updateSession(id, { reasoningEffort: stickyEffort, silent: true }).catch((err: unknown) => {
         armStickyApplyBackoff();
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
