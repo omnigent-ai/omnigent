@@ -24,7 +24,6 @@ import {
   CornerUpLeftIcon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   Loader2Icon,
   XIcon,
 } from "lucide-react";
@@ -52,7 +51,7 @@ import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdow
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import { validateAttachments } from "@/lib/attachments";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -195,6 +194,7 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
@@ -3607,32 +3607,8 @@ function ComposerImpl(
           ),
           attachments: (
             <>
-              {/* File chips — shown below textarea when files are attached */}
-              {files.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                  {files.map((file, i) => (
-                    <span
-                      key={attachmentKey(file)}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      {file.type.startsWith("image/") ? (
-                        <ImageIcon className="size-3 shrink-0" />
-                      ) : (
-                        <FileTextIcon className="size-3 shrink-0" />
-                      )}
-                      <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                      <button
-                        type="button"
-                        onClick={() => removeFile(i)}
-                        className="ml-0.5 rounded-full hover:text-foreground"
-                        aria-label={`Remove ${file.name || "image.png"}`}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
+              {/* Pending attachments — image thumbnails (click to view) + file rows. */}
+              <ComposerAttachments files={files} onRemove={removeFile} />
               {/* Rejected-attachment feedback: unsupported type or too large */}
               {attachmentError !== null && (
                 <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
