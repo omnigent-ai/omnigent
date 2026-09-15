@@ -859,6 +859,7 @@ export function ChatPage() {
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  const sessionModelOverrideForEffort = useChatStore((s) => s.sessionModelOverride);
   // Pre-catalog fallback: a fresh native session's own catalog only arrives
   // once its CLI is up (codex answers model/list after app-server boot,
   // ~15s cold), which left the gear's Model list sparse and its Effort row
@@ -1044,15 +1045,23 @@ export function ChatPage() {
     activeConversationId,
   ]);
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
-  // Effort ladders key on the model the session is actually on — the
-  // reported `llmModel` — falling back to the sticky preference only
-  // before the first report lands. Memoized because codex-native resolves
-  // via codexEffortLevelsForModel, which returns a fresh array each call;
-  // a new identity here would defeat the memo() on MainAgentSurface/Composer
-  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  // Effort ladders key on the model the session is actually on — the reported
+  // `llmModel` — then the session's pinned `model_override`, and only then the
+  // sticky preference. The override matters for a harness that never reports a
+  // concrete model (devin pins the family there): without it the lookup finds no
+  // catalog row and a per-model ladder comes back empty, hiding the picker.
+  // Memoized because codex-native resolves via codexEffortLevelsForModel, which
+  // returns a fresh array each call; a new identity here would defeat the memo()
+  // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
+  // codexModelOptions rationale).
   const effortLevels = useMemo(
-    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
-    [capabilitySource, codexModelOptions, llmModel, selectedModel],
+    () =>
+      effortLevelsForConv(
+        capabilitySource,
+        codexModelOptions,
+        llmModel ?? sessionModelOverrideForEffort ?? selectedModel,
+      ),
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
