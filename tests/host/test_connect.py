@@ -296,6 +296,43 @@ async def test_handle_model_options_rejects_unsupported_harness() -> None:
     )
 
 
+async def test_handle_model_options_acp_row_discovers_via_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A builtin ACP row runs its vendor `models` command host-side."""
+    import omnigent.harnesses.acp_cli_models as acp_models
+
+    monkeypatch.setattr(
+        acp_models,
+        "discover_acp_cli_models",
+        lambda _harness, _row: [{"id": "grok-4.6", "displayName": "grok-4.6"}],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_grok", harness="grok"),
+    )
+
+    assert result.status == "ok"
+    assert [m["id"] for m in result.models] == ["grok-4.6"]
+    assert result.routable_models == ["grok-4.6"]
+
+
+async def test_handle_model_options_custom_acp_degrades_to_empty() -> None:
+    """A user-configured ``acp:<slug>`` agent (canonicalizes to ``acp``, with no
+    vendor ``models`` command) yields an empty list — free-text in the picker —
+    not the ``failed`` error a truly unsupported harness gets."""
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_acp", harness="acp:kilocode"),
+    )
+
+    assert result.status == "ok"
+    assert result.models == []
+    assert result.routable_models == []
+
+
 async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

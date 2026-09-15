@@ -20,9 +20,13 @@ Every row runs through the shared generic wrap
 AcpExecutor` — the same code path a user-configured ``acp:<slug>`` agent uses.
 To promote a new ACP-speaking vendor CLI to a builtin harness, add one row and
 its docs; do not add a new inner module, registry entries, or a per-harness
-spawn-env builder. Rows own their auth and model selection (``OWN_AUTH``): no
-Omnigent credential or model override is wired, so a ``/model`` pick is
-rejected up front rather than silently dropped.
+spawn-env builder. Rows own their auth (``OWN_AUTH``): no Omnigent credential is
+wired. Model selection rides the standard ACP session config-option switch
+(``session/set_config_option``), which :class:`AcpExecutor` applies before each
+prompt, so a ``/model`` pick reaches an agent that advertises a ``model`` option;
+a row may also declare a ``models`` command (``models_argv`` / ``models_format``)
+so the launch picker can list the account's models before a session exists (see
+:mod:`omnigent.harnesses.acp_cli_models`).
 
 One consequence worth knowing before adding a row: the generic ACP spawn env is
 deny-by-default and a row has no ``env_passthrough`` of its own (only a
@@ -59,12 +63,23 @@ class AcpCliHarness:
         MCP and ignore ``mcpServers``, configuring MCP out of band instead
         (e.g. jcode reads ``~/.jcode/mcp.json``); set ``False`` for those so
         the server isn't advertised.
+    :param models_argv: Argv for the CLI's non-interactive model-list command
+        (e.g. ``("models",)`` for grok, ``("models", "list", "--format", "json")``
+        for devin). Empty means the harness advertises no scriptable list; the
+        launch picker then falls back to free-text (the ACP session's advertised
+        ``model`` option still populates the in-session picker). Run host-side by
+        :func:`omnigent.harnesses.acp_cli_models.discover_acp_cli_models`.
+    :param models_format: Parser name for ``models_argv`` output — one of the
+        keys in :data:`omnigent.harnesses.acp_cli_models._PARSERS`
+        (``"devin-json"``, ``"grok-text"``) or ``"none"``.
     """
 
     install: HarnessInstallSpec
     args: tuple[str, ...]
     aliases: tuple[str, ...] = ()
     omnigent_mcp: bool = True
+    models_argv: tuple[str, ...] = ()
+    models_format: str = "none"
 
     @property
     def label(self) -> str:
@@ -90,10 +105,11 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
     # Devin (Cognition's ``devin`` CLI) drives ``devin acp`` — its ACP stdio
     # server. Ships via a curl installer (not npm) and authenticates through its
     # own ``devin auth login``, which writes a credential file it reads back at
-    # spawn; Omnigent stores nothing. The row runs Devin's account-default model:
-    # a row carries no per-user model, and ``DEVIN_MODEL`` cannot reach the agent
-    # (see the env note above), so pinning a model needs a user-configured
-    # ``acp:<slug>`` agent whose command passes ``--model``.
+    # spawn; Omnigent stores nothing. ``devin models list --format json`` lists
+    # the account's models for the launch picker, and Devin's ACP ``session/new``
+    # advertises a ``model`` config option, so a pick applies via the standard
+    # ``session/set_config_option`` switch. Effort is encoded in the model id
+    # (e.g. ``claude-opus-5-high``), so there is no separate effort option.
     "devin": AcpCliHarness(
         install=HarnessInstallSpec(
             "Devin",
@@ -104,11 +120,16 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
             auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
         ),
         args=("acp",),
+        models_argv=("models", "list", "--format", "json"),
+        models_format="devin-json",
     ),
     # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
     # curl installer (not npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no
-    # credential.
+    # credential. ``grok models`` lists the account's models for the launch
+    # picker; its ACP ``session/new`` advertises ``model`` and a separate
+    # ``reasoning_effort`` (category ``thought_level``) config option, both
+    # applied via ``session/set_config_option``.
     "grok": AcpCliHarness(
         install=HarnessInstallSpec(
             "Grok Build",
@@ -120,6 +141,8 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         ),
         args=("agent", "stdio"),
         aliases=("grok-build",),
+        models_argv=("models",),
+        models_format="grok-text",
     ),
     # jcode (https://jcode.sh) drives ``jcode acp``. Ships via a curl
     # installer (not npm) and owns its provider/model config in

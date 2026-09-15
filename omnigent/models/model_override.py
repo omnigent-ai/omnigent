@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_plugins import model_env_keys
@@ -288,9 +289,10 @@ def harness_supports_model_override(harness: str | None) -> bool:
 
     Native CLIs receive the override as
     ``--model`` at terminal launch; the SDK harnesses receive it via
-    ``HARNESS_<H>_MODEL`` in the spawn env. Anything else (e.g.
-    unknown harnesses) silently ignores the
-    persisted value, so callers must reject the override up front.
+    ``HARNESS_<H>_MODEL`` in the spawn env; builtin ACP CLI rows apply it via the
+    ACP ``session/set_config_option`` switch before each prompt. Anything else
+    (e.g. unknown harnesses) silently ignores the persisted value, so callers
+    must reject the override up front.
 
     :param harness: Harness id from a spec, e.g. ``"codex-native"`` or
         ``"claude"``; ``None`` when the harness could not be resolved.
@@ -298,7 +300,13 @@ def harness_supports_model_override(harness: str | None) -> bool:
     """
     if harness is None:
         return False
+    canonical = canonicalize_harness(harness)
     return (
         is_native_harness(harness)
-        or canonicalize_harness(harness) in _SDK_MODEL_OVERRIDE_HARNESSES
+        or canonical in _SDK_MODEL_OVERRIDE_HARNESSES
+        # Builtin ACP CLI rows apply a model pick via the standard ACP session
+        # config-option switch (``session/set_config_option``), which the ACP
+        # executor runs before each prompt — so the override reaches the agent
+        # without a spawn-env var of its own.
+        or canonical in ACP_CLI_HARNESSES
     )

@@ -143,6 +143,10 @@ _UPDATE_CONFIG_OPTION = "config_option_update"
 # not ``optionId``).
 _AGENT_METHOD_SET_CONFIG_OPTION = "session/set_config_option"
 _CONFIG_OPTION_MODEL = "model"
+# ACP config-option ``category`` for reasoning effort (Grok's ``reasoning_effort``
+# option carries ``category:"thought_level"``). Matched by category, not id, since
+# the option id is vendor-chosen while the category is the standard placement key.
+_CONFIG_CATEGORY_THOUGHT_LEVEL = "thought_level"
 
 # ACP tool-call lifecycle statuses (the terminal ones close a tool card).
 _TOOL_STATUS_COMPLETED = "completed"
@@ -389,6 +393,12 @@ class AcpExecutor(Executor):
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
         self._model_switch_supported: bool = True
+        # Full per-option snapshot (category, type, currentValue, choices) keyed
+        # by option id — the choices the model / effort pickers draw from. Kept
+        # alongside the model-only bookkeeping above so its behavior is unchanged.
+        self._config_options: dict[str, _AcpJsonObject] = {}
+        # Effort (``thought_level``) has its own latch, mirroring the model one.
+        self._effort_switch_supported: bool = True
 
         # Parsed argv; the first token is the binary we resolve / sandbox.
         self._argv: list[str] = shlex.split(config.command)
@@ -1505,6 +1515,16 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
+            # Record the full option so the pickers can offer the agent's own
+            # advertised choices; a set response's echoed options refresh these in
+            # place per id (values are updated; ids are not pruned).
+            self._config_options[opt_id] = {
+                "id": opt_id,
+                "category": opt.get("category"),
+                "type": opt.get("type"),
+                "currentValue": opt.get("currentValue"),
+                "options": opt.get("options") if isinstance(opt.get("options"), list) else [],
+            }
             if opt_id == _CONFIG_OPTION_MODEL:
                 current = opt.get("currentValue")
                 if isinstance(current, str) and current:
@@ -1573,6 +1593,81 @@ class AcpExecutor(Executor):
             "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
         )
 
+    def _config_id_for_category(self, category: str) -> str | None:
+        """Return the advertised config-option id for *category*, or ``None``.
+
+        Matches on the standard ``category`` (e.g. ``"thought_level"``) rather
+        than a vendor-chosen id; the agents we target advertise at most one option
+        per category.
+        """
+        for opt_id, opt in self._config_options.items():
+            if opt.get("category") == category:
+                return opt_id
+        return None
+
+    async def _apply_effort_override(self, session_id: str, effort: str | None) -> None:
+        """Warm-set the agent's reasoning effort via ACP ``session/set_config_option``.
+
+        Standard ACP, so this works for any agent that exposes a
+        ``thought_level`` session config option (Grok's ``reasoning_effort``,
+        values ``{xhigh, high, medium, low}``). No-op when effort is unset, when
+        the agent advertises no such option (e.g. Devin, which encodes effort in
+        the model id), when the requested value isn't one the agent offers, or
+        when a prior attempt latched the feature off — and never fails the turn.
+
+        :param session_id: The live ACP session to reconfigure.
+        :param effort: Requested canonical effort (e.g. ``"high"``), or ``None``.
+        """
+        if not effort or not self._effort_switch_supported:
+            return
+        config_id = self._config_id_for_category(_CONFIG_CATEGORY_THOUGHT_LEVEL)
+        if config_id is None:
+            # Only latch off once options are known and none is a thought_level —
+            # before the first advertisement we simply don't know yet.
+            if self._config_options:
+                self._effort_switch_supported = False
+            return
+        option = self._config_options.get(config_id, {})
+        if effort == option.get("currentValue"):
+            return
+        choices = [c.get("value") for c in option.get("options", []) if isinstance(c, dict)]
+        if choices and effort not in choices:
+            logger.info(
+                "acp[%s] effort %r not offered by the agent (%s); leaving as-is",
+                self._config.name,
+                effort,
+                config_id,
+            )
+            return
+        response = await self._rpc(
+            _AGENT_METHOD_SET_CONFIG_OPTION,
+            {"sessionId": session_id, "configId": config_id, "value": effort},
+        )
+        if "error" in response:
+            self._effort_switch_supported = False
+            logger.warning(
+                "acp[%s] effort switch to %s rejected (%s); continuing on the current effort",
+                self._config.name,
+                effort,
+                response["error"].get("message", response["error"]),
+            )
+            return
+        result = response.get("result")
+        echoed = result.get("configOptions") if isinstance(result, dict) else None
+        self._note_config_options(echoed)
+        # Trust an echoed currentValue (``_note_config_options`` applied it); if the
+        # agent accepted the switch without echoing the option, record the requested
+        # value locally so the same effort isn't re-sent every turn — mirrors how the
+        # model path falls back to the requested id when no model option is echoed.
+        echoed_ids = (
+            {opt.get("id") for opt in echoed if isinstance(opt, dict)}
+            if isinstance(echoed, list)
+            else set()
+        )
+        if config_id not in echoed_ids and config_id in self._config_options:
+            self._config_options[config_id]["currentValue"] = effort
+        logger.info("acp[%s] effort set to %s (transcript kept)", self._config.name, effort)
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1614,6 +1709,18 @@ class AcpExecutor(Executor):
         except Exception as exc:  # noqa: BLE001
             self._model_switch_supported = False
             logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
+
+        # Apply a reasoning-effort pick the same way — for agents that expose a
+        # ``thought_level`` option (Grok). Devin encodes effort in the model id,
+        # so this is a graceful no-op there.
+        requested_effort = (
+            config.extra.get("reasoning_effort") if config is not None and config.extra else None
+        )
+        try:
+            await self._apply_effort_override(session_id, requested_effort)
+        except Exception as exc:  # noqa: BLE001
+            self._effort_switch_supported = False
+            logger.warning("acp[%s] effort switch failed: %s", self._config.name, exc)
 
         # A fresh ACP session holds no prior context. Captured before the latch
         # flips so we know whether to replay history into this turn.

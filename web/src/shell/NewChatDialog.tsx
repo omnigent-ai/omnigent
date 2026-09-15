@@ -1273,7 +1273,10 @@ const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[]
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
-    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
+    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native" ||
+    // ACP harnesses (devin, grok, acp:<slug>) discover their models host-side via
+    // the vendor CLI, so they get the same model picker + per-agent config gear.
+    isAcpHarnessAgent(agent)
   );
 }
 
@@ -3117,11 +3120,60 @@ export function NewChatLandingScreen() {
     [agentList, effectiveAgentId, pendingAgent],
   );
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  // Builtin / custom ACP harnesses (devin, grok, acp:<slug>) expose their models
+  // through the host's CLI probe (`devin models list`, `grok models`) over the
+  // same /model-options path the native pickers use — so the model picker lights
+  // up for them, and the pick applies via the ACP session/set_config_option switch.
+  const selectedAcpHarness = isAcpHarnessAgent(selectedAgent)
+    ? (selectedAgent?.harness ?? null)
+    : null;
+  const {
+    data: hostAcpModelOptions,
+    isLoading: hostAcpModelsLoading,
+    error: hostAcpModelsError,
+  } = useHostModelOptions(
+    selectedHostId,
+    selectedAcpHarness ?? "",
+    !sandboxSelected && selectedAcpHarness !== null,
+  );
+  const acpModelOptions: readonly NativeModelOption[] = useMemo(
+    () =>
+      sandboxSelected || selectedAcpHarness === null
+        ? []
+        : (hostAcpModelOptions ?? []).map((option) => ({
+            id: option.id,
+            model: option.model,
+            displayName: nativeModelLabel(option),
+            isDefault: option.isDefault,
+            source: option.source,
+          })),
+    [hostAcpModelOptions, sandboxSelected, selectedAcpHarness],
+  );
+  // Keep pickedModel valid for the selected ACP harness: clear a value carried
+  // from another harness so a create can't pin a model this agent doesn't offer.
+  // Only reconcile once discovery has resolved — an in-flight fetch reports empty
+  // options, which would otherwise wipe a valid pinned model before the list arrives.
+  useEffect(() => {
+    if (selectedAcpHarness === null || hostAcpModelsLoading || hostAcpModelOptions === undefined) {
+      return;
+    }
+    if (pickedModel !== "" && !acpModelOptions.some((m) => m.id === pickedModel)) {
+      setPickedModel("");
+    }
+  }, [
+    selectedAcpHarness,
+    hostAcpModelsLoading,
+    hostAcpModelOptions,
+    acpModelOptions,
+    pickedModel,
+    setPickedModel,
+  ]);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
-  const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
+  const supportsModelPicker =
+    nativeAgentHasCapability(selectedAgent, "modelPicker") || selectedAcpHarness !== null;
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
@@ -3313,7 +3365,9 @@ export function NewChatLandingScreen() {
       ? piModelOptions
       : selectedNativeHarness === "codex-native"
         ? codexModelOptions
-        : [];
+        : selectedAcpHarness !== null
+          ? acpModelOptions
+          : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     !sandboxSelected &&
@@ -3324,13 +3378,17 @@ export function NewChatLandingScreen() {
         ? hostCodexModelsLoading
         : selectedNativeHarness === "pi-native"
           ? hostPiModelsLoading
-          : false);
+          : selectedAcpHarness !== null
+            ? hostAcpModelsLoading
+            : false);
   const pickerModelsError =
     selectedNativeHarness === "claude-native"
       ? hostClaudeModelsError
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
-        : null;
+        : selectedAcpHarness !== null
+          ? hostAcpModelsError
+          : null;
   const pickerDataLoading =
     agentsLoading ||
     (cachedPickerOptions !== null && (hostsLoading || info === "loading")) ||
@@ -3450,13 +3508,16 @@ export function NewChatLandingScreen() {
     writeHarnessOption(harness, options);
   };
   const selectPickerModel = (model: string) => {
-    if (!selectedNativeHarness) return;
+    // ACP harnesses have a model picker but no native harness id; key the
+    // remembered pick off whichever harness the composer is on.
+    const pickerHarness = selectedNativeHarness ?? selectedAcpHarness;
+    if (!pickerHarness) return;
     userPickedModelRef.current = true;
     if (model === MODEL_SELECT_SMART) {
       setPickedModel("");
       setPickedEffort("");
       setCostControlMode("on");
-      rememberPickerOptions(selectedNativeHarness, { routing: "on", model: "", effort: "" });
+      rememberPickerOptions(pickerHarness, { routing: "on", model: "", effort: "" });
       return;
     }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
@@ -3471,7 +3532,7 @@ export function NewChatLandingScreen() {
     setPickedModel(picked);
     setPickedEffort(effort);
     setCostControlMode(null);
-    rememberPickerOptions(selectedNativeHarness, { model: picked, effort, routing: "off" });
+    rememberPickerOptions(pickerHarness, { model: picked, effort, routing: "off" });
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectedNativeHarness) return;
@@ -4859,7 +4920,8 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
-      const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
+      const agentSupportsModelPicker =
+        nativeAgentHasCapability(agent, "modelPicker") || isAcpHarnessAgent(agent);
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is

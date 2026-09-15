@@ -3315,6 +3315,42 @@ describe("NewChatLandingScreen", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  it("shows CLI-discovered models for an ACP harness and sends the pick as model_override", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockAgents([
+      {
+        id: "a_devin",
+        name: "devin-agent",
+        display_name: "Devin",
+        description: null,
+        harness: "devin",
+        acpHarness: true,
+        skills: [],
+      },
+    ]);
+    // The host's `devin models list` probe answers /model-options for the row.
+    mockModelQueries((harness) =>
+      harness === "devin"
+        ? ({
+            ...SUCCESS_QUERY_STATE,
+            data: [
+              { id: "claude-opus-5-high", displayName: "Claude Opus 5 High" },
+              { id: "claude-sonnet-5-medium", displayName: "Claude Sonnet 5 Medium" },
+            ],
+          } as unknown as ReturnType<typeof useHostModelOptions>)
+        : DISABLED_QUERY_RESULT,
+    );
+    renderLanding();
+    openAgentModels("a_devin");
+    fireEvent.click(await screen.findByTestId("new-chat-landing-agent-model-claude-opus-5-high"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("claude-opus-5-high");
+  });
+
   it("hides adjacent Codex effort options when the model has no effort metadata", () => {
     useHostModelOptionsMock.mockImplementation(
       (_hostId, harness) =>
