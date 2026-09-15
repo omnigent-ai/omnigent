@@ -35,6 +35,9 @@ from omnigent._startup_events import capture_cli_entry
 from omnigent.cli_common import (
     RESUME_PICKER_SENTINEL as _RESUME_PICKER_SENTINEL,
 )
+from omnigent.cli_common import (
+    AuthFailure as _AuthFailure,
+)
 
 # Interactive harness/credential configuration lives in omnigent.cli_config; the
 # config/setup Click commands and the first-run plan call these entry points.
@@ -2333,6 +2336,7 @@ def main() -> None:
     # unrelated to runner startup are excluded to avoid a misleading hint.
     suggest_stale_host_recovery = argv[0] not in {
         "integration",
+        "login",
         "setup",
         "stop",
         "update",
@@ -2362,8 +2366,9 @@ def main() -> None:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
         # Withhold the stale-host hint for failures `omnigent stop` cannot
-        # fix — a crashed background server (LocalServerStartupError) or a
-        # missing dependency — whose real cause is already surfaced above.
+        # fix — an auth/access failure (AuthFailure), a crashed background
+        # server (LocalServerStartupError), or a missing dependency — whose
+        # real cause is already surfaced above.
         if suggest_stale_host_recovery and not suppresses_recovery_hint(exc):
             print_stale_host_hint()
         raise SystemExit(exc.exit_code) from exc
@@ -3584,7 +3589,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         else f"Not signed in to {display}"
     )
     if non_interactive or not sys.stdin.isatty():
-        raise click.ClickException(
+        raise _AuthFailure(
             f"{state} (Databricks-fronted; /v1/me answered "
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
@@ -11948,7 +11953,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
     )
 
     if not databricks_sdk_installed():
-        raise click.ClickException(
+        raise _AuthFailure(
             "Logging in to a Databricks-fronted server (a Databricks App or "
             "workspace-hosted omnigent) requires the `databricks` extra "
             f"(databricks-sdk is not installed). Reinstall with:\n  "
@@ -12021,7 +12026,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
                 display = ServerUrl(api_base=server, org_id=org_id).display
         verify = _verify_databricks_server_token(server, token, org_id)
     if verify.status_code != 200:
-        raise click.ClickException(
+        raise _AuthFailure(
             f"{workspace_host} accepted the login, but {display} rejected the token "
             f"(HTTP {verify.status_code}). Check that your user has access to this app."
         )
@@ -12070,7 +12075,7 @@ def _login_and_mint_workspace_auth_info(
     _run_databricks_browser_login(workspace_host, org_id)
     auth_info = _databricks_workspace_auth_info(workspace_host)
     if auth_info is None:
-        raise click.ClickException(
+        raise _AuthFailure(
             f"Workspace login completed but no token resolves for {workspace_host}. "
             f"Run `databricks auth token --host {workspace_host}` to debug."
         )
@@ -12098,7 +12103,7 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
-        raise click.ClickException(
+        raise _AuthFailure(
             "The Databricks CLI is required to log in to a workspace. "
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
@@ -12116,7 +12121,7 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
         check=False,
     )
     if result.returncode != 0:
-        raise click.ClickException(
+        raise _AuthFailure(
             f"`databricks auth login --host {login_host} --profile {profile}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
@@ -12149,9 +12154,7 @@ def _verify_databricks_server_token(
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:
-        raise click.ClickException(
-            f"Could not reach {server}/v1/me to verify login: {exc}"
-        ) from exc
+        raise _AuthFailure(f"Could not reach {server}/v1/me to verify login: {exc}") from exc
 
 
 @dataclass(frozen=True)
