@@ -13,6 +13,7 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_native_spawn_env,
     build_hook_config,
     devin_input_ready,
+    devin_queue_pending,
     hooks_size,
     iter_hook_events,
     record_hook_event,
@@ -430,3 +431,37 @@ class TestModelOptions:
         )
         with pytest.raises(ValueError, match="did not contain any valid families"):
             list_devin_cli_model_options()
+
+
+# Devin's own queue strip, verbatim from a pane where a message was submitted
+# while a turn was running (devin 3000.10.21).
+_QUEUED_PANE = """\
+Pro · 100% remaining (resets in 11h 21m)
+────────────────────────────────────────
+❭ Ask Devin to build features, fix bugs, or work on your code
+────────────────────────────────────────
+── 1 queued ─────────────────────────── ↑ edit · ↵ send now ──
+○ Tell me the best one
+"""
+
+
+class TestQueuedPane:
+    """A steered message must not sit in Devin's own queue."""
+
+    def test_queue_strip_is_detected(self) -> None:
+        assert devin_queue_pending(_QUEUED_PANE) is True
+
+    def test_idle_pane_has_nothing_queued(self) -> None:
+        assert devin_queue_pending(_IDLE_PANE) is False
+
+    def test_busy_pane_alone_is_not_a_queue(self) -> None:
+        # Mid-turn without the queue strip: the composer is writable, nothing parked.
+        assert devin_queue_pending(_BUSY_PANE) is False
+
+    def test_wrapped_queue_strip_is_still_detected(self) -> None:
+        # Narrow panes wrap the strip, so matching cannot depend on one line.
+        assert devin_queue_pending("── 2 queued ──\n↑ edit ·\n↵ send now ──\n○ hi\n") is True
+
+    def test_the_word_queued_alone_is_not_a_queue(self) -> None:
+        # A turn that merely talks about queues must not trip the flush.
+        assert devin_queue_pending("I queued the job for you.\n") is False

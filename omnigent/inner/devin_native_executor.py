@@ -48,8 +48,10 @@ class DevinNativeExecutor(Executor):
         """:returns: ``True`` — Devin accepts steering input mid-turn.
 
         Devin's composer stays writable while a turn runs (its placeholder
-        changes to "Guide Devin while it works"), so a queued message steers the
-        running turn rather than waiting for it to finish.
+        changes to "Guide Devin while it works"), so a message can steer the
+        running turn rather than waiting for it to finish. Devin parks a mid-turn
+        submission in its own queue, which the bridge then flushes with Devin's
+        "send now" — Omnigent only delivers mid-turn when the user asked for now.
         """
         return True
 

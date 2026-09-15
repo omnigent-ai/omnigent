@@ -99,6 +99,11 @@ _DEVIN_BUSY_PLACEHOLDER = "Guide Devin while it works"
 _DEVIN_INPUT_READY_MARKERS = (_DEVIN_IDLE_PLACEHOLDER, _DEVIN_BUSY_PLACEHOLDER)
 #: Pane text shown while the TUI is still starting up.
 _DEVIN_BOOT_MARKERS = ("Starting", "Loading", "Connecting")
+#: Devin parks a message submitted mid-turn in its own queue and offers this
+#: hint; pressing Enter again is its "send now".
+_DEVIN_SEND_NOW_HINT = "send now"
+_QUEUE_FLUSH_TIMEOUT_S = 2.0
+_QUEUE_FLUSH_INTERVAL_S = 0.3
 
 #: Hook events Omnigent registers. ``PreToolUse`` / ``UserPromptSubmit`` are
 #: enforcement gates; ``PermissionRequest`` mirrors Devin's own consent prompt
@@ -641,6 +646,34 @@ def _devin_still_booting(pane: str) -> bool:
     return any(marker in pane for marker in _DEVIN_BOOT_MARKERS)
 
 
+def devin_queue_pending(pane: str) -> bool:
+    """Return whether Devin is holding a submitted message in its own queue.
+
+    Devin parks a message submitted while a turn runs ("N queued … enter send
+    now") instead of steering it in, so a message Omnigent meant to send now
+    would sit there until the turn ended.
+    """
+    normalized = " ".join(pane.split())
+    return "queued" in normalized and _DEVIN_SEND_NOW_HINT in normalized
+
+
+def _flush_devin_queue(socket_path: str, tmux_target: str) -> None:
+    """Press Devin's "send now" while it holds a queued message.
+
+    Omnigent delivers a message mid-turn only when the user asked for it to go now
+    (the always-steer preference, or the queue strip's send-now), so Devin's own
+    queue must not hold it back. Any message the user parked in the pane goes with
+    it. Best-effort and bounded: Devin sends a queued message when the turn ends
+    anyway, so a pane that will not clear is left alone rather than failed.
+    """
+    deadline = time.monotonic() + _QUEUE_FLUSH_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if not devin_queue_pending(_capture_pane(socket_path, tmux_target)):
+            return
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        time.sleep(_QUEUE_FLUSH_INTERVAL_S)
+
+
 def _devin_pane_error(pane: str) -> str:
     """Return a short pane-visible failure reason, or empty string."""
     lowered = pane.lower()
@@ -815,6 +848,7 @@ def inject_user_message(
     if not draft_seen:
         # Never observed the draft, so there is nothing to verify against —
         # the Enter above is the best-effort submit.
+        _flush_devin_queue(socket_path, tmux_target)
         return
     deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
     last_enter = time.monotonic()
@@ -823,6 +857,7 @@ def inject_user_message(
         if not _draft_in_input_region(
             _capture_pane(socket_path, tmux_target), needle, baseline_region
         ):
+            _flush_devin_queue(socket_path, tmux_target)
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
