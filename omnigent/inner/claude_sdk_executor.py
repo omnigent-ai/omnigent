@@ -1973,6 +1973,34 @@ class ClaudeSDKExecutor(Executor):
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
 
+    async def _evict_terminated_client(self, session_key: str) -> None:
+        """Drop a cached client whose CLI child has terminated.
+
+        Reads the same transport state the SDK's ``write()`` checks, so a
+        non-``None`` returncode here is exactly the state that would raise
+        "Cannot write to terminated process" on the next ``query()``. A
+        missing transport/process (test fakes, force-closed clients) reads
+        as alive: only a positively terminated child triggers eviction.
+
+        :param session_key: Session whose cached client to check.
+        """
+        state = self._clients.get(session_key)
+        if state is None:
+            return
+        transport = getattr(state.client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        returncode = getattr(process, "returncode", None)
+        if returncode is None:
+            return
+        logger.warning(
+            "Claude SDK CLI for session %s terminated between turns "
+            "(exit code: %s); discarding the dead client so this turn "
+            "rebuilds a fresh one.",
+            session_key,
+            returncode,
+        )
+        await self._close_live_client(session_key)
+
     async def close(self) -> None:
         session_keys = list(self._clients)
         for session_key in session_keys:
@@ -2431,6 +2459,11 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        # A CLI child killed between turns (OS / cgroup / idle reap) leaves the
+        # cached client dead; writing to it would fail this turn and poison the
+        # session via the crash boundary. Evict it before resume_session is
+        # computed so the turn rebuilds a fresh client and replays history.
+        await self._evict_terminated_client(session_key)
         prompt = self._build_prompt(
             messages,
             resume_session=session_key in self._clients,
