@@ -57,7 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "side_chat";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -376,6 +376,16 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
  */
 export function getCachedServerInfo(): ServerInfo | null {
   return cachedServerInfo;
+}
+
+/**
+ * Test-only: override the cached server info (pass ``null`` to clear).
+ *
+ * Lets a test drive code that reads :func:`getCachedServerInfo` (e.g. the
+ * non-React store's `/side` feature gate) without standing up the boot probe.
+ */
+export function setCachedServerInfoForTests(info: ServerInfo | null): void {
+  cachedServerInfo = info;
 }
 
 /**

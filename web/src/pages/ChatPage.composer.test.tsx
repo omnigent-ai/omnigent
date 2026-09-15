@@ -25,7 +25,13 @@ import {
 } from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+
+// A server info snapshot with the `side_chat` release feature turned on, for
+// the /side tests (the composer reads the flag from CapabilitiesContext).
+const SIDE_CHAT_ON = { ...FALLBACK_SERVER_INFO, features: { side_chat: true } };
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -3064,7 +3070,11 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
   it("sends as a /side command carrying the quoted selection and the question", () => {
     const props = composerProps();
     const ref = createRef<ComponentRef<typeof Composer>>();
-    render(<Composer {...props} ref={ref} />);
+    render(
+      <CapabilitiesContext.Provider value={SIDE_CHAT_ON}>
+        <Composer {...props} ref={ref} />
+      </CapabilitiesContext.Provider>,
+    );
 
     act(() => ref.current?.startSideChat("restore the row on failure"));
     fireEvent.change(textarea(), { target: { value: "why is this safe?" } });

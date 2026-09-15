@@ -102,7 +102,7 @@ import {
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
-import { isSideChatCommand, SIDE_CHAT_COMMAND_PREFIX, supportsSideChat } from "@/lib/sideChat";
+import { isSideChatCommand, SIDE_CHAT_COMMAND_PREFIX, sideChatEnabled } from "@/lib/sideChat";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -943,8 +943,9 @@ export function ChatPage() {
       const chat = useChatStore.getState();
       // A codex /side command opens its own side chat off the parent thread, so
       // it must POST now even mid-turn rather than park in the queue (see the
-      // matching gate in the store's send()). Mirror that harness gate here.
-      const opensSideChat = supportsSideChat(chat.sessionHarness) && isSideChatCommand(text.trim());
+      // matching gate in the store's send()). Mirror that gate here.
+      const opensSideChat =
+        sideChatEnabled(chat.sessionHarness, serverInfo) && isSideChatCommand(text.trim());
       if (
         shouldQueueSend(
           chat.conversationId,
@@ -977,6 +978,7 @@ export function ChatPage() {
       canResumeOnLocalHost,
       isUnreachable,
       navigate,
+      serverInfo,
     ],
   );
 
@@ -1597,8 +1599,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   const composerRef = useRef<ComposerHandle>(null);
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
-  // in side chat" action to harnesses that support side chat.
+  // in side chat" action to harnesses that support side chat, plus the
+  // deployment `side_chat` release flag.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
+  const selectionServerInfo = useServerInfo();
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1835,7 +1839,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             containerRef={conversationRef}
             onReply={(text) => composerRef.current?.appendReplyQuote(text)}
             onAskInSideChat={
-              supportsSideChat(selectionSessionHarness)
+              sideChatEnabled(selectionSessionHarness, selectionServerInfo)
                 ? (text) => composerRef.current?.startSideChat(text)
                 : undefined
             }
@@ -2367,6 +2371,8 @@ function ComposerImpl(
     sideChat,
     removeQuote,
   } = useReplyDraft();
+  // Deployment release flags (drives the /side `side_chat` gate below).
+  const composerServerInfo = useServerInfo();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -2662,10 +2668,11 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
-  // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
-  // only on codex-native sessions. Selected/typed, it sends as plaintext to the
-  // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
-  const showSide = supportsSideChat(sessionHarness);
+  // /side is a Codex Code CLI built-in (ephemeral fork side chat), offered only
+  // on codex-native sessions AND when the `side_chat` release feature is on.
+  // Selected/typed, it sends as plaintext to the vendor turn path (see submit);
+  // the runner opens the fork as a sub-agent chat.
+  const showSide = sideChatEnabled(sessionHarness, composerServerInfo);
   const slashCommands = useMemo(
     () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw, showSide),
     [skills, showEffort, showModel, showCompact, showBtw, showSide],
@@ -3229,7 +3236,7 @@ function ComposerImpl(
         ),
       };
       const serialized = serializeReplyDraft(outgoing);
-      if (sideChat && supportsSideChat(sessionHarness)) {
+      if (sideChat && sideChatEnabled(sessionHarness, composerServerInfo)) {
         // Route the quoted selection + question to a side chat: the /side
         // pipeline keys off the leading command and forks. No main-chat bubble
         // is kept for a side chat, so no reply-draft snapshot is persisted.

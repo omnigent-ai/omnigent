@@ -47,6 +47,20 @@ def _fork_started(
 
 
 # --------------------------------------------------------------------------- #
+# side_chat_enabled — OMNIGENT_FEATURES=side_chat feature gate
+# --------------------------------------------------------------------------- #
+def test_side_chat_enabled_reads_the_feature_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    assert side_chat.side_chat_enabled() is False  # default off
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "side_chat")
+    assert side_chat.side_chat_enabled() is True
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "canvas,usage_page")
+    assert side_chat.side_chat_enabled() is False  # other features don't enable it
+
+
+# --------------------------------------------------------------------------- #
 # side_chat_question — /side detection on normalized turn input
 # --------------------------------------------------------------------------- #
 def test_side_chat_question_extracts_question() -> None:

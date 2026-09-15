@@ -71,6 +71,22 @@ _logger = logging.getLogger(__name__)
 _JsonObject = dict[str, Any]
 
 
+def side_chat_enabled() -> bool:
+    """
+    Whether the ``/side`` side-chat release feature is on for this process.
+
+    Gated by ``OMNIGENT_FEATURES=side_chat`` (see :mod:`omnigent.server.feature_flags`).
+    Read at each ``/side`` decision point so the whole feature — command
+    interception and the forwarder drainer — is inert when off; a ``/side``
+    message then flows through as an ordinary turn. Child processes inherit
+    ``OMNIGENT_FEATURES`` from the runner, so this reads the same value the
+    server resolves.
+    """
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+    return resolve_feature_flags().enabled(Feature.SIDE_CHAT)
+
+
 def side_chat_question_from_text(text: str) -> str | None:
     """
     Return the question when *text* is a ``/side`` command.

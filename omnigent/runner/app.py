@@ -9005,6 +9005,7 @@ def create_runner_app(
             )
             if (
                 _side_question is not None
+                and _side_chat.side_chat_enabled()
                 and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
             ):
                 _side_chat.request_side_chat(

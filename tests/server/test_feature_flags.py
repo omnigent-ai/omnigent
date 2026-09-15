@@ -23,6 +23,7 @@ def test_features_default_off() -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "side_chat": False,
     }
 
 
@@ -55,6 +56,14 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == ("canvas",)
+
+
+def test_side_chat_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "side_chat"})
+
+    assert flags.enabled(Feature.SIDE_CHAT)
+    assert flags.frontend_dict()["side_chat"] is True
+    assert flags.enabled_names() == ("side_chat",)
 
 
 def test_unknown_feature_fails_with_known_names() -> None:

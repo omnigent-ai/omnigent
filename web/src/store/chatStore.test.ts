@@ -35,6 +35,7 @@ import { buildBubbles } from "@/lib/renderItems";
 import { INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { FALLBACK_SERVER_INFO, setCachedServerInfoForTests } from "@/lib/capabilities";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import {
@@ -6639,6 +6640,15 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("codex /side send", () => {
+    // The store's /side gate reads the `side_chat` release flag from the cached
+    // server info; turn it on for these tests and clear it after.
+    beforeEach(() => {
+      setCachedServerInfoForTests({ ...FALLBACK_SERVER_INFO, features: { side_chat: true } });
+    });
+    afterEach(() => {
+      setCachedServerInfoForTests(null);
+    });
+
     it("neither bubbles in the parent nor latches it into Working", async () => {
       // The command is forked into a side chat, so this session runs nothing:
       // a bubble would sit unanswered and a "streaming" latch would never clear.

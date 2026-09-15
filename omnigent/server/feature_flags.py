@@ -23,6 +23,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    SIDE_CHAT = "side_chat"
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SIDE_CHAT,
+        description="Codex-native /side ephemeral side chat (fork opened as a sub-agent)",
+        owner="codex",
+        review_by_release="0.16.0",
     ),
 )
 

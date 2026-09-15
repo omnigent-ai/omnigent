@@ -473,7 +473,7 @@ class CodexNativeExecutor(Executor):
                 await client.connect()
                 try:
                     side_question = side_chat.side_chat_question(input_items)
-                    if side_question is not None:
+                    if side_question is not None and side_chat.side_chat_enabled():
                         # /side opens an ephemeral fork as its own sub-agent chat.
                         # The fork must happen on the forwarder's connection —
                         # it owns the fork's event stream, while this client
