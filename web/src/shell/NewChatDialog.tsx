@@ -230,13 +230,8 @@ import {
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
 } from "@/lib/nativeHarnessModes";
-import {
-  fetchHosts,
-  useHostModelOptions,
-  useHostSkills,
-  useHosts,
-  type Host,
-} from "@/hooks/useHosts";
+import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { useSkills } from "@/hooks/useSkills";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -264,7 +259,7 @@ import { useHostWorktrees, type HostWorktree } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import type { NativeModelOption, SkillsStatus } from "@/lib/types";
+import type { NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -4243,31 +4238,27 @@ export function NewChatLandingScreen() {
             ? "Choose a harness to discover host skills."
             : undefined;
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
-  const hostSkills = useHostSkills(
-    selectedHostId,
-    skillsHarness,
-    workspaceTrimmed,
-    canDiscoverHostSkills,
-  );
-  const skillsStatus: SkillsStatus = canDiscoverHostSkills
-    ? hostSkills.isPending
-      ? "loading"
-      : hostSkills.isError
-        ? "error"
-        : "ready"
-    : !sandboxSelected && (hostsLoading || agentsLoading)
-      ? "loading"
-      : "unavailable";
+  const {
+    skills: hostSkills,
+    skillsStatus,
+    refetch: refreshSkills,
+  } = useSkills({
+    hostId: selectedHostId,
+    harness: skillsHarness,
+    path: workspaceTrimmed,
+    enabled: canDiscoverHostSkills,
+    starting: !sandboxSelected && (hostsLoading || agentsLoading),
+  });
   const availableSkills = useMemo(() => {
     // Bundled skills take precedence, as they do in the runner's session catalog.
     const skills = new Map((selectedAgent?.skills ?? []).map((skill) => [skill.name, skill]));
     if (canDiscoverHostSkills) {
-      for (const skill of hostSkills.data ?? []) {
+      for (const skill of hostSkills) {
         if (!skills.has(skill.name)) skills.set(skill.name, skill);
       }
     }
     return [...skills.values()];
-  }, [selectedAgent?.skills, canDiscoverHostSkills, hostSkills.data]);
+  }, [selectedAgent?.skills, canDiscoverHostSkills, hostSkills]);
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
@@ -5827,7 +5818,7 @@ export function NewChatLandingScreen() {
                         commands={skillCommands}
                         skillsStatus={skillsStatus}
                         skillsUnavailableMessage={skillsUnavailableMessage}
-                        onRetrySkills={() => void hostSkills.refetch()}
+                        onRetrySkills={() => void refreshSkills()}
                       />
                     )}
                     {/* "@"-file-mention browser — native terminal agents with a workspace */}

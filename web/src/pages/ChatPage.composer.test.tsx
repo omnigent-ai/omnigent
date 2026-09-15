@@ -3934,8 +3934,8 @@ const skillsFixture = create<{
   refetch: ReturnType<typeof vi.fn>;
 }>(() => ({ skills: [], skillsStatus: null, refetch: vi.fn() }));
 
-vi.mock("@/hooks/useSessionSkills", () => ({
-  useSessionSkills: (_session: unknown, _online: unknown, starting: boolean) => {
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: ({ starting }: { starting: boolean }) => {
     const state = skillsFixture();
     return {
       ...state,

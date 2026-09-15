@@ -17,7 +17,7 @@ from fastapi import HTTPException
 
 from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.routes._host_skills import request_host_skills
+from omnigent.server.routes.skills import request_host_skills
 
 
 async def test_hosts_not_mounted_without_host_store(client: httpx.AsyncClient) -> None:
@@ -45,7 +45,7 @@ async def test_skills_proxy_cleans_up_unanswered_requests(
         owner=None,
     )
     if outcome == "timeout":
-        monkeypatch.setattr("omnigent.server.routes._host_skills._SKILLS_TIMEOUT_S", 0.01)
+        monkeypatch.setattr("omnigent.server.routes.skills._SKILLS_TIMEOUT_S", 0.01)
     elif outcome == "replaced":
         registry.deregister(conn.host_id)
     task = asyncio.create_task(

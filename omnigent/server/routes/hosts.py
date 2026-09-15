@@ -55,12 +55,11 @@ from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
-from omnigent.server.routes._host_skills import request_host_skills
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
 )
-from omnigent.server.schemas import SessionGitOptions, SkillSummary
+from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -464,12 +463,6 @@ class HostModelOptionsResponse(BaseModel):
     error: str | None = None
 
 
-class HostSkillsResponse(BaseModel):
-    """User-invocable skill metadata discovered on a host."""
-
-    skills: list[SkillSummary]
-
-
 class LaunchRunnerRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/runners``.
 
@@ -735,50 +728,6 @@ def create_hosts_router(
                 [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
             ),
             error=error if isinstance(error, str) and error else None,
-        )
-
-    @router.get("/hosts/{host_id}/harnesses/{harness}/skills")
-    async def get_host_skills(
-        request: Request,
-        host_id: str,
-        harness: str,
-        path: str = Query(
-            ...,
-            min_length=1,
-            description="Absolute or tilde-prefixed discovery directory on the selected host.",
-        ),
-    ) -> HostSkillsResponse:
-        """Discover workspace, user, and plugin skill metadata before a session exists.
-
-        Uses the host's ambient harness configuration. Sessions may add bundled
-        agent skills and apply agent filters, so this is a pre-launch catalog.
-        Requires a connected host running a version that supports skill discovery.
-        """
-        user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
-
-        result = await request_host_skills(
-            host_registry=host_registry,
-            host_conn=conn,
-            harness=canonicalize_harness(harness) or harness,
-            path=path,
-        )
-        if result.status != "ok":
-            raise HTTPException(
-                status_code={"invalid_path": 400, "not_directory": 404}.get(
-                    result.error_code or "", 502
-                ),
-                detail=result.error or "host skill discovery failed",
-            )
-        return HostSkillsResponse(
-            skills=[SkillSummary.model_validate(skill) for skill in result.skills]
         )
 
     @router.post("/hosts/{host_id}/runners")

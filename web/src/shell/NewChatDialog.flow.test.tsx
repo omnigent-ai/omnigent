@@ -1,3 +1,6 @@
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
@@ -89,7 +92,6 @@ vi.mock("@/lib/identity", () => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
-  useHostSkills: vi.fn(() => ({ data: [], isPending: false, isError: false, refetch: vi.fn() })),
   useHostModelOptions: vi.fn(() => ({
     data: [
       { id: "opus", displayName: "Opus" },

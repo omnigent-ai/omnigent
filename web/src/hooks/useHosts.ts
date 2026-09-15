@@ -1,7 +1,6 @@
 import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
-import type { NativeModelOption, SkillSummary } from "@/lib/types";
-import { fetchSkills } from "./useSessionSkills";
+import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
   host_id: string;
@@ -129,29 +128,6 @@ export function useHostModelOptions(hostId: string | null, harness: string, enab
     // surfaces its error once the retries exhaust (~22 s).
     retry: 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
-  });
-}
-
-/** Skill metadata available before a session exists, scoped to the launch target. */
-export function useHostSkills(
-  hostId: string | null,
-  harness: string | null,
-  path: string,
-  enabled = true,
-) {
-  return useQuery({
-    queryKey: ["host-skills", hostId, harness, path],
-    queryFn: async ({ signal }): Promise<SkillSummary[]> => {
-      const params = new URLSearchParams({ path });
-      return fetchSkills(
-        `/v1/hosts/${encodeURIComponent(hostId!)}/harnesses/${encodeURIComponent(harness!)}/skills?${params}`,
-        signal,
-      );
-    },
-    enabled: enabled && hostId !== null && harness !== null && path !== "",
-    staleTime: 30_000,
-    // Invalid directories and older hosts should expose Retry, not prolong the spinner.
-    retry: false,
   });
 }
 

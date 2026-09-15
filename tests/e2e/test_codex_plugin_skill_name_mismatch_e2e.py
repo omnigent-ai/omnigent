@@ -11,7 +11,7 @@ runtime::
 On the current build the same installed skill is surfaced under two
 different names depending on the session's harness family:
 
-* a claude-family session's ``GET /v1/sessions/{id}/skills`` menu shows
+* a claude-family session's ``GET /v1/skills?session_id={id}`` menu shows
   ``myplugin:brand-review`` (``_claude_plugin_skills`` namespaces it),
 * a codex-family session's menu and ``$CODEX_HOME/skills/`` carry only the
   bare ``brand-review`` (``select_codex_skill_dirs`` keys by directory

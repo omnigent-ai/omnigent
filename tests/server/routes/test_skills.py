@@ -1,4 +1,4 @@
-"""Session menu discovery uses the host and retains session access rules."""
+"""Unified discovery authorizes either a session editor or the host owner."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
@@ -19,9 +20,10 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions.routes_agent import register_agent_routes
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -55,8 +57,10 @@ def skills_app(db_uri: str, tmp_path: Path):
     )
     permissions.ensure_user("owner")
     permissions.ensure_user("reader")
+    permissions.ensure_user("editor")
     permissions.grant("owner", conv.id, LEVEL_OWNER)
     permissions.grant("reader", conv.id, LEVEL_READ)
+    permissions.grant("editor", conv.id, LEVEL_EDIT)
     conn = registry.register(
         "a828988dc0b441fb8d04dad3761773b9",
         AsyncMock(),
@@ -76,12 +80,28 @@ def skills_app(db_uri: str, tmp_path: Path):
         permission_store=permissions,
     )
     app.include_router(router, prefix="/v1")
+    app.include_router(
+        create_skills_router(
+            registry,
+            hosts,
+            conversations,
+            agent_store=agents,
+            auth_provider=_Auth(),
+            permission_store=permissions,
+        ),
+        prefix="/v1",
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
     return app, registry, conn, conv, agent, hosts
 
 
-@pytest.mark.parametrize("user", ["owner", "reader"])
+@pytest.mark.parametrize("user", ["owner", "editor"])
 @pytest.mark.parametrize("acknowledged", [True, False])
-async def test_session_catalog_needs_no_runner_and_preserves_shared_read_access(
+async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
     skills_app, user: str, acknowledged: bool
 ) -> None:
     app, _, conn, conv, agent, _ = skills_app
@@ -90,7 +110,7 @@ async def test_session_catalog_needs_no_runner_and_preserves_shared_read_access(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         task = asyncio.create_task(
-            client.get(f"/v1/sessions/{conv.id}/skills", headers={"x-test-user": user})
+            client.get("/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": user})
         )
         frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
         assert isinstance(frame, HostSkillsFrame)
@@ -118,15 +138,64 @@ async def test_session_catalog_needs_no_runner_and_preserves_shared_read_access(
     assert not conn.pending_skills
 
 
-async def test_unauthorized_session_does_not_send_discovery(skills_app) -> None:
+@pytest.mark.parametrize("user,status", [("reader", 403), ("stranger", 404), (None, 401)])
+async def test_unauthorized_session_does_not_send_discovery(
+    skills_app, user: str | None, status: int
+) -> None:
     app, _, conn, conv, _, _ = skills_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        with pytest.raises(OmnigentError):
-            await client.get(f"/v1/sessions/{conv.id}/skills", headers={"x-test-user": "stranger"})
+        response = await client.get(
+            "/v1/skills",
+            params={"session_id": conv.id},
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status
     assert conn.outbound_queue.empty()
     assert not conn.pending_skills
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"host_id": "other-host"},
+        {"path": "/other"},
+        {"harness": "codex-native"},
+    ],
+)
+async def test_session_target_cannot_be_overridden(skills_app, overrides: dict[str, str]) -> None:
+    app, _, conn, conv, _, _ = skills_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/v1/skills",
+            params={"session_id": conv.id, **overrides},
+            headers={"x-test-user": "editor"},
+        )
+    assert response.status_code == 422
+    assert conn.outbound_queue.empty()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"session_id": ""},
+        {"host_id": "host"},
+        {"host_id": "host", "path": "/repo"},
+        {"harness": "claude-native", "path": "/repo"},
+    ],
+)
+async def test_discovery_requires_one_complete_target(skills_app, params: dict[str, str]) -> None:
+    app, _, conn, _, _, _ = skills_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/v1/skills", params=params, headers={"x-test-user": "owner"})
+    assert response.status_code == 422
+    assert conn.outbound_queue.empty()
 
 
 @pytest.mark.parametrize(

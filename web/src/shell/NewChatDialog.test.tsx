@@ -1,6 +1,9 @@
+import { useSkills } from "@/hooks/useSkills";
+
+vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
 import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
-import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as UseSkillsModule from "@/hooks/useSkills";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
@@ -38,7 +41,6 @@ import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/ide
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
   useHostModelOptions,
-  useHostSkills,
   fetchHosts,
   useHosts,
   useInstallHarness,
@@ -162,7 +164,6 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
-  useHostSkills: vi.fn(),
   fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
@@ -1104,13 +1105,15 @@ function setupLandingMocks() {
   useProjectConfigMock.mockReset();
   useProjectConfigMock.mockReturnValue(DISABLED_QUERY_RESULT);
   useHostModelOptionsMock.mockReset();
-  vi.mocked(useHostSkills).mockReset();
-  vi.mocked(useHostSkills).mockReturnValue({
-    data: [],
-    isPending: false,
-    isError: false,
-    refetch: vi.fn(),
-  } as unknown as ReturnType<typeof useHostSkills>);
+  vi.mocked(useSkills).mockReset();
+  vi.mocked(useSkills).mockImplementation(
+    ({ enabled = true, starting = false }) =>
+      ({
+        skills: [],
+        skillsStatus: enabled ? "ready" : starting ? "loading" : "unavailable",
+        refetch: vi.fn(),
+      }) as ReturnType<typeof useSkills>,
+  );
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
   useHostWorktreesMock.mockReset();
@@ -5868,20 +5871,23 @@ describe("NewChatLandingScreen skills menu", () => {
     });
   }
 
-  function mockHostSkills(state: Partial<ReturnType<typeof useHostSkills>>) {
-    vi.mocked(useHostSkills).mockReturnValue({
-      data: [],
-      isPending: false,
-      isError: false,
-      refetch: vi.fn(),
-      ...state,
-    } as ReturnType<typeof useHostSkills>);
+  function mockSkills(state: Partial<ReturnType<typeof useSkills>>) {
+    vi.mocked(useSkills).mockImplementation(
+      ({ enabled = true, starting = false }) =>
+        ({
+          skills: [],
+          skillsStatus: "ready",
+          refetch: vi.fn(),
+          ...state,
+          ...(!enabled ? { skills: [], skillsStatus: starting ? "loading" : "unavailable" } : {}),
+        }) as ReturnType<typeof useSkills>,
+    );
   }
 
   it("updates and selects arriving skills under StrictMode without retyping", async () => {
-    const { useHostSkills: realHook } =
-      await vi.importActual<typeof UseHostsModule>("@/hooks/useHosts");
-    vi.mocked(useHostSkills).mockImplementation(realHook);
+    const { useSkills: realHook } =
+      await vi.importActual<typeof UseSkillsModule>("@/hooks/useSkills");
+    vi.mocked(useSkills).mockImplementation(realHook);
     let resolveSkills!: (response: Response) => void;
     authenticatedFetchMock.mockReturnValue(
       new Promise<Response>((resolve) => {
@@ -5897,7 +5903,7 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(input).toHaveValue("/review");
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
     expect(authenticatedFetchMock.mock.calls[0]![0]).toContain(
-      "/v1/hosts/host_1/harnesses/claude-native/skills?path=%2FUsers%2Fcorey%2Frepo",
+      "/v1/skills?host_id=host_1&harness=claude-native&path=%2FUsers%2Fcorey%2Frepo",
     );
     await act(async () =>
       resolveSkills({
@@ -5918,13 +5924,13 @@ describe("NewChatLandingScreen skills menu", () => {
 
   it("preserves bundled skills while host discovery loads and gives them precedence", () => {
     mockAgents([skilledAgent()]);
-    mockHostSkills({ isPending: true, data: undefined });
+    mockSkills({ skillsStatus: "loading" });
     renderLanding();
     typeMessage("/");
     expect(screen.getByText("Loading skills…")).toBeInTheDocument();
     expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
-    mockHostSkills({
-      data: [
+    mockSkills({
+      skills: [
         { name: "review-pr", description: "Host duplicate" },
         { name: "host-review", description: "Host-only skill" },
       ],
@@ -5938,12 +5944,12 @@ describe("NewChatLandingScreen skills menu", () => {
 
   it("shows Retry for discovery failures and an empty state after successful retry", () => {
     const retry = vi.fn();
-    mockHostSkills({ isError: true, refetch: retry });
+    mockSkills({ skillsStatus: "error", refetch: retry });
     renderLanding();
     typeMessage("/");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(retry).toHaveBeenCalledOnce();
-    mockHostSkills({ data: [] });
+    mockSkills({ skills: [] });
     typeMessage("/missing");
     expect(screen.getByText("No matching skills")).toBeInTheDocument();
     typeMessage("/");
@@ -5951,7 +5957,7 @@ describe("NewChatLandingScreen skills menu", () => {
   });
 
   it("dismisses a loading-only menu with Escape", () => {
-    mockHostSkills({ isPending: true });
+    mockSkills({ skillsStatus: "loading" });
     renderLanding();
     typeMessage("/");
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Escape" });
@@ -5961,7 +5967,7 @@ describe("NewChatLandingScreen skills menu", () => {
 
   it("hides the cached host catalog when the host disconnects", () => {
     mockAgents([skilledAgent()]);
-    mockHostSkills({ data: [{ name: "host-only", description: "Host-only skill" }] });
+    mockSkills({ skills: [{ name: "host-only", description: "Host-only skill" }] });
     renderLanding();
     typeMessage("/");
     expect(screen.getByTestId("slash-menu-item-host-only")).toBeInTheDocument();
@@ -5969,11 +5975,13 @@ describe("NewChatLandingScreen skills menu", () => {
     typeMessage("/host");
     expect(screen.getByText("Skills unavailable while the host is offline.")).toBeInTheDocument();
     expect(screen.queryByTestId("slash-menu-item-host-only")).not.toBeInTheDocument();
-    expect(useHostSkills).toHaveBeenLastCalledWith(
-      "host_1",
-      "claude-sdk",
-      "/Users/corey/repo",
-      false,
+    expect(useSkills).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        hostId: "host_1",
+        harness: "claude-sdk",
+        path: "/Users/corey/repo",
+        enabled: false,
+      }),
     );
     typeMessage("/");
     expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
@@ -5983,7 +5991,7 @@ describe("NewChatLandingScreen skills menu", () => {
     "delivers a host skill as the first message (native: %s)",
     async (native) => {
       if (!native) mockAgents([skilledAgent()]);
-      mockHostSkills({ data: [{ name: "host-review", description: "Review on host" }] });
+      mockSkills({ skills: [{ name: "host-review", description: "Review on host" }] });
       authenticatedFetchMock.mockResolvedValue({
         ok: true,
         json: async () => ({ id: "conv_new" }),
