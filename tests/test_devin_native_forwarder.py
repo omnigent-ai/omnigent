@@ -461,9 +461,6 @@ class TestPoisonEventSkip:
             )
             assert _post_failure_is_permanent(exc) is False, status
 
-    def test_a_transport_error_is_retried(self) -> None:
-        assert _post_failure_is_permanent(httpx.ConnectError("down")) is False
-
     @pytest.mark.asyncio
     async def test_the_loop_steps_over_a_rejected_event(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -501,20 +498,28 @@ class TestPoisonEventSkip:
         assert _read_state(tmp_path).hooks_offset == hooks_size(tmp_path)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            httpx.HTTPStatusError(
+                "unavailable",
+                request=httpx.Request("POST", "http://x"),
+                response=httpx.Response(503),
+            ),
+            httpx.ConnectError("server down"),  # carries no verdict at all
+        ],
+        ids=["503", "transport"],
+    )
     async def test_the_loop_stops_on_a_retryable_failure(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
     ) -> None:
-        """A 503 keeps its event, so the supervisor's restart re-posts it."""
+        """A retryable failure keeps its event for the supervisor's restart."""
         for payload in (_SESSION_START, _USER_PROMPT):
             record_hook_event(tmp_path, payload)
 
         async def _handle(client, **kwargs: Any) -> None:
             if kwargs["payload"].get("hook_event_name") == "UserPromptSubmit":
-                raise httpx.HTTPStatusError(
-                    "unavailable",
-                    request=httpx.Request("POST", "http://x"),
-                    response=httpx.Response(503),
-                )
+                raise failure
 
         monkeypatch.setattr("omnigent.harnesses.devin_native.forwarder._handle_event", _handle)
         monkeypatch.setattr(

@@ -779,7 +779,7 @@ async def forward_devin_hooks_to_session(
                             state=state,
                             turn=turn,
                         )
-                    except httpx.HTTPError as exc:
+                    except httpx.HTTPStatusError as exc:
                         if not _post_failure_is_permanent(exc):
                             raise
                         # Step over an event the server will never accept. One
@@ -809,19 +809,18 @@ async def forward_devin_hooks_to_session(
 _RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
-def _post_failure_is_permanent(exc: httpx.HTTPError) -> bool:
-    """Whether re-posting *exc*'s event could ever succeed.
+def _post_failure_is_permanent(exc: httpx.HTTPStatusError) -> bool:
+    """Whether re-posting the event *exc* rejected could ever succeed.
 
-    A transport error or a busy server is worth a restart. A payload the server
+    A busy or briefly unavailable server is worth a restart. A payload the server
     rejects on its merits — over the 10 MiB event limit, or malformed — is not:
     the cursor only advances past an event that posted, so retrying one forever
-    would stall every later turn behind it.
+    would stall every later turn behind it. Transport errors never reach here;
+    they carry no verdict, so they propagate and the supervisor retries them.
 
-    :param exc: The failure raised while forwarding one hook event.
+    :param exc: The rejection raised while forwarding one hook event.
     :returns: ``True`` when the event should be skipped rather than retried.
     """
-    if not isinstance(exc, httpx.HTTPStatusError):
-        return False
     status = exc.response.status_code
     return status < 500 and status not in _RETRYABLE_STATUSES
 
