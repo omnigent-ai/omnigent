@@ -1,6 +1,6 @@
 import {
   HarnessPicker,
-  HarnessPickerEntry,
+  HarnessPickerConfigRow,
   HarnessPickerConfigPage,
 } from "@/components/composer/HarnessPicker";
 import {
@@ -42,7 +42,6 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -209,7 +208,6 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
-import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import {
   formatStatusModelLabel,
@@ -3434,8 +3432,6 @@ function ComposerImpl(
                 tokensUsed={composerTokensUsed}
               />
             </div>
-            <BackgroundTaskIndicator />
-            <SubagentTaskIndicator conversationId={composerSessionId} />
           </div>
         </ComposerWorkspaceBar>
       </div>
@@ -4325,7 +4321,7 @@ function SessionHarnessPicker({
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
-  const [configMenuOpen, setConfigMenuOpen] = useState(false);
+  const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
@@ -4393,12 +4389,12 @@ function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
       setMenuOpen(true);
-      setConfigMenuOpen(true);
+      setConfigMenu(showModels ? "model" : "effort");
     }
-  }, [openNonce, disabled, configurable]);
+  }, [openNonce, disabled, configurable, showModels]);
   useEffect(() => {
     setMenuOpen(false);
-    setConfigMenuOpen(false);
+    setConfigMenu(null);
     setError(null);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
@@ -4440,56 +4436,78 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
-  const configContent = (
-    <ComposerConfigSections
-      models={
-        showModels
-          ? {
-              testId: "composer-agent-models",
-              header: "Models",
-              choices: [
-                ...(!modelOptions.some((model) => model.isDefault)
-                  ? [
-                      {
-                        key: "__default__",
-                        label: "Default",
-                        checked: !routingOn && pickerSelectedModel === null,
-                        disabled: busy || pendingModelChange !== null,
-                        onSelect: () => selectModel(null),
-                        testId: "composer-agent-model-default",
-                      },
-                    ]
-                  : []),
-                ...modelOptions.map((model) => ({
-                  key: model.id,
-                  label: nativeModelLabel(model),
-                  checked:
-                    !routingOn &&
-                    (model.id === pickerSelectedModel ||
-                      (pickerSelectedModel === null && model.isDefault === true)),
-                  disabled: busy || pendingModelChange !== null,
-                  onSelect: () => selectModel(model.isDefault ? null : model.id),
-                  testId: `composer-agent-model-${model.id}`,
-                  className: "whitespace-normal break-words",
-                  data: { "data-model-id": model.id },
-                })),
-                ...(pickerSelectedModel &&
-                !modelOptions.some((model) => model.id === pickerSelectedModel)
-                  ? [
-                      {
-                        key: "__current__",
-                        label: `${modelSummary ?? "Default"} (current)`,
-                        checked: !routingOn,
-                        disabled: true,
-                        className: "whitespace-normal break-words",
-                        data: { "data-model-id": pickerSelectedModel },
-                      },
-                    ]
-                  : []),
-              ],
+  const modelContent = (
+    <>
+      {costRoutingEligible && showModels && (
+        <>
+          <DropdownMenuItem
+            disabled={busy || pendingModelChange !== null}
+            onSelect={() =>
+              void apply(() => useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"))
             }
-          : undefined
-      }
+            data-active={routingOn ? "true" : undefined}
+            className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          >
+            <WandSparklesIcon className="size-4" />
+            {SMART_ROUTING_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>
+      )}
+      <ComposerConfigSections
+        models={
+          showModels
+            ? {
+                testId: "composer-agent-models",
+                header: "Models",
+                choices: [
+                  ...(!modelOptions.some((model) => model.isDefault)
+                    ? [
+                        {
+                          key: "__default__",
+                          label: "Default",
+                          checked: !routingOn && pickerSelectedModel === null,
+                          disabled: busy || pendingModelChange !== null,
+                          onSelect: () => selectModel(null),
+                          testId: "composer-agent-model-default",
+                        },
+                      ]
+                    : []),
+                  ...modelOptions.map((model) => ({
+                    key: model.id,
+                    label: nativeModelLabel(model),
+                    checked:
+                      !routingOn &&
+                      (model.id === pickerSelectedModel ||
+                        (pickerSelectedModel === null && model.isDefault === true)),
+                    disabled: busy || pendingModelChange !== null,
+                    onSelect: () => selectModel(model.isDefault ? null : model.id),
+                    testId: `composer-agent-model-${model.id}`,
+                    className: "whitespace-normal break-words",
+                    data: { "data-model-id": model.id },
+                  })),
+                  ...(pickerSelectedModel &&
+                  !modelOptions.some((model) => model.id === pickerSelectedModel)
+                    ? [
+                        {
+                          key: "__current__",
+                          label: `${modelSummary ?? "Default"} (current)`,
+                          checked: !routingOn,
+                          disabled: true,
+                          className: "whitespace-normal break-words",
+                          data: { "data-model-id": pickerSelectedModel },
+                        },
+                      ]
+                    : []),
+                ],
+              }
+            : undefined
+        }
+      />
+    </>
+  );
+  const effortContent = (
+    <ComposerConfigSections
       efforts={
         showEffort && availableEfforts.length > 0
           ? {
@@ -4515,7 +4533,7 @@ function SessionHarnessPicker({
         open={menuOpen}
         onOpenChange={(next) => {
           if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigMenuOpen(false);
+          if (!next) setConfigMenu(null);
         }}
         trigger={{
           label: "Configure session",
@@ -4535,60 +4553,59 @@ function SessionHarnessPicker({
         tooltip={<ComposerConfigTooltipRows rows={summary} />}
         tooltipTestId="composer-config-gear-tooltip"
         testId="composer-agent-menu"
-        configOpen={configMenuOpen}
       >
-        {isMobile && configMenuOpen ? (
+        {isMobile && configMenu !== null ? (
           <HarnessPickerConfigPage
             backTestId="composer-agent-config-back"
-            testId="composer-agent-config-menu"
-            onBack={() => setConfigMenuOpen(false)}
+            testId={
+              configMenu === "model" ? "composer-agent-config-menu" : "composer-agent-effort-menu"
+            }
+            onBack={() => setConfigMenu(null)}
           >
-            {configContent}
+            {configMenu === "model" ? modelContent : effortContent}
           </HarnessPickerConfigPage>
         ) : (
           <>
-            <div
-              title={
-                !costRoutingEligible || !showModels
-                  ? "Smart Routing is not available for this session."
-                  : undefined
-              }
-            >
-              <DropdownMenuItem
-                disabled={
-                  busy || pendingModelChange !== null || !costRoutingEligible || !showModels
-                }
-                onSelect={() =>
-                  void apply(() =>
-                    useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
+            <PickerSectionHeader>
+              {nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+            </PickerSectionHeader>
+            {showModels && (
+              <HarnessPickerConfigRow
+                label="Model"
+                value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
+                open={configMenu === "model"}
+                onOpenChange={(open) =>
+                  setConfigMenu((current) =>
+                    open ? "model" : current === "model" ? null : current,
                   )
                 }
-                data-active={routingOn ? "true" : undefined}
-                className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+                isMobile={isMobile}
+                disabled={busy || pendingModelChange !== null}
+                valueTestId="composer-agent-model-summary"
+                testId="composer-agent-edit"
+                configTestId="composer-agent-config-menu"
               >
-                <WandSparklesIcon className="size-4" />
-                <span className="flex-1">{SMART_ROUTING_LABEL}</span>
-                <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
-                  Model
-                </span>
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-            </div>
-            <PickerSectionHeader>{nativeAgent ? "Harnesses" : "Agents"}</PickerSectionHeader>
-            <HarnessPickerEntry
-              open={configMenuOpen}
-              onOpenChange={setConfigMenuOpen}
-              icon={<ComposerAgentIcon agent={iconAgent} />}
-              label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-              summary={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
-              active={!routingOn}
-              isMobile={isMobile}
-              disabled={busy || pendingModelChange !== null}
-              summaryTestId="composer-agent-model-summary"
-              testId="composer-agent-edit"
-              configTestId="composer-agent-config-menu"
-              configContent={configContent}
-            />
+                {modelContent}
+              </HarnessPickerConfigRow>
+            )}
+            {showEffort && availableEfforts.length > 0 && (
+              <HarnessPickerConfigRow
+                label={modelPickerKind === "pi" ? "Thinking level" : "Effort"}
+                value={routingOn ? "Automatic" : (effortLabel ?? "Default")}
+                open={configMenu === "effort"}
+                onOpenChange={(open) =>
+                  setConfigMenu((current) =>
+                    open ? "effort" : current === "effort" ? null : current,
+                  )
+                }
+                isMobile={isMobile}
+                disabled={routingOn || busy || pendingModelChange !== null}
+                testId="composer-agent-effort-select"
+                configTestId="composer-agent-effort-menu"
+              >
+                {effortContent}
+              </HarnessPickerConfigRow>
+            )}
           </>
         )}
       </HarnessPicker>

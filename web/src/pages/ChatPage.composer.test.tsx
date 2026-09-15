@@ -7,6 +7,7 @@ import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -152,9 +153,15 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
 }
 
 async function openSessionModels() {
-  fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+  if (!screen.queryByTestId("composer-agent-menu")) openSessionConfig();
   fireEvent.click(screen.getByTestId("composer-agent-edit"));
   await screen.findByTestId("composer-agent-config-menu");
+}
+
+async function openSessionEfforts() {
+  if (!screen.queryByTestId("composer-agent-menu")) openSessionConfig();
+  fireEvent.click(screen.getByTestId("composer-agent-effort-select"));
+  await screen.findByTestId("composer-agent-effort-menu");
 }
 
 function openSessionConfig() {
@@ -1391,10 +1398,11 @@ describe("Composer model/effort label", () => {
 
   const label = () => screen.getByTestId("composer-agent-config-value");
 
-  it("shows the catalog display name beside Edit in the shared harness row", () => {
+  it("opens directly to Model and Effort rows under the session harness heading", () => {
     useChatStore.setState({
       llmModel: "system.ai.claude-opus-4-6",
       sessionHarness: "claude-native",
+      selectedEffort: "xhigh",
     });
     renderWithTooltips(
       <Composer
@@ -1409,13 +1417,18 @@ describe("Composer model/effort label", () => {
     );
     expect(label()).toHaveTextContent("Opus");
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
-    const row = screen.getByTestId("composer-agent-edit");
-    expect(row).toHaveClass("composer-agent-row");
-    expect(row).toHaveAttribute("data-active", "true");
+    const menu = within(screen.getByTestId("composer-agent-menu"));
+    expect(menu.getByText("Claude Code")).toBeVisible();
+    expect(menu.queryByText("Harnesses")).toBeNull();
+    expect(menu.queryByText("Edit")).toBeNull();
+    expect(menu.getAllByRole("menuitem")).toHaveLength(2);
+    const row = menu.getByRole("menuitem", { name: "Model: Opus" });
     expect(within(row).getByText("Opus")).toHaveClass("text-right");
-    expect(within(row).getByText("Edit")).toHaveClass("composer-agent-edit");
+    expect(menu.getByRole("menuitem", { name: "Effort: xHigh" })).toBeVisible();
+    expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
     fireEvent.keyDown(row, { key: "ArrowRight" });
     expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
+    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
   });
 
   it("shows the model in the foreground and effort muted", () => {
@@ -3459,6 +3472,57 @@ describe("Composer config gear", () => {
     expect(tip.textContent).not.toContain("Effort:");
   });
 
+  it.each([
+    { costRoutingEligible: false, showModels: true },
+    { costRoutingEligible: true, showModels: false },
+    { costRoutingEligible: false, showModels: false },
+  ])(
+    "hides unavailable Smart Routing and its separator ($costRoutingEligible, $showModels)",
+    async ({ costRoutingEligible, showModels }) => {
+      renderWithTooltips(
+        <Composer
+          {...composerProps({ costRoutingEligible, showModels, modelPickerKind: "claude" })}
+        />,
+      );
+      openSessionConfig();
+      if (showModels) await openSessionModels();
+      expect(screen.queryByRole("menuitem", { name: "Smart Routing" })).toBeNull();
+      expect(screen.queryByRole("separator")).toBeNull();
+      expect(screen.getByTestId("composer-agent-effort-select")).toBeVisible();
+    },
+  );
+
+  it.each(["off", "on"] as const)(
+    "shows available Smart Routing only in the Model submenu when routing is %s",
+    async (costControlModeOverride) => {
+      useChatStore.setState({ costControlModeOverride });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            costRoutingEligible: true,
+            showModels: true,
+            modelPickerKind: "claude",
+          })}
+        />,
+      );
+      openSessionConfig();
+      const rootMenu = within(screen.getByTestId("composer-agent-menu"));
+      expect(rootMenu.queryByRole("menuitem", { name: "Smart Routing" })).toBeNull();
+      expect(rootMenu.queryByRole("separator")).toBeNull();
+      await openSessionModels();
+      const menu = within(screen.getByTestId("composer-agent-config-menu"));
+      expect(menu.getByRole("menuitem", { name: "Smart Routing" })).not.toHaveAttribute(
+        "data-disabled",
+      );
+      expect(menu.getAllByRole("separator")).toHaveLength(1);
+      expect(useChatStore.getState().costControlModeOverride).toBe(costControlModeOverride);
+      if (costControlModeOverride === "on") {
+        expect(screen.getByTestId("composer-agent-effort-select")).toHaveAttribute("data-disabled");
+        expect(screen.getByTestId("composer-agent-effort-select")).toHaveTextContent("Automatic");
+      }
+    },
+  );
+
   it("omits Advanced settings and its trailing separator from the picker", () => {
     renderWithTooltips(
       <Composer
@@ -3469,7 +3533,24 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-advanced-settings")).toBeNull();
     expect(screen.queryByText("Advanced settings…")).toBeNull();
     const menu = screen.getByTestId("composer-agent-menu");
-    expect(menu.lastElementChild).toBe(screen.getByTestId("composer-agent-edit"));
+    expect(menu.lastElementChild).toBe(screen.getByTestId("composer-agent-effort-select"));
+    expect(within(menu).queryByRole("separator")).toBeNull();
+  });
+
+  it("switches between Model and Effort flyouts on hover and returns to typing on outside click", async () => {
+    const user = userEvent.setup();
+    renderWithTooltips(
+      <Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />,
+    );
+    await user.click(screen.getByTestId("composer-config-gear"));
+    await user.hover(screen.getByTestId("composer-agent-edit"));
+    expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
+    await user.hover(screen.getByTestId("composer-agent-effort-select"));
+    expect(await screen.findByTestId("composer-agent-efforts")).toBeVisible();
+    expect(screen.queryByTestId("composer-agent-models")).toBeNull();
+    await user.click(textarea());
+    expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+    expect(textarea()).toHaveFocus();
   });
 
   it("opens mobile model and effort settings in place with Back navigation", async () => {
@@ -3492,11 +3573,18 @@ describe("Composer config gear", () => {
       fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
       fireEvent.click(screen.getByTestId("composer-agent-edit"));
       const menu = await screen.findByTestId("composer-agent-menu");
-      expect(within(menu).getByTestId("composer-agent-efforts")).toBeTruthy();
+      expect(within(menu).getByTestId("composer-agent-models")).toBeVisible();
+      expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
+      expect(screen.getAllByRole("menu")).toHaveLength(1);
+      fireEvent.click(screen.getByTestId("composer-agent-config-back"));
+      expect(screen.queryByTestId("composer-agent-models")).toBeNull();
+      fireEvent.click(screen.getByTestId("composer-agent-effort-select"));
+      expect(within(menu).getByTestId("composer-agent-efforts")).toBeVisible();
       expect(screen.getAllByRole("menu")).toHaveLength(1);
       fireEvent.click(screen.getByTestId("composer-agent-config-back"));
       expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
-      expect(screen.getByTestId("composer-agent-edit")).toBeTruthy();
+      expect(screen.getByTestId("composer-agent-edit")).toBeVisible();
+      expect(screen.getByTestId("composer-agent-effort-select")).toBeVisible();
     } finally {
       window.matchMedia = originalMatchMedia;
     }
@@ -3520,7 +3608,9 @@ describe("Composer config gear", () => {
       />,
     );
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
-    fireEvent.keyDown(screen.getByTestId("composer-agent-edit"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByTestId("composer-agent-effort-select"), { key: "ArrowRight" });
+    expect(screen.queryByTestId("composer-agent-models")).toBeNull();
+    expect(screen.queryByRole("separator")).toBeNull();
     expect(await screen.findByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
       "aria-checked",
       "true",
@@ -3686,8 +3776,10 @@ describe("Composer config gear", () => {
     fireEvent.click(
       document.querySelector('[data-testid="composer-agent-model-sonnet"]') as Element,
     );
-    fireEvent.click(document.querySelector('[data-testid="composer-agent-effort-low"]') as Element);
-    // Draft only — no live commit yet.
+    const effortRow = screen.getByTestId("composer-agent-effort-select");
+    expect(effortRow).toHaveAttribute("data-disabled");
+    fireEvent.click(effortRow);
+    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
     expect(setModel).toHaveBeenCalledTimes(1);
     expect(setEffort).not.toHaveBeenCalled();
 
@@ -3698,8 +3790,11 @@ describe("Composer config gear", () => {
     expect(setEffort).not.toHaveBeenCalled();
     resolveModel();
     await waitFor(() =>
-      expect(screen.getByTestId("composer-agent-effort-low")).not.toHaveAttribute("data-disabled"),
+      expect(screen.getByTestId("composer-agent-effort-select")).not.toHaveAttribute(
+        "data-disabled",
+      ),
     );
+    await openSessionEfforts();
     fireEvent.click(screen.getByTestId("composer-agent-effort-low"));
     await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
     expect(calls).toEqual(["model", "effort"]);
@@ -3760,13 +3855,15 @@ describe("Composer config gear", () => {
     await openSessionModels();
     await screen.findByTestId("composer-agent-config-menu");
 
+    await openSessionEfforts();
     // Sol starts on ultra.
     expect(screen.getByTestId("composer-agent-effort-ultra")).toHaveAttribute(
       "aria-checked",
       "true",
     );
 
-    // Draft a switch to Luna, whose ceiling is "max".
+    // Switch to Luna, whose ceiling is "max".
+    await openSessionModels();
     fireEvent.click(
       document.querySelector('[data-testid="composer-agent-model-gpt-5.6-luna"]') as Element,
     );
@@ -3775,6 +3872,7 @@ describe("Composer config gear", () => {
     // while Luna's own max stays.
     await waitFor(() => expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(null));
     act(() => useChatStore.setState({ llmModel: "gpt-5.6-luna", selectedEffort: null }));
+    await openSessionEfforts();
     expect(screen.queryByTestId("composer-agent-effort-default")).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-ultra"]')).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-max"]')).not.toBeNull();

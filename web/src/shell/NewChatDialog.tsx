@@ -2,6 +2,7 @@ import {
   HarnessPicker,
   HarnessPickerEntry,
   HarnessPickerConfigPage,
+  HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
@@ -68,6 +69,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { iconForAgent } from "@/components/AgentCard";
+import claudeLogo from "@/assets/claude.svg";
 import { showToast } from "@/components/ui/toast";
 import {
   CLAUDE_NATIVE_EFFORTS,
@@ -87,7 +89,6 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuSub,
-  DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -1216,7 +1217,7 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  */
 const COMPOSER_HARNESS_ICONS: Record<string, { src: string; invertInDark: boolean }> = {
   claude: {
-    src: "data:image/svg+xml,%3csvg%20width='24'%20height='24'%20viewBox='0%200%2024%2024'%20fill='none'%20xmlns='http://www.w3.org/2000/svg'%3e%3cpath%20d='M12.5088%200.00292969C12.6946%200.0286268%2012.9018%200.0283452%2013.0938%200.0478516C13.5758%200.0932324%2014.0549%200.167193%2014.5283%200.268555C17.3121%200.869188%2019.7921%202.43961%2021.5254%204.69922C22.7038%206.23717%2023.4925%208.03736%2023.8242%209.94629C23.878%2010.2575%2023.9197%2010.5713%2023.9492%2010.8857C23.9624%2011.0364%2023.9734%2011.354%2024%2011.4883V12.5215C23.9582%2012.7249%2023.9575%2013.0548%2023.9346%2013.2734C23.8842%2013.7421%2023.8058%2014.2075%2023.7012%2014.667C23.0305%2017.6081%2021.2775%2020.1889%2018.79%2021.8955C17.3676%2022.8709%2015.7518%2023.5292%2014.0527%2023.8262C13.7475%2023.8801%2013.4396%2023.9216%2013.1309%2023.9492C13.0311%2023.958%2012.6116%2023.9804%2012.5459%2024H11.4561C11.3898%2023.9811%2010.9218%2023.9534%2010.8164%2023.9434C10.4737%2023.9091%2010.1325%2023.8603%209.79395%2023.7969C7.83176%2023.4294%205.99231%2022.5782%204.44141%2021.3213C2.22749%2019.5256%200.724672%2017.0005%200.202148%2014.1982C0.128034%2013.7983%200.0735237%2013.3946%200.0390625%2012.9893C0.022862%2012.7876%200.0201573%2012.5562%200%2012.3623V11.6074C0.0182209%2011.4158%200.0234242%2011.2135%200.0390625%2011.0195C0.0666679%2010.692%200.106158%2010.3654%200.15918%2010.041C0.500533%207.9821%201.37255%206.04761%202.68848%204.42773C4.42465%202.29186%206.84293%200.81853%209.53711%200.254883C9.95703%200.166565%2010.3816%200.101085%2010.8086%200.0585938C11.0559%200.0342254%2011.3026%200.0249623%2011.5469%200H12.4883L12.5088%200.00292969ZM5.7002%207.10156L5.70117%2011.2637H3.59961L3.60059%2013.4326L5.7002%2013.4336C5.70026%2014.1276%205.68763%2014.8624%205.70117%2015.5527H6.74121V17.6016H7.80176V15.5527H8.84375L8.8418%2017.6016H9.90137V15.5527H14.0996C14.0996%2016.2309%2014.0923%2016.9248%2014.1006%2017.6016H15.1602V15.5527H16.2002C16.2002%2016.2206%2016.1864%2016.9382%2016.2012%2017.6016H17.2607V15.5527H18.3018V13.4336H20.4014V11.2637H18.2998V7.10156H5.7002ZM8.84277%209.27148V11.2617C8.52811%2011.2757%208.12327%2011.2638%207.80176%2011.2637V9.27051L8.84277%209.27148ZM16.2002%2011.2637H15.1562V9.27148L16.2002%209.27051V11.2637Z'%20fill='%23D87757'/%3e%3c/svg%3e",
+    src: claudeLogo,
     invertInDark: false,
   },
   cursor: {
@@ -1318,8 +1319,8 @@ function NewChatPickerLoading({
  * Groups harnesses and agents, with model/effort submenus and advanced
  * brain-harness selection where supported. Entries without those settings
  * are plain selectable rows; permissions live in the composer's hand menu.
- * Selecting an editable entry opens its submenu and selects it first, keeping
- * the shared configuration state in {@link NewChatLandingScreen} coherent.
+ * Rows select directly. Edit selects the entry before opening its settings,
+ * keeping the shared configuration state in {@link NewChatLandingScreen} coherent.
  */
 export function AgentHarnessPicker({
   agentEntries,
@@ -1340,7 +1341,7 @@ export function AgentHarnessPicker({
   sandboxSelected,
   allowCreateCustomAgent = true,
   onOpenChange,
-  dropdownModal = true,
+  dropdownModal = false,
   contentClassName,
   contentAlign = "end",
   triggerClassName,
@@ -1389,7 +1390,7 @@ export function AgentHarnessPicker({
   // `triggerLabelClassName`).
   /** Notified when the picker dropdown opens/closes. */
   onOpenChange?: (open: boolean) => void;
-  /** Whether the Radix dropdown should modal-block outside content. Defaults true. */
+  /** Whether the dropdown blocks outside interaction. Defaults false so composer clicks reach their target. */
   dropdownModal?: boolean;
   /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
   contentClassName?: string;
@@ -1486,6 +1487,16 @@ export function AgentHarnessPicker({
   const isMobile = useIsMobileViewport();
   const [menuPage, setMenuPage] = useState<"more" | "custom" | "config" | null>(null);
   const [configAgentId, setConfigAgentId] = useState<string | null>(null);
+  const [inlineHarnessId, setInlineHarnessId] = useState(effectiveAgentId);
+  // Keep desktop rows anchored while a config flyout is open; promote on reopen.
+  useEffect(() => {
+    if (!open) setInlineHarnessId(autoHarnessActive ? null : effectiveAgentId);
+  }, [open, autoHarnessActive, effectiveAgentId]);
+  const promotedHarnessId = isMobile
+    ? autoHarnessActive
+      ? null
+      : effectiveAgentId
+    : inlineHarnessId;
   // Reset to the main list whenever the menu closes so it never reopens on a
   // stale drill-in page.
   useEffect(() => {
@@ -1539,7 +1550,7 @@ export function AgentHarnessPicker({
             setConfigAgentId((current) => (current === agent.id ? null : current));
           }
         }}
-        onSelect={editable ? undefined : () => onSelectAgent(agent)}
+        onSelect={() => onSelectAgent(agent)}
         configContent={active ? selectedConfigContent : null}
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
@@ -1581,7 +1592,7 @@ export function AgentHarnessPicker({
       const selected = agent.id === effectiveAgentId;
       if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(agent.harness, host)) continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      if (primaryOrder.includes(key)) {
+      if (primaryOrder.includes(key) || agent.id === promotedHarnessId) {
         ready.push(agent);
       } else more.push(agent);
     }
@@ -1592,7 +1603,7 @@ export function AgentHarnessPicker({
     ready.sort((first, second) => rank(first, primaryOrder) - rank(second, primaryOrder));
     more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId]);
+  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1650,7 +1661,7 @@ export function AgentHarnessPicker({
       )}
       {canCreateAgent && (
         <>
-          <DropdownMenuSeparator />
+          {hasCustomAgents && <DropdownMenuSeparator />}
           {createAgentItem}
         </>
       )}
@@ -1744,7 +1755,7 @@ export function AgentHarnessPicker({
           {selectedConfigContent}
         </HarnessPickerConfigPage>
       ) : showMore ? (
-        // Mobile drill-in page for the "needs setup" harnesses.
+        // Mobile drill-in page for the remaining harnesses.
         <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
           <DropdownMenuItem
             data-testid="new-chat-landing-page-back"
@@ -1781,23 +1792,11 @@ export function AgentHarnessPicker({
         <>
           {/* Smart Routing sits in its own unlabeled group above the
             harnesses: it routes over them rather than being one of them. */}
-          {(autoHarnessAvailable || onSelectAutoHarness != null) && (
-            <div
-              title={
-                !autoHarnessAvailable
-                  ? "Requires enabled routing, the workspace AI gateway router, and configured Claude Code and Codex harnesses."
-                  : undefined
-              }
-            >
+          {autoHarnessAvailable && (
+            <>
               <DropdownMenuItem
                 data-testid="new-chat-landing-harness-smart-routing"
                 data-active={autoHarnessActive ? "true" : undefined}
-                disabled={!autoHarnessAvailable}
-                aria-description={
-                  !autoHarnessAvailable
-                    ? "Requires enabled routing, the workspace AI gateway router, and configured Claude Code and Codex harnesses."
-                    : undefined
-                }
                 onSelect={() => {
                   if (!autoHarnessAvailable) return;
                   onSelectAutoHarness?.();
@@ -1812,11 +1811,10 @@ export function AgentHarnessPicker({
                 </span>
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-            </div>
+            </>
           )}
-          {/* Harnesses group — the native terminal CLIs (Claude Code is the
-            default), so the most-used picks lead. Ready-to-use harnesses list
-            inline; "needs setup" ones fold into a "More" group. */}
+          {/* Primary harnesses and the selected harness stay inline;
+            the remaining harnesses fold into Other. */}
           {(readyHarnessEntries.length > 0 || moreHarnessEntries.length > 0) && (
             <>
               <PickerSectionHeader>Harnesses</PickerSectionHeader>
@@ -1854,9 +1852,9 @@ export function AgentHarnessPicker({
                     >
                       <span className="flex-1 text-left">{otherHarnessLabel}</span>
                     </DropdownMenuSubTrigger>
-                    <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
+                    <HarnessPickerSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
                       {moreHarnessEntries.map(renderEntry)}
-                    </DropdownMenuSubContent>
+                    </HarnessPickerSubContent>
                   </DropdownMenuSub>
                 ))}
               <DropdownMenuSeparator />
@@ -1893,9 +1891,9 @@ export function AgentHarnessPicker({
                 >
                   <span className="flex-1 text-left">Other...</span>
                 </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
+                <HarnessPickerSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
                   {customAgentsBody}
-                </DropdownMenuSubContent>
+                </HarnessPickerSubContent>
               </DropdownMenuSub>
             ))}
           {/* No custom agents to group: surface the create action directly so
@@ -3588,7 +3586,10 @@ export function NewChatLandingScreen() {
         />
         {selectedAgentHasAdvancedSettings && (
           <>
-            <DropdownMenuSeparator />
+            {(supportsModelPicker ||
+              supportsPermissionMode ||
+              selectedNativeHarness === "codex-native" ||
+              pickerEffortOptions.length > 0) && <DropdownMenuSeparator />}
             <DropdownMenuItem
               data-testid="new-chat-landing-config-gear"
               onSelect={() => setConfigOpen(true)}

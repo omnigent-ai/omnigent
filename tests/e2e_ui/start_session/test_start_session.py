@@ -2767,11 +2767,11 @@ async def _drive_kimi_picker_dedup(base_url: str, session_id: str) -> None:
             # Open the agent picker dropdown.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
-            # The native Kimi row is offered...
-            await page.get_by_test_id("new-chat-landing-harness-more").click()
+            # The selected native Kimi is promoted into the main list.
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_kimi_native_e2e")
             ).to_be_visible(timeout=30_000)
+            await expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
             # ...and the SDK kimi row is dropped (hidden by NEW_SESSION_HIDDEN_AGENTS).
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_kimi_sdk_e2e")
