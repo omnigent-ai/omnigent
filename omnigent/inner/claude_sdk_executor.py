@@ -740,6 +740,56 @@ def _usage_from_observed_call(
     }
 
 
+# Known empty-result failure subtypes, mapped to a short human-readable cause.
+_ERROR_SUBTYPE_HINTS = {
+    "error_during_execution": "the turn was aborted mid-execution",
+    "error_max_turns": "the turn hit the CLI's maximum turn count",
+}
+
+# Trailing stderr lines to include in an empty-result failure reason.
+_STDERR_TAIL_LINES = 5
+
+
+def _error_result_failure_reason(
+    result: str | None,
+    subtype: str | None,
+    api_error_status: int | None,
+    errors: Sequence[str] | None,
+    system_diagnostics: Sequence[str],
+    stderr_lines: Sequence[str],
+) -> str:
+    """Failure reason surfaced for an ``is_error`` ``ResultMessage``.
+
+    API-level failures carry a descriptive ``result`` (``API Error: ...``) which
+    is used as-is. The empty-result subtypes (``error_during_execution``,
+    ``error_max_turns``) leave ``result`` unset, so derive the reason from the
+    subtype and any captured CLI errors, diagnostics, and stderr instead of a
+    detail-free fallback.
+    """
+    if result:
+        return result
+    if subtype and subtype != "success":
+        hint = _ERROR_SUBTYPE_HINTS.get(subtype)
+        headline = (
+            f"claude-sdk turn failed ({subtype}: {hint})"
+            if hint
+            else f"claude-sdk turn failed ({subtype})"
+        )
+    elif api_error_status is not None:
+        headline = f"claude-sdk turn failed (API error, HTTP status {api_error_status})"
+    else:
+        headline = "claude-sdk turn failed (the CLI reported an error with no detail)"
+    parts = [headline]
+    if errors:
+        parts.append("CLI errors:\n" + "\n".join(str(err) for err in errors))
+    if system_diagnostics:
+        parts.append("CLI system diagnostics:\n" + "\n".join(system_diagnostics))
+    stderr_tail = [line for line in stderr_lines if line.strip()][-_STDERR_TAIL_LINES:]
+    if stderr_tail:
+        parts.append("CLI stderr (tail):\n" + "\n".join(stderr_tail))
+    return "\n".join(parts)
+
+
 def _sandbox_disabled_by_env() -> bool:
     """``True`` when the diagnostic bypass env var is set to a truthy
     value. Emits a WARNING on activation so CI output unambiguously
@@ -3065,9 +3115,17 @@ class ClaudeSDKExecutor(Executor):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
                         if getattr(result_msg, "is_error", None):
-                            # Harness-level failure (e.g. expired login). Surface
-                            # as an executor error rather than assistant content.
-                            failure_text = result_msg.result or "claude-sdk harness error"
+                            # Harness-level failure (expired login, mid-turn abort,
+                            # max turns). An empty ``result`` derives its reason from
+                            # the subtype and captured errors/diagnostics/stderr.
+                            failure_text = _error_result_failure_reason(
+                                result_msg.result,
+                                getattr(result_msg, "subtype", None),
+                                getattr(result_msg, "api_error_status", None),
+                                getattr(result_msg, "errors", None),
+                                system_diagnostics,
+                                stderr_lines,
+                            )
                             logger.error(
                                 "claude-sdk ResultMessage is_error=True for agent %r: %s",
                                 self._agent_name,
