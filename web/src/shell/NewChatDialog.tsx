@@ -4213,6 +4213,7 @@ export function NewChatLandingScreen() {
   // space yet), but lists skills only — built-ins like /model need a
   // live session. Hidden for native-terminal agents (their CLI owns
   // slash commands) and for agents without bundled skills.
+  const [inputFocused, setInputFocused] = useState(false);
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
   const skillCommands = useMemo(() => {
     if (isNativeTerminalAgent) return {};
@@ -4222,6 +4223,7 @@ export function NewChatLandingScreen() {
   }, [selectedAgent, isNativeTerminalAgent]);
   const trimmedMessage = message.trimStart();
   const slashMenuOpen =
+    inputFocused &&
     trimmedMessage.startsWith("/") &&
     !trimmedMessage.slice(1).includes("/") &&
     !trimmedMessage.includes(" ");
@@ -5644,13 +5646,14 @@ export function NewChatLandingScreen() {
                   );
                 },
                 onFocus: () => {
+                  setInputFocused(true);
                   // From here the textarea's caret is one the user placed, so
                   // dictation inserts there instead of at the end of the draft.
                   dictation.noteFocus();
                 },
                 onBlur: () => {
-                  // Dismiss the mention menu when focus leaves the textarea; menu
-                  // rows preventDefault on mousedown so selecting one doesn't blur.
+                  // Menu rows preventDefault on mousedown so selecting one keeps focus.
+                  setInputFocused(false);
                   dismissMention();
                 },
                 onKeyDown: (e, { shouldSubmitFromKeyboard, shouldPreferSendOverCompletion }) => {

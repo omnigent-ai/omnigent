@@ -2311,6 +2311,7 @@ function ComposerImpl(
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -2626,6 +2627,7 @@ function ComposerImpl(
   // "/" (guards against file-path-like strings).
   const trimmedValue = value.trimStart();
   const menuOpen =
+    inputFocused &&
     draft.quotes.length === 0 &&
     trimmedValue.startsWith("/") &&
     !trimmedValue.slice(1).includes("/") &&
@@ -3439,14 +3441,14 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
-          onFocus: (e) => handleTextFocus(null, e.currentTarget),
+          onFocus: (e) => {
+            setInputFocused(true);
+            handleTextFocus(null, e.currentTarget);
+          },
           onKeyDown: handleKeyDown,
           onBlur: () => {
-            // Dismiss the "@"-mention menu when focus leaves the textarea
-            // (clicking a chip's ✕, the Send button, or another field).
-            // Menu rows ``preventDefault`` on mousedown so selecting an entry
-            // keeps focus and does NOT blur — this only fires for genuine
-            // focus-out, where the lingering menu would otherwise float.
+            // Menu rows preventDefault on mousedown so selecting one keeps focus.
+            setInputFocused(false);
             dismissMention();
           },
           onPaste: handlePaste,
