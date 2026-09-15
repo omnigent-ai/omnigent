@@ -1591,6 +1591,8 @@ const MAX_SPELL_SUGGESTIONS = 5;
  *   - spelling suggestions + "Add to Dictionary" over a misspelled word
  *     (`spellcheck: true` is set on the window's webPreferences),
  *   - Copy Link Address over a link,
+ *   - Copy Image over an image (e.g. a previewed PNG — the shell menu is the
+ *     only copy affordance for it; there is no browser-native fallback),
  *   - Cut / Copy / Paste / Select All in editable fields, Copy over a
  *     text selection — each enabled per Chromium's `editFlags`.
  * Right-clicking dead space shows nothing (no popup) rather than a menu
@@ -1621,6 +1623,14 @@ function attachContextMenu(win) {
       template.push({
         label: "Copy Link Address",
         click: () => clipboard.writeText(params.linkURL),
+      });
+      template.push({ type: "separator" });
+    }
+
+    if (params.mediaType === "image" && params.hasImageContents) {
+      template.push({
+        label: "Copy Image",
+        click: () => win.webContents.copyImageAt(params.x, params.y),
       });
       template.push({ type: "separator" });
     }
