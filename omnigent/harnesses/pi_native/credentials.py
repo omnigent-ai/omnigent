@@ -825,7 +825,7 @@ def _fetch_pi_model_lists(
     """
     try:
         models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
-    except Exception:  # noqa: BLE001 — HTTP/network failure → empty
+    except Exception:
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
             "Pi will show only the selected model",
@@ -847,7 +847,7 @@ def _fetch_pi_model_lists(
         models = enrich_databricks_model_catalog(
             models, model_catalog.catalog_model_entries("databricks")
         )
-    except Exception:  # noqa: BLE001 — live availability remains authoritative
+    except Exception:
         _LOGGER.info(
             "pi-native: could not enrich the live Databricks model list with MLflow metadata",
             exc_info=True,
@@ -1076,7 +1076,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
                 claude_models, gpt_models, completions_models, gemini_models = (
                     _fetch_pi_model_lists(real_workspace_url, token)
                 )
-            except Exception:  # noqa: BLE001 — network failure must not break launch
+            except Exception:
                 _LOGGER.info(
                     "pi-native: could not fetch workspace model list; showing default model only",
                     exc_info=True,
@@ -1317,7 +1317,14 @@ def _inline_family_pi_provider(
             auth_header = True
         else:
             continue
-        resolved_model = model or entry.family_default_model(family_name)
+        if model is not None:
+            resolved_model = model
+        else:
+            # A ``default:`` tier may name another tier (an alias such as
+            # ``deepseek-pro: deepseek-v4-pro``); launch with the id the
+            # endpoint actually serves, not the alias.
+            default_tier = entry.family_default_model(family_name)
+            resolved_model = family.resolve_model_tier(default_tier) if default_tier else None
         if not resolved_model:
             continue
         # A session override can arrive as a Databricks-gateway id, which only
@@ -1345,12 +1352,14 @@ def _inline_family_pi_provider(
         # model's entry is already in the list, so skip a second copy. Tier
         # ids get the same bracket-suffix strip as the selected model, so
         # ``[1m]``-style operator ids don't render a gateway-rejected entry.
+        # A tier value may itself name another tier; resolve it first so an
+        # alias never renders as a picker row.
         shortlist: list[_PiModelEntry] = [model_entry]
         seen_ids: set[str] = {resolved_model}
         for tier_model in family.models.values():
             if not isinstance(tier_model, str) or not tier_model:
                 continue
-            tier_id = re.sub(r"\[.*?\]$", "", tier_model)
+            tier_id = re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
             if tier_id in seen_ids:
                 continue
             seen_ids.add(tier_id)
@@ -1506,7 +1515,7 @@ def resolve_pi_native_provider(
                 ),
             )
         return resolved
-    except Exception:  # noqa: BLE001 — any resolution failure must not break launch
+    except Exception:
         # Any failure (malformed config, duplicate per-family default, or an
         # unresolved ``api_key: $VAR``) falls back to Pi's own login rather than
         # failing the terminal launch.

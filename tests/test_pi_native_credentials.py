@@ -2720,6 +2720,8 @@ def test_connect_broker_skipped_without_sidecar(monkeypatch: pytest.MonkeyPatch)
         "omnigent.host.databricks_credential.broker_token_command", lambda host, *a, **k: None
     )
     assert creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}}) is None
+
+
 def test_inline_family_registers_curated_shortlist_as_extra_models() -> None:
     """The family's ``models:`` tier map registers as Pi ``extra_models``.
 
@@ -2896,3 +2898,72 @@ def test_provider_launch_without_curated_set_does_not_scope(tmp_path: Path) -> N
     settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
     assert "enabledModels" not in settings
     assert settings["defaultThinkingLevel"] is None
+
+
+def test_curated_tier_alias_resolves_to_concrete_id() -> None:
+    """A tier value naming another tier resolves to the concrete id.
+
+    Deployments alias tier names to ids (``deepseek-pro: deepseek-v4-pro``)
+    and reference the alias from elsewhere (``default: deepseek-pro``). The
+    alias must reach neither the launch model nor the picker's shortlist —
+    the gateway serves the id, not the tier name.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "deepseek-pro",  # aliases the tier below
+                        "deepseek-pro": "deepseek-v4-pro",
+                        "glm": "GLM-5.3",
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    # The launch model is the id, not the alias ...
+    assert provider.model == "deepseek-v4-pro"
+    # ... and the alias never renders as a picker row of its own.
+    assert [entry["id"] for entry in provider.extra_models] == [
+        "deepseek-v4-pro",
+        "GLM-5.3",
+    ]
+    assert provider.curated_models is True
+
+
+def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
+    """An aliased tier resolves first, then gets the bracket-suffix strip.
+
+    The alias key is matched against the raw map, so a bracketed target
+    still collapses to its bare gateway id instead of rendering (or
+    launching) with the suffix.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "long-context",  # aliases the tier below
+                        "long-context": "GLM-5.3[16m]",
+                        "glm": "GLM-5.3-Flash",
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.model == "GLM-5.3"
+    assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3", "GLM-5.3-Flash"]
