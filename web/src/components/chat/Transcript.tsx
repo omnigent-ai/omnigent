@@ -12,7 +12,7 @@ import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { hasCommandModifier } from "@/lib/hotkeys";
+import { useMessageNavigationActions } from "@/hooks/useMessageNavigationActions";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import {
   type Bubble,
@@ -250,6 +250,7 @@ function TranscriptImpl({
     [display.bubbles],
   );
   const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
+  useMessageNavigationActions(nav);
 
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Mirrors the transcript's loaded window and grows lazily.
@@ -283,20 +284,6 @@ function TranscriptImpl({
     () => liveCandidateAssistantIndex(display.streamBubbles),
     [display.streamBubbles],
   );
-
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => {
-      if (!hasCommandModifier(e) || !e.altKey) return;
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      if (e.defaultPrevented) return;
-      e.preventDefault();
-      if (e.key === "ArrowUp") nav.goPrev();
-      else nav.goNext();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [nav]);
 
   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   return (
