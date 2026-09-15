@@ -515,3 +515,108 @@ describe("MainTerminalView — persistent hidden mount", () => {
     );
   });
 });
+
+describe("MainTerminalView — reaped native pane self-heal", () => {
+  const CODEX_PANE: TerminalInfo = {
+    id: "terminal_codex_main",
+    name: "codex",
+    session: "main",
+    running: true,
+  };
+
+  it("auto-re-ensures a reaped native pane while the runner is still online", async () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    // The codex TUI was live, then the idle reaper tore the pane down while
+    // the runner stayed online — the terminal inventory goes empty.
+    const { rerender } = renderView({
+      terminals: [CODEX_PANE],
+      isNativeWrapper: true,
+      runnerOnline: true,
+      onResume,
+    });
+    expect(await screen.findByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_codex_main",
+    );
+
+    rerender(viewTree({ terminals: [], isNativeWrapper: true, runnerOnline: true, onResume }));
+
+    // The pane is re-ensured transparently — no manual Resume prompt, and the
+    // passive startup status stands in until the recreated pane reappears.
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("status")).toHaveTextContent("Starting up…");
+    expect(screen.queryByText("The harness is not running.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+  });
+
+  it("drops to the manual Resume prompt when auto-recovery fails", async () => {
+    const onResume = vi.fn().mockRejectedValue(new Error("codex relaunch failed"));
+    const { rerender } = renderView({
+      terminals: [CODEX_PANE],
+      isNativeWrapper: true,
+      runnerOnline: true,
+      onResume,
+    });
+    await screen.findByTestId("terminal-view");
+
+    rerender(viewTree({ terminals: [], isNativeWrapper: true, runnerOnline: true, onResume }));
+
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+    // A failed re-ensure surfaces the actionable stopped-session UI so the
+    // user can retry by hand.
+    expect(await screen.findByText("The harness is not running.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+    expect(
+      screen.getByText("Couldn't resume session: codex relaunch failed"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the manual prompt (no auto-recover) when the runner is offline", async () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = renderView({
+      terminals: [CODEX_PANE],
+      isNativeWrapper: true,
+      runnerOnline: true,
+      onResume,
+    });
+    await screen.findByTestId("terminal-view");
+
+    // The runner went offline (session stopped): resuming relaunches the
+    // runner, a heavier action the user must initiate — so no auto-recover.
+    rerender(viewTree({ terminals: [], isNativeWrapper: true, runnerOnline: false, onResume }));
+
+    expect(await screen.findByText("The harness is not running.")).toBeInTheDocument();
+    expect(onResume).not.toHaveBeenCalled();
+  });
+
+  it("auto-re-ensures on a fresh load of a reaped session (reopened tab)", async () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    // Returning to a reaped codex session is usually a full page reload (a
+    // reopened tab), so the recovery must not depend on this mount having
+    // seen the pane earlier: an empty inventory + online runner on the
+    // Terminal view is itself the request for the pane.
+    renderView({ terminals: [], isNativeWrapper: true, runnerOnline: true, onResume });
+
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("status")).toHaveTextContent("Starting up…");
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+  });
+
+  it("does not auto-recover a non-native (SDK) terminal-first session", async () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    // The native-pane reaper only tears down native vendor panes; an SDK REPL
+    // that empties keeps the existing manual-resume behavior.
+    const { rerender } = renderView({
+      terminals: [REPL_TERMINAL],
+      isNativeWrapper: false,
+      runnerOnline: true,
+      onResume,
+    });
+    await screen.findByTestId("terminal-view");
+
+    rerender(viewTree({ terminals: [], isNativeWrapper: false, runnerOnline: true, onResume }));
+
+    expect(await screen.findByText("The harness is not running.")).toBeInTheDocument();
+    expect(onResume).not.toHaveBeenCalled();
+  });
+});
