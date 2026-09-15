@@ -32,6 +32,7 @@ import {
   MessageActions,
   MessageAction,
   MessageContent,
+  type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import {
@@ -605,6 +606,21 @@ function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string
   );
 }
 
+// User-authored tags and placeholders are text, including valid HTML examples.
+const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOptions"] = {
+  handlers: {
+    html: (_state, node: { value: string }) =>
+      node.value
+        .split("\n")
+        .flatMap((line, index) => [
+          ...(index
+            ? [{ type: "element" as const, tagName: "br", properties: {}, children: [] }]
+            : []),
+          { type: "text" as const, value: line },
+        ]),
+  },
+};
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
@@ -758,7 +774,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               `breaks` keeps single newlines as line breaks. Empty text renders
               nothing rather than an empty markdown block. */}
             {text && (
-              <FilePathAwareMessageResponse breaks mode="static">
+              <FilePathAwareMessageResponse
+                breaks
+                mode="static"
+                remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+              >
                 {text}
               </FilePathAwareMessageResponse>
             )}
