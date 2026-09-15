@@ -88,6 +88,10 @@ const cases = [
   ["web/electron/main.ts", "desktop-app"],
   ["omnigent/server/api.py", "server"],
   ["omnigent/server/auth.py", "auth"],
+  ["examples/polly/config.yaml", "examples"],
+  ["examples/extensions/hello-page/web/src/main.ts", "examples"],
+  ["examples/kimi_hello.yaml", "examples"],
+  ["omnigent/resources/examples/polly", "resources"],
 ];
 for (const [fn, key] of cases) {
   const m = resolve(fn);

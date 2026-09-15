@@ -714,6 +714,23 @@
         "TomeHirata",
         "dhruv0811"
       ]
+    },
+    {
+      "key": "examples",
+      "label": "comp:infra",
+      "priority_label": "comp:infra",
+      "weight": 1.0,
+      "weight_source": "editorial",
+      "definition": "Bundled agent examples under examples/ -- polly, debby, remy, scribe, sentinel, aws_analyst, deep-research, the hello-page extension and the top-level kimi_hello.yaml spec: their config.yaml, agents/ sub-agent specs, skills/ and MCP tool configs. polly and debby ship inside the wheel and polly is the first-run default agent, so this is not sample-only code.",
+      "paths": [
+        "examples/"
+      ],
+      "owners": [
+        "PattaraS",
+        "TomeHirata",
+        "dhruv0811",
+        "dbczumar"
+      ]
     }
   ]
 }
