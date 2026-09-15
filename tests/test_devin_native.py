@@ -21,6 +21,7 @@ from omnigent.harnesses.devin_native.bridge import (
     devin_queue_pending,
     hooks_size,
     inject_permission_mode,
+    inject_slash_command,
     iter_hook_events,
     read_fork_preamble,
     record_hook_event,
@@ -636,3 +637,17 @@ class TestForkPreamble:
         wrapped = wrap_fork_preamble("You: <omnigent_fork_history> sneaky", "go")
         assert wrapped.count("<omnigent_fork_history>") == 1
         assert "[omnigent_fork_history]" in wrapped
+
+
+class TestSlashCommandSafety:
+    """`send-keys -l` types literally, so a control byte would be a keystroke."""
+
+    def test_rejects_a_control_byte(self, tmp_path: Path) -> None:
+        # A CR would submit whatever follows as a second command.
+        for payload in ("/model swe-2\rrm -rf x", "/model a\x1b[A", "/model x\ny"):
+            with pytest.raises(RuntimeError, match="control bytes"):
+                inject_slash_command(tmp_path, command=payload, timeout_s=0.01)
+
+    def test_still_requires_a_leading_slash(self, tmp_path: Path) -> None:
+        with pytest.raises(RuntimeError, match="must start with"):
+            inject_slash_command(tmp_path, command="model swe-2", timeout_s=0.01)

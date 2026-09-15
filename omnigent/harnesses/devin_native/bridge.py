@@ -1196,9 +1196,17 @@ def inject_slash_command(
 
     :param bridge_dir: Per-session bridge directory.
     :param command: Slash command including the leading ``/``.
+    :raises RuntimeError: If *command* does not start with ``/`` or carries a
+        control byte.
     """
     if not command.startswith("/"):
         raise RuntimeError(f"devin-native slash command must start with '/': {command!r}")
+    # `send-keys -l` types the string literally, so a CR/ESC would land as real
+    # keystrokes able to submit a second command. The paste path already drops
+    # control bytes (`_paste_payload_bytes`); refuse them here rather than strip,
+    # since every caller builds the command from a validated catalog id.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in command):
+        raise RuntimeError(f"devin-native slash command must not carry control bytes: {command!r}")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
