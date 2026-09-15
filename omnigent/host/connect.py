@@ -4333,9 +4333,9 @@ def run_host_process(
 
     telemetry.init("omni-host")
 
-    from omnigent.host.identity import CONFIG_PATH
+    from omnigent.host.identity import host_config_path
 
-    path = config_path or CONFIG_PATH
+    path = host_config_path(config_path)
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:

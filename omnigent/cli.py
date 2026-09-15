@@ -2620,10 +2620,12 @@ class _SpawnedDaemonProcess:
     :param pid: Spawned process id, e.g. ``4242``.
     :param log_path: Daemon log path, e.g.
         ``"/Users/me/.omnigent/logs/host/host-abc.log"``.
+    :param process: Child process handle when this invocation spawned it.
     """
 
     pid: int
     log_path: str
+    process: subprocess.Popen[bytes] | None = None
 
 
 def _normalize_daemon_target(server_url: str | None) -> str:
@@ -2883,24 +2885,13 @@ def _load_existing_host_id() -> str | None:
 
     :returns: Host id from config, e.g. ``"host_abc123"``, or ``None``.
     """
-    candidate_paths = [_effective_global_config_path()]
-    from omnigent.host.identity import CONFIG_PATH
+    from omnigent.host.identity import load_host_identity_if_present
 
-    if CONFIG_PATH not in candidate_paths:
-        candidate_paths.append(CONFIG_PATH)
-    for path in candidate_paths:
-        try:
-            raw = yaml.safe_load(path.read_text()) if path.exists() else None
-        except (OSError, yaml.YAMLError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        host = raw.get("host")
-        if isinstance(host, dict):
-            host_id = host.get("host_id")
-            if isinstance(host_id, str) and host_id:
-                return host_id
-    return None
+    try:
+        identity = load_host_identity_if_present()
+    except (OSError, yaml.YAMLError):
+        return None
+    return identity.host_id if identity is not None else None
 
 
 def _daemon_tunnel_recovers(
@@ -3135,7 +3126,44 @@ def _spawn_host_daemon_process(
         return None
     finally:
         log_fh.close()
-    return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path))
+    return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path), process=proc)
+
+
+def _stop_spawned_host_daemon_process(
+    spawned: _SpawnedDaemonProcess,
+    *,
+    grace_timeout: float = _HOST_DAEMON_STOP_GRACE_S,
+) -> None:
+    """Stop a daemon child started by this invocation."""
+    proc = spawned.process
+    if proc is not None:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=grace_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return
+
+    if not _pid_alive(spawned.pid):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(spawned.pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(spawned.pid):
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(spawned.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+def _delete_spawned_daemon_record(target: str, spawned: _SpawnedDaemonProcess) -> None:
+    """Delete *target*'s record only when the spawned child owns it."""
+    record = _find_daemon_record(target)
+    if record is not None and record.pid == spawned.pid:
+        _delete_daemon_record(record)
 
 
 _DAEMON_CLAIM_TIMEOUT_S = 10.0
@@ -3349,10 +3377,10 @@ def _load_or_create_host_id() -> str | None:
     host_id = _load_existing_host_id()
     if host_id is not None:
         return host_id
-    from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
+    from omnigent.host.identity import load_or_create_host_identity
 
     try:
-        return load_or_create_host_identity(CONFIG_PATH).host_id
+        return load_or_create_host_identity().host_id
     except (OSError, ValueError):
         # OSError: identity file unwritable. ValueError: a malformed persisted /
         # env host_id — a foreground host has nothing to key on, so degrade to
@@ -3385,19 +3413,31 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     config_sig = server_config_signature(include_features=not server_url)
     daemon_env = _build_host_daemon_env(server_url=server_url)
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
+    expected_host_id = _load_existing_host_id()
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
         return False
-    if _wait_for_daemon_claim(target, spawned) is None:
+    claimed = _wait_for_daemon_claim(target, spawned)
+    if claimed is None:
+        _stop_spawned_host_daemon_process(spawned)
+        _delete_spawned_daemon_record(target, spawned)
         # The spawned daemon (or a concurrent winner) never wrote its record:
         # it likely crashed during startup. Point at its log so the failure is
         # diagnosable instead of silently absent from `host status`.
-        logging.getLogger(__name__).warning(
-            "host daemon for %s did not claim its registry record within %.0fs; "
-            "see %s for the daemon's own log",
-            target,
-            _DAEMON_CLAIM_TIMEOUT_S,
-            spawned.log_path,
+        raise click.ClickException(
+            f"Host daemon for {target!r} did not claim its registry record within "
+            f"{_DAEMON_CLAIM_TIMEOUT_S:.0f}s and was stopped. See {spawned.log_path}."
+        )
+    expected_host_id = expected_host_id or _load_existing_host_id()
+    if expected_host_id is not None and claimed.host_id != expected_host_id:
+        _stop_spawned_host_daemon_process(spawned)
+        _delete_spawned_daemon_record(target, spawned)
+        actual_host_id = claimed.host_id or "<missing>"
+        raise click.ClickException(
+            f"Host daemon for {target!r} registered as {actual_host_id!r}, but this "
+            f"invocation requested {expected_host_id!r}. The spawned daemon was stopped. "
+            "Check OMNIGENT_HOST_ID, OMNIGENT_HOST_NAME, and OMNIGENT_CONFIG_HOME. "
+            f"See {spawned.log_path}."
         )
     return decision.config_changed
 
@@ -3429,6 +3469,19 @@ def _build_host_daemon_env(
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
     )
+    from omnigent.host.identity import (
+        HOST_ID_ENV_VAR,
+        HOST_NAME_ENV_VAR,
+        HOST_TOKEN_ENV_VAR,
+    )
+
+    identity_env_vars = frozenset(
+        {
+            HOST_ID_ENV_VAR,
+            HOST_NAME_ENV_VAR,
+            HOST_TOKEN_ENV_VAR,
+        }
+    )
 
     if not server_url:
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
@@ -3438,6 +3491,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key in identity_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3451,6 +3505,7 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key in identity_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later
@@ -10294,7 +10349,6 @@ def host_reset_id(yes: bool) -> None:
     :param yes: When ``True``, skip the confirmation prompt.
     """
     from omnigent.host.identity import (
-        CONFIG_PATH,
         HOST_ID_ENV_VAR,
         HOST_NAME_ENV_VAR,
         host_identity_env_override_active,
@@ -10329,7 +10383,7 @@ def host_reset_id(yes: bool) -> None:
             "for an administrator to clean up",
             abort=True,
         )
-    old_host_id, new_host_id = reset_host_id(CONFIG_PATH)
+    old_host_id, new_host_id = reset_host_id()
     if old_host_id is None:
         click.echo(f"No previous host id was persisted; created {new_host_id}.")
     else:
