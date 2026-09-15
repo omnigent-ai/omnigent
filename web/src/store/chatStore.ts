@@ -826,12 +826,6 @@ export interface ConversationState {
    */
   awaitingSideChatFor: string | null;
   /**
-   * Side-chat child to reveal in the sub-agents rail, or null. `AppShell`
-   * observes it, switches the rail to Agents, and clears it; navigation rides
-   * the existing `redirectToConversationId` channel.
-   */
-  sideChatRailRequest: string | null;
-  /**
    * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
    * top-level session. Set from the snapshot on bind; lets a head sub-agent's
    * composer identity name the head rather than the bundle orchestrator.
@@ -988,6 +982,16 @@ export interface AppChatState {
    * the old conversation renders the persisted notice instead.
    */
   redirectToConversationId: string | null;
+  /**
+   * Side-chat child to reveal in the sub-agents rail, or null. `AppShell`
+   * observes it and, once the router has navigated to that child, switches the
+   * rail to Agents and clears it. App-global (NOT conversation-scoped): it is
+   * set while the main chat is still active but must survive the navigation to
+   * the child to be read there — a per-conversation value would be written to
+   * the main entry and read as null on the child. Navigation itself rides
+   * `redirectToConversationId`.
+   */
+  sideChatRailRequest: string | null;
   /**
    * Messages submitted while the agent is busy, held client-side (not yet
    * POSTed) and shown in the composer's queue strip. The head is flushed
