@@ -73,13 +73,14 @@ DEVIN_NATIVE_TERMINAL_ROLE = "devin-native"
 
 #: Terminal roles whose PTY-activity watcher drives the session's working
 #: status (pane activity → ``running``, quiescence → ``idle``), not just the
-#: activity badge. These are the native agent terminals whose ``run_turn``
-#: injects and returns immediately, so the PTY watcher is their only (or, for
-#: harnesses with a hook forwarder, their only *top-level*) running/idle status
-#: source — without membership here the web "Working…" badge never clears and
-#: the turn times out. A generic shell's role is absent so its output can't move
-#: the session status. Every native TUI harness that injects-and-returns must be
-#: listed; ``tests/runner/test_native_terminal_lock_coverage.py`` guards this.
+#: activity badge. These are the native agent terminals whose ``run_turn`` injects
+#: and returns immediately, leaving pane activity as their only running/idle
+#: source — without membership here the web "Working…" badge never clears and the
+#: turn times out. A generic shell's role is absent so its output can't move the
+#: session status. A harness whose own forwarder posts authoritative running/idle
+#: edges (devin-native, from its hook stream) is excluded instead, because pane
+#: quiescence would clobber them; ``tests/runner/test_native_terminal_lock_coverage.py``
+#: guards both sides.
 _STATUS_EMITTING_TERMINAL_ROLES: frozenset[str] = frozenset(
     {
         CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -90,7 +91,11 @@ _STATUS_EMITTING_TERMINAL_ROLES: frozenset[str] = frozenset(
         QWEN_NATIVE_TERMINAL_ROLE,
         KIMI_NATIVE_TERMINAL_ROLE,
         HERMES_NATIVE_TERMINAL_ROLE,
-        DEVIN_NATIVE_TERMINAL_ROLE,
+        # devin-native is deliberately ABSENT: its hook stream carries exact turn
+        # boundaries (UserPromptSubmit -> Stop), so its forwarder posts
+        # running/idle itself. Pane quiescence would flip the session to idle
+        # after ~1s of any mid-turn lull and clobber that, which makes a follow-up
+        # bypass the queue and always steer.
     }
 )
 # Role marker for the embedded Omnigent REPL terminal auto-created for

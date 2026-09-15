@@ -54,17 +54,20 @@ def test_extra_community_key_does_not_trip_the_guard() -> None:
     assert _require_full_native_lock_coverage(dispatch) is dispatch
 
 
-def test_devin_drives_web_status_from_the_pty_watcher() -> None:
-    # devin-native's run_turn injects and returns, so the runner's PTY-activity
-    # watcher is its only top-level running/idle status source. Absent from this
-    # set, the web "Working…" spinner never clears and the turn times out (the
-    # class of bug that left devin turns stuck on "Starting up…").
+def test_devin_status_comes_from_its_forwarder_not_the_pty_watcher() -> None:
+    # devin-native's hook stream carries exact turn boundaries, so its forwarder
+    # posts running/idle. The PTY watcher must NOT also drive status for it: pane
+    # quiescence flips to idle after ~1s of any mid-turn lull, which would clobber
+    # the authoritative edge and make a follow-up bypass the queue (always steer).
     from omnigent.runner.resource_registry import (
         _STATUS_EMITTING_TERMINAL_ROLES,
+        CLAUDE_NATIVE_TERMINAL_ROLE,
         DEVIN_NATIVE_TERMINAL_ROLE,
     )
 
-    assert DEVIN_NATIVE_TERMINAL_ROLE in _STATUS_EMITTING_TERMINAL_ROLES
+    assert DEVIN_NATIVE_TERMINAL_ROLE not in _STATUS_EMITTING_TERMINAL_ROLES
+    # The set is still live for the harnesses that have no such forwarder.
+    assert CLAUDE_NATIVE_TERMINAL_ROLE in _STATUS_EMITTING_TERMINAL_ROLES
 
 
 def test_devin_is_wired_into_interrupt_and_stop() -> None:

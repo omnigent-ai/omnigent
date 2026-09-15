@@ -168,9 +168,14 @@ async def test_full_turn_maps_to_omnigent_items(tmp_path: Path) -> None:
     assert assistant["agent"] == "devin-native-ui"
     assert "```" in assistant["content"][0]["text"]
 
-    # The turn closes exactly once, carrying the same id every item used.
+    # The turn opens busy and closes exactly once, carrying the same id every
+    # item used. The opening edge is what keeps the session "busy" for the web,
+    # since Devin's executor returns as soon as it has injected.
     statuses = client.events("external_session_status")
-    assert statuses == [{"status": "idle", "response_id": _TURN}]
+    assert statuses == [
+        {"status": "running", "response_id": _TURN},
+        {"status": "idle", "response_id": _TURN},
+    ]
 
 
 @pytest.mark.asyncio
@@ -196,13 +201,33 @@ async def test_every_item_carries_the_prompt_id_as_turn_id(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_turn_opens_running_and_closes_idle(tmp_path: Path) -> None:
+    # Devin's executor returns right after injecting, so the Omnigent turn is over
+    # immediately and the web sees no streaming state. These hook-driven edges are
+    # what keep the session "busy" for the whole turn, so a follow-up can queue
+    # instead of always steering.
+    client = _FakeClient()
+    await _drive(client, [_USER_PROMPT, _STOP], tmp_path)
+    statuses = [
+        (event["status"], event.get("response_id"))
+        for event in client.events("external_session_status")
+    ]
+    assert statuses[0] == ("running", _TURN)
+    assert statuses[-1] == ("idle", _TURN)
+
+
+@pytest.mark.asyncio
 async def test_new_prompt_closes_a_turn_left_open(tmp_path: Path) -> None:
     # A turn whose Stop never arrived (TUI killed mid-turn) must not swallow the
     # next turn's status edge.
     client = _FakeClient()
     second = dict(_USER_PROMPT, prompt_id="second-prompt", prompt="again")
     await _drive(client, [_USER_PROMPT, _PRE_TOOL, second], tmp_path)
-    assert client.events("external_session_status") == [{"status": "idle", "response_id": _TURN}]
+    assert client.events("external_session_status") == [
+        {"status": "running", "response_id": _TURN},
+        {"status": "idle", "response_id": _TURN},
+        {"status": "running", "response_id": "devin:turn:second-prompt"},
+    ]
 
 
 @pytest.mark.asyncio

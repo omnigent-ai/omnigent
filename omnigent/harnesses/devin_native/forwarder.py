@@ -318,6 +318,30 @@ async def _post_usage(
         resp.raise_for_status()
 
 
+async def _open_turn(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    turn: _TurnState,
+) -> None:
+    """Post the running status edge that opens a turn.
+
+    Devin's executor returns as soon as it has injected, so the Omnigent turn is
+    already over and the web sees no streaming state; pane activity is the only
+    other signal and it goes quiet on any mid-turn lull. The hook stream knows the
+    real boundaries, so this edge is what makes the session read as busy for the
+    whole turn — which is what lets a follow-up queue instead of always steering.
+    """
+    turn.live = True
+    with contextlib.suppress(httpx.HTTPError):
+        await post_external_session_status(
+            client,
+            session_id=session_id,
+            status="running",
+            response_id=turn.response_id,
+        )
+
+
 async def _close_turn(
     client: httpx.AsyncClient,
     *,
@@ -508,6 +532,7 @@ async def _handle_event(
             await _close_turn(client, session_id=session_id, turn=turn)
         prompt = payload.get("prompt")
         turn.prompt_id = prompt_id
+        await _open_turn(client, session_id=session_id, turn=turn)
         if isinstance(prompt, str) and prompt.strip():
             await _post_item(
                 client,
