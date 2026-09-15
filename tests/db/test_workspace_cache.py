@@ -49,6 +49,20 @@ def test_setdefault_returns_mutable_inner_for_nested_dicts() -> None:
         assert cache.setdefault("user", {}) == {}
 
 
+def test_update_is_workspace_scoped() -> None:
+    """``update`` merges into the current workspace only."""
+    cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+    with workspace_scope(1):
+        cache.update({"a": 1, "b": 2})
+        assert sorted(cache.items()) == [("a", 1), ("b", 2)]
+    with workspace_scope(2):
+        assert cache.get("a") is None
+        cache.update({"a": 9})
+        assert cache["a"] == 9
+    with workspace_scope(1):
+        assert cache["a"] == 1
+
+
 def test_pop_scoped_and_default() -> None:
     """``pop`` is workspace-scoped and honors the default sentinel."""
     cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()

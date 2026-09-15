@@ -27,7 +27,7 @@ there because its key is already globally unique (``call_id``,
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from typing import Any, Generic, TypeVar, overload
 
 from omnigent.db.db_models import current_workspace_id
@@ -73,11 +73,29 @@ class WorkspaceScopedCache(Generic[K, V]):
     def __contains__(self, key: object) -> bool:
         return (current_workspace_id(), key) in self._backing
 
-    def get(self, key: K, default: V | None = None) -> V | None:
+    @overload
+    def get(self, key: K) -> V | None:
+        """Return the current workspace's value, or ``None`` if absent."""
+
+    @overload
+    def get(self, key: K, default: V) -> V:
+        """Return the current workspace's value, or *default* if absent."""
+
+    @overload
+    def get(self, key: K, default: D) -> V | D:
+        """Return the current workspace's value, or *default* if absent."""
+
+    def get(self, key: K, default: Any = None) -> Any:
         return self._backing.get(self._scoped(key), default)
 
     def setdefault(self, key: K, default: V) -> V:
         return self._backing.setdefault(self._scoped(key), default)
+
+    def update(self, other: Mapping[K, V]) -> None:
+        """Merge *other*'s entries into the current workspace's slice."""
+        ws = current_workspace_id()
+        for key, value in other.items():
+            self._backing[(ws, key)] = value
 
     @overload
     def pop(self, key: K) -> V:
