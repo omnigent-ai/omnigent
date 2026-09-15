@@ -23,6 +23,7 @@ import pytest
 
 from omnigent.inner.cursor_executor import (
     CursorExecutor,
+    UnresolvableCursorModelError,
     _build_cursor_prompt,
     _normalize_cursor_usage,
     _resolve_model,
@@ -142,6 +143,16 @@ def _install_fake_sdk(
             state["closed"] += 1
             state["client_closed"] += 1
 
+        # Mirrors AsyncClient.list_models(): the account-catalog rows the
+        # executor resolves a pinned model against before dispatch.
+        async def list_models(self, *, api_key: Any = None) -> list[Any]:
+            return [
+                SimpleNamespace(id="auto-smart", display_name="Auto"),
+                SimpleNamespace(id="composer-2.5", display_name="Composer 2.5"),
+                SimpleNamespace(id="claude-opus-4-8", display_name="Opus 4.8"),
+                SimpleNamespace(id="gpt-5.5", display_name="GPT-5.5"),
+            ]
+
     class _FakeAsyncAgent:
         @classmethod
         async def create(
@@ -215,6 +226,88 @@ def test_resolve_model_drops_databricks_and_defaults_to_auto_smart() -> None:
     assert _resolve_model("databricks/kimi") == "auto-smart"
     assert _resolve_model(None) == "auto-smart"
     assert _resolve_model("auto") == "auto-smart"
+
+
+class _CatalogClient:
+    """Minimal stand-in for ``cursor_sdk.AsyncClient``'s model listing."""
+
+    def __init__(self, entries: list[tuple[str, str]] | None = None, exc: Exception | None = None):
+        self._entries = entries if entries is not None else []
+        self._exc = exc
+
+    async def list_models(self, *, api_key: Any = None) -> list[Any]:
+        if self._exc is not None:
+            raise self._exc
+        return [
+            SimpleNamespace(id=model_id, display_name=display_name)
+            for model_id, display_name in self._entries
+        ]
+
+
+_CATALOG = [
+    ("auto-smart", "Auto"),
+    ("composer-2.5", "Composer 2.5"),
+    ("claude-opus-4-8", "Opus 4.8"),
+    ("gpt-5.5", "GPT-5.5"),
+]
+
+
+async def test_catalog_resolution_accepts_served_ids_verbatim() -> None:
+    """An id the account catalog serves dispatches unchanged."""
+    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+
+    client = _CatalogClient(_CATALOG)
+    for model_id in ("composer-2.5", "claude-opus-4-8", "gpt-5.5"):
+        assert await _resolve_model_against_catalog(client, model_id, "crsr_x") == model_id
+
+
+async def test_catalog_resolution_maps_display_labels_to_ids() -> None:
+    """A display label naming exactly one catalog entry maps to its id.
+
+    The model switcher can persist the human label ("Composer") instead of
+    the id; forwarding it verbatim kills the turn with the backend's opaque
+    invalid_argument error.
+    """
+    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+
+    client = _CatalogClient(_CATALOG)
+    assert await _resolve_model_against_catalog(client, "Composer", "crsr_x") == "composer-2.5"
+    assert await _resolve_model_against_catalog(client, "Composer 2.5", "crsr_x") == "composer-2.5"
+
+
+async def test_catalog_resolution_rejects_unknown_ids_with_actionable_error() -> None:
+    """A typo'd or unknown id fails loudly, naming the available models.
+
+    This includes same-family typos (``composer-9999``) the old
+    shape-only validation could not catch.
+    """
+    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+
+    client = _CatalogClient(_CATALOG)
+    for bad in ("composr-2.5", "composer-9999", "gpt-not-a-real-model", "my model"):
+        with pytest.raises(UnresolvableCursorModelError) as excinfo:
+            await _resolve_model_against_catalog(client, bad, "crsr_x")
+        assert bad in str(excinfo.value)
+        assert "composer-2.5" in str(excinfo.value)  # names the available ids
+
+
+async def test_catalog_resolution_never_blocks_auto_select_or_degrades_loudly() -> None:
+    """auto-smart skips validation; a failing listing degrades, not blocks."""
+    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+
+    # The default auto-select is never validated (an empty/failed listing
+    # must not break unpinned sessions).
+    failing = _CatalogClient(exc=RuntimeError("listing unavailable"))
+    assert await _resolve_model_against_catalog(failing, "auto-smart", "crsr_x") == "auto-smart"
+    # A failing listing dispatches the requested id unverified (the backend
+    # still validates) instead of turning a listing outage into a hard block.
+    assert await _resolve_model_against_catalog(failing, "gpt-5.5", "crsr_x") == "gpt-5.5"
+
+    # A client without list_models (older SDK) likewise degrades.
+    class _Bare:
+        pass
+
+    assert await _resolve_model_against_catalog(_Bare(), "gpt-5.5", "crsr_x") == "gpt-5.5"
 
 
 def test_resolve_model_warns_when_dropping_a_pinned_model(
@@ -492,6 +585,163 @@ async def test_databricks_model_resolved_to_auto_smart(monkeypatch: pytest.Monke
     finally:
         await executor.close()
     assert state["create_models"] == ["auto-smart"]
+
+
+async def test_run_turn_rejects_unresolvable_model_before_sdk_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolvable model yields an in-band ExecutorError; no agent is created."""
+    from omnigent.inner.executor import ExecutorConfig
+
+    state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [
+            e
+            async for e in executor.run_turn(
+                [_user("hi")], [], "SYS", config=ExecutorConfig(model="composr-2.5")
+            )
+        ]
+    finally:
+        await executor.close()
+    assert state["create_models"] == []  # never reached agent creation
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "composr-2.5" in events[0].message
+    assert "composer-2.5" in events[0].message  # names the available ids
+
+    # A display label maps to its catalog id and the turn proceeds normally.
+    state2 = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor2 = CursorExecutor(api_key="crsr_x")
+    try:
+        events2 = [
+            e
+            async for e in executor2.run_turn(
+                [_user("hi")], [], "SYS", config=ExecutorConfig(model="Composer")
+            )
+        ]
+    finally:
+        await executor2.close()
+    assert state2["create_models"] == ["composer-2.5"]
+    assert not any(isinstance(e, ExecutorError) for e in events2)
+
+    # The session recovers: a valid pick on the next turn works normally.
+    state3 = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor3 = CursorExecutor(api_key="crsr_x")
+    try:
+        events3 = [
+            e
+            async for e in executor3.run_turn(
+                [_user("hi")], [], "SYS", config=ExecutorConfig(model="composer-2.5")
+            )
+        ]
+    finally:
+        await executor3.close()
+    assert state3["create_models"] == ["composer-2.5"]
+    assert not any(isinstance(e, ExecutorError) for e in events3)
+
+
+async def test_usage_attributed_to_resolved_id_not_display_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Usage/cost records the catalog-resolved id, not the requested label."""
+    from omnigent.inner.executor import ExecutorConfig
+
+    turn_ended = SimpleNamespace(
+        type="turn-ended",
+        usage={"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
+    )
+    script = {
+        "messages": [_assistant("ok")],
+        "interaction_updates": [turn_ended],
+        "status": "finished",
+        "result": "ok",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [
+            e
+            async for e in executor.run_turn(
+                [_user("hi")], [], "SYS", config=ExecutorConfig(model="Composer")
+            )
+        ]
+    finally:
+        await executor.close()
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1 and completes[0].usage is not None
+    assert completes[0].usage["model"] == "composer-2.5"  # not "Composer"
+
+
+async def test_resolved_id_on_next_turn_reuses_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a label resolves ('Composer' -> composer-2.5), a next turn pinning
+    either the label or the resolved id reuses the live agent instead of
+    tearing it down for the same underlying model."""
+    from omnigent.inner.executor import ExecutorConfig
+
+    scripts = [
+        {"messages": [_assistant("one")], "result": "one"},
+        {"messages": [_assistant("two")], "result": "two"},
+        {"messages": [_assistant("three")], "result": "three"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("first")], [], "SYS", config=ExecutorConfig(model="Composer")
+            )
+        ]
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("second")], [], "SYS", config=ExecutorConfig(model="composer-2.5")
+            )
+        ]
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("third")], [], "SYS", config=ExecutorConfig(model="Composer")
+            )
+        ]
+    finally:
+        await executor.close()
+    # One agent creation for all three turns; a genuinely different model
+    # still recreates (see test_session_restart_on_model_change).
+    assert state["create_models"] == ["composer-2.5"]
+    assert len(state["sent"]) == 3
+
+
+async def test_session_restart_on_model_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Switching to a genuinely different model rebuilds the agent."""
+    from omnigent.inner.executor import ExecutorConfig
+
+    scripts = [
+        {"messages": [_assistant("one")], "result": "one"},
+        {"messages": [_assistant("two")], "result": "two"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("first")], [], "SYS", config=ExecutorConfig(model="composer-2.5")
+            )
+        ]
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("second")], [], "SYS", config=ExecutorConfig(model="gpt-5.5")
+            )
+        ]
+    finally:
+        await executor.close()
+    assert state["create_models"] == ["composer-2.5", "gpt-5.5"]
+    assert state["closed"] >= 1
 
 
 async def test_api_key_threaded_to_create(monkeypatch: pytest.MonkeyPatch) -> None:
