@@ -149,7 +149,24 @@ sandbox:
   daytona:
     image: docker.io/<you>/omnigent-host:latest  # default: official image
     env: [OPENAI_API_KEY, ANTHROPIC_API_KEY, GIT_TOKEN]
+    cpu: 4                   # vCPUs; default: 2
+    memory: 8                # GiB; default: 4
+    disk: 20                 # GiB; default: Daytona's own
+    auto_delete_interval: 60 # minutes; default: never auto-delete
 ```
+
+The default 2 vCPU / 4 GiB fits a host driving one interactive
+session. A workspace that builds and tests inside the sandbox needs
+more: at 4 GiB a real monorepo suite does not OOM-kill, it silently
+starves — the cgroup hits its memory ceiling continuously, containers
+the tests start cannot get memory, and specs fail with no `oom_kill`
+to point at.
+
+`auto_delete_interval` makes Daytona delete a sandbox that has stayed
+stopped for that many minutes (`0` deletes on stop). Set it when the
+deployment's API key has no delete permission: teardown's `delete`
+call then returns 403 and every session leaks a stopped sandbox, while
+a server-side reap keeps the account clean without widening the key.
 
 A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
 in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
