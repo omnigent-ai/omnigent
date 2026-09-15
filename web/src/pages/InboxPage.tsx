@@ -337,6 +337,7 @@ export function InboxPage() {
                   allowAutoMode={item.elicitation.allowAutoMode}
                   rememberScope={item.elicitation.rememberScope}
                   codexPersistModes={item.elicitation.codexPersistModes}
+                  agyPermission={item.elicitation.agyPermission}
                   onSubmit={makeSubmit(item)}
                 />
               )}

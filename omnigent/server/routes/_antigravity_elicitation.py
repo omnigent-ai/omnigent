@@ -148,6 +148,36 @@ def _agy_ask_question_params(
     )
 
 
+# agy marks a permission prompt as carrying an "always allow" choice with this
+# ``persistSuggestionType`` value plus a concrete ``suggestedPersistPattern``
+# (the pattern its own TUI menu offers to remember, e.g. the command word).
+_PERSIST_SUGGESTED = "PERSIST_SUGGESTION_TYPE_SUGGESTED"
+
+
+def _suggested_persist_pattern(spec: object) -> str | None:
+    """
+    Return the always-allow persist pattern a permission spec advertises.
+
+    agy offers an always-allow menu entry only when the spec carries
+    ``persistSuggestionType == PERSIST_SUGGESTION_TYPE_SUGGESTED`` AND a
+    non-empty ``suggestedPersistPattern``. Both are required here so the web
+    card never offers (and the TUI mapper never types) a persist choice agy's
+    own prompt does not have.
+
+    :param spec: The ``requestedInteraction.permission`` block.
+    :returns: The advertised persist pattern, or ``None`` when the prompt
+        offers no always-allow choice.
+    """
+    if not isinstance(spec, dict):
+        return None
+    if spec.get("persistSuggestionType") != _PERSIST_SUGGESTED:
+        return None
+    pattern = spec.get("suggestedPersistPattern")
+    if isinstance(pattern, str) and pattern:
+        return pattern
+    return None
+
+
 def _agy_permission_params(
     trajectory_id: object,
     step_index: object,
@@ -156,19 +186,35 @@ def _agy_permission_params(
     """
     Build elicitation params for a ``permission`` pending interaction.
 
+    Besides the binary approve/reject shape, the params surface the two parts
+    of agy's own prompt the card must not drop:
+
+    * ``action_description`` — the spec's ``actionDescription`` (what agy says
+      it wants to do, e.g. "Running pwd command").
+    * ``always_allow_pattern`` — the advertised persist pattern when agy's
+      prompt offers an "always allow" choice (see
+      :func:`_suggested_persist_pattern`); the web card renders it as an
+      "Always allow <pattern>" button whose accept verdict carries
+      ``_meta.persist == "always"``.
+
     :param trajectory_id: agy trajectory id string.
     :param step_index: Step index integer (0 when absent).
     :param spec: The ``requestedInteraction.permission`` block; carries
-        ``resource.{action, target}`` and ``actionDescription``.
-    :returns: ``ElicitationRequestParams`` for a binary command-approval card.
+        ``resource.{action, target}``, ``actionDescription``, and the persist
+        suggestion fields.
+    :returns: ``ElicitationRequestParams`` for the command-approval card.
     """
     command: str | None = None
+    action_description: str | None = None
     if isinstance(spec, dict):
         resource = spec.get("resource")
         if isinstance(resource, dict):
             target = resource.get("target")
             if isinstance(target, str) and target:
                 command = target
+        described = spec.get("actionDescription")
+        if isinstance(described, str) and described:
+            action_description = described
 
     message = "Antigravity wants to run a command"
     if command:
@@ -179,6 +225,11 @@ def _agy_permission_params(
     }
     if command:
         extras["command"] = command
+    if action_description:
+        extras["action_description"] = action_description
+    always_allow_pattern = _suggested_persist_pattern(spec)
+    if always_allow_pattern:
+        extras["always_allow_pattern"] = always_allow_pattern
     if isinstance(trajectory_id, str) and trajectory_id:
         extras["trajectory_id"] = trajectory_id
     if isinstance(step_index, int):
@@ -321,6 +372,12 @@ def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:
 
     ``accept`` → ``allow: True``; ``decline`` or ``cancel`` → ``allow: False``.
 
+    An always-allow accept (``_meta.persist == "always"``) still delivers the
+    plain ``allow: True`` here: the live-verified RPC variant carries only
+    ``allow``, and the persist side of the verdict rides the TUI channel
+    (:func:`to_tui_selection_keys` selects agy's own always-allow menu entry,
+    which owns recording the pattern).
+
     :param result: Web-submitted elicitation verdict.
     :returns: ``{"permission": {"allow": <bool>}}``
     """
@@ -328,12 +385,14 @@ def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:
 
 
 # agy's attended-TUI permission prompt is a numbered list: option 1 is the bare
-# "Yes" (approve once) and the LAST option is "No" (decline). The web card is a
-# binary Approve/Reject (the non-1:1 mapping with options 2/3 — the "always
-# allow" variants — is intentionally acceptable, #1200), so Approve drives the
-# always-safe "Yes" (1) and Reject drives "No" (4). These are the digits typed
-# into the pane, each followed by Enter to confirm the selection.
+# "Yes" (approve once), option 2 is the always-allow entry carrying the spec's
+# advertised ``suggestedPersistPattern`` (options 2/3 are the persist
+# variants), and the LAST option is "No" (4). The web card's Approve drives the
+# always-safe "Yes" (1), its "Always allow <pattern>" choice drives the
+# advertised persist entry (2), and Reject drives "No" (4). These are the
+# digits typed into the pane, each followed by Enter to confirm the selection.
 _AGY_TUI_PERMISSION_APPROVE_OPTION = "1"
+_AGY_TUI_PERMISSION_ALWAYS_ALLOW_OPTION = "2"
 _AGY_TUI_PERMISSION_REJECT_OPTION = "4"
 _AGY_TUI_CONFIRM_KEY = "Enter"
 
@@ -356,9 +415,10 @@ def to_tui_selection_keys(
     :func:`omnigent.harnesses.antigravity_native.bridge.send_interaction_keys_via_tui`,
     mirroring cursor-native. This is the pure shape-mapper for those keys.
 
-    * **permission** — Approve → option ``"1"`` ("Yes"), Reject → option ``"4"``
-      ("No"), each followed by ``Enter``. (The card is binary; the non-1:1 map
-      with the "always allow" variants 2/3 is intentionally acceptable, #1200.)
+    * **permission** — Approve → option ``"1"`` ("Yes"); an always-allow accept
+      (``_meta.persist == "always"``, offered only when the spec advertises a
+      persist pattern) → option ``"2"`` (agy's own always-allow menu entry);
+      Reject → option ``"4"`` ("No") — each followed by ``Enter``.
     * **ask_question** — type the selected option id(s) ("1".."N") then ``Enter``;
       agy's TUI numbers questions' options the same way its RPC ``selectedOptionIds``
       do. A decline/cancel (or no usable selection) presses ``Escape`` to dismiss.
@@ -372,12 +432,16 @@ def to_tui_selection_keys(
     :raises ValueError: When ``kind`` is not ``"ask_question"`` or ``"permission"``.
     """
     if kind == "permission":
-        option = (
-            _AGY_TUI_PERMISSION_APPROVE_OPTION
-            if result.action == "accept"
-            else _AGY_TUI_PERMISSION_REJECT_OPTION
-        )
-        return [option, _AGY_TUI_CONFIRM_KEY]
+        if result.action != "accept":
+            return [_AGY_TUI_PERMISSION_REJECT_OPTION, _AGY_TUI_CONFIRM_KEY]
+        persist = result.meta.get("persist") if result.meta is not None else None
+        if persist == "always" and _suggested_persist_pattern(spec) is not None:
+            # The always-allow menu entry exists only when the spec advertised
+            # a persist pattern; an unadvertised persist request falls back to
+            # the plain approve so a stale or crafted verdict can never select
+            # a menu entry agy's prompt does not have.
+            return [_AGY_TUI_PERMISSION_ALWAYS_ALLOW_OPTION, _AGY_TUI_CONFIRM_KEY]
+        return [_AGY_TUI_PERMISSION_APPROVE_OPTION, _AGY_TUI_CONFIRM_KEY]
     if kind == "ask_question":
         return _agy_ask_question_tui_keys(result, spec)
     raise ValueError(f"Unsupported agy interaction kind: {kind!r}")
