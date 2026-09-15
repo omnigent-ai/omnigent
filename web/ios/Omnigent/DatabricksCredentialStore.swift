@@ -4,6 +4,7 @@ import Security
 struct DatabricksCredentialScope: Hashable, Sendable {
   let workspaceOrigin: URL
   let clientID: String
+  let workspaceID: String?
 
   init(workspaceURL: URL, configuration: DatabricksOAuthConfiguration) throws {
     guard var origin = URLComponents(url: workspaceURL, resolvingAgainstBaseURL: false),
@@ -12,6 +13,16 @@ struct DatabricksCredentialScope: Hashable, Sendable {
       origin.user == nil, origin.password == nil,
       origin.port == nil || origin.port == 443
     else { throw DatabricksOAuthError.invalidWorkspace }
+    let identifiers = (origin.queryItems ?? []).filter { $0.name == "o" }
+    guard identifiers.count <= 1 else { throw DatabricksOAuthError.invalidWorkspace }
+    if let identifier = identifiers.first {
+      guard let value = identifier.value, !value.isEmpty,
+        value.utf8.allSatisfy({ (48...57).contains($0) })
+      else { throw DatabricksOAuthError.invalidWorkspace }
+      workspaceID = value
+    } else {
+      workspaceID = nil
+    }
     origin.scheme = "https"
     origin.host = origin.host?.lowercased()
     origin.port = nil
@@ -26,7 +37,9 @@ struct DatabricksCredentialScope: Hashable, Sendable {
   var account: String {
     let origin = workspaceOrigin.absoluteString
     // Length-prefix the origin so neither component can collide with the separator.
-    return "\(origin.utf8.count):\(origin)\(clientID)"
+    let base = "\(origin.utf8.count):\(origin)\(clientID)"
+    guard let workspaceID else { return base }
+    return "o:\(workspaceID.count):\(workspaceID):\(base)"
   }
 }
 
@@ -53,14 +66,15 @@ struct DatabricksCredentialStore: DatabricksCredentialStoring {
     guard status == errSecSuccess else { throw DatabricksCredentialError.keychain(status) }
     guard let data = result as? Data,
       let record = try? JSONDecoder().decode(Record.self, from: data),
-      record.version == 1, record.tokens.isValid
+      record.version == (record.tokens.issuer == nil ? 1 : 2), record.tokens.isValid
     else { throw DatabricksCredentialError.invalidData }
     return record.tokens
   }
 
   func save(_ tokens: DatabricksOAuthTokens, for scope: DatabricksCredentialScope) throws {
     guard tokens.isValid else { throw DatabricksCredentialError.invalidData }
-    let data = try JSONEncoder().encode(Record(version: 1, tokens: tokens))
+    let data = try JSONEncoder().encode(
+      Record(version: tokens.issuer == nil ? 1 : 2, tokens: tokens))
     let query = query(for: scope)
     let attributes: [String: Any] = [
       kSecValueData as String: data,

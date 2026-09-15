@@ -31,13 +31,25 @@ struct DatabricksOAuthAttempt: Sendable {
       URLQueryItem(name: "code_challenge", value: Self.challenge(for: verifier)),
       URLQueryItem(name: "code_challenge_method", value: "S256"),
     ]
+    if let workspaceID = credentialScope.workspaceID {
+      components.queryItems?.append(URLQueryItem(name: "o", value: workspaceID))
+    }
     // OAuth servers decode query parameters as form data, where a literal + is a space.
     components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(
       of: "+", with: "%2B")
     return components.url!
   }
 
+  struct AuthorizationResponse: Sendable {
+    let code: String
+    let issuer: DatabricksOAuthIssuer
+  }
+
   func authorizationCode(from callback: URL) throws -> String {
+    try authorizationResponse(from: callback).code
+  }
+
+  func authorizationResponse(from callback: URL) throws -> AuthorizationResponse {
     guard configuration.matchesCallback(callback),
       let items = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems
     else { throw DatabricksOAuthError.invalidCallback }
@@ -56,17 +68,27 @@ struct DatabricksOAuthAttempt: Sendable {
     guard codes.count == 1, let code = codes.first?.value, !code.isEmpty else {
       throw DatabricksOAuthError.invalidCallback
     }
-    return code
+    let issuers = items.filter { $0.name == "iss" }
+    let issuerURL: URL
+    if issuers.isEmpty {
+      issuerURL = workspaceOrigin.appendingPathComponent("oidc")
+    } else {
+      guard issuers.count == 1, let value = issuers.first?.value, !value.isEmpty,
+        let url = URL(string: value)
+      else { throw DatabricksOAuthError.invalidIssuer }
+      issuerURL = url
+    }
+    return AuthorizationResponse(code: code, issuer: try DatabricksOAuthIssuer(issuerURL))
   }
 
-  func tokenRequest(code: String) -> URLRequest {
+  func tokenRequest(code: String, issuer: DatabricksOAuthIssuer? = nil) -> URLRequest {
     DatabricksOAuthClient.tokenRequest(
       for: credentialScope,
       fields: [
         ("grant_type", "authorization_code"),
         ("redirect_uri", configuration.redirectURL.absoluteString), ("scope", Self.scope),
         ("code_verifier", verifier), ("code", code),
-      ])
+      ], issuer: issuer)
   }
 
   static func challenge(for verifier: String) -> String {

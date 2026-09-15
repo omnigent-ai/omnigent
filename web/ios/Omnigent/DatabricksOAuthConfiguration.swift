@@ -49,6 +49,8 @@ enum DatabricksOAuthError: Error, Equatable, LocalizedError {
   case invalidWorkspace
   case randomGenerationFailed
   case invalidCallback
+  case invalidIssuer
+  case invalidDiscovery
   case authorizationDenied
   case authorizationFailed
   case loginInProgress
@@ -66,6 +68,8 @@ enum DatabricksOAuthError: Error, Equatable, LocalizedError {
     case .invalidWorkspace: "Databricks OAuth requires an HTTPS workspace URL."
     case .randomGenerationFailed: "Could not prepare secure sign-in. Please try again."
     case .invalidCallback: "Databricks returned an invalid sign-in callback."
+    case .invalidIssuer: "Databricks returned an unsupported OAuth issuer."
+    case .invalidDiscovery: "Databricks returned inconsistent OAuth provider metadata."
     case .authorizationDenied: "Databricks sign-in was not authorized."
     case .authorizationFailed: "Databricks could not authorize this sign-in."
     case .loginInProgress: "A Databricks sign-in is already in progress."

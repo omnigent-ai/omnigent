@@ -224,10 +224,26 @@ final class OAuthTestServer {
   let workspaceURL: URL
   let session: URLSession
 
-  init(handler: @escaping Handler = { _ in Response(data: tokenData) }) {
+  init(
+    automaticDiscovery: Bool = true, handler: @escaping Handler = { _ in Response(data: tokenData) }
+  ) {
     workspaceURL = URL(
       string: "https://test-\(UUID().uuidString.lowercased()).cloud.databricks.com")!
-    OAuthURLProtocol.setHandler(handler, for: workspaceURL.host!)
+    OAuthURLProtocol.setHandler(
+      { request in
+        let suffix = "/.well-known/openid-configuration"
+        if automaticDiscovery, request.url?.path.hasSuffix(suffix) == true {
+          XCTAssertEqual(request.httpMethod, "GET")
+          XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+          XCTAssertNil(request.httpBody)
+          let issuer = String(request.url!.absoluteString.dropLast(suffix.count))
+          return Response(
+            data: try JSONSerialization.data(withJSONObject: [
+              "issuer": issuer, "token_endpoint": issuer + "/v1/token",
+            ]))
+        }
+        return try handler(request)
+      }, for: workspaceURL.host!)
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [OAuthURLProtocol.self]
     session = DatabricksOAuthClient.makeSession(configuration: configuration)

@@ -220,6 +220,58 @@ final class DatabricksLoginManagerTests: XCTestCase {
     XCTAssertEqual(harness.credentials.snapshot(for: scope), original)
   }
 
+  func testIssuerDiscoveryKeepsSelectedWorkspaceContext() async throws {
+    let authority = OAuthTestServer()
+    let issuer = try DatabricksOAuthIssuer(authority.workspaceURL.appendingPathComponent("oidc"))
+    let harness = try Harness(
+      server: OAuthTestServer { _ in
+        XCTFail("Exchange must use the discovered authority")
+        return .init(data: OAuthTestServer.tokenData)
+      })
+    let selectedURL = URL(string: harness.server.workspaceURL.absoluteString + "/omnigent?o=123")!
+    let scope = try DatabricksCredentialScope(
+      workspaceURL: selectedURL, configuration: harness.configuration)
+    let started = expectation(description: "browser started")
+    harness.onStart = { started.fulfill() }
+    let task = harness.signIn(workspaceURL: selectedURL)
+    await fulfillment(of: [started], timeout: 2)
+    let browser = harness.browsers[0]
+    XCTAssertEqual(
+      URLComponents(url: browser.url, resolvingAgainstBaseURL: false)?.queryItems?.first {
+        $0.name == "o"
+      }?.value, "123")
+    browser.succeed(redirect: harness.configuration.redirectURL, issuer: issuer.url.absoluteString)
+    let tokens = try await task.value
+    XCTAssertEqual(tokens.issuer, issuer)
+    XCTAssertEqual(harness.credentials.snapshot(for: scope), tokens)
+    let authorityScope = try DatabricksCredentialScope(
+      workspaceURL: authority.workspaceURL, configuration: harness.configuration)
+    XCTAssertNil(harness.credentials.snapshot(for: authorityScope))
+  }
+
+  func testUnsupportedCallbackIssuerNeverExchangesOrStoresTokens() async throws {
+    let harness = try Harness(
+      server: OAuthTestServer(automaticDiscovery: false) { _ in
+        XCTFail("Unsupported issuer must not trigger any request")
+        return .init(data: OAuthTestServer.tokenData)
+      })
+    let started = expectation(description: "browser started")
+    harness.onStart = { started.fulfill() }
+    let task = harness.signIn()
+    await fulfillment(of: [started], timeout: 2)
+    harness.browsers[0].succeed(
+      redirect: harness.configuration.redirectURL, issuer: "https://example.org/oidc")
+    do {
+      _ = try await task.value
+      XCTFail("Expected issuer rejection")
+    } catch {
+      XCTAssertEqual(error as? DatabricksOAuthError, .invalidIssuer)
+    }
+    let scope = try DatabricksCredentialScope(
+      workspaceURL: harness.server.workspaceURL, configuration: harness.configuration)
+    XCTAssertNil(harness.credentials.snapshot(for: scope))
+  }
+
   private func assertCancelled(_ task: Task<DatabricksOAuthTokens, Error>) async {
     do {
       _ = try await task.value
@@ -264,10 +316,11 @@ private final class Harness {
       clientID: "test-client", redirectURL: redirectURL)
   }
 
-  func signIn() -> Task<DatabricksOAuthTokens, Error> {
+  func signIn(workspaceURL: URL? = nil) -> Task<DatabricksOAuthTokens, Error> {
     Task {
       try await manager.signIn(
-        workspaceURL: server.workspaceURL, configuration: configuration, anchor: anchor)
+        workspaceURL: workspaceURL ?? server.workspaceURL, configuration: configuration,
+        anchor: anchor)
     }
   }
 }
@@ -296,7 +349,7 @@ private final class FakeAuthenticationSession: DatabricksAuthenticationSession {
   }
   func cancel() { cancelCount += 1 }
 
-  func succeed(redirect: URL) {
+  func succeed(redirect: URL, issuer: String? = nil) {
     let state = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!.first {
       $0.name == "state"
     }!.value!
@@ -304,6 +357,7 @@ private final class FakeAuthenticationSession: DatabricksAuthenticationSession {
     callback.queryItems = [
       URLQueryItem(name: "state", value: state), URLQueryItem(name: "code", value: "code"),
     ]
+    if let issuer { callback.queryItems?.append(URLQueryItem(name: "iss", value: issuer)) }
     completion(callback.url, nil)
   }
 }

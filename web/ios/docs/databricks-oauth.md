@@ -3,8 +3,9 @@
 The native OAuth layer is available for workspace-hosted Omnigent, but is **not
 connected to WebView loading yet**. Workspace and Databricks Apps sign-in still
 run inline; generic OIDC is unchanged. Native token persistence and on-demand
-refresh are implemented; platform session-cookie bootstrap and WebView activation
-remain separate integration steps.
+refresh, workspace query context, and issuer discovery are implemented. Platform
+session-cookie bootstrap, isolated per-workspace WebKit data stores, and WebView
+activation remain separate integration steps.
 
 ## Build configuration
 
@@ -57,9 +58,8 @@ sign-in can complete:
 3. Register the exact redirect URL on the Databricks public OAuth client and
    enable that client for the intended Databricks accounts.
 
-The public and internal flavors have different bundle IDs; verify association
-for each shipped flavor. This repository cannot authorize either app on the
-Databricks-owned callback domain. Its default URL is **not proof that domain
+Verify the domain association separately for every shipped bundle ID. This
+repository cannot provision the callback domain's association. Its default URL is **not proof that domain
 association or OAuth registration has been provisioned**.
 
 If you override the redirect **host**, also change the Associated Domains entry
@@ -76,30 +76,65 @@ and expiry in Keychain before returning success. Callers must not log tokens or
 send them to JavaScript. A cleared or superseded sign-in cannot commit its result.
 
 - Fresh cryptographic state and S256 PKCE verifier for every attempt.
-- Workspace-scoped `/oidc/v1/authorize` and `/oidc/v1/token`, using the documented
-  `all-apis offline_access` U2M scopes. Cookie-exchange scope requirements still
-  need confirmation before activation.
-- Exact callback destination and state validation before exchanging the code.
+- Start at the entered host's `/oidc/v1/authorize`, with `all-apis offline_access`.
+  Forward a supplied `o` value to retain the requested workspace context; do not
+  copy unrelated page query parameters into OAuth requests. A canonical workspace
+  host can authorize without `o`. No workspace picker or workspace-list API is used.
+- Validate the exact callback destination, state, code, and optional `iss` before
+  exchanging the code. A missing issuer falls back to the entered origin's `/oidc`
+  issuer; a present malformed or duplicate issuer is rejected, not ignored.
 - Native, form-encoded token POST in a cookie/cache/credential-isolated session;
   no HTTP redirects, even within the same origin.
 - One sign-in at a time, cancellation of browser and token exchange, and rejection
   of duplicate or stale callbacks. Provider error descriptions are not surfaced.
 - Normal browser SSO rather than forced ephemeral browsing.
 
+## Issuer discovery
+
+The OAuth authority is distinct from the page destination. Supported issuer shapes
+are HTTPS Databricks workspace `/oidc` and account `/oidc/accounts/<account-id>` URLs
+on the existing Databricks workspace domain families. Issuers with userinfo,
+nondefault ports, queries, fragments, unsupported paths, or outside hosts are rejected.
+
+Before code exchange, this client fetches
+`<issuer>/.well-known/openid-configuration` through its isolated transport. Its
+validation policy requires an exact issuer match and a `token_endpoint` equal to
+`<issuer>/v1/token`. Discovery requests contain no credentials and do not follow
+redirects. Inconsistent metadata prevents the token POST; the client does not fall
+back to an origin-only endpoint after discovery fails. These describe client
+behavior, not a guarantee that every deployment exposes these endpoints.
+
+Consequently, an account issuer keeps its account path for token requests, while a
+workspace issuer uses `/oidc/v1/token`. Persist the verified issuer with the opaque
+token bundle and retain it on refresh; no JWT decoding is needed for routing. This
+metadata is not proof that the grant can access a particular workspace—the platform
+must authorize the eventual workspace request. Discovery does not repin the WebView
+or change the user's destination.
+
 ## Credentials and refresh
 
 Use `DatabricksTokenManager.shared` for all production callers. A
-`DatabricksCredentialScope` identifies one account per canonical workspace origin
-and exact client ID. Paths, case, and explicit port 443 do not create separate
-identities. Different workspace origins or client IDs never share a grant. This
-uses the same workspace-host identity as the OAuth issuer; it does not introduce
-support for multiple workspace identities behind one shared origin.
+`DatabricksCredentialScope` identifies one account per normalized entered origin,
+optional `o`, and exact client ID. The workspace ID is a nonempty ASCII decimal
+string; duplicate or malformed `o` parameters are rejected. IDs are not converted
+to floating-point numbers. Different IDs on a shared host have separate saved
+grants, refresh operations, and clearing boundaries. Paths, host case, and explicit
+port 443 do not create separate identities.
+
+The page origin need not equal the saved OAuth issuer. Aliases are not automatically
+merged, and account grants are not copied into other workspace records. The original
+no-`o` Keychain key format is preserved; a URL with `o` never falls back to an old
+ambiguous origin-only record. Version-1 workspace-only records remain readable and
+use their legacy refresh route. Issuer-aware records use version 2 so older builds
+reject them rather than ignore their routing context. Malformed or unknown record
+versions are not silently deleted.
 
 - `tokens(for:)` loads a saved bundle and returns it if it has more than 60 seconds
   remaining. Otherwise, callers for the same scope share one refresh request.
 - Refresh uses a form-encoded public-client `refresh_token` grant. A replacement
   refresh token is saved with the entire bundle before callers receive success.
-  If the response omits it, the previous refresh token is retained.
+  If the response omits it, the previous refresh token is retained. Issuer metadata
+  is retained with the replacement bundle, including across pending-write retries.
 - Only a validated HTTP 400 `invalid_grant` response from the expected token
   endpoint automatically clears that scope and returns `nil` (sign-in needed).
   Missing credentials also return `nil`. Network, throttling, server, configuration,
@@ -132,9 +167,11 @@ Run these focused suites in Xcode's Test navigator:
 - `DatabricksOAuthConfigurationTests`
 - `DatabricksOAuthAttemptTests`
 - `DatabricksOAuthClientTests`
+- `DatabricksOAuthIssuerTests`
 - `DatabricksLoginManagerTests`
 - `DatabricksCredentialStoreTests`
 - `DatabricksTokenManagerTests`
+- `DeepLinkTests` (conversation paths preserve existing workspace queries)
 
 They use synthetic tokens and fake browser sessions; they never log in to a live
 workspace. Credential-store tests use real Keychain APIs under unique test-only

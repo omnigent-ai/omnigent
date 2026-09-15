@@ -166,10 +166,13 @@ final class DatabricksTokenManagerTests: XCTestCase {
   func testFailedRotationWriteRetriesPersistenceWithoutReusingOldGrant() async throws {
     let store = MemoryDatabricksCredentialStore()
     let scope = try credentialScope()
-    let saved = credentialTokens(expiry: 900)
+    let issuer = try DatabricksOAuthIssuer(
+      URL(string: "https://accounts.cloud.databricks.com/oidc/accounts/test-account")!)
+    let saved = credentialTokens(expiry: 900, issuer: issuer)
     try store.save(saved, for: scope)
     store.fail(.save)
-    let rotated = credentialTokens(access: "rotated-access", refresh: "rotated-refresh")
+    let rotated = credentialTokens(
+      access: "rotated-access", refresh: "rotated-refresh", issuer: issuer)
     let client = RefreshStub(response: .success(rotated))
     let manager = DatabricksTokenManager(
       store: store, client: client, now: { Date(timeIntervalSince1970: 1000) })
@@ -186,6 +189,44 @@ final class DatabricksTokenManagerTests: XCTestCase {
     XCTAssertEqual(store.snapshot(for: scope), rotated)
     let calls = await client.calls
     XCTAssertEqual(calls.count, 1)
+    XCTAssertEqual(calls.first?.issuer, issuer)
+  }
+
+  func testRejectsRefreshThatDropsIssuerContext() async throws {
+    let store = MemoryDatabricksCredentialStore()
+    let scope = try credentialScope()
+    let issuer = try DatabricksOAuthIssuer(
+      URL(string: "https://workspace.cloud.databricks.com/oidc")!)
+    let saved = credentialTokens(expiry: 900, issuer: issuer)
+    try store.save(saved, for: scope)
+    let manager = DatabricksTokenManager(
+      store: store, client: RefreshStub(response: .success(credentialTokens())))
+    do {
+      _ = try await manager.tokens(for: scope)
+      XCTFail("Expected issuer mismatch")
+    } catch {
+      XCTAssertEqual(error as? DatabricksOAuthError, .invalidTokenResponse)
+    }
+    XCTAssertEqual(store.snapshot(for: scope), saved)
+  }
+
+  func testSameOriginWorkspaceContextsKeepTheirOwnTokens() async throws {
+    let first = try credentialScope(workspace: "https://workspace.databricks.com/omnigent?o=123")
+    let second = try credentialScope(workspace: "https://workspace.databricks.com/omnigent?o=456")
+    let store = MemoryDatabricksCredentialStore()
+    let firstTokens = credentialTokens(access: "first")
+    let secondTokens = credentialTokens(access: "second")
+    let manager = DatabricksTokenManager(
+      store: store, client: RefreshStub(), now: { Date(timeIntervalSince1970: 1000) })
+    try await manager.save(firstTokens, for: first)
+    try await manager.save(secondTokens, for: second)
+    let loadedFirst = try await manager.tokens(for: first)
+    let loadedSecond = try await manager.tokens(for: second)
+    XCTAssertEqual(loadedFirst, firstTokens)
+    XCTAssertEqual(loadedSecond, secondTokens)
+    try await manager.clear(for: first)
+    XCTAssertNil(store.snapshot(for: first))
+    XCTAssertEqual(store.snapshot(for: second), secondTokens)
   }
 
   func testFailedClearDoesNotAllowOldCredentialsToReappear() async throws {
@@ -210,21 +251,26 @@ final class DatabricksTokenManagerTests: XCTestCase {
   }
 
   func testClearAndNewLoginRejectLateRefreshResults() async throws {
+    let oldIssuer = try DatabricksOAuthIssuer(
+      URL(string: "https://accounts.cloud.databricks.com/oidc/accounts/old-account")!)
+    let newIssuer = try DatabricksOAuthIssuer(
+      URL(string: "https://accounts.cloud.databricks.com/oidc/accounts/new-account")!)
     for replaceWithLogin in [false, true] {
       for remoteResult: Result<DatabricksOAuthTokens, Error> in [
-        .success(credentialTokens(access: "old-result")),
+        .success(credentialTokens(access: "old-result", issuer: oldIssuer)),
         .failure(DatabricksOAuthError.invalidRefreshGrant),
       ] {
         let requested = expectation(description: "refresh started")
         let client = RefreshStub(onRequest: { requested.fulfill() })
         let store = MemoryDatabricksCredentialStore()
         let scope = try credentialScope()
-        try store.save(credentialTokens(expiry: 900), for: scope)
+        try store.save(credentialTokens(expiry: 900, issuer: oldIssuer), for: scope)
         let manager = DatabricksTokenManager(
           store: store, client: client, now: { Date(timeIntervalSince1970: 1000) })
         let waiter = Task { try await manager.tokens(for: scope) }
         await fulfillment(of: [requested], timeout: 2)
-        let newer = credentialTokens(access: "new-login", refresh: "new-login-refresh")
+        let newer = credentialTokens(
+          access: "new-login", refresh: "new-login-refresh", issuer: newIssuer)
         if replaceWithLogin {
           try await manager.save(newer, for: scope)
         } else {
@@ -251,6 +297,7 @@ private actor RefreshStub: DatabricksTokenRefreshing {
   struct Call: Sendable {
     let token: String
     let scope: DatabricksCredentialScope
+    let issuer: DatabricksOAuthIssuer?
   }
   private(set) var calls: [Call] = []
   private(set) var cancellationStates: [Bool] = []
@@ -271,11 +318,13 @@ private actor RefreshStub: DatabricksTokenRefreshing {
     self.onRequest = onRequest
   }
 
-  func refresh(_ refreshToken: String, for scope: DatabricksCredentialScope) async throws
+  func refresh(
+    _ refreshToken: String, for scope: DatabricksCredentialScope, issuer: DatabricksOAuthIssuer?
+  ) async throws
     -> DatabricksOAuthTokens
   {
     let index = calls.count
-    calls.append(Call(token: refreshToken, scope: scope))
+    calls.append(Call(token: refreshToken, scope: scope, issuer: issuer))
     if let response { return try response.get() }
     let tokens: DatabricksOAuthTokens = try await withCheckedThrowingContinuation { continuation in
       pending[index] = continuation

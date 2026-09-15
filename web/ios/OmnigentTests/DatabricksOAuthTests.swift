@@ -59,7 +59,8 @@ final class DatabricksOAuthAttemptTests: XCTestCase {
   func testUsesWorkspaceIssuerAndPublicClientPKCE() throws {
     let config = try configuration(clientID: "client+&value")
     let attempt = try DatabricksOAuthAttempt(
-      workspaceURL: URL(string: "https://DBC-123.cloud.databricks.com/omnigent/c/abc?o=123#view")!,
+      workspaceURL: URL(
+        string: "https://DBC-123.cloud.databricks.com/omnigent/c/abc?o=123&view=chat#view")!,
       configuration: config)
     let components = try XCTUnwrap(
       URLComponents(url: attempt.authorizationURL, resolvingAgainstBaseURL: false))
@@ -75,7 +76,8 @@ final class DatabricksOAuthAttemptTests: XCTestCase {
     XCTAssertEqual(query["code_challenge"], DatabricksOAuthAttempt.challenge(for: attempt.verifier))
     XCTAssertEqual(query["code_challenge_method"], "S256")
     XCTAssertNil(query["code_verifier"])
-    XCTAssertNil(query["o"])
+    XCTAssertEqual(query["o"], "123")
+    XCTAssertNil(query["view"])
     XCTAssertFalse(components.percentEncodedQuery!.contains("+"))
   }
 

@@ -27,7 +27,7 @@ struct AppRootView: View {
         }
       case .web(let serverURL, let path):
         WebShellView(
-          initialURL: path.map { conversationURL(for: serverURL, path: $0) } ?? serverURL,
+          initialURL: path.map { Self.conversationURL(for: serverURL, path: $0) } ?? serverURL,
           connectToNewServer: {
             mode = .setup(prefill: settings.serverURL, error: nil)
           },
@@ -213,14 +213,9 @@ extension AppRootView {
     return nil
   }
 
-  /// Join a basename-less SPA path (`/c/<id>`) onto a server URL that may carry
-  /// a workspace mount (`WorkspaceURLExpander.workspaceUIPath`). The path lives
-  /// UNDER the mount, so it
-  /// is string-concatenated (not URL-resolved, which would anchor against the
-  /// origin and drop the mount) — mirroring the desktop's `resolveServerPath`.
-  private func conversationURL(for serverURL: URL, path: String) -> URL {
-    let base = serverURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-    return URL(string: base + path) ?? serverURL
+  /// Append a conversation under the mount without moving it into the server's query or fragment.
+  static func conversationURL(for serverURL: URL, path: String) -> URL {
+    serverURL.appendingPathComponent(path)
   }
 }
 

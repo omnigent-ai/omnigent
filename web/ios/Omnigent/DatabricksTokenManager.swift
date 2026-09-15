@@ -91,7 +91,8 @@ actor DatabricksTokenManager {
     let id = UUID()
     let task = Task {
       do {
-        let tokens = try await client.refresh(saved.refreshToken, for: scope)
+        let tokens = try await client.refresh(saved.refreshToken, for: scope, issuer: saved.issuer)
+        guard tokens.issuer == saved.issuer else { throw DatabricksOAuthError.invalidTokenResponse }
         finishRefresh(id, for: scope, result: .success(tokens))
       } catch {
         finishRefresh(id, for: scope, result: .failure(error))

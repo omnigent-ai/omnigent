@@ -58,8 +58,9 @@ final class DatabricksLoginManager {
       do {
         let callback = try await self.callbackURL(for: attempt, anchor: anchor, id: id)
         try Task.checkCancellation()
-        let code = try attempt.authorizationCode(from: callback)
-        let tokens = try await self.client.exchange(code: code, for: attempt)
+        let authorization = try attempt.authorizationResponse(from: callback)
+        let tokens = try await self.client.exchange(
+          code: authorization.code, for: attempt, issuer: authorization.issuer)
         try Task.checkCancellation()
         try await self.tokenManager.save(tokens, for: signIn)
         try Task.checkCancellation()

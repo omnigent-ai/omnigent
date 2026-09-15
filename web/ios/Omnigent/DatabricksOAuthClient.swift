@@ -4,6 +4,16 @@ struct DatabricksOAuthTokens: Codable, Sendable, Equatable {
   let accessToken: String
   let refreshToken: String
   let expiresAt: Date
+  let issuer: DatabricksOAuthIssuer?
+
+  init(
+    accessToken: String, refreshToken: String, expiresAt: Date, issuer: DatabricksOAuthIssuer? = nil
+  ) {
+    self.accessToken = accessToken
+    self.refreshToken = refreshToken
+    self.expiresAt = expiresAt
+    self.issuer = issuer
+  }
 
   var isValid: Bool {
     [accessToken, refreshToken].allSatisfy {
@@ -14,7 +24,9 @@ struct DatabricksOAuthTokens: Codable, Sendable, Equatable {
 }
 
 protocol DatabricksTokenRefreshing: Sendable {
-  func refresh(_ refreshToken: String, for scope: DatabricksCredentialScope) async throws
+  func refresh(
+    _ refreshToken: String, for scope: DatabricksCredentialScope, issuer: DatabricksOAuthIssuer?
+  ) async throws
     -> DatabricksOAuthTokens
 }
 
@@ -27,29 +39,38 @@ struct DatabricksOAuthClient: DatabricksTokenRefreshing {
     self.session = session ?? Self.sharedSession
   }
 
-  func exchange(code: String, for attempt: DatabricksOAuthAttempt) async throws
+  func exchange(
+    code: String, for attempt: DatabricksOAuthAttempt, issuer: DatabricksOAuthIssuer? = nil
+  ) async throws
     -> DatabricksOAuthTokens
   {
-    try await requestTokens(attempt.tokenRequest(code: code))
+    let issuer =
+      try issuer ?? DatabricksOAuthIssuer(attempt.workspaceOrigin.appendingPathComponent("oidc"))
+    var request = URLRequest(url: issuer.discoveryURL)
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.timeoutInterval = 30
+    let (data, response) = try await send(request)
+    guard response.statusCode == 200 else { throw DatabricksOAuthError.invalidDiscovery }
+    try issuer.validateDiscovery(data)
+    return try await requestTokens(attempt.tokenRequest(code: code, issuer: issuer), issuer: issuer)
   }
 
-  func refresh(_ refreshToken: String, for scope: DatabricksCredentialScope) async throws
+  func refresh(
+    _ refreshToken: String, for scope: DatabricksCredentialScope,
+    issuer: DatabricksOAuthIssuer? = nil
+  ) async throws
     -> DatabricksOAuthTokens
   {
     let request = Self.tokenRequest(
       for: scope,
       fields: [
         ("grant_type", "refresh_token"), ("refresh_token", refreshToken),
-      ])
-    return try await requestTokens(request, previousRefreshToken: refreshToken)
+      ], issuer: issuer)
+    return try await requestTokens(request, previousRefreshToken: refreshToken, issuer: issuer)
   }
 
-  private func requestTokens(_ request: URLRequest, previousRefreshToken: String? = nil)
-    async throws
-    -> DatabricksOAuthTokens
-  {
+  private func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
     try Task.checkCancellation()
-    let requestedAt = Date()
     let data: Data
     let response: URLResponse
     do {
@@ -64,6 +85,16 @@ struct DatabricksOAuthClient: DatabricksTokenRefreshing {
     guard let http = response as? HTTPURLResponse, http.url == request.url else {
       throw DatabricksOAuthError.tokenExchangeFailed
     }
+    return (data, http)
+  }
+
+  private func requestTokens(
+    _ request: URLRequest, previousRefreshToken: String? = nil, issuer: DatabricksOAuthIssuer? = nil
+  )
+    async throws -> DatabricksOAuthTokens
+  {
+    let requestedAt = Date()
+    let (data, http) = try await send(request)
     if previousRefreshToken != nil, http.statusCode == 400,
       (try? JSONDecoder().decode(ErrorResponse.self, from: data))?.error == "invalid_grant"
     {
@@ -71,10 +102,14 @@ struct DatabricksOAuthClient: DatabricksTokenRefreshing {
     }
     guard http.statusCode == 200 else { throw DatabricksOAuthError.tokenExchangeFailed }
     return try Self.tokens(
-      from: data, requestedAt: requestedAt, previousRefreshToken: previousRefreshToken)
+      from: data, requestedAt: requestedAt, previousRefreshToken: previousRefreshToken,
+      issuer: issuer)
   }
 
-  static func tokens(from data: Data, requestedAt: Date, previousRefreshToken: String? = nil) throws
+  static func tokens(
+    from data: Data, requestedAt: Date, previousRefreshToken: String? = nil,
+    issuer: DatabricksOAuthIssuer? = nil
+  ) throws
     -> DatabricksOAuthTokens
   {
     guard let response = try? JSONDecoder().decode(TokenResponse.self, from: data),
@@ -84,15 +119,19 @@ struct DatabricksOAuthClient: DatabricksTokenRefreshing {
     else { throw DatabricksOAuthError.invalidTokenResponse }
     let tokens = DatabricksOAuthTokens(
       accessToken: response.accessToken, refreshToken: refreshToken,
-      expiresAt: requestedAt.addingTimeInterval(response.expiresIn))
+      expiresAt: requestedAt.addingTimeInterval(response.expiresIn), issuer: issuer)
     guard tokens.isValid else { throw DatabricksOAuthError.invalidTokenResponse }
     return tokens
   }
 
-  static func tokenRequest(for scope: DatabricksCredentialScope, fields: [(String, String)])
+  static func tokenRequest(
+    for scope: DatabricksCredentialScope, fields: [(String, String)],
+    issuer: DatabricksOAuthIssuer? = nil
+  )
     -> URLRequest
   {
-    var request = URLRequest(url: scope.workspaceOrigin.appendingPathComponent("oidc/v1/token"))
+    var request = URLRequest(
+      url: issuer?.tokenEndpoint ?? scope.workspaceOrigin.appendingPathComponent("oidc/v1/token"))
     request.httpMethod = "POST"
     request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
