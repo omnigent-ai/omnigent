@@ -24,7 +24,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { authenticatedFetch } from "@/lib/identity";
+import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
@@ -44,7 +44,11 @@ import {
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
 import { revokePermission } from "@/lib/permissionsApi";
-import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
+import {
+  conversationDisplayLabel,
+  sessionBelongsToProject,
+  setLegacyPinnedConversationId,
+} from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { setSessionHost } from "@/lib/sessionHost";
 import {
@@ -400,10 +404,32 @@ export { markRecentlyCreated };
 export { clearRecentlyCreated } from "@/lib/sessionListCache";
 
 /**
+ * Resolve a project folder NAME to the `{ id, name }` the shared membership rule
+ * ({@link sessionBelongsToProject}) expects, from the cached `["projects"]` list.
+ * A label-only folder (no first-class row yet) resolves `id: null` and still
+ * matches members via the legacy `omni_project` label.
+ */
+function projectFolderByName(
+  queryClient: QueryClient,
+  name: string,
+): { id: string | null; name: string } {
+  const summary = queryClient.getQueryData<ProjectSummary[]>(["projects"])?.find((p) => p.name === name);
+  return { id: summary?.id ?? null, name };
+}
+
+/**
  * Prepend recently-created rows the first page doesn't yet include (the index
- * hasn't caught up). Only the unfiltered, unsearched first page — a create sorts
+ * hasn't caught up). Only the unsearched first page — a create sorts
  * newest-first. Once the fetch returns the row itself, the keep-alive is dropped.
  * Applied before `applySessionTombstones`, so a create-then-delete stays gone.
+ *
+ * Covers both the global sidebar list (`project` unset) and a project folder's
+ * own `?project=` fetch (`project` = the folder name): a filed new session
+ * (a fork inheriting its source's project, or a composer create into a folder)
+ * would otherwise vanish from its folder once the folder's search-indexed
+ * refetch lags the write — the folder-scoped mirror of the global keep-alive.
+ * A folder fetch injects only rows that belong to that folder (dual-read
+ * membership), so a create in one project never leaks into another's list.
  */
 function withRecentlyCreated(
   page: ConversationsPage,
@@ -416,16 +442,23 @@ function withRecentlyCreated(
 ): ConversationsPage {
   // Recently-created sessions are always owned (active, not archived), so skip
   // injection for "shared" and "archived" filters where they would not belong.
+  // A `project` + `includeArchived` list is the Archived view's per-project
+  // filter (never an active folder), so skip it too — a fresh active session
+  // doesn't belong there.
   if (
     after !== undefined ||
     searchQuery ||
-    project ||
     visibility === "shared" ||
     visibility === "archived" ||
+    (project && includeArchived) ||
     recentlyCreatedSessions.size === 0
   ) {
     return page;
   }
+  // A folder fetch scopes injection to that folder's members; the global list
+  // (no project) injects every recently-created row.
+  const folder = project ? projectFolderByName(queryClient, project) : null;
+  const viewerId = folder ? getCurrentUserId() : null;
   const present = new Set(page.data.map((c) => c.id));
   const inject: Conversation[] = [];
   for (const [id, snapshot] of recentlyCreatedSessions) {
@@ -437,7 +470,12 @@ function withRecentlyCreated(
     // beats the frozen snapshot, so a WS-confirmed title — or archive flag —
     // isn't reverted by re-injecting stale data.
     const row = findCachedConversationRow(queryClient, id) ?? snapshot;
+    // Child/sub-agent sessions live off the sidebar — mirror the exclusion
+    // insertNewRowsIntoPages applies so the keep-alive can't surface one in the
+    // global list or a project folder.
+    if (row.parent_session_id != null) continue;
     if (row.archived && !includeArchived) continue;
+    if (folder && !sessionBelongsToProject(row, folder, viewerId)) continue;
     inject.push(row);
   }
   if (inject.length === 0) return page;
@@ -913,6 +951,10 @@ export function useArchiveConversation() {
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
       }
+      // An archived session leaves the active sidebar; drop its keep-alive entry
+      // so a widened sidebar-cache TTL can't re-inject it once the archiving
+      // tombstone lapses. Only on archive — unarchive returns it to the list.
+      if (archived) unmarkRecentlyCreated(updated.id);
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
       // or drops it from that project folder's own paginated list. These read
@@ -1047,6 +1089,9 @@ function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly st
   for (const id of ids) {
     queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
     queryClient.removeQueries({ queryKey: ["session", id] });
+    // Drop any keep-alive entry so a widened sidebar-cache TTL can't re-inject a
+    // just-deleted row after its delete tombstone lapses.
+    unmarkRecentlyCreated(id);
   }
   expireSessionsDeleting([...ids]);
   // Deleting the last member of a project empties it, so refresh the
@@ -1269,6 +1314,10 @@ export function useBulkArchiveConversations() {
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, ids);
       }
+      // Archived rows leave the active sidebar; drop their keep-alive entries so
+      // a widened sidebar-cache TTL can't re-inject them after the archiving
+      // tombstone lapses. Only on archive — unarchive returns them to the list.
+      if (archived) for (const id of ids) unmarkRecentlyCreated(id);
     },
     onSettled: () => {
       // Project caches read the DB directly (no search-index lag), so unlike
@@ -2160,6 +2209,7 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
 /** One page of a project's (non-archived) sessions, newest-first. */
 async function fetchProjectSessionsPage(
   project: string,
+  queryClient: QueryClient,
   after?: string,
   limit = 20,
 ): Promise<ConversationsPage> {
@@ -2172,7 +2222,21 @@ async function fetchProjectSessionsPage(
   if (after) params.set("after", after);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return applySessionTombstones((await res.json()) as ConversationsPage, true);
+  // Keep a just-created member (fork or composer create into this folder) in the
+  // folder's first page until the search index reflects it — the folder mirror
+  // of the global list's keep-alive, so the row doesn't drop when this
+  // `?project=` refetch lags the write.
+  return applySessionTombstones(
+    withRecentlyCreated(
+      (await res.json()) as ConversationsPage,
+      after,
+      "",
+      project,
+      false,
+      queryClient,
+    ),
+    true,
+  );
 }
 
 /**
@@ -2186,9 +2250,11 @@ async function fetchProjectSessionsPage(
  * folder paginates independently with its own infinite-scroll sentinel.
  */
 export function useProjectSessions(project: string, enabled: boolean) {
+  const queryClient = useQueryClient();
   return useInfiniteQuery({
     queryKey: ["project-sessions", project],
-    queryFn: ({ pageParam }) => fetchProjectSessionsPage(project, pageParam as string | undefined),
+    queryFn: ({ pageParam }) =>
+      fetchProjectSessionsPage(project, queryClient, pageParam as string | undefined),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,

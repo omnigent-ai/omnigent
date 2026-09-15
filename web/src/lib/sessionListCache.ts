@@ -12,6 +12,7 @@
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { getOmnigentSidebarCacheTtlSeconds } from "@/lib/host";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -325,27 +326,53 @@ export function mergeItemsIntoPages(
 // optimistic-create writer) can reach it without an import cycle.
 export const recentlyCreatedSessions = new Map<string, Conversation>();
 
-/** Grace window for the server's async create reindex. */
-const CREATED_KEEPALIVE_MS = 60_000;
+/** Fallback grace window for the server's async create reindex, used when the
+ * host sends no override. Matches the prior hard-coded value. */
+const DEFAULT_KEEPALIVE_MS = 60_000;
+/** Upper bound so a mis-set flag can't pin rows for hours. */
+const MAX_KEEPALIVE_MS = 3_600_000;
 
-/** Keep a just-created session in the first-page list fetch until it's indexed. */
+/**
+ * Resolve the keep-alive window (ms) from the host-configured TTL
+ * (`getOmnigentSidebarCacheTtlSeconds`), falling back to the default. A
+ * configured 0 disables the keep-alive (a kill switch); an absent/invalid value
+ * uses the default. Read at set-time, so a host that updates its config widens
+ * the window on the next create without a reload.
+ */
+function keepAliveMs(): number {
+  const secs = getOmnigentSidebarCacheTtlSeconds();
+  if (typeof secs !== "number" || !Number.isFinite(secs) || secs < 0) return DEFAULT_KEEPALIVE_MS;
+  return Math.min(secs * 1000, MAX_KEEPALIVE_MS);
+}
+
+/**
+ * Keep a just-created session in the first-page list fetch until it's indexed.
+ * The window is host-configurable (`getOmnigentSidebarCacheTtlSeconds`) so an
+ * embed host can widen it to bridge a search-index reindex lag; a configured 0
+ * disables the keep-alive entirely.
+ */
 export function markRecentlyCreated(conv: Conversation): void {
+  const ttlMs = keepAliveMs();
+  if (ttlMs <= 0) return; // kill switch: keep-alive disabled
   recentlyCreatedSessions.set(conv.id, conv);
-  setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
+  setTimeout(() => recentlyCreatedSessions.delete(conv.id), ttlMs);
+}
+
+/**
+ * Drop a session's keep-alive entry so it stops being re-injected. Call when the
+ * row must fall out of the sidebar — it was deleted or archived (a widened TTL
+ * must not resurrect it), or an optimistic unarchive whose PATCH failed and has
+ * to fall back to archived. Pin/unpin and move-between-projects must NOT call
+ * this: the session still exists and is still recently-created; only its
+ * membership changed. Safe to call for an id that isn't tracked.
+ */
+export function unmarkRecentlyCreated(id: string): void {
+  recentlyCreatedSessions.delete(id);
 }
 
 /** Clear the keep-alive map — exported for test cleanup (mirrors `unmarkSessionsDeleting`). */
 export function clearRecentlyCreated(): void {
   recentlyCreatedSessions.clear();
-}
-
-/**
- * Drop one row from the keep-alive map — e.g. an optimistic unarchive whose
- * PATCH failed, so the row must stop being re-injected and fall back to
- * archived. Safe to call for an id that isn't tracked.
- */
-export function unmarkRecentlyCreated(id: string): void {
-  recentlyCreatedSessions.delete(id);
 }
 
 /**

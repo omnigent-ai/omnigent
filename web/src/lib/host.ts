@@ -165,6 +165,16 @@ export interface OmnigentHostConfig {
      */
     databricksGitCredentials?: ReactNode;
   };
+  /**
+   * Keep-alive window (seconds) the SPA uses to pin a just-created / forked
+   * session in its sidebar list AND its project folder, so a session-search
+   * reindex lag can't drop the row before it is queryable (see
+   * `markRecentlyCreated` / `withRecentlyCreated`). An embed host that knows its
+   * index can lag (and may drive this from its own config/flag) can widen the
+   * window. Absent ⇒ the consumer's own 60s default (so the standalone build is
+   * unchanged); `0` disables the keep-alive.
+   */
+  sidebarCacheTtlSeconds?: number;
 }
 
 let hostConfig: OmnigentHostConfig = {};
@@ -241,6 +251,15 @@ export function getOmnigentTransformShareLink(): OmnigentHostConfig["transformSh
  */
 export function getOmnigentThemeSettingsUrl(): OmnigentHostConfig["themeSettingsUrl"] {
   return hostConfig.themeSettingsUrl;
+}
+
+/**
+ * The host-provided sidebar recently-created keep-alive window (seconds), or
+ * `undefined` when none is configured (standalone ⇒ the consumer's own 60s
+ * default). `0` disables the keep-alive.
+ */
+export function getOmnigentSidebarCacheTtlSeconds(): OmnigentHostConfig["sidebarCacheTtlSeconds"] {
+  return hostConfig.sidebarCacheTtlSeconds;
 }
 
 /**

@@ -17,7 +17,11 @@ import {
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  clearRecentlyCreated,
+  type ConversationsInfiniteData,
+  recentlyCreatedSessions,
+} from "@/lib/sessionListCache";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -98,6 +102,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearRecentlyCreated();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -301,6 +306,68 @@ describe("SessionUpdatesProvider project folders", () => {
       "Sprint 42",
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
+  });
+
+  it("eagerly inserts a brand-new filed row into its folder (label membership)", () => {
+    // A fork/composer create filed under "Sprint 42" arrives on the stream. It
+    // isn't in the folder's cache yet and — being filed — the global list can't
+    // place it, so the folder loop must insert it (else it waits on the folder's
+    // lagging ?project= refetch and appears nowhere).
+    const client = new QueryClient();
+    seedProjectFolder(client, "Sprint 42", ["conv_old"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() =>
+      handler({
+        type: "changed",
+        items: [{ ...conv("conv_new"), labels: { omni_project: "Sprint 42" } }],
+      }),
+    );
+
+    const folder = client.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+    // Armed for the folder keep-alive so a lagging ?project= refetch can't drop it.
+    expect(recentlyCreatedSessions.has("conv_new")).toBe(true);
+  });
+
+  it("resolves a first-class project_id to the folder via the projects cache", () => {
+    const client = new QueryClient();
+    client.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+    seedProjectFolder(client, "Sprint 42", ["conv_old"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() =>
+      handler({ type: "changed", items: [{ ...conv("conv_new"), project_id: "p_sprint" }] }),
+    );
+
+    const folder = client.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("does not insert a new row into a non-matching folder", () => {
+    const client = new QueryClient();
+    seedProjectFolder(client, "Old folder", ["conv_old"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() =>
+      handler({
+        type: "changed",
+        items: [{ ...conv("conv_new"), labels: { omni_project: "Sprint 42" } }],
+      }),
+    );
+
+    const folder = client.getQueryData<ConversationsInfiniteData>(["project-sessions", "Old folder"]);
+    // conv_new is filed under "Sprint 42", so "Old folder" must be untouched.
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_old"]);
   });
 });
 

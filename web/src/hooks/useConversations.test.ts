@@ -991,6 +991,153 @@ describe("recently-created keep-alive", () => {
   });
 });
 
+describe("recently-created keep-alive (project folders)", () => {
+  const listResponse = (ids: string[]) =>
+    mockResponse({
+      object: "list",
+      data: ids.map((id) => ({ id, object: "conversation", title: id, created_at: 0, updated_at: 1 })),
+      first_id: ids[0] ?? null,
+      last_id: ids.at(-1) ?? null,
+      has_more: false,
+    });
+
+  const renderFolder = (project: string, queryClient: QueryClient) =>
+    renderHook(() => useProjectSessions(project, true), {
+      wrapper: ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children),
+    });
+
+  it("keeps a just-created member in its folder's fetch when the folder's index lags (label membership)", async () => {
+    // A fork/composer create filed under "Sprint 42" via the legacy label.
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: { omni_project: "Sprint 42" },
+      permission_level: null,
+    });
+    // The folder's own ?project= fetch lags and comes back without it.
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderFolder("Sprint 42", queryClient);
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    // Injected at the top of the folder, so it doesn't vanish from the folder.
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("keeps a just-created member via first-class project_id (resolved through the projects cache)", async () => {
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+      project_id: "p_sprint",
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // The dual-read membership resolves project_id → folder name via this cache.
+    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+    const { result } = renderFolder("Sprint 42", queryClient);
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("does not inject a member filed under a different folder", async () => {
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: { omni_project: "Sprint 42" },
+      permission_level: null,
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderFolder("Old folder", queryClient);
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    // conv_new belongs to "Sprint 42", so it must not leak into "Old folder".
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_old"]);
+  });
+
+  it("does not inject a child/sub-agent session even when filed under the folder", async () => {
+    // A sub-agent child (parent_session_id set) lives off the sidebar; the
+    // keep-alive must not surface it in a folder, mirroring insertNewRowsIntoPages.
+    markRecentlyCreated({
+      id: "conv_child",
+      object: "conversation",
+      title: "Child",
+      created_at: 0,
+      updated_at: 9,
+      labels: { omni_project: "Sprint 42" },
+      permission_level: null,
+      parent_session_id: "conv_parent",
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderFolder("Sprint 42", queryClient);
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_old"]);
+  });
+
+  it("drops the keep-alive (no duplicate) once the folder fetch returns the member", async () => {
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: { omni_project: "Sprint 42" },
+      permission_level: null,
+    });
+    // The folder's index has caught up: the fetch now includes conv_new itself.
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_new", "conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderFolder("Sprint 42", queryClient);
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("does not inject into the Archived view's per-project filter", async () => {
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: { omni_project: "Sprint 42" },
+      permission_level: null,
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_archived"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // useConversations(search, includeArchived, options, project): the Archived
+    // view's per-project filter — a fresh active session doesn't belong here.
+    const { result } = renderHook(() => useConversations("", true, {}, "Sprint 42"), {
+      wrapper: ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children),
+    });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_archived"]);
+  });
+});
+
 describe("useRenameConversation cache patching", () => {
   function seedAndRename() {
     // The PATCH response carries the server-confirmed new title and

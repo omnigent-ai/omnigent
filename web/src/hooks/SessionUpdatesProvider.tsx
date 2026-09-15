@@ -21,10 +21,13 @@ import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import {
+  type Conversation,
   isSessionArchiving,
   isSessionDeleting,
   markRecentlyCreated,
+  type ProjectSummary,
 } from "@/hooks/useConversations";
+import { sessionBelongsToProject } from "@/shell/sidebarNav";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -50,6 +53,24 @@ const DEBOUNCE_MS = 250;
 // Live frames overlay those caches with these fixed filters so archived rows
 // drop out the same way they do from the default sidebar list.
 const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+
+/**
+ * Coerce a wire item into a sidebar-shaped row for the project-membership test,
+ * mirroring the row `insertNewRowsIntoPages` builds. Frames are full rows, so
+ * the defaults only backstop absent fields.
+ */
+function wireToConversation(wire: SessionListWireItem): Conversation {
+  return {
+    object: "conversation",
+    title: null,
+    created_at: 0,
+    updated_at: 0,
+    labels: {},
+    permission_level: null,
+    ...nullsToUndefined(wire),
+    id: wire.id,
+  };
+}
 
 /**
  * Overlay wire items onto every cached `["conversations", ...]` variant.
@@ -122,14 +143,51 @@ function applyItemsToCache(
   const projectEntries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   });
+  const projects = queryClient.getQueryData<ProjectSummary[]>(["projects"]);
   for (const [key, data] of projectEntries) {
     const {
-      data: next,
+      data: merged,
       found,
       needsRefetch: queryNeedsRefetch,
     } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, activeId);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
+    // Eager-insert a brand-new row filed under THIS folder (a fork inheriting
+    // its source's project, or a composer create into it). The global loop above
+    // leaves a filed row "missing" — it lives under its folder, not the flat
+    // list — so without this the row waits on the folder's search-indexed
+    // refetch. Gated by the shared dual-read membership so only rows filed here
+    // are inserted; the folder keep-alive (fetchProjectSessionsPage) then holds
+    // the row across that lagging refetch. The folder name is the query key.
+    let next = merged;
+    const folderName = key[1];
+    if (typeof folderName === "string") {
+      const folder = {
+        id: projects?.find((p) => p.name === folderName)?.id ?? null,
+        name: folderName,
+      };
+      const missingHere = new Map(
+        [...itemsById].filter(
+          ([id, wire]) =>
+            !found.has(id) &&
+            sessionBelongsToProject(wireToConversation(wire), folder, viewerId ?? null),
+        ),
+      );
+      const { data: nextData, inserted } = insertNewRowsIntoPages(
+        merged,
+        missingHere,
+        PROJECT_FOLDER_FILTERS,
+        isSessionDeleting,
+        viewerId,
+      );
+      next = nextData;
+      for (const row of inserted) {
+        foundAnywhere.add(row.id);
+        // Hold the row in the folder's own fetch until its index catches up,
+        // mirroring the global-list keep-alive armed in the loop above.
+        markRecentlyCreated(row);
+      }
+    }
     if (next !== data) queryClient.setQueryData(key, next);
   }
   return {

@@ -1,17 +1,31 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import { getOmnigentSidebarCacheTtlSeconds } from "@/lib/host";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
+  clearRecentlyCreated,
   collectConversationIds,
   filtersFromConversationQueryKey,
   insertNewRowsIntoPages,
+  markRecentlyCreated,
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
+  recentlyCreatedSessions,
   removeIdsFromPages,
+  unmarkRecentlyCreated,
 } from "./sessionListCache";
+
+// sessionListCache reads the host-configured keep-alive window via
+// getOmnigentSidebarCacheTtlSeconds; mock just that export so the TTL can be
+// steered per test.
+vi.mock("@/lib/host", () => ({ getOmnigentSidebarCacheTtlSeconds: vi.fn(() => undefined) }));
+const mockTtlSeconds = vi.mocked(getOmnigentSidebarCacheTtlSeconds);
+function serverTtlSeconds(secs: number | undefined): void {
+  mockTtlSeconds.mockReturnValue(secs);
+}
 
 function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
   return {
@@ -43,6 +57,71 @@ const DEFAULT_FILTERS = { searchQuery: "", includeArchived: false };
 
 // Most cases aren't on a chat route, so no row is the pinned active one.
 const NO_ACTIVE = undefined;
+
+describe("markRecentlyCreated keep-alive TTL + unmarkRecentlyCreated", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    clearRecentlyCreated();
+    serverTtlSeconds(undefined);
+  });
+  afterEach(() => {
+    clearRecentlyCreated();
+    vi.useRealTimers();
+    mockTtlSeconds.mockReset();
+  });
+
+  it("defaults to a 60s window when the host sends no TTL", () => {
+    markRecentlyCreated(conv("a"));
+    expect(recentlyCreatedSessions.has("a")).toBe(true);
+    vi.advanceTimersByTime(59_000);
+    expect(recentlyCreatedSessions.has("a")).toBe(true);
+    vi.advanceTimersByTime(2_000);
+    expect(recentlyCreatedSessions.has("a")).toBe(false);
+  });
+
+  it("honors a widened server TTL so the row survives past the old 60s window", () => {
+    serverTtlSeconds(600);
+    markRecentlyCreated(conv("a"));
+    vi.advanceTimersByTime(120_000); // well past the old 60s default
+    expect(recentlyCreatedSessions.has("a")).toBe(true);
+    vi.advanceTimersByTime(481_000); // past 600s total
+    expect(recentlyCreatedSessions.has("a")).toBe(false);
+  });
+
+  it("treats a server TTL of 0 as a kill switch (never keeps the row)", () => {
+    serverTtlSeconds(0);
+    markRecentlyCreated(conv("a"));
+    expect(recentlyCreatedSessions.has("a")).toBe(false);
+  });
+
+  it("clamps an absurd TTL to the 1h max", () => {
+    serverTtlSeconds(99_999); // ~27h requested
+    markRecentlyCreated(conv("a"));
+    vi.advanceTimersByTime(3_600_000 - 1_000);
+    expect(recentlyCreatedSessions.has("a")).toBe(true);
+    vi.advanceTimersByTime(2_000); // just past 1h
+    expect(recentlyCreatedSessions.has("a")).toBe(false);
+  });
+
+  it("falls back to the default for a negative / non-finite TTL", () => {
+    serverTtlSeconds(-5);
+    markRecentlyCreated(conv("a"));
+    expect(recentlyCreatedSessions.has("a")).toBe(true);
+    vi.advanceTimersByTime(61_000);
+    expect(recentlyCreatedSessions.has("a")).toBe(false);
+  });
+
+  it("unmarkRecentlyCreated drops the entry so a widened TTL can't re-inject it", () => {
+    serverTtlSeconds(600);
+    markRecentlyCreated(conv("a"));
+    expect(recentlyCreatedSessions.has("a")).toBe(true);
+    unmarkRecentlyCreated("a");
+    expect(recentlyCreatedSessions.has("a")).toBe(false);
+    // Still gone after the original timer would have fired.
+    vi.advanceTimersByTime(601_000);
+    expect(recentlyCreatedSessions.has("a")).toBe(false);
+  });
+});
 
 describe("mergeItemsIntoPages", () => {
   it("overlays changed fields onto the matching row", () => {
