@@ -893,6 +893,99 @@ class TestUserConfigJsonc:
         assert _read_user_config(self._write(tmp_path, "{not json at all")) == {}
 
 
+class TestPermissionRequestReauth:
+    """Devin's approval card must survive the launch bearer expiring.
+
+    The token baked in at launch dies with the ~1h Databricks OAuth lifetime, so
+    without a re-mint every card after that hour silently degraded to the terminal
+    prompt the mirror exists to replace.
+    """
+
+    def _mirror(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        responses: list[object],
+    ) -> tuple[object, list[dict[str, str]]]:
+        import httpx
+
+        from omnigent.harnesses.devin_native import hook as devin_hook
+
+        attempts: list[dict[str, str]] = []
+
+        class _ScriptedClient:
+            def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+                del timeout
+                self._headers = headers
+
+            def __enter__(self) -> _ScriptedClient:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def post(self, url: str, json: object = None) -> httpx.Response:
+                del json
+                attempts.append(dict(self._headers))
+                spec = responses[min(len(attempts) - 1, len(responses) - 1)]
+                req = httpx.Request("POST", url)
+                if isinstance(spec, tuple):
+                    status, headers_or_text = spec
+                    if status == 302:
+                        return httpx.Response(
+                            302, headers={"Location": headers_or_text}, request=req
+                        )
+                    return httpx.Response(status, text=str(headers_or_text), request=req)
+                raise AssertionError(f"unexpected scripted response {spec!r}")
+
+        monkeypatch.setattr(devin_hook.httpx, "Client", _ScriptedClient)
+        monkeypatch.setenv(
+            "_OMNIGENT_AUTH_HEADERS",
+            json.dumps({"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o1"}),
+        )
+        monkeypatch.setattr(
+            "omnigent.runner._entry._make_auth_token_factory",
+            lambda server_url=None: lambda: "fresh",
+        )
+        verdict = devin_hook._mirror_permission_request(
+            {"hook_event_name": "PermissionRequest", "tool_name": "write"},
+            server_url="https://omnigents.example.databricksapps.com",
+            session_id="conv_abc",
+        )
+        return verdict, attempts
+
+    def test_a_lapsed_bearer_is_re_minted_and_the_card_still_answers(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        approve = '{"hookSpecificOutput": {"decision": {"behavior": "allow"}}}'
+        verdict, attempts = self._mirror(
+            monkeypatch,
+            [(302, "https://w.example.com/oidc/oauth2/v2.0/authorize"), (200, approve)],
+        )
+        assert verdict == {"decision": "approve"}, "the web verdict must still land"
+        assert len(attempts) == 2
+        assert attempts[0]["Authorization"] == "Bearer stale"
+        assert attempts[1]["Authorization"] == "Bearer fresh"
+        # Routing header survives the re-mint, or the retry misroutes.
+        assert attempts[1]["X-Databricks-Org-Id"] == "o1"
+        assert "re-minted token and retrying" in capsys.readouterr().err
+
+    def test_a_healthy_bearer_is_not_re_minted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        deny = '{"hookSpecificOutput": {"decision": {"behavior": "deny", "message": "no"}}}'
+        verdict, attempts = self._mirror(monkeypatch, [(200, deny)])
+        assert verdict == {"decision": "deny", "reason": "no"}
+        assert len(attempts) == 1
+
+    def test_a_still_lapsed_bearer_defers_to_the_tui(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Re-mint happened but the server still rejects: fail-ask, never fail-open.
+        verdict, attempts = self._mirror(
+            monkeypatch, [(302, "https://w.example.com/oidc/authorize"), (401, "nope")]
+        )
+        assert verdict is None
+        assert len(attempts) == 2
+
+
 class TestBlockedPromptRecord:
     """A policy-blocked prompt must carry its verdict into the hook log."""
 

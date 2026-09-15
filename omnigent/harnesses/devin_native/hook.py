@@ -37,6 +37,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.native.native_policy_hook import (
+    _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
@@ -195,20 +196,41 @@ def _mirror_permission_request(
     behavior for an unreachable or unattended web UI. Note this is a *consent*
     mirror, not an enforcement gate: enforcement already happened in
     ``PreToolUse``, which fails closed.
+
+    The launch-time bearer dies with the ~1h Databricks OAuth lifetime, so a
+    lapsed-token signal re-mints once and retries; without that, every approval
+    card after the first hour would degrade to the terminal prompt that this
+    mirror exists to avoid.
     """
     tool_name = payload.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name:
         return None
     url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/hooks/permission-request"
     timeout = httpx.Timeout(_PERMISSION_READ_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
+    headers = policy_hook_request_headers()
+    reauth = policy_hook_reauth(server_url, headers)
     try:
-        with httpx.Client(headers=policy_hook_request_headers(), timeout=timeout) as client:
-            response = client.post(url, json=payload)
-            response.raise_for_status()
-            if not response.content:
-                # Endpoint timed out waiting for a human — defer to the TUI.
-                return None
-            body = response.json()
+        for attempt in range(2):
+            with httpx.Client(headers=headers, timeout=timeout) as client:
+                response = client.post(url, json=payload)
+                if attempt == 0 and _is_login_redirect_or_unauthorized(response):
+                    refreshed = reauth()
+                    if refreshed:
+                        headers = refreshed
+                        print(
+                            "omnigent devin permission-request hook: Omnigent auth "
+                            "expired; re-minted token and retrying",
+                            file=sys.stderr,
+                        )
+                        continue
+                response.raise_for_status()
+                if not response.content:
+                    # Endpoint timed out waiting for a human — defer to the TUI.
+                    return None
+                body = response.json()
+                break
+        else:  # pragma: no cover — the loop always breaks or returns
+            return None
     except (httpx.HTTPError, ValueError) as exc:
         print(
             f"omnigent devin permission-request hook: {exc}; deferring to the Devin prompt",
