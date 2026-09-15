@@ -8778,6 +8778,31 @@
         ],
         "title": "ValidationError",
         "type": "object"
+      },
+      "VersionResponse": {
+        "properties": {
+          "version": {
+            "title": "Version",
+            "type": "string"
+          },
+          "webapp_build_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webapp Build Id"
+          }
+        },
+        "required": [
+          "version",
+          "webapp_build_id"
+        ],
+        "title": "VersionResponse",
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -8825,18 +8850,14 @@
     },
     "/api/version": {
       "get": {
-        "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`.",
+        "description": "Return the installed package version and built SPA fingerprint.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** Package version and nullable `webapp_build_id`.",
         "operationId": "version_api_version_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Version Api Version Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/VersionResponse"
                 }
               }
             },
