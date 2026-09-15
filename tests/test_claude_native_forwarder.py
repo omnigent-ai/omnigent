@@ -6715,7 +6715,9 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
         )
 
     assert set(attempts.values()) == {2}
-    assert sorted(status for _, status in statuses) == ["idle"] * 5
+    # The clean quiescence edge posts the badge-only "quiesced", never the
+    # terminal "idle" (which the runner would deliver as a completion).
+    assert sorted(status for _, status in statuses) == ["quiesced"] * 5
     assert all(entry.delivery_error is None for entry in state.subagents.values())
 
 
