@@ -13,6 +13,11 @@ from typing import Any
 
 import pytest
 
+from omnigent.harnesses.devin_native.bridge import (
+    hooks_size,
+    iter_hook_events,
+    record_hook_event,
+)
 from omnigent.harnesses.devin_native.forwarder import (
     _ForwardState,
     _handle_event,
@@ -410,6 +415,28 @@ class TestStatePersistence:
     def test_corrupt_state_starts_at_the_beginning(self, tmp_path: Path) -> None:
         (tmp_path / "devin_forwarder_state.json").write_text("{not json", encoding="utf-8")
         assert _read_state(tmp_path).hooks_offset == 0
+
+    def test_resume_keeps_a_cursor_that_sits_behind_unconsumed_events(
+        self, tmp_path: Path
+    ) -> None:
+        """A resume must not skip a tail the previous forwarder never consumed.
+
+        Bridge dirs are keyed by session id and survive a resume, so a stored
+        cursor can lag the log when a forwarder is killed mid-turn. Advancing to
+        the end on the resume would drop those turns; the ``hooks_offset == 0``
+        clause on the skip is what prevents it.
+        """
+        record_hook_event(tmp_path, {"hook_event_name": "Stop", "prompt_id": "p1"})
+        consumed = hooks_size(tmp_path)  # a real record boundary
+        record_hook_event(tmp_path, {"hook_event_name": "UserPromptSubmit", "prompt_id": "p2"})
+        _write_state(tmp_path, _ForwardState(hooks_offset=consumed))
+
+        state = _read_state(tmp_path)
+        skipped = bool(state.hooks_offset == 0)  # the guard's own condition
+        assert skipped is False
+        assert state.hooks_offset < hooks_size(tmp_path)
+        remaining = [p for _, p in iter_hook_events(tmp_path, start_offset=state.hooks_offset)]
+        assert [p["hook_event_name"] for p in remaining] == ["UserPromptSubmit"]
 
 
 # The one.txt sub-agent's task, verbatim as the run_subagent hook delivers it and

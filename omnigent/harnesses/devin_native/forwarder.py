@@ -728,13 +728,20 @@ async def forward_devin_hooks_to_session(
     :param agent_name: Agent label stamped on mirrored assistant items.
     :param poll_interval_s: Seconds between hook-log polls.
     :param auth: Optional refresh-capable httpx Auth for remote deployments.
-    :param start_at_end: Skip hook events already in the log — used on a cold
-        resume so replayed history is not re-posted as new.
+    :param start_at_end: Skip hook events already in the log, but only when this
+        bridge dir has no cursor yet. Devin does not re-fire hooks for replayed
+        history on ``--resume`` (its ``SessionStart`` carries ``source="resume"``
+        and the next event is the user's new prompt), so the skip exists only for
+        a first attach to a log something else already wrote.
     :returns: Never normally returns; cancel the task to stop it.
     """
     from omnigent.cli_auth import open_server_client
 
     state = _read_state(bridge_dir)
+    # The cursor check is load-bearing, not belt-and-braces: bridge dirs are
+    # keyed by session id and survive a resume, so a stored cursor can sit behind
+    # events a killed forwarder never consumed. Skipping to the end on a resume
+    # would drop those turns for good.
     if start_at_end and state.hooks_offset == 0:
         from omnigent.harnesses.devin_native.bridge import hooks_size
 
