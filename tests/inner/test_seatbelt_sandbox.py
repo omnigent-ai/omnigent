@@ -573,6 +573,46 @@ def test_profile_emits_extra_read_roots(tmp_path: Path) -> None:
     assert expected in profile
 
 
+def test_profile_canonicalises_symlinked_extra_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Extra read/write roots spelled through a symlink are emitted at their
+    kernel-canonical path, like the scratch tmpdir (L2). Subpath rules match
+    the kernel's canonicalised path (macOS ``/tmp`` → ``/private/tmp``), so
+    an un-canonicalised spelling emits a rule the kernel never sees and the
+    grant is silently dead under deny-default.
+    """
+    import tempfile
+
+    # Anchor the system tempdir inside tmp_path so the symlinked write root
+    # below is not classified as the always-canonicalised scratch tmpdir.
+    fake_sys_tmp = tmp_path / "systmp"
+    fake_sys_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(fake_sys_tmp))
+
+    real = tmp_path / "real"
+    (real / "rdata").mkdir(parents=True)
+    (real / "wdata").mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    read_spelling = link / "rdata"
+    write_spelling = link / "wdata"
+    policy = _make_policy(tmp_path, read_roots=[read_spelling], write_roots=[write_spelling])
+    profile = _build_profile(policy, tmp_path.resolve(strict=False))
+
+    canonical_read = str(read_spelling.resolve(strict=False))
+    canonical_write = str(write_spelling.resolve(strict=False))
+    # The symlink must actually diverge, or the assertions prove nothing.
+    assert canonical_read != str(read_spelling)
+    assert canonical_write != str(write_spelling)
+    assert f'(allow file-read* (subpath "{canonical_read}"))' in profile
+    assert f'(allow file-read* (subpath "{canonical_write}"))' in profile
+    assert f'(allow file-write* (subpath "{canonical_write}"))' in profile
+    assert f'(allow file-write* (subpath "{write_spelling}"))' not in profile
+
+
 def test_profile_network_section_for_allow_network_true_no_egress(
     tmp_path: Path,
 ) -> None:

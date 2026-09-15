@@ -1269,6 +1269,13 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".npm" / "_logs",
         pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
+    # The CLI anchors its per-uid runtime dir at Node's os.tmpdir() with a
+    # hardcoded /tmp fallback, which need not match tempfile.gettempdir()
+    # (macOS resolves the latter to /var/folders/.../T). Grant both spellings.
+    if os.name == "posix":
+        tmp_runtime = pathlib.Path("/tmp") / f"claude-{stable_user_id()}"
+        if tmp_runtime not in roots:
+            roots.append(tmp_runtime)
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
     return roots
