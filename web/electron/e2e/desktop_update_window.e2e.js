@@ -173,25 +173,57 @@ describe(
         // Let the card settle on screen so the failing run's video shows it.
         await window.waitForTimeout(1_500);
 
-        // 4. THE BUG: the prompt is hosted in a separate visible, focusable
-        //    top-level OS window ("Omnigent Update") alongside the app window,
-        //    so the OS presents it as a second window (window switchers,
-        //    Mission Control, screen-share pickers) and clicking the card
-        //    moves OS focus out of the app. A fixed build either hosts the
-        //    card inside the app window (no such window) or keeps the overlay
-        //    window non-focusable so it is never presented alongside the app.
-        const separateWindows = await electronApp.evaluate(({ BrowserWindow }) =>
+        // 4. THE BUG on macOS: the prompt is hosted in a separate visible,
+        //    focusable OS window ("Omnigent Update"), so Mission Control and
+        //    screen-share pickers present it alongside the app. Linux keeps
+        //    the default focusability because Electron makes non-focusable
+        //    Linux windows unmanaged and always-on-top across all workspaces.
+        const overlayWindows = await electronApp.evaluate(({ BrowserWindow }) =>
           BrowserWindow.getAllWindows()
             .filter((w) => w.webContents.getURL().includes("update-overlay"))
-            .filter((w) => w.isVisible() && w.isFocusable())
-            .map((w) => ({ title: w.getTitle(), bounds: w.getBounds() })),
+            .map((w) => ({
+              title: w.getTitle(),
+              bounds: w.getBounds(),
+              visible: w.isVisible(),
+              focusable: w.isFocusable(),
+              hasParent: Boolean(w.getParentWindow()),
+            })),
         );
         assert.equal(
-          separateWindows.length,
-          0,
-          "update prompt is presented as a separate focusable OS window " +
-            `alongside the app: ${JSON.stringify(separateWindows)}`,
+          overlayWindows.length,
+          1,
+          `unexpected overlays: ${JSON.stringify(overlayWindows)}`,
         );
+        assert.equal(overlayWindows[0].visible, true);
+        assert.equal(overlayWindows[0].hasParent, true);
+        if (process.platform === "darwin") {
+          assert.equal(
+            overlayWindows[0].focusable,
+            false,
+            "update prompt is presented as a separate focusable macOS window " +
+              `alongside the app: ${JSON.stringify(overlayWindows)}`,
+          );
+        }
+
+        // 5. The macOS first-mouse option and the existing click-through state
+        //    must leave real card controls actionable. Dismiss through
+        //    Playwright's Electron input path, then require the React card to
+        //    disappear and the shell window to collapse back to its 1px sliver.
+        await overlayPage.getByRole("button", { name: "Dismiss" }).click();
+        await overlayPage.getByText("is available").waitFor({ state: "hidden", timeout: 5_000 });
+        let collapsedHeight = overlayWindows[0].bounds.height;
+        /* oxlint-disable no-await-in-loop */
+        for (let i = 0; i < 50 && collapsedHeight !== 1; i++) {
+          collapsedHeight = await electronApp.evaluate(({ BrowserWindow }) => {
+            const overlay = BrowserWindow.getAllWindows().find((w) =>
+              w.webContents.getURL().includes("update-overlay"),
+            );
+            return overlay?.getBounds().height ?? 0;
+          });
+          if (collapsedHeight !== 1) await window.waitForTimeout(100);
+        }
+        /* oxlint-enable no-await-in-loop */
+        assert.equal(collapsedHeight, 1, "Dismiss did not collapse the update prompt");
       } finally {
         // Close FIRST (flushes the videos), then name the clips — the failing
         // path (the reproduction) must still produce the before-fix footage.

@@ -130,9 +130,9 @@ function makeOverlay({ platform = process.platform } = {}) {
 }
 
 describe("update overlay", () => {
-  it("creates the overlay as a non-focusable window so the OS never presents it alongside the app", () => {
-    const { controller } = makeOverlay();
-    const overlay = controller.ensureOverlay(new FakeWindow());
+  it("keeps the macOS overlay out of OS window lists without changing Linux window management", () => {
+    const mac = makeOverlay({ platform: "darwin" });
+    const overlay = mac.controller.ensureOverlay(new FakeWindow());
     // A focusable overlay is listed by window switchers / Mission Control /
     // screen-share pickers as a second app window and steals focus on click.
     assert.equal(overlay.options.focusable, false);
@@ -140,6 +140,14 @@ describe("update overlay", () => {
     assert.equal(overlay.options.skipTaskbar, true);
     // Never-active windows only get clicks via first-mouse delivery (macOS).
     assert.equal(overlay.options.acceptFirstMouse, true);
+
+    const linux = makeOverlay({ platform: "linux" });
+    const linuxOverlay = linux.controller.ensureOverlay(new FakeWindow());
+    // Electron makes non-focusable Linux windows unmanaged, always-on-top, and
+    // visible on every workspace. Leave the platform defaults intact there.
+    assert.equal(linuxOverlay.options.focusable, undefined);
+    assert.equal(linuxOverlay.options.hiddenInMissionControl, undefined);
+    assert.equal(linuxOverlay.options.acceptFirstMouse, undefined);
   });
 
   it("excludes the overlay from the macOS shown-windows menu", () => {
