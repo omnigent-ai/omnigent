@@ -204,6 +204,28 @@ def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.binary == "fakecli"
 
 
+def test_codebuddy_launch_and_setup_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CodeBuddy's documented ACP command and host login reach the shared UI setup."""
+    from omnigent.onboarding.harness_install import ui_install_key
+
+    monkeypatch.setenv("OMNIGENT_CODEBUDDY_PATH", "/opt/code buddy/codebuddy")
+    row = ACP_CLI_HARNESSES["codebuddy"]
+    env = _build_acp_cli_spawn_env(_spec("codebuddy"), harness="codebuddy")
+
+    assert shlex.split(env["HARNESS_ACP_COMMAND"]) == ["/opt/code buddy/codebuddy", "--acp"]
+    assert row.install.package == "@tencent-ai/codebuddy-code"
+    assert row.aliases == ("cbc", "codebuddy-code")
+    assert "HARNESS_ACP_MODEL" not in env
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+    for spelling in ("codebuddy", "cbc", "codebuddy-code"):
+        assert ui_install_key(spelling) == "codebuddy"
+        steps = ui_setup_steps(spelling)
+        assert [step.kind for step in steps] == ["install", "auth"]
+        assert steps[1].action == "command"
+        assert steps[1].command == "codebuddy"
+        assert steps[1].status_key is None
+
+
 def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
     """Rows that opt out of MCP injection must propagate that to the wrap.
 

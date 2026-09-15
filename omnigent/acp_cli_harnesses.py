@@ -87,6 +87,17 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
+    "codebuddy": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "CodeBuddy",
+            "codebuddy",
+            "@tencent-ai/codebuddy-code",
+            login_args=(),
+            auth_hint="run `codebuddy` and complete its browser sign-in on the host",
+        ),
+        args=("--acp",),
+        aliases=("cbc", "codebuddy-code"),
+    ),
     # Devin (Cognition's ``devin`` CLI) drives ``devin acp`` — its ACP stdio
     # server. Ships via a curl installer (not npm) and authenticates through its
     # own ``devin auth login``, which writes a credential file it reads back at
