@@ -3368,6 +3368,7 @@ async def _auto_create_devin_terminal(
         session_config_path,
         write_devin_agent_rule,
         write_devin_mcp_config,
+        write_fork_preamble,
         write_hook_wrapper,
         write_tmux_target,
     )
@@ -3390,13 +3391,32 @@ async def _auto_create_devin_terminal(
     # Deliver a custom agent's instructions as an always-on Windsurf rule (the
     # only channel Devin applies to every turn); a plain agent clears any stale
     # rule a prior custom-agent launch left in this workspace.
-    write_devin_agent_rule(
-        workspace_path, _native_startup_raw_instructions_from_spec(agent_spec)
-    )
+    write_devin_agent_rule(workspace_path, _native_startup_raw_instructions_from_spec(agent_spec))
 
     # Register Omnigent's MCP relay before the TUI starts — Devin reads its MCP
     # servers at launch, from a project-local file (its user config carries none).
     write_devin_mcp_config(workspace_path, bridge_dir)
+
+    # A forked clone replays its prior conversation as a preamble on the first
+    # injected message: Devin's own session store is read-only to us, so there is
+    # no local transcript to rebuild for `--resume`. Best-effort — a failure just
+    # starts the fork without the carried context.
+    if launch_config.fork_carry_history and server_client is not None:
+        try:
+            from omnigent.harnesses.claude_native.main import (
+                _fetch_all_session_items_for_claude_resume,
+            )
+
+            fork_items = await _fetch_all_session_items_for_claude_resume(
+                server_client, session_id
+            )
+            write_fork_preamble(bridge_dir, _cursor_fork_history_preamble(fork_items))
+        except Exception:  # noqa: BLE001 — context carry-over is best-effort
+            _logger.warning(
+                "devin-native: could not carry fork history for %s",
+                session_id,
+                exc_info=True,
+            )
 
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 

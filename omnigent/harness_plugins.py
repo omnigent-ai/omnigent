@@ -548,7 +548,11 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         live_queue=True,
         images=True,
         compaction=True,
-        fork_history=_FH.REBUILD,
+        # PREAMBLE, not REBUILD: Devin's session store is read-only to Omnigent, so
+        # a fork replays its prior turns as text on the clone's first message (the
+        # choice cursor-native makes) rather than seeding a local transcript for
+        # `--resume`. See write_fork_preamble / wrap_fork_preamble.
+        fork_history=_FH.PREAMBLE,
         shell_tool_name="exec",
         shell_tool_prompt=_SHELL_PROMPT,
         # A custom agent's instructions are delivered at launch as an always-on

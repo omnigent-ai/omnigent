@@ -201,6 +201,34 @@ async def test_every_item_carries_the_prompt_id_as_turn_id(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_fork_history_is_stripped_from_the_mirrored_user_turn(tmp_path: Path) -> None:
+    # A forked clone's first message carries the prior conversation as context for
+    # Devin, but it is not something the user typed — mirroring it back would
+    # duplicate the copied history in the Omnigent timeline.
+    from omnigent.harnesses.devin_native.bridge import wrap_fork_preamble
+
+    client = _FakeClient()
+    wrapped = wrap_fork_preamble("You: earlier\n\nAssistant: sure", "now do the thing")
+    await _drive(client, [dict(_USER_PROMPT, prompt=wrapped)], tmp_path)
+    mirrored = client.items("message")[0]["content"][0]["text"]
+    assert mirrored == "now do the thing"
+    assert "earlier" not in mirrored
+
+
+@pytest.mark.asyncio
+async def test_an_unterminated_fork_block_still_strips(tmp_path: Path) -> None:
+    # A truncated paste has no close tag; strip to end-of-text rather than
+    # mirroring raw history.
+    client = _FakeClient()
+    await _drive(
+        client,
+        [dict(_USER_PROMPT, prompt="<omnigent_fork_history>\nYou: earlier")],
+        tmp_path,
+    )
+    assert client.items("message") == []
+
+
+@pytest.mark.asyncio
 async def test_turn_opens_running_and_closes_idle(tmp_path: Path) -> None:
     # Devin's executor returns right after injecting, so the Omnigent turn is over
     # immediately and the web sees no streaming state. These hook-driven edges are

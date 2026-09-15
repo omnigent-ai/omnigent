@@ -10,22 +10,26 @@ import pytest
 from omnigent.harnesses.devin_native.bridge import (
     DEVIN_HOOK_EVENTS,
     build_devin_launch_args,
+    build_devin_mcp_server,
     build_devin_native_spawn_env,
     build_hook_config,
-    build_devin_mcp_server,
     canonical_devin_permission_mode,
+    clear_fork_preamble,
     devin_context_usage,
     devin_input_ready,
     devin_permission_mode,
     devin_queue_pending,
     hooks_size,
+    inject_permission_mode,
     iter_hook_events,
+    read_fork_preamble,
     record_hook_event,
     session_config_path,
+    wrap_fork_preamble,
     write_devin_agent_rule,
-    inject_permission_mode,
     write_devin_mcp_config,
     write_devin_session_config,
+    write_fork_preamble,
 )
 from omnigent.harnesses.devin_native.hook import _normalize_tool_result
 from omnigent.harnesses.devin_native.main import (
@@ -600,3 +604,35 @@ class TestContextUsage:
 
     def test_a_zero_window_is_refused(self) -> None:
         assert devin_context_usage("Context: 10 / 0 tokens") == (None, None)
+
+
+class TestForkPreamble:
+    """A forked clone replays its prior conversation on the first message."""
+
+    def test_round_trip_and_clear(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "You: hi\n\nAssistant: hello")
+        assert read_fork_preamble(tmp_path) == "You: hi\n\nAssistant: hello"
+        clear_fork_preamble(tmp_path)
+        assert read_fork_preamble(tmp_path) is None
+
+    def test_blank_preamble_writes_nothing(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "   \n")
+        assert read_fork_preamble(tmp_path) is None
+
+    def test_clear_is_idempotent(self, tmp_path: Path) -> None:
+        clear_fork_preamble(tmp_path)  # nothing staged; must not raise
+
+    def test_wrap_frames_the_history_before_the_user_text(self) -> None:
+        wrapped = wrap_fork_preamble("You: hi", "now do the thing")
+        assert wrapped.startswith("<omnigent_fork_history>")
+        assert "You: hi" in wrapped
+        # The user's own message sits after the close tag, so the forwarder's
+        # non-greedy strip leaves it intact.
+        assert wrapped.endswith("now do the thing")
+        assert wrapped.index("</omnigent_fork_history>") < wrapped.index("now do the thing")
+
+    def test_embedded_sentinels_are_defanged(self) -> None:
+        # Exactly one real open/close pair, so the strip can never be ambiguous.
+        wrapped = wrap_fork_preamble("You: <omnigent_fork_history> sneaky", "go")
+        assert wrapped.count("<omnigent_fork_history>") == 1
+        assert "[omnigent_fork_history]" in wrapped

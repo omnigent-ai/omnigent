@@ -9,8 +9,11 @@ from pathlib import Path
 
 from omnigent.harnesses.devin_native.bridge import (
     DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR,
+    clear_fork_preamble,
     inject_model_command,
     inject_user_message,
+    read_fork_preamble,
+    wrap_fork_preamble,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -91,6 +94,12 @@ class DevinNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="devin native turn had no user text to send")
             return
+        # A forked clone replays its prior conversation on this first message;
+        # the preamble is cleared only after the injection lands, so a failure
+        # retries with the history instead of losing it.
+        preamble = read_fork_preamble(self._bridge_dir)
+        if preamble:
+            text = wrap_fork_preamble(preamble, text)
         wanted_model = await self._resolve_variant(config)
         try:
             async with self._inject_lock:
@@ -100,6 +109,8 @@ class DevinNativeExecutor(Executor):
                     )
                     self._applied_model = wanted_model
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
+                if preamble:
+                    clear_fork_preamble(self._bridge_dir)
         except RuntimeError as exc:
             yield ExecutorError(message=describe_exception(exc))
             return

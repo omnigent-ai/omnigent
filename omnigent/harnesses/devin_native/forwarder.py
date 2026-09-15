@@ -34,6 +34,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.devin_native.bridge import (
+    FORK_HISTORY_CLOSE_TAG,
+    FORK_HISTORY_OPEN_TAG,
     export_path,
     iter_hook_events,
     read_devin_context_usage,
@@ -67,6 +70,16 @@ _STATE_FILE = "devin_forwarder_state.json"
 #: Backoff bounds for the supervisor when the forward loop dies.
 _SUPERVISE_INITIAL_BACKOFF_S = 1.0
 _SUPERVISE_MAX_BACKOFF_S = 30.0
+
+#: The fork-history block the executor prepends to a clone's first message. It is
+#: context for Devin, not something the user typed, so it is stripped from the
+#: mirrored user turn (an unterminated block strips to end-of-text so a truncated
+#: paste degrades instead of mirroring raw history).
+_FORK_HISTORY_RE = re.compile(
+    rf"{re.escape(FORK_HISTORY_OPEN_TAG)}.*?{re.escape(FORK_HISTORY_CLOSE_TAG)}"
+    rf"|{re.escape(FORK_HISTORY_OPEN_TAG)}.*",
+    re.DOTALL,
+)
 
 _SESSION_START = "SessionStart"
 _USER_PROMPT_SUBMIT = "UserPromptSubmit"
@@ -542,6 +555,8 @@ async def _handle_event(
         prompt = payload.get("prompt")
         turn.prompt_id = prompt_id
         await _open_turn(client, session_id=session_id, turn=turn)
+        if isinstance(prompt, str):
+            prompt = _FORK_HISTORY_RE.sub("", prompt).strip()
         if isinstance(prompt, str) and prompt.strip():
             await _post_item(
                 client,

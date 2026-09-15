@@ -456,6 +456,80 @@ def write_devin_mcp_config(
 _AGENT_RULE_RELPATH = (".windsurf", "rules", "omnigent-agent-instructions.md")
 
 
+#: Prior conversation a forked clone replays on its first message: written by the
+#: launch path, consumed once by the executor.
+_FORK_PREAMBLE_FILE = "fork_preamble.txt"
+#: Sentinel framing that history inside the injected message. Devin reads the
+#: framed block as context; the forwarder strips it when mirroring the user turn so
+#: the copied conversation is not duplicated in the Omnigent timeline. Same
+#: sentinel text cursor-native uses, so a fork reads the same either side.
+FORK_HISTORY_OPEN_TAG = "<omnigent_fork_history>"
+FORK_HISTORY_CLOSE_TAG = "</omnigent_fork_history>"
+_FORK_HISTORY_HEADER = (
+    "Here is the conversation carried over from the session this one was forked from:"
+)
+_FORK_HISTORY_FOOTER = "That is the end of the carried-over conversation; my message follows."
+
+
+def write_fork_preamble(bridge_dir: Path, preamble: str) -> None:
+    """Stage a forked clone's prior conversation for its first injected message.
+
+    Devin's own session store is read-only to Omnigent, so there is no local
+    transcript to rebuild for ``--resume``; replaying the turns as text is the
+    closest analog (the same choice cursor-native makes).
+
+    :param bridge_dir: Per-session bridge directory.
+    :param preamble: Rendered transcript; blank writes nothing.
+    """
+    if not preamble.strip():
+        return
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (bridge_dir / _FORK_PREAMBLE_FILE).write_text(preamble, encoding="utf-8")
+
+
+def read_fork_preamble(bridge_dir: Path) -> str | None:
+    """Return the staged fork preamble, or ``None`` when there is none.
+
+    Left in place until :func:`clear_fork_preamble`, so a failed first injection
+    retries with the history rather than silently losing it.
+    """
+    try:
+        text = (bridge_dir / _FORK_PREAMBLE_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text or None
+
+
+def clear_fork_preamble(bridge_dir: Path) -> None:
+    """Drop the staged preamble once it has been delivered."""
+    with contextlib.suppress(OSError):
+        (bridge_dir / _FORK_PREAMBLE_FILE).unlink()
+
+
+def _neutralize_fork_sentinels(text: str) -> str:
+    """Defang literal sentinel tags so the framed block holds exactly one pair."""
+    return text.replace(FORK_HISTORY_OPEN_TAG, "[omnigent_fork_history]").replace(
+        FORK_HISTORY_CLOSE_TAG, "[/omnigent_fork_history]"
+    )
+
+
+def wrap_fork_preamble(preamble: str, user_text: str) -> str:
+    """Frame the replayed history ahead of the fork's first user message.
+
+    :param preamble: Rendered prior-conversation transcript.
+    :param user_text: The user's first message in the fork.
+    :returns: The framed transcript followed by the user text.
+    """
+    return (
+        f"{FORK_HISTORY_OPEN_TAG}\n"
+        f"{_FORK_HISTORY_HEADER}\n\n"
+        f"{_neutralize_fork_sentinels(preamble)}\n\n"
+        f"{_FORK_HISTORY_FOOTER}\n"
+        f"{FORK_HISTORY_CLOSE_TAG}\n\n"
+        f"{user_text}"
+    )
+
+
 def write_devin_agent_rule(workspace: Path, instructions: str | None) -> None:
     """Deliver a custom agent's instructions to Devin as an always-on rule.
 
