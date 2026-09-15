@@ -6,10 +6,11 @@
 //      cached across the sidebar's `["conversations", ...]` query variants,
 //      and pushes it to the socket, and
 //   3. applies incoming snapshot/changed/removed frames back into that cache
-//      — patching field changes (status, runner, title, …) in place and
-//      falling back to a debounced refetch for structural changes,
-//      membership-affecting filter changes, and updated_at resorting where
-//      the server's list shape can't be reconstructed locally.
+//      — patching field changes (status, runner, title, updated_at, …) in
+//      place and falling back to a debounced refetch only for membership
+//      changes the client can't decide (archive flips, project relabels,
+//      unplaceable new rows, title changes while a search list is cached).
+//      Ordering converges locally: the sidebar sorts by `updated_at` itself.
 //
 // This replaces the old 4 s list poll; `useConversations` keeps low-rate
 // HTTP reconciliation so new sessions from other tabs / CLIs are still
@@ -57,13 +58,11 @@ const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as co
  * @param queryClient - The app QueryClient.
  * @param items - Wire items from a snapshot/changed frame.
  * @returns Ids not found in any cached page and whether any patched row
- *   needs a server refetch to preserve filtered-query membership or sort
- *   order.
+ *   needs a server refetch to preserve filtered-query membership.
  */
 function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
-  activeId: string | undefined,
   viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
@@ -82,13 +81,19 @@ function applyItemsToCache(
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   });
+  // Only search-scoped lists depend on the server's title/content matching,
+  // so a title change forces the debounced refetch only while one is cached
+  // (sidebar search or the command palette, plus their gc window).
+  const searchListCached = entries.some(
+    ([key]) => filtersFromConversationQueryKey(key).searchQuery !== "",
+  );
   for (const [key, data] of entries) {
     const filters = filtersFromConversationQueryKey(key);
     const {
       data: merged,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filters, activeId);
+    } = mergeItemsIntoPages(data, itemsById, filters, searchListCached);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     // Surface a brand-new watched session (a create here or elsewhere, a share)
@@ -127,7 +132,7 @@ function applyItemsToCache(
       data: next,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, activeId);
+    } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, searchListCached);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
@@ -361,13 +366,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
-            activeIdRef.current,
             getCurrentUserId(),
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas
-          // (archive/search/connected filters) and updated_at resorting need
-          // the same server-side reconciliation.
+          // (archive flips, relabels, searched-title changes) need the same
+          // server-side reconciliation.
           //
           // Skip the active session: its updated_at bumps on open before the
           // initial list fetch returns, so it lands in missingIds even though

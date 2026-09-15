@@ -1834,11 +1834,10 @@ describe("chatStore — send (first-send ordering)", () => {
     // server-acked + streamed content, plus snapshot hydration.
     expect(state.blocks.filter((b) => b.type === "user_message")).toHaveLength(0);
 
-    expect(invalidateSpy).toHaveBeenCalledTimes(2);
-    expect(invalidateSpy.mock.calls.map(([arg]) => arg)).toEqual([
-      { queryKey: ["conversations"] },
-      { queryKey: ["conversations"] },
-    ]);
+    // Only the create path invalidates (the new row must enter the list);
+    // the send itself must not force a second list fetch.
+    expect(invalidateSpy).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy.mock.calls.map(([arg]) => arg)).toEqual([{ queryKey: ["conversations"] }]);
   });
 
   it("serializes rapid-fire sends so POSTs reach the server in submission order", async () => {
@@ -2157,8 +2156,11 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(calls).toEqual([{ url: "/v1/sessions/conv_existing/events", method: "POST" }]);
   });
 
-  it("invalidates conversations after every postEvent (existing-session sidebar reorder)", async () => {
-    // Without this, the sender's chat lags 0-4 s behind their own message.
+  it("does not force a session-list refetch on send (WS patches the sidebar)", async () => {
+    // Title auto-gen and status/runner transitions stream over
+    // WS /v1/sessions/updates and patch the list in place; a per-send
+    // ["conversations"] invalidation is forced search-backend load that
+    // scales with every message on search-backed deployments.
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -2175,7 +2177,7 @@ describe("chatStore — send (first-send ordering)", () => {
         Array.isArray((arg as { queryKey: unknown[] }).queryKey) &&
         (arg as { queryKey: unknown[] }).queryKey[0] === "conversations",
     );
-    expect(conversationInvalidations).toHaveLength(1);
+    expect(conversationInvalidations).toHaveLength(0);
   });
 
   it("rebinds the SSE stream before posting when the controller was cleared (idle disconnect)", async () => {

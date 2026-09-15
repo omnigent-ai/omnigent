@@ -211,22 +211,26 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 /**
  * Decide whether a field change needs server-side list reconciliation.
  *
- * The server owns pagination, updated_at sorting, search matches over title
- * and item content, and archive filtering. Push frames update visible row
- * fields immediately; this tells the provider when to follow with a list
- * refetch so filtered query membership and page order converge. Title
- * changes reconcile every list variant because a row absent from a search
- * query may now match it.
+ * The server owns pagination, archive filtering, project membership, and
+ * search matches over title and item content. Push frames update visible
+ * row fields immediately; this tells the provider when to follow with a
+ * list refetch so filtered-query membership converges. Visible order never
+ * needs one: the sidebar and folders re-sort rows client-side by
+ * `updated_at` (see `sortByUpdatedAtDesc`), so a patched timestamp moves
+ * the row on its own — on search-backed deployments every skipped refetch
+ * is a search query saved.
  *
  * @param changed - Names of wire fields that changed the cached row.
- * @param isActiveRow - Whether this row is the active chat (the one held
- *   in place by `ActiveChatOverride`). An `updated_at`-only change on it
- *   doesn't move the visible row, so it doesn't need a server resort.
+ * @param searchListCached - Whether any search-scoped `["conversations"]`
+ *   variant is cached. Only those lists depend on the server's title/content
+ *   matching, so a title change forces reconciliation only while one exists.
  * @returns `true` when the query should be invalidated after patching.
  */
-function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
+function changedFieldsNeedRefetch(changed: Set<string>, searchListCached: boolean): boolean {
+  // An archived flip must ENTER the row into variants that don't hold it
+  // (the Archived tab, or the default lists on unarchive), which no local
+  // patch can place.
   if (changed.has("archived")) return true;
-  if (changed.has("title")) return true;
   // A labels change can move a row between project-filtered variants and the
   // project folders (["project-sessions", …]). A session relabeled INTO the
   // selected project isn't in that filtered cache yet, so no local patch can
@@ -235,13 +239,10 @@ function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): b
   // caller's invalidation is prefix-wide (["conversations"]), so it reconciles
   // the filtered variants too.
   if (changed.has("labels")) return true;
-  // updated_at only affects the server's sort order. The active chat row is
-  // pinned at its position by ActiveChatOverride regardless of that order, so
-  // an updated_at bump on it — the common case while the user sends messages —
-  // never changes what's visible. Skip the full-list refetch it would
-  // otherwise force every tick. Any other row's updated_at still needs the
-  // server resort to move it.
-  if (changed.has("updated_at") && !isActiveRow) return true;
+  // A renamed row may start or stop matching a search-scoped list — the
+  // server matches over title AND item content, so only it can decide.
+  // With no search list cached, the in-place patch is complete.
+  if (changed.has("title")) return searchListCached;
   return false;
 }
 
@@ -261,9 +262,9 @@ function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): b
  *   query.
  * @param itemsById - Wire items keyed by conversation id.
  * @param filters - Canonical filters for this conversations query.
- * @param activeId - The active chat's conversation id (`/c/:id`), or
- *   `undefined` when not on a chat route. Its `updated_at` bumps don't force
- *   a refetch because `ActiveChatOverride` pins its visible position.
+ * @param searchListCached - Whether any search-scoped `["conversations"]`
+ *   variant is cached; gates the title-change refetch (see
+ *   `changedFieldsNeedRefetch`). Callers that ignore `needsRefetch` omit it.
  * @returns The possibly updated data, ids found in it, and whether this
  *   query needs a server refetch after the local patch.
  */
@@ -271,7 +272,7 @@ export function mergeItemsIntoPages(
   data: ConversationsInfiniteData | undefined,
   itemsById: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
-  activeId: string | undefined,
+  searchListCached = false,
 ): { data: ConversationsInfiniteData | undefined; found: Set<string>; needsRefetch: boolean } {
   const found = new Set<string>();
   if (!data) return { data, found, needsRefetch: false };
@@ -298,7 +299,7 @@ export function mergeItemsIntoPages(
         needsRefetch = true;
         continue;
       }
-      if (changedFieldsNeedRefetch(changed, conv.id === activeId)) {
+      if (changedFieldsNeedRefetch(changed, searchListCached)) {
         needsRefetch = true;
       }
       rowChanged = true;
@@ -495,20 +496,17 @@ export function overlayTitleIntoCaches(
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   })) {
-    // activeId only gates `needsRefetch`, which both callers ignore —
-    // they patch in place rather than refetching.
     const { data: next } = mergeItemsIntoPages(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS);
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
@@ -549,14 +547,13 @@ export function overlayArchivedIntoCaches(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS);
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>

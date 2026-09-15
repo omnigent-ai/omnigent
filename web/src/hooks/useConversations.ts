@@ -1696,7 +1696,6 @@ export function useTogglePinnedConversation() {
         data,
         itemsById,
         filtersFromConversationQueryKey(key),
-        undefined,
       );
       if (next !== data) queryClient.setQueryData(key, next);
     }
@@ -1997,7 +1996,6 @@ export function useMoveToProject() {
         data,
         itemsById,
         filtersFromConversationQueryKey(key),
-        undefined,
       );
       if (found.has(id)) inWindow = true;
       if (next !== data) queryClient.setQueryData(key, next);
@@ -2013,7 +2011,6 @@ export function useMoveToProject() {
           targetData,
           itemsById,
           PROJECT_FOLDER_FILTERS,
-          undefined,
         );
         let next = merged ?? targetData;
         const [first, ...rest] = next.pages;

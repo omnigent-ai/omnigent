@@ -2199,10 +2199,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // `session.input.consumed` clears this bubble by FIFO order (its
       // `clearedPendingId` matches only snapshot-hydrated bubbles, which
       // already carry the server id); see the consumed handler.
-      // Refresh the sidebar without waiting for the 4 s `useConversations`
-      // poll — picks up server-side title auto-gen and any runner_id /
-      // status transitions that happen during the turn.
-      queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      // Deliberately no ["conversations"] invalidation here: title auto-gen
+      // and status/runner transitions stream over WS /v1/sessions/updates and
+      // patch the sidebar in place, while a per-send refetch is search-backend
+      // load that scales with every message.
     } catch (err) {
       const { message, code } = describeSendFailure(err);
       // Hand the failed message back to the composer so the user can retry it —
@@ -2367,7 +2367,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
-      queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      // Same as `send`: the WS updates stream keeps the sidebar fresh; no
+      // forced ["conversations"] refetch per command.
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
