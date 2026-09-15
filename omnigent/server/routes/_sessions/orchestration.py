@@ -6484,12 +6484,14 @@ async def _relay_runner_stream_once(
             f"/v1/sessions/{session_id}/stream",
             timeout=_relay_timeout,
         ) as resp:
+            resp.raise_for_status()
             _logger.info(
                 "Relay: connected to runner GET /stream for session=%s",
                 session_id,
                 extra=debug_event("runner_stream_connected", session_id=session_id),
             )
             buffer = ""
+            heartbeat_seen = False
             async for chunk in resp.aiter_text():
                 buffer += chunk
                 while "\n\n" in buffer:
@@ -6518,6 +6520,13 @@ async def _relay_runner_stream_once(
                     # read timeout; not forwarded to the session stream
                     # (the Omnigent subscriber generates its own heartbeats).
                     if evt_type == "session.heartbeat":
+                        if not heartbeat_seen:
+                            heartbeat_seen = True
+                            _logger.info(
+                                "Relay: runner stream ready for session=%s",
+                                session_id,
+                                extra=debug_event("runner_stream_ready", session_id=session_id),
+                            )
                         if ready is not None:
                             ready.set()
                         continue
@@ -7041,6 +7050,17 @@ async def _relay_runner_stream_once(
                     session_stream.publish(session_id, event)
 
     except (httpx.HTTPError, ConnectionError) as exc:
+        if isinstance(exc, httpx.HTTPStatusError):
+            _logger.warning(
+                "Relay: runner GET /stream rejected for session=%s with HTTP %s",
+                session_id,
+                exc.response.status_code,
+                extra=debug_event(
+                    "runner_stream_http_rejected",
+                    session_id=session_id,
+                    http_status=exc.response.status_code,
+                ),
+            )
         # WSTunnelTransport raises bare ConnectionError on tunnel close;
         # treat the same as HTTPError. The finally below consumes the
         # intentional-stop marker, so snapshot it now for the supervisor's
