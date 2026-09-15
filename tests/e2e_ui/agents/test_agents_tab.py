@@ -52,3 +52,21 @@ def test_agents_tab_lists_lone_agent(
     # and a lone agent has no sub-agent rows beneath it.
     expect(rail.locator(_SUBAGENT_MAIN_ROW)).to_be_visible(timeout=30_000)
     expect(rail.locator(_SUBAGENT_ROW)).to_have_count(0)
+
+
+def test_agents_graph_shows_root_agent_icon(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The graph node identifies the root agent with its harness icon."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Agents")).click()
+    rail.get_by_role("button", name="Graph view").click()
+
+    root_node = rail.locator(".react-flow__node").filter(has_text="hello_world")
+    expect(root_node).to_be_visible(timeout=30_000)
+    expect(root_node.locator("svg")).to_have_count(1)

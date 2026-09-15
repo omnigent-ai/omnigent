@@ -93,6 +93,13 @@ describe("AgentCard icon selection", () => {
     // fires, so the generic bot is the floor.
     expect(chosenIcon(agent({ name: "mystery", harness: "agents_sdk" }))).toBe("bot");
   });
+
+  it("hides its decorative icon from assistive technology", () => {
+    const { container } = render(
+      <AgentCard agent={agent()} selected={false} onSelect={() => {}} />,
+    );
+    expect(container.querySelector("[data-icon]")).toHaveAttribute("aria-hidden", "true");
+  });
 });
 
 describe("AgentCard compact mode", () => {
