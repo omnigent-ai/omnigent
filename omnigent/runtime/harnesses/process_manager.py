@@ -780,6 +780,18 @@ class HarnessProcessManager:
                     entry.harness,
                     conversation_id,
                     entry.process.returncode,
+                    extra={
+                        "session_id": conversation_id,
+                        "event_name": "harness_exit_detected",
+                        "attributes": {
+                            "harness": entry.harness,
+                            "pid": entry.process.pid,
+                            "returncode": entry.process.returncode,
+                            "tracked_response_id": self._in_flight_response_ids.get(
+                                conversation_id
+                            ),
+                        },
+                    },
                 )
                 await self._close_entry(entry)
                 entry = None

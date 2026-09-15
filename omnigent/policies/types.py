@@ -272,6 +272,13 @@ class PolicyResult:
         denied ASK must leave no trace). ``None`` means "no
         state changes." e.g.
         ``[StateUpdate(key="call_count", action=StateUpdateAction.INCREMENT, value=1)]``.
+    :param deciding_policy_workspace_id: Databricks workspace id
+        that owns the deciding policy (``deciding_policies[0]``).
+        Engine-set on DENY / ASK when the deciding policy is a
+        workspace-scoped stored row; ``None`` for YAML /
+        agent-spec policies (not workspace-scoped) and on ALLOW.
+        Surfaced so a denial can be attributed to the owning
+        workspace in logs.
     """
 
     action: PolicyAction
@@ -280,6 +287,7 @@ class PolicyResult:
     deciding_policies: list[str] | None = None
     data: object | None = None
     state_updates: list[StateUpdate] | None = None
+    deciding_policy_workspace_id: int | None = None
 
     @property
     def deciding_policy(self) -> str | None:

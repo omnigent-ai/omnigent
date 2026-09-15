@@ -3688,7 +3688,13 @@ async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
-    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    tombstones = [
+        host
+        for _, host in host_store.list_current_managed_sandbox_hosts_page(
+            after=None,
+            limit=10,
+        )
+    ]
     assert len(tombstones) == 1
     assert tombstones[0].deleted_at is not None
     assert tombstones[0].sandbox_id == "sb-term-2"
@@ -3700,7 +3706,8 @@ async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
     )
     assert await reaper.sweep_once() == 1
     assert fake.terminated == ["sb-term-2"]
-    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
 
 
 async def test_terminate_managed_host_retains_only_failed_generation(
@@ -3745,7 +3752,13 @@ async def test_terminate_managed_host_retains_only_failed_generation(
     await terminate_managed_host(host, host_store, _injected_config(fake))
 
     assert attempts == ["sb-term-new-partial", "sb-term-old-partial"]
-    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    tombstones = [
+        host
+        for _, host in host_store.list_current_managed_sandbox_hosts_page(
+            after=None,
+            limit=10,
+        )
+    ]
     assert len(tombstones) == 1
     assert tombstones[0].sandbox_id == "sb-term-new-partial"
     assert tombstones[0].terminating_sandbox_id is None
@@ -3757,7 +3770,8 @@ async def test_terminate_managed_host_retains_only_failed_generation(
     )
     assert await reaper.sweep_once() == 1
     assert fake.terminated == ["sb-term-old-partial", "sb-term-new-partial"]
-    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
@@ -4765,6 +4779,96 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     assert engaged == [True, True]
     assert len(calls) == 1
     assert calls[0]["agent_id"] == builtin.id
+
+
+# ── Gensee sandbox provider ─────────────────────────────────
+
+
+def test_parse_gensee_builds_core_launcher() -> None:
+    """The built-in Gensee provider receives its validated server config."""
+    from omnigent.onboarding.sandboxes.gensee import GenseeSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "gensee",
+            "server_url": "https://omnigent.example.com",
+            "gensee": {
+                "endpoint": "https://sandbox.example.com/control/",
+                "api_token_env": "CUSTOM_GENSEE_TOKEN",
+                "workspace_root": "/srv/gensee/workspaces",
+                "operation_timeout_s": 600,
+                "poll_interval_s": 1,
+                "request_timeout_s": 30,
+                "retry_timeout_s": 0,
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+            },
+        }
+    )
+
+    assert deployment is not None
+    config = deployment.default
+    assert config.provider == "gensee"
+    assert config.managed_launch_supported is True
+    assert config.token_ttl_s == 7 * 24 * 3600
+    launcher = config.launcher_factory()
+    assert isinstance(launcher, GenseeSandboxLauncher)
+    assert launcher.endpoint == "https://sandbox.example.com/control"
+    assert launcher.api_token_env == "CUSTOM_GENSEE_TOKEN"
+    assert str(launcher.workspace_root) == "/srv/gensee/workspaces"
+    assert launcher.retry_timeout_s == 0
+    assert launcher.env == ("OPENAI_API_KEY", "GIT_TOKEN")
+
+
+def test_parse_gensee_uses_safe_defaults() -> None:
+    """A minimal Gensee block targets the production control endpoint."""
+    from omnigent.onboarding.sandboxes.gensee import GenseeSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "gensee",
+            "server_url": "https://omnigent.example.com",
+        }
+    )
+
+    assert deployment is not None
+    launcher = deployment.default.launcher_factory()
+    assert isinstance(launcher, GenseeSandboxLauncher)
+    assert launcher.endpoint == "https://sandbox.gensee.ai"
+    assert launcher.api_token_env == "GENSEE_CONTROLLER_API_TOKEN"
+
+
+def test_parse_gensee_rejects_unknown_config_key() -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.gensee.*unknown"):
+        parse_sandbox_config(
+            {
+                "provider": "gensee",
+                "server_url": "https://omnigent.example.com",
+                "gensee": {"project": "not-a-public-provider-setting"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "gensee",
+    [
+        {"endpoint": "http://sandbox.example.com"},
+        {"api_token_env": "NOT-AN-ENV"},
+        {"workspace_root": "relative"},
+        {"operation_timeout_s": 0},
+        {"retry_timeout_s": -1},
+        {"env": ["NOT-AN-ENV"]},
+        {"env": ["DUPLICATE", "DUPLICATE"]},
+    ],
+)
+def test_parse_gensee_rejects_invalid_config(gensee: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.gensee"):
+        parse_sandbox_config(
+            {
+                "provider": "gensee",
+                "server_url": "https://omnigent.example.com",
+                "gensee": gensee,
+            }
+        )
 
 
 # ── contributed sandbox providers ───────────────────────────

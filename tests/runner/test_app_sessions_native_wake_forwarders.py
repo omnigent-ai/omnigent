@@ -853,6 +853,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         No-op thread preload.
@@ -1135,6 +1136,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1317,6 +1319,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Refuse the resume the way codex's thread-store does for a bad rollout.

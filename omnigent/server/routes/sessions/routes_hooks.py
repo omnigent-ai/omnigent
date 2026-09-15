@@ -916,6 +916,7 @@ def register_hooks_routes(
                                 policy_phase=phase.value,
                                 policy_reason=decline_body["reason"],
                                 policy_gate="declined",
+                                policy_workspace_id=result.deciding_policy_workspace_id,
                             )
                             return Response(
                                 content=json.dumps(decline_body),
@@ -933,6 +934,7 @@ def register_hooks_routes(
                             policy_verdict=approval_body["result"],
                             policy_phase=phase.value,
                             policy_gate="ask",
+                            policy_workspace_id=result.deciding_policy_workspace_id,
                         )
                         if approval_body.get("reason"):
                             add_audit_attrs(policy_reason=approval_body["reason"])
@@ -956,15 +958,23 @@ def register_hooks_routes(
             resp_body["data"] = result.data
         # Tag the audit envelope with the decision so a DENY/ASK is debuggable
         # (a deny returns HTTP 200, so status alone can't tell you the verdict).
-        add_audit_attrs(policy_verdict=resp_body["result"], policy_phase=phase.value)
+        add_audit_attrs(
+            policy_verdict=resp_body["result"],
+            policy_phase=phase.value,
+            policy_workspace_id=result.deciding_policy_workspace_id,
+        )
         if result.reason:
             add_audit_attrs(policy_reason=result.reason)
         # Emit a structured log for non-ALLOW verdicts so operators can diagnose
-        # policy evaluation failures without needing audit-log access.
+        # policy evaluation failures without needing audit-log access. The
+        # workspace id is the deciding policy's owning workspace (None for a
+        # YAML / agent-spec policy that is not a workspace-scoped row).
         if result.action in (PolicyAction.DENY, PolicyAction.ASK):
             _logger.info(
-                "policy_eval_verdict: session=%s phase=%s action=%s policy=%s reason=%r tool=%s",
+                "policy_eval_verdict: session=%s policy_workspace=%s phase=%s "
+                "action=%s policy=%s reason=%r tool=%s",
                 session_id,
+                result.deciding_policy_workspace_id,
                 phase.value,
                 result.action.value,
                 result.deciding_policy,

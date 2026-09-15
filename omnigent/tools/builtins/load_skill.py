@@ -44,15 +44,18 @@ class LoadSkillTool(Tool):
             the agent spec.
         """
         all_skills = list(skills)
-        # Discover host-scope skills. Use agent_root when provided,
-        # but fall back to cwd — in production the server process
-        # runs from the user's project, so cwd finds .claude/skills/
-        # even when agent_root is a cache dir.
-        discovery_root = agent_root or Path.cwd()
         from omnigent.spec.parser import discover_host_skills
 
+        try:
+            discovery_root = agent_root or Path.cwd()
+        except OSError:
+            # A runner can outlive its working directory; bundled skills still work.
+            host_skills = []
+        else:
+            host_skills = discover_host_skills(discovery_root, skills_filter)
+
         bundled_names = {s.name for s in skills}
-        for hs in discover_host_skills(discovery_root, skills_filter):
+        for hs in host_skills:
             if hs.name not in bundled_names:
                 all_skills.append(hs)
         self._skills = all_skills

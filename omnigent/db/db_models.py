@@ -874,9 +874,10 @@ class SqlConversation(ConversationBase):
     )
 
     __table_args__ = (
-        # No bare created_at/updated_at indexes: the sessions list is ACL-scoped
-        # (id IN (...)) and resolves via the PK; the default sidebar (archived=
-        # false, updated_at DESC) is served by the archived_updated index below.
+        # Keep created_at unindexed here: ACL-selective listings may rationally
+        # use a semi-join plus sort, while an ordering index can encourage many
+        # permission probes. The default sidebar (archived=false, updated_at
+        # DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
         Index(
             "ix_conversations_root_conversation_id",
@@ -1367,7 +1368,7 @@ class SqlHost(OmnigentBase):
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
@@ -1381,6 +1382,13 @@ class SqlHost(OmnigentBase):
         # rotation) stays consistent.
         UniqueConstraint(
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
+        Index("ix_hosts_sandbox_scan", "sandbox_id", "workspace_id", "host_id"),
+        Index(
+            "ix_hosts_terminating_sandbox_scan",
+            "terminating_sandbox_id",
+            "workspace_id",
+            "host_id",
         ),
     )
 

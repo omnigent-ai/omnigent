@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import Callable
@@ -739,8 +740,10 @@ def test_clear_bridge_state_removes_stale_runtime_state(tmp_path: Path) -> None:
     assert read_bridge_state(bridge_dir) is None
 
 
-def test_preload_codex_thread_for_resume_resumes_and_closes(
+@pytest.mark.parametrize("retain_client", [False, True])
+def test_preload_codex_thread_for_resume_manages_subscription(
     monkeypatch: pytest.MonkeyPatch,
+    retain_client: bool,
 ) -> None:
     """
     Preloading uses Codex ``thread/resume`` before bridge state is exposed.
@@ -768,7 +771,7 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         fake_client_factory,
     )
 
-    asyncio.run(
+    retained = asyncio.run(
         codex_native_app_server.preload_codex_thread_for_resume(
             "ws://127.0.0.1:1234",
             "019e96aa-0be2-7343-8d3b-6f914d60936b",
@@ -780,6 +783,7 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
                 "-c",
                 'approvals_reviewer="auto_review"',
             ],
+            retain_client=retain_client,
         )
     )
 
@@ -796,7 +800,36 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
             },
         )
     ]
-    assert fake_client.closed is True
+    assert fake_client.closed is not retain_client
+    assert retained is (fake_client if retain_client else None)
+
+
+@pytest.mark.parametrize("retain_client", [False, True])
+@pytest.mark.parametrize("stage", ["connect", "request"])
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+def test_preload_codex_thread_closes_client_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    retain_client: bool,
+    stage: str,
+    error: type[BaseException],
+) -> None:
+    """Failed or cancelled startup must not leave a preload subscription open."""
+    fake_client = _FakeCodexAppServerClient()
+
+    async def fail(*_args: Any, **_kwargs: Any) -> None:
+        raise error("preload failed")
+
+    monkeypatch.setattr(fake_client, stage, fail)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    with pytest.raises(error, match="preload failed"):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876", "thread_test", retain_client=retain_client
+            )
+        )
+    assert fake_client.closed
 
 
 @pytest.mark.parametrize(
@@ -886,14 +919,175 @@ def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> 
         thread_id="thread_x",
         remote_url="ws://127.0.0.1:9876",
     ) == [
-        *args,
-        "-c",
-        'approval_policy="never"',
         "resume",
         "--remote",
         "ws://127.0.0.1:9876",
         "thread_x",
     ]
+
+
+@pytest.mark.parametrize(
+    ("permission_args", "expected_permissions"),
+    [
+        ((), {"approvalsReviewer": "auto_review"}),
+        (
+            ("-a", "on-failure", "-s=read-only"),
+            {"approvalPolicy": "on-failure", "sandbox": "read-only"},
+        ),
+        (
+            ("--ask-for-approval=on-request", "--sandbox", "workspace-write"),
+            {"approvalPolicy": "on-request", "sandbox": "workspace-write"},
+        ),
+        (
+            (
+                "--config",
+                'sandbox_mode="read-only"',
+                '-c=approval_policy="on-request"',
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ),
+            {
+                "sandbox": "read-only",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+            },
+        ),
+        (
+            (
+                '--config=default_permissions=":danger-full-access"',
+                "-c",
+                'approvals_reviewer="user"',
+            ),
+            {
+                "permissions": ":danger-full-access",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+            },
+        ),
+        (
+            ("--dangerously-bypass-approvals-and-sandbox",),
+            {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+        ),
+    ],
+)
+def test_remote_resume_applies_permissions_only_on_app_server(
+    monkeypatch: pytest.MonkeyPatch,
+    permission_args: tuple[str, ...],
+    expected_permissions: dict[str, str],
+) -> None:
+    """Remote attachment must not repeat the policy already applied by preload."""
+    fake_client = _FakeCodexAppServerClient()
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        lambda *_args, **_kwargs: fake_client,
+    )
+    model_args = ("--model", "test-model", "-c", 'model_reasoning_effort="high"')
+    launch_args = (*permission_args, *model_args)
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:9876", "thread_test", terminal_launch_args=launch_args
+        )
+    )
+    assert fake_client.requests == [
+        (
+            "thread/resume",
+            {"threadId": "thread_test", "excludeTurns": True, **expected_permissions},
+        )
+    ]
+    assert fake_client.closed
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=('model_provider="test-provider"',),
+    ) == [
+        "-c",
+        'model_provider="test-provider"',
+        *model_args,
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_test",
+    ]
+
+
+@pytest.mark.parametrize("codex_cli_version", [None, (0, 154, 0), (0, 155, 0)])
+def test_remote_resume_omits_app_server_permission_config(
+    codex_cli_version: tuple[int, int, int] | None,
+) -> None:
+    """Server config overrides also stay off the remote terminal's command line."""
+    overrides = (
+        'approval_policy="never"',
+        'sandbox_mode="danger-full-access"',
+        'model_provider="test-provider"',
+    )
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=overrides,
+        codex_cli_version=codex_cli_version,
+        bypass_sandbox=True,
+        bypass_hook_trust=True,
+    ) == [
+        "-c",
+        'model_provider="test-provider"',
+        "--dangerously-bypass-hook-trust",
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_test",
+    ]
+
+
+@pytest.mark.parametrize("codex_cli_version", [(0, 136, 0), (0, 153, 0), (0, 153, 1)])
+def test_remote_resume_preserves_legacy_bypass_args(
+    codex_cli_version: tuple[int, int, int],
+) -> None:
+    """Older TUIs need the bypass settings even after app-server preload."""
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=("-a", "on-request", "-s", "read-only", "--model", "test-model"),
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=('approval_policy="never"', 'sandbox_mode="danger-full-access"'),
+        codex_cli_version=codex_cli_version,
+        bypass_sandbox=True,
+    ) == [
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'sandbox_mode="danger-full-access"',
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--model",
+        "test-model",
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_test",
+    ]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--add-dir", "/extra-workspace"),
+        ("--config", "sandbox_workspace_write.network_access=false"),
+        ("--full-auto",),
+        ("-c", "approvals_reviewer=false"),
+        ("--config", 'sandbox_mode=""'),
+        ("-c",),
+        ("--config",),
+        ("-c", 'developer_instructions="Do not change approval_policy"'),
+    ],
+)
+def test_remote_resume_preserves_settings_not_applied_by_preload(args: tuple[str, ...]) -> None:
+    """Do not silently discard unsupported policy settings or unrelated config."""
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+    ) == [*args, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
 
 
 def _started_event(turn_id: str) -> dict[str, Any]:
@@ -1180,7 +1374,6 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             "thread_local",
             "unix:///tmp/app-server.sock",
             [
-                *_AUTO_REVIEW_ARGS,
                 "resume",
                 "--remote",
                 "unix:///tmp/app-server.sock",
@@ -1203,7 +1396,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             "thread_host",
             "ws://127.0.0.1:9876",
-            [*_AUTO_REVIEW_ARGS, "resume", "--remote", "ws://127.0.0.1:9876", "thread_host"],
+            ["resume", "--remote", "ws://127.0.0.1:9876", "thread_host"],
         ),
         # Leading codex args are preserved ahead of the attach flags.
         (
@@ -1213,7 +1406,6 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             [
                 "--model",
                 "gpt-5.4-mini",
-                *_AUTO_REVIEW_ARGS,
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1274,7 +1466,6 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
-                *_AUTO_REVIEW_ARGS,
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1424,13 +1615,11 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
                 "ws://127.0.0.1:9876",
             ],
         ),
-        # Resume path: the bypass flag is a global flag and MUST precede the
-        # ``resume`` subcommand, and a pre-existing bypass flag is de-duped.
+        # Resume inherits the bypass policy from the app-server.
         (
             ("--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only"),
             "thread_x",
             [
-                "--dangerously-bypass-approvals-and-sandbox",
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1445,15 +1634,8 @@ def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
     expected: list[str],
 ) -> None:
     """
-    ``bypass_sandbox=True`` emits one ``--dangerously-bypass-approvals-and-
-    sandbox`` and strips the conflicting ``--sandbox`` / ``--ask-for-approval``
-    pairs.
-
-    See :func:`omnigent.harnesses.codex_native.app_server._strip_approval_sandbox_flags`.
-    Asserting the exact argv guards three things: the bypass flag is present
-    exactly once, the conflicting flag pairs are removed (with their values),
-    and the bypass flag lands before any ``resume`` subcommand (codex rejects
-    a global flag placed after a subcommand).
+    Fresh sessions get one bypass flag without conflicting approval flags.
+    Resumed terminals inherit that policy from the app-server.
     """
     assert (
         codex_native_app_server.build_codex_remote_args(
@@ -1740,16 +1922,31 @@ def test_wait_for_thread_started_times_out_when_no_thread_event() -> None:
         )
 
 
-def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
+def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     tmp_path: Path,
 ) -> None:
     """
     Fresh Codex sessions pass the listener used to discover
     ``thread/started``. Once the thread id is known, the forwarder
     subscribes that connection so TUI-originated turn/item events are
-    mirrored into the web session.
+    mirrored into the web session. Dead-letter recovery belongs to cold-resume
+    rollout reconstruction, so starting the live forwarder must not replay it
+    again after that snapshot has already been built.
     """
     fake_client = _FakeCodexAppServerClient()
+    codex_native_forwarder.append_dead_letter(
+        tmp_path,
+        session_id="conv_123",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="http 503",
+        http_status=503,
+    )
+    ap_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ap_requests.append(request)
+        return httpx.Response(200)
 
     async def run() -> None:
         """
@@ -1765,6 +1962,7 @@ def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
             app_server_url=str(tmp_path / "app-server.sock"),
             thread_id="thread_123",
             client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
         )
 
     asyncio.run(run())
@@ -1773,6 +1971,8 @@ def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
     ]
     assert fake_client.closed
+    assert ap_requests == []
+    assert (tmp_path / "dead_letter.jsonl").exists()
 
 
 def test_supervise_forwarder_resumes_when_it_opens_client(
@@ -1971,6 +2171,22 @@ def test_subscribe_until_ready_replays_completed_turn_status(
                     "id": "thread_123",
                     "turns": [
                         {
+                            "id": "turn_122",
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "item_old_user",
+                                    "content": [{"type": "text", "text": "already synced"}],
+                                },
+                                {
+                                    "type": "agentMessage",
+                                    "id": "item_old_agent",
+                                    "text": "already synced reply",
+                                },
+                            ],
+                        },
+                        {
                             "id": "turn_123",
                             "status": "completed",
                             "items": [
@@ -1985,7 +2201,7 @@ def test_subscribe_until_ready_replays_completed_turn_status(
                                     "text": "reply",
                                 },
                             ],
-                        }
+                        },
                     ],
                 }
             }
@@ -2025,6 +2241,7 @@ def test_subscribe_until_ready_replays_completed_turn_status(
 
     asyncio.run(run())
 
+    assert fake_client.requests == [("thread/resume", {"threadId": "thread_123"})]
     assert [payload["type"] for payload in posted] == [
         "external_conversation_item",
         "external_conversation_item",
@@ -2935,6 +3152,7 @@ def test_forwarder_persists_interrupted_codex_partial_agent_message(tmp_path: Pa
                     "content": [{"type": "output_text", "text": "partial answer"}],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:interrupted-partial",
             },
         },
         {
@@ -4004,6 +4222,8 @@ def test_forwarder_keeps_streaming_when_native_tui_answers_codex_elicitation(
                     "content": [{"type": "output_text", "text": "after approval"}],
                 },
                 "response_id": "codex_turn_123",
+                "message_id": "codex:thread_123:turn_123:agentMessage:item_agent",
+                "source_id": "thread_123:turn_123:item_agent",
             },
         },
     ]
@@ -5818,6 +6038,7 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
                     "content": [{"type": "input_text", "text": "hello codex"}],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:item_user",
             },
         },
         {
@@ -5830,6 +6051,8 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
                     "content": [{"type": "output_text", "text": "hello from codex"}],
                 },
                 "response_id": "codex_turn_123",
+                "message_id": "codex:thread_123:turn_123:agentMessage:item_agent",
+                "source_id": "thread_123:turn_123:item_agent",
             },
         },
     ]
@@ -6132,6 +6355,8 @@ def test_forwarder_posts_completed_codex_plan_item() -> None:
                     ],
                 },
                 "response_id": "codex_turn_123",
+                "message_id": "codex:thread_123:turn_123:plan:plan_123",
+                "source_id": "thread_123:turn_123:plan_123",
             },
         }
     ]
@@ -6232,6 +6457,7 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
                     "call_id": "call_abc123",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:call_abc123:call",
             },
         },
         {
@@ -6243,6 +6469,7 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
                     "output": "hello world\n",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:call_abc123:output",
             },
         },
     ]
@@ -6356,6 +6583,7 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: 
             "output": "collecting tests...\n1 passed\n",
         },
         "response_id": "codex_turn_123",
+        "source_id": "thread_123:turn_123:call_abc123:output",
     }
 
 
@@ -6535,6 +6763,7 @@ def test_forwarder_posts_codex_image_view_tool_call() -> None:
                     "call_id": "img_view_1",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:img_view_1:call",
             },
         },
         {
@@ -6546,6 +6775,7 @@ def test_forwarder_posts_codex_image_view_tool_call() -> None:
                     "output": "/repo/screenshot.png",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:img_view_1:output",
             },
         },
     ]
@@ -6653,6 +6883,7 @@ def test_forwarder_posts_codex_entered_review_mode_marker() -> None:
                     ],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:review_1",
             },
         }
     ]
@@ -6688,6 +6919,7 @@ def test_forwarder_posts_codex_exited_review_mode_marker() -> None:
                     "content": [{"type": "output_text", "text": "Exited review mode"}],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:review_2",
             },
         }
     ]
@@ -6773,6 +7005,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
                     "call_id": "codex_turn_diff_turn_123",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:turn-diff:call",
             },
         },
         {
@@ -6784,6 +7017,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
                     "output": latest_diff,
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:turn-diff:output",
             },
         },
         {
@@ -8006,6 +8240,90 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
     assert captured.get("developer_instructions") == "Be a concise, careful coding assistant."
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_failure", [None, "terminal", "client"])
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cleanup_failure: str | None,
+    error: type[BaseException],
+) -> None:
+    """A failed or cancelled close must not skip the remaining owned resources."""
+    from unittest.mock import AsyncMock
+
+    closed: list[str] = []
+
+    async def close_resource(name: str) -> None:
+        closed.append(name)
+        if cleanup_failure == name:
+            raise error("cleanup failed")
+
+    async def close_terminal(**_kwargs: Any) -> None:
+        await close_resource("terminal")
+
+    async def close_client() -> None:
+        await close_resource("client")
+
+    async def close_server() -> None:
+        await close_resource("server")
+
+    def progress(_progress: object, message: str) -> None:
+        if message == "Codex terminal ready.":
+            raise error("startup failed")
+
+    client = SimpleNamespace(close=close_client)
+    server = SimpleNamespace(
+        start=AsyncMock(),
+        close=close_server,
+        codex_cli_version=(0, 154, 0),
+        config_overrides=[],
+        env={},
+        codex_home=tmp_path / "codex-home",
+    )
+    preload = AsyncMock(return_value=client)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        codex_native,
+        "_fetch_codex_session",
+        AsyncMock(
+            return_value={
+                "labels": {codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE},
+                "external_session_id": "thread_test",
+            }
+        ),
+    )
+    monkeypatch.setattr(codex_native, "_find_running_codex_terminal", AsyncMock(return_value=None))
+    monkeypatch.setattr(codex_native, "_ensure_local_codex_resume_rollout", AsyncMock())
+    monkeypatch.setattr(codex_native, "build_codex_native_server", lambda **_kwargs: server)
+    monkeypatch.setattr(codex_native, "preload_codex_thread_for_resume", preload)
+    monkeypatch.setattr(
+        codex_native,
+        "_launch_codex_terminal",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                terminal_id="terminal_test",
+            )
+        ),
+    )
+    monkeypatch.setattr(codex_native, "_update_startup_progress", progress)
+    monkeypatch.setattr(codex_native, "_close_codex_terminal", close_terminal)
+
+    with pytest.raises(error, match="cleanup failed" if cleanup_failure else "startup failed"):
+        await codex_native._prepare_codex_terminal(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_test",
+            runner_id=None,
+            session_bundle=None,
+            codex_args=(),
+            command="codex",
+            model=None,
+        )
+    assert preload.await_args.kwargs["retain_client"] is True
+    assert closed == ["terminal", "client", "server"]
+
+
 def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8150,8 +8468,11 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ensure_status", [200, 503])
 async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    ensure_status: int,
 ) -> None:
     """
     Daemon preparation owns session create, runner launch, and terminal ensure.
@@ -8165,6 +8486,9 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    from omnigent import _startup_events as startup
+
+    caplog.set_level("INFO", logger="omnigent.startup")
     original_async_client = httpx.AsyncClient
     calls: list[tuple[str, str, object]] = []
 
@@ -8198,7 +8522,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         if request.method == "GET" and path == "/v1/runners/runner_new/status":
             return httpx.Response(200, json={"online": True})
         if request.method == "POST" and path.endswith("/resources/terminals"):
-            return httpx.Response(200, json={"id": "terminal_codex_main"})
+            return httpx.Response(ensure_status, json={"id": "terminal_codex_main"})
         if request.method == "GET" and path.endswith("/resources/terminals/terminal_codex_main"):
             return httpx.Response(
                 200,
@@ -8228,17 +8552,27 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     monkeypatch.setattr(codex_native.httpx, "AsyncClient", client_factory)
     progress_updates: list[str] = []
 
-    prepared = await codex_native._prepare_codex_terminal_via_daemon(
-        base_url="https://example.com",
-        headers={},
-        session_id=None,
-        session_bundle=b"bundle",
-        codex_args=("--config", "approval_policy=on-request"),
-        model="gpt-5.4-mini",
-        host_id="host_local",
-        workspace="/repo",
-        startup_progress=RunnerStartupProgress(update=progress_updates.append),
+    expected_error = (
+        pytest.raises(click.ClickException) if ensure_status != 200 else contextlib.nullcontext()
     )
+    with expected_error:
+        with startup.native_startup_attempt(harness="codex-native"):
+            prepared = await codex_native._prepare_codex_terminal_via_daemon(
+                base_url="https://example.com",
+                headers={},
+                session_id=None,
+                session_bundle=b"bundle",
+                codex_args=("--config", "approval_policy=on-request"),
+                model="gpt-5.4-mini",
+                host_id="host_local",
+                workspace="/repo",
+                startup_progress=RunnerStartupProgress(update=progress_updates.append),
+            )
+    if ensure_status != 200:
+        events = [r.attributes["event"] for r in caplog.records if r.name == "omnigent.startup"]
+        assert events[-1] == "launch_failed"
+        assert "terminal_available" not in events
+        return
 
     assert prepared.session_id == "conv_new"
     assert prepared.terminal_id == "terminal_codex_main"
@@ -8273,6 +8607,23 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         "Starting Codex terminal...",
         "Codex terminal ready.",
     ]
+
+    events = [r.attributes for r in caplog.records if r.name == "omnigent.startup"]
+    assert [e["event"] for e in events] == [
+        "launch_started",
+        "session_resolved",
+        "runner_requested",
+        "runner_connected",
+        "session_runner_bound",
+        "terminal_available",
+        "launch_incomplete",
+    ]
+    assert len({e["attempt_id"] for e in events}) == 1
+    assert all(
+        r.session_id == "conv_new"
+        for r in caplog.records
+        if r.name == "omnigent.startup" and r.attributes["event"] != "launch_started"
+    )
 
 
 @pytest.mark.asyncio
@@ -8758,7 +9109,18 @@ def test_launch_codex_terminal_starts_fresh_remote_tui() -> None:
     assert client.posts[0][1]["spec"]["tmux_start_on_attach"] is True
 
 
-def test_launch_codex_terminal_uses_remote_resume_order() -> None:
+@pytest.mark.parametrize(
+    ("codex_cli_version", "permission_args"),
+    [
+        ((0, 153, 1), ["-c", "approval_policy=on-request"]),
+        ((0, 154, 0), []),
+        (None, []),
+    ],
+)
+def test_launch_codex_terminal_uses_remote_resume_order(
+    codex_cli_version: tuple[int, int, int] | None,
+    permission_args: list[str],
+) -> None:
     """
     Terminal launch uses the Codex resume subcommand with ``--remote``
     before the thread id, matching Codex CLI parsing coverage.
@@ -8776,6 +9138,7 @@ def test_launch_codex_terminal_uses_remote_resume_order() -> None:
             thread_id="thread_123",
             remote_url="ws://127.0.0.1:9876",
             env={"CODEX_HOME": "/tmp/codex-home"},
+            codex_cli_version=codex_cli_version,
         )
     )
 
@@ -8789,8 +9152,7 @@ def test_launch_codex_terminal_uses_remote_resume_order() -> None:
                 "spec": {
                     "command": "/opt/codex/bin/codex",
                     "args": [
-                        "-c",
-                        "approval_policy=on-request",
+                        *permission_args,
                         "resume",
                         "--remote",
                         "ws://127.0.0.1:9876",
@@ -8852,6 +9214,57 @@ def test_launch_codex_terminal_extracts_tmux_attach_metadata(
     assert launched.terminal_id == "terminal_codex_main"
     assert launched.tmux_socket == socket_path
     assert launched.tmux_target == "main"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attach_fails", [False, True])
+async def test_attach_retains_preload_subscription_until_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    attach_fails: bool,
+) -> None:
+    """The same subscribed client must survive attachment and reach the forwarder."""
+    client = _FakeCodexAppServerClient()
+    forwarded: list[object] = []
+
+    async def forward(**kwargs: Any) -> None:
+        forwarded.append(kwargs["client"])
+        await asyncio.Event().wait()
+
+    async def attach(**_kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        assert forwarded == [client]
+        assert not client.closed
+        if attach_fails:
+            raise RuntimeError("attach failed")
+
+    async def close(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(codex_native, "supervise_forwarder", forward)
+    monkeypatch.setattr(codex_native, "_attach_terminal_resource", attach)
+    monkeypatch.setattr(codex_native, "_close_codex_terminal", close)
+    prepared = codex_native.PreparedCodexTerminal(
+        session_id="conv_test",
+        terminal_id="terminal_test",
+        tmux_socket=None,
+        tmux_target=None,
+        bridge_dir=tmp_path,
+        thread_id="thread_test",
+        app_server_url="ws://127.0.0.1:9876",
+        app_server=SimpleNamespace(close=close),  # type: ignore[arg-type]
+        event_client=client,  # type: ignore[arg-type]
+        reattached=False,
+    )
+    operation = codex_native._attach_with_forwarder(
+        base_url="http://127.0.0.1:8000", headers={}, prepared=prepared, prompt=None
+    )
+    if attach_fails:
+        with pytest.raises(RuntimeError, match="attach failed"):
+            await operation
+    else:
+        await operation
+    assert client.closed
 
 
 def test_attach_with_forwarder_uses_direct_tmux_when_socket_is_local(
@@ -10634,6 +11047,72 @@ def test_clone_codex_rollout_returns_none_for_unsafe_target_id(
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
+    tmp_path: Path,
+) -> None:
+    """A successful dead-letter replay is included in the rebuilt snapshot."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    replay_data = {
+        "item_type": "message",
+        "item_data": {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "recovered reply"}],
+        },
+        "response_id": "turn_recovered",
+        "source_id": "codex:item:recovered",
+    }
+    codex_native_forwarder.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex",
+        event_type="external_conversation_item",
+        payload=replay_data,
+        reason="http 503",
+        http_status=503,
+    )
+    request_order: list[str] = []
+    server_items: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_order.append(request.method)
+        if request.method == "POST":
+            body = json.loads(request.content)
+            assert body == {"type": "external_conversation_item", "data": replay_data}
+            server_items.append(
+                {
+                    "id": "msg_recovered",
+                    "response_id": replay_data["response_id"],
+                    "type": "message",
+                    **replay_data["item_data"],
+                }
+            )
+            return httpx.Response(200)
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": server_items, "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=tmp_path.resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert request_order == ["POST", "GET"]
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+    assert any(
+        record["type"] == "response_item" and record["payload"].get("id") == "msg_recovered"
+        for record in records
+    )
 
 
 @pytest.mark.asyncio

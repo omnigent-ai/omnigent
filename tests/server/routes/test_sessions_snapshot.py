@@ -562,6 +562,53 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED",
+        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
+        "HTTP 429: billing_hard_limit_reached",
+        "API Error: 429: Your credit balance is too low to access the API.",
+    ],
+)
+@pytest.mark.parametrize(
+    ("stored_code", "expected_code"),
+    [
+        ("native_turn_error", "rate_limit_exceeded"),
+        ("codex_turn_error", "rate_limit_exceeded"),
+        ("codex_reauth_required", "codex_reauth_required"),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
+    message: str,
+    stored_code: str,
+    expected_code: str,
+) -> None:
+    """Failures saved without a rate-limit code become retryable on reload."""
+    session_id = "319c3d34a4ab4e6d983872bf898a19b4"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": stored_code,
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_rate_limit", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == stored_code
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 
@@ -1898,8 +1945,12 @@ async def test_session_snapshot_retries_503_model_options(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "skills", [[], [{"name": "triage-issues", "description": "Triage issues."}]]
+)
 async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     monkeypatch: pytest.MonkeyPatch,
+    skills: list[dict[str, str]],
 ) -> None:
     """
     The background runner-skills fetch publishes ``session.skills`` once
@@ -1925,9 +1976,7 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     class _FakeRunnerClient:
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             if url.endswith("/skills"):
-                return _FakeResponse(
-                    {"skills": [{"name": "triage-issues", "description": "Triage issues."}]}
-                )
+                return _FakeResponse({"skills": skills})
             return _FakeResponse({"status": "idle"})
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
@@ -1951,6 +2000,7 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     # First poll serves [] and kicks the background fetch.
     first = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
     assert first.skills == []
+    assert first.skills_status == "loading"
     await _drain_runner_skills("38aed2dc1dc1b08dbbaa1cf9592d7ae5")
 
     # Exactly one session.skills event for this session was published when
@@ -1967,6 +2017,9 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
         f"Expected exactly 1 session.skills publish on fetch resolve, "
         f"got {len(skills_events)}: {published}"
     )
+    ready = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
+    assert ready.skills_status == "ready"
+    assert [s.model_dump() for s in ready.skills] == skills
 
 
 @pytest.mark.asyncio
@@ -1997,6 +2050,7 @@ async def test_session_snapshot_skills_empty_without_runner(
     )
 
     assert snapshot.skills == []
+    assert snapshot.skills_status == "unavailable"
 
 
 @pytest.mark.asyncio

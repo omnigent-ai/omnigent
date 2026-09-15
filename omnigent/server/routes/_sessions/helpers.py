@@ -41,6 +41,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
+from omnigent.debug_logging import debug_event
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     Agent,
@@ -71,6 +72,7 @@ from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
+from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -136,6 +138,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_HARNESS,
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODES,
+    _CLAUDE_NATIVE_READABLE_PERMISSION_MODES,
     _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
     _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -202,6 +205,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_explicit_unread,
     _read_last_seen,
     _runner_skills_cache,
+    _runner_skills_failed,
     _runner_skills_inflight,
     _runner_skills_stale,
     _session_active_response_cache,
@@ -2586,7 +2590,8 @@ async def _persist_external_permission_mode_change(
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row for ``session_id`` at the route boundary.
-    :param body: Event body; ``data.permission_mode`` must be a switchable mode.
+    :param body: Event body; ``data.permission_mode`` must be a mode the pane
+        footer can report (the switchable modes plus ``bypassPermissions``).
     :param conversation_store: Store used to upsert the mode label.
     :returns: None.
     :raises OmnigentError: If ``data.permission_mode`` is missing or unsupported.
@@ -2599,10 +2604,10 @@ async def _persist_external_permission_mode_change(
             code=ErrorCode.INVALID_INPUT,
         )
     mode = raw_mode.strip()
-    if mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
+    if mode not in _CLAUDE_NATIVE_READABLE_PERMISSION_MODES:
         raise OmnigentError(
             "external_permission_mode_change requires data.permission_mode in "
-            f"{sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}; got {mode!r}",
+            f"{sorted(_CLAUDE_NATIVE_READABLE_PERMISSION_MODES)}; got {mode!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     # Reflect the switch into terminal_launch_args so a relaunch reopens in this
@@ -2735,6 +2740,40 @@ def _merge_codex_permission_launch_args(
     return [*merged, *permission_args]
 
 
+def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], bool]:
+    """
+    Drop every permission-mode selector from Claude launch args.
+
+    Removes ``--permission-mode`` (space- or ``=``-joined) and the standalone
+    ``--dangerously-skip-permissions``, which Claude treats as
+    ``--permission-mode bypassPermissions``; leaving that flag next to a pinned
+    mode would resume the session in bypass under a restricted label.
+
+    :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
+    :returns: The remaining args in order, and whether a selector was present.
+    """
+    stripped: list[str] = []
+    had_flag = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-skip-permissions":
+            had_flag = True
+            index += 1
+            continue
+        if arg == "--permission-mode":
+            had_flag = True
+            index += 2  # drop the flag and its separate value token
+            continue
+        if arg.startswith("--permission-mode="):
+            had_flag = True
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return stripped, had_flag
+
+
 def _merge_claude_permission_launch_args(
     existing_args: list[str] | None,
     mode: str,
@@ -2745,7 +2784,8 @@ def _merge_claude_permission_launch_args(
     launcher restores the mode from ``terminal_launch_args`` — not the label.
     Rewrite the existing ``--permission-mode`` entry (space- or ``=``-joined) to
     the current mode, preserving other args in order, so a cold resume reopens
-    in the mode the user last chose.
+    in the mode the user last chose. A standalone ``--dangerously-skip-permissions``
+    counts as an existing ``--permission-mode bypassPermissions``.
 
     Returns ``existing_args`` unchanged when they carry no ``--permission-mode``:
     a session launched without the flag (manual, or a ``settings.json``
@@ -2755,23 +2795,33 @@ def _merge_claude_permission_launch_args(
     settings default on relaunch. Those sessions surface the live mode through
     the permission-mode label instead.
     """
-    args = list(existing_args or ())
-    if not any(a == "--permission-mode" or a.startswith("--permission-mode=") for a in args):
+    stripped, had_flag = _strip_claude_permission_launch_arg(list(existing_args or ()))
+    if not had_flag:
         return existing_args
-    merged: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--permission-mode":
-            index += 2  # drop the flag and its separate value token
-            continue
-        if arg.startswith("--permission-mode="):
-            index += 1
-            continue
-        merged.append(arg)
-        index += 1
-    merged.extend(("--permission-mode", mode))
-    return merged
+    return [*stripped, "--permission-mode", mode]
+
+
+def _pin_claude_permission_launch_args(
+    existing_args: list[str] | None,
+    mode: str,
+) -> list[str]:
+    """
+    Set ``--permission-mode`` to ``mode`` in Claude launch args, adding it when absent.
+
+    For a switch the user made deliberately (the web picker, confirmed by the
+    runner) the mode must survive a cold resume even when the session was
+    created without the flag: the launcher rebuilds Claude's args from
+    ``terminal_launch_args`` alone and never reads the mode label, so a
+    label-only record reopens the session in Claude's default (manual) mode.
+    Pinning ``"default"`` is a deliberate choice of Claude's manual mode and
+    overrides a ``permissions.defaultMode`` in the user's settings on relaunch.
+
+    :param existing_args: Current launch args, e.g. ``["--model", "opus"]`` or ``None``.
+    :param mode: Runner-confirmed mode, e.g. ``"auto"``.
+    :returns: The args with exactly one trailing ``--permission-mode <mode>``.
+    """
+    stripped, _ = _strip_claude_permission_launch_arg(list(existing_args or ()))
+    return [*stripped, "--permission-mode", mode]
 
 
 def _handle_external_session_todos(
@@ -2829,6 +2879,7 @@ def _publish_external_conversation_item(
     session_id: str,
     item: ConversationItem,
     cleared_pending_id: str | None = None,
+    message_id: str | None = None,
 ) -> None:
     """
     Broadcast a terminal-observed conversation item.
@@ -2847,6 +2898,7 @@ def _publish_external_conversation_item(
         at the persist site — see :func:`_persist_external_conversation_item`
         — because it also folds the entry's file blocks into the durable
         item before append.
+    :param message_id: Optional live-preview stream finalized by this item.
     :returns: None.
     """
     if item.type == "message" and isinstance(item.data, MessageData):
@@ -2858,7 +2910,10 @@ def _publish_external_conversation_item(
             # path that filters on the flag, so keep it off the stream.
             return
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
-    session_stream.publish(session_id, event.model_dump())
+    payload = event.model_dump()
+    if message_id is not None:
+        payload["message_id"] = message_id
+    session_stream.publish(session_id, payload)
 
 
 def _publish_external_output_text_delta(session_id: str, body: SessionEventInput) -> None:
@@ -3183,6 +3238,12 @@ def _parse_external_conversation_item(
             "external_conversation_item data.response_id must be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
+    message_id = body.data.get("message_id")
+    if message_id is not None and (not isinstance(message_id, str) or not message_id):
+        raise OmnigentError(
+            "external_conversation_item data.message_id must be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # NOTE: producers that can re-post (the native transcript forwarders
     # retry timed-out POSTs whose disposition they cannot know) send a
     # ``data.source_id`` dedup key; the persist path derives the item's
@@ -3199,6 +3260,8 @@ def _parse_external_conversation_item(
             f"Invalid data payload for external item type {item_type!r}: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if message_id is not None and isinstance(data, MessageData) and data.role == "assistant":
+        data = data.model_copy(update={"stream_message_id": message_id})
     return NewConversationItem(
         type=item_type,
         response_id=response_id.strip(),
@@ -4389,6 +4452,7 @@ def _publish_status(
     blocked_on: str | None = None,
     persist_live_status: bool = True,
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
+    failure_origin: str | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4416,6 +4480,11 @@ def _publish_status(
         a ``response.failed`` event.
     :param response_id: Optional response id for terminal-backed status
         edges, e.g. ``"codex_turn_abc123"``.
+    :param failure_origin: Stable slug naming the publish path behind a
+        ``"failed"`` edge, e.g. ``"runner_disconnected_mid_turn"``. Every
+        server-side failure logs one ERROR from here, so without it the
+        dozen unrelated causes that reach this function are one
+        undifferentiated signature. Ignored for non-failed edges.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -4469,11 +4538,28 @@ def _publish_status(
         # rejection) funnels through here, so log once at ERROR for the
         # dashboard. Relayed runner failures arrive via session_stream and are
         # already logged runner-side, so they don't reach this path.
+        #
+        # Because every cause shares this one line, the row has to carry which
+        # path published it: the origin slug, the failure code, and the status
+        # the session was leaving. The message keeps its "session turn failed
+        # for <id>: <detail>" shape so existing detail-matching stays valid.
+        origin = failure_origin or "unattributed"
+        failure_code = error.code if error is not None else "none"
         _logger.error(
-            "session turn failed for %s: %s",
+            "session turn failed for %s (origin=%s code=%s prev=%s): %s",
             session_id,
+            origin,
+            failure_code,
+            previous_status or "unknown",
             error.message if error is not None else "no detail",
-            extra={"session_id": session_id},
+            extra=debug_event(
+                "session_turn_failed",
+                session_id=session_id,
+                origin=origin,
+                code=failure_code,
+                previous_status=previous_status or "unknown",
+                response_id=response_id,
+            ),
         )
         session_live_state.persist_scheduled_run_completion(
             session_id,
@@ -4666,7 +4752,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
     if raw_error_code and raw_error_message:
         error: dict[str, str] = {
-            "code": raw_error_code,
+            "code": classify_native_turn_error(raw_error_code, raw_error_message),
             "message": raw_error_message,
         }
         for key, label in (
@@ -4798,13 +4884,9 @@ def _publish_runner_skills(session_id: str) -> None:
     """
     Publish a typed :class:`SessionSkillsEvent` to the live stream.
 
-    Fired the moment the background runner-skills fetch
-    (:func:`_load_runner_skills`) populates the per-session cache, so a
-    connected client can re-read the session snapshot and fill its
-    slash-command menu instead of waiting for the next bind. Carries no
-    payload beyond the conversation id — it is a "skills resolved,
-    re-read the snapshot" nudge; the snapshot's cache-backed ``skills``
-    field stays the source of truth.
+    Fired when background skill discovery succeeds or first fails, so a
+    connected client can re-read ``skills`` and ``skills_status`` from
+    the session snapshot. Carries only the conversation id.
 
     No-op when no client is subscribed (``session_stream`` has no
     buffer): a client binding later reads the now-warm snapshot directly.
@@ -4870,6 +4952,7 @@ def _invalidate_runner_backed_snapshot_state(
     """
     from omnigent.server.smart_routing import invalidate_runner_catalog
 
+    _runner_skills_failed.discard(session_id)
     # Only worth marking when there is something to keep serving: a session
     # with no cached skills already re-fetches on the next read, and marking
     # it would leave an id behind for every cold session ever opened.
@@ -10337,6 +10420,13 @@ async def _load_runner_skills(
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     """
+
+    def failed() -> None:
+        # Notify once per failure streak: the nudge's snapshot read may retry.
+        if session_id not in _runner_skills_failed:
+            _runner_skills_failed.add(session_id)
+            _publish_runner_skills(session_id)
+
     try:
         resp = await runner_client.get(
             f"/v1/sessions/{session_id}/skills",
@@ -10346,19 +10436,25 @@ async def _load_runner_skills(
         _logger.debug(
             "Runner skills query failed for %s", session_id, extra={"session_id": session_id}
         )
+        failed()
         return
     if resp.status_code != 200:
+        failed()
         return
     try:
-        raw = resp.json().get("skills", [])
+        raw = resp.json()["skills"]
+        if not isinstance(raw, list):
+            raise ValueError("Expected a skills list")
         skills = [SkillSummary(name=s["name"], description=s["description"]) for s in raw]
     except (ValueError, AttributeError, KeyError, TypeError):
         _logger.debug(
             "Runner skills payload malformed for %s", session_id, extra={"session_id": session_id}
         )
+        failed()
         return
     _runner_skills_cache[session_id] = skills
     _runner_skills_stale.discard(session_id)
+    _runner_skills_failed.discard(session_id)
     # Nudge any subscribed client to re-read the (now-warm) snapshot so
     # its slash-command menu fills without waiting for the next bind.
     _publish_runner_skills(session_id)
@@ -10779,6 +10875,7 @@ __all__ = [
     "_persist_policy_deny_sentinel",
     "_persist_session_status_error_labels",
     "_persist_stored_session_bundle",
+    "_pin_claude_permission_launch_args",
     "_policy_notice_from_ensure_response",
     "_poll_request_disconnect",
     "_presentation_labels_for_agent",
