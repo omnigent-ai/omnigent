@@ -9,21 +9,20 @@ import pytest
 
 from dev.benchmarks.omnigent.environment import BenchEnvironment
 from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, run_latency
-from dev.benchmarks.omnigent.project_order import OrderContext, _list
+from dev.benchmarks.omnigent.project_order import PROJECT_COUNT, OrderContext, _list
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["save", "reset"])
 @pytest.mark.parametrize("persist", [True, False])
 @pytest.mark.parametrize("iterations,warmup", [(2, 1), (1, 0)])
 async def test_writes_require_persistence_and_real_changes(
-    operation: str, persist: bool, iterations: int, warmup: int
+    persist: bool, iterations: int, warmup: int
 ) -> None:
     import json
 
     saved = None
     mode = "alphabetical"
-    writes: list[list[str] | None] = []
+    writes: list[list[str]] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
         nonlocal saved, mode
@@ -32,23 +31,23 @@ async def test_writes_require_persistence_and_real_changes(
                 200,
                 json={
                     "data": [
-                        {"id": str(i), "name": f"Benchmark project {i:04d}"} for i in range(10)
+                        {"id": str(i), "name": f"Benchmark project {i:04d}"}
+                        for i in range(PROJECT_COUNT)
                     ]
                 },
             )
         if request.method == "PUT":
             ids = json.loads(request.content)["ordered_project_ids"]
             writes.append(ids)
-            # Let setup/preconditioning succeed; break only the timed writes.
-            if persist or ids == [str(i) for i in reversed(range(10))]:
-                if ids is not None:
-                    saved = ids
-                mode = "alphabetical" if ids is None else "manual"
+            # Let setup succeed; break saves of the alternate order.
+            if persist or ids == [str(i) for i in reversed(range(PROJECT_COUNT))]:
+                saved = ids
+                mode = "manual"
             return httpx.Response(
                 200,
                 json={
-                    "ordered_project_ids": saved if ids is None else ids,
-                    "sort_mode": "alphabetical" if ids is None else "manual",
+                    "ordered_project_ids": ids,
+                    "sort_mode": "manual",
                 },
             )
         return httpx.Response(200, json={"ordered_project_ids": saved, "sort_mode": mode})
@@ -58,7 +57,7 @@ async def test_writes_require_persistence_and_real_changes(
     ) as client:
         env = cast(BenchEnvironment, SimpleNamespace(client=client))
         result = await run_latency(
-            ALL_JOURNEYS[f"project_order_{operation}_10"],
+            ALL_JOURNEYS[f"project_order_save_{PROJECT_COUNT}"],
             env,
             iterations=iterations,
             warmup=warmup,
@@ -66,14 +65,7 @@ async def test_writes_require_persistence_and_real_changes(
     if persist:
         assert result.n_failures == 0
         assert result.n_success == iterations
-        if operation == "save":
-            assert all(a != b for a, b in pairwise(writes))
-        else:
-            # Setup plus one precondition/reset pair for each warmup and sample.
-            count = iterations + warmup
-            assert len(writes) == 1 + 2 * count
-            assert writes[2::2] == [None] * count
-            assert all(ids is not None for ids in writes[1::2])
+        assert all(a != b for a, b in pairwise(writes))
     else:
         assert result.n_failures > 0
         assert any("saved order" in reason for reason in result.failures)

@@ -413,29 +413,28 @@ seeding.
 
 ### Project-order latency
 
-The default suite includes eight scenarios at each of **10, 100, and 1,000
-projects**: order GET (alphabetical/custom), order save/reset, and both project
-list endpoints (alphabetical/custom). Stable names start with `project_order_`.
-For a quick focused run:
+The default suite includes **four scenarios at 1,000 projects**: order GET,
+manual order PUT, and both project-list endpoints in manual mode. This keeps
+one latency signal per endpoint without multiplying the report by sort mode
+and project count. Alphabetical/reset behavior and size limits remain covered
+by store/API tests. For a focused run:
 
 ```bash
 uv run --no-sync dev/benchmarks/omnigent/run.py \
-  --journeys project_order_save_1000,project_order_reset_1000,project_order_projects_custom_1000,project_order_session_projects_custom_1000 \
+  --journeys project_order_save_1000,project_order_get_custom_1000,project_order_projects_custom_1000,project_order_session_projects_custom_1000 \
   --iterations 100 --runs 3 --output /tmp/project-order-benchmark.json
 ```
 
-These journeys own the `benchmark-project-order-{10,100,1000}` accounts, using
+These journeys share the `benchmark-project-order-1000` account, using
 the benchmark server's trusted identity header. Setup creates exactly the
 specified number of empty projects via the API, outside timing; repeated runs
 reuse them. Existing corpus sessions and the local user's preference are
 untouched. Use a benchmark database, as with the rest of this suite.
 
-Saves alternate between two orders. Reset samples first install a custom order,
-then switch to alphabetical mode while verifying that the manual IDs are retained.
-Persistence checks and reset preconditioning run outside each operation's
-latency timer; they do contribute to request counters and wall-clock throughput.
-Read samples validate exact counts and ordering, including alphabetical mode.
-These scenarios measure project-count scaling with empty projects; the existing
+Saves alternate between two manual orders. Persistence checks run outside each
+operation's latency timer; they do contribute to request counters and wall-clock
+throughput. Read samples validate exact counts and ordering. The large-project
+case guards against work that scales poorly with project count; the existing
 `list_projects` journey continues covering the local user's seeded sessions.
 
 The existing nightly backend matrix collects these names automatically. PR
