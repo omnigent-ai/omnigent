@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import os
 import queue
@@ -5489,7 +5491,9 @@ def test_post_tools_changed_preserves_programming_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("result_kind", ["text", "images", "image_error"])
 async def test_channel_server_relays_active_omnigent_tools(
+    result_kind: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     subprocess_bridge_root: Path,
@@ -5523,8 +5527,25 @@ async def test_channel_server_relays_active_omnigent_tools(
         text=True,
     )
     calls: list[dict[str, object]] = []
+    from PIL import Image
 
-    async def tool_executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+    from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+    from omnigent.util.json_types import JsonObject
+
+    image_blocks: list[JsonObject] = []
+    for color in ("red", "blue"):
+        buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+        image_blocks.append(
+            {
+                "type": "image",
+                "data": base64.b64encode(buffer.getvalue()).decode(),
+                "mimeType": "image/png",
+            }
+        )
+    image_blocks.append({"type": "text", "text": "After both images: subtract 30; word amber."})
+
+    async def tool_executor(name: str, arguments: dict[str, object]) -> object:
         """
         Capture one relayed tool call.
 
@@ -5534,6 +5555,10 @@ async def test_channel_server_relays_active_omnigent_tools(
         :returns: Structured tool result.
         """
         calls.append({"name": name, "arguments": arguments})
+        if result_kind != "text":
+            return json.loads(
+                encode_mcp_image_result(image_blocks, is_error=result_kind == "image_error")
+            )
         return {"echo": arguments}
 
     relay = None
@@ -5598,8 +5623,14 @@ async def test_channel_server_relays_active_omnigent_tools(
         )
         tool_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
         assert tool_result["id"] == 3
-        text = tool_result["result"]["content"][0]["text"]
-        assert json.loads(text) == {"echo": {"value": "hello"}}
+        if result_kind == "text":
+            text = tool_result["result"]["content"][0]["text"]
+            assert json.loads(text) == {"echo": {"value": "hello"}}
+        else:
+            assert tool_result["result"] == {
+                "content": image_blocks,
+                "isError": result_kind == "image_error",
+            }
         assert calls == [{"name": "sys_custom", "arguments": {"value": "hello"}}]
     finally:
         if relay is not None:

@@ -1,4 +1,9 @@
-"""Bridge utilities for the native Claude Code wrapper.
+"""Claude terminal utilities and the shared native-harness MCP relay.
+
+The ``serve-mcp`` entrypoint and tool relay also serve Codex, Antigravity,
+OpenCode, Cursor, Hermes, Kiro, Qwen and ACP clients. The historical module
+path remains stable; shared result conversion lives in
+``omnigent.runtime.mcp_tool_result``.
 
 The native wrapper has two live processes that need to rendezvous:
 
@@ -5327,7 +5332,7 @@ def start_tool_relay(
     session_id: str | None = None,
 ) -> ClaudeNativeToolRelay:
     """
-    Start a relay for Omnigent tool calls from Claude.
+    Start the shared relay for native-harness Omnigent tool calls.
 
     Writes ``tool_relay.json`` and starts the HTTP server that backs it
     (see :func:`_start_bridge_http_server` for the bind/advertise rules).
@@ -5880,20 +5885,10 @@ async def _await_tool_result(result: Awaitable[object]) -> object:
 
 
 def _mcp_response_from_tool_result(result: object) -> _JsonObject:
-    """
-    Convert a harness tool result into MCP response shape.
+    """Convert relay results without loading the runtime on observer hook imports."""
+    from omnigent.runtime.mcp_tool_result import mcp_response_from_tool_result
 
-    :param result: Result returned by ``_tool_executor``. Existing
-        harnesses usually return a dict, e.g. ``{"result": "ok"}``.
-    :returns: MCP tool-call response.
-    """
-    payload = result if isinstance(result, dict) else {"result": result}
-    response: _JsonObject = {
-        "content": [{"type": "text", "text": json.dumps(payload)}],
-    }
-    if payload.get("blocked") is True or ("error" in payload and payload.get("error")):
-        response["isError"] = True
-    return response
+    return mcp_response_from_tool_result(result)
 
 
 def _notification_writer(

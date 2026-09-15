@@ -49,7 +49,6 @@ in tmux to kill. Launching the real Pi terminal needs ``pi`` / ``tmux`` /
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import io
 import json
 import os
@@ -64,9 +63,11 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
+import psutil
 import pytest
 import yaml
 
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e._harness_probes import cli_unavailable_reason
@@ -107,72 +108,39 @@ pytestmark = [
 ]
 
 
-def _bridge_marker(session_id: str) -> str:
-    """Return the hashed bridge-dir path segment for *session_id*.
-
-    The harness writes a session's Pi bridge under
-    ``~/.omnigent/pi-native/<sha256(session_id)[:32]>``; the launched ``pi``
-    process references that dir via ``--extension`` / ``--session-dir``, so
-    the segment is a reliable needle for finding the process in ``/proc``.
-
-    :param session_id: The session/conversation id.
-    :returns: ``"pi-native/<32-hex>"``.
-    """
-    digest = hashlib.sha256(session_id.encode()).hexdigest()[:32]
-    return f"pi-native/{digest}"
-
-
-def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
-    """Scan ``/proc`` for the launched ``pi`` CLI naming *marker*.
-
-    The pi CLI runs as ``node .../pi --extension <bridge>/... --approve
-    --session-dir <bridge>/...``. Two *other* processes also name the bridge
-    marker and must be skipped: the ``tmux new-session ... '<pi command>'``
-    launcher (which embeds the whole pi command as ONE argv element, so
-    ``--extension`` is not a standalone token there) and the ``python -m
-    omnigent.runner...`` runner that spawned it.
-
-    Match only the process where ``--extension`` is its own argv token and
-    ``argv[0]`` is not tmux -- that is the real pi CLI.
-
-    :param marker: The ``pi-native/<hash>`` bridge segment.
-    :returns: ``(pid, argv)`` of the pi process, or ``None`` if not found yet.
-    """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle not in raw:
-            continue
-        argv = [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
-        if not argv:
-            continue
-        if "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux"):
-            return int(pid_dir.name), argv
-    return None
-
-
-def _kill_pi_processes(marker: str) -> None:
-    """Best-effort SIGKILL of any process still naming *marker*.
-
-    :param marker: The bridge segment; kills the pi CLI and any child that
-        inherited it so the test leaves no orphaned tmux/pi tree.
-    """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle in raw:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(int(pid_dir.name), signal.SIGKILL)
+def _live_pane_process(resource: dict) -> psutil.Process | None:
+    """Resolve the live CLI from its session-owned tmux pane, independent of argv."""
+    metadata = resource["metadata"]
+    socket = metadata.get("tmux_socket")
+    target = metadata.get("tmux_target")
+    if not isinstance(socket, str) or not socket or not isinstance(target, str) or not target:
+        return None
+    probe = subprocess.run(
+        [
+            "tmux",
+            "-S",
+            socket,
+            "-f",
+            "/dev/null",
+            "list-panes",
+            "-t",
+            target,
+            "-F",
+            "#{pane_pid} #{pane_dead}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    fields = probe.stdout.split()
+    if probe.returncode or len(fields) != 2 or fields[1] != "0":
+        return None
+    try:
+        pid = int(fields[0])
+        return psutil.Process(pid) if pid > 1 else None
+    except (ValueError, psutil.NoSuchProcess):
+        return None
 
 
 def _scan_home_logs_for(home: Path, pattern: re.Pattern[str]) -> str | None:
@@ -293,22 +261,21 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
     raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
 
 
-def _terminal_resource_present(client: httpx.Client, session_id: str) -> bool:
-    """Return whether the session currently exposes a ``terminal`` resource.
-
-    The pi:main terminal shows up in ``GET /v1/sessions/{id}/resources`` (the
-    runner-authoritative inventory the web UI renders as the Terminal pane).
-    When the terminal exits it is removed (``session.resource.deleted``), so a
-    transition present -> absent is the user-visible "terminal disappeared".
-
-    :param client: HTTP client pointed at the server.
-    :param session_id: Session/conversation id.
-    :returns: ``True`` while a terminal resource is listed.
-    """
+def _pi_terminal_resource(client: httpx.Client, session_id: str) -> dict | None:
+    """Return only this session's registered pi:main terminal."""
     resp = client.get(f"/v1/sessions/{session_id}/resources", timeout=30.0)
-    if resp.status_code != 200:
-        return False
-    return any(item.get("type") == "terminal" for item in resp.json().get("data", []))
+    resp.raise_for_status()
+    for item in resp.json().get("data", []):
+        metadata = item.get("metadata", {})
+        if (
+            item.get("type") == "terminal"
+            and item.get("session_id") == session_id
+            and item.get("id") == terminal_resource_id("pi", "main")
+            and metadata.get("terminal_name") == "pi"
+            and metadata.get("session_key") == "main"
+        ):
+            return item
+    return None
 
 
 @pytest.fixture(scope="module")
@@ -435,47 +402,41 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
     )
     assert create.status_code in (200, 201), f"session create failed: {create.text}"
     session_id = str(create.json()["session_id"])
-    marker = _bridge_marker(session_id)
 
     try:
         # 1) Wait for the real pi CLI to launch inside the runner-owned tmux
         #    server, so the idle watcher is live before we kill it.
-        pi_pid: int | None = None
+        pi_process: psutil.Process | None = None
         deadline = time.monotonic() + 150.0
         while time.monotonic() < deadline:
-            found = _find_pi_process(marker)
-            if found is not None:
-                pi_pid = found[0]
-                break
+            session = http_client.get(f"/v1/sessions/{session_id}", timeout=10.0)
+            session.raise_for_status()
+            # Pi's session_start extension publishes this only after the CLI
+            # has initialized, so the pane cannot still be its startup shell.
+            if session.json().get("external_session_id"):
+                resource = _pi_terminal_resource(http_client, session_id)
+                if resource is not None:
+                    pi_process = _live_pane_process(resource)
+                    if pi_process is not None:
+                        break
             if host.proc.poll() is not None:
                 raise AssertionError(
                     f"host daemon exited (rc={host.proc.returncode}) before pi launched; "
                     f"log tail:\n{host.daemon_log.read_text()[-2000:]}"
                 )
             time.sleep(1.0)
-        assert pi_pid is not None, (
+        assert pi_process is not None, (
             "the launched 'pi' process never appeared for session "
             f"{session_id!r}; daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
 
-        # 2) Confirm the pi:main terminal is a live session resource (the
-        #    Terminal pane the web UI renders), then give the idle watcher a
-        #    couple of poll intervals to arm.
-        term_deadline = time.monotonic() + 30.0
-        while time.monotonic() < term_deadline:
-            if _terminal_resource_present(http_client, session_id):
-                break
-            time.sleep(POLL_INTERVAL_S)
-        assert _terminal_resource_present(http_client, session_id), (
-            "pi:main terminal resource never appeared for session "
-            f"{session_id!r}; the runner did not register the terminal."
-        )
+        # 2) Let the idle watcher arm, then terminate the initialized CLI.
         time.sleep(2.5)
+        assert _pi_terminal_resource(http_client, session_id) is not None
+        # psutil verifies process identity before signaling, protecting against PID reuse.
+        pi_process.kill()
 
-        # 3) Kill the pi CLI -- models the organic crash/exit the KPI counts.
-        os.kill(pi_pid, signal.SIGKILL)
-
-        # 4) Scan the runner logs for the failure signature while confirming the
+        # 3) Scan the runner logs for the failure signature while confirming the
         #    terminal exit is handled. On the buggy build the signature fires
         #    within ~3 probe intervals (~3-5s); scan generously past that.
         signature_line: str | None = None
@@ -486,7 +447,7 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
             if hit is not None:
                 signature_line = hit
                 break
-            if not _terminal_resource_present(http_client, session_id):
+            if _pi_terminal_resource(http_client, session_id) is None:
                 terminal_gone = True
             time.sleep(0.5)
 
@@ -494,7 +455,7 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
         # terminal is removed on both the buggy and fixed builds), so a green
         # result reflects the fix, not a no-op where pi never died.
         if signature_line is None and not terminal_gone:
-            terminal_gone = not _terminal_resource_present(http_client, session_id)
+            terminal_gone = _pi_terminal_resource(http_client, session_id) is None
         assert terminal_gone or signature_line is not None, (
             "pi:main terminal never exited after the pi CLI was killed -- the "
             "exit path was not exercised, so the reproduction is inconclusive."
@@ -508,4 +469,10 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
             f"diagnosable pane-dead exit:\n    {signature_line}"
         )
     finally:
-        _kill_pi_processes(marker)
+        # Close only this test session's terminal; never scan unrelated processes.
+        with contextlib.suppress(httpx.HTTPError):
+            http_client.delete(
+                f"/v1/sessions/{session_id}/resources/terminals/"
+                f"{terminal_resource_id('pi', 'main')}",
+                timeout=10.0,
+            )

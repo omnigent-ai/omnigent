@@ -44,7 +44,12 @@ from omnigent.inner.executor import (
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
+from omnigent.runtime.mcp_tool_result import native_image_payload
 from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.runtime.tool_result_replay import (
+    image_omitted_placeholder,
+    tool_result_content_blocks,
+)
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
@@ -119,12 +124,14 @@ class ExecutorAdapter(HarnessApp):
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
         harness_label: str = "Claude",
+        replay_tool_history: bool = False,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
+        self._replay_tool_history = replay_tool_history
         # Lazily-constructed inner executor, reused across turns for the conversation lifetime.
         self._executor: Executor | None = None
         # Per-turn turn context. The stable tool/elicitation/policy bridges read this at call
@@ -166,7 +173,9 @@ class ExecutorAdapter(HarnessApp):
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
         executor = self._ensure_executor()
-        messages = _translate_input_to_messages(request.input)
+        messages = _translate_input_to_messages(
+            request.input, replay_tool_history=self._replay_tool_history
+        )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
         for message in messages:
@@ -1164,16 +1173,20 @@ def _extract_user_text(
 
 def _translate_input_to_messages(
     input_value: str | list[dict[str, Any]],
+    *,
+    replay_tool_history: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
-    Accepts conversation-history shape (role-keyed messages; tool items dropped) and
+    Accepts conversation history (with optional tool replay) and
     single-turn fallback shape (plain string or content blocks, collapsed to one user message).
     """
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
 
-    history_messages = _extract_role_keyed_messages(input_value)
+    history_messages = _extract_role_keyed_messages(
+        input_value, replay_tool_history=replay_tool_history
+    )
     if history_messages:
         return history_messages
 
@@ -1181,17 +1194,76 @@ def _translate_input_to_messages(
     return [{"role": "user", "content": content}]
 
 
+def _tool_output_history_content(item: dict[str, Any]) -> str | list[dict[str, Any]]:
+    """Rehydrate persisted tool evidence without placing image bytes in prompt text."""
+    output = item.get("output")
+    if not isinstance(output, str):
+        output = json.dumps(output, ensure_ascii=False)
+    blocks = tool_result_content_blocks(output).blocks
+    content: list[dict[str, Any]] = [
+        {"type": "input_text", "text": f"Tool result ({item.get('call_id', '')}):"}
+    ]
+    if blocks is None:
+        content.append({"type": "input_text", "text": output})
+    else:
+        for block in blocks:
+            if block["type"] == "image":
+                source = block["source"]
+                assert isinstance(source, dict)
+                data, mime = source.get("data"), source.get("media_type")
+                canonical = (
+                    native_image_payload(data, mime)
+                    if isinstance(data, str) and isinstance(mime, str)
+                    else None
+                )
+                if canonical is None:
+                    content.append(
+                        {
+                            "type": "input_text",
+                            "text": image_omitted_placeholder(
+                                mime if isinstance(mime, str) else None
+                            ),
+                        }
+                    )
+                    continue
+                content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{mime};base64,{canonical}",
+                    }
+                )
+            else:
+                content.append({"type": "input_text", "text": block.get("text", "")})
+    return _normalize_message_content(content)
+
+
 def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
+    *,
+    replay_tool_history: bool = False,
 ) -> list[Message]:
     """Extract role-keyed message items from an Omnigent input list.
 
-    Tool-call items (function_call, function_call_output, etc.) are skipped — the inner SDK
-    reconstructs them from its own Layer 1 state. Returns empty list for non-history inputs.
+    Tool items are skipped unless the harness opts into replay for fresh SDK threads.
+    Returns an empty list for non-history inputs.
     """
     messages: list[Message] = []
     for item in input_value:
         if not isinstance(item, dict):
+            continue
+        if replay_tool_history and item.get("type") == "function_call":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"Tool call {item.get('name', '')} ({item.get('call_id', '')}): "
+                        f"{item.get('arguments', '')}"
+                    ),
+                }
+            )
+            continue
+        if replay_tool_history and item.get("type") == "function_call_output":
+            messages.append({"role": "tool", "content": _tool_output_history_content(item)})
             continue
         if item.get("type") != "message" or "role" not in item:
             continue
