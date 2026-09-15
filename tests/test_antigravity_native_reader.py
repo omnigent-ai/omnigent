@@ -3864,8 +3864,10 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     """``_rotate_session_for_cascade`` runs claude's exact session-rotation sequence.
 
     Asserts: GET old snapshot → POST /v1/sessions (agent_id + inherited labels) →
-    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" — and that
-    bridge state is rewritten with the new session id + new cascade id. Crucially,
+    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" → the three
+    supersession-notice POSTs to the OLD session's /events (idle status, notice
+    message, redirect event) — and that bridge state is rewritten with the new
+    session id + new cascade id. Crucially,
     NO ``external_session_id`` PATCH is made: agy is one long-lived process hosting
     many cascades, so the new cascade is already live (reached via the rewritten
     bridge state, not a later ``--resume``), exactly as claude's
@@ -3906,7 +3908,21 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
             f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
         ),
         ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
+        # The supersession notice to the OLD conversation: idle status, notice
+        # message, redirect event (shared with claude/codex rotations).
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
     ]
+    # The notice posts carry the three supersession event types, in order, and
+    # the redirect targets the new conversation.
+    event_bodies = [b for (_m, p, b) in calls if p == f"/v1/sessions/{_SESSION_ID}/events"]
+    assert [b.get("type") for b in event_bodies] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    assert event_bodies[2].get("data") == {"target_conversation_id": "conv_new"}
     # No external_session_id PATCH is made anywhere (the loop-bug source): every
     # PATCH body is a runner_id bind/release, never an external_session_id write.
     assert all("external_session_id" not in body for (_m, _p, body) in calls), (
