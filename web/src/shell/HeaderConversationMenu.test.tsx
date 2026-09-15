@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { SessionNavigationTestHost } from "@/lib/sessionNavigation.test-utils";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
@@ -203,6 +205,36 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  it.each(["Archive", "Delete"])("returns to the Canvas board after %s", (action) => {
+    function LocationProbe() {
+      const location = useLocation();
+      return <output data-testid="location">{location.pathname + location.search}</output>;
+    }
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter
+          initialEntries={["/canvas?canvas=board&o=123&session=conv-1&file=old&view=terminal"]}
+        >
+          <SessionNavigationTestHost resolveHref={canvasSessionHref}>
+            <HeaderConversationMenu
+              conversation={CONVERSATION}
+              currentProject={null}
+              canShare
+              canFork
+              onShare={() => {}}
+              onFork={mocks.fork}
+            />
+            <LocationProbe />
+          </SessionNavigationTestHost>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: action }));
+    if (action === "Delete") fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=board&o=123");
   });
 
   it("offers Unarchive on an archived session and unarchives in place", () => {

@@ -5,7 +5,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -254,6 +254,18 @@ import type { Agent } from "@/hooks/useAgents";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
+import type * as ChatPageModule from "@/pages/ChatPage";
+import { useNavigateToSession } from "@/lib/sessionNavigation";
+
+vi.mock("@/pages/ChatPage", async (importOriginal) => ({
+  ...(await importOriginal<typeof ChatPageModule>()),
+  ChatSession: ({ conversationId }: { conversationId: string }) => (
+    <div data-testid="canvas-chat" data-session-id={conversationId}>
+      <TerminalFirstViewProbe />
+    </div>
+  ),
+}));
+
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
@@ -398,6 +410,27 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
+function CanvasBoardProbe() {
+  const open = useNavigateToSession();
+  const navigate = useNavigate();
+  return (
+    <div data-testid="canvas-board-probe">
+      <input aria-label="Board state" defaultValue="retained" />
+      <button type="button" onClick={() => open("canvas_a")}>
+        Select A
+      </button>
+      <button type="button" onClick={() => open("canvas_b")}>
+        Select B
+      </button>
+      <button type="button" onClick={() => navigate(-1)}>
+        History back
+      </button>
+      <LocationDisplay />
+      <PathDisplay />
+    </div>
+  );
+}
+
 function renderShell(path: string, info?: ServerInfo, canvas = false) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -454,6 +487,7 @@ function renderShell(path: string, info?: ServerInfo, canvas = false) {
                   </>
                 }
               />
+              <Route path="canvas" element={<CanvasBoardProbe />} />
               <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
             </Route>
           </Routes>
@@ -579,6 +613,126 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe("Canvas session shell", () => {
+  let restoreMeasure: () => void;
+  beforeEach(() => {
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    const spy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        return this.getAttribute("data-testid") === "canvas-stage"
+          ? new DOMRect(0, 0, 1200, 900)
+          : original.call(this);
+      });
+    restoreMeasure = () => spy.mockRestore();
+    mockConversations([
+      { id: "canvas_a", permission_level: null },
+      { id: "canvas_b", permission_level: null },
+    ]);
+  });
+  afterEach(() => restoreMeasure());
+  const info = () => serverInfo({ features: { canvas: true } });
+
+  it("selects, switches, closes and restores chat without remounting the board", () => {
+    renderShell("/canvas?o=123", info());
+    const board = screen.getByTestId("canvas-board-probe");
+    fireEvent.change(screen.getByLabelText("Board state"), { target: { value: "keep me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Select A" }));
+    expect(screen.getByTestId("canvas-chat")).toHaveAttribute("data-session-id", "canvas_a");
+    expect(screen.getByTestId("url-pathname")).toHaveTextContent("/canvas");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("o=123&session=canvas_a&view=chat");
+    expect(screen.getByRole("link", { name: "Open session full page" })).toHaveAttribute(
+      "href",
+      "/c/canvas_a",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Select B" }));
+    expect(screen.getByTestId("canvas-chat")).toHaveAttribute("data-session-id", "canvas_b");
+    fireEvent.click(screen.getByRole("button", { name: "Close session panel" }));
+    expect(screen.queryByTestId("canvas-chat")).toBeNull();
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^o=123$/);
+    fireEvent.click(screen.getByRole("button", { name: "History back" }));
+    expect(screen.getByTestId("canvas-chat")).toHaveAttribute("data-session-id", "canvas_b");
+    expect(screen.getByTestId("canvas-board-probe")).toBe(board);
+    expect(screen.getByLabelText("Board state")).toHaveValue("keep me");
+  });
+
+  it("does not mount chat or session resources when Canvas is disabled", () => {
+    renderShell("/canvas?session=canvas_a", serverInfo());
+    expect(screen.queryByTestId("canvas-chat")).toBeNull();
+    expect(screen.queryByTestId("canvas-stage")).toBeNull();
+    expect(useSessionMock).not.toHaveBeenCalledWith("canvas_a");
+  });
+
+  it("starts with chat and opens compact workspace tools inside the session region", () => {
+    writeSessionWorkspaceState("canvas_a", { open: true });
+    renderShell("/canvas?session=canvas_a&view=chat", info());
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveAttribute(
+      "data-maximized",
+      "true",
+    );
+    const main = screen.getByTestId("canvas-chat").closest("main");
+    expect(main).toHaveAttribute("inert");
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(main).not.toHaveAttribute("inert");
+    expect(screen.getByTestId("canvas-chat")).toHaveAttribute("data-session-id", "canvas_a");
+  });
+
+  it("keeps chat interactive when an open desktop workspace disappears below md", () => {
+    let mobile = false;
+    const listeners = new Set<() => void>();
+    const original = window.matchMedia;
+    const spy = vi.spyOn(window, "matchMedia").mockImplementation((query) =>
+      query !== "(max-width: 767.98px)"
+        ? original(query)
+        : ({
+            ...original(query),
+            get matches() {
+              return mobile;
+            },
+            addEventListener: (_type: string, listener: () => void) => {
+              listeners.add(listener);
+            },
+            removeEventListener: (_type: string, listener: () => void) => {
+              listeners.delete(listener);
+            },
+          } as MediaQueryList),
+    );
+    try {
+      renderShell("/canvas?session=canvas_a&view=chat", info());
+      fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+      const main = screen.getByTestId("canvas-chat").closest("main");
+      expect(main).toHaveAttribute("inert");
+      act(() => {
+        mobile = true;
+        for (const listener of listeners) listener();
+      });
+      expect(main).not.toHaveAttribute("inert");
+      expect(main).not.toHaveAttribute("aria-hidden");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("keeps the board and close controls outside terminal push mode", () => {
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "shell", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    sessionStorage.setItem("omnigent.web.panel-key:canvas_a", "terminal:terminal_main");
+    renderShell("/canvas?session=canvas_a&view=terminal", info());
+    const board = screen.getByTestId("canvas-board-probe");
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+    expect(board.closest(".md\\:hidden")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
+    expect(screen.getByTestId("canvas-board-probe")).toBe(board);
+  });
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {

@@ -3,6 +3,9 @@
  * a freeform React Flow surface, one canvas per project plus a **Main** canvas
  * for sessions outside any project.
  *
+ * A click selects a session in the URL; AppShell hosts its chat beside this board.
+ * Panel resizing preserves the viewport; Fit and Reset remain explicit controls.
+ *
  * Built entirely from existing primitives, with no server surface of its own:
  *
  * - Sessions load through `useCanvasSessions`: the sidebar's cached rows paint
@@ -72,7 +75,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { useNavigate, useSearchParams } from "@/lib/routing";
+import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { useNavigateToSession } from "@/lib/sessionNavigation";
+import { CANVAS_SESSION_PARAM } from "@/canvas/canvasNavigation";
+import { sessionLinkParams } from "@/lib/sessionLinks";
 import { cn } from "@/lib/utils";
 import { NewProjectButton } from "@/shell/NewProjectButton";
 import { ProjectRowIcon } from "@/shell/ProjectPicker";
@@ -85,7 +91,6 @@ const FIT_VIEW = { padding: 0.2, maxZoom: 1 };
 const SNAP_GRID: [number, number] = [GRID_STEP, GRID_STEP];
 const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2.5;
-const RESIZE_REFIT_DELAY_MS = 100;
 const EMPTY_PROJECTS: ProjectSummary[] = [];
 /** Query parameter carrying the selected canvas so a reload lands on the same tab. */
 export const CANVAS_QUERY_PARAM = "canvas";
@@ -151,7 +156,11 @@ function CanvasControls({
 
 function CanvasSurface() {
   const navigate = useNavigate();
+  const navigateToSession = useNavigateToSession();
+  const location = useLocation();
+  const initialLocationKey = useRef(location.key);
   const [searchParams, setSearchParams] = useSearchParams();
+  const selectedSession = searchParams.get(CANVAS_SESSION_PARAM);
   const { trackClick } = useOmnigentAnalytics();
   const { fitView } = useReactFlow();
   const viewerId = useViewerId();
@@ -160,18 +169,23 @@ function CanvasSurface() {
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
-  // The URL names the canvas; without it, reopen the viewer's last selection
-  // once identity is known. Never hydrate an authenticated view from the
-  // anonymous storage slot while embedded identity is still resolving.
-  const [activeCanvas, setActiveCanvas] = useState(
-    () =>
-      searchParams.get(CANVAS_QUERY_PARAM) ??
-      (viewerId === null ? MAIN_CANVAS_ID : (readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID)),
-  );
+  // Snapshot memory once; Back to the initial URL must not reread a newer saved tab.
+  const initialCanvas = useRef<{ viewer: string; id: string } | null>(null);
+  const navigated = useRef(false);
+  if (location.key !== initialLocationKey.current) navigated.current = true;
+  if (viewerId !== null && initialCanvas.current?.viewer !== viewerId) {
+    initialCanvas.current = {
+      viewer: viewerId,
+      id: navigated.current ? MAIN_CANVAS_ID : (readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID),
+    };
+  }
+  const activeCanvas =
+    searchParams.get(CANVAS_QUERY_PARAM) ??
+    (location.key === initialLocationKey.current
+      ? (initialCanvas.current?.id ?? MAIN_CANVAS_ID)
+      : MAIN_CANVAS_ID);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
-  const activeCanvasRef = useRef(activeCanvas);
-  const activeCanvasViewerRef = useRef(viewerId);
-  const userSelectedCanvasRef = useRef(false);
+  const previousCanvasRef = useRef(activeCanvas);
   // Loaded per viewer (the store is keyed by server and user) in the positions
   // effect below, so identity resolving after mount swaps in the right layout.
   const layoutRef = useRef<CanvasLayout>(EMPTY_CANVAS_LAYOUT);
@@ -184,7 +198,6 @@ function CanvasSurface() {
   // The card set the view was last fitted to; a different set refits.
   const fittedKeyRef = useRef<string | null>(null);
   const pendingProjectNameRef = useRef<string | null>(null);
-  const flowContainerRef = useRef<HTMLDivElement>(null);
   const aliveRef = useRef(true);
 
   useEffect(() => {
@@ -235,12 +248,19 @@ function CanvasSurface() {
     fittedKeyRef.current = null;
   }, []);
 
+  useEffect(() => {
+    if (previousCanvasRef.current === activeCanvas) return;
+    previousCanvasRef.current = activeCanvas;
+    scheduleFit();
+  }, [activeCanvas, scheduleFit]);
+
   const openSession = useCallback(
     (sessionId: string) => {
+      if (selectedSession === sessionId && searchParams.get("view") === "chat") return;
       trackClick("canvas.open-session");
-      navigate(`/c/${encodeURIComponent(sessionId)}`);
+      navigateToSession(sessionId);
     },
-    [navigate, trackClick],
+    [navigateToSession, searchParams, selectedSession, trackClick],
   );
 
   const nodesFor = useCallback(
@@ -263,9 +283,10 @@ function CanvasSurface() {
           onOpen: openSession,
         },
         selectable: true,
+        selected: session.id === selectedSession,
         focusable: false,
       })),
-    [openSession],
+    [openSession, selectedSession],
   );
 
   // Unplaced cards get grid slots whenever the session or project set changes.
@@ -330,18 +351,6 @@ function CanvasSurface() {
     [setSearchParams],
   );
 
-  // Identity can resolve after mount. A bare visit then restores that viewer's
-  // canvas; an explicit URL or a tab picked meanwhile keeps precedence.
-  useEffect(() => {
-    if (activeCanvasViewerRef.current === viewerId) return;
-    activeCanvasViewerRef.current = viewerId;
-    if (searchParams.has(CANVAS_QUERY_PARAM) || userSelectedCanvasRef.current) return;
-    const remembered = readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID;
-    activeCanvasRef.current = remembered;
-    setActiveCanvas(remembered);
-    scheduleFit();
-  }, [scheduleFit, searchParams, viewerId]);
-
   // Keep a restored project in the URL and remember explicit deep links once
   // the project list confirms they are valid.
   useEffect(() => {
@@ -350,7 +359,6 @@ function CanvasSurface() {
     }
     if (
       viewerId !== null &&
-      activeCanvasRef.current === activeCanvas &&
       projectsQuery.data !== undefined &&
       (activeCanvas === MAIN_CANVAS_ID ||
         projects.some((project) => projectCanvasId(project) === activeCanvas))
@@ -361,23 +369,23 @@ function CanvasSurface() {
 
   const selectCanvas = useCallback(
     (canvasId: string) => {
-      if (activeCanvasRef.current === canvasId) return;
+      if (activeCanvas === canvasId) return;
       trackClick("canvas.tab");
-      userSelectedCanvasRef.current = true;
-      activeCanvasRef.current = canvasId;
-      setActiveCanvas(canvasId);
-      writeCanvasParam(canvasId);
-      scheduleFit();
+      setSearchParams((current) => {
+        const next = sessionLinkParams(current.toString());
+        next.delete(CANVAS_SESSION_PARAM);
+        if (canvasId === MAIN_CANVAS_ID) next.delete(CANVAS_QUERY_PARAM);
+        else next.set(CANVAS_QUERY_PARAM, canvasId);
+        return next;
+      });
     },
-    [scheduleFit, trackClick, writeCanvasParam],
+    [activeCanvas, setSearchParams, trackClick],
   );
 
   // A project canvas whose project was deleted (or a stale URL) falls back to Main.
   useEffect(() => {
     if (activeCanvas === MAIN_CANVAS_ID || projectsQuery.data === undefined) return;
     if (projects.some((project) => projectCanvasId(project) === activeCanvas)) return;
-    activeCanvasRef.current = MAIN_CANVAS_ID;
-    setActiveCanvas(MAIN_CANVAS_ID);
     writeCanvasParam(MAIN_CANVAS_ID);
     scheduleFit();
   }, [activeCanvas, projects, projectsQuery.data, scheduleFit, writeCanvasParam]);
@@ -392,32 +400,13 @@ function CanvasSurface() {
     selectCanvas(projectCanvasId(project));
   }, [projects, selectCanvas]);
 
-  // Follow the window: while the view is an auto-fit, keep it fitted as the
-  // container resizes. A hand-panned view is left alone.
-  useEffect(() => {
-    const container = flowContainerRef.current;
-    if (!container || typeof ResizeObserver === "undefined") return;
-    let first = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const observer = new ResizeObserver(() => {
-      if (first) {
-        first = false;
-        return;
-      }
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        if (loaded && !viewportDirtyRef.current) fitCanvas();
-      }, RESIZE_REFIT_DELAY_MS);
-    });
-    observer.observe(container);
-    return () => {
-      if (timer) clearTimeout(timer);
-      observer.disconnect();
-    };
-  }, [fitCanvas, loaded]);
-
   const onNodesChange = useCallback((changes: NodeChange<SessionCardNode>[]) => {
-    setNodes((current) => applyNodeChanges(changes, current));
+    setNodes((current) =>
+      applyNodeChanges(
+        changes.filter((change) => change.type !== "select"),
+        current,
+      ),
+    );
   }, []);
 
   const onNodeDragStop = useCallback(
@@ -497,7 +486,7 @@ function CanvasSurface() {
       className="flex min-h-0 flex-1 flex-col"
       data-testid="canvas-page"
       style={{
-        paddingTop: "calc(var(--omnigent-header-height) + var(--omnigent-inset-top))",
+        paddingTop: "calc(2rem + var(--omnigent-inset-top))",
         paddingBottom: "var(--omnigent-inset-bottom)",
       }}
     >
@@ -565,7 +554,6 @@ function CanvasSurface() {
         </div>
       )}
       <div
-        ref={flowContainerRef}
         className="canvas-flow relative min-h-0 min-w-0 flex-1 border-t"
         data-testid="canvas-flow"
       >
@@ -574,7 +562,7 @@ function CanvasSurface() {
           nodeTypes={nodeTypes}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
-          onNodeDoubleClick={(_event, node) => openSession(node.id)}
+          onNodeClick={(_event, node) => openSession(node.id)}
           onMoveEnd={onMoveEnd}
           nodesDraggable
           nodesConnectable={false}

@@ -52,7 +52,8 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const workspace = conversation.workspace?.trim() || "No working directory";
 
   const openFromKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Enter" && event.key !== " ") return;
+    if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " "))
+      return;
     event.preventDefault();
     event.stopPropagation();
     onOpen(conversation.id);
@@ -66,13 +67,18 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
         selected && "border-brand-accent ring-2 ring-brand-accent/25",
       )}
       data-testid="session-card"
+      data-canvas-session-id={conversation.id}
+      aria-pressed={selected ?? false}
       data-state={state?.kind ?? "idle"}
       role="button"
       tabIndex={0}
       aria-label={`${title}. ${label}. ${workspace}`}
       onClick={(event) => {
         // Pointer clicks select (and start drags); only keyboard activation opens.
-        if (event.detail === 0) onOpen(conversation.id);
+        if (event.detail === 0) {
+          event.stopPropagation();
+          onOpen(conversation.id);
+        }
       }}
       onKeyDown={openFromKeyboard}
     >

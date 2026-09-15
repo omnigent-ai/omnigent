@@ -1,23 +1,38 @@
-// Shared hook for the conversation id of the currently-viewed chat route.
-//
-// Both RunnerHealthProvider and SessionUpdatesProvider render above the
-// router's `<Routes>`, so `useParams` has no match there — they match the
-// pathname directly instead. Kept in one place so the route shape (`/c/:id`)
-// is defined once.
+import { useLocation, useRebasePath } from "@/lib/routing";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { CANVAS_SESSION_PARAM } from "@/canvas/canvasNavigation";
 
-import { useMemo } from "react";
-import { useLocation } from "@/lib/routing";
+/** Resolve the visible session above Routes, including embedded mount paths. */
+export function useSessionRoute(): { isCanvas: boolean; conversationId: string | undefined } {
+  const { pathname, search } = useLocation();
+  const rebasePath = useRebasePath();
+  const info = useServerInfo();
+  const canvasPath = rebasePath("/canvas").toLowerCase();
+  const routePath = pathname.toLowerCase();
+  const isCanvas =
+    isFeatureEnabled(info, "canvas") &&
+    (routePath === canvasPath || routePath === `${canvasPath}/`);
+  if (isCanvas) {
+    return {
+      isCanvas,
+      conversationId: new URLSearchParams(search).get(CANVAS_SESSION_PARAM) || undefined,
+    };
+  }
+  const prefix = rebasePath("/c/");
+  if (!routePath.startsWith(prefix.toLowerCase()))
+    return { isCanvas: false, conversationId: undefined };
+  const segment = pathname.slice(prefix.length).replace(/\/$/, "");
+  if (!segment || segment.includes("/")) return { isCanvas: false, conversationId: undefined };
+  let conversationId = segment;
+  try {
+    conversationId = decodeURIComponent(segment);
+  } catch {
+    // Match the router's undecoded fallback for malformed URL encoding.
+  }
+  return { isCanvas: false, conversationId };
+}
 
-/**
- * Extract the active conversation id from the `/c/:id` route.
- *
- * @returns The conversation id when on a chat route (e.g. `"conv_abc123"`),
- *   otherwise `undefined`.
- */
 export function useActiveConversationId(): string | undefined {
-  const { pathname } = useLocation();
-  return useMemo(() => {
-    const match = pathname.match(/^\/c\/([^/]+)/);
-    return match ? match[1] : undefined;
-  }, [pathname]);
+  return useSessionRoute().conversationId;
 }

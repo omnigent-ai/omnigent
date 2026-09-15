@@ -54,6 +54,8 @@ function useFocusedSessionActive(): boolean {
 
 interface ExecutionLogsPanelProps {
   open: boolean;
+  /** Fill the session region instead of reserving a viewport-sized push column. */
+  fluid?: boolean;
   /**
    * Parent (main) conversation id. Acts as the session id for the
    * pinned "main" entry and as the parent reference for the
@@ -90,6 +92,7 @@ const ITEMS_POLL_MS = 3_000;
 
 export function ExecutionLogsPanel({
   open,
+  fluid = false,
   conversationId,
   initialKey,
   onClose,
@@ -137,18 +140,19 @@ export function ExecutionLogsPanel({
       ref={ref}
       data-testid="execution-logs-panel"
       data-state={open ? "open" : "closed"}
-      style={{ width: panelWidth }}
+      style={{ width: fluid && open ? undefined : panelWidth, maxWidth: "100%" }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
         "fixed inset-0 z-50 shadow-lg",
         open ? "translate-x-0" : "translate-x-full",
         "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
         open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
+        fluid && open && "md:flex-1",
       )}
       aria-hidden={!open}
       data-collapsed={!open || undefined}
     >
-      {isDesktop && (
+      {isDesktop && !fluid && (
         <div
           {...handleProps}
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"

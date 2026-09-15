@@ -1,10 +1,13 @@
 // Tests for the Canvas page (`/canvas`). React Flow is stubbed to a plain list
-// that exposes the props the page drives (nodes, drag-stop, double-click), and
+// that exposes the props the page drives (nodes, drag-stop, click), and
 // the session loader and project hook are mocked at their seams; the layout,
 // storage, and card modules run for real.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { SessionNavigationTestHost } from "@/lib/sessionNavigation.test-utils";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
+import { useNavigateToSession } from "@/lib/sessionNavigation";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -42,7 +45,11 @@ vi.mock("@xyflow/react", () => ({
   ReactFlowProvider: ({ children }: { children: ReactNode }) => children,
   ReactFlow: (props: Record<string, unknown>) => {
     flowProps.current = props;
-    const nodes = props.nodes as { id: string; position: { x: number; y: number } }[];
+    const nodes = props.nodes as {
+      id: string;
+      selected?: boolean;
+      position: { x: number; y: number };
+    }[];
     return (
       <div data-testid="react-flow">
         {nodes.map((node) => (
@@ -52,9 +59,10 @@ vi.mock("@xyflow/react", () => ({
             data-testid={`flow-node-${node.id}`}
             data-x={node.position?.x}
             data-y={node.position?.y}
-            onDoubleClick={() =>
-              (props.onNodeDoubleClick as (event: MouseEvent, value: unknown) => void)(
-                new MouseEvent("dblclick"),
+            data-selected={node.selected}
+            onClick={() =>
+              (props.onNodeClick as (event: MouseEvent, value: unknown) => void)(
+                new MouseEvent("click"),
                 node,
               )
             }
@@ -125,7 +133,22 @@ function projectsStub(projects: ProjectSummary[] | undefined) {
 
 function LocationProbe() {
   const location = useLocation();
-  return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
+  const navigate = useNavigate();
+  const navigateToSession = useNavigateToSession();
+  return (
+    <>
+      <div data-testid="location">{`${location.pathname}${location.search}`}</div>
+      <button type="button" onClick={() => navigate(-1)}>
+        Back
+      </button>
+      <button type="button" onClick={() => navigate(1)}>
+        Forward
+      </button>
+      <button type="button" onClick={() => navigateToSession(null)}>
+        Close panel
+      </button>
+    </>
+  );
 }
 
 function pageTree(initialEntry = "/canvas") {
@@ -134,18 +157,20 @@ function pageTree(initialEntry = "/canvas") {
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
-          <Routes>
-            <Route
-              path="/canvas"
-              element={
-                <>
-                  <CanvasPage />
-                  <LocationProbe />
-                </>
-              }
-            />
-            <Route path="*" element={<LocationProbe />} />
-          </Routes>
+          <SessionNavigationTestHost resolveHref={canvasSessionHref}>
+            <Routes>
+              <Route
+                path="/canvas"
+                element={
+                  <>
+                    <CanvasPage />
+                    <LocationProbe />
+                  </>
+                }
+              />
+              <Route path="*" element={<LocationProbe />} />
+            </Routes>
+          </SessionNavigationTestHost>
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>
@@ -350,7 +375,7 @@ describe("CanvasPage", () => {
     expect(screen.getByText("No sessions in Legacy")).toBeInTheDocument();
   });
 
-  it("opens a session on double-click and starts new sessions in the active project", () => {
+  it("opens a session on single-click and starts new sessions in the active project", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("conv_1", 1, { project_id: "proj_a" })]),
@@ -369,8 +394,58 @@ describe("CanvasPage", () => {
 
     renderPage();
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
-    fireEvent.doubleClick(screen.getByTestId("flow-node-conv_1"));
-    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_1");
+    fireEvent.click(screen.getByTestId("flow-node-conv_1"));
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/canvas?canvas=proj_a&session=conv_1&view=chat",
+    );
+  });
+
+  it("switches and clears selected cards without remounting or refitting the board", () => {
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("a", 2), conversation("b", 1)]),
+    );
+    renderPage("/canvas?o=123&file=x&diff=1&comment=c1&view=terminal");
+    const board = screen.getByTestId("react-flow");
+    const fits = flowFitView.mock.calls.length;
+    fireEvent.click(screen.getByTestId("flow-node-a"));
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?o=123&session=a&view=chat");
+    expect(screen.getByTestId("flow-node-a")).toHaveAttribute("data-selected", "true");
+    fireEvent.click(screen.getByTestId("flow-node-b"));
+    expect(screen.getByTestId("flow-node-a")).toHaveAttribute("data-selected", "false");
+    expect(screen.getByTestId("flow-node-b")).toHaveAttribute("data-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close panel" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?o=123");
+    expect(screen.getByTestId("flow-node-b")).toHaveAttribute("data-selected", "false");
+    expect(screen.getByTestId("react-flow")).toBe(board);
+    expect(flowFitView).toHaveBeenCalledTimes(fits);
+  });
+
+  it("does not restore a newer saved project when Back returns to the initial Main URL", () => {
+    viewerIdRef.current = "viewer";
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    renderPage();
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    expect(window.localStorage.getItem(activeCanvasStorageKey("viewer"))).toBe("proj_a");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByRole("tab", { name: "Main" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/canvas$/);
+  });
+
+  it("honors Back/Forward board URLs and clears the panel on project changes", () => {
+    viewerIdRef.current = "viewer";
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("a", 2)]),
+    );
+    renderPage("/canvas?o=123");
+    fireEvent.click(screen.getByTestId("flow-node-a"));
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?o=123&canvas=proj_a");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByRole("tab", { name: "Main" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("flow-node-a")).toHaveAttribute("data-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Forward" }));
+    expect(screen.getByRole("tab", { name: "Alpha" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("saves every card's spot once complete, so a moved card leaves the others in place", async () => {
@@ -502,17 +577,7 @@ describe("CanvasPage", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(
       projectsStub([{ id: "proj_release", name: "Release" }]),
     );
-    rerender(
-      <QueryClientProvider client={new QueryClient()}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/canvas"]}>
-            <Routes>
-              <Route path="/canvas" element={<CanvasPage />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>,
-    );
+    rerender(pageTree());
     expect(screen.getByRole("tab", { name: "Release" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("No sessions in Release")).toBeInTheDocument();
   });

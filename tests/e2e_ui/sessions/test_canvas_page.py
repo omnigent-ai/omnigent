@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.conftest import _build_hello_world_bundle, seed_committed_turn
 
 
 def _stub_server_info(page: Page, *, canvas: bool) -> None:
@@ -133,8 +133,11 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     )
     expect(cards).to_have_count(1)
 
-    cards.dblclick()
-    expect(page).to_have_url(re.compile(r"/c/project-session$"))
+    cards.click()
+    expect(page).to_have_url(
+        re.compile(r"/canvas\?canvas=project-release&session=project-session&view=chat$")
+    )
+    expect(page.get_by_role("region", name="Session panel")).to_be_visible()
 
 
 def test_canvas_page_remembers_a_dragged_card_across_reloads(
@@ -174,6 +177,8 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
     page.wait_for_function(
         f"() => JSON.stringify((({read_layout})() ?? {{}}).positions?.only) !== '[0,0]'"
     )
+    expect(page).to_have_url(f"{live_server}/canvas")
+    expect(page.get_by_role("region", name="Session panel")).to_have_count(0)
     moved = card.bounding_box()
     assert moved is not None
     assert abs(moved["y"] - before["y"]) > 60
@@ -202,6 +207,96 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
     page.wait_for_function(
         f"() => JSON.stringify((({read_layout})() ?? {{}}).positions?.only) === '[0,0]'"
     )
+
+
+def test_canvas_click_opens_chat_panel_without_leaving_board(
+    page: Page, seeded_session_pair: tuple[str, str, str], tmp_path: Path
+) -> None:
+    """The real chat, drafts, resize controls and narrow fallback share one persistent board."""
+    base_url, session_a, session_b = seeded_session_pair
+    for session_id, title in [(session_a, "Canvas session A"), (session_b, "Canvas session B")]:
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}", json={"title": title}, timeout=10.0
+        ).raise_for_status()
+    seed_committed_turn(
+        session_a, prompt="Question A", reply="Canvas reply A", response_id="canvas_a"
+    )
+    seed_committed_turn(
+        session_b, prompt="Question B", reply="Canvas reply B", response_id="canvas_b"
+    )
+    _stub_server_info(page, canvas=True)
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    page.goto(f"{base_url}/canvas?o=123")
+    card_a = page.locator(f'[data-canvas-session-id="{session_a}"]')
+    card_b = page.locator(f'[data-canvas-session-id="{session_b}"]')
+    expect(card_a).to_be_visible(timeout=30_000)
+    expect(card_b).to_be_visible()
+    page.evaluate(
+        "async () => { await new Promise(requestAnimationFrame);"
+        " await new Promise(requestAnimationFrame); }"
+    )
+    page.evaluate("window.canvasBoard = document.querySelector('[data-testid=canvas-page]')")
+    viewport = page.locator(".react-flow__viewport").evaluate("el => el.style.transform")
+
+    card_a.click()
+    panel = page.get_by_role("region", name="Session panel")
+    expect(panel.get_by_text("Canvas reply A", exact=True)).to_be_visible(timeout=30_000)
+    expect(page).to_have_url(re.compile(rf"/canvas\?o=123&session={session_a}&view=chat$"))
+    expect(page.get_by_role("region", name="Canvas board")).to_be_visible()
+    assert page.locator(".react-flow__viewport").evaluate("el => el.style.transform") == viewport
+    # The unchanged viewport can clip neighbors in the narrower board. Fit is explicit.
+    page.get_by_role("button", name="Fit view", exact=True).click()
+    expect(card_b).to_be_visible()
+    composer = panel.get_by_role("textbox", name="Message the agent")
+    composer.fill("Draft for A")
+    card_b.click()
+    expect(panel.get_by_text("Canvas reply B", exact=True)).to_be_visible()
+    expect(composer).to_have_value("")
+    card_a.click()
+    expect(panel.get_by_text("Canvas reply A", exact=True)).to_be_visible()
+    expect(composer).to_have_value("Draft for A")
+    viewport = page.locator(".react-flow__viewport").evaluate("el => el.style.transform")
+    page.screenshot(path=str(tmp_path / "canvas-session-panel-wide.png"))
+
+    divider = page.get_by_role("separator", name="Resize Canvas and chat")
+    handle = divider.bounding_box()
+    assert handle is not None
+    page.mouse.move(handle["x"] + handle["width"] / 2, handle["y"] + 200)
+    page.mouse.down()
+    page.mouse.move(handle["x"] + 70, handle["y"] + 200, steps=8)
+    page.mouse.up()
+    assert page.locator(".react-flow__viewport").evaluate("el => el.style.transform") == viewport
+    assert page.evaluate(
+        "window.canvasBoard === document.querySelector('[data-testid=canvas-page]')"
+    )
+
+    panel.get_by_role("button", name="Expand right panel").click()
+    expect(panel.locator("main")).to_have_attribute("inert", "")
+    page.set_viewport_size({"width": 700, "height": 900})
+    close_sidebar = page.get_by_role("button", name="Close sidebar", exact=True)
+    if close_sidebar.is_visible():
+        # The mobile sidebar covers the scrim's center; its right edge is the close target.
+        scrim = close_sidebar.bounding_box()
+        assert scrim is not None
+        close_sidebar.click(position={"x": scrim["width"] - 20, "y": 20})
+        expect(page.get_by_test_id("sidebar-scrim")).to_have_css("opacity", "0")
+    expect(panel.locator("main")).not_to_have_attribute("inert", "")
+    expect(composer).to_have_value("Draft for A")
+    expect(composer).to_be_editable()
+    expect(page.get_by_role("region", name="Canvas board")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / "canvas-session-panel-narrow.png"))
+    panel.get_by_role("button", name="Close session panel").click()
+    expect(page).to_have_url(f"{base_url}/canvas?o=123")
+    expect(page.get_by_role("region", name="Canvas board")).to_be_visible()
+    assert page.evaluate(
+        "window.canvasBoard === document.querySelector('[data-testid=canvas-page]')"
+    )
+    assert page.locator(".react-flow__viewport").evaluate("el => el.style.transform") == viewport
+    page.go_back()
+    expect(panel.get_by_text("Canvas reply A", exact=True)).to_be_visible()
+    panel.get_by_role("link", name="Open session full page").click()
+    expect(page).to_have_url(re.compile(rf"/c/{session_a}$"))
+    expect(page.get_by_text("Canvas reply A", exact=True)).to_be_visible()
 
 
 def test_canvas_cards_follow_live_session_updates(page: Page, live_server: str) -> None:

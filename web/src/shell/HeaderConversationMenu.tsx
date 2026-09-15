@@ -56,7 +56,7 @@ import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useNavigate } from "@/lib/routing";
+import { useNavigateToSession } from "@/lib/sessionNavigation";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { cn } from "@/lib/utils";
@@ -98,7 +98,7 @@ export function HeaderConversationMenu({
   viewItems = null,
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
-  const navigate = useNavigate();
+  const navigateToSession = useNavigateToSession();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
@@ -165,7 +165,7 @@ export function HeaderConversationMenu({
   const confirmDelete = () => {
     setDeleteOpen(false);
     setDeleteBranch(false);
-    navigate("/", { replace: true });
+    navigateToSession(null, { replace: true });
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,
@@ -185,7 +185,7 @@ export function HeaderConversationMenu({
     // being archived, so leave its chat surface now — synchronously, like
     // confirmDelete — rather than in an onSuccess callback that fires a
     // round-trip later with a stale active session.
-    navigate("/", { replace: true });
+    navigateToSession(null, { replace: true });
     archive.mutate({ id: conversation.id, archived: true });
     // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
     // and per-call mutate callbacks don't fire once their observer unmounts.

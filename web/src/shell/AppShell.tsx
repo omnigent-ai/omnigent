@@ -1,7 +1,12 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Outlet, useParams, useSearchParams } from "@/lib/routing";
-import { useSessionHref } from "@/lib/sessionNavigation";
+import { Outlet, useLocation, useParams, useSearchParams } from "@/lib/routing";
+import { SessionNavigationProvider, useSessionHref } from "@/lib/sessionNavigation";
+import { useSessionRoute } from "@/hooks/useActiveConversationId";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
+import { CanvasStage, useCanvasSplitLayout } from "@/canvas/CanvasStage";
+import { ChatSession } from "@/pages/ChatPage";
 import {
   PROJECT_LABEL_KEY,
   type Conversation,
@@ -184,6 +189,31 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
+  const { isCanvas, conversationId } = useSessionRoute();
+  const { search } = useLocation();
+  const inheritedHref = useSessionHref();
+  const resolveHref = useCallback(
+    (id: string | null, query?: string) =>
+      isCanvas ? canvasSessionHref(id, search) : inheritedHref(id, query),
+    [isCanvas, search, inheritedHref],
+  );
+  return (
+    <SessionNavigationProvider resolveHref={resolveHref}>
+      <AppShellBody inCanvas={isCanvas} conversationId={conversationId} />
+    </SessionNavigationProvider>
+  );
+}
+
+function AppShellBody({
+  inCanvas,
+  conversationId,
+}: {
+  inCanvas: boolean;
+  conversationId: string | undefined;
+}) {
+  const canvasLayout = useCanvasSplitLayout(inCanvas, conversationId !== undefined);
+  const compactWorkspace = inCanvas && canvasLayout.sessionWidth < 960;
+  const mobileViewport = useIsMobileViewport();
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -221,10 +251,7 @@ export function AppShell() {
 
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
-  const { conversationId, extensionId } = useParams<{
-    conversationId: string;
-    extensionId: string;
-  }>();
+  const { extensionId } = useParams<{ extensionId: string }>();
   // A client-only temp id (`temp:*`, shown while `createSession` is in flight)
   // has no server session behind it. Feed every server-scoped hook this instead
   // of the raw route id so none of them fetch `/v1/sessions/temp:*` during the
@@ -396,7 +423,7 @@ export function AppShell() {
   // state stays false — leaving it true would let rail-gated side effects fire
   // on non-session routes like the home page.
   const [rightPanelOpen, setRightPanelOpen] = useState(() =>
-    conversationId
+    conversationId && !inCanvas
       ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
       : false,
   );
@@ -762,7 +789,9 @@ export function AppShell() {
     useResizableInlinePanel(
       rootSessionId,
       inlinePanelMinWidth,
-      sidebarOpen ? sidebarWidth : 0,
+      (sidebarOpen ? sidebarWidth : 0) +
+        canvasLayout.reservedWidth +
+        (inCanvas && debugMode && !compactWorkspace ? 224 : 0),
       rootSessionResolved,
     );
   // How many children are actively working — surfaced in the tab badge so
@@ -1006,6 +1035,14 @@ export function AppShell() {
     // terminal absent from the new session's list.
     pendingShellCreateRef.current = null;
     setTerminalPendingClose(null);
+    setShareOpen(false);
+    setForkOpen(false);
+    setForkUpToResponseId(null);
+    setAgentInfoOpen(false);
+    setRightPanelMaximized((wasMaximized) => {
+      if (wasMaximized) restoreSidebarAfterMaximize();
+      return false;
+    });
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
@@ -1066,13 +1103,6 @@ export function AppShell() {
     // file selection (one content slot).
     autoFocusTerminalKeyRef.current = null;
     setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
-    // A maximized rail is transient too — the incoming session starts docked.
-    // If we were maximized, restore the sidebar we collapsed on entry (the
-    // toggle handler won't run on a session switch).
-    setRightPanelMaximized((wasMaximized) => {
-      if (wasMaximized) restoreSidebarAfterMaximize();
-      return false;
-    });
     // A selected file must be visible in the rail. The Files and Changes tabs
     // both surface the inline viewer; the Agents/Browser tabs don't, so
     // pull the rail to Files unless it's already on a files scope.
@@ -1090,10 +1120,12 @@ export function AppShell() {
     const commentParam = searchParams.get("comment");
     const hasWorkspaceUrlSignal =
       urlFile !== null || (commentParam !== null && commentParam !== "");
-    setRightPanelOpen((persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal);
+    setRightPanelOpen(
+      (!inCanvas && (persisted.open ?? readDefaultWorkspacePanelOpen())) || hasWorkspaceUrlSignal,
+    );
 
     stateConvRef.current = conversationId;
-  }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [conversationId, inCanvas]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Record the incoming root after restoration compares it with the outgoing tree.
   useEffect(() => {
@@ -1104,8 +1136,12 @@ export function AppShell() {
   // terminal-first label is known, apply URL state first, then the per-tab
   // choice, then the configured default.
   useEffect(() => {
-    if (!conversationId || !terminalFirst) return;
+    if (!conversationId) return;
     const requestedView = searchParams.get("view");
+    if (!terminalFirst) {
+      if (inCanvas && requestedView === "chat") setPanelInitialKeyState(null);
+      return;
+    }
     const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
     const terminalKey =
       agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
@@ -1120,7 +1156,7 @@ export function AppShell() {
     } else if (readTranscriptViewDefault() === "terminal") {
       setPanelInitialKeyState(terminalKey);
     }
-  }, [agentTerminal, conversationId, searchParams, terminalFirst]);
+  }, [agentTerminal, conversationId, searchParams, terminalFirst, inCanvas]);
 
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
@@ -1389,18 +1425,27 @@ export function AppShell() {
   // side effect is done here — outside any state updater — so the maximize
   // setter stays a plain boolean flip. ``restoreSidebarAfterMaximize`` is
   // shared with the session-switch reset, which also drops out of full screen.
+  const sidebarCollapsedForMaximize = useRef(false);
   const restoreSidebarAfterMaximize = useCallback(() => {
+    if (!sidebarCollapsedForMaximize.current) return;
+    sidebarCollapsedForMaximize.current = false;
     setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
   }, []);
   const toggleRightPanelMaximized = useCallback(() => {
+    if (inCanvas) {
+      if (compactWorkspace) setRightPanelOpen(false);
+      else setRightPanelMaximized((prev) => !prev);
+      return;
+    }
     if (!rightPanelMaximized) {
       sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+      sidebarCollapsedForMaximize.current = true;
       setSidebarOpen(false);
     } else {
       restoreSidebarAfterMaximize();
     }
     setRightPanelMaximized((prev) => !prev);
-  }, [rightPanelMaximized, sidebarOpen, restoreSidebarAfterMaximize]);
+  }, [rightPanelMaximized, sidebarOpen, restoreSidebarAfterMaximize, inCanvas, compactWorkspace]);
 
   // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
   // here where both panels' open-state lives.
@@ -1929,6 +1974,7 @@ export function AppShell() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  const workspaceOverlayVisible = compactWorkspace && workspacePanelVisible && !mobileViewport;
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
@@ -2023,7 +2069,23 @@ export function AppShell() {
             {/* Content region (everything right of the sidebar): a relative
           flex row holding the chat+workspace group and the push panels
           as siblings. */}
-            <div className="relative flex min-h-0 min-w-0 flex-1">
+            <CanvasStage
+              enabled={inCanvas}
+              conversationId={conversationId}
+              layout={canvasLayout}
+              board={<Outlet />}
+              sidebarOpen={sidebarOpen}
+              onOpenSidebar={() => setSidebarOpen(true)}
+              onBackToChat={
+                inCanvas && (workspaceOverlayVisible || panelOpen || executionLogsOpen)
+                  ? () => {
+                      setRightPanelOpen(false);
+                      setPanelInitialKey(null);
+                      setExecutionLogsKey(null);
+                    }
+                  : undefined
+              }
+            >
               {/* Chat + workspace group. The full-width header overlay is
             scoped to this group, so it spans the chat *and* the right
             workspace card but never reaches over the push panels (which
@@ -2035,13 +2097,12 @@ export function AppShell() {
               <div
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
-                  panelOpen && !terminalFirst && "md:hidden",
+                  ((panelOpen && !terminalFirst) || (inCanvas && executionLogsOpen)) && "md:hidden",
                 )}
                 style={
                   {
-                    "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth}px`
-                      : "0px",
+                    "--workspace-panel-offset":
+                      workspacePanelVisible && !compactWorkspace ? `${inlinePanelWidth}px` : "0px",
                   } as CSSProperties
                 }
               >
@@ -2123,23 +2184,31 @@ export function AppShell() {
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
+                  ref={(element) => {
+                    element?.toggleAttribute("inert", workspaceOverlayVisible);
+                  }}
+                  aria-hidden={workspaceOverlayVisible ? true : undefined}
                 >
-                  <Outlet />
+                  {inCanvas ? <ChatSession conversationId={conversationId} /> : <Outlet />}
                 </main>
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
               rendered in debug mode so the column doesn't occupy space in
               normal use. */}
-                {serverConversationId && debugMode && !panelOpen && !executionLogsOpen && (
-                  <div className="hidden md:flex md:flex-col md:w-56 md:shrink-0 md:border-l md:border-border md:overflow-y-auto md:px-2 md:pb-2 md:pt-12 md:gap-2">
-                    <SessionRail
-                      conversationId={serverConversationId}
-                      onExpandExecutionLogs={openExecutionLogsPanel}
-                      suppressed={false}
-                    />
-                  </div>
-                )}
+                {serverConversationId &&
+                  debugMode &&
+                  !compactWorkspace &&
+                  !panelOpen &&
+                  !executionLogsOpen && (
+                    <div className="hidden md:flex md:flex-col md:w-56 md:shrink-0 md:border-l md:border-border md:overflow-y-auto md:px-2 md:pb-2 md:pt-12 md:gap-2">
+                      <SessionRail
+                        conversationId={serverConversationId}
+                        onExpandExecutionLogs={openExecutionLogsPanel}
+                        suppressed={false}
+                      />
+                    </div>
+                  )}
 
                 {/* Right workspace card — gated on conversationId (panels have
               no workspace to read without a session), default-open,
@@ -2155,8 +2224,8 @@ export function AppShell() {
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
-                    width={inlinePanelWidth}
-                    inert={inlinePanelWidth === 0}
+                    width={compactWorkspace ? canvasLayout.sessionWidth : inlinePanelWidth}
+                    inert={!compactWorkspace && inlinePanelWidth === 0}
                     handleProps={inlinePanelHandleProps}
                     rightRailTab={rightRailTab}
                     onRightRailTabChange={handleRightRailTabChange}
@@ -2182,7 +2251,7 @@ export function AppShell() {
                     }
                     closingTerminalKey={closingTerminalKey}
                     onCloseTerminal={requestCloseTerminal}
-                    maximized={rightPanelMaximized}
+                    maximized={rightPanelMaximized || compactWorkspace}
                     onToggleMaximized={toggleRightPanelMaximized}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
@@ -2215,6 +2284,7 @@ export function AppShell() {
               )}
               {conversationId && (
                 <ExecutionLogsPanel
+                  fluid={inCanvas}
                   open={executionLogsOpen}
                   conversationId={conversationId}
                   initialKey={executionLogsKey}
@@ -2288,7 +2358,7 @@ export function AppShell() {
                   />
                 </div>
               )}
-            </div>
+            </CanvasStage>
           </div>
           {conversationId && (
             <PermissionsModal

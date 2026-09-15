@@ -33,6 +33,9 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 }));
 
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 
 function conv(id: string): Conversation {
   return {
@@ -116,6 +119,46 @@ describe("SessionUpdatesProvider watch-set", () => {
     seedConversations(client, ["conv_a"]);
     renderProvider(client, ["/c/conv_child"]);
     expect(lastWatched()).toEqual(["conv_a", "conv_child"]);
+  });
+
+  it.each(["", "/mount"])(
+    "watches and clears off-sidebar Canvas selections under %s",
+    (basename) => {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      let navigate: ReturnType<typeof useNavigate> | null = null;
+      function CaptureNavigate() {
+        navigate = useNavigate();
+        return null;
+      }
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter initialEntries={[`${basename}/canvas?session=child`]}>
+            <RoutingProvider value={basenamedRouting(basename)}>
+              <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features: { canvas: true } }}>
+                <SessionUpdatesProvider>
+                  <CaptureNavigate />
+                </SessionUpdatesProvider>
+              </CapabilitiesProvider>
+            </RoutingProvider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      expect(lastWatched()).toEqual(["child", "conv_a"]);
+      act(() => navigate!(`${basename}/canvas?session=child2`));
+      expect(lastWatched()).toEqual(["child2", "conv_a"]);
+      act(() => navigate!(`${basename}/canvas`));
+      expect(lastWatched()).toEqual(["conv_a"]);
+      act(() => navigate!(`${basename}/canvas?session=temp:local`));
+      expect(lastWatched()).toEqual(["conv_a"]);
+    },
+  );
+
+  it("does not watch a selected Canvas session while its feature is disabled", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/canvas?session=child"]);
+    expect(lastWatched()).toEqual(["conv_a"]);
   });
 
   it("does not duplicate the open session when it's already a sidebar row", () => {

@@ -35,6 +35,7 @@ import {
 } from "@/components/KeyboardShortcut";
 import { useNavigate, useParams } from "@/lib/routing";
 import { useNavigateToSession } from "@/lib/sessionNavigation";
+import { useChatSessionBinding } from "@/hooks/useChatSessionBinding";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -446,18 +447,11 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
-  // Mirror the host's selected session into the shared active store.
-  // switchTo fetches history asynchronously; the store's loading/error
-  // fields drive the hydration gates below.
+  const staleSelection = isStaleTempConvId(urlConvId);
+  useChatSessionBinding(staleSelection ? undefined : urlConvId);
   useEffect(() => {
-    // A reloaded temp selection has no server session to bind. Clear it
-    // through the host rather than leaving a read-only phantom chat.
-    if (isStaleTempConvId(urlConvId)) {
-      navigateToSession(null, { replace: true });
-      return;
-    }
-    void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigateToSession]);
+    if (staleSelection) navigateToSession(null, { replace: true });
+  }, [staleSelection, navigateToSession]);
 
   // Server-driven redirect: when the active conversation is superseded
   // (a `session.superseded` event — e.g. a Claude `/clear` rotated it

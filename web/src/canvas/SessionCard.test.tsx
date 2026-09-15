@@ -31,12 +31,15 @@ function renderCard(
     data: { pullRequest: null, onOpen: vi.fn(), ...data },
     selected,
   } as unknown as NodeProps<SessionCardNode>;
+  const parentClick = vi.fn();
   render(
     <TooltipProvider>
-      <SessionCard {...props} />
+      <div onClick={parentClick}>
+        <SessionCard {...props} />
+      </div>
     </TooltipProvider>,
   );
-  return { card: screen.getByTestId("session-card"), onOpen: props.data.onOpen };
+  return { card: screen.getByTestId("session-card"), onOpen: props.data.onOpen, parentClick };
 }
 
 afterEach(() => {
@@ -111,13 +114,36 @@ describe("SessionCard", () => {
     expect(screen.getByText("Failed")).toBeInTheDocument();
   });
 
+  it("exposes which card has an open session panel", () => {
+    const { card } = renderCard({ conversation: conversation() }, true);
+    expect(card).toHaveAttribute("aria-pressed", "true");
+    expect(card).toHaveAttribute("data-canvas-session-id", "conv_1");
+  });
+
+  it("does not intercept keyboard activation or clicks on the PR link", () => {
+    const { onOpen } = renderCard({
+      conversation: conversation(),
+      pullRequest: {
+        number: 7,
+        title: "Ship it",
+        state: "OPEN",
+        url: "https://github.com/acme/repo/pull/7",
+      },
+    });
+    const link = screen.getByRole("link", { name: "Open pull request #7" });
+    expect(fireEvent.keyDown(link, { key: "Enter" })).toBe(true);
+    fireEvent.click(link);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
   it("opens from the keyboard but leaves pointer clicks to selection and drag", () => {
-    const { card, onOpen } = renderCard({ conversation: conversation() });
+    const { card, onOpen, parentClick } = renderCard({ conversation: conversation() });
     fireEvent.click(card, { detail: 1 });
     expect(onOpen).not.toHaveBeenCalled();
     fireEvent.keyDown(card, { key: "Enter" });
     fireEvent.click(card, { detail: 0 });
     expect(onOpen).toHaveBeenCalledTimes(2);
     expect(onOpen).toHaveBeenCalledWith("conv_1");
+    expect(parentClick).toHaveBeenCalledTimes(1);
   });
 });
