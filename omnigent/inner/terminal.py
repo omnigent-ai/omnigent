@@ -772,6 +772,16 @@ def reap_orphaned_terminals() -> int:
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
         shutil.rmtree(entry, ignore_errors=True)
+        # Record what the sweep destroyed. The socket path is the join key
+        # against the owning session's "no server running on <socket>" exit,
+        # so a killed terminal ties to that session, not a mystery loss.
+        logger.warning(
+            "orphan sweep reaped terminal tmux server on %s "
+            "(instance dir %s, owner pid %s no longer running)",
+            socket_path,
+            entry.name,
+            pid,
+        )
         reaped += 1
     return reaped
 

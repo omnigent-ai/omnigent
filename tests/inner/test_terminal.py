@@ -1952,6 +1952,46 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
 
 
+def test_reap_orphaned_terminals_logs_what_it_killed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The sweep logs the socket and owner pid of each terminal it reaps.
+
+    The socket path is the join key against the owning session's
+    "no server running on <socket>" exit, so a reaped terminal can be
+    tied to the session it failed rather than read as an unexplained loss.
+
+    :param tmp_path: Fake temp root the sweep scans.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Captures emitted log records.
+    :returns: None.
+    """
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda *a, **k: SimpleNamespace(returncode=0), TimeoutExpired=TimeoutError
+        ),
+    )
+    dead_pid = _dead_pid()
+    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead3", dead_pid)
+    socket_path = dead_dir / "tmux.sock"
+    socket_path.touch()
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.logger.name):
+        assert terminal_mod.reap_orphaned_terminals() == 1
+
+    reap_logs = [r.getMessage() for r in caplog.records if "orphan sweep reaped" in r.getMessage()]
+    assert len(reap_logs) == 1
+    # Both the socket (the join key) and the owner pid are recorded.
+    assert str(socket_path) in reap_logs[0]
+    assert str(dead_pid) in reap_logs[0]
+
+
 @pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="sandbox backends only resolve on Linux (bwrap) or macOS (seatbelt)",
