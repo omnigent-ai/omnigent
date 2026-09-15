@@ -18,6 +18,10 @@ from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+from omnigent.native.native_coding_agents import (
+    native_coding_agent_for_harness,
+    native_coding_agent_for_wrapper_label,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -80,6 +84,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _native_ask_gate_lock,
     _publish_policy_denied,
+    _resolve_harness,
     _structured_ask_user_question,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -157,7 +162,11 @@ def register_hooks_routes(
         session_id: str,
     ) -> Response:
         """
-        Claude Code ``PermissionRequest`` HTTP hook endpoint.
+        Claude Code ``PermissionRequest`` HTTP hook endpoint, also used by Kimi.
+
+        Kimi identifies its callbacks with ``elicit_kimi_`` ids. Reject a
+        callback targeting a different known native harness before publishing
+        a card; legacy sessions without native metadata retain compatibility.
 
         Receives Claude Code's PermissionRequest hook payload (tool
         name + input the user would otherwise see a TUI prompt for),
@@ -186,8 +195,8 @@ def register_hooks_routes(
         :returns: Claude PermissionRequest hookSpecificOutput JSON,
             or ``200`` with empty body on timeout (fail-ask).
         :raises OmnigentError: 404 if the session doesn't exist,
-            400 if the body fails JSON parse or is missing
-            ``tool_name``.
+            400 if the body fails JSON parse or is missing ``tool_name``,
+            409 if the callback targets a different native harness.
         """
         from omnigent.server.routes import sessions as _sf
 
@@ -240,6 +249,27 @@ def register_hooks_routes(
             permission_mode = None
         elicitation_id = _client_supplied_hook_elicitation_id(payload, session_id)
 
+        # Kimi shares this wire protocol and already namespaces every hook id.
+        is_claude = not (elicitation_id and elicitation_id.startswith("elicit_kimi_"))
+        hook_harness = "claude-native" if is_claude else "kimi-native"
+        hook_label = "Claude" if is_claude else "Kimi"
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        native_agent = native_coding_agent_for_harness(harness) or (
+            native_coding_agent_for_wrapper_label(conv.labels.get("omnigent.wrapper"))
+        )
+        # Legacy sessions may lack native metadata; a known native session must match.
+        if native_agent is not None and native_agent.harness != hook_harness:
+            raise OmnigentError(
+                f"{hook_label} permission hook does not match the session's "
+                f"{native_agent.display_name} harness.",
+                code=ErrorCode.CONFLICT,
+            )
+
         try:
             preview_str = json.dumps(tool_input or {}, ensure_ascii=False)
         except (TypeError, ValueError):
@@ -260,13 +290,13 @@ def register_hooks_routes(
             extras["cwd"] = cwd
         if permission_mode is not None:
             extras["permission_mode"] = permission_mode
-        if _allow_auto_mode_eligible(tool_name, permission_mode):
+        if is_claude and _allow_auto_mode_eligible(tool_name, permission_mode):
             extras["allow_auto_mode"] = True
         # Edit tools → "Accept & allow all edits" (switches the session to
         # acceptEdits via setMode). Stamped only for edit-tool prompts
         # under a still-prompting mode — see _allow_all_edits_eligible.
         # The verdict site re-checks the same predicate before honoring it.
-        if _allow_all_edits_eligible(tool_name, permission_mode):
+        if is_claude and _allow_all_edits_eligible(tool_name, permission_mode):
             extras["allow_all_edits"] = True
         # Non-edit eligible tools → "don't ask again" (installs a
         # session-scoped allow rule via addRules). Stamped only when the
@@ -275,7 +305,7 @@ def register_hooks_routes(
         # request host so the UI can label the button ("… for github.com"
         # vs "… for WebFetch"); the verdict site re-derives the same scope
         # before honoring the flag, never trusting a client-supplied rule.
-        if _allow_remember_eligible(tool_name, permission_mode):
+        if is_claude and _allow_remember_eligible(tool_name, permission_mode):
             remember_scope: dict[str, Any] = {"tool": tool_name}
             remember_host = _claude_native_remember_host(tool_name, tool_input)
             if remember_host is not None:
@@ -290,7 +320,7 @@ def register_hooks_routes(
         # ``content_preview`` keeps its 1024-char cap for the
         # binary-card fallback; the structured field is the
         # authoritative source the UI consumes when present.
-        if tool_name == "AskUserQuestion":
+        if is_claude and tool_name == "AskUserQuestion":
             ask_payload = _structured_ask_user_question(tool_input)
             if ask_payload is not None:
                 extras["ask_user_question"] = ask_payload
@@ -303,15 +333,20 @@ def register_hooks_routes(
         # filtering: every field the hook carried natively reaches
         # the UI. An empty/absent input stamps nothing, leaving the
         # binary-card fallback.
-        if tool_name == "ExitPlanMode" and isinstance(tool_input, dict) and tool_input:
+        if (
+            is_claude
+            and tool_name == "ExitPlanMode"
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
             extras["exit_plan_mode"] = tool_input
         params = ElicitationRequestParams(
             mode="form",
-            message=f"Claude wants to call **{tool_name}**",
+            message=f"{hook_label} wants to call **{tool_name}**",
             requestedSchema=None,
             url=None,
             phase="pre_tool_use",
-            policy_name="claude_native_permission",
+            policy_name=f"{hook_harness.replace('-', '_')}_permission",
             content_preview=f"{tool_name}({preview_str})",
             **extras,
         )
@@ -339,6 +374,12 @@ def register_hooks_routes(
 
         behavior = "allow" if result.action == "accept" else "deny"
         decision: dict[str, Any] = {"behavior": behavior}
+        if not is_claude:
+            # Kimi consumes only the verdict and injects a terminal keystroke.
+            return Response(
+                content=json.dumps({"hookSpecificOutput": {"decision": decision}}),
+                media_type="application/json",
+            )
         # A decline can carry feedback typed into the web card (the
         # ExitPlanMode "Reject with feedback" flow). Claude's
         # PermissionRequest decision contract surfaces it via

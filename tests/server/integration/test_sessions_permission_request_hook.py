@@ -42,7 +42,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
 
@@ -145,8 +145,10 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("harness", [None, "claude-native"])
 async def test_permission_request_hook_allow_round_trip(
     client: httpx.AsyncClient,
+    harness: str | None,
 ) -> None:
     """
     UI approves Claude's permission request → endpoint returns
@@ -158,7 +160,11 @@ async def test_permission_request_hook_allow_round_trip(
     doesn't park the future (verdict comes in but the endpoint never
     wakes); the verdict→decision mapping returns the wrong literal.
     """
-    agent = await create_test_agent(client, "test-permission-allow")
+    agent = await create_test_agent(
+        client,
+        "test-permission-allow",
+        executor={"type": "omnigent", "config": {"harness": harness}} if harness else None,
+    )
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload()
 
@@ -178,6 +184,8 @@ async def test_permission_request_hook_allow_round_trip(
     )
 
     event = await drain_task
+    assert event["params"]["message"] == "Claude wants to call **Bash**"
+    assert event["params"]["policy_name"] == "claude_native_permission"
     verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
     assert verdict.status_code == 202, verdict.text
 
@@ -192,8 +200,12 @@ async def test_permission_request_hook_allow_round_trip(
     }
 
 
+@pytest.mark.parametrize("tool_name", ["Bash", "Write", "AskUserQuestion", "ExitPlanMode"])
+@pytest.mark.parametrize("action", ["accept", "decline"])
 async def test_permission_request_hook_accepts_kimi_namespaced_elicitation_id(
     client: httpx.AsyncClient,
+    tool_name: str,
+    action: str,
 ) -> None:
     """
     A kimi-native hook supplies ``_omnigent_elicitation_id = elicit_kimi_…`` on
@@ -204,11 +216,21 @@ async def test_permission_request_hook_accepts_kimi_namespaced_elicitation_id(
     Regression: the id regex was hard-coded to ``^elicit_claude_…$``, so every
     kimi approval POST was rejected and no card surfaced in the web UI.
     """
-    agent = await create_test_agent(client, "test-permission-kimi-id")
+    agent = await create_test_agent(
+        client,
+        "test-permission-kimi-id",
+        executor={"type": "omnigent", "config": {"harness": "kimi-native"}},
+    )
     session_id = await _create_session(client, agent["id"])
     elicitation_id = "elicit_kimi_" + "0" * 32
-    payload = await _claude_permission_payload()
+    payload = await _claude_permission_payload(tool_name)
     payload["_omnigent_elicitation_id"] = elicitation_id
+    if tool_name == "AskUserQuestion":
+        payload["tool_input"] = {
+            "questions": [{"question": "Continue?", "header": "Next", "options": []}]
+        }
+    elif tool_name == "ExitPlanMode":
+        payload["tool_input"] = {"plan": "Run the tests."}
 
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
     await asyncio.sleep(0.05)
@@ -223,11 +245,77 @@ async def test_permission_request_hook_accepts_kimi_namespaced_elicitation_id(
     # The published card uses the client-supplied id verbatim (not 400, not a
     # server-minted replacement).
     assert event["elicitation_id"] == elicitation_id
-    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    params = event["params"]
+    assert params["message"] == f"Kimi wants to call **{tool_name}**"
+    assert params["policy_name"] == "kimi_native_permission"
+    for extra in (
+        "allow_auto_mode",
+        "allow_all_edits",
+        "remember_scope",
+        "ask_user_question",
+        "exit_plan_mode",
+    ):
+        assert extra not in params
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        action,
+        {"allow_auto_mode": True, "allow_all_edits": True, "remember": True},
+    )
     assert verdict.status_code == 202, verdict.text
     resp = await hook_task
     assert resp.status_code == 200, resp.text
-    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    assert resp.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow" if action == "accept" else "deny"
+    }
+
+
+@pytest.mark.parametrize(
+    ("harness", "labels", "override", "hook_vendor"),
+    [
+        ("codex-native", {}, None, "claude"),
+        (None, {"omnigent.wrapper": "codex-native-ui"}, None, "claude"),
+        ("claude-native", {"omnigent.wrapper": "claude-native-ui"}, "codex-native", "claude"),
+        ("pi-native", {}, None, "claude"),
+        ("claude-native", {}, None, "kimi"),
+        ("kimi-native", {}, None, "claude"),
+    ],
+)
+async def test_permission_request_hook_rejects_mismatched_native_harness(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+    labels: dict[str, str],
+    override: str | None,
+    hook_vendor: str,
+) -> None:
+    """A stale callback must not publish an approval into another native harness's session."""
+    monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.01)
+    agent = await create_test_agent(
+        client,
+        "test-permission-mismatch",
+        executor={"type": "omnigent", "config": {"harness": harness}} if harness else None,
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": labels, "harness_override": override},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    payload = await _claude_permission_payload()
+    if hook_vendor == "kimi":
+        payload["_omnigent_elicitation_id"] = "elicit_kimi_" + "0" * 32
+    collector = await start_session_stream_collector(session_id)
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+        )
+        assert response.status_code == 409, response.text
+        assert "permission hook does not match" in response.text
+        await collector.assert_no_event(within=0.01)
+    finally:
+        await collector.stop()
 
 
 async def test_cursor_permission_request_hook_allow_round_trip(
@@ -2648,7 +2736,11 @@ async def test_codex_command_approval_hook_accept_round_trip(
     approvals and accepted web verdicts return Codex's command
     approval response shape.
     """
-    agent = await create_test_agent(client, "test-codex-command-approval")
+    agent = await create_test_agent(
+        client,
+        "test-codex-command-approval",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
     session_id = await _create_session(client, agent["id"])
     payload = {
         "id": 13,
