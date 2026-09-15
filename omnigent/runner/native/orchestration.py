@@ -3369,6 +3369,7 @@ async def _auto_create_devin_terminal(
         write_agent_instructions_preamble,
         write_devin_agent_rule,
         write_devin_mcp_config,
+        write_devin_workspace_hint,
         write_fork_preamble,
         write_hook_wrapper,
         write_tmux_target,
@@ -3399,6 +3400,10 @@ async def _auto_create_devin_terminal(
     rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
     if raw_instructions and not rule_is_live:
         write_agent_instructions_preamble(bridge_dir, raw_instructions)
+    elif rule_is_live:
+        # Record the workspace so the SessionEnd hook can remove this rule when
+        # the session ends, rather than leaving it to load into a later Devin run.
+        write_devin_workspace_hint(bridge_dir, workspace_path)
 
     # Register Omnigent's MCP relay before the TUI starts — Devin reads its MCP
     # servers at launch, from a project-local file (its user config carries none).

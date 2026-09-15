@@ -65,6 +65,7 @@ _PRE_TOOL_USE = "PreToolUse"
 _POST_TOOL_USE = "PostToolUse"
 _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 _PERMISSION_REQUEST = "PermissionRequest"
+_SESSION_END = "SessionEnd"
 
 #: Events carrying an Omnigent policy verdict.
 _POLICY_EVENTS = frozenset({_PRE_TOOL_USE, _POST_TOOL_USE, _USER_PROMPT_SUBMIT})
@@ -309,6 +310,21 @@ def main(argv: list[str] | None = None) -> int:
     # Everything else records first: the transcript must survive a policy or
     # network failure, and these events describe work that already happened.
     _record_event(bridge_dir, payload)
+
+    if hook_event == _SESSION_END and bridge_dir is not None and session_id:
+        # The session is over: remove this session's always-on agent rule so it
+        # does not load into a later Devin run in the same workspace. Gated on the
+        # ownership stamp, so a rule another session owns is left alone.
+        from omnigent.harnesses.devin_native.bridge import (
+            read_devin_workspace_hint,
+            remove_devin_agent_rule_if_owned,
+        )
+
+        workspace = read_devin_workspace_hint(bridge_dir)
+        if workspace is not None:
+            remove_devin_agent_rule_if_owned(workspace, session_id)
+        return 0
+
     if not governed:
         # Not a governed session (e.g. the user ran `devin` outside Omnigent with
         # a stale config). Record-only; never block.
