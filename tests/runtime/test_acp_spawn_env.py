@@ -340,3 +340,62 @@ def test_no_permission_mode_omits_env_var(_isolate_config: Path) -> None:
     assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_spawn_env(
         _make_spec(harness="acp:goose")
     )
+
+
+def test_agent_entry_permission_mode_threads_into_env_var(_isolate_config: Path) -> None:
+    """An agent entry's own ``permission_mode`` reaches the child.
+
+    Agents run unattended in their own CLI (Cline's "Auto-approve all") should
+    be configurable once in ``~/.omnigent/config.yaml`` rather than needing a
+    per-spec override. Without this the setting is inert and every tool call
+    parks on an approval card.
+    """
+    _write_acp_config(
+        _isolate_config,
+        agents=[
+            {
+                "name": "Cline",
+                "command": "cline --acp",
+                "permission_mode": "bypassPermissions",
+            }
+        ],
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:cline"))
+    assert env["HARNESS_ACP_PERMISSION_MODE"] == "bypassPermissions"
+
+
+def test_spec_permission_mode_overrides_the_agent_entry(_isolate_config: Path) -> None:
+    """An explicit spec value wins over the agent entry's default stance.
+
+    Lets one run tighten a normally-unattended agent without editing config.
+    """
+    _write_acp_config(
+        _isolate_config,
+        agents=[
+            {
+                "name": "Cline",
+                "command": "cline --acp",
+                "permission_mode": "bypassPermissions",
+            }
+        ],
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:cline", permission_mode="auto"))
+    assert env["HARNESS_ACP_PERMISSION_MODE"] == "auto"
+
+
+def test_agent_entry_rejects_an_unknown_permission_mode(_isolate_config: Path) -> None:
+    """A typo fails loudly instead of silently falling back to prompting."""
+    _write_acp_config(
+        _isolate_config,
+        agents=[{"name": "Cline", "command": "cline --acp"}],
+    )
+    spec = _make_spec(
+        harness="acp:cline",
+        acp_agent={
+            "name": "Cline",
+            "command": "cline --acp",
+            "permission_mode": "bypass",
+        },
+    )
+    with pytest.raises(ValueError, match="permission_mode must be one of"):
+        _build_acp_spawn_env(spec)
