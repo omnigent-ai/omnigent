@@ -711,16 +711,28 @@ class CodexAppServerClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
-        await self._ws.send(
-            json.dumps(
-                {
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                }
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    }
+                )
             )
-        )
-        response = await future
+            if self._reader_task is not None:
+                await asyncio.wait(
+                    (future, self._reader_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                if not future.done():
+                    raise ConnectionError(
+                        f"Codex app-server disconnected before responding to {method}"
+                    )
+            response = await future
+        finally:
+            self._pending_requests.pop(request_id, None)
+            future.cancel()
         error = response.get("error")
         if error:
             exc = CodexAppServerResponseError(error)
