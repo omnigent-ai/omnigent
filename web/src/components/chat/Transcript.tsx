@@ -320,7 +320,8 @@ function TranscriptImpl({
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
               display.hasTasks ? "pt-4" : "pt-20",
-              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
+              // An 8px outer gutter plus 16px padding leaves 9px beyond the rail ticks.
+              "md:w-[calc(100%-1rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
