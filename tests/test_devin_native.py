@@ -14,6 +14,7 @@ from omnigent.harnesses.devin_native.bridge import (
     build_hook_config,
     build_devin_mcp_server,
     canonical_devin_permission_mode,
+    devin_context_usage,
     devin_input_ready,
     devin_permission_mode,
     devin_queue_pending,
@@ -567,3 +568,35 @@ class TestPermissionMode:
         # which auto-approves every tool.
         with pytest.raises(RuntimeError, match="does not expose permission mode"):
             inject_permission_mode(tmp_path, mode="not-a-mode")
+
+
+class TestContextUsage:
+    """The web context ring is fed from Devin's own footer."""
+
+    def test_reads_the_abbreviated_pair(self) -> None:
+        assert devin_context_usage("SWE-2 High   Context: 26k / 262k tokens (9%)") == (
+            26_000,
+            262_000,
+        )
+
+    def test_reads_a_wrapped_footer(self) -> None:
+        # A narrow pane splits the footer across lines, so matching cannot be
+        # line-based (this is the shape the sidebar terminal produces).
+        pane = "Claude Opus 5 Context: 25k / 1.0M\nLow           tokens (2%)\n"
+        assert devin_context_usage(pane) == (25_000, 1_000_000)
+
+    def test_reads_unabbreviated_counts(self) -> None:
+        assert devin_context_usage("Context: 1234 / 200000 tokens (1%)") == (1234, 200_000)
+
+    def test_the_real_idle_pane_parses(self) -> None:
+        # The captured fixture carries the footer, so the ring fills from an
+        # ordinary idle pane without waiting for anything.
+        assert devin_context_usage(_IDLE_PANE) == (26_000, 262_000)
+
+    def test_no_footer_yields_no_pair(self) -> None:
+        # Better a hidden ring than one drawn from a half-parsed footer.
+        assert devin_context_usage("GLM-5.2 High") == (None, None)
+        assert devin_context_usage(_BOOT_PANE) == (None, None)
+
+    def test_a_zero_window_is_refused(self) -> None:
+        assert devin_context_usage("Context: 10 / 0 tokens") == (None, None)

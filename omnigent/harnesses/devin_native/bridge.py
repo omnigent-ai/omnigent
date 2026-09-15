@@ -31,6 +31,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -116,6 +117,12 @@ _DEVIN_PERMISSION_MARKERS: tuple[tuple[str, str], ...] = (
     ("(bypass permissions on)", "dangerous"),
     ("(accept edits on)", "accept-edits"),
     ("(smart mode on)", "smart"),
+)
+#: Devin's footer carries the turn's context fill, e.g.
+#: ``Context: 25k / 1.0M tokens (2%)``. That is the only place it reports the
+#: window, so it is what feeds the web context ring.
+_DEVIN_CONTEXT_RE = re.compile(
+    r"Context:\s*([\d.]+)\s*([kKmM]?)\s*(?:/|of)\s*([\d.]+)\s*([kKmM]?)"
 )
 #: Devin's default permission mode — the one with no on-screen marker.
 DEVIN_DEFAULT_PERMISSION_MODE = "normal"
@@ -773,6 +780,57 @@ def devin_queue_pending(pane: str) -> bool:
     """
     normalized = " ".join(pane.split())
     return "queued" in normalized and _DEVIN_SEND_NOW_HINT in normalized
+
+
+def _scaled_tokens(value: str, suffix: str) -> int | None:
+    """Turn Devin's abbreviated token count ("25k", "1.0M") into an int."""
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    multiplier = {"": 1, "k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000}.get(suffix)
+    if multiplier is None or parsed < 0:
+        return None
+    return int(parsed * multiplier)
+
+
+def devin_context_usage(pane: str) -> tuple[int | None, int | None]:
+    """Return ``(context tokens used, context window)`` from Devin's footer.
+
+    Devin abbreviates both ("Context: 25k / 1.0M tokens (2%)") and wraps the line
+    in a narrow pane, so the text is whitespace-normalized before matching.
+
+    :param pane: Captured pane text.
+    :returns: Both values, or ``(None, None)`` when the footer carries no usable
+        pair — the ring simply stays hidden rather than showing a wrong fill.
+    """
+    match = _DEVIN_CONTEXT_RE.search(" ".join(pane.split()))
+    if match is None:
+        return (None, None)
+    used = _scaled_tokens(match.group(1), match.group(2))
+    window = _scaled_tokens(match.group(3), match.group(4))
+    if used is None or window is None or window <= 0:
+        return (None, None)
+    return (used, window)
+
+
+def read_devin_context_usage(bridge_dir: Path) -> tuple[int | None, int | None]:
+    """Read the pane's context footer, without waiting on the TUI.
+
+    Best-effort by design: this runs on the forwarder's turn-end path, so a pane
+    that has gone away (or a bridge with no tmux target yet) must cost nothing.
+
+    :param bridge_dir: Per-session bridge directory.
+    :returns: ``(used, window)``, or ``(None, None)`` when unavailable.
+    """
+    info = _read_bridge_json(bridge_dir, _TMUX_FILE)
+    if not isinstance(info, dict):
+        return (None, None)
+    socket_path = info.get("socket_path")
+    tmux_target = info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return (None, None)
+    return devin_context_usage(_capture_pane(socket_path, tmux_target))
 
 
 def canonical_devin_permission_mode(mode: str) -> str:

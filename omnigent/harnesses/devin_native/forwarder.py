@@ -44,6 +44,7 @@ import httpx
 from omnigent.harnesses.devin_native.bridge import (
     export_path,
     iter_hook_events,
+    read_devin_context_usage,
     write_forwarder_ready,
 )
 from omnigent.harnesses.devin_native.subagents import (
@@ -310,6 +311,14 @@ async def _post_usage(
     }
     if model:
         data["model"] = model
+    # The web context ring reads `context_tokens`/`context_window` off this event
+    # (see `_context_labels_from_turn_usage`); Devin reports its fill only in the
+    # pane footer, so scrape it here rather than leaving the ring blank.
+    context_tokens, context_window = read_devin_context_usage(bridge_dir)
+    if context_tokens is not None:
+        data["context_tokens"] = context_tokens
+    if context_window is not None:
+        data["context_window"] = context_window
     with contextlib.suppress(httpx.HTTPError):
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
