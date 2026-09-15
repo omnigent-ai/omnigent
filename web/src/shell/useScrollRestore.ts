@@ -27,8 +27,14 @@ export function saveScrollTop(key: string, scrollTop: number): void {
  */
 export const SCROLL_RESTORE_BUDGET_MS = 1500;
 
-/** Pointer/touch/wheel input that means the user has taken over scrolling. */
-const USER_SCROLL_EVENTS = ["wheel", "touchstart", "pointerdown"] as const;
+/**
+ * Input that means the reader has taken over scrolling, so the restore must
+ * stop re-asserting the saved offset and never fight them. Includes `keydown`
+ * for keyboard and assistive-tech scrolling (PageDown/arrows/Space/Home/End),
+ * not just pointer/touch/wheel — otherwise a keyboard scroll within the restore
+ * budget would be snapped back each frame.
+ */
+const USER_SCROLL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
 
 /** The slice of a Monaco code editor the scroll restore needs. */
 interface ScrollableEditor {
@@ -123,46 +129,65 @@ export function useScrollRestore(
       : null;
   }
 
-  // No dependency array: intentionally runs after every render — each
-  // content-growth step is another chance to reach the saved offset. Cleanup
-  // cancels the previous run's frame, so only one loop is ever live.
+  // Arm a restore once per content identity / readiness change — NOT every
+  // render. A virtualized tree re-renders on every scroll frame; re-running the
+  // restore then would fight the user and re-read layout each frame.
   useLayoutEffect(() => {
     const el = ref.current;
     const pending = pendingRef.current;
     if (!el || !pending || !ready) return;
+
     let frame = 0;
-    function settleForUser() {
-      pendingRef.current = null;
+    let done = false;
+    // A user gesture settles the restore so we never fight the reader.
+    const onUserScroll = () => finish();
+    // Tear down listeners/frame WITHOUT touching pendingRef, so it is safe as
+    // the effect's cleanup: under StrictMode dev replay (setup → cleanup →
+    // setup on one commit) settling here would null pendingRef and the re-setup
+    // would then early-return without restoring. Only `finish` settles.
+    const teardown = () => {
       cancelAnimationFrame(frame);
-      detach();
-    }
-    const detach = () => {
-      for (const type of USER_SCROLL_EVENTS) el.removeEventListener(type, settleForUser);
+      for (const type of USER_SCROLL_EVENTS) el.removeEventListener(type, onUserScroll);
     };
-    const attempt = () => {
-      // A user gesture (or a later render's loop) may have already settled it.
-      if (pendingRef.current !== pending) {
-        detach();
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (pendingRef.current === pending) pendingRef.current = null;
+      teardown();
+    };
+
+    // A zero target needs no work beyond writing it: settle immediately so we
+    // don't force a synchronous layout of the freshly mounted content.
+    if (pending.target === 0) {
+      el.scrollTop = 0;
+      finish();
+      return teardown;
+    }
+
+    // Nonzero: re-assert the target every frame until it holds through the
+    // budget or a user scrolls. This is a write-only loop (`el.scrollTop = …`,
+    // never a scrollHeight/clientHeight read), so it forces no layout and works
+    // for every consumer regardless of which descendant grows — a virtualized
+    // tree's spacer, an editor's content, or async notebook cells. As content
+    // grows, later frames' writes reach further until the offset sticks.
+    // Keeping `pending` non-null until finish also suppresses the save handler,
+    // so growth-driven scroll events can't overwrite the saved offset.
+    const tick = () => {
+      if (done) return;
+      if (pendingRef.current !== pending || performance.now() >= pending.deadline) {
+        finish();
         return;
       }
       el.scrollTop = pending.target;
-      const maxScroll = el.scrollHeight - el.clientHeight;
-      if (maxScroll >= pending.target || performance.now() >= pending.deadline) {
-        pendingRef.current = null;
-        detach();
-        return;
-      }
-      frame = requestAnimationFrame(attempt);
+      frame = requestAnimationFrame(tick);
     };
     for (const type of USER_SCROLL_EVENTS) {
-      el.addEventListener(type, settleForUser, { passive: true });
+      el.addEventListener(type, onUserScroll, { passive: true });
     }
-    attempt();
-    return () => {
-      cancelAnimationFrame(frame);
-      detach();
-    };
-  });
+    el.scrollTop = pending.target;
+    frame = requestAnimationFrame(tick);
+    return teardown;
+  }, [key, ready, ref]);
 
   return useCallback((event: UIEvent<HTMLElement>) => {
     if (keyRef.current && pendingRef.current === null) {

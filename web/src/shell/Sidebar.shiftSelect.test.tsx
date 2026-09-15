@@ -353,7 +353,7 @@ describe("Sidebar shift-click selection", () => {
 
     // Select both rows — "2 selected", but only the owned one is deletable.
     fireEvent.click(await screen.findByRole("link", { name: "mine" }));
-    fireEvent.click(screen.getByRole("link", { name: "theirs" }));
+    fireEvent.click(screen.getByRole("link", { name: /^theirs/ }));
     await waitFor(() => {
       expect(screen.getByText("2 selected")).toBeInTheDocument();
     });

@@ -12,6 +12,26 @@ on:
         required: false
         default: false
         type: boolean
+      intake:
+        description: Run one-time labeling, assignment, and duplicate detection
+        required: false
+        default: false
+        type: boolean
+      apply:
+        description: Apply the planned changes instead of producing a dry run
+        required: false
+        default: true
+        type: boolean
+      manual_dispatch:
+        description: Use the caller's explicit duplicate-comment choice
+        required: false
+        default: false
+        type: boolean
+      post_duplicate_comments:
+        description: Post duplicate comments during a manual dispatch
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -64,22 +84,44 @@ jobs:
           DATABRICKS_AUTH_TYPE: oauth-m2m
           GITHUB_TOKEN: ${{ github.token }}
           MODEL_ENDPOINT: ${{ vars.ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT }}
+          INTAKE: ${{ inputs.intake }}
+          APPLY: ${{ inputs.apply }}
+          MANUAL_DISPATCH: ${{ inputs.manual_dispatch }}
+          POST_DUPLICATE_COMMENTS: ${{ inputs.post_duplicate_comments }}
+          REPO_POST_DUPLICATE_COMMENTS: ${{ vars.ISSUE_TRIAGE_POST_DUPLICATE_COMMENTS || 'false' }}
+          CLOSE_DUPLICATES: ${{ vars.ISSUE_TRIAGE_CLOSE_DUPLICATES || 'false' }}
         run: |
           set -euo pipefail
           : "${DATABRICKS_HOST:?Set the DATABRICKS_HOST repository secret}"
           : "${DATABRICKS_CLIENT_ID:?Set the DATABRICKS_CLIENT_ID repository secret}"
           : "${DATABRICKS_CLIENT_SECRET:?Set the DATABRICKS_CLIENT_SECRET repository secret}"
           : "${MODEL_ENDPOINT:?Set the ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT repository variable}"
-          uv run --frozen --project .github/triage_v2 issue-priority-event \
-            --issue-number "${{ inputs.issue_number }}" \
-            --github-repo "${{ github.repository }}" \
-            --model-endpoint "$MODEL_ENDPOINT" \
-            --areas .github/areas.json \
-            --label-manifest .github/issue-prioritization-labels.json \
-            --output-dir /tmp/issue-priority-v2 \
-            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}" \
-            --source-revision "${{ github.sha }}" \
-            --mode apply
+          mode=dry_run
+          if [ "$APPLY" = "true" ]; then
+            mode=apply
+          fi
+          args=(
+            --issue-number "${{ inputs.issue_number }}"
+            --github-repo "${{ github.repository }}"
+            --model-endpoint "$MODEL_ENDPOINT"
+            --areas .github/areas.json
+            --label-manifest .github/issue-prioritization-labels.json
+            --output-dir /tmp/issue-priority-v2
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}"
+            --source-revision "${{ github.sha }}"
+            --mode "$mode"
+          )
+          if [ "$INTAKE" = "true" ]; then
+            args+=(--intake --maintainers .github/MAINTAINER)
+            if [ "$CLOSE_DUPLICATES" = "true" ]; then
+              args+=(--close-duplicates)
+            fi
+            if { [ "$MANUAL_DISPATCH" = "true" ] && [ "$POST_DUPLICATE_COMMENTS" = "true" ]; } ||
+               { [ "$MANUAL_DISPATCH" != "true" ] && [ "$REPO_POST_DUPLICATE_COMMENTS" = "true" ]; }; then
+              args+=(--post-duplicate-comments)
+            fi
+          fi
+          uv run --frozen --project .github/triage_v2 issue-priority-event "${args[@]}"
 
       - name: Upload decision artifact
         if: always() && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'

@@ -15,6 +15,9 @@ Two modes:
 from __future__ import annotations
 
 import argparse
+import logging
+import os
+import time
 
 
 def main() -> None:
@@ -45,27 +48,63 @@ def main() -> None:
 
     from omnigent.process_logging import configure_process_logging
 
-    configure_process_logging("host", force=True)
+    log_path = configure_process_logging("host", force=True)
 
     if args.local == bool(args.server):
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
 
-    from omnigent.host.daemon_lifecycle import normalize_daemon_target
+    from omnigent.host.daemon_lifecycle import (
+        DAEMON_CONFIG_SIG_ENV_VAR,
+        DaemonLifecycleLock,
+        HostDaemonRecord,
+        normalize_daemon_target,
+        write_daemon_record,
+    )
 
-    if args.local:
-        # The daemon owns the local server: start/reuse it, then connect.
-        from omnigent.host.local_server import ensure_local_omnigent_server
+    daemon_target = normalize_daemon_target(None if args.local else args.server)
+    lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
+    claim = lifecycle_lock.try_acquire()
+    if claim is False:
+        logging.getLogger(__name__).info(
+            "Another host daemon already claimed target %s; exiting", daemon_target
+        )
+        return
 
-        server_url = ensure_local_omnigent_server().url
-        daemon_target = normalize_daemon_target(None)
-    else:
-        server_url = args.server
-        daemon_target = normalize_daemon_target(args.server)
+    try:
+        from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
 
-    from omnigent.host.connect import run_host_process
+        identity = load_or_create_host_identity(CONFIG_PATH)
+        mode = "local" if args.local else "server"
+        record = HostDaemonRecord(
+            pid=os.getpid(),
+            target=daemon_target,
+            mode=mode,
+            server_url=None if args.local else daemon_target,
+            log_path=str(log_path),
+            started_at=int(time.time()),
+            host_id=identity.host_id,
+            config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
+        )
+        write_daemon_record(record, update_legacy_pidfile=True)
 
-    run_host_process(server_url=server_url, daemon_target=daemon_target)
+        if args.local:
+            # The daemon owns the local server: start/reuse it, then connect.
+            from omnigent.host.local_server import ensure_local_omnigent_server
+
+            server_url = ensure_local_omnigent_server().url
+        else:
+            server_url = args.server
+
+        from omnigent.host.connect import run_host_process
+
+        run_host_process(
+            server_url=server_url,
+            daemon_target=daemon_target,
+            lifecycle_lock=lifecycle_lock,
+        )
+    finally:
+        lifecycle_lock.release()
 
 
 if __name__ == "__main__":

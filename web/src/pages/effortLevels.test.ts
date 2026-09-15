@@ -3,6 +3,7 @@ import type { NativeModelOption } from "@/lib/types";
 
 import {
   effortLevelsForConv,
+  shouldShowCodexApprovalModeControl,
   shouldShowCodexPlanModeControl,
   shouldShowEffortPicker,
   shouldShowGoalControl,
@@ -231,6 +232,23 @@ describe("shouldShowCodexPlanModeControl", () => {
     ).toBe(false);
     expect(shouldShowCodexPlanModeControl({ labels: { "omnigent.ui": "terminal" } })).toBe(false);
     expect(shouldShowCodexPlanModeControl(null)).toBe(false);
+  });
+});
+
+describe("shouldShowCodexApprovalModeControl", () => {
+  it("returns true only for codex-native wrapper sessions", () => {
+    expect(
+      shouldShowCodexApprovalModeControl({ labels: { "omnigent.wrapper": "codex-native-ui" } }),
+    ).toBe(true);
+    expect(
+      shouldShowCodexApprovalModeControl({
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+    ).toBe(false);
+    expect(shouldShowCodexApprovalModeControl({ labels: { "omnigent.ui": "terminal" } })).toBe(
+      false,
+    );
+    expect(shouldShowCodexApprovalModeControl(null)).toBe(false);
   });
 });
 

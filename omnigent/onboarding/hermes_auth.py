@@ -11,7 +11,7 @@ binary.
 
 Detection reads ``~/.hermes/config.yaml`` directly — the same user config the
 native bridge copies forward in
-:func:`omnigent.hermes_native_bridge._load_user_hermes_config`. A fresh install
+:func:`omnigent.harnesses.hermes_native.bridge._load_user_hermes_config`. A fresh install
 ships ``model.provider: auto`` (auto-detect from credentials — nothing picked
 yet); a finished ``hermes model`` run replaces that with a concrete provider id
 (e.g. ``openrouter``). So "configured" is a concrete, non-``auto`` provider,

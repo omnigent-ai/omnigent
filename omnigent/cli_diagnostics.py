@@ -38,12 +38,16 @@ from typing import cast
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.process_logging import (
-    TerminalLogFormatter,
+    RedactingLogFormatter,
     effective_log_level,
     env_truthy,
     process_log_dir,
+    redact_log_text,
     terminal_supports_color,
 )
+
+_RedactingFormatter = RedactingLogFormatter
+_redact = redact_log_text
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -105,63 +109,40 @@ class _LoggingStreamSnapshot:
 _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 
 # ---------------------------------------------------------------------------
-# Secret redaction filter
+# Surfaced log-tail redaction
 # ---------------------------------------------------------------------------
 
-#: Patterns that match values likely to be secrets.  Applied to every
-#: log record's formatted message before it hits the file.
-_SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Header values: "Authorization: Bearer xxx" or "bearer xxx"
-    re.compile(r"(?i)(authorization\s*[:=]\s*)\S+"),
-    re.compile(r"(?i)(bearer\s+)\S+"),
-    # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
-    re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
-    # Anthropic / OpenAI style keys
-    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
-    # Databricks PATs
-    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
-]
+#: URL userinfo: ``scheme://user:password@host`` — e.g. a database URI baked
+#: into a migration error's copy-pasteable command. Redacts the whole
+#: userinfo (the lookahead keeps the ``@host`` part readable). The shared
+#: :func:`omnigent.process_logging.redact_log_text` filter does not cover
+#: URL userinfo, so :func:`redact_secrets` applies this pattern on top.
+#:
+#: The greedy ``\S+`` anchors on the *last* ``@`` in the whitespace-delimited
+#: token: passwords may legally contain ``/`` and ``@`` (SQLAlchemy accepts
+#: ``postgresql://user:p/ss@host``), so stopping at the first ``/`` or ``@``
+#: would leak the rest of the password. Anchoring on the last ``@`` can
+#: over-redact a credential-free URL whose path contains ``@``, which is the
+#: safe direction for surfaced log text.
+_URL_USERINFO_PATTERN = re.compile(r"(://)\S+(?=@)")
+
 _REDACTED = "[REDACTED]"
 
 
-def _redact(text: str) -> str:
+def redact_secrets(text: str) -> str:
     """
-    Replace secret-shaped substrings in *text* with :data:`_REDACTED`.
+    Public wrapper around the diagnostics redaction filter.
+
+    For callers outside the logging pipeline that are about to surface
+    captured log content on a user-visible channel (e.g. the server-log
+    tail embedded in a startup error) and must scrub secret-shaped
+    substrings — including URL userinfo like
+    ``postgresql+psycopg://user:password@host`` — first.
 
     :param text: Arbitrary log text (may include tracebacks).
     :returns: Scrubbed text.
     """
-    for pat in _SECRET_PATTERNS:
-        text = pat.sub(
-            lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,
-            text,
-        )
-    return text
-
-
-class _RedactingFormatter(TerminalLogFormatter):
-    """
-    Formatter that scrubs obvious secrets from the *final* formatted
-    output — after ``%``-interpolation of ``record.args`` and after
-    traceback rendering.
-
-    A ``logging.Filter`` on ``record.msg`` would run *before*
-    formatting, so secrets passed as ``logger.info("key=%s", secret)``
-    or appearing in exception tracebacks would slip through.
-    Overriding :meth:`format` is the correct interception point
-    because the base class returns the fully-assembled string
-    (message + traceback) and nothing downstream mutates it before
-    the handler writes.
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        """
-        Format *record* then redact secrets from the result.
-
-        :param record: The log record to format.
-        :returns: Formatted, redacted string ready for the handler.
-        """
-        return _redact(super().format(record))
+    return _URL_USERINFO_PATTERN.sub(rf"\g<1>{_REDACTED}", redact_log_text(text))
 
 
 class _RedactingStderr(io.TextIOBase):
@@ -417,6 +398,37 @@ def print_stale_host_hint() -> None:
         "host instances, then try again.",
         file=dest,
     )
+
+
+#: Attribute an exception may carry to opt out of the stale-host recovery
+#: hint (:func:`print_stale_host_hint`). Any exception type representing a
+#: failure that hint cannot fix (a missing dependency, a failed background
+#: server whose real cause is already surfaced inline) can set this to
+#: ``True`` — keeps :mod:`cli_diagnostics` decoupled from the modules that
+#: raise those errors.
+SUPPRESS_RECOVERY_HINT_ATTR = "omnigent_suppress_recovery_hint"
+
+
+def suppresses_recovery_hint(exc: BaseException) -> bool:
+    """
+    Report whether the stale-host recovery hint should be withheld for *exc*.
+
+    The hint (:func:`print_stale_host_hint`) assumes the failure may be a
+    runner tunnel rejection caused by stale host processes. That is
+    misleading for whole classes of error ``omnigent stop`` cannot fix — a
+    missing Python dependency (e.g. the ``psycopg`` Postgres driver) or a
+    background local server that crashed with its real cause already
+    surfaced inline. Suppressing the hint for those keeps the error
+    pointing at the real fix.
+
+    :param exc: The exception about to be surfaced by :func:`omnigent.cli.main`.
+    :returns: ``True`` when the hint should be suppressed — either *exc* is an
+        :class:`ImportError` (missing dependency) or it carries a truthy
+        :data:`SUPPRESS_RECOVERY_HINT_ATTR` marker.
+    """
+    if isinstance(exc, ImportError):
+        return True
+    return bool(getattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, False))
 
 
 def log_cli_exception(exc: BaseException, *, prefix: str = "CLI error") -> None:

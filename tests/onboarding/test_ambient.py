@@ -13,6 +13,9 @@ count, so a wrong field turns the test red.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from omnigent.onboarding import ambient
@@ -990,3 +993,25 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
     assert ambient.claude_managed_gateway() == (None, False)
+
+
+def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:
+    path = tmp_path / "managed-settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "modelPicker": {
+                    "options": [
+                        {"model": "gateway-opus", "label": "Opus"},
+                        {"model": "gateway-sonnet", "label": "Sonnet"},
+                    ],
+                    "replaceBuiltInOptions": True,
+                }
+            }
+        )
+    )
+
+    assert ambient.claude_managed_model_picker((path,)) == (
+        ("gateway-opus", "Opus"),
+        ("gateway-sonnet", "Sonnet"),
+    )

@@ -42,7 +42,7 @@ from omnigent.chat import (
 )
 from omnigent.cli import _build_resume_parts
 from omnigent.inner.databricks_executor import DatabricksCredentials
-from omnigent.model_resolver import ModelResolutionError
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
 
@@ -86,7 +86,7 @@ def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPa
     def _capture(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main.run_kiro_native", _capture)
 
     redirected = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -253,9 +253,11 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
         """Record each poll interval the helper chooses."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
+    def _fake_get(url: str, timeout: float, trust_env: bool = True) -> _Resp:
         """Fail twice, then report ready on the third probe."""
         del url, timeout
+        # Loopback readiness probes must bypass the env proxy config.
+        assert trust_env is False
         http_calls["count"] += 1
         if http_calls["count"] < 3:
             raise __import__("httpx").ConnectError("not ready")
@@ -386,9 +388,11 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         """Record the poll interval chosen while runner is offline."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
+    def _fake_get(url: str, timeout: float, trust_env: bool = True) -> _Resp:
         """Report server readiness immediately but runner online later."""
         del timeout
+        # Loopback readiness probes must bypass the env proxy config.
+        assert trust_env is False
         requested_urls.append(url)
         if url.endswith("/health"):
             return _Resp(200)
@@ -1220,6 +1224,9 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
     monkeypatch.setattr(chat_module, "_resolve_resume_target", lambda **_k: None)
     monkeypatch.setattr(chat_module, "_prepare_chat_session_via_daemon", _fake_prepare)
     monkeypatch.setattr(chat_module, "_chat_with_server", _fake_chat_with_server)
+    # A one-shot run tears its session down on exit; stub it so this test
+    # asserts the attach inputs without reaching the network.
+    monkeypatch.setattr(chat_module, "_stop_headless_session", lambda **_k: None)
 
     _chat_via_daemon(
         str(agent_yaml),
@@ -1244,6 +1251,121 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
     assert prepare["resume_conversation_id"] is None
     assert prepare["fork_session_id"] is None
     assert prepare["host_id"] == "host_x"
+
+
+def _wire_daemon_chat_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str = "conv_oneshot",
+) -> None:
+    """Stub the daemon chat path down to the session-teardown boundary.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param session_id: Session id the fake prep step returns.
+    """
+
+    async def _fake_prepare(**_kwargs: object) -> _DaemonChatSession:
+        return _DaemonChatSession(session_id=session_id, runner_id="runner_oneshot")
+
+    monkeypatch.setattr(chat_module, "_bundle_agent", lambda _p: b"bundle-bytes")
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_or_create_host_identity",
+        lambda: SimpleNamespace(host_id="host_x", name="x"),
+    )
+    monkeypatch.setattr(chat_module, "_resolve_resume_target", lambda **_k: None)
+    monkeypatch.setattr(chat_module, "_prepare_chat_session_via_daemon", _fake_prepare)
+    monkeypatch.setattr(chat_module, "_chat_with_server", lambda *_a, **_k: None)
+
+
+def test_one_shot_run_stops_its_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``-p`` run stops the session it finished, releasing the runner.
+
+    The daemon tears a runner down only on an explicit stop, so without this
+    a completed one-shot leaves its runner — and that runner's harness
+    subtree — alive until the runner's own idle self-exit.
+    """
+    agent_yaml = tmp_path / "hello.yaml"
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
+    stopped: list[dict[str, object]] = []
+    _wire_daemon_chat_stubs(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.cli._stop_session_on_server",
+        lambda **kwargs: stopped.append(kwargs),
+    )
+
+    _chat_via_daemon(
+        str(agent_yaml),
+        "https://example.databricksapps.com",
+        None,
+        overrides=ChatOverrides(),
+        initial_message="say hi",
+    )
+
+    assert stopped == [
+        {
+            "base_url": "https://example.databricksapps.com",
+            "session_id": "conv_oneshot",
+        }
+    ]
+
+
+def test_interactive_run_leaves_its_session_online(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interactive REPL session is not torn down when the REPL returns.
+
+    Stopping it would kill the runner a user reattaches to with ``--continue``.
+    """
+    agent_yaml = tmp_path / "hello.yaml"
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
+    stopped: list[dict[str, object]] = []
+    _wire_daemon_chat_stubs(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.cli._stop_session_on_server",
+        lambda **kwargs: stopped.append(kwargs),
+    )
+
+    _chat_via_daemon(
+        str(agent_yaml),
+        "https://example.databricksapps.com",
+        None,
+        overrides=ChatOverrides(),
+    )
+
+    assert stopped == []
+
+
+def test_one_shot_teardown_failure_does_not_fail_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop that the server rejects must not fail an already-finished run."""
+    agent_yaml = tmp_path / "hello.yaml"
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
+
+    def _explode(**_kwargs: object) -> None:
+        raise click.ClickException("server said no")
+
+    _wire_daemon_chat_stubs(monkeypatch)
+    monkeypatch.setattr("omnigent.cli._stop_session_on_server", _explode)
+
+    _chat_via_daemon(
+        str(agent_yaml),
+        "https://example.databricksapps.com",
+        None,
+        overrides=ChatOverrides(),
+        initial_message="say hi",
+    )
 
 
 class _FakeSessionsApi:
@@ -1311,7 +1433,7 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_host_online", _no_host_wait)
     monkeypatch.setattr("omnigent.host.daemon_launch.launch_or_reuse_daemon_runner", _fake_launch)
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_runner_online", _no_runner_wait)
-    monkeypatch.setattr("omnigent.native_terminal.bind_session_runner", _fake_bind)
+    monkeypatch.setattr("omnigent.native.native_terminal.bind_session_runner", _fake_bind)
 
 
 def test_prepare_chat_session_via_daemon_creates_fresh_and_launches(
@@ -3231,7 +3353,7 @@ def test_await_accounts_setup_noop_for_header_mode(
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
-        lambda _url, timeout=5.0: _info_response(
+        lambda _url, timeout=5.0, trust_env=True: _info_response(
             {"accounts_enabled": False, "needs_setup": False}
         ),
     )
@@ -3264,7 +3386,9 @@ def test_await_accounts_setup_waits_then_continues(
     monkeypatch.setattr("omnigent.cli_auth.load_token", _load)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
-        lambda _url, timeout=5.0: _info_response({"accounts_enabled": True, "needs_setup": True}),
+        lambda _url, timeout=5.0, trust_env=True: _info_response(
+            {"accounts_enabled": True, "needs_setup": True}
+        ),
     )
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
 
@@ -3280,12 +3404,192 @@ def test_await_accounts_setup_times_out(
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
-        lambda _url, timeout=5.0: _info_response({"accounts_enabled": True, "needs_setup": True}),
+        lambda _url, timeout=5.0, trust_env=True: _info_response(
+            {"accounts_enabled": True, "needs_setup": True}
+        ),
     )
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
 
     with pytest.raises(click.ClickException, match="Timed out"):
         chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000", timeout_s=0.0)
+
+
+def test_await_accounts_setup_tolerates_unparseable_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy env httpx cannot parse must not crash the accounts probe.
+
+    With e.g. ``NO_PROXY=fe80::/10`` in the shell, httpx raises
+    ``httpx.InvalidURL: Invalid port: ':'`` at client construction — before
+    any request is sent. ``InvalidURL`` is NOT an ``HTTPError`` subclass, so
+    an ``except (httpx.HTTPError, ValueError)`` guard misses it and the
+    launch used to die on the crash handler. The probe must swallow it and
+    return, letting the normal path continue.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+
+    def _invalid_proxy_env(*_a: object, **_k: object) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr("omnigent.chat.httpx.get", _invalid_proxy_env)
+
+    # Must not raise — the crash-handler path is exactly this escaping.
+    chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
+
+
+def test_await_accounts_setup_probe_bypasses_env_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loopback ``/v1/info`` probe must pass ``trust_env=False``.
+
+    Building an env-trusting client both routes loopback traffic through any
+    configured proxy and can crash outright on a proxy value httpx cannot
+    parse, so the probe must not read the proxy environment at all.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    seen: dict[str, object] = {}
+
+    def _fake_get(url: str, **kwargs: object) -> SimpleNamespace:
+        seen["url"] = url
+        seen.update(kwargs)
+        return _info_response({"accounts_enabled": False, "needs_setup": False})
+
+    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+
+    chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
+
+    assert seen.get("trust_env") is False, (
+        f"loopback /v1/info probe must bypass the environment proxy config (got kwargs {seen!r})"
+    )
+
+
+def test_server_get_keeps_env_proxy_for_remote_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-loopback requests keep httpx's default env-proxy handling.
+
+    Only loopback traffic is proxy-exempt; a corporate proxy must still
+    apply to a real remote server, so ``_server_get`` must not force
+    ``trust_env=False`` there.
+    """
+    seen: dict[str, object] = {}
+
+    def _fake_get(url: str, **kwargs: object) -> SimpleNamespace:
+        seen["url"] = url
+        seen.update(kwargs)
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+
+    chat_module._server_get("https://example.databricksapps.com/v1/info", timeout=5.0)
+
+    assert "trust_env" not in seen, (
+        f"remote requests must keep httpx's default proxy handling; got kwargs {seen!r}"
+    )
+
+
+def test_prepare_chat_session_via_daemon_reports_unparseable_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``httpx.InvalidURL`` from the daemon prep path is a ``ClickException``.
+
+    A remote ``--server`` target keeps ``trust_env`` on, so building the SDK /
+    daemon clients parses the proxy environment and raises ``InvalidURL``
+    (not an ``HTTPError``) on a value like ``NO_PROXY=fe80::/10`` — an
+    environment problem that must not reach the crash handler.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    async def _invalid_proxy_env(
+        _self: object, _bundle: bytes, *, filename: str, workspace: str
+    ) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr(_FakeSessionsApi, "create", _invalid_proxy_env)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        asyncio.run(
+            _prepare_chat_session_via_daemon(
+                base_url="https://example.databricksapps.com",
+                headers={},
+                auth=None,
+                host_id="host_x",
+                bundle=b"bundle-bytes",
+                resume_conversation_id=None,
+                fork_session_id=None,
+                workspace="/tmp/proj",
+            )
+        )
+
+    # Exact match: proves the error names the target server and the parse
+    # failure (a substring URL probe here trips CodeQL's url-sanitization rule).
+    assert str(excinfo.value) == (
+        "Could not connect to the Omnigent server at "
+        "https://example.databricksapps.com. "
+        "Check the URL, your network connection, and any HTTP proxy settings. "
+        "(the proxy environment could not be parsed: Invalid port: ':')"
+    )
+    # No runner is launched against a server we could not reach.
+    assert "launch" not in captured
+
+
+def test_pick_agent_reports_unparseable_proxy_env_as_click_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``httpx.InvalidURL`` from a bad proxy env is a ``ClickException``.
+
+    ``InvalidURL`` is raised at client construction (not a transport error),
+    so the ConnectError/ConnectTimeout/ProxyError guard alone misses it and
+    it used to escape to the crash handler.
+    """
+
+    def _invalid_proxy_env(*_args: object, **_kwargs: object) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr(chat_module.httpx, "get", _invalid_proxy_env)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("https://example.databricksapps.com")
+
+    # Same actionable message as an unreachable server: check URL/proxy.
+    assert "proxy" in str(excinfo.value)
+
+
+def test_wait_for_remote_runner_surfaces_unparseable_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remote runner-status poll fails fast on an unparseable proxy env.
+
+    A remote base_url keeps ``trust_env`` on, so a proxy value httpx cannot
+    parse raises ``InvalidURL`` at client construction on every poll. That
+    failure is deterministic, so the poll must raise the actionable
+    ClickException on the first attempt instead of burning the timeout
+    (or escaping to the crash handler).
+    """
+    proc = SimpleNamespace(poll=lambda: None, returncode=None)
+    sleeps: list[float] = []
+
+    def _invalid_proxy_env(*_args: object, **_kwargs: object) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr("omnigent.chat.time.sleep", sleeps.append)
+    monkeypatch.setattr("omnigent.chat.httpx.get", _invalid_proxy_env)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _wait_for_remote_runner(
+            "https://example.databricksapps.com",
+            "runner_remote_test",
+            {"Authorization": "Bearer tok-test"},
+            proc,
+            timeout=5.0,
+        )
+
+    message = str(excinfo.value)
+    assert "proxy environment could not be parsed" in message
+    assert "Invalid port" in message
+    # Deterministic construction-time failure: no retry sleeps, no timeout burn.
+    assert sleeps == []
 
 
 def test_run_attach_errors_loud_when_host_offline(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4120,7 +4424,9 @@ def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) 
     def _fake_run_cursor_native(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.cursor_native.run_cursor_native", _fake_run_cursor_native)
+    monkeypatch.setattr(
+        "omnigent.harnesses.cursor_native.main.run_cursor_native", _fake_run_cursor_native
+    )
 
     handled = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -4156,7 +4462,7 @@ def test_redirect_native_resume_covers_every_native_agent(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.goose_native.run_goose_native",
+        "omnigent.harnesses.goose_native.main.run_goose_native",
         lambda **kwargs: captured.update(kwargs),
     )
 
@@ -4216,7 +4522,7 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
     redirected: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.cursor_native.run_cursor_native",
+        "omnigent.harnesses.cursor_native.main.run_cursor_native",
         lambda **kwargs: redirected.update(kwargs),
     )
 

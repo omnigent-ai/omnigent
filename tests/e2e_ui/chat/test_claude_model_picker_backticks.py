@@ -14,7 +14,7 @@ the Model picker → every row must read as a plain model name and both
 1M-context rows must read the same way.
 
 The catalog is produced by the REAL probe pipeline
-(``omnigent.claude_native.claude_model_catalog``) against a stub ``claude``
+(``omnigent.harnesses.claude_native.main.claude_model_catalog``) against a stub ``claude``
 CLI whose stream-json output is byte-identical to what a real Claude Code
 2.1.250 ``claude -p "/model"`` run printed when captured live — so the test
 is deterministic regardless of which CLI version this machine has installed,
@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from omnigent.claude_native import claude_model_catalog
+from omnigent.harnesses.claude_native.main import claude_model_catalog
 from tests.e2e_ui.conftest import fetch_with_retry
 
 # What each picker row must read as once the harness's markdown-code label
@@ -171,7 +171,7 @@ def _open_model_picker(page: Page, base_url: str, session_id: str) -> None:
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
 
 def test_claude_native_picker_shows_plain_model_names(
@@ -198,7 +198,7 @@ def test_claude_native_picker_shows_plain_model_names(
 
     _open_model_picker(page, base_url, session_id)
 
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_LABELS))
     for index, (model_id, label) in enumerate(_EXPECTED_LABELS):
         row = rows.nth(index)
@@ -208,7 +208,7 @@ def test_claude_native_picker_shows_plain_model_names(
 
     # The "Default (…)" sentinel row names the default via the same label, so
     # the backticks must not leak into it either.
-    default_row = page.get_by_role("option", name=re.compile(r"^Default \("))
+    default_row = page.locator('[role="menuitemcheckbox"][data-model-id]').first
     expect(default_row).not_to_contain_text("`")
 
 
@@ -236,7 +236,7 @@ def test_claude_native_picker_1m_context_rows_read_alike(
 
     _open_model_picker(page, base_url, session_id)
 
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_LABELS))
     one_m_texts = [
         rows.nth(index).inner_text().strip()

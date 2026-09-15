@@ -17,16 +17,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  WorkspacePicker,
+  isNavigablePath,
+  resolveWorkspacePath,
+  useResolvedHostHome,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";
 import { buildReconnectCommand } from "./ReconnectSessionDialog";
-import {
-  isValidWorkspace,
-  normalizeWorkspacePath,
-  sessionsSharingDirectory,
-} from "./NewChatDialog";
+import { normalizeWorkspacePath, sessionsSharingDirectory } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -167,8 +168,14 @@ export function ResumeWithDirectoryDialog({
     onOpenChange(next);
   }
 
-  const workspaceTrimmed = normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = isValidWorkspace(workspace);
+  // Resolve a typed "~/…" path to its absolute form against the host's home,
+  // so it's directly submittable without opening the tree browser (the server
+  // never expands ~). Already-absolute values pass through normalized; a
+  // tilde path stays unresolved until the home listing arrives.
+  const resolvedHome = useResolvedHostHome(selectedHostId);
+  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
+  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
+  const workspaceValid = resolvedWorkspace !== null;
 
   // Conflict hint: other *connected* sessions already working in the
   // picked directory on this host (same wiring as NewChatDialog).

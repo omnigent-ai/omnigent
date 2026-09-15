@@ -185,20 +185,28 @@ function beginSessionHostResolve(url: string): Promise<void> | null {
   return resolveSessionHost(decodeURIComponent(match[1]));
 }
 
+// Requests whose target host lives in a JSON body, not the URL, so
+// {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
+// and the host-mediated local import (POST /v1/imports/local[/stream]).
+const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
+
 /**
- * The create endpoint (``POST /v1/sessions``) carries its target host_id in the
- * request body, not the URL, so {@link hostScopeForUrl} can't see it. Left unkeyed,
- * the create round-robins and can miss the replica holding the host's runner
- * tunnel — the server notifies the runner inline over that pod-local tunnel, so
- * an off-replica create fails with "runner is offline". Recover the host_id from
- * a JSON create body so the create is pinned like every other host-scoped
- * request. Bundled (multipart) creates are hostless here — they only write rows
- * and bind the runner via a separate ``POST /v1/hosts/{id}/runners`` — and a
- * sandbox create carries ``host_type`` but no ``host_id``; both yield null.
+ * Recover the target host_id from a JSON request body for a body-host-keyed
+ * request ({@link isBodyHostKeyedRequest}), or null when the body names none.
+ *
+ * These requests carry the host in the body, not the URL, so left unkeyed they
+ * round-robin and can miss the replica holding that host's runner tunnel. A
+ * session create fails "runner is offline" (the server notifies the runner
+ * inline over its pod-local tunnel); an import fails "host is not connected"
+ * (the import reads the host's transcripts over that same tunnel). Keying by the
+ * body host_id pins both to the right replica like every other host-scoped
+ * request. Bundled (multipart) creates are hostless here (non-string body) and a
+ * managed-sandbox create carries ``host_type`` but no ``host_id``; both yield
+ * null → unkeyed (see {@link isBodyHostKeyedRequest}).
  */
-function hostIdForCreateBody(url: string, body: BodyInit | null | undefined): string | null {
+function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
   if (typeof body !== "string") return null;
-  if (!/\/v1\/sessions(?:\?|$)/.test(url)) return null;
+  if (!BODY_HOST_KEYED_RE.test(url)) return null;
   try {
     const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
@@ -208,29 +216,27 @@ function hostIdForCreateBody(url: string, body: BodyInit | null | undefined): st
 }
 
 /**
- * Whether this request is a session create keyable only by its own body host_id.
+ * Whether this request is keyable only by its own body host_id, never the modal.
  *
- * A MANAGED SANDBOX create should never ride the modal host. The modal is a
- * cache-affinity hint for reads, but a create has a side effect pinned to a
- * replica: the managed launch task it spawns lives on whichever pod served it,
- * and that task needs the new host's tunnel in its LOCAL registry to send
- * ``host.launch_runner``. A managed create carries no ``host_id`` (the host does
- * not exist yet), so keying it to the modal host routes the launch task to a
- * replica unrelated to the session — the sandbox boots, its tunnel registers on
- * the default replica, and the launch task never sees it, so no runner is ever
- * spawned. Unkeyed, the create lands on the same default replica the host will
- * dial back to.
+ * The modal host is a cache-affinity hint for reads, but these requests have a
+ * side effect pinned to a replica and must key by their OWN target host:
  *
- * A create that NAMES a host in its body keeps its key (see
- * {@link hostIdForCreateBody}) — that host is a real target whose runner the
- * server notifies inline over its pod-local tunnel, so an off-replica create
- * would fail. A bundled (multipart) create has a non-string body and so is not
- * matched here: it only writes rows and binds the runner via a separate
- * ``POST /v1/hosts/{id}/runners`` (which keys itself from the URL), so it spawns
- * no replica-pinned launch task and may keep riding the modal.
+ * - A session create's managed launch task lives on whichever pod served it and
+ *   needs the new host's tunnel in its LOCAL registry to send
+ *   ``host.launch_runner``. A managed create carries no ``host_id`` (the host
+ *   doesn't exist yet) → null → unkeyed, landing on the same default replica the
+ *   host will dial back to. A create that NAMES a host keeps that key.
+ * - A local import reads the chosen host's transcripts over its tunnel, which is
+ *   registered on the replica keyed by that host_id — never the importing user's
+ *   modal host (null / a different host for a fresh user), which is why an
+ *   unkeyed import lands off-replica and 409s "host is not connected".
+ *
+ * A bundled (multipart) create has a non-string body and is not matched: it only
+ * writes rows and binds the runner via a separate ``POST /v1/hosts/{id}/runners``
+ * (keyed from the URL), so it spawns no replica-pinned work and may ride the modal.
  */
-function isSessionCreate(url: string, body: BodyInit | null | undefined): boolean {
-  return typeof body === "string" && /\/v1\/sessions(?:\?|$)/.test(url);
+function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
+  return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -440,14 +446,15 @@ export async function authenticatedFetch(
     // host isn't known yet must send NO key rather than the modal — the modal
     // is the wrong guess for a SPECIFIC session, so it would route to a replica
     // that doesn't hold the tunnel; a keyless miss re-addresses instead. Only
-    // an unscoped route (list / updates) may ride the modal — a JSON create may
-    // not (see {@link isSessionCreate}): it is keyable ONLY by its own body
-    // host_id, so a managed sandbox create (no host_id yet) stays unkeyed.
+    // an unscoped route (list / updates) may ride the modal — a JSON request
+    // whose target host is in the body may not (see {@link isBodyHostKeyedRequest}):
+    // it is keyable ONLY by that body host_id (a managed create with none stays
+    // unkeyed).
     const scope = hostScopeForUrl(url);
     if (scope.scoped) {
       derivedHostId = scope.hostId;
-    } else if (isSessionCreate(url, init?.body)) {
-      derivedHostId = hostIdForCreateBody(url, init?.body);
+    } else if (isBodyHostKeyedRequest(url, init?.body)) {
+      derivedHostId = hostIdFromBody(url, init?.body);
     } else {
       derivedHostId = modalHostId();
     }

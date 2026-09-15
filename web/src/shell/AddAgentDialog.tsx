@@ -114,7 +114,9 @@ export function AddAgentDialog({
           <DialogTitle>Add agent</DialogTitle>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+        {/* px-1/-mx-1 give the fields' 3px focus ring room to paint:
+            overflow-y-auto also clips horizontally at the padding box. */}
+        <div className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
           <div className="flex flex-col gap-2">
             <span className="text-sm font-medium text-muted-foreground">Pick an agent</span>
             {agentList.length === 0 ? (

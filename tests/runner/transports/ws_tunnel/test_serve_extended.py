@@ -214,11 +214,17 @@ async def test_dispatch_via_asgi_app_crash_sends_500() -> None:
 
     end = decode_frame(sent[2])
     assert isinstance(end, ResponseEndFrame)
+    # Pre-head crash ends cleanly: the synthetic 500 body should be readable,
+    # not aborted.
+    assert end.error is None, (
+        f"pre-head crash sent error-flagged end frame: {end.error!r} — "
+        "breaks clean 500 delivery to the consumer"
+    )
 
 
 @pytest.mark.asyncio
 async def test_dispatch_via_asgi_app_crash_after_head_sends_end() -> None:
-    """An app crash after sending head still sends end frame."""
+    """An app crash after sending head still sends end frame, now error-flagged."""
 
     async def _late_crash_app(
         scope: dict[str, Any],
@@ -238,7 +244,13 @@ async def test_dispatch_via_asgi_app_crash_after_head_sends_end() -> None:
     frames = [decode_frame(s) for s in sent]
     assert isinstance(frames[0], ResponseHeadFrame)
     assert frames[0].status == 200
-    assert isinstance(frames[-1], ResponseEndFrame)
+    end = frames[-1]
+    assert isinstance(end, ResponseEndFrame)
+    # After-head crash must signal the error so the consumer raises rather than
+    # seeing a clean EOF after partial body.
+    assert end.error is not None, (
+        "after-head crash sent clean end frame — consumer would see silent EOF"
+    )
 
 
 @pytest.mark.asyncio
@@ -388,23 +400,29 @@ async def test_serve_tunnel_recycle_close_code_resets_backoff(
 async def test_serve_tunnel_on_reconnect_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """on_reconnect is called after successful reconnect (not initial connect)."""
-    reconnects: list[str] = []
+    """on_reconnect runs only after a reconnect reaches the ready state."""
+    events: list[str] = []
     call_count = 0
 
     async def _serve_once(app: Any, **kwargs: Any) -> None:
         nonlocal call_count
         call_count += 1
-        # A clean return models a served-then-closed connection, so the
-        # upgrade-accepted callback fires like the real _serve_tunnel_once.
+        events.append(f"attempt-{call_count}")
+        if call_count == 2:
+            raise ConnectionError("server is still starting")
         kwargs["on_connected"]()
+        on_ready = kwargs["on_ready"]
+        if on_ready is not None:
+            events.append(f"ready-{call_count}")
+            await on_ready()
 
     async def _sleep(delay: float) -> None:
-        if call_count >= 2:
+        del delay
+        if call_count >= 3:
             raise asyncio.CancelledError
 
     async def _on_reconnect() -> None:
-        reconnects.append("reconnected")
+        events.append("reconnected")
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
@@ -418,8 +436,90 @@ async def test_serve_tunnel_on_reconnect_callback(
             on_reconnect=_on_reconnect,
         )
 
-    # on_reconnect is called before the second _serve_once, not the first.
-    assert reconnects == ["reconnected"]
+    assert events == [
+        "attempt-1",
+        "attempt-2",
+        "attempt-3",
+        "ready-3",
+        "reconnected",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_records_connection_lifecycle_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner metrics distinguish an initial connection from a reconnect."""
+    call_count = 0
+    connected: list[tuple[str, bool]] = []
+    disconnected: list[tuple[str, BaseException | None]] = []
+
+    async def _serve_once(app: Any, **kwargs: Any) -> None:
+        nonlocal call_count
+        del app
+        call_count += 1
+        kwargs["on_connected"]()
+
+    async def _sleep(delay: float) -> None:
+        del delay
+        if call_count >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(
+        serve_module,
+        "record_websocket_connected",
+        lambda kind, *, reconnect: connected.append((kind, reconnect)),
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append((kind, error)),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://localhost:8000",
+            runner_id="r1",
+            runner_version="0.1.0",
+        )
+
+    assert connected == [("runner", False), ("runner", True)]
+    assert disconnected == [("runner", None), ("runner", None)]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_records_unexpected_error_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected post-connect exception is recorded, not a clean close."""
+    disconnected: list[tuple[str, BaseException | None]] = []
+
+    async def _serve_once(app: Any, **kwargs: Any) -> None:
+        del app
+        kwargs["on_connected"]()
+        raise RuntimeError("callback blew up")
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(
+        serve_module,
+        "record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append((kind, error)),
+    )
+
+    with pytest.raises(RuntimeError, match="callback blew up"):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://localhost:8000",
+            runner_id="r1",
+            runner_version="0.1.0",
+        )
+
+    assert len(disconnected) == 1
+    assert disconnected[0][0] == "runner"
+    assert isinstance(disconnected[0][1], RuntimeError)
 
 
 # ── websocket_http_status edge cases ────────────────────

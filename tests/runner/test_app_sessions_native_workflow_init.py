@@ -15,9 +15,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import native_dispatch
-from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
@@ -144,7 +144,7 @@ async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> 
         return {"PI_BRIDGE": conversation_id}
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.pi_native_bridge.build_pi_native_spawn_env", _fake_build)
+        mp.setattr("omnigent.harnesses.pi_native.bridge.build_pi_native_spawn_env", _fake_build)
         async with httpx.AsyncClient(base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "pi-native",
@@ -174,7 +174,9 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     transport = httpx.MockTransport(_labels_handler)
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.codex_native_bridge.build_codex_native_spawn_env", _fake_build)
+        mp.setattr(
+            "omnigent.harnesses.codex_native.bridge.build_codex_native_spawn_env", _fake_build
+        )
         async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "codex-native",
@@ -202,7 +204,9 @@ async def test_resolve_native_spawn_env_claude_uses_bridge_id_helper() -> None:
         return "claude_bridge_1"
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.claude_native_bridge.build_claude_native_spawn_env", _fake_build)
+        mp.setattr(
+            "omnigent.harnesses.claude_native.bridge.build_claude_native_spawn_env", _fake_build
+        )
         mp.setattr(
             "omnigent.runner.native.orchestration._claude_native_bridge_id_with_optional_labels",
             _fake_bridge_id,
@@ -235,8 +239,10 @@ async def test_resolve_native_spawn_env_hermes_writes_policy_hook_before_build()
         return {"HERMES_BRIDGE": session_id}
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.hermes_native_bridge.write_policy_hook_config", _fake_write)
-        mp.setattr("omnigent.hermes_native_bridge.build_hermes_native_spawn_env", _fake_build)
+        mp.setattr("omnigent.harnesses.hermes_native.bridge.write_policy_hook_config", _fake_write)
+        mp.setattr(
+            "omnigent.harnesses.hermes_native.bridge.build_hermes_native_spawn_env", _fake_build
+        )
         async with httpx.AsyncClient(base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "hermes-native",
@@ -1242,9 +1248,8 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
 
     End-to-end through ``POST /v1/sessions/{conv}/events`` (no live LLM):
     the scripted harness emits an ``action_required`` for a spec-declared
-    python tool, and the runner must dispatch it locally with
-    ``runner_workspace`` set to the resolved ``ResolvedSpec.workdir`` (the
-    bundle dir), not the generic CLI ``runner_workspace``. This is the
+    python tool, and the runner must dispatch it locally with the session
+    workspace kept separate from the resolved ``ResolvedSpec.workdir``. This is the
     dispatch-time counterpart to
     :func:`test_runner_session_tool_schemas_use_resolved_bundle_workdir`,
     which only proved schema generation used the bundle workdir.
@@ -1260,6 +1265,8 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    session_workspace = tmp_path / "session-worktree"
+    session_workspace.mkdir()
     spec = AgentSpec(
         spec_version=1,
         name="bundle-agent",
@@ -1272,10 +1279,15 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
         ],
     )
 
-    captured_workspaces: list[Path | None] = []
+    captured_workspaces: list[tuple[Path | None, Path | None]] = []
 
-    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
-        captured_workspaces.append(runner_workspace)
+    async def _fake_dispatch(
+        *,
+        runner_workspace: Path | None = None,
+        local_tool_workdir: Path | None = None,
+        **kwargs: Any,
+    ) -> str:
+        captured_workspaces.append((runner_workspace, local_tool_workdir))
         return "ok"
 
     monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
@@ -1303,10 +1315,23 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
         del agent_id, session_id
         return ResolvedSpec(spec=spec, workdir=bundle_dir)
 
+    class _WorkspaceServerClient(NullServerClient):
+        class _WorkspaceResponse(NullServerClient._Response):
+            def json(self) -> dict[str, Any]:
+                return {
+                    "workspace": str(session_workspace),
+                    "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                }
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            if url.startswith("/v1/sessions/"):
+                return self._WorkspaceResponse()
+            return await super().get(url, **kwargs)
+
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=_WorkspaceServerClient(),  # type: ignore[arg-type]
         runner_workspace=workspace,
     )
     async with _runner_client(app) as client:
@@ -1328,10 +1353,7 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
             await asyncio.sleep(0.05)
 
     assert captured_workspaces, "native tool must be dispatched locally"
-    assert captured_workspaces[0] == bundle_dir, (
-        "dispatch must use the resolved bundle workdir, not runner_workspace "
-        f"({workspace!r}); got {captured_workspaces[0]!r}"
-    )
+    assert captured_workspaces[0] == (session_workspace.resolve(), bundle_dir)
 
 
 @pytest.mark.asyncio
@@ -2073,6 +2095,17 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                     (),
                     {"status_code": 200, "json": lambda self: {"data": []}},
                 )()
+            if path.endswith("/child_sessions"):
+                # Restart recovery lists the session's children; an empty
+                # list ends the scan after this single read.
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "status_code": 200,
+                        "json": lambda self: {"data": [], "has_more": False},
+                    },
+                )()
             raise AssertionError(f"unexpected metadata callback: {path}")
 
     server_client = _ServerClient()
@@ -2130,7 +2163,13 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     assert first_response.json()["session_init_protocol_version"] == 2
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
-    assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
+    # The envelope supplies session metadata, so the only snapshot-style
+    # callback is the history read; restart recovery adds one read of the
+    # durable child-session list, which is empty here.
+    assert server_client.get_paths == [
+        f"/v1/sessions/{session_id}/child_sessions",
+        f"/v1/sessions/{session_id}/items",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2493,7 +2532,7 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
     # No bridge dir exists in this test; keep the lazy comment-relay start
     # from parking on the cold-bridge tools/list_changed wait.
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.post_tools_changed",
+        "omnigent.harnesses.claude_native.bridge.post_tools_changed",
         lambda *args, **kwargs: None,
     )
 
@@ -2559,3 +2598,23 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
 
     assert compactions, "harness compaction was never persisted to the server"
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
+
+
+def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
+    """Every kimi forwarder start must be preceded by a bridge-state clear.
+
+    This is the invariant that lets the forwarder discard a state file it
+    cannot parse (e.g. one written by an older build): the only path that
+    starts ``supervise_kimi_forwarder`` is ``_auto_create_kimi_terminal``,
+    which always unlinks the state file (and stamps a fresh launch epoch)
+    first, so a stale state file is never read by a new forwarder.
+    """
+    import inspect
+
+    from omnigent.runner.native import orchestration as orch
+
+    src = inspect.getsource(orch._auto_create_kimi_terminal)
+    assert "clear_kimi_bridge_state(bridge_dir)" in src
+    assert src.index("clear_kimi_bridge_state(bridge_dir)") < src.rindex(
+        "supervise_kimi_forwarder("
+    )

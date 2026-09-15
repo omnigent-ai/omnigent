@@ -139,10 +139,10 @@ platform :ios do
 
     app_path = File.join(build_dir, "Build/Products/Debug-iphonesimulator/Omnigent.app")
 
-    # Boot, install, and launch
-    sh("xcrun simctl boot '#{device}' || true") # || true so already-booted is fine
-    sh("xcrun simctl install booted '#{app_path}'")
-    sh("xcrun simctl launch booted ai.omnigent.ios")
+    # Wait for the selected simulator rather than racing its boot process.
+    sh("xcrun simctl bootstatus '#{device}' -b")
+    sh("xcrun simctl install '#{device}' '#{app_path}'")
+    sh("xcrun simctl launch '#{device}' ai.omnigent.ios")
 
     UI.success("Launched on #{device}")
   end

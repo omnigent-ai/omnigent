@@ -8,7 +8,7 @@ resolves ``"cursor-native"`` to this module via
 Wraps a :class:`omnigent.inner.cursor_native_executor.CursorNativeExecutor`,
 which injects web-UI messages into the running ``cursor-agent`` TUI (launched by
 ``omnigent cursor`` in the session terminal) via tmux. The bridge dir is read
-from :data:`~omnigent.cursor_native_bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
+from :data:`~omnigent.harnesses.cursor_native.bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
 
 Tool policies: Omnigent's PreToolUse/PostToolUse policy gates (which claude- and
 codex-native enforce via hooks) do NOT apply to cursor-native — ``cursor-agent``

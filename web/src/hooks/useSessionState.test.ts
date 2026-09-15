@@ -34,11 +34,29 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "idle" }))).toBeNull();
   });
 
-  it("falls through to null when status is failed (no longer a sidebar state)", () => {
-    // status="failed" is a server-side concept that the chat surfaces
-    // with its own error UI; the sidebar deliberately does not render
-    // it. See useSessionState.ts header for rationale.
-    expect(getSessionState(conv({ status: "failed" }))).toBeNull();
+  it("flags a latest-message error even when the session has settled to idle", () => {
+    expect(getSessionState(conv({ status: "idle" }), true)).toEqual({ kind: "error" });
+  });
+
+  it("keeps running and approval states ahead of a previous message error", () => {
+    expect(getSessionState(conv({ status: "running" }), true)).toEqual({ kind: "running" });
+    expect(getSessionState(conv({ status: "idle", pending_elicitations_count: 1 }), true)).toEqual({
+      kind: "awaiting",
+      count: 1,
+    });
+  });
+
+  it("returns error from the existing failed session status", () => {
+    expect(getSessionState(conv({ status: "failed" }))).toEqual({ kind: "error" });
+  });
+
+  it("follows status updates without retaining an old error", () => {
+    const conversation = conv({ status: "failed" });
+    expect(getSessionState(conversation)).toEqual({ kind: "error" });
+    conversation.status = "running";
+    expect(getSessionState(conversation)).toEqual({ kind: "running" });
+    conversation.status = "idle";
+    expect(getSessionState(conversation)).toBeNull();
   });
 
   it("treats failed + pending elicitation as awaiting (the actionable signal)", () => {

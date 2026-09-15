@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
@@ -112,8 +113,14 @@ _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 
 # ACP protocol constants (JSON-RPC 2.0 method names).
 _AGENT_METHOD_INITIALIZE = "initialize"
+_AGENT_METHOD_AUTHENTICATE = "authenticate"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+# Browser/device-login method ids that cannot complete on a headless sandbox.
+_ACP_INTERACTIVE_AUTH_METHODS = frozenset({"grok.com"})
+# ACP error code an agent returns when a request requires ``authenticate``
+# first (Grok Build's ``session/new`` uses it for "Authentication required").
+_ACP_AUTH_REQUIRED_CODE = -32000
 
 # Notification sent *from* the agent to the client (streaming progress).
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -296,6 +303,49 @@ def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     return mime, payload
 
 
+def _is_auth_required_error(error: object) -> bool:
+    """True when a JSON-RPC error object says authentication is required.
+
+    Matches the ACP auth-required error code and, as a fallback for agents
+    that use a generic code, an "authentication required" message.
+    """
+    if not isinstance(error, dict):
+        return False
+    if error.get("code") == _ACP_AUTH_REQUIRED_CODE:
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and "authentication required" in message.lower()
+
+
+def _unattended_auth_method_id(initialize_result: _AcpJsonObject) -> str | None:
+    """Pick a non-browser ACP auth method, or ``None`` if none is advertised.
+
+    Prefers ``_meta.defaultAuthMethodId`` (Grok sets this to ``cached_token``
+    when ``auth.json`` loaded) and otherwise the first method that is not a
+    known interactive login id. Entries without a string ``id`` are skipped.
+    """
+    methods = initialize_result.get("authMethods")
+    if not isinstance(methods, list) or not methods:
+        return None
+    ids = [
+        method.get("id")
+        for method in methods
+        if isinstance(method, dict) and isinstance(method.get("id"), str)
+    ]
+    meta = initialize_result.get("_meta")
+    default = meta.get("defaultAuthMethodId") if isinstance(meta, dict) else None
+    if (
+        isinstance(default, str)
+        and default in ids
+        and default not in _ACP_INTERACTIVE_AUTH_METHODS
+    ):
+        return default
+    for method_id in ids:
+        if method_id not in _ACP_INTERACTIVE_AUTH_METHODS:
+            return method_id
+    return None
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -364,6 +414,13 @@ class AcpExecutor(Executor):
         self._session_id: str | None = None
         self._initialized: bool = False
         self._image_supported: bool = False
+        # One-way latch per subprocess: set after a successful ACP
+        # ``authenticate``; reset on restart so a fresh process re-auths.
+        self._authenticated: bool = False
+        # ``initialize.result`` snapshot advertising auth (``authMethods`` +
+        # ``_meta.defaultAuthMethodId``); consumed only when ``session/new``
+        # actually reports that authentication is required.
+        self._auth_advertisement: _AcpJsonObject = {}
         self._system_prompt_sent: bool = False
 
         # ACP toolCallId → tool name / rawInput from the originating tool_call, so
@@ -410,6 +467,8 @@ class AcpExecutor(Executor):
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
         self._image_supported = False
+        self._authenticated = False
+        self._auth_advertisement = {}
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
@@ -422,6 +481,9 @@ class AcpExecutor(Executor):
             env=env,
             cwd=self._cwd,
             limit=_STREAM_LIMIT,
+            # Own session/group: the sandbox launcher forks the real agent,
+            # and without a group boundary teardown reaches only the wrapper.
+            **_proc.spawn_kwargs(),
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -677,11 +739,66 @@ class AcpExecutor(Executor):
             message = resp["error"].get("message", resp["error"])
             self._warn_initialize_failed(str(message))
             raise RuntimeError(f"ACP initialize failed: {message}")
+        result = resp.get("result") or {}
         prompt_caps = (
-            (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
+            result.get("agentCapabilities", {}).get("promptCapabilities", {})
+            if isinstance(result, dict)
+            else {}
         )
         self._image_supported = bool(prompt_caps.get("image"))
+        # Stash the advertised auth methods but do NOT authenticate here:
+        # sending an unsolicited ``authenticate`` would change the handshake
+        # for every agent that advertises methods informationally (or is
+        # already authenticated via env/disk). ``_ensure_session`` reacts
+        # only when ``session/new`` actually demands authentication.
+        self._auth_advertisement = result if isinstance(result, dict) else {}
         self._initialized = True
+
+    async def _authenticate(self, method_id: str) -> None:
+        """Send ACP ``authenticate`` with *method_id* and latch success.
+
+        Called reactively from :meth:`_ensure_session` after ``session/new``
+        reports that authentication is required — never proactively, so agents
+        whose ``session/new`` already succeeds keep their handshake untouched.
+        """
+        auth_resp = await self._rpc(
+            _AGENT_METHOD_AUTHENTICATE,
+            {"methodId": method_id},
+            timeout=_INIT_TIMEOUT_SECONDS,
+        )
+        if "error" in auth_resp:
+            error = auth_resp["error"]
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise RuntimeError(f"ACP authenticate failed: {message}")
+        self._authenticated = True
+
+    async def _authenticate_and_retry_session_new(
+        self, resp: _AcpJsonObject, params: _AcpJsonObject
+    ) -> _AcpJsonObject:
+        """Authenticate with an advertised headless method and retry once.
+
+        Grok Build (``grok agent stdio``) rejects ``session/new`` with
+        ``Authentication required`` until the client sends ``authenticate``;
+        its ``_meta.defaultAuthMethodId`` (``cached_token`` when
+        ``~/.grok/auth.json`` holds a token) completes headlessly. If the
+        agent advertises only interactive/browser methods — or a malformed
+        list with no usable id — raise a clear diagnosis instead of attempting
+        a login that cannot succeed on a headless host. With no advertised
+        methods at all, return the original error untouched.
+        """
+        method_id = _unattended_auth_method_id(self._auth_advertisement)
+        if method_id is None:
+            if self._auth_advertisement.get("authMethods"):
+                error = resp["error"]
+                message = error.get("message", error) if isinstance(error, dict) else error
+                raise RuntimeError(
+                    "ACP session/new requires authentication, but the agent "
+                    "advertises no headless auth method (browser-only or "
+                    f"malformed authMethods): {message}"
+                )
+            return resp
+        await self._authenticate(method_id)
+        return await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning the session id.
@@ -708,6 +825,8 @@ class AcpExecutor(Executor):
             params["model"] = self._config.model
 
         resp = await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        if "error" in resp and not self._authenticated and _is_auth_required_error(resp["error"]):
+            resp = await self._authenticate_and_retry_session_new(resp, params)
         if "error" in resp:
             raise RuntimeError(
                 f"ACP session/new failed: {resp['error'].get('message', resp['error'])}"
@@ -720,6 +839,12 @@ class AcpExecutor(Executor):
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = session_id
+        # Capture the agent's advertised model from session/new's config options, so a
+        # turn's usage can name it. Agents that report the model here (e.g. jcode) would
+        # otherwise leave it unknown until a later config_option_update, leaving the
+        # server unable to attribute per-model token usage for the turn.
+        if isinstance(result, dict):
+            self._note_config_options(result.get("configOptions"))
         return self._session_id
 
     def _session_mcp_servers(self) -> list[_AcpJsonObject]:
@@ -1176,14 +1301,15 @@ class AcpExecutor(Executor):
         return self._context_window
 
     @staticmethod
-    def _usage_from_result(result: _AcpJsonObject) -> dict[str, int] | None:
+    def _usage_from_result(result: _AcpJsonObject) -> dict[str, Any] | None:
         """Map an agent's final ``result.usage`` to Omnigent's usage keys.
 
-        ACP does not standardize usage, but agents that report it (Goose, Devin)
-        use ``{totalTokens, inputTokens, outputTokens}`` plus an optional
-        ``cachedReadTokens``; Omnigent's ``TurnComplete.usage`` uses
-        ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens}``.
-        Absent → ``None`` (usage simply isn't shown for agents that don't report).
+        ACP does not standardize usage, but agents that report it (Goose, Devin,
+        jcode) use ``{totalTokens, inputTokens, outputTokens}`` plus optional
+        ``cachedReadTokens`` / ``cachedWriteTokens``; Omnigent's ``TurnComplete.usage``
+        uses ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens,
+        cache_creation_input_tokens}``. Absent → ``None`` (usage simply isn't shown for
+        agents that don't report).
 
         ``cachedReadTokens`` is kept as its own key rather than folded into
         ``input_tokens``: cache reads are real consumption but billed at a
@@ -1195,17 +1321,37 @@ class AcpExecutor(Executor):
         usage = result.get("usage")
         if not isinstance(usage, dict):
             return None
-        out: dict[str, int] = {}
+        out: dict[str, Any] = {}
         for acp_key, omni_key in (
             ("inputTokens", "input_tokens"),
             ("outputTokens", "output_tokens"),
             ("totalTokens", "total_tokens"),
             ("cachedReadTokens", "cache_read_input_tokens"),
+            ("cachedWriteTokens", "cache_creation_input_tokens"),
         ):
             value = usage.get(acp_key)
             if isinstance(value, int) and not isinstance(value, bool):
                 out[omni_key] = value
         return out or None
+
+    def _usage_with_active_model(self, result: _AcpJsonObject) -> dict[str, Any] | None:
+        """Usage from the result, tagged with the active model for cost attribution.
+
+        ACP ``result.usage`` carries token counts but no model id, so the server
+        cannot attribute a turn's tokens to a model — leaving its per-model usage
+        view (``usage_by_model``) empty and the counts unrendered in the UI. Stamp
+        the agent's active model (its ``model`` config option, captured at
+        ``session/new``) so the tokens are attributed, mirroring how codex stamps
+        ``usage["model"]``. The stamp is skipped when the model is unknown or the
+        agent already reported one on the result.
+
+        :param result: The ACP ``session/prompt`` result object.
+        :returns: The usage dict (with ``model`` when known), or ``None``.
+        """
+        usage = self._usage_from_result(result)
+        if usage is not None and self._active_model and "model" not in usage:
+            usage["model"] = self._active_model
+        return usage
 
     def _is_bridge_tool_call(self, name: str, update: _AcpJsonObject) -> bool:
         """True when this tool call reaches Omnigent through the MCP bridge.
@@ -1566,7 +1712,7 @@ class AcpExecutor(Executor):
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_from_result(result) if isinstance(result, dict) else None
+                usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
@@ -1643,10 +1789,12 @@ class AcpExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]
             try:
-                self._proc.terminate()
+                # Tree-aware: the handle is the sandbox launcher, not the
+                # agent it forked. A bare terminate() orphans the agent.
+                _proc.terminate_tree(self._proc)
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(Exception):
-                    self._proc.kill()
+                    _proc.kill_tree(self._proc)
             finally:
                 self._proc = None

@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 import tomllib
 
-from omnigent.kimi_native_credentials import resolve_user_kimi_home
+from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 
 # Provider ``type`` values that identify a Kimi / Moonshot API-key provider in
 # ``config.toml``. The manual coding-endpoint block uses ``kimi``; a provider
@@ -51,7 +51,7 @@ _KIMI_API_KEY_ENV_VARS: tuple[str, ...] = ("KIMI_API_KEY", "MOONSHOT_API_KEY")
 def _kimi_config_path() -> Path:
     """Return the path to the user's Kimi Code ``config.toml``.
 
-    Mirrors :func:`~omnigent.kimi_native_credentials.resolve_user_kimi_home`
+    Mirrors :func:`~omnigent.harnesses.kimi_native.credentials.resolve_user_kimi_home`
     (``$KIMI_CODE_HOME`` when set, else ``~/.kimi-code``) and appends
     ``config.toml``.
     """
@@ -63,7 +63,7 @@ def _kimi_credentials_path() -> Path:
 
     ``$KIMI_CODE_HOME/credentials/kimi-code.json`` (default
     ``~/.kimi-code/credentials/kimi-code.json``), resolved at call time via
-    :func:`~omnigent.kimi_native_credentials.resolve_user_kimi_home` so it
+    :func:`~omnigent.harnesses.kimi_native.credentials.resolve_user_kimi_home` so it
     honors ``$KIMI_CODE_HOME`` — matching where kimi actually stores auth.
     """
     return resolve_user_kimi_home() / "credentials" / "kimi-code.json"

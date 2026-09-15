@@ -1,0 +1,201 @@
+<!doctype html>
+<!--
+  Arca connect console — a SHELL-OWNED modal page (see src/arca_connect_window.js
+  for the trust model). Shows the exact command that will run on the user's Arca
+  instance, then streams its live output into the terminal pane below, so
+  enrollment is fully transparent. All dynamic values are set via textContent —
+  never innerHTML — since the server URL is remote-influenced data.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline' 'self'; script-src 'self'; font-src 'self'"
+    />
+    <title>Connect Arca</title>
+    <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1f2328;
+        --muted: #656d76;
+        --border: #d0d7de;
+        --accent: #0969da;
+        --danger: #cf222e;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e6edf3;
+          --muted: #8d96a0;
+          --border: #30363d;
+          --accent: #4493f8;
+          --danger: #f85149;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 16px;
+        font:
+          13px/1.45 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        color: var(--fg);
+        background: Canvas;
+        user-select: none;
+      }
+      h1 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+      #server {
+        font-weight: 500;
+        color: var(--fg);
+      }
+      /* One terminal box: the `$ command` line pinned up top, and — once the
+         run starts — an xterm.js pane streaming the live output below it. In
+         the asking phase it hugs the command; on confirm it expands. */
+      #console {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        font:
+          12px/1.5 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 10px;
+        background: #0d1117;
+        color: #e6edf3;
+        user-select: text;
+      }
+      body:not([data-phase="asking"]) #console {
+        flex: 1;
+        min-height: 0;
+      }
+      #command {
+        margin: 0;
+        flex: none;
+        font: inherit;
+        /* Wrap rather than scroll: the user is asked to READ this command,
+           and scrollbars in a small consent card hide the tail of the very
+           thing being consented to. break-all because a URL is one long
+           unbreakable token. */
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      /* Shell prompt, as CSS generated content: visually a `$ ` prefix, but
+         never part of a copy/paste selection. */
+      #command::before {
+        content: "$ ";
+        color: #8d96a0;
+        user-select: none;
+      }
+      /* The xterm.js mount point; the addon-fit sizes the grid to it. */
+      #terminal {
+        flex: 1;
+        min-height: 0;
+      }
+      /* Output exists only once a run started. */
+      body[data-phase="asking"] #terminal,
+      body[data-phase="asking"] #status {
+        display: none;
+      }
+      #status {
+        min-height: 1.4em;
+        font-weight: 500;
+      }
+      #status[data-kind="error"] {
+        color: var(--danger);
+      }
+      #status[data-kind="ok"] {
+        color: var(--accent);
+      }
+      footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+      button {
+        padding: 5px 14px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: Canvas;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      /* Inline spinner for the (still disabled) Connect button while the
+         command runs. Flex centering keeps the ring optically middle-aligned
+         with the label at any font metrics. */
+      button.loading {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        opacity: 0.85;
+      }
+      button.loading::before {
+        content: "";
+        flex: none;
+        width: 10px;
+        height: 10px;
+        border: 2px solid rgb(255 255 255 / 40%);
+        border-top-color: #fff;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body data-phase="asking">
+    <h1>Connect your Arca instance?</h1>
+    <p>
+      This runs the command below over <span id="server">…</span>. While connected as a runner, that
+      server can execute agent code and commands on the Arca instance on its behalf. Only confirm
+      for servers you trust.
+    </p>
+    <div id="console">
+      <div id="command">…</div>
+      <div id="terminal"></div>
+    </div>
+    <div id="status"></div>
+    <footer>
+      <button id="cancel" type="button">Cancel</button>
+      <button id="confirm" type="button" class="primary">Connect</button>
+    </footer>
+    <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+    <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+    <script src="./console.js"></script>
+  </body>
+</html>

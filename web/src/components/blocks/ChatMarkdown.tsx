@@ -19,6 +19,7 @@ import { MessageResponse } from "@/components/ai-elements/message";
 import { WORKSPACE_FILE_LINK_ATTR } from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
+import { isNativeShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
@@ -159,6 +160,37 @@ function WorkspacePathInlineCode({
 const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-primary underline";
 
 /**
+ * Follows an external chat link (`target="_blank"`) on a plain click, with a
+ * same-tab fallback where popup creation is withheld. In a normal browser tab
+ * the link still opens a new tab, but in an embedding host pane (or under a
+ * popup blocker) a bare `_blank` click is silently swallowed — nothing opens
+ * and nothing navigates — so a click must fall back to navigating in place.
+ * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
+ * open-in-new-tab / menu semantics. Native shells are left on the default
+ * path: their window-open policy routes the link externally and reports
+ * `null` regardless, so the fallback would navigate twice.
+ */
+function followLinkWithPopupFallback(
+  event: React.MouseEvent<HTMLAnchorElement>,
+  href: string,
+): void {
+  if (event.defaultPrevented || event.button !== 0) return;
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (isNativeShell()) return;
+  if (!/^(?:https?:)?\/\//i.test(href)) return;
+  event.preventDefault();
+  const popup = window.open("about:blank", "_blank");
+  if (popup) {
+    popup.opener = null;
+  }
+  const link = (popup?.document ?? document).createElement("a");
+  link.href = href;
+  link.target = "_self";
+  link.rel = "noopener noreferrer";
+  link.click();
+}
+
+/**
  * Anchor renderer for markdown links. A link to a workspace file, its href
  * parked on a fragment by `markWorkspaceFileLinks` and the real path moved to
  * `WORKSPACE_FILE_LINK_ATTR`, opens the FileViewer instead of navigating,
@@ -181,6 +213,9 @@ function WorkspaceFileLink({
   const openWorkspaceFile = useWorkspaceFileOpener(path);
 
   if (!path) {
+    // Streamdown renders external links with target="_blank"; those need the
+    // popup fallback so a click still works where new tabs can't open.
+    const blankHref = props.target === "_blank" && typeof href === "string" ? href : null;
     return (
       <a
         href={href}
@@ -188,6 +223,14 @@ function WorkspaceFileLink({
         title={title}
         data-streamdown="link"
         {...props}
+        onClick={
+          blankHref === null
+            ? props.onClick
+            : (event) => {
+                props.onClick?.(event);
+                followLinkWithPopupFallback(event, blankHref);
+              }
+        }
       >
         {children}
       </a>

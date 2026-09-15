@@ -113,6 +113,13 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
         assert "EXPLORE / SEARCH — answer a specific question" in prompt
 
 
+def test_polly_preflights_host_harness_readiness() -> None:
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    assert "sys_session_get_info({})" in config
+    assert "`configured_harnesses` map" in config
+    assert config.index("configured_harnesses") < config.index("command -v")
+
+
 def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
     """
     The ``pi`` sub-agent is a headless scaffold-harness child: pi harness,

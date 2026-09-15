@@ -634,3 +634,52 @@ def test_delete_conversation_keeps_template_agent(
 
     asyncio.run(store.delete_conversation(conv.id))
     assert _col(omnigent_db, "agents", "id") == ["191cbf904e3223e9e00ac9a1abfe79a5"]
+
+
+# ── Connection-checkout budget ─────────────────────────
+
+
+def test_get_conversation_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Split-DB keeps two checkouts — one per engine — and still reads metadata.
+
+    The single-DB collapse comes from ``shared_read_scope``, which keys its
+    shared session by engine. Here the metadata table genuinely lives on another
+    engine, so its checkout cannot be shared away; what must not regress is the
+    routing (metadata still read from the Omnigent DB) or the per-engine budget.
+    """
+    from sqlalchemy import event
+
+    created = store.create_conversation(
+        title="split-budget",
+        runner_id="runner_split",
+        host_id="a6bfc420101272fcd5906a9eff904dfd",
+        workspace="/tmp/ws",
+    )
+
+    per_engine: dict[str, int] = {"conv": 0, "omnigent": 0}
+
+    def _mk(tag: str) -> Any:
+        def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+            per_engine[tag] += 1
+
+        return _on_checkout
+
+    conv_hook, omni_hook = _mk("conv"), _mk("omnigent")
+    assert store._conv_engine is not store._engine, "fixture must be split-DB"
+    event.listen(store._conv_engine, "checkout", conv_hook)
+    event.listen(store._engine, "checkout", omni_hook)
+    try:
+        conv = store.get_conversation(created.id)
+    finally:
+        event.remove(store._conv_engine, "checkout", conv_hook)
+        event.remove(store._engine, "checkout", omni_hook)
+
+    assert per_engine == {"conv": 1, "omnigent": 1}, per_engine
+    assert conv is not None
+    assert conv.title == "split-budget"
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_split",
+        "a6bfc420101272fcd5906a9eff904dfd",
+    )

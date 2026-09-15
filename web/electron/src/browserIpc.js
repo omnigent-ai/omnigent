@@ -381,7 +381,13 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     const g = gateRegistry(event);
     if (g.error) return { exists: false };
     const { conversationId } = args ?? {};
-    return { exists: typeof conversationId === "string" && g.registry.has(conversationId) };
+    const entry = typeof conversationId === "string" ? g.registry.get(conversationId) : null;
+    if (!entry) return { exists: false };
+    return {
+      exists: true,
+      url: entry.view.webContents.getURL(),
+      ...readNavState(entry.view.webContents),
+    };
   });
 
   // Destroy the conversation's view (explicit close — unmount only detaches).

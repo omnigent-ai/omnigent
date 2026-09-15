@@ -45,6 +45,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: write   # dispatch a Merge Ready re-evaluation when this flips green
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -75,3 +76,21 @@ jobs:
         run: |
           : "${E2E_UI_JUDGE_MODEL:?Set OMNIGENT_CI_E2E_JUDGE_MODEL repository variable}"
           bash .github/scripts/e2e-ui-required/check.sh
+
+      # Merge Ready (the single required gating check) does NOT re-evaluate when
+      # this check flips green: E2E UI Required isn't in Merge Ready's
+      # workflow_run trigger list, and its check_run only wakes Merge Ready for
+      # DCO. So when a `skip-e2e-ui-test` waiver (or a newly pushed test) turns
+      # this check green, the PR would otherwise sit BLOCKED with every check
+      # already green. Nudge Merge Ready to re-post its status. Only on success --
+      # a red gate must stay blocking, and Merge Ready ignores a workflow_dispatch
+      # re-eval that isn't fully green anyway.
+      - name: Re-evaluate Merge Ready
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run merge-ready.yml -R "$REPO" -f pr="$PR" \
+            || echo "::warning::could not dispatch Merge Ready re-evaluation for #$PR"

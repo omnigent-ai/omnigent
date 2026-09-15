@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import qwen_native_bridge as qnb
+from omnigent.harnesses.qwen_native import bridge as qnb
 
 
 def _user_item(text: str, *, response_id: str | None = None) -> dict:

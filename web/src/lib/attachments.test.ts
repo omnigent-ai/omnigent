@@ -77,6 +77,19 @@ describe("validateAttachments", () => {
     expect(errors[0]).toContain("too large");
   });
 
+  it("caps non-compressible images (SVG) at the smaller limit", () => {
+    // Under 5 MB: accepted. A raster PNG the same size would be fine too, but
+    // SVG can't be compressed server-side, so it keeps the small cap.
+    const smallSvg = makeFile("icon.svg", "image/svg+xml", 4 * MB);
+    expect(validateAttachments([smallSvg]).accepted).toHaveLength(1);
+
+    // Between the SVG cap (5 MB) and the raster image cap (50 MB): rejected.
+    const bigSvg = makeFile("big.svg", "image/svg+xml", 6 * MB);
+    const { accepted, errors } = validateAttachments([bigSvg]);
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("too large");
+  });
+
   it("partitions a mixed batch into accepted + errors", () => {
     const ok = makeFile("a.png", "image/png");
     const badType = makeFile("a.zip", "application/zip");

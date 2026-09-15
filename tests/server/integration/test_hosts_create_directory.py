@@ -301,3 +301,23 @@ async def test_create_directory_unknown_host_returns_404(
         )
 
     assert resp.status_code == 404
+
+
+async def test_create_directory_windows_drive_path_accepted(
+    mkdir_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """A Windows drive path is absolute and must not 400 as relative."""
+    app, _reg, _comm, _replies, _drain = mkdir_setup
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/directories",
+            json={"path": r"C:\Users\alice\work\fresh"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path"] == r"C:\Users\alice\work\fresh"

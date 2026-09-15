@@ -1,0 +1,24 @@
+
+╭─── Claude Code v2.1.236 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│                    Welcome back!                   │ Run /init to create a CLAUDE.md file with instructions for Claude                                       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▛█                      │ What's new                                                                                              │
+│                      ▝▜██████▀                     │ Fixed Claude Code failing to launch on macOS 12 (Monterey), a regression introduced in 2.1.255          │
+│                        ▝▝ ▝▝                       │ Fixed remote and scheduled sessions failing with "user messages must have non-empty content" after a r… │
+│                                                    │ Added Claude Fable 5.1 (`claude-fable-5-1`), now the default Fable model — 1M context, $10/$50 per Mto… │
+│ Opus 4.8 (1M context) with hi… · API Usage Billing │ /release-notes for more                                                                                 │
+│               /private/tmp/btw-repro               │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Try Codex in Isaac for improved token efficiency and speed — run `isaac codex` to start a Codex session.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+    /btw name a fruit that is red, one word only
+    /btw list the numbers 1 through 30, each on its own line, formatted as "N = word" (e.g. 1 = one)
+    /btw write a 200-word paragraph about the history of coffee
+
+      · Answering…
+
+    ←/→ to switch · x to clear history · Esc to close

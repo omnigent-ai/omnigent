@@ -17,9 +17,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor, type EditorProps, type OnChange, type OnMount } from "@monaco-editor/react";
-import { useTheme } from "next-themes";
 import { AlertTriangleIcon, MessageSquareOffIcon } from "lucide-react";
-import { normalizeResolvedTheme } from "@/components/theme/themeMode";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
   codeFontFamilyForEditor,
   readCodeFont,
@@ -220,8 +219,7 @@ function MonacoCodeEditorInner({
   pendingBodyRef,
 }: InnerProps) {
   const lang = detectLang(path);
-  const { resolvedTheme } = useTheme();
-  const monacoTheme = resolvedThemeToMonaco(normalizeResolvedTheme(resolvedTheme));
+  const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
 
   // Gate rendering until Shiki has registered the github themes + this file's
   // grammar, so the editor never flashes Monaco's default 'vs' theme.

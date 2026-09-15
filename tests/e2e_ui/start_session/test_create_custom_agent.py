@@ -200,6 +200,7 @@ async def _open_create_agent(page) -> None:
     exist), so open the dropdown and click the create item directly.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()
+    await page.get_by_test_id("new-chat-landing-custom-agents").click()
     await page.get_by_test_id("new-chat-landing-create-agent").click()
 
 
@@ -235,6 +236,7 @@ async def _drive_dialog_opens(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
             # "Create custom agent" item should be visible.
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
             await expect(create_item).to_be_visible()
 
@@ -419,8 +421,8 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             await expect(dialog).to_be_hidden(timeout=5_000)
 
             # The agent chip should still show the original agent (Claude Code).
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Claude Code"
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+                "aria-label", re.compile("Claude Code")
             )
         finally:
             await browser.close()
@@ -460,8 +462,8 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Sanity: the sandbox is the default managed target.
-            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
-                "Databricks Sandbox"
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_have_attribute(
+                "aria-label", re.compile(re.escape("Databricks Sandbox"))
             )
 
             # On the sandbox, "Create custom agent" is not offered (a managed
@@ -475,10 +477,11 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
-            await expect(page.get_by_test_id("new-chat-landing-host-chip")).not_to_contain_text(
-                "Databricks Sandbox"
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).not_to_have_attribute(
+                "aria-label", re.compile(re.escape("Databricks Sandbox"))
             )
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
             await expect(create_item).to_be_visible()
             await create_item.click()
@@ -534,8 +537,8 @@ async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> N
             # Switch the target back to the sandbox: the pending pick is dropped.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id("new-chat-landing-sandbox-option").click()
-            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
-                "Databricks Sandbox"
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_have_attribute(
+                "aria-label", re.compile(re.escape("Databricks Sandbox"))
             )
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).not_to_contain_text(
                 "pending-agent"

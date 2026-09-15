@@ -15,6 +15,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
 
+/** Keep touch targets large without enlarging the visible glyphs. */
+const ACTION_BUTTON_CLASS =
+  "flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground max-md:size-11 max-md:text-muted-foreground";
+
+const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
   messages: QueuedMessage[];
@@ -33,7 +39,11 @@ interface QueuedMessagesStripProps {
    * Drives drag-to-reorder; omit to render a non-reorderable strip.
    */
   onReorder?: (queueId: string, beforeQueueId: string | null) => void;
-  /** Column-width class so the strip lines up with the composer card. */
+  /**
+   * Layout class aligning the strip with the composer surface it docks
+   * onto (its tuck only hides behind a surface at least as wide, so match
+   * that surface's width — e.g. the workspace bar's inset).
+   */
   widthClassName?: string;
 }
 
@@ -70,7 +80,7 @@ function QueuedRow({
     <div
       ref={setDropRef}
       className={cn(
-        "flex items-center gap-1.5 text-sm text-muted-foreground",
+        "flex items-center gap-1.5 text-sm text-muted-foreground max-md:gap-0.5",
         isDragging && "opacity-40",
         isOver && "rounded bg-foreground/5",
       )}
@@ -80,14 +90,17 @@ function QueuedRow({
           type="button"
           ref={setDragRef}
           aria-label="Reorder queued message"
-          className="shrink-0 cursor-grab touch-none rounded p-0.5 text-muted-foreground/50 transition hover:text-foreground focus-visible:text-foreground active:cursor-grabbing"
+          className={cn(
+            ACTION_BUTTON_CLASS,
+            "cursor-grab touch-none text-muted-foreground/50 active:cursor-grabbing max-md:text-muted-foreground/80",
+          )}
           {...attributes}
           {...listeners}
         >
-          <GripVerticalIcon className="size-3.5" aria-hidden="true" />
+          <GripVerticalIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
         </button>
       ) : (
-        <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        <ClockIcon className={cn(ACTION_ICON_CLASS, "shrink-0")} aria-hidden="true" />
       )}
       <span className="min-w-0 flex-1 truncate">{message.text}</span>
       {/* Always visible (not hover-gated) so the actions are discoverable;
@@ -98,10 +111,10 @@ function QueuedRow({
             <button
               type="button"
               aria-label="Send queued message now"
-              className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+              className={ACTION_BUTTON_CLASS}
               onClick={() => onSteer(message.queueId)}
             >
-              <ArrowUpIcon className="size-3.5" aria-hidden="true" />
+              <ArrowUpIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="top">Send now</TooltipContent>
@@ -110,18 +123,18 @@ function QueuedRow({
       <button
         type="button"
         aria-label="Edit queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+        className={ACTION_BUTTON_CLASS}
         onClick={() => onEdit(message.queueId)}
       >
-        <PencilIcon className="size-3.5" aria-hidden="true" />
+        <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
       </button>
       <button
         type="button"
         aria-label="Remove queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+        className={ACTION_BUTTON_CLASS}
         onClick={() => onDelete(message.queueId)}
       >
-        <Trash2Icon className="size-3.5" aria-hidden="true" />
+        <Trash2Icon className={ACTION_ICON_CLASS} aria-hidden="true" />
       </button>
     </div>
   );
@@ -129,7 +142,8 @@ function QueuedRow({
 
 /**
  * Docked strip above the composer listing messages queued while the agent is
- * busy. Peeks above the composer card (`-mb-4` + bottom padding), mirroring
+ * busy. Peeks above the composer stack's top surface (`-mb-4` + bottom
+ * padding tuck its square bottom corners behind it), mirroring
  * `SubagentComposerTray`. Renders nothing when the queue is empty.
  *
  * Each row can be steered (sent now), edited (pulled back into the composer),

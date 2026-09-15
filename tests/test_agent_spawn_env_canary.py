@@ -240,6 +240,26 @@ def test_deny_exact_beats_a_matching_prefix(hostile_env):
     assert env["OPENAI_BASE_URL"] == "https://x"
 
 
+def test_codex_passes_service_principal_m2m_credentials(hostile_env):
+    """codex's own builder must let the SP M2M pair through, so a
+    Databricks-gateway ``auth.command`` can mint an OAuth token on refresh.
+    The canaried DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN must still not."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    src = {
+        **hostile_env,
+        "DATABRICKS_CLIENT_ID": "sp-app-id",
+        "DATABRICKS_CLIENT_SECRET": "sp-secret",
+    }
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("os.environ", src)
+        env = _clean_codex_env()
+    assert env["DATABRICKS_CLIENT_ID"] == "sp-app-id"
+    assert env["DATABRICKS_CLIENT_SECRET"] == "sp-secret"
+    assert "DATABRICKS_CONFIG_PROFILE" not in env
+    assert "DATABRICKS_TOKEN" not in env
+
+
 def test_source_is_never_mutated(hostile_env):
     before = dict(hostile_env)
     clean_agent_env(allow_prefixes=("QWEN_",), source=hostile_env)

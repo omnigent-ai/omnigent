@@ -12,7 +12,7 @@ import yaml
 from click import ClickException
 
 from omnigent._wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
-from omnigent.kiro_native import (
+from omnigent.harnesses.kiro_native.main import (
     _KIRO_PATH_ENV,
     LaunchedKiroTerminal,
     PreparedKiroTerminal,
@@ -153,7 +153,7 @@ async def test_attach_terminal_resource_requires_tmux_metadata() -> None:
 
 def test_session_labels_use_kiro_wrapper_value() -> None:
     """Kiro wrapper sessions stamp the centralized wrapper label."""
-    from omnigent.kiro_native import _SESSION_LABELS
+    from omnigent.harnesses.kiro_native.main import _SESSION_LABELS
 
     assert _SESSION_LABELS[WRAPPER_LABEL_KEY] == KIRO_NATIVE_WRAPPER_VALUE
 
@@ -347,7 +347,7 @@ def test_resolve_session_id_for_resume_no_picker_returns_none() -> None:
 
 def test_run_kiro_native_requires_server(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing server URL is a programming error surfaced as a clear message."""
-    monkeypatch.setattr("omnigent.kiro_native._preflight_local_tools", lambda: None)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main._preflight_local_tools", lambda: None)
 
     with pytest.raises(ClickException, match="resolved Omnigent server URL"):
         run_kiro_native(server=None, session_id=None, kiro_args=())
@@ -357,7 +357,7 @@ def test_run_kiro_native_materializes_spec_and_delegates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The launcher writes a spec and hands a trimmed base URL to the server path."""
-    monkeypatch.setattr("omnigent.kiro_native._preflight_local_tools", lambda: None)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main._preflight_local_tools", lambda: None)
     captured: dict[str, object] = {}
 
     def _fake_remote(base_url: str, spec_path: Path, **kwargs: object) -> None:
@@ -365,7 +365,9 @@ def test_run_kiro_native_materializes_spec_and_delegates(
         captured["spec_exists"] = spec_path.exists()
         captured["kwargs"] = kwargs
 
-    monkeypatch.setattr("omnigent.kiro_native._run_with_remote_server", _fake_remote)
+    monkeypatch.setattr(
+        "omnigent.harnesses.kiro_native.main._run_with_remote_server", _fake_remote
+    )
 
     run_kiro_native(
         server="http://server/",

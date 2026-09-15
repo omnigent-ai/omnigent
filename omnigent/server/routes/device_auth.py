@@ -21,10 +21,11 @@ Endpoints (all mounted at the app root):
   returns delegated access + refresh tokens.
 - ``POST /oauth/revoke`` — revoke a grant (backs client logout).
 
-Mounted only in ``accounts`` auth mode (and only when
-``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). OIDC deployments delegate login
-to the IdP via the cli-ticket flow (``/auth/cli-login``) and never use this
-grant; header mode has no server-mintable identity.
+Mounted in ``accounts`` and ``oidc`` (standard OIDC) auth modes when
+``OMNIGENT_DEVICE_GRANT_ENABLED`` is set. GitHub OAuth (``provider_type=="github"``)
+and header mode are excluded: GitHub does not support ``prompt=login``/
+``max_age=0`` so the anti-phishing re-auth gate cannot be enforced;
+header mode has no server-mintable identity.
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.
 
@@ -57,10 +58,17 @@ from collections.abc import Callable
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
+from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.routes._oauth import (
+    NO_STORE_HEADERS,
+    RATE_LIMITER_MAX_KEYS,
+    SlidingWindowRateLimiter,
+)
+from omnigent.server.routes._oauth import oauth_error as _oauth_error
 from omnigent.server.routes._origin import require_trusted_origin
 
 _logger = logging.getLogger(__name__)
@@ -185,36 +193,45 @@ def mint_delegated_token(
     ttl_seconds: int,
     provider: str,
     *,
-    grant_id: str,
+    grant_id: str | None,
     client_id: str,
     jti: str,
     scope: str | None = DELEGATED_SCOPE,
 ) -> str:
-    """Mint a grant-derived access token.
+    """Mint a grant-derived or client-credential access token.
 
     Same HS256 shape as
     :func:`omnigent.server.oidc.mint_session_token` (so
     :meth:`UnifiedAuthProvider._check_cookie` validates it unchanged),
-    plus grant claims:
+    plus the delegated claims:
 
-    - ``scope`` — present ⇒ the auth layer restricts the token to the
-      session APIs and refuses admin endpoints. ``None`` omits the claim,
-      giving the token the SAME authority as the session JWT it renews —
-      used ONLY for first-party login grants, whose bearer is the
-      authenticated user's own CLI/host, not a third-party client.
-    - ``grant_id`` — the grant this token was issued from, checked against
-      the revocation denylist so revoking the grant immediately kills the
-      token. Carried regardless of scope.
+    - ``scope`` — present ⇒ the auth layer confines the token to the
+      fail-closed path allowlist and refuses admin endpoints. ``None``
+      omits the claim, giving the token the SAME authority as the session
+      JWT it renews — used ONLY for first-party login grants, whose bearer
+      is the authenticated user's own CLI/host, not a third-party client.
+    - ``grant_id`` — the store-backed grant this token was issued from,
+      checked against the revocation denylist so revoking the grant
+      immediately kills the token. ``None`` omits the claim, for the
+      client-credentials grant, which has no stored grant to revoke
+      (rotation and expiry are its revocation); the auth layer skips the
+      denylist lookup when it is absent.
     - ``jti`` — unique token id, for audit/log correlation.
     - ``act`` — provenance (RFC 8693 style), ``{"client_id": "<app>"}``,
-      naming the application that obtained the grant so every action is
-      attributable to it.
+      naming the application the token acts on behalf of so every action
+      is attributable to it.
+
+    The two claims are independent: a device grant carries both, a login
+    grant only ``grant_id``, a machine client only ``scope``.
 
     :param user_id: The Omnigent identity the token acts as (``sub``).
     :param cookie_secret: HMAC key for HS256 signing.
     :param ttl_seconds: Token lifetime in seconds (kept short — ≤ 1 h).
     :param provider: Identity provider name (informational claim).
-    :param grant_id: The grant id.
+    :param grant_id: The grant id, or ``None`` for a client-credentials
+        token (no ``grant_id`` claim is emitted). Required keyword with no
+        default: omitting it must be a deliberate statement, since a token
+        that silently loses the claim also skips the revocation lookup.
     :param client_id: The client id (the requesting application,
         e.g. ``"slack"``); recorded in the ``act`` claim for audit.
     :param jti: Unique token id.
@@ -228,18 +245,14 @@ def mint_delegated_token(
         "iat": now,
         "exp": now + ttl_seconds,
         "provider": provider,
-        "grant_id": grant_id,
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if grant_id is not None:
+        payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
-
-
-def _oauth_error(error: str, status_code: int = 400) -> JSONResponse:
-    """Return an RFC 6749 / 8628 shaped OAuth error response."""
-    return JSONResponse(status_code=status_code, content={"error": error})
 
 
 def _require_browser_origin(request: Request) -> None:
@@ -269,59 +282,6 @@ _AUTHORIZE_RATE_WINDOW_SECONDS = 60  # …per client per this window.
 # Purge expired/dead grants at most this often (piggybacked on authorize
 # so no scheduler is required — keeps the table bounded under load).
 _PURGE_MIN_INTERVAL_SECONDS = 300
-
-
-# Hard cap on distinct keys the limiter tracks at once. Bounds memory even
-# under a spray from many source IPs (e.g. a whole IPv6 /64) — without it a
-# key hit once and never revisited would live forever. When the cap is hit
-# the whole table is swept of aged-out keys; if still full, the limiter
-# fails OPEN for a new key (availability over a soft throttle — the real
-# anti-abuse control in production is the confidential client secret).
-_RATE_LIMITER_MAX_KEYS = 10_000
-
-
-class _SlidingWindowRateLimiter:
-    """Minimal per-key sliding-window limiter (in-memory, single-process).
-
-    Keyed by client IP. Adequate for a single-process socket-mode
-    deployment; a multi-replica server would want a shared store, but the
-    grant table's own single-use/expiry semantics already bound abuse.
-
-    Memory is bounded by :data:`_RATE_LIMITER_MAX_KEYS`: keys are dropped
-    when they age out (on touch) and, when the cap is reached, a full sweep
-    reclaims every aged-out key before admitting a new one.
-    """
-
-    def __init__(self, max_events: int, window_seconds: int, max_keys: int) -> None:
-        self._max = max_events
-        self._window = window_seconds
-        self._max_keys = max_keys
-        self._hits: dict[str, list[float]] = {}
-
-    def _sweep(self, cutoff: float) -> None:
-        """Drop every key whose hits have all aged out."""
-        dead = [k for k, ts in self._hits.items() if not any(t > cutoff for t in ts)]
-        for k in dead:
-            self._hits.pop(k, None)
-
-    def allow(self, key: str, now: float) -> bool:
-        cutoff = now - self._window
-        # New key while at capacity: sweep aged-out keys first; if the table
-        # is still full of live keys, fail open rather than grow unbounded.
-        if key not in self._hits and len(self._hits) >= self._max_keys:
-            self._sweep(cutoff)
-            if len(self._hits) >= self._max_keys:
-                return True
-        hits = [t for t in self._hits.get(key, ()) if t > cutoff]
-        # Opportunistically bound memory: drop keys that fully aged out.
-        if not hits:
-            self._hits.pop(key, None)
-        if len(hits) >= self._max:
-            self._hits[key] = hits
-            return False
-        hits.append(now)
-        self._hits[key] = hits
-        return True
 
 
 def _resolve_signing_config(auth_provider: UnifiedAuthProvider) -> tuple[bytes, str]:
@@ -403,6 +363,7 @@ def create_oauth_token_router(
     device_grant_store: DeviceGrantStore,
     *,
     handle_device_code: Callable[[str], Response] | None = None,
+    handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
     client_secret_ok: Callable[[Request], bool] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/token`` + ``/oauth/revoke`` router.
@@ -413,6 +374,11 @@ def create_oauth_token_router(
     RFC 8628 device-code consent flow (which stays accounts-only behind
     ``OMNIGENT_DEVICE_GRANT_ENABLED``).
 
+    This is the app's ONE ``POST /oauth/token``. Every grant type dispatches
+    from the single handler below, and a grant with no handler injected
+    answers ``unsupported_grant_type`` — a second router claiming the same
+    path would be shadowed silently, since FastAPI resolves first-match-wins.
+
     :param auth_provider: The active provider — ``accounts`` or ``oidc``.
     :param device_grant_store: Persistence for grants.
     :param handle_device_code: Optional device-code grant handler.
@@ -420,6 +386,11 @@ def create_oauth_token_router(
         the full flow keeps one token endpoint; standalone mounts leave
         it ``None`` and ``device_code`` exchanges get
         ``unsupported_grant_type``.
+    :param handle_client_credentials: Optional client-credentials grant
+        handler, from
+        :func:`omnigent.server.routes.client_credentials.create_client_credentials_handler`.
+        ``None`` (no machine client configured) leaves that grant type
+        answering ``unsupported_grant_type``.
     :param client_secret_ok: Optional client-secret gate (callable that validates
         the request). When ``None`` (standalone mounts), builds the gate from
         the ``OMNIGENT_DEVICE_CLIENT_SECRET`` env var. When provided
@@ -474,11 +445,11 @@ def create_oauth_token_router(
 
     @router.post("/oauth/token", dependencies=[])
     async def token(request: Request) -> Response:
-        """Exchange a device_code or refresh_token for an access token.
+        """Exchange a device_code, refresh_token or client credential.
 
         RFC 8628 / 6749 error shapes: ``authorization_pending``,
         ``slow_down``, ``expired_token``, ``access_denied``,
-        ``invalid_grant``, ``unsupported_grant_type``.
+        ``invalid_grant``, ``invalid_client``, ``unsupported_grant_type``.
         """
         form = await request.form()
         grant_type = str(form.get("grant_type") or "")
@@ -496,6 +467,13 @@ def create_oauth_token_router(
             return handle_device_code(str(form.get("device_code") or ""))
         if grant_type == "refresh_token":
             return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+        if grant_type == "client_credentials":
+            # RFC 6749 §4.4: the machine client presents its OWN credential,
+            # so it authenticates itself rather than passing the device
+            # client-secret gate. Its handler carries the throttle.
+            if handle_client_credentials is None:
+                return _oauth_error("unsupported_grant_type")
+            return handle_client_credentials(request, form)
         return _oauth_error("unsupported_grant_type")
 
     def _handle_refresh_grant(refresh_token: str) -> Response:
@@ -548,6 +526,7 @@ def create_oauth_token_router(
                     "token_type": "Bearer",
                     "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
                 },
+                headers=NO_STORE_HEADERS,
             )
 
         new_refresh = _mint_refresh_token()
@@ -578,6 +557,7 @@ def create_oauth_token_router(
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
+            headers=NO_STORE_HEADERS,
         )
 
     # ── Revocation ────────────────────────────────────────────────
@@ -629,31 +609,48 @@ def create_oauth_token_router(
 def create_device_auth_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
+    *,
+    handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
-    :param auth_provider: The active provider. Must be ``accounts`` mode;
-        its cookie config supplies the HMAC signing key and public base URL.
+    :param auth_provider: The active provider. Must be ``accounts`` or
+        ``oidc`` mode; its cookie config supplies the HMAC signing key
+        and public base URL. Header mode has no server-mintable identity
+        and raises.
     :param device_grant_store: Persistence for device grants.
+    :param handle_client_credentials: Optional client-credentials handler,
+        forwarded to the token router this builds. The device flow and the
+        machine grant share that one ``POST /oauth/token``.
     :returns: APIRouter to mount at the app root.
     """
-    if auth_provider._source != "accounts":
-        raise RuntimeError(
-            f"create_device_auth_router requires accounts auth (got {auth_provider._source!r})"
-        )
-    cookie_config = auth_provider._accounts_config
-    assert cookie_config is not None, "accounts mode must have an accounts config"
-    cookie_secret = cookie_config.cookie_secret
-    base_url = cookie_config.base_url
-    provider_name = auth_provider._source
+    cookie_secret, provider_name = _resolve_signing_config(auth_provider)
+    if auth_provider._source == "accounts":
+        assert auth_provider._accounts_config is not None
+        _mode_cfg = auth_provider._accounts_config
+    else:
+        assert auth_provider._oidc_config is not None
+        _mode_cfg = auth_provider._oidc_config
+        # GitHub OAuth runs under _source == "oidc" but does not support
+        # prompt=login / max_age, so the anti-phishing reauth gate cannot
+        # be enforced. Refuse to build the device-grant router for it.
+        if getattr(_mode_cfg, "provider_type", None) == "github":
+            raise RuntimeError(
+                "create_device_auth_router: GitHub OAuth does not support forced "
+                "re-authentication (prompt=login); the device-grant anti-phishing "
+                "gate cannot be enforced. Set OMNIGENT_DEVICE_GRANT_ENABLED only "
+                "for standard OIDC deployments."
+            )
+    base_url = _mode_cfg.base_url
+    session_cookie_name: str = _mode_cfg.session_cookie_name
 
     _client_secret_ok = _make_client_secret_gate()
     # Resolve grant max lifetime once at mount (not on every purge).
     _grant_max_lifetime = _grant_max_lifetime_seconds()
 
     router = APIRouter()
-    _rate_limiter = _SlidingWindowRateLimiter(
-        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, _RATE_LIMITER_MAX_KEYS
+    _rate_limiter = SlidingWindowRateLimiter(
+        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, RATE_LIMITER_MAX_KEYS
     )
     # Last time we purged expired grants; gates the opportunistic purge on
     # authorize so the table stays bounded without a separate scheduler.
@@ -744,6 +741,9 @@ def create_device_auth_router(
                 "expires_in": _DEVICE_CODE_TTL_SECONDS,
                 "interval": _POLL_INTERVAL_SECONDS,
             },
+            # RFC 8628 §3.2 carries the bearer device_code and user_code here,
+            # so this body is as sensitive as a token response.
+            headers=NO_STORE_HEADERS,
         )
 
     # ── Browser consent page ──────────────────────────────────────
@@ -770,7 +770,7 @@ def create_device_auth_router(
         time). ``None`` when absent/invalid. Used to enforce that consent
         follows a login started FOR this device flow.
         """
-        token = request.cookies.get(cookie_config.session_cookie_name)
+        token = request.cookies.get(session_cookie_name)
         if not token:
             return None
         try:
@@ -954,6 +954,7 @@ def create_device_auth_router(
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
+            headers=NO_STORE_HEADERS,
         )
 
     router.include_router(
@@ -961,6 +962,7 @@ def create_device_auth_router(
             auth_provider,
             device_grant_store,
             handle_device_code=_handle_device_code_grant,
+            handle_client_credentials=handle_client_credentials,
             client_secret_ok=_client_secret_ok,
         )
     )

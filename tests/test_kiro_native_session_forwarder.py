@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-import omnigent.kiro_native_session_forwarder as forwarder
+import omnigent.harnesses.kiro_native.session_forwarder as forwarder
 
 
 def _write_kiro_session(

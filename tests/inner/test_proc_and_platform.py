@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -71,18 +72,91 @@ def test_default_interactive_shell_honors_known_shell_on_path(
 def test_default_interactive_shell_falls_back_to_bash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unset / unknown / not-on-PATH ``$SHELL`` all fall back to bash."""
-    # Unset $SHELL → bash (known shells resolve on PATH here).
-    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    """Unset / unknown / uninstalled ``$SHELL`` all fall back to bash."""
+    # Resolution is fully hermetic: neither PATH nor the standard shell dirs
+    # yield anything, so only $SHELL's own absolute path could rescue a value.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_platform, "_resolve_interactive_shell", lambda name: None)
+    monkeypatch.setattr(os.path, "isabs", lambda path: False)
+    # Unset $SHELL → bash.
     monkeypatch.delenv("SHELL", raising=False)
     assert _platform.default_interactive_shell() == "bash"
-    # An unknown shell name is never honored, even if on PATH.
+    # An unknown shell name is never honored, even if it resolved.
     monkeypatch.setenv("SHELL", "/opt/weird/nushell")
     assert _platform.default_interactive_shell() == "bash"
-    # A known shell that does not resolve on PATH also falls back.
-    monkeypatch.setattr("shutil.which", lambda name: None)
+    # A known shell that resolves nowhere (not on PATH, not in a standard dir,
+    # $SHELL not usable as an absolute path) also falls back.
     monkeypatch.setenv("SHELL", "/bin/zsh")
     assert _platform.default_interactive_shell() == "bash"
+
+
+def test_normalize_interactive_shells_filters_and_deduplicates() -> None:
+    """Host and server accept only supported shell basenames."""
+    assert _platform.normalize_interactive_shells(["zsh", "bash", "zsh", "not-a-shell", 42]) == [
+        "zsh",
+        "bash",
+    ]
+    assert _platform.normalize_interactive_shells("bash") == []
+
+
+@pytest.mark.posix_only
+def test_default_interactive_shell_trusts_shell_absolute_path_off_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A known ``$SHELL`` whose absolute path is executable is honored even
+    when it does not resolve on a stripped ``PATH``.
+
+    Reproduces the frozen-PATH host daemon (GUI/launchd launch): ``$SHELL`` is
+    ``/bin/zsh`` but ``PATH`` omits ``/bin``, so a bare ``shutil.which("zsh")``
+    misses it. The login shell must still be honored.
+    """
+    zsh = tmp_path / "zsh"
+    zsh.write_text("#!/bin/sh\n")
+    zsh.chmod(0o755)
+    # Nothing resolves on PATH or in the standard shell dirs.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_platform, "_INTERACTIVE_SHELL_DIRS", ())
+    monkeypatch.setenv("SHELL", str(zsh))
+    assert _platform.default_interactive_shell() == "zsh"
+
+
+@pytest.mark.posix_only
+def test_resolve_interactive_shell_uses_matching_absolute_login_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A Nix-style login shell remains executable under a stripped PATH."""
+    fish = tmp_path / "profiles" / "default" / "bin" / "fish"
+    fish.parent.mkdir(parents=True)
+    fish.write_text("#!/bin/sh\n")
+    fish.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(fish))
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(_platform, "_INTERACTIVE_SHELL_DIRS", ())
+
+    assert _platform.default_interactive_shell() == "fish"
+    assert _platform._resolve_interactive_shell("fish") == str(fish)
+
+
+@pytest.mark.parametrize("name", ["/bin/bash", "../bash", "unknown"])
+def test_resolve_interactive_shell_rejects_paths_and_unknown_names(
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolver accepts allowlisted basenames only."""
+    monkeypatch.setattr("shutil.which", lambda value: pytest.fail(f"resolved {value}"))
+    assert _platform._resolve_interactive_shell(name) is None
+
+
+def _fake_resolver(installed: set[str]):
+    """A ``_resolve_interactive_shell`` stand-in: resolve only *installed*.
+
+    Fully hermetic — the real helper probes both PATH and standard shell dirs,
+    so patching it (not just ``shutil.which``) is what keeps a test from leaking
+    whatever shells the host machine actually has installed.
+    """
+    return lambda name: f"/usr/bin/{name}" if name in installed else None
 
 
 @pytest.mark.posix_only
@@ -90,7 +164,9 @@ def test_installed_interactive_shells_lists_default_first_then_alternatives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The default ($SHELL) leads; installed alternatives follow, deduped."""
-    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        _platform, "_resolve_interactive_shell", _fake_resolver({"bash", "zsh", "fish"})
+    )
     monkeypatch.setenv("SHELL", "/bin/zsh")
     # zsh is the default → first; bash/fish follow in offer order; no dupes.
     assert _platform.installed_interactive_shells() == ["zsh", "bash", "fish"]
@@ -100,21 +176,44 @@ def test_installed_interactive_shells_lists_default_first_then_alternatives(
 def test_installed_interactive_shells_skips_uninstalled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Alternatives that don't resolve on PATH are omitted."""
+    """Alternatives that resolve nowhere are omitted."""
     # Only bash and zsh installed; fish absent.
-    monkeypatch.setattr(
-        "shutil.which", lambda name: f"/usr/bin/{name}" if name in {"bash", "zsh"} else None
-    )
+    monkeypatch.setattr(_platform, "_resolve_interactive_shell", _fake_resolver({"bash", "zsh"}))
     monkeypatch.setenv("SHELL", "/bin/bash")
     assert _platform.installed_interactive_shells() == ["bash", "zsh"]
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_offers_shells_off_stripped_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shells in a standard dir are offered even when ``PATH`` omits it.
+
+    Regression for the frozen-PATH host daemon: with ``SHELL=/bin/zsh`` but a
+    ``PATH`` missing ``/bin``, ``shutil.which`` finds nothing, yet the standard
+    shell dirs still resolve zsh/bash — so the picker must offer both instead of
+    collapsing to a lone (phantom) ``bash``.
+    """
+    monkeypatch.setattr("shutil.which", lambda name: None)  # nothing on PATH
+
+    # Both live in /bin, off the stripped PATH.
+    def in_bin(path: str) -> bool:
+        return os.path.basename(path) in {"zsh", "bash"} and path.startswith("/bin/")
+
+    monkeypatch.setattr("os.path.isfile", in_bin)
+    monkeypatch.setattr("os.access", lambda p, mode: True)
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    assert _platform.installed_interactive_shells() == ["zsh", "bash"]
 
 
 @pytest.mark.posix_only
 def test_installed_interactive_shells_always_nonempty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With nothing resolvable the bash fallback is still offered alone."""
+    """With nothing resolvable anywhere the bash fallback is still offered alone."""
     monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_platform, "_resolve_interactive_shell", lambda name: None)
+    monkeypatch.setattr(os.path, "isabs", lambda path: False)
     monkeypatch.delenv("SHELL", raising=False)
     assert _platform.installed_interactive_shells() == ["bash"]
 
@@ -189,6 +288,19 @@ def test_process_alive_is_a_nondestructive_probe() -> None:
 def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(2_000_000_000) is False
     assert _proc.process_alive(-1) is False
+
+
+def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A target pgid of 1 must never be signalled.
+
+    ``killpg(1, sig)`` is ``kill(-1, sig)`` -- a broadcast to every process
+    the user can signal (a mocked pid that coerces to 1 killed the CI runner).
+    """
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(_proc, "_getpgid_fn", lambda pid: 1 if pid else 54321)
+    monkeypatch.setattr(_proc, "_killpg_fn", lambda pgid, sig: sent.append((pgid, sig)))
+    assert _proc._killpg(1, signal.SIGTERM) is False
+    assert sent == []
 
 
 def test_terminate_tree_stops_the_process() -> None:

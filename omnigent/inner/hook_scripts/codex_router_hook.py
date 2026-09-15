@@ -19,7 +19,7 @@ A rewrite echoes the rest of ``tool_input`` back untouched, but ``model``
 and ``reasoning_effort`` are both rewritten: codex validates each against
 its own model catalog *before* the request leaves the CLI, so a servable
 catalog id or an out-of-ladder effort fails the spawn outright rather than
-degrading it. See :mod:`omnigent.codex_model_vocabulary`.
+degrading it. See :mod:`omnigent.models.codex_model_vocabulary`.
 """
 
 from __future__ import annotations
@@ -29,10 +29,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from omnigent.codex_model_vocabulary import clamp_spawn_effort, codex_spawn_model
 from omnigent.inner.hook_scripts.subagent_router import (
     run_route_subagent_main,
 )
+from omnigent.models.codex_model_vocabulary import clamp_spawn_effort, codex_spawn_model
 
 # Codex flattens MCP-ish tool names, so the spawn tool arrives as
 # ``collaborationspawn_agent`` on 0.145.x. Both the hooks.json matcher
@@ -94,7 +94,7 @@ def spawn_model_translator(
 
     Codex's ``spawn_agent`` validates ``model`` against its own catalog
     before the request leaves the CLI, so a servable catalog id has to be
-    spelled in codex's slugs — see :mod:`omnigent.codex_model_vocabulary`.
+    spelled in codex's slugs — see :mod:`omnigent.models.codex_model_vocabulary`.
 
     :param bridge_dir: Unused; the vocabulary is a property of the CLI, not
         of the session (accepted so this matches the translator-factory

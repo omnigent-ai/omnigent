@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from omnigent.cli import cli
+from omnigent.cli_invocation import WRAPPER_COMMAND_ENV
 from omnigent.host.local_server import LocalServerInfo
 from omnigent.update_check import (
     _build_nightly_upgrade_suggestion,
@@ -332,27 +333,29 @@ def test_upgrade_pre_passes_prerelease_flag_to_installer(
     assert ran == ["uv tool upgrade omnigent --prerelease allow"]
 
 
-# ── ``omni update`` alias ────────────────────────────────────────────
+# ── deprecated ``omni update`` spelling ──────────────────────────────
 
 
-def test_update_is_alias_for_upgrade_same_callback() -> None:
-    """``update`` and ``upgrade`` resolve to the exact same Click command.
+def test_update_is_hidden_and_shares_upgrade_options() -> None:
+    """``update`` is a hidden shim over ``upgrade``, not a second command.
 
-    The alias is registered by handing the *same* Command object to the
-    group under a second name, so its callback, options and help must be
-    identical — there is no second implementation to drift from ``upgrade``.
+    It has to be its own Click object to warn, so the guard is that it reuses
+    ``upgrade``'s parameter objects — the option surface cannot drift.
     """
     update_cmd = cli.commands["update"]
     upgrade_cmd = cli.commands["upgrade"]
 
-    assert update_cmd is upgrade_cmd
-    assert update_cmd.callback is upgrade_cmd.callback
-    # Same option surface (--check / --force / --pre).
-    assert [p.name for p in update_cmd.params] == [p.name for p in upgrade_cmd.params]
+    assert update_cmd is not upgrade_cmd
+    assert update_cmd.hidden is True
+    assert upgrade_cmd.hidden is False
+    # The very same Parameter objects, not merely equally-named ones.
+    assert all(a is b for a, b in zip(update_cmd.params, upgrade_cmd.params, strict=True))
 
 
-def test_update_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
-    """``omni update`` runs the upgrade flow end-to-end (up-to-date path)."""
+def test_update_warns_then_runs_upgrade(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """``omni update`` still works, but warns and names ``upgrade``."""
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
 
     def _must_not_run(*_a: object, **_k: object) -> int:
@@ -363,8 +366,31 @@ def test_update_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None
     result = CliRunner().invoke(cli, ["update"])
 
     assert result.exit_code == 0, result.output
-    assert "up to date" in result.output
-    assert "0.1.0" in result.output
+    assert "`update` is deprecated" in result.stderr
+    assert "upgrade" in result.stderr
+    assert "up to date" in result.stdout
+    assert "0.1.0" in result.stdout
+
+
+def test_update_deprecation_notice_honors_the_wrapper_command(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """Under a wrapper the notice says ``isaac omni upgrade``, not ``omni``.
+
+    The wrapper guard rejects naked ``omnigent`` calls, so a hint spelling the
+    naked binary would name a command that cannot run.
+    """
+    monkeypatch.setenv(WRAPPER_COMMAND_ENV, "isaac omni")
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command",
+        lambda *_a, **_k: pytest.fail("upgrade ran while already up to date"),
+    )
+
+    result = CliRunner().invoke(cli, ["update"])
+
+    assert result.exit_code == 0, result.output
+    assert "`isaac omni upgrade`" in result.stderr
 
 
 def test_update_check_matches_upgrade_check(
@@ -383,8 +409,11 @@ def test_update_check_matches_upgrade_check(
     upgrade_result = runner.invoke(cli, ["upgrade", "--check"])
 
     assert update_result.exit_code == upgrade_result.exit_code == 1
-    assert update_result.output == upgrade_result.output
-    assert "v0.1.0 → v0.2.0" in update_result.output
+    assert update_result.stdout == upgrade_result.stdout
+    assert "v0.1.0 → v0.2.0" in update_result.stdout
+    # The warning is the only difference between the two.
+    assert "`update` is deprecated" in update_result.stderr
+    assert "deprecated" not in upgrade_result.stderr
 
 
 def test_update_suppresses_update_check_like_upgrade() -> None:

@@ -60,8 +60,11 @@ with `git worktree remove <path>` when done.
 ## What it does
 
 1. Reconstructs the user journey from the linked bug report.
-2. Drives the running app through that journey — browser tools for UI bugs,
-   `sys_session_*` / HTTP for backend bugs — until it observes the failure.
+2. Drives the running app through that journey — Playwright `tests/e2e_ui/` for
+   headless web UI runs (including CI), embedded-browser tools for local sessions
+   with a connected desktop, and `sys_session_*` / HTTP for backend bugs — until
+   it observes the failure. Headless CI does not probe or use desktop browser
+   tools, even when they appear in the tool list.
 3. Authors a durable e2e test (`tests/e2e_ui/` for UI, PTY/pexpect for CLI
    journeys, `tests/e2e/` for backend) keyed to the concrete failure, so a fix
    has a fail→pass regression guard.

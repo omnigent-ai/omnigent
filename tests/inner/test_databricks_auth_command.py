@@ -54,7 +54,15 @@ def _run_generated_helper(
         "FORCE_OK": "1" if force_refresh_works else "0",
         "CACHED_OK": "1" if cached_token_works else "0",
     }
-    env.pop("DATABRICKS_BEARER", None)
+    # The command's last-resort fallback shells to the databricks-sdk mint
+    # (``python -m omnigent.inner.databricks_token``). Strip ambient Databricks
+    # resolution and point the config file at a nonexistent path so that mint is
+    # deterministic — no host/creds/profile ⇒ it prints nothing — keeping these
+    # assertions hermetic on any machine (incl. a Databricks-credentialed CI).
+    for key in list(env):
+        if key.startswith("DATABRICKS_"):
+            env.pop(key, None)
+    env["DATABRICKS_CONFIG_FILE"] = str(tmp_path / "nonexistent-databrickscfg")
     if bearer is not None:
         env["DATABRICKS_BEARER"] = bearer
     result = subprocess.run(
@@ -127,12 +135,16 @@ def test_the_generated_helper_selects_by_profile_when_one_is_named() -> None:
     from omnigent.inner.databricks_executor import databricks_bearer_token_command
 
     named = databricks_bearer_token_command("https://example.databricks.com", "agent")
-    assert '--profile "agent"' in named
-    assert "--host" not in named
+    # Scope to the CLI mint's selector: it selects by profile (host lookup is
+    # ambiguous when two profiles share a workspace). The sdk fallback separately
+    # passes --host for its own workspace guard, so assert on the mint, not the
+    # whole command.
+    assert 'databricks auth token --profile "agent"' in named
+    assert "databricks auth token --host" not in named
 
     unnamed = databricks_bearer_token_command("https://example.databricks.com/", None)
-    assert '--host "https://example.databricks.com"' in unnamed
-    assert "--profile" not in unnamed
+    assert 'databricks auth token --host "https://example.databricks.com"' in unnamed
+    assert "databricks auth token --profile" not in unnamed
 
 
 @pytest.mark.posix_only
@@ -253,3 +265,283 @@ def test_without_a_recorded_command_an_unauthenticated_profile_stays_empty(
         )
         == ""
     )
+
+
+def _write_broker_sidecar(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workspace_host: str):
+    """Point the config file at *tmp_path* and drop a broker sidecar for *workspace_host*."""
+    from omnigent.host import databricks_credential as dc
+
+    cfg_path = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    assert dc._write_sidecar(
+        cfg_path, "https://omni.example", "host-1", "host-tok", workspace_host
+    )
+
+
+def test_the_broker_sidecar_becomes_the_fallback_for_the_connected_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In a connect sandbox, the host-only profile delegates its mint to the broker."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
+    assert "python3 -m omnigent.host.databricks_credential token" in command
+
+
+def test_the_broker_sidecar_is_ignored_for_a_different_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gateway pinned to a spec's own workspace must not borrow the broker token."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://connected.databricks.com")
+    command = databricks_bearer_token_command("https://other.databricks.com", "myprofile")
+    assert "omnigent.host.databricks_credential" not in command
+
+
+def test_the_broker_is_ignored_for_a_different_profile_on_the_connected_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Identity boundary: only the host-only connect profile (HOST_DATABRICKS_PROFILE)
+    borrows the owner's broker bearer. A different, credential-less profile that
+    happens to share the connected workspace host must NOT silently mint as the
+    owner — distinct profiles on one host can be different users/service principals."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    # Same connected workspace host as the sidecar, but NOT the connect profile.
+    command = databricks_bearer_token_command("https://example.databricks.com", "someone-else")
+    assert "omnigent.host.databricks_credential" not in command
+
+
+def test_an_explicit_fallback_is_not_overridden_by_the_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A caller-supplied fallback (e.g. ucode's) wins over the broker default."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    command = databricks_bearer_token_command(
+        "https://example.databricks.com", "omnigent", fallback_command="ucode-token"
+    )
+    assert "omnigent.host.databricks_credential" not in command
+    assert "ucode-token" in command
+
+
+def test_no_sidecar_falls_back_to_the_sdk_mint_not_the_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A normal profile (no managed-connect broker sidecar) still carries a
+    fallback: the databricks-sdk mint. That is the only path that resolves an
+    OAuth M2M / service-principal (or OIDC) bearer once ``databricks auth token``
+    (U2M-only) yields nothing, so a workload-identity host is no longer stuck.
+    The broker is not referenced — that stays reserved for the connect profile."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    cmd = databricks_bearer_token_command("https://example.databricks.com", "myprofile")
+    assert "omnigent.host.databricks_credential" not in cmd
+    assert (
+        "python3 -m omnigent.inner.databricks_token "
+        "--host https://example.databricks.com --profile myprofile" in cmd
+    )
+    # The eval-fallback clause now carries the sdk mint.
+    assert "eval" in cmd
+
+
+def test_the_sdk_fallback_selects_by_host_when_no_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no named profile the sdk fallback selects the workspace by host, so
+    env / OIDC service-principal credentials mint against the pinned workspace."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    cmd = databricks_bearer_token_command("https://example.databricks.com/", None)
+    assert (
+        "python3 -m omnigent.inner.databricks_token --host https://example.databricks.com" in cmd
+    )
+
+
+def test_the_connect_profile_tries_the_broker_then_the_sdk_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The connect profile mints via the broker first, then the sdk as a last
+    resort. The broker is preferred but no longer *excludes* the sdk mint."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
+    broker = command.index("omnigent.host.databricks_credential token")
+    sdk = command.index("omnigent.inner.databricks_token")
+    assert broker < sdk  # broker is tried before the sdk fallback
+
+
+def test_an_explicit_fallback_still_chains_the_sdk_mint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression for the native-Claude ``apiKeyHelper`` path: a caller-supplied
+    fallback (ucode's recorded ``databricks auth token`` command) must not
+    *exclude* the sdk mint — otherwise an M2M profile on that harness would never
+    reach the SDK. Both run, recorded first."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+    command = databricks_bearer_token_command(
+        "https://example.databricks.com", "agent", fallback_command="ucode-token"
+    )
+    recorded = command.index("ucode-token")
+    sdk = command.index("omnigent.inner.databricks_token")
+    assert recorded < sdk
+
+
+def test_the_sdk_entrypoint_prints_the_resolved_bearer(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The entrypoint prints the sdk-resolved bearer when the resolved workspace
+    matches the requested gateway host (for an M2M profile this is the
+    client-credentials token the CLI cannot mint)."""
+    from omnigent.inner import databricks_token
+
+    monkeypatch.setattr(
+        databricks_token,
+        "_sdk_bearer",
+        lambda profile, host: ("https://example.databricks.com", "m2m-bearer"),
+    )
+    rc = databricks_token.main(["--host", "https://example.databricks.com", "--profile", "sp"])
+    assert rc == 0
+    assert capsys.readouterr().out == "m2m-bearer\n"
+
+
+def test_the_sdk_entrypoint_fails_closed_on_a_workspace_mismatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Identity guard: if the named profile resolves to a *different* workspace
+    than the gateway host, print nothing rather than hand its bearer to this
+    gateway."""
+    from omnigent.inner import databricks_token
+
+    monkeypatch.setattr(
+        databricks_token,
+        "_sdk_bearer",
+        lambda profile, host: ("https://other.databricks.com", "someone-elses-token"),
+    )
+    rc = databricks_token.main(["--host", "https://example.databricks.com", "--profile", "sp"])
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_the_sdk_entrypoint_prints_nothing_when_unresolved(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No credential ⇒ print nothing (exit 0) so the caller's shell falls through."""
+    from omnigent.inner import databricks_token
+
+    monkeypatch.setattr(databricks_token, "_sdk_bearer", lambda profile, host: None)
+    rc = databricks_token.main(["--host", "https://example.databricks.com", "--profile", "sp"])
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_the_sdk_entrypoint_is_quiet_on_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A token-endpoint failure during the M2M exchange must not crash the mint;
+    it prints nothing and the harness retries at the next refresh."""
+    from omnigent.inner import databricks_token
+
+    def _boom(profile: str | None, host: str | None) -> None:
+        raise RuntimeError("token endpoint unreachable")
+
+    monkeypatch.setattr(databricks_token, "_sdk_bearer", _boom)
+    rc = databricks_token.main(["--host", "https://example.databricks.com", "--profile", "sp"])
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_the_sdk_entrypoint_hints_on_stderr_when_the_sdk_is_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A base install without the ``databricks`` extra can't mint M2M; the
+    entrypoint stays silent on stdout but hints on stderr so it is debuggable.
+    The hint is scoped to the SDK import (not authenticate()) so an optional-dep
+    ImportError is not misattributed."""
+    import sys
+
+    from omnigent.inner import databricks_token
+
+    # Make ``import databricks.sdk.config`` raise ImportError.
+    monkeypatch.setitem(sys.modules, "databricks.sdk.config", None)
+    assert databricks_token.main(["--host", "https://example.databricks.com"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "databricks-sdk" in captured.err
+
+
+def test_the_sdk_entrypoint_withholds_when_no_host_is_given(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The workspace guard fails closed on an empty --host rather than releasing
+    an unchecked token."""
+    from omnigent.inner import databricks_token
+
+    monkeypatch.setattr(
+        databricks_token,
+        "_sdk_bearer",
+        lambda profile, host: ("https://example.databricks.com", "tok"),
+    )
+    assert databricks_token.main(["--profile", "sp"]) == 0  # no --host
+    assert capsys.readouterr().out == ""
+
+
+def test_profile_pinning_scrubs_the_ambient_credential_env_vars() -> None:
+    """Named-profile identity guarantee: the SDK resolves env above the profile
+    section, so the scrub set (built from the real SDK attribute table) must
+    cover the ambient creds that would otherwise outrank a named profile — host,
+    PAT, and M2M client id/secret — while keeping the config-file locator so the
+    profile can still be found. This exercises the real SDK, not a mock."""
+    from omnigent.inner import databricks_token
+
+    names = databricks_token._ambient_credential_env_vars()
+    assert {
+        "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CLIENT_SECRET",
+        "DATABRICKS_CONFIG_PROFILE",
+    } <= names
+    assert "DATABRICKS_CONFIG_FILE" not in names
+
+
+def test_the_sdk_path_bounds_and_restores_the_network_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK metadata probe + token exchange are otherwise unbounded; bound
+    them to parity with the CLI/broker mints (~15s) and restore the prior default
+    so the bound doesn't leak into the caller."""
+    import socket
+
+    import databricks.sdk.config as sdk_config
+
+    from omnigent.inner import databricks_token
+
+    seen: dict[str, float | None] = {}
+
+    class _StubConfig:
+        host = "https://example.databricks.com"
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def authenticate(self) -> dict[str, str]:
+            seen["during"] = socket.getdefaulttimeout()
+            return {"Authorization": "Bearer tok"}
+
+    monkeypatch.setattr(sdk_config, "Config", _StubConfig)
+    before = socket.getdefaulttimeout()
+    databricks_token._sdk_bearer(None, "https://example.databricks.com")
+    assert seen["during"] == databricks_token._SDK_NETWORK_TIMEOUT_S
+    assert socket.getdefaulttimeout() == before

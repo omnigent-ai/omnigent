@@ -1,0 +1,26 @@
+   Skipped refreshing managed:kimi-code: OAuth provider "managed:kimi-code" requires login before it can be used.
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                    │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                    │
+ │  ▐█████▌  Send /help for help information.                                                                         │
+ │                                                                                                                    │
+ │  Directory: <scratch>                                                                                              │
+ │  Session:                                                                                                          │
+ │  Model:     system.ai.kimi-k3                                                                                      │
+ │  Version:   0.34.0                                                                                                 │
+ │                                                                                                                    │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   No session yet — one will be created on your first message.
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and
+ restart tmux.
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > [paste #1 +11 lines]                                                                                             │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ system.ai.kimi-k3  <scratch>
+                                                                                                     context: 0% (0/1M)

@@ -1009,3 +1009,121 @@ describe("useAvailableAgents pinned agents", () => {
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly"]);
   });
 });
+
+describe("useAvailableAgents slow discovery scan", () => {
+  const catalogResponse = () =>
+    mockResponse({
+      object: "list",
+      data: [
+        { id: "ag_claude", name: "claude-native-ui", harness: "claude-native", builtin: true },
+        { id: "ag_codex", name: "codex-native-ui", harness: "codex-native", builtin: true },
+      ],
+      has_more: false,
+    });
+
+  it("serves catalog rows as placeholder data without waiting for the scan", async () => {
+    // Managed deployments with large session tables answer the discovery
+    // scan slowly; here it simply never resolves until released. The
+    // catalog-only harness rows must come up anyway — a slow scan must not
+    // hold the picker hostage any more than a failing one does.
+    let releaseScan: (r: Response) => void = () => {};
+    const scanGate = new Promise<Response>((resolve) => {
+      releaseScan = resolve;
+    });
+    fetchMock.mockImplementation((url: string) => {
+      if (url === BUILTINS_URL) return Promise.resolve(catalogResponse());
+      if (url === SCAN_URL) return scanGate;
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+
+    // Catalog rows appear while the scan is still pending…
+    await waitFor(() =>
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex"]),
+    );
+    expect(result.current.isPlaceholderData).toBe(true);
+
+    // …and upgrade in place — placeholder flag cleared, scan-discovered
+    // agents merged in — once the scan finally lands.
+    releaseScan(
+      mockResponse({
+        object: "list",
+        data: [{ id: "sess_1", agent_id: "ag_custom", agent_name: "my-agent", created_at: 1 }],
+        has_more: false,
+      }),
+    );
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex", "ag_custom"]);
+  });
+
+  it("keeps supersedable templates (builtin: false) out of the placeholder rows", async () => {
+    // A user-registered template competes newest-wins with same-named
+    // session-discovered agents in the resolved merge (#3234). Surfacing it
+    // as launchable while the scan is still pending could bind a stale
+    // template id the merge would have superseded — so the placeholder
+    // carries protected rows only, and the template joins once the scan
+    // settles the race.
+    let releaseScan: (r: Response) => void = () => {};
+    const scanGate = new Promise<Response>((resolve) => {
+      releaseScan = resolve;
+    });
+    fetchMock.mockImplementation((url: string) => {
+      if (url === BUILTINS_URL)
+        return Promise.resolve(
+          mockResponse({
+            object: "list",
+            data: [
+              {
+                id: "ag_claude",
+                name: "claude-native-ui",
+                harness: "claude-native",
+                builtin: true,
+              },
+              { id: "ag_codex", name: "codex-native-ui", harness: "codex-native", builtin: true },
+              {
+                id: "ag_template",
+                name: "agent-a",
+                harness: "claude-sdk",
+                builtin: false,
+                created_at: 200,
+              },
+            ],
+            has_more: false,
+          }),
+        );
+      if (url === SCAN_URL) return scanGate;
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+
+    // Placeholder rows: the protected harnesses, never the template.
+    await waitFor(() =>
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex"]),
+    );
+    expect(result.current.isPlaceholderData).toBe(true);
+
+    // Once the scan lands (empty: nothing supersedes it), the template is
+    // merged in — deferred until the race is settled, not dropped.
+    releaseScan(mockResponse({ object: "list", data: [], has_more: false }));
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex", "ag_template"]);
+  });
+
+  it("fetches the catalog once per mount (placeholder and merge share it)", async () => {
+    routeFetch({
+      [BUILTINS_URL]: catalogResponse(),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+
+    // The placeholder's catalog query and the merged queryFn share one
+    // GET /v1/agents — the placeholder must not double the catalog load.
+    const catalogCalls = fetchMock.mock.calls.filter((c) => c[0] === BUILTINS_URL);
+    expect(catalogCalls).toHaveLength(1);
+  });
+});

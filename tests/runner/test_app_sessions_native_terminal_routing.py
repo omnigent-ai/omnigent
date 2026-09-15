@@ -11,10 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    codex_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
@@ -263,12 +261,17 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     # the reader can find the cause. The raw ImportError text ("requires the
     # 'claude' CLI") must not appear in the HTTP body — only in that log.
     body = resp.json()
-    assert body["error"]["code"] == "native_terminal_start_failed"
-    assert body["error"]["message"] == (
+    error = body["error"]
+    error_id = error["error_id"]
+    assert error["code"] == "native_terminal_start_failed"
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
+    assert error["message"] == (
         "Native Claude terminal failed to start; "
-        f"see the runner log for details: {pinned_runner_log}"
+        f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
     )
-    assert "requires the 'claude' CLI" not in body["error"]["message"]
+    assert "requires the 'claude' CLI" not in error["message"]
 
 
 @dataclass

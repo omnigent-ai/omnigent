@@ -24,10 +24,10 @@ from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import pydantic
 
-from omnigent import model_catalog
-from omnigent.json_types import JsonValue
 from omnigent.llms.adapters._content import redact_inline_data_uris
+from omnigent.models import model_catalog
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonValue
 
 if TYPE_CHECKING:
     from openai import OpenAI, Stream

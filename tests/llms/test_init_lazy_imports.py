@@ -1,8 +1,8 @@
-"""Regression test for the omnigent.llms <-> omnigent.reasoning_effort cycle.
+"""Regression test for the omnigent.llms <-> omnigent.util.reasoning_effort cycle.
 
 The eager top-level imports in ``omnigent/llms/__init__.py`` created
 a circular load when any caller imported ``omnigent.llms.errors``
-during the load of ``omnigent.reasoning_effort`` (which happens on
+during the load of ``omnigent.util.reasoning_effort`` (which happens on
 every server-routes import via ``server/routes/sessions.py``).
 
 The fix in ``omnigent/llms/__init__.py`` switches to a
@@ -32,7 +32,7 @@ def test_sessions_routes_import_does_not_trigger_cycle() -> None:
     triggered ``reasoning_effort`` -> ``llms.errors`` -> ``llms.__init__``
     -> ``llms.client`` -> ``reasoning_effort`` re-entry."""
     _purge("omnigent.llms")
-    _purge("omnigent.reasoning_effort")
+    _purge("omnigent.util.reasoning_effort")
     _purge("omnigent.server.routes.sessions")
     importlib.import_module("omnigent.server.routes.sessions")
 

@@ -1,4 +1,4 @@
-"""Regression tests for the Homebrew formula generator's handling of pillow.
+"""Regression tests for Homebrew's Pillow resources and source-build mirrors.
 
 `brew install omnigent-ai/tap/omnigent` fails on macOS with "error building
 wheel for pillow": the generated formula ships pillow as an sdist resource, so
@@ -14,6 +14,9 @@ resolution mocked to a closure containing pillow, and assert on the rendered
 formula: the pillow resource must reference wheel files, never the sdist.
 They fail while the bug is live and pass once the generator stops emitting
 pillow's sdist.
+
+The rendered install method must also retain opt-in mirror setup so release
+regeneration cannot revert source-build fixes.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from textwrap import dedent
 
 _SCRIPT_DIR = Path(__file__).resolve().parents[2] / ".github" / "scripts" / "homebrew"
 _SCRIPT = _SCRIPT_DIR / "generate_formula.py"
@@ -175,3 +179,55 @@ def test_pick_macos_wheels_finds_pillow_cp314_wheels() -> None:
     )
     for arch in arches:
         assert wheels[arch][0].endswith(".whl")
+
+
+def _install_stanza(formula: str) -> str:
+    return dedent(formula.split("  def install\n", 1)[1].split("\n  end", 1)[0])
+
+
+def test_generated_formula_forwards_pip_mirror_before_creating_virtualenv(monkeypatch) -> None:
+    install = _install_stanza(_generate_formula_with_pillow(monkeypatch))
+    setup = dedent(
+        """\
+        if Homebrew::EnvConfig.non_default_variable?(:HOMEBREW_PIP_INDEX_URL) &&
+           (pip_index_url = Homebrew::EnvConfig.pip_index_url.presence)
+          ENV["PIP_INDEX_URL"] = pip_index_url
+        end
+        """
+    ).strip()
+
+    assert setup in install
+    assert install.index(setup) < install.index('venv = virtualenv_create(libexec, "python3.14")')
+
+
+def test_generated_formula_configures_cargo_mirror_before_resources(monkeypatch) -> None:
+    install = _install_stanza(_generate_formula_with_pillow(monkeypatch))
+    setup = dedent(
+        """\
+        if (cargo_index = ENV.fetch("HOMEBREW_CARGO_INDEX_URL", nil).presence)
+          (buildpath/".cargo").mkpath
+          (buildpath/".cargo/config.toml").write <<~TOML
+            [source.crates-io]
+            replace-with = "mirror"
+
+            [source.mirror]
+            registry = "sparse+#{cargo_index}"
+          TOML
+          ENV["CARGO_HOME"] = buildpath/".cargo"
+        end
+        """
+    ).strip()
+
+    assert setup in install
+    assert install.index(setup) < install.index("venv.pip_install sdists")
+
+
+def test_build_host_mirror_urls_are_not_baked_into_generated_formula(monkeypatch) -> None:
+    monkeypatch.delenv("HOMEBREW_PIP_INDEX_URL", raising=False)
+    monkeypatch.delenv("HOMEBREW_CARGO_INDEX_URL", raising=False)
+    original = _generate_formula_with_pillow(monkeypatch)
+
+    monkeypatch.setenv("HOMEBREW_PIP_INDEX_URL", "https://pypi.example.com/simple")
+    monkeypatch.setenv("HOMEBREW_CARGO_INDEX_URL", "https://cargo.example.com/index/")
+
+    assert _generate_formula_with_pillow(monkeypatch) == original

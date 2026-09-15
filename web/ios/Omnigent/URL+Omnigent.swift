@@ -1,6 +1,17 @@
 import Foundation
 import WebKit
 
+/// Server domains whose platform SSO must run inside the WebView so its cookies
+/// land in the WebView's own cookie store.
+private let inWebViewAuthDomains = ["databricks.com", "azuredatabricks.net", "databricksapps.com"]
+
+/// Whether the pinned server uses an authentication redirect chain that must
+/// remain in the WebView rather than Omnigent's system-browser OIDC handoff.
+func usesInWebViewAuth(_ origin: String?) -> Bool {
+  guard let origin, let host = URL(string: origin)?.host?.lowercased() else { return false }
+  return inWebViewAuthDomains.contains { host == $0 || host.hasSuffix(".\($0)") }
+}
+
 extension URL {
   var omnigentOrigin: String? {
     guard let scheme, let host else { return nil }

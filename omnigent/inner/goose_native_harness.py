@@ -8,7 +8,7 @@ resolves ``"goose-native"`` to this module via
 Wraps a :class:`omnigent.inner.goose_native_executor.GooseNativeExecutor`, which
 injects web-UI messages into the running ``goose session`` TUI (launched by
 ``omnigent goose`` in the session terminal) via tmux. The bridge dir is read from
-:data:`~omnigent.goose_native_bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
+:data:`~omnigent.harnesses.goose_native.bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
 
 Tool policies: Omnigent's PreToolUse/PostToolUse policy gates (which claude- and
 codex-native enforce via hooks) do NOT apply to goose-native — ``goose`` runs its

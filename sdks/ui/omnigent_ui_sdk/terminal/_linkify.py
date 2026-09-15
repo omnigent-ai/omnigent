@@ -13,22 +13,23 @@ the escape bytes are silently consumed without disrupting the
 visible output. This is the standard "graceful degradation"
 behavior every modern terminal honors per the OSC 8 spec.
 
-Why this lives here, not as a Rich highlighter or markup
-transformation: Rich's ``Console`` only auto-applies a
-``highlighter`` to plain-string args of ``Console.print`` —
-pre-built ``Text``/``Panel``/``Group`` renderables (which is
-what ``TerminalHost.output`` mostly receives) bypass the
-highlighter pass entirely. Rather than walk every Rich
-renderable type to find ``Text`` leaves and stylize them,
-we post-process the rendered ANSI string. One byte-level pass
-applies uniformly to every render path (streaming text,
-non-streaming Rich, mid-paragraph rewrites) without entangling
-us with Rich's renderable internals.
+``LinkifyingConsole`` attaches destinations to Rich text before
+line wrapping, including text inside panels, tables, and Markdown.
+Each wrapped fragment retains the complete URL. ``linkify_ansi``
+is a fallback for renderables that emit ANSI or segments directly;
+already-linked fragments pass through unchanged.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+
+from rich.console import Console, ConsoleOptions, RenderableType
+from rich.protocol import rich_cast
+from rich.segment import Segment
+from rich.style import Style
+from rich.text import Text
 
 # Match ``http://`` / ``https://`` URLs, stopping at:
 #   - whitespace
@@ -44,11 +45,20 @@ import re
 #     render by leaking the reset's tail ``0m`` as visible text before the
 #     URL. Real URLs never contain raw control bytes (they are
 #     percent-encoded), so excluding them is always safe.
+#   - the ellipsis (…) used by display elision — it is never part of a
+#     real URL, and a fragment cut at an ellipsis has lost its tail.
 # Trailing punctuation (``.,;:!?``) is stripped in the substitution
 # callback rather than excluded by the regex — e.g. "Visit
 # https://example.com." should fire OSC 8 over the URL but leave
 # the period after the close-OSC8.
-_URL = r"https?://[^\s\)\]\>\"'<\x00-\x1f\x7f]+"
+_URL = r"https?://[^\s\)\]\>\"'<…\x00-\x1f\x7f]+"
+_URL_RE = re.compile(_URL)
+
+# Display-elision marker. A URL match that runs into an ellipsis was cut
+# for display (e.g. the 80-char tool-args summary); its true destination
+# is unknowable here, so it must not be hyperlinked at all — a link to
+# the visible fragment opens a wrong page.
+_ELLIPSIS = "…"
 
 # Match a complete pre-existing OSC 8 hyperlink block so we don't
 # re-wrap a URL that was already linkified (some agent paths emit
@@ -86,6 +96,36 @@ _OSC_OPEN = "\x1b]8;;"
 _OSC_CLOSE = "\x1b\\"
 
 
+class LinkifyingConsole(Console):
+    """Attach URL destinations before Rich splits text into terminal rows."""
+
+    def render(
+        self, renderable: RenderableType, options: ConsoleOptions | None = None
+    ) -> Iterable[Segment]:
+        renderable = rich_cast(renderable)
+        render_options = options or self.options
+        if isinstance(renderable, str):
+            renderable = self.render_str(
+                renderable, highlight=render_options.highlight, markup=render_options.markup
+            )
+        if isinstance(renderable, Text) and not self.get_style(renderable.style).link:
+            plain = renderable.plain
+            matches = [
+                match
+                for match in _URL_RE.finditer(plain)
+                # Skip fragments cut by display elision — see _ELLIPSIS.
+                if plain[match.end() : match.end() + 1] != _ELLIPSIS
+            ]
+            if matches:
+                renderable = renderable.copy()
+                for match in matches:
+                    url = match.group().rstrip(_TRAILING_PUNCT)
+                    renderable.stylize_before(
+                        Style(link=url), match.start(), match.start() + len(url)
+                    )
+        yield from super().render(renderable, options)
+
+
 def linkify_ansi(text: str) -> str:
     """
     Wrap ``http(s)://`` URLs in OSC 8 hyperlink escapes.
@@ -120,6 +160,9 @@ def linkify_ansi(text: str) -> str:
         # An IndexError here would mean the regex changed in a
         # way that no longer guarantees the prefix — fail loud.
         url = match.group(2)
+        # Skip fragments cut by display elision — see _ELLIPSIS.
+        if match.string[match.end(2) : match.end(2) + 1] == _ELLIPSIS:
+            return url
         trailing = ""
         while url[-1] in _TRAILING_PUNCT:
             trailing = url[-1] + trailing

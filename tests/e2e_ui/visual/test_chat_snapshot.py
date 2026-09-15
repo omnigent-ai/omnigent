@@ -216,7 +216,7 @@ def test_chat_conversation_matches_baseline(
     # read-only model/effort label; wait for both so the capture includes them
     # (they hydrate from the same session snapshot the bubbles above wait on).
     expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
-    expect(page.locator('[data-testid="composer-model-effort-label"]')).to_be_visible()
+    expect(page.locator('[data-testid="composer-agent-config-value"]')).to_be_visible()
 
     # Shiki loads lazily: the colored token spans mount a frame after the block
     # first paints raw. Wait until the tokens resolve more than one distinct

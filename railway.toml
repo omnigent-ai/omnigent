@@ -1,7 +1,8 @@
 # Railway config: pulls the CI image via the Dockerfile.prebuilt shim (a source
 # build can't produce the gitignored web UI bundle). Pair with a Railway
-# Postgres plugin; DATABASE_URL and PORT are injected automatically. Setup +
-# the post-OSS deploy button: deploy/railway/README.md.
+# Postgres plugin. PORT is injected automatically, but DATABASE_URL is not: add
+# a `DATABASE_URL = ${{Postgres.DATABASE_URL}}` reference variable on the app
+# service yourself. Setup + the post-OSS deploy button: deploy/railway/README.md.
 
 [build]
 builder = "DOCKERFILE"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 import pytest
 
@@ -114,6 +115,36 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
+def test_record_to_row_redacts_token_like_text_fields() -> None:
+    secret = "aB3" + "xY7" * 12
+    try:
+        raise ValueError(f"credential={secret}")
+    except ValueError:
+        import sys
+
+        record = logging.LogRecord(
+            "omnigent.runner",
+            logging.ERROR,
+            __file__,
+            10,
+            "request failed: %s",
+            (secret,),
+            sys.exc_info(),
+            func="do_it",
+        )
+    record.attributes = {"upstream_response": secret, "attempt": 3}
+
+    row = dl.record_to_row(record, source="runner")
+
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert secret not in str(row["message"])
+    assert secret not in str(row["stack_trace"])
+    assert secret not in attributes["upstream_response"]
+    assert attributes["attempt"] == "3"
+    assert "[REDACTED]" in str(row)
+
+
 def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     # session_id is passed explicitly at the callsite via extra= and read off
     # the record. There is deliberately no ambient request-scoped fallback; an
@@ -169,6 +200,137 @@ def test_record_to_row_captures_stack_trace() -> None:
     assert "ValueError: boom" in (row["stack_trace"] or "")
 
 
+def test_record_to_row_auto_attributes_logged_exception() -> None:
+    """A record with exc_info gets error_category/error_impact derived from the
+    exception, so every exc_info=… log site is covered without per-site edits.
+
+    An arbitrary exception is UNKNOWN on both axes (no guessed owner); the sink
+    does not need the callsite to have classified it.
+    """
+    import sys
+
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert attrs == {"error_category": "unknown", "error_impact": "unknown"}
+
+
+def test_record_to_row_auto_attributes_omnigent_error_from_its_axes() -> None:
+    """An OmnigentError logged via exc_info carries its own code-derived axes."""
+    import sys
+
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    try:
+        raise OmnigentError("gone", code=ErrorCode.RUNNER_UNAVAILABLE)
+    except OmnigentError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    # runner_unavailable is config-owned and self-healing.
+    assert attrs["error_category"] == "config"
+    assert attrs["error_impact"] == "transient"
+
+
+def test_record_to_row_explicit_attributes_win_over_derived() -> None:
+    """An explicit error_category/error_impact on the record is never overwritten
+    by the exception-derived fallback."""
+    import sys
+
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    record.attributes = {"error_category": "server", "error_impact": "blocking"}
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert attrs == {"error_category": "server", "error_impact": "blocking"}
+
+
+def test_phase_scope_stamps_error_phase_on_logged_exception() -> None:
+    """An error logged inside a phase_scope inherits where it failed, even when
+    the exception carries no error code."""
+    import sys
+
+    from omnigent.errors import ErrorPhase
+
+    with dl.phase_scope(ErrorPhase.HARNESS_STARTUP):
+        try:
+            raise ValueError("spawn blew up")
+        except ValueError:
+            record = logging.LogRecord(
+                "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+            )
+        attrs = dl.record_to_row(record, source="runner")["attributes"]
+    assert attrs["error_phase"] == "harness_startup"
+    # And the arbitrary exception still auto-attributes category/impact.
+    assert attrs["error_category"] == "unknown"
+
+
+def test_coded_error_phase_wins_over_ambient_scope() -> None:
+    """A coded OmnigentError's own (concrete) phase beats the ambient scope, so
+    a harness_not_configured raised during a runner-launch scope still reads
+    harness_setup (the useful, semantic location)."""
+    import sys
+
+    from omnigent.errors import ErrorCode, ErrorPhase, OmnigentError
+
+    with dl.phase_scope(ErrorPhase.RUNNER_LAUNCH):
+        try:
+            raise OmnigentError("no harness", code=ErrorCode.HARNESS_NOT_CONFIGURED)
+        except OmnigentError:
+            record = logging.LogRecord(
+                "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+            )
+        attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert attrs["error_phase"] == "harness_setup"
+
+
+def test_no_phase_when_no_code_and_no_scope() -> None:
+    """Outside any scope, an uncoded exception gets no error_phase (we don't
+    guess a location)."""
+    import sys
+
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert "error_phase" not in attrs
+
+
+def test_benign_row_in_phase_scope_is_not_stamped() -> None:
+    """A non-error log line inside a phase_scope must NOT inherit error_phase.
+
+    phase_scope wraps the whole turn loop, so benign INFO/DEBUG telemetry (and
+    high-volume SSE-event rows) flow through here. Stamping them would pollute
+    the error_phase column, so only rows that are actually errors (an exception,
+    or an explicit category/impact) get located.
+    """
+    from omnigent.errors import ErrorPhase
+
+    with dl.phase_scope(ErrorPhase.TURN):
+        info = logging.LogRecord("omnigent.runtime.x", logging.INFO, __file__, 1, "hi", (), None)
+        info_attrs = dl.record_to_row(info, source="runner")["attributes"]
+        # A bare WARNING with no exception and no explicit error attrs is not an
+        # error row either; it stays clean.
+        warn = logging.LogRecord(
+            "omnigent.runtime.x", logging.WARNING, __file__, 1, "hm", (), None
+        )
+        warn_attrs = dl.record_to_row(warn, source="runner")["attributes"]
+    assert "error_phase" not in info_attrs
+    assert "error_category" not in info_attrs
+    assert "error_phase" not in warn_attrs
+
+
 def test_debug_event_builds_extra() -> None:
     assert dl.debug_event("evt", a=1, b="x") == {
         "event_name": "evt",
@@ -212,6 +374,72 @@ def test_record_to_row_falls_back_to_context_var() -> None:
     with dl.current_user_id_scope("ctx@x"):
         assert dl.record_to_row(record, source="server")["user_id"] == "ctx@x"
     assert dl.record_to_row(record, source="server")["user_id"] is None
+
+
+def test_record_to_row_session_id_falls_back_to_ambient_scope() -> None:
+    # The server middleware binds an ambient session id for a session-scoped
+    # request; unthreaded records inherit it, and only inside the scope.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="server")["session_id"] == "conv_ambient"
+    assert dl.record_to_row(record, source="server")["session_id"] is None
+
+
+def test_record_to_row_prefers_explicit_session_id_over_ambient() -> None:
+    # An explicit record.session_id wins over the ambient request-scoped value.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    record.session_id = "conv_explicit"
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="server")["session_id"] == "conv_explicit"
+
+
+def test_record_to_row_session_ambient_beats_primary_but_explicit_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Priority on a runner: explicit extra > ambient scope > primary-session env.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="runner")["session_id"] == "conv_ambient"
+    assert dl.record_to_row(record, source="runner")["session_id"] == "conv_primary"
+
+
+def test_request_audit_attrs_accumulate_and_reset() -> None:
+    # Outside a request (no bag) add_audit_attrs is a no-op and the current
+    # attrs are empty.
+    assert dl.current_request_audit_attrs() == {}
+    dl.add_audit_attrs(event_type="message")
+    assert dl.current_request_audit_attrs() == {}
+    # After a per-request reset, handlers accumulate attrs (coerced to str,
+    # None dropped) that the middleware later reads.
+    dl.reset_request_audit_attrs()
+    dl.add_audit_attrs(event_type="message", item_id="it_1", ignored=None)
+    dl.add_audit_attrs(count=3)
+    assert dl.current_request_audit_attrs() == {
+        "event_type": "message",
+        "item_id": "it_1",
+        "count": "3",
+    }
+
+
+def test_mark_request_audit_suppressed_sets_reserved_flag() -> None:
+    # Inside a request it sets the reserved _suppress key the middleware reads
+    # to skip the envelope end-event.
+    dl.reset_request_audit_attrs()
+    assert "_suppress" not in dl.current_request_audit_attrs()
+    dl.mark_request_audit_suppressed()
+    assert dl.current_request_audit_attrs()["_suppress"] == "1"
+
+
+def test_current_session_id_scope_resets() -> None:
+    assert dl.current_session_id() is None
+    dl.set_current_session_id("outer")
+    try:
+        with dl.current_session_id_scope("inner"):
+            assert dl.current_session_id() == "inner"
+        assert dl.current_session_id() == "outer"
+    finally:
+        dl.set_current_session_id(None)
 
 
 def test_record_to_row_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,6 +497,39 @@ def test_emit_revives_closed_uploader(_configured_env: None) -> None:
         sink.close()
 
 
+def test_custom_send_receives_prepared_rows_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    sink = dl.DebugLogHandler("integration", send)
+    try:
+        record = logging.LogRecord(
+            "integration.logger",
+            logging.INFO,
+            __file__,
+            1,
+            "hello %s",
+            ("world",),
+            None,
+        )
+        sink.emit(record)
+
+        assert delivered.wait(timeout=1.0)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+        assert batches[0][0]["source"] == "integration"
+        assert batches[0][0]["message"] == "hello world"
+    finally:
+        sink.close()
+
+
 def test_ignored_loggers_are_dropped() -> None:
     # httpx/httpcore records are chatty HTTP-client noise and must be dropped;
     # everything else is kept.
@@ -284,6 +545,46 @@ def test_attach_is_noop_when_disabled() -> None:
     target.handlers.clear()
     dl.attach_debug_log_sink([target], source="runner", level=logging.INFO)
     assert not any(isinstance(h, dl.ZerobusLogHandler) for h in target.handlers)
+
+
+def test_attach_uses_custom_send_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_active_sink", None)
+    target = logging.getLogger("test.debug_logging.custom")
+    target.handlers.clear()
+    target.setLevel(logging.INFO)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    dl.attach_debug_log_sink(
+        [target],
+        source="custom",
+        level=logging.INFO,
+        send=send,
+    )
+    sink = dl._active_sink
+    assert sink is not None
+    assert type(sink) is dl.DebugLogHandler
+    try:
+        target.info("custom delivery")
+        assert delivered.wait(timeout=1.0)
+        assert batches[0][0]["message"] == "custom delivery"
+        # The audit-event logger is wired sink-only and non-propagating, so
+        # request audit rows reach the table but never the on-disk/stderr logs.
+        audit_logger = dl.audit_event_logger()
+        assert audit_logger.propagate is False
+        assert sink in audit_logger.handlers
+    finally:
+        target.removeHandler(sink)
+        dl.sse_event_logger().removeHandler(sink)
+        dl.audit_event_logger().removeHandler(sink)
+        sink.close()
 
 
 def test_runner_primary_session_id(monkeypatch: pytest.MonkeyPatch) -> None:

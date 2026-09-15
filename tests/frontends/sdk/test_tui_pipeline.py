@@ -8,6 +8,7 @@ correctly in the terminal output.
 
 from __future__ import annotations
 
+import re
 import sys
 
 import pytest
@@ -364,9 +365,10 @@ _OSC_OPEN = "\x1b]8;;"
 _OSC_CLOSE = "\x1b\\"
 
 
-def _osc8_wrap(url: str) -> str:
-    """Expected OSC 8 byte sequence for a URL."""
-    return f"{_OSC_OPEN}{url}{_OSC_CLOSE}{url}{_OSC_OPEN}{_OSC_CLOSE}"
+def _osc8_wrap(url: str) -> re.Pattern[str]:
+    """Match an OSC 8 link with or without Rich's optional link ID."""
+    escaped_url = re.escape(url)
+    return re.compile(rf"\x1b\]8;[^;]*;{escaped_url}\x1b\\{escaped_url}\x1b\]8;;\x1b\\")
 
 
 def test_pipeline_streaming_text_linkifies_urls_on_newline_flush(
@@ -386,7 +388,7 @@ def test_pipeline_streaming_text_linkifies_urls_on_newline_flush(
     host.output(StreamingText(text="Visit https://example.com ok\n"))
     captured = capsys.readouterr()
     # The OSC 8 wrapper must appear around the URL.
-    assert _osc8_wrap("https://example.com") in captured.out, (
+    assert _osc8_wrap("https://example.com").search(captured.out), (
         f"Expected OSC 8 hyperlink in streamed text flushed by newline, "
         f"got: {captured.out!r}. The linkify_ansi call in _print_text_line "
         f"may have been removed."
@@ -413,7 +415,7 @@ def test_pipeline_streaming_text_linkifies_urls_on_word_wrap(
     text = "See https://example.com " + "x" * 60
     host.output(StreamingText(text=text))
     captured = capsys.readouterr()
-    assert _osc8_wrap("https://example.com") in captured.out, (
+    assert _osc8_wrap("https://example.com").search(captured.out), (
         f"Expected OSC 8 hyperlink in word-wrapped streaming text, "
         f"got: {captured.out!r}. The linkify_ansi call on the wrap path "
         f"may have been removed."
@@ -449,7 +451,7 @@ def test_pipeline_stream_replace_linkifies_urls(
         host.output(item)
 
     combined = "".join(writes)
-    assert _osc8_wrap("https://example.com/path") in combined, (
+    assert _osc8_wrap("https://example.com/path").search(combined), (
         f"Expected OSC 8 hyperlink in StreamReplace output, "
         f"got: {combined!r}. The linkify_ansi call in "
         f"_replace_live_region may have been removed."
@@ -490,7 +492,7 @@ def test_pipeline_tool_output_url_linkified(
     # Rich may interleave SGR color codes between the OSC 8 opener
     # and the display text, so we check for the OSC 8 opener
     # (which carries the URL) and the closer separately.
-    assert f"{_OSC_OPEN}https://docs.example.com/api" in output, (
+    assert re.search(r"\x1b\]8;[^;]*;https://docs\.example\.com/api\x1b\\", output), (
         f"Expected OSC 8 opener with URL in tool result panel, "
         f"got: {output!r}. The linkify_ansi call in the Rich-renderable "
         f"branch of output() may have been removed."

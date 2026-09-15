@@ -1,6 +1,6 @@
 """Tests for the pure RPC step→item mapper.
 
-These exercise :func:`omnigent.antigravity_native_steps.map_step_to_events`
+These exercise :func:`omnigent.harnesses.antigravity_native.steps.map_step_to_events`
 using the real recorded fixtures captured from live agy sessions — from BOTH
 RPC shapes, since they differ (``stream_*`` fixtures are verbatim
 ``StreamAgentStateUpdates`` frames, the rest are ``GetCascadeTrajectorySteps``
@@ -26,7 +26,7 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
-from omnigent.antigravity_native_steps import (
+from omnigent.harnesses.antigravity_native.steps import (
     OutboundEvent,
     _execution_discriminator,
     map_step_to_events,

@@ -35,7 +35,9 @@ def _run(monkeypatch: pytest.MonkeyPatch, tool_name: str) -> tuple[dict, bool]:
 
         return _R()
 
-    monkeypatch.setattr("omnigent.native_policy_hook.post_evaluate_with_retry", _spy, raising=True)
+    monkeypatch.setattr(
+        "omnigent.native.native_policy_hook.post_evaluate_with_retry", _spy, raising=True
+    )
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(json.dumps({"tool_name": tool_name, "tool_input": {}})),

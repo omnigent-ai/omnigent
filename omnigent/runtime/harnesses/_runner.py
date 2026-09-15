@@ -378,6 +378,7 @@ def _create_uvicorn_config(
             app,
             uds=socket_path,
             log_level=_UVICORN_LOG_LEVEL,
+            log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
         )
     if bind:
@@ -387,6 +388,7 @@ def _create_uvicorn_config(
             host=host,
             port=int(port),
             log_level=_UVICORN_LOG_LEVEL,
+            log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
         )
     sys.exit("runner: exactly one of --socket or --bind is required")

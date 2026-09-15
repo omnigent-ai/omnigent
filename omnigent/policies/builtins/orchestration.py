@@ -16,12 +16,15 @@ from collections.abc import Callable, Collection
 from typing import Any, TypeAlias
 
 from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
 
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
 _Json: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # A ready ALLOW decision (the common case — most tool calls pass).
 _ALLOW: _Json = {"result": "ALLOW"}
+
+_SPAWN_BOUNDS_STATE_KEY = "_policy_spawn_bounds_dispatches"
 
 
 def _decision(result: str, reason: str) -> _Json:
@@ -429,12 +432,12 @@ def spawn_bounds(
 
     Counts the *dispatch_tools* tool calls within a single orchestrator turn
     and DENIES once *max_dispatches_per_turn* is exceeded, forcing fan-out in
-    bounded waves rather than an unbounded fleet. The orchestrator dispatches
-    every worker through a sub-agent send (``sys_session_send``), so that is the
-    default counted tool. The counter resets each turn via the ``reset_turn``
-    hook the runner calls (``omnigent/runner/policy.py``). This is the v1
-    concurrency bound; true cross-turn live-concurrency accounting is a v1.x
-    refinement.
+    bounded waves rather than an unbounded fleet. The count is persisted in
+    ``session_state`` because the deployed server rebuilds its policy engine
+    for every tool call. Every request-phase event resets the persisted count
+    — that is each inbound user-role message, including a sub-agent wake
+    notice — so a wave collected by a wake gets a fresh budget. The closure
+    remains the runner-local fallback, reset through ``reset_turn``.
 
     :param max_dispatches_per_turn: Maximum worker dispatches allowed in one
         turn, e.g. ``5``.
@@ -454,20 +457,46 @@ def spawn_bounds(
             ``data["name"]`` is one of *dispatch_tools*.
         :returns: ALLOW, or DENY once the per-turn cap is exceeded.
         """
+        if event.get("type") == "request":
+            state["count"] = 0
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _SPAWN_BOUNDS_STATE_KEY, "action": "set", "value": 0},
+                ],
+            }
         if _tool_call(event, counted) is None:
             return _ALLOW
-        state["count"] += 1
-        if state["count"] > max_dispatches_per_turn:
-            return _decision(
+        session_state = event.get("session_state") or {}
+        persisted = session_state.get(_SPAWN_BOUNDS_STATE_KEY, 0)
+        persisted_count = persisted if isinstance(persisted, int) else 0
+        # A fresh server engine starts the closure at 0 and reads the
+        # persisted count; the runner gate has no session_state and keeps
+        # counting in the closure. max() serves both without double counting.
+        state["count"] = max(state["count"], persisted_count) + 1
+        result: _Json = (
+            _decision(
                 "DENY",
                 f"Exceeded {max_dispatches_per_turn} worker dispatches this turn; "
                 "fan out in waves (collect the running batch before dispatching more).",
             )
-        return _ALLOW
+            if state["count"] > max_dispatches_per_turn
+            else {"result": "ALLOW"}
+        )
+        # Increment rather than set: an ASK from another policy defers this
+        # write until approval, and replaying an absolute count would wind
+        # back the dispatches counted in between.
+        result["state_updates"] = [
+            {"key": _SPAWN_BOUNDS_STATE_KEY, "action": "increment", "value": 1},
+        ]
+        return result
 
     def reset_turn() -> None:
         """
-        Reset the per-turn dispatch counter at each turn boundary.
+        Reset the closure's per-turn dispatch counter at each turn boundary.
+
+        Clears only the runner-local closure; the persisted count in
+        ``session_state`` is reset by the request-phase event instead.
 
         :returns: ``None``.
         """
@@ -552,12 +581,12 @@ def worktree_guard(
     :returns: An evaluator ``fn(event, config)`` returning a V0 decision.
     """
 
-    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit
-    # (surfaced via the PreToolUse hook), and Pi's native lowercase
+    # Match Omnigent built-in OS write/edit, every Claude/Codex native write
+    # tool (surfaced via the PreToolUse hook), and Pi's native lowercase
     # write/edit (surfaced via the pi ``tool_call`` hook). Pi uses the same
     # ``path`` argument key as the Omnigent tools, so no Pi-specific arg
     # branch is needed below.
-    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "MultiEdit", "write", "edit"}
+    _write_tools = NATIVE_WRITE_TOOLS | {"sys_os_write", "sys_os_edit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
@@ -571,35 +600,43 @@ def worktree_guard(
         args = _tool_call(event, _write_tools)
         if args is None:
             return _ALLOW
-        # Omnigent tools use ``path``; Claude native tools use ``file_path``.
-        path = args.get("path") or args.get("file_path")
-        if not isinstance(path, str):
-            return _ALLOW
-        # Backslashes are not valid in POSIX paths and could confuse
-        # downstream processing into treating them as separators, slipping a
-        # ``..\\`` past the split-on-'/' traversal check.
-        if "\\" in path:
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
-        # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
-        # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
-        # below inert on a Windows runner (absolute paths would ALLOW there).
-        # normpath collapses ``..``/``.``/repeated slashes and pushes every
-        # upward traversal to the front, so a single startswith catches every
-        # escape form (e.g. "a/../../escape" → "../../escape").
-        normalized = posixpath.normpath(path)
-        if normalized.startswith(("/", "~", "..")):
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
-        # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
-        # reads as an ordinary relative dir named "C:" to posixpath, so the test
-        # above misses it. Checked on the NORMALIZED path, not the raw one:
-        # normpath strips a leading "./" (and collapses "a/../C:/..."), which
-        # would otherwise hide the drive letter from a raw-string check. UNC
-        # ("//server/share") keeps its leading slashes and is caught above.
-        # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
-        # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
-        drive = normalized[:1]
-        if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # Omnigent tools use ``path``; Claude native tools use ``file_path``,
+        # except NotebookEdit which uses ``notebook_path``. Check EVERY
+        # path-like argument present, not the first truthy one: a decoy
+        # in-tree ``path`` alongside an escaping ``notebook_path`` (or
+        # ``file_path``) must still DENY, since the tool acts on its own
+        # canonical key regardless of what else rides in the payload.
+        paths = [
+            value
+            for key in ("path", "file_path", "notebook_path")
+            if isinstance(value := args.get(key), str)
+        ]
+        for path in paths:
+            # Backslashes are not valid in POSIX paths and could confuse
+            # downstream processing into treating them as separators, slipping a
+            # ``..\\`` past the split-on-'/' traversal check.
+            if "\\" in path:
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+            # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
+            # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
+            # below inert on a Windows runner (absolute paths would ALLOW there).
+            # normpath collapses ``..``/``.``/repeated slashes and pushes every
+            # upward traversal to the front, so a single startswith catches every
+            # escape form (e.g. "a/../../escape" → "../../escape").
+            normalized = posixpath.normpath(path)
+            if normalized.startswith(("/", "~", "..")):
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+            # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
+            # reads as an ordinary relative dir named "C:" to posixpath, so the test
+            # above misses it. Checked on the NORMALIZED path, not the raw one:
+            # normpath strips a leading "./" (and collapses "a/../C:/..."), which
+            # would otherwise hide the drive letter from a raw-string check. UNC
+            # ("//server/share") keeps its leading slashes and is caught above.
+            # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
+            # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
+            drive = normalized[:1]
+            if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         return _ALLOW
 
     return _evaluate
@@ -616,7 +653,7 @@ def read_only_os(
     Factory: deny every file-mutating tool call (report-only agents).
 
     DENIES ``sys_os_write`` / ``sys_os_edit`` and the Claude/Codex/Pi native
-    ``Write`` / ``Edit`` / ``MultiEdit`` aliases. Reads, searches, and shell
+    ``Write`` / ``Edit`` / ``MultiEdit`` / ``NotebookEdit`` aliases. Reads, searches, and shell
     commands are left untouched — pair with :func:`blast_radius` to also bound
     shell blast radius. Use on agents whose contract is to investigate and
     report, never to change code (e.g. a security reviewer and its read-only
@@ -628,18 +665,10 @@ def read_only_os(
         write/edit tool call, ALLOW otherwise.
     """
 
-    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit/
-    # MultiEdit, and Pi's native lowercase write/edit — the same tool set
+    # Match Omnigent built-in OS write/edit, every Claude/Codex native write
+    # tool, and Pi's native lowercase write/edit — the same tool set
     # worktree_guard gates, so the two write policies stay in lockstep.
-    write_tools = {
-        "sys_os_write",
-        "sys_os_edit",
-        "Write",
-        "Edit",
-        "MultiEdit",
-        "write",
-        "edit",
-    }
+    write_tools = NATIVE_WRITE_TOOLS | {"sys_os_write", "sys_os_edit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
@@ -714,15 +743,15 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "factory",
         "name": "Restrict Writes to Git Worktree",
         "description": "Blocks file writes (sys_os_write/edit, Claude/Codex native "
-        "Write/Edit, and Pi native write/edit) outside the worker's git worktree to "
-        "prevent cross-branch contamination",
+        "Write/Edit/MultiEdit/NotebookEdit, and Pi native write/edit) outside the worker's "
+        "git worktree to prevent cross-branch contamination",
     },
     {
         "handler": "omnigent.policies.builtins.orchestration.read_only_os",
         "kind": "factory",
         "name": "Report-Only (Deny File Writes)",
         "description": "Denies every file-mutating tool (sys_os_write/edit, Claude/Codex "
-        "native Write/Edit/MultiEdit, and Pi native write/edit) so a report-only agent "
-        "can read and run shell but never change code",
+        "native Write/Edit/MultiEdit/NotebookEdit, and Pi native write/edit) so a "
+        "report-only agent can read and run shell but never change code",
     },
 ]

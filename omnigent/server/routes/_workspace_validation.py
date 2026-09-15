@@ -44,8 +44,38 @@ _WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
 
 
 def _is_windows_absolute_path(path: str) -> bool:
-    """Return True for Windows drive-letter absolute paths (``C:\\…`` / ``C:/…``)."""
+    """Return True for Windows drive-letter absolute paths (``C:\\...`` / ``C:/...``)."""
     return bool(_WINDOWS_ABS_PATH_RE.match(path))
+
+
+def _is_unc_path(path: str) -> bool:
+    """Return True for UNC paths (backslash-share or ``//server/share``)."""
+    return path.startswith(("\\\\", "//"))
+
+
+def restore_host_filesystem_url_path(path: str) -> str:
+    """Re-add the leading slash FastAPI's ``:path`` converter strips.
+
+    FastAPI captures ``/v1/hosts/{id}/filesystem/{path:path}`` without
+    the URL's leading slash, so POSIX ``/Users/me/proj`` arrives as
+    ``Users/me/proj`` and must be restored. Windows drive-letter and
+    UNC paths are already absolute in the capture (``C:/Users/me``).
+    Prefixing ``/`` would produce ``/C:/Users/me``, which is not a
+    directory on the host and is why the workspace picker falls
+    through to the drive root.
+
+    Tilde-prefixed paths (``~/foo``) are forwarded unchanged; the
+    host expands ``~``.
+
+    :param path: Path captured from the URL, e.g. ``Users/me``,
+        ``C:/Users/me/work``, or ``~/projects``.
+    :returns: Path to forward to ``host.list_dir``.
+    """
+    if path.startswith("~") or _is_windows_absolute_path(path) or _is_unc_path(path):
+        return path
+    if not path.startswith("/"):
+        return "/" + path
+    return path
 
 
 # How long to wait for a host.stat round-trip before giving up. Stat
@@ -176,16 +206,24 @@ def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     :returns: ``True`` when the workspace is the boundary or
         nested under it.
     """
-    if canonical_workspace == canonical_boundary:
+    # host.stat realpath on Windows uses backslashes. Only then treat
+    # ``\`` as a separator and ignore drive-letter case. On POSIX a
+    # backslash is a legal filename character, so ``/allowed\escape``
+    # must not look like a child of ``/allowed``.
+    if _is_windows_absolute_path(canonical_workspace) or _is_windows_absolute_path(
+        canonical_boundary
+    ):
+        workspace = canonical_workspace.replace("\\", "/").lower()
+        boundary = canonical_boundary.replace("\\", "/").lower()
+    else:
+        workspace = canonical_workspace
+        boundary = canonical_boundary
+    if workspace == boundary:
         return True
     # Add a trailing separator so ``/a/foo`` is not treated as a
-    # subpath of ``/a/fo`` (prefix collision). ``/`` is the only
-    # separator the host stat returns since ``canonical_path`` is
-    # always absolute.
-    boundary_with_sep = (
-        canonical_boundary if canonical_boundary.endswith("/") else canonical_boundary + "/"
-    )
-    return canonical_workspace.startswith(boundary_with_sep)
+    # subpath of ``/a/fo`` (prefix collision).
+    boundary_with_sep = boundary if boundary.endswith("/") else boundary + "/"
+    return workspace.startswith(boundary_with_sep)
 
 
 async def validate_workspace(

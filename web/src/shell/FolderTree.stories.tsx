@@ -40,9 +40,13 @@ const meta = {
     sort: "alpha",
   },
   decorators: [
+    // The tree virtualizes against a bounded-height scroll container (its own
+    // fallback one, since no scrollParentRef is passed here). Give the frame a
+    // fixed height so windowing has a viewport, mirroring the real fill-height
+    // callers (WorkspacePanel / FilesPanelDrawer).
     (Story) => (
       <StoryQueryRouter>
-        <div className="w-[340px] rounded-lg border bg-card p-1">
+        <div className="flex h-[420px] w-[340px] flex-col rounded-lg border bg-card p-1">
           <Story />
         </div>
       </StoryQueryRouter>

@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`omnigent.cursor_native_bridge` composer handling.
+"""Unit tests for :mod:`omnigent.harnesses.cursor_native.bridge` composer handling.
 
 Focused on the leftover-draft clear (:func:`_clear_composer`) and its use by
 :func:`inject_user_message`. cursor-agent restores the interrupted prompt into
@@ -15,8 +15,8 @@ from pathlib import Path
 import click
 import pytest
 
-from omnigent import cursor_native_bridge
-from omnigent.cursor_native_bridge import write_tmux_target
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.cursor_native.bridge import write_tmux_target
 
 _SOCK = "/tmp/example/cursor.sock"
 _TARGET = "cursor:0.0"
@@ -336,7 +336,7 @@ class TestHooksConfig:
         # The recorder is invoked isolated (-I) on the usage module, with the
         # absolute bridge dir baked in so it writes where the forwarder reads.
         assert "-I" in command
-        assert "omnigent.cursor_native_usage" in command
+        assert "omnigent.harnesses.cursor_native.usage" in command
         assert "record-usage" in command
         assert "/tmp/bridge" in command
         assert command.startswith("/usr/bin/python3")
@@ -361,3 +361,179 @@ class TestHooksConfig:
         assert payload["hooks"]["stop"][0]["command"].endswith(str(bridge_dir))
         # No leftover temp file from the atomic write.
         assert not (workspace / ".cursor" / "hooks.json.tmp").exists()
+
+    def test_write_hooks_config_preserves_existing_hooks(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        path = cursor_dir / "hooks.json"
+        pre_existing = {
+            "version": 1,
+            "hooks": {
+                "preToolUse": [{"command": "./scripts/pre-tool-guard.sh"}],
+                "stop": [{"command": "./scripts/notify-done.sh"}],
+            },
+        }
+        path.write_text(json.dumps(pre_existing), encoding="utf-8")
+
+        cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge")
+
+        payload = json.loads(path.read_text())
+        # The workspace's own hooks survive the launch write...
+        assert payload["hooks"]["preToolUse"] == [{"command": "./scripts/pre-tool-guard.sh"}]
+        stop_commands = [entry["command"] for entry in payload["hooks"]["stop"]]
+        assert "./scripts/notify-done.sh" in stop_commands
+        # ...and Omnigent's usage stop hook is registered alongside them.
+        assert any(
+            "omnigent.harnesses.cursor_native.usage" in command for command in stop_commands
+        )
+
+    def test_write_hooks_config_replaces_stale_usage_hook(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge-old")
+        path = cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge-new")
+
+        payload = json.loads(path.read_text())
+        usage_commands = [
+            entry["command"]
+            for entry in payload["hooks"]["stop"]
+            if "omnigent.harnesses.cursor_native.usage" in entry["command"]
+        ]
+        # Relaunching must not accumulate recorders pointing at dead bridge dirs.
+        assert len(usage_commands) == 1
+        assert usage_commands[0].endswith(str(tmp_path / "bridge-new"))
+
+    def test_write_hooks_config_tolerates_malformed_file(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "hooks.json").write_text("{not json", encoding="utf-8")
+
+        path = cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge")
+
+        payload = json.loads(path.read_text())
+        assert payload["version"] == 1
+        stop_commands = [entry["command"] for entry in payload["hooks"]["stop"]]
+        assert any(
+            "omnigent.harnesses.cursor_native.usage" in command for command in stop_commands
+        )
+
+    def test_write_hooks_config_tolerates_invalid_utf8_file(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        # Invalid UTF-8 must not crash the launch: reading it raises
+        # UnicodeDecodeError (a ValueError, not a JSONDecodeError), which the
+        # shared tolerant loader must swallow.
+        (cursor_dir / "hooks.json").write_bytes(b'\xff\xfe{"hooks": {}}')
+
+        path = cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge")
+
+        payload = json.loads(path.read_text())
+        assert payload["version"] == 1
+        stop_commands = [entry["command"] for entry in payload["hooks"]["stop"]]
+        assert any(
+            "omnigent.harnesses.cursor_native.usage" in command for command in stop_commands
+        )
+
+    def test_write_mcp_config_tolerates_invalid_utf8_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        # Stub the bridge-token write and Cursor CLI plumbing: this test only
+        # exercises the mcp.json read-merge-write path.
+        monkeypatch.setattr(cursor_native_bridge, "write_mcp_bridge_config", lambda _: None)
+        monkeypatch.setattr(cursor_native_bridge, "enable_mcp_for_workspace", lambda _: None)
+        monkeypatch.setattr(cursor_native_bridge, "allow_mcp_tools_in_cli_config", lambda: None)
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        # The sibling mcp.json writer shares the decode policy: invalid UTF-8
+        # must not crash the launch either.
+        (cursor_dir / "mcp.json").write_bytes(b'\xff\xfe{"mcpServers": {}}')
+
+        path = cursor_native_bridge.write_mcp_config(workspace, tmp_path / "bridge")
+
+        payload = json.loads(path.read_text())
+        assert "omnigent" in payload["mcpServers"]
+
+
+class TestMcpBridgeConfigSecureDir:
+    """``bridge.json`` holds a relay bearer token, so its tree must be owner-only."""
+
+    @staticmethod
+    def _bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+        """Point the bridge root at a production-shaped tree under ``tmp_path``.
+
+        ``_ensure_secure_bridge_dir`` anchors the ancestor walk at the uid-scoped
+        dir's parent, so mirror ``<trusted>/omnigent-<uid>/cursor-native/<digest>``.
+        """
+        uid_dir = tmp_path / "omnigent-test"
+        monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", uid_dir / "cursor-native")
+        return uid_dir, cursor_native_bridge.bridge_dir_for_session_id("sess")
+
+    def test_writes_token_under_owner_only_tree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The happy path still mints and persists the relay token."""
+        import json
+
+        _, bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+        cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+
+        token = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+        assert isinstance(token, str) and token
+
+    def test_rejects_symlinked_ancestor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A symlinked bridge-tree ancestor is refused — the token is never written.
+
+        On a shared host the sticky bit on ``/tmp`` blocks deletion, not creation,
+        so another local user can pre-create the uid-scoped dir as a symlink and
+        capture the relay token. Writing must fail loudly instead.
+        """
+        uid_dir, bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+        elsewhere = tmp_path / "attacker"
+        elsewhere.mkdir()
+        uid_dir.symlink_to(elsewhere, target_is_directory=True)
+
+        with pytest.raises(RuntimeError, match="is a symlink"):
+            cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+        # No token leaked into the attacker-controlled destination.
+        assert not (elsewhere / "cursor-native").exists()
+        assert not (bridge_dir / "bridge.json").exists()
+
+    def test_rejects_foreign_owned_ancestor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pre-existing world-writable ancestor owned by another uid is refused.
+
+        Models the attacker pre-creating ``$TMPDIR/omnigent-<uid>`` as a 0o777
+        directory they own: the ancestor walk must reject it rather than write the
+        token into a tree somebody else controls.
+        """
+        import os
+
+        if not hasattr(os, "getuid"):
+            pytest.skip("POSIX uid ownership checks are unavailable on this platform")
+
+        uid_dir, bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+        uid_dir.mkdir(parents=True)
+        uid_dir.chmod(0o777)
+        # The dir belongs to the real uid, so pretend we are somebody else.
+        monkeypatch.setattr(os, "getuid", lambda: os.stat(uid_dir).st_uid + 1)
+
+        with pytest.raises(RuntimeError, match="owned by uid"):
+            cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+        assert not (bridge_dir / "bridge.json").exists()

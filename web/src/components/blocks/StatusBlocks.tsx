@@ -1,18 +1,19 @@
 // Inline status indicators for non-tool, non-text, non-reasoning blocks.
 // Each is small enough to live in one file.
 //
-// - ErrorBanner: centered destructive pill with an expandable message body.
+// - ErrorBanner: centered destructive pill with an expandable message body;
+//   `level="info"` renders it as a neutral notice instead.
 // - RetryIndicator: muted one-liner about an in-flight retry.
 // - CompactionMarker: permanent marker shown after compaction completes.
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
 //   the "Working…" indicator.
 
 import {
-  AlertCircleIcon,
   BrainCircuitIcon,
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
+  Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
   ShieldXIcon,
@@ -47,7 +48,9 @@ interface ErrorBannerProps {
   cause?: string;
   /** Concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
-  /** Reconnect the existing session without replaying or duplicating user input. */
+  /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
+  level?: "error" | "info";
+  /** Recover the existing session or continue after a retryable turn failure. */
   onRetry?: () => Promise<void>;
 }
 
@@ -68,6 +71,11 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
+  codex_thread_reset:
+    "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+  codex_turn_error: "Codex ran into an error during this turn.",
+  native_turn_error: "The agent ran into an error during this turn.",
+  rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -76,6 +84,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
+  "rate_limit_exceeded",
 ]);
 
 interface ParsedErrorMessage {
@@ -144,9 +153,13 @@ export function ErrorBanner({
   title,
   cause,
   remediation,
+  level,
   onRetry,
 }: ErrorBannerProps) {
-  const headline = title || FAILURE_CODE_DESCRIPTIONS[code] || "Something went wrong";
+  const notice = level === "info";
+  const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
+  const headline =
+    title || FAILURE_CODE_DESCRIPTIONS[code] || (notice ? "Notice" : "Something went wrong");
   const parsed = useMemo(() => parseErrorMessage(message), [message]);
   const messageText = useMemo(() => {
     const parts: string[] = [];
@@ -173,16 +186,12 @@ export function ErrorBanner({
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
-  const [headerHovered, setHeaderHovered] = useState(false);
-  const [headerFocusVisible, setHeaderFocusVisible] = useState(false);
   const copyResetRef = useRef<number>(0);
   const retryInFlightRef = useRef(false);
-  const headerPointerDownRef = useRef(false);
   const dismissButtonRef = useRef<HTMLButtonElement>(null);
   const messageId = useId();
   const diagnosticsId = useId();
   const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
-  const showDisclosureIcon = expanded || headerHovered || headerFocusVisible;
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -216,7 +225,8 @@ export function ErrorBanner({
           aria-atomic="true"
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
-          Reconnecting
+          <Loader2Icon aria-hidden="true" className="animate-spin" />
+          {code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
         </Badge>
       </div>
     );
@@ -250,30 +260,17 @@ export function ErrorBanner({
         aria-hidden="true"
         className="pointer-events-none absolute top-[20px] right-0 left-0 h-px"
         style={{
-          background:
-            "repeating-linear-gradient(to right, color-mix(in srgb, var(--destructive) 32%, transparent) 0 2px, transparent 2px 6px)",
+          background: `repeating-linear-gradient(to right, color-mix(in srgb, ${tone} 32%, transparent) 0 2px, transparent 2px 6px)`,
         }}
       />
       <div
         data-testid="error-pill"
+        data-level={notice ? "info" : "error"}
         onClick={() => setExpanded((value) => !value)}
-        onMouseEnter={() => setHeaderHovered(true)}
-        onMouseLeave={() => setHeaderHovered(false)}
-        onPointerDown={() => {
-          headerPointerDownRef.current = true;
-          setHeaderFocusVisible(false);
-        }}
-        onPointerUp={() => {
-          headerPointerDownRef.current = false;
-        }}
-        onPointerCancel={() => {
-          headerPointerDownRef.current = false;
-        }}
         className="group/error relative z-10 w-[560px] max-w-full cursor-pointer rounded-[12px] p-[8px] text-foreground"
         style={{
-          background:
-            "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
-          border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+          background: `color-mix(in srgb, ${tone} 4%, var(--app-shell-bg, var(--background)))`,
+          border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
         }}
       >
         <div className="flex w-full min-w-0 items-start gap-[4px]">
@@ -285,47 +282,37 @@ export function ErrorBanner({
               event.stopPropagation();
               setExpanded((value) => !value);
             }}
-            onKeyDown={(event) => {
-              setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
-            }}
-            onFocus={(event) => {
-              setHeaderFocusVisible(
-                !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
-              );
-            }}
-            onBlur={() => {
-              headerPointerDownRef.current = false;
-              setHeaderFocusVisible(false);
-            }}
             className="flex min-w-0 flex-1 cursor-pointer items-start rounded-lg bg-transparent text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <span
               data-testid="error-leading-slot"
               className="mt-[4px] mr-[4px] flex h-[18px] w-[18px] shrink-0 items-center justify-center"
             >
-              {showDisclosureIcon ? (
-                <ChevronRightIcon
-                  data-testid="error-disclosure-icon"
-                  className={cn(
-                    "size-4 text-muted-foreground transition-transform duration-150 animate-in fade-in group-hover/error:text-foreground",
-                    expanded && "rotate-90",
-                  )}
-                  aria-hidden="true"
-                />
-              ) : (
-                <AlertCircleIcon
-                  data-testid="error-status-icon"
-                  className="size-[18px] text-destructive duration-150 animate-in fade-in"
-                  aria-hidden="true"
-                />
-              )}
+              <ChevronRightIcon
+                data-testid="error-disclosure-icon"
+                className={cn(
+                  "size-4 text-muted-foreground transition-transform duration-150 group-hover/error:text-foreground",
+                  expanded && "rotate-90",
+                )}
+                aria-hidden="true"
+              />
             </span>
-            <span
-              data-testid="error-headline"
-              title={headline}
-              className="mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6 text-destructive"
-            >
-              {headline}
+            <span className="mr-[4px] flex min-w-0 flex-1 flex-col">
+              <span
+                data-testid="error-headline"
+                title={headline}
+                className={cn(
+                  "min-w-0 truncate whitespace-nowrap leading-6",
+                  notice ? "text-foreground" : "text-destructive",
+                )}
+              >
+                {headline}
+              </span>
+              {!expanded && (
+                <span className="text-[11px] leading-4 text-muted-foreground/70">
+                  Expand for details
+                </span>
+              )}
             </span>
           </button>
           {retryable ? (
@@ -349,7 +336,7 @@ export function ErrorBanner({
             type="button"
             variant="ghost"
             size="icon-xs"
-            aria-label="Dismiss error message"
+            aria-label={notice ? "Dismiss notice" : "Dismiss error message"}
             onClick={(event) => {
               event.stopPropagation();
               setDismissed(true);

@@ -22,6 +22,7 @@ def test_features_default_off() -> None:
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
+        "canvas": False,
     }
 
 
@@ -46,6 +47,14 @@ def test_removed_harness_install_variable_allows_explicit_off() -> None:
     flags = resolve_feature_flags({"OMNIGENT_HARNESS_INSTALL_ENABLED": "0"})
 
     assert not flags.enabled(Feature.HARNESS_INSTALL)
+
+
+def test_canvas_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "canvas"})
+
+    assert flags.enabled(Feature.CANVAS)
+    assert flags.frontend_dict()["canvas"] is True
+    assert flags.enabled_names() == ("canvas",)
 
 
 def test_unknown_feature_fails_with_known_names() -> None:

@@ -418,6 +418,91 @@ describe("BlockStream — reasoning", () => {
     expect(startIdx).toBeLessThan(chunkIdx);
   });
 
+  it("reasoning_done with no prior deltas renders a settled reasoning block", () => {
+    // A native transcript mirror (claude-native thinking blocks) persists
+    // the thought as a reasoning item with NO reasoning deltas ever
+    // streamed. The item must render as one settled ReasoningBlock, under
+    // the item's own response id, before the answer that follows.
+    const blocks = reduce([
+      {
+        type: "reasoning_done",
+        text: "the user wants the token verbatim",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_native_1",
+      },
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "TOKEN" }],
+        itemId: "it_m1",
+        responseId: "resp_native_1",
+      },
+    ]);
+
+    const types = blockTypes(blocks);
+    const blockIdx = types.indexOf("reasoning_block");
+    const doneIdx = types.indexOf("text_done");
+    expect(blockIdx).toBeGreaterThanOrEqual(0);
+    expect(doneIdx).toBeGreaterThan(blockIdx);
+
+    const block = blocks[blockIdx] as ReasoningBlock;
+    expect(block.reasoningText).toBe("the user wants the token verbatim");
+    expect(block.ctx.itemId).toBe("it_r1");
+    expect(block.ctx.responseId).toBe("resp_native_1");
+  });
+
+  it("reasoning_done after streamed deltas is deduped (no double render)", () => {
+    // Delta-streaming harnesses may publish the persisted reasoning item
+    // after the deltas already painted the thought. The item must not
+    // re-render the same text as a trailing ReasoningBlock — mirrors
+    // message_done's "deltas already produced the text" dedup.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "plan the answer\n" },
+      { type: "text_delta", delta: "Answer" },
+      {
+        type: "reasoning_done",
+        text: "plan the answer\n",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_1",
+      },
+      { type: "message_done", content: [], itemId: "", responseId: "" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const types = blockTypes(blocks);
+    expect(types).toContain("reasoning_chunk");
+    expect(types).not.toContain("reasoning_block");
+  });
+
+  it("reasoning_done while a streamed section is open closes it without re-rendering", () => {
+    // The item arrives before any text closed the section: it marks the
+    // section's end. Chunks streamed, so no trailing ReasoningBlock.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "thinking hard\n" },
+      {
+        type: "reasoning_done",
+        text: "thinking hard\n",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_1",
+      },
+      { type: "text_delta", delta: "Answer" },
+      { type: "message_done", content: [], itemId: "", responseId: "" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const types = blockTypes(blocks);
+    expect(types).toContain("reasoning_chunk");
+    expect(types).not.toContain("reasoning_block");
+    const chunks = blocks.filter((b): b is ReasoningChunk => b.type === "reasoning_chunk");
+    expect(chunks.map((c) => c.text).join("")).toContain("thinking hard");
+  });
+
   it("interleaved text→reasoning→text closes each text section (no orphan, no concatenation)", () => {
     // think→speak→think→speak in one response: reasoning must close text
     // or the pre-reasoning text orphans and the final text_done concatenates.
@@ -1373,6 +1458,23 @@ describe("BlockStream — status events", () => {
 
     expect(blockTypes(blocks)).toContain("compaction_loading");
     expect(blockTypes(blocks)).not.toContain("compaction");
+  });
+
+  it("compaction_in_progress threads the server start time onto the block", () => {
+    // The server anchors started_at to the FIRST progress report of a
+    // compaction, so the spinner's elapsed counter can survive
+    // re-announcements and page reloads.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "compaction_in_progress", startedAtS: 1_700_000_000 },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const loading = blocks.find((b) => b.type === "compaction_loading");
+    expect(loading).toBeDefined();
+    if (loading && loading.type === "compaction_loading") {
+      expect(loading.startedAtS).toBe(1_700_000_000);
+    }
   });
 
   it("compaction_completed event → CompactionBlock (done marker)", () => {

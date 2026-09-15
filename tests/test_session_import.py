@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.kimi_native_forwarder import KimiWireItem, read_kimi_wire_items
-from omnigent.kiro_native_session_forwarder import (
+from omnigent.harnesses.kimi_native.forwarder import KimiWireItem, read_kimi_wire_items
+from omnigent.harnesses.kiro_native.session_forwarder import (
     KiroConversationMessage,
     parse_kiro_jsonl_line,
 )
@@ -25,7 +25,7 @@ from omnigent.session_import.local import (
     load_pi_session,
     load_qwen_session,
 )
-from omnigent.session_import.models import SessionImportNotFoundError
+from omnigent.session_import.models import LocalSessionImport, SessionImportNotFoundError
 
 
 def test_import_adapters_use_stable_forwarder_parser_contracts(tmp_path: Path) -> None:
@@ -478,6 +478,207 @@ def test_load_claude_session_rejects_empty_history(tmp_path: Path) -> None:
         load_claude_session(session_id, claude_home=tmp_path)
 
 
+def _write_claude_transcript_with_compaction(tmp_path: Path, session_id: str) -> Path:
+    """Write a transcript with a compaction summary splitting two turns."""
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "user",
+            "uuid": "user-pre",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": "first question before compaction"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "assistant-pre",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "early reply"}]},
+        },
+        {
+            "type": "user",
+            "uuid": "compact-1",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "summary of the conversation so far"},
+        },
+        {
+            "type": "user",
+            "uuid": "user-post",
+            "message": {"role": "user", "content": "follow-up after compaction"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "assistant-post",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "later reply"}]},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+    return transcript
+
+
+def test_load_claude_session_keeps_full_history_below_size_threshold(tmp_path: Path) -> None:
+    """A small transcript imports whole, even when it contains a compaction summary."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_compaction(tmp_path, session_id)
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    # Pre-compaction turn, the summary, and the post-compaction turn all present.
+    texts = [
+        block["text"]
+        for item in imported.items
+        for block in item.data.model_dump().get("content", [])
+        if isinstance(block, dict) and "text" in block
+    ]
+    assert "first question before compaction" in texts
+    assert "summary of the conversation so far" in texts
+    assert "follow-up after compaction" in texts
+
+
+def test_load_claude_session_trims_to_last_compaction_when_large(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transcript past the size threshold imports only from the last compaction summary."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_compaction(tmp_path, session_id)
+    # Force the large-file path without writing multiple megabytes.
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    texts = [
+        block["text"]
+        for item in imported.items
+        for block in item.data.model_dump().get("content", [])
+        if isinstance(block, dict) and "text" in block
+    ]
+    # Pre-compaction records the live agent no longer sees are dropped; the
+    # summary and everything after it are kept.
+    assert "first question before compaction" not in texts
+    assert "early reply" not in texts
+    assert "summary of the conversation so far" in texts
+    assert "follow-up after compaction" in texts
+    assert "later reply" in texts
+
+
+def test_load_claude_session_large_without_compaction_imports_all(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large transcript that never compacted keeps its full history."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_titles(tmp_path, session_id, ai_title=None, custom_title=None)
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    # No isCompactSummary boundary → trimming is a no-op, first message stays.
+    assert imported.title == "inspect TODO.md"
+    assert imported.items
+
+
+def test_load_claude_session_trims_to_final_compaction_with_multiple(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With several compactions, only the last boundary onward is imported."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "user",
+            "uuid": "user-0",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": "original"},
+        },
+        {
+            "type": "user",
+            "uuid": "compact-1",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "first summary"},
+        },
+        {
+            "type": "user",
+            "uuid": "compact-2",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "second summary"},
+        },
+        {
+            "type": "user",
+            "uuid": "user-final",
+            "message": {"role": "user", "content": "after second"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    texts = [
+        block["text"]
+        for item in imported.items
+        for block in item.data.model_dump().get("content", [])
+        if isinstance(block, dict) and "text" in block
+    ]
+    assert "original" not in texts
+    assert "first summary" not in texts
+    assert "second summary" in texts
+    assert "after second" in texts
+
+
+def test_load_claude_session_trims_at_real_two_mb_threshold(tmp_path: Path) -> None:
+    """Past the real 2 MB threshold, pre-compaction records are dropped (no patch)."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    filler = "x" * 4096  # ~4 KB per record; ~600 records clears 2 MB.
+    records: list[dict[str, object]] = [
+        {
+            "type": "user",
+            "uuid": f"pre-{i}",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": f"pre-compaction {i} {filler}"},
+        }
+        for i in range(600)
+    ]
+    records.append(
+        {
+            "type": "user",
+            "uuid": "compact-1",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "post compaction summary marker"},
+        }
+    )
+    records.append(
+        {
+            "type": "user",
+            "uuid": "post-1",
+            "message": {"role": "user", "content": "question after compaction marker"},
+        }
+    )
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+    assert transcript.stat().st_size > 2 * 1024 * 1024
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    texts = [
+        block["text"]
+        for item in imported.items
+        for block in item.data.model_dump().get("content", [])
+        if isinstance(block, dict) and "text" in block
+    ]
+    assert not any(text.startswith("pre-compaction") for text in texts)
+    assert any("post compaction summary marker" in text for text in texts)
+    assert any("question after compaction marker" in text for text in texts)
+
+
 def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -642,6 +843,231 @@ def test_load_codex_session_normalizes_response_items(tmp_path: Path) -> None:
         "call_id": "call_2",
         "output": "",
     }
+
+
+def _codex_item_texts(imported: LocalSessionImport) -> list[str]:
+    """Flatten the text of every message item in an imported Codex session."""
+    return [
+        block["text"]
+        for item in imported.items
+        for block in item.data.model_dump().get("content", [])
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+
+
+def _write_codex_rollout_with_compaction(
+    tmp_path: Path, session_id: str, *, extra_pre: list[dict] | None = None
+) -> Path:
+    """Write a Codex rollout with a ``compacted`` record between two turns."""
+    rollout = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "15"
+        / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    records: list[dict] = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
+        {"type": "turn_context", "payload": {"turn_id": "turn_1", "cwd": "/repo"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "pre compaction question"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "pre compaction answer"}],
+            },
+        },
+    ]
+    records.extend(extra_pre or [])
+    records.append(
+        {
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "compaction summary baseline"}],
+                    }
+                ],
+                "window_id": 1,
+            },
+        }
+    )
+    records.extend(
+        [
+            {"type": "turn_context", "payload": {"turn_id": "turn_2", "cwd": "/repo"}},
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "post compaction question"}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "post compaction answer"}],
+                },
+            },
+        ]
+    )
+    rollout.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+    return rollout
+
+
+def test_load_codex_session_keeps_full_history_below_size_threshold(tmp_path: Path) -> None:
+    """A small rollout imports the raw history whole; the compacted record is ignored."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    _write_codex_rollout_with_compaction(tmp_path, session_id)
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    texts = _codex_item_texts(imported)
+    assert "pre compaction question" in texts
+    assert "post compaction question" in texts
+    # The compacted record's replacement_history is not surfaced below threshold.
+    assert "compaction summary baseline" not in texts
+
+
+def test_load_codex_session_trims_to_last_compaction_when_large(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the threshold, only the compaction baseline and later turns import."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    _write_codex_rollout_with_compaction(tmp_path, session_id)
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    texts = _codex_item_texts(imported)
+    # Pre-compaction records the live agent no longer sees are dropped.
+    assert "pre compaction question" not in texts
+    assert "pre compaction answer" not in texts
+    # The replacement_history baseline and post-compaction turns are kept.
+    assert "compaction summary baseline" in texts
+    assert "post compaction question" in texts
+    assert "post compaction answer" in texts
+
+
+def test_load_codex_session_trims_to_final_compaction_with_multiple(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With two compactions, only the last baseline onward survives."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    # A second compaction after the first: its replacement_history is the final
+    # baseline, so the first summary must not survive.
+    extra_pre = [
+        {
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "first summary baseline"}],
+                    }
+                ]
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "between compactions"}],
+            },
+        },
+    ]
+    _write_codex_rollout_with_compaction(tmp_path, session_id, extra_pre=extra_pre)
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    texts = _codex_item_texts(imported)
+    assert "first summary baseline" not in texts
+    assert "between compactions" not in texts
+    assert "compaction summary baseline" in texts
+    assert "post compaction question" in texts
+
+
+def test_load_codex_session_ignores_empty_compaction_boundary_when_large(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compacted record with no usable replacement_history does not wipe history."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    rollout = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "15"
+        / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    records = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
+        {"type": "turn_context", "payload": {"turn_id": "turn_1", "cwd": "/repo"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "only real turn"}],
+            },
+        },
+        # Degenerate boundary: empty replacement_history. Must not drop everything.
+        {"type": "compacted", "payload": {"replacement_history": []}},
+    ]
+    rollout.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    assert _codex_item_texts(imported) == ["only real turn"]
+
+
+def test_load_codex_session_trims_at_real_two_mb_threshold(tmp_path: Path) -> None:
+    """Past the real 2 MB threshold, pre-compaction Codex records are dropped (no patch)."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    filler = "x" * 4096
+    extra_pre = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": f"pre bulk {i} {filler}"}],
+            },
+        }
+        for i in range(600)
+    ]
+    rollout = _write_codex_rollout_with_compaction(tmp_path, session_id, extra_pre=extra_pre)
+    assert rollout.stat().st_size > 2 * 1024 * 1024
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    texts = _codex_item_texts(imported)
+    assert not any(text.startswith("pre bulk") for text in texts)
+    assert "pre compaction question" not in texts
+    assert "compaction summary baseline" in texts
+    assert "post compaction question" in texts
 
 
 def _write_codex_rollout(tmp_path: Path, session_id: str, *, first_message: str) -> None:

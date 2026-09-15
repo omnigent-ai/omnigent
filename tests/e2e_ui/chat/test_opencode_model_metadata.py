@@ -116,16 +116,14 @@ def test_opencode_native_model_command_opens_picker_and_persists_pick(
     composer = page.get_by_placeholder("Send a message…")
     composer.fill("/model ")
     composer.press("Enter")
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
-    page.get_by_test_id("composer-config-model").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
 
-    current_row = page.locator(f'[role="option"][data-model-id="{LIVE_TUI_MODEL}"]')
-    alternate_row = page.locator(f'[role="option"][data-model-id="{ALTERNATE_MODEL}"]')
+    current_row = page.locator(f'[role="menuitemcheckbox"][data-model-id="{LIVE_TUI_MODEL}"]')
+    alternate_row = page.locator(f'[role="menuitemcheckbox"][data-model-id="{ALTERNATE_MODEL}"]')
     expect(current_row).to_be_visible()
     expect(alternate_row).to_be_visible()
 
     # Selecting only drafts the pick; the PATCH fires on Save.
-    alternate_row.click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -133,7 +131,7 @@ def test_opencode_native_model_command_opens_picker_and_persists_pick(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        alternate_row.click()
 
     assert patch_bodies[-1] == {"model_override": ALTERNATE_MODEL}
-    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text(ALTERNATE_MODEL)
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(ALTERNATE_MODEL)

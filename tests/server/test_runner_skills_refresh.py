@@ -16,10 +16,12 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import httpx
 import pytest
 
 from omnigent.server.routes._sessions.common import (
     _runner_skills_cache,
+    _runner_skills_failed,
     _runner_skills_inflight,
     _runner_skills_stale,
 )
@@ -27,7 +29,10 @@ from omnigent.server.routes._sessions.helpers import (
     _invalidate_runner_backed_snapshot_state,
     _load_runner_skills,
 )
-from omnigent.server.routes._sessions.orchestration import _fetch_runner_skills
+from omnigent.server.routes._sessions.orchestration import (
+    _fetch_runner_skills,
+    _runner_skills_status,
+)
 from omnigent.server.schemas import SkillSummary
 
 SESSION = "conv_refresh_probe"
@@ -64,10 +69,12 @@ def _clean_caches() -> object:
     for store in (_runner_skills_cache, _runner_skills_inflight):
         store.pop(SESSION, None)
     _runner_skills_stale.discard(SESSION)
+    _runner_skills_failed.discard(SESSION)
     yield
     for store in (_runner_skills_cache, _runner_skills_inflight):
         store.pop(SESSION, None)
     _runner_skills_stale.discard(SESSION)
+    _runner_skills_failed.discard(SESSION)
 
 
 def _seed(*names: str) -> None:
@@ -179,3 +186,64 @@ async def test_a_session_with_no_cached_skills_is_not_marked() -> None:
     )
 
     assert SESSION not in _runner_skills_stale
+
+
+@pytest.mark.parametrize("skills", [[], [{"name": "review", "description": "Review code"}]])
+async def test_loading_settles_even_when_no_skills_are_found(skills: list[dict[str, str]]) -> None:
+    runner = cast(Any, _StubRunner({"skills": skills}))
+    assert await _fetch_runner_skills(runner, SESSION) == []
+    assert _runner_skills_status(runner, SESSION) == "loading"
+
+    await _runner_skills_inflight[SESSION]
+
+    assert _runner_skills_status(runner, SESSION) == "ready"
+    assert [s.model_dump() for s in await _fetch_runner_skills(runner, SESSION)] == skills
+    assert runner.calls == 1
+
+
+@pytest.mark.parametrize("payload", [{}, {"skills": None}, {"skills": {}}, {"skills": [{}]}])
+async def test_failed_discovery_notifies_once_and_can_recover(
+    payload: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions
+
+    published: list[dict[str, object]] = []
+
+    class RecordingStream:
+        @staticmethod
+        def publish(session_id: str, event: dict[str, object]) -> None:
+            published.append(event)
+
+    monkeypatch.setattr(sessions, "session_stream", RecordingStream)
+    runner = cast(Any, _StubRunner(payload))
+    await _load_runner_skills(runner, SESSION)
+    assert _runner_skills_status(runner, SESSION) == "error"
+    assert [event["type"] for event in published] == ["session.skills"]
+
+    # Reading the snapshot after the failure event must not create a nudge loop.
+    await _fetch_runner_skills(runner, SESSION)
+    await _runner_skills_inflight[SESSION]
+    assert len(published) == 1
+
+    await _load_runner_skills(cast(Any, _StubRunner({"skills": []})), SESSION)
+    assert _runner_skills_status(runner, SESSION) == "ready"
+    assert len(published) == 2
+
+
+async def test_transport_failure_stops_loading_and_refresh_clears_error() -> None:
+    class UnreachableRunner:
+        async def get(self, *args: object, **kwargs: object) -> None:
+            raise httpx.ReadTimeout("runner timed out")
+
+    runner = cast(Any, UnreachableRunner())
+    await _load_runner_skills(runner, SESSION)
+    assert _runner_skills_status(runner, SESSION) == "error"
+
+    _invalidate_runner_backed_snapshot_state(
+        SESSION,
+        cancel_inflight=False,
+        drop_model_options=False,
+    )
+    assert _runner_skills_status(runner, SESSION) == "loading"
+    assert _runner_skills_status(None, SESSION) == "unavailable"

@@ -6,6 +6,12 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from omnigent.harnesses.pi_native.bridge import (
+    PI_NATIVE_BRIDGE_DIR_ENV_VAR,
+    PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    enqueue_user_message,
+    refresh_config_auth_headers,
+)
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -17,12 +23,6 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
-from omnigent.pi_native_bridge import (
-    PI_NATIVE_BRIDGE_DIR_ENV_VAR,
-    PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
-    enqueue_user_message,
-    refresh_config_auth_headers,
-)
 
 
 class PiNativeExecutor(Executor):

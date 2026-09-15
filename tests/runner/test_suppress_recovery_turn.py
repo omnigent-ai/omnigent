@@ -29,6 +29,7 @@ from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
 )
 from omnigent.spec.types import AgentSpec
+from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -90,6 +91,22 @@ class _HistoryServerClient:
         return self._Resp({})
 
 
+class _CatchUpServerClient(_HistoryServerClient):
+    """Return no history until the test exposes a missed user item."""
+
+    def __init__(self) -> None:
+        self.expose_item = False
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if url.rstrip("/").endswith(f"/sessions/{SESSION_ID}/items"):
+            page = _ITEMS_PAGE if self.expose_item else {"data": [], "has_more": False}
+            return self._Resp(page)
+        if url.rstrip("/").endswith("/items"):
+            return self._Resp({"data": [], "has_more": False})
+        return self._Resp({})
+
+
 def _build_sdk_app(
     server_client: Any,
 ) -> tuple[FastAPI, _FakeProcessManager, _ScriptedHarnessClient]:
@@ -133,6 +150,21 @@ def _session_init_payload(
         conv,
         server_version=server_version,
         suppress_recovery_turn=suppress_recovery_turn,
+    )
+
+
+def _assert_browser_tools_hidden(body: dict[str, Any]) -> None:
+    tool_names = {
+        function["name"]
+        for tool in body.get("tools", [])
+        if isinstance(tool, dict)
+        and isinstance((function := tool.get("function")), dict)
+        and isinstance(function.get("name"), str)
+    }
+    assert tool_names, "expected non-browser framework tools to remain advertised"
+    assert tool_names.isdisjoint(BROWSER_TOOL_NAMES), (
+        "headless internal turn advertised browser tools: "
+        f"{sorted(tool_names & BROWSER_TOOL_NAMES)}"
     )
 
 
@@ -223,6 +255,7 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
             "Expected recovery turn to call the harness once after create_session "
             f"without suppress_recovery_turn; got {len(harness.posted_bodies)}"
         )
+        _assert_browser_tools_hidden(harness.posted_bodies[0])
 
         # Now forward the message: since the recovery turn already ran and
         # _active_turns is now empty, the forward triggers a second turn.
@@ -249,3 +282,33 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
             "Expected two harness calls total (recovery turn + forward-triggered turn); "
             f"got {len(harness.posted_bodies)}"
         )
+
+
+@pytest.mark.asyncio
+async def test_catch_up_turn_hides_browser_tools_without_renderer_evidence() -> None:
+    """Reconnect catch-up fails closed when no renderer hint accompanies the item."""
+    from omnigent.runner.app import _session_histories_ref
+
+    server_client = _CatchUpServerClient()
+    app, _pm, harness = _build_sdk_app(server_client)
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=True),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        _session_histories_ref[SESSION_ID] = []
+        server_client.expose_item = True
+        try:
+            await app.state.catch_up_scan()
+            for _ in range(100):
+                if harness.posted_bodies:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            _session_histories_ref.pop(SESSION_ID, None)
+
+    assert len(harness.posted_bodies) == 1, "catch-up scan did not start one harness turn"
+    _assert_browser_tools_hidden(harness.posted_bodies[0])

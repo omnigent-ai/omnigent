@@ -117,7 +117,7 @@ describe("TerminalsPanel navigation", () => {
     expect(screen.queryByTestId("terminal-view")).toBeNull();
   });
 
-  it("shows terminal view after clicking a row, deferred until expanded", () => {
+  it("shows terminal view after clicking a row, deferred until expanded", async () => {
     renderPanel();
 
     fireEvent.click(screen.getByRole("button", { name: /worker/i }));
@@ -128,7 +128,9 @@ describe("TerminalsPanel navigation", () => {
     // TerminalView deferred until 180 ms settle.
     expect(screen.queryByTestId("terminal-view")).toBeNull();
 
-    act(() => {
+    // async act flushes both the fake-timer tick and any Suspense microtasks
+    // from the lazy TerminalView chunk resolving through its boundary.
+    await act(async () => {
       vi.advanceTimersByTime(180);
     });
 

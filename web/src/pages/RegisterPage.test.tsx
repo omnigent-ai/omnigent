@@ -58,6 +58,13 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // useLoginV2 persists ?login-v2 to localStorage — clear it so the v2 flag
+  // doesn't leak into the v1 tests (which assume the default-off state).
+  try {
+    window.localStorage.clear();
+  } catch {
+    /* jsdom localStorage always present, but be safe */
+  }
   Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
 });
 
@@ -122,5 +129,54 @@ describe("RegisterPage", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("invite expired");
     expect(hrefWrites).toHaveLength(0);
+  });
+});
+
+describe("RegisterPage v2 (?login-v2=1) flow", () => {
+  it("shows the 'Join your team' landing first, not the form", () => {
+    renderRegisterAt("?invite=tok123&login-v2=1");
+    expect(screen.getByRole("heading", { name: /join your team/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /accept invitation/i })).toBeInTheDocument();
+    // The form isn't rendered until the invite is accepted.
+    expect(screen.queryByLabelText(/username/i)).not.toBeInTheDocument();
+  });
+
+  it("advances to the form on Accept, then redeems and navigates home", async () => {
+    renderRegisterAt("?invite=tok123&login-v2=1");
+    fireEvent.click(screen.getByRole("button", { name: /accept invitation/i }));
+
+    // Form now shown; complete it.
+    fillForm("alice", "longenough", "longenough");
+    fireEvent.click(screen.getByRole("button", { name: /create account/i }));
+
+    await waitFor(() =>
+      expect(accountsApi.register).toHaveBeenCalledWith({
+        invite: "tok123",
+        username: "alice",
+        password: "longenough",
+      }),
+    );
+    await waitFor(() => expect(hrefWrites[0]).toBe("/"));
+  });
+
+  it("surfaces a redeem error after Accept and does not navigate", async () => {
+    vi.mocked(accountsApi.register).mockResolvedValue({
+      ok: false,
+      error: "invite expired",
+      status: 400,
+    });
+    renderRegisterAt("?invite=tok123&login-v2=1");
+    fireEvent.click(screen.getByRole("button", { name: /accept invitation/i }));
+    fillForm("alice", "longenough", "longenough");
+    fireEvent.click(screen.getByRole("button", { name: /create account/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("invite expired");
+    expect(hrefWrites).toHaveLength(0);
+  });
+
+  it("skips the landing and shows the invite-required error when the token is missing", () => {
+    renderRegisterAt("?login-v2=1");
+    expect(screen.queryByRole("button", { name: /accept invitation/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/invite token/i);
   });
 });

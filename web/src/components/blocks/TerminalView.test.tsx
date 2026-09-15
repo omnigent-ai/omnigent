@@ -32,6 +32,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     url: string;
     container: HTMLDivElement;
     clipboardEnabled: boolean;
+    adaptCodexPalette: boolean;
     onClipboardRequest?: (text: string) => void;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
@@ -60,11 +61,14 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _onInput?: () => void,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string) => void,
+      _focusOnConnect = true,
+      adaptCodexPalette = false,
     ) {
       terminalSessionMock.instances.push({
         url,
         container,
         clipboardEnabled,
+        adaptCodexPalette,
         onClipboardRequest,
         onState,
         dispose: this.dispose,
@@ -147,6 +151,16 @@ describe("buildAttachPath", () => {
 });
 
 describe("control-mode terminal", () => {
+  it.each([
+    ["terminal_codex_main", true],
+    ["terminal_claude_main", false],
+    ["terminal_bash_s1", false],
+  ])("adapts cached colors only for the Codex pane: %s", async (terminalId, expected) => {
+    render(<TerminalView sessionId="conv_abc" terminalId={terminalId} readOnly />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(terminalSessionMock.instances[0].adaptCodexPalette).toBe(expected);
+  });
+
   it("disables clipboard bridging for read-only attaches", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));

@@ -115,13 +115,34 @@ describe("harnessUnavailableReasonOnHost", () => {
     );
   });
 
-  it("returns null when ready, unknown, or no host", () => {
+  it("returns null when ready or no host", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: true }))).toBe(null);
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future" }))).toBe(
       "unconfigured",
     );
     expect(harnessUnavailableReasonOnHost("codex", hostWith(null))).toBe(null);
     expect(harnessUnavailableReasonOnHost(null, hostWith({ codex: false }))).toBe(null);
+  });
+
+  it("treats a missing key on a readiness-reporting host as unconfigured", () => {
+    // Version skew: a host predating a harness reports the harnesses it knows but
+    // omits the new one. It can't launch what it never lists, so a missing key on
+    // a non-empty map is unconfigured — not silently "available". Regression for
+    // jcode showing on a pre-jcode host that only reports devin/grok.
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith({ devin: false, grok: false }))).toBe(
+      "unconfigured",
+    );
+    // An absent or empty map still fails open (readiness genuinely unknown), so a
+    // host that reports nothing is never emptied out.
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith(null))).toBe(null);
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith({}))).toBe(null);
+  });
+
+  it("never treats the Smart Routing auto sentinel as unconfigured", () => {
+    // "auto" is a client-only sentinel — the daemon never reports a readiness key
+    // for it, so the missing-key branch must not sweep it in (else Smart Routing
+    // gets a spurious "needs setup" badge and is hidden under the toggle).
+    expect(harnessUnavailableReasonOnHost("auto", hostWith({ codex: false }))).toBe(null);
   });
 });
 

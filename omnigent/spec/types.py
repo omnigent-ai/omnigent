@@ -83,6 +83,18 @@ class RetryPolicy:
         Used only by the in-process LLM path and the tool-retry
         classifier — L0 SDKs ignore this and L2 receives
         already-classified errors.
+
+    .. note::
+        MCP tool-call reconnect-retries are at-least-once: a call
+        whose connection died — or whose response was lost to a
+        transient network failure after the server accepted the
+        request — is retried on a fresh connection even though the
+        server may have fully executed it. Non-idempotent MCP tools
+        (writes, payments, message sends) can therefore run more
+        than once under transient network failures; tools that need
+        exactly-once semantics must implement their own idempotency
+        (e.g. idempotency keys), or the server should be configured
+        with ``max_retries=0``.
     """
 
     max_retries: int = 7

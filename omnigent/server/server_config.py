@@ -186,6 +186,20 @@ def copy_total_bytes_limit() -> int:
     return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)
 
 
+def image_compression_concurrency() -> int:
+    """Max concurrent image uploads that materialize + decode in memory.
+
+    Bounds server peak upload memory (each holds up to the image cap in raw
+    bytes plus a decoded bitmap). Config key ``image_compression_concurrency``;
+    defaults to
+    :data:`omnigent.runtime.content_resolver.MAX_IMAGE_COMPRESSION_CONCURRENCY`.
+    Raise it on instances with more memory headroom.
+    """
+    from omnigent.runtime.content_resolver import MAX_IMAGE_COMPRESSION_CONCURRENCY
+
+    return _config_positive_int("image_compression_concurrency", MAX_IMAGE_COMPRESSION_CONCURRENCY)
+
+
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """Return the ``branding:`` mapping, or ``{}`` when absent/not a map."""
     section = config.get("branding")

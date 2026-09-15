@@ -11,30 +11,75 @@
 // Only plain accept/decline prompts (command, edit, plan, codex command) are
 // accepted. AskUserQuestion elicitations are skipped: they require choosing a
 // specific option, so a blanket "accept" carries no answer and the user must
-// pick on the card itself.
+// pick on the card itself. An elicitation whose `requestedSchema` names
+// fields is skipped for exactly that reason — the server asked for values,
+// and accepting from the keyboard would send it none of them.
+//
+// A chord that lands in a text field holding a draft is also skipped: the
+// user was mid-composition when the prompt appeared, and Cmd/Ctrl+Enter is a
+// send chord there (the ONLY send key under the Mod+Enter preference). A
+// keystroke that expressed send intent must never resolve a permission
+// prompt that mounted moments earlier.
 
 import { useEffect } from "react";
 
+import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import type { ElicitationBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
 
-export function useApproveHotkey(): void {
+/**
+ * Whether the keystroke landed in a text field that holds a draft — the
+ * signature of a user mid-composition, for whom Cmd/Ctrl+Enter means "send
+ * what I typed", never "approve the prompt that just appeared". A field can
+ * hold a sendable draft its text can't show (pending attachments or
+ * @-mentions with an empty value), so the composer marks itself with
+ * `data-has-draft` and that marker counts too. An EMPTY, unmarked field
+ * carries no send intent, so the chord still accepts from there (the common
+ * post-send state, where focus may remain in the cleared composer).
+ */
+export function isDraftingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  // Complete send intent (text OR attachments OR mentions), as declared by
+  // the field itself — a bare value check can't see non-text drafts.
+  if (target.dataset.hasDraft === "true") return true;
+  if (target instanceof HTMLTextAreaElement) return target.value.length > 0;
+  if (target instanceof HTMLInputElement) {
+    // Only text-like inputs carry a typed draft; a checkbox/radio value is a
+    // constant ("on"), not something the user composed.
+    const textLike = /^(?:text|search|url|tel|email|password|number)$/;
+    return textLike.test(target.type) && target.value.length > 0;
+  }
+  return target.isContentEditable && (target.textContent ?? "").trim().length > 0;
+}
+
+export function useApproveHotkey(isMac = isMacPlatform()): void {
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl, not Alt/Shift (mirrors the session-switch hotkey's guard).
-      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      // Platform command modifier, not Alt/Shift (mirrors the session-switch guard):
+      // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
+      if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
       if (e.key !== "Enter") return;
+
+      // Mid-composition chord — a send intent aimed at the draft, not a
+      // verdict. Leave the event for the composer's own handler (whose
+      // send path is separately gated while a prompt is pending).
+      if (isDraftingTarget(e.target)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
       // Newest-first: accept the most recent still-pending prompt that takes a
       // plain verdict. Skip AskUserQuestion (needs an explicit choice).
-      const pending = [...blocks]
+      // The newest pending prompt is the one on screen. Searching past it for
+      // an older binary one would accept something the person cannot see while
+      // they are filling in a form.
+      const newest = [...blocks]
         .reverse()
-        .find(
-          (b): b is ElicitationBlock =>
-            b.type === "elicitation" && b.status === "pending" && !b.askUserQuestion,
-        );
-      if (!pending) return;
+        .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
+      if (!newest) return;
+      const takesAPlainVerdict =
+        !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
+      if (!takesAPlainVerdict) return;
+      const pending = newest;
 
       // Intercept before the composer's Enter-to-send handler runs.
       e.preventDefault();
@@ -44,5 +89,5 @@ export function useApproveHotkey(): void {
 
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, []);
+  }, [isMac]);
 }

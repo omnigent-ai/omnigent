@@ -22,6 +22,7 @@ from omnigent.db.utils import (
     _resolve_lakebase_token_provider,
     _run_migrations,
     _shared_read_sessions,
+    _translate_missing_driver_error,
     build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
@@ -29,7 +30,12 @@ from omnigent.db.utils import (
     generate_agent_id,
     generate_item_id,
     get_or_create_engine,
+    is_cockroachdb,
+    is_postgresql_family,
     make_managed_session_maker,
+    normalize_database_url,
+    run_migrations_with_retry,
+    run_write_transaction,
     set_lakebase_token_provider,
     shared_read_scope,
     strip_nul_bytes,
@@ -86,6 +92,303 @@ def test_non_sqlite_engine_has_pool_settings(
     # the database server restarts or closes idle connections.
     # Failure means connections could persist indefinitely and break.
     assert captured_kwargs.get("pool_recycle") == 1800
+
+
+def test_cockroachdb_dialect_helpers_and_url() -> None:
+    assert normalize_database_url("cockroachdb://root@host/db") == (
+        "cockroachdb+psycopg://root@host/db"
+    )
+    assert is_cockroachdb("cockroachdb")
+    assert is_postgresql_family("cockroachdb")
+    assert is_postgresql_family("postgresql")
+    assert not is_postgresql_family("mysql")
+
+
+def test_cockroachdb_engine_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.db import utils
+
+    captured: dict[str, Any] = {}
+    mock_engine = MagicMock()
+
+    def capture(uri: str, **kwargs: Any) -> MagicMock:
+        captured["uri"] = uri
+        captured.update(kwargs)
+        return mock_engine
+
+    monkeypatch.setattr(utils, "create_engine", capture)
+    engine = utils._create_engine("cockroachdb://root@host/db")
+
+    assert engine is mock_engine
+    assert captured["uri"] == "cockroachdb+psycopg://root@host/db"
+    assert captured["isolation_level"] == "READ COMMITTED"
+    assert captured["pool_size"] == 200
+    assert captured["max_overflow"] == 20
+    assert captured["pool_timeout"] == 10.0
+
+
+def test_run_write_transaction_retries_only_serialization_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from sqlalchemy.exc import DBAPIError
+
+    from omnigent.db import current_query_name, query_name_scope
+
+    class SerializationFailure(Exception):
+        sqlstate = "40001"
+
+    class NamedMaker:
+        def __init__(self) -> None:
+            self.engine = MagicMock()
+            self.engine.dialect.name = "cockroachdb"
+            self.query_name_prefix = "omnigent.test"
+            self.sessions: list[MagicMock] = []
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[MagicMock]:
+            session = MagicMock()
+            self.sessions.append(session)
+            with query_name_scope(f"{self.query_name_prefix}.{query_name}"):
+                try:
+                    yield session
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    raise
+
+    maker = NamedMaker()
+    attempts = 0
+    observed_names: list[str | None] = []
+    retry_metrics: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "omnigent.db.utils.record_transaction_retry",
+        lambda operation, outcome: retry_metrics.append((operation, outcome)),
+    )
+
+    def write(_session: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        observed_names.append(current_query_name())
+        if attempts < 3:
+            raise DBAPIError("statement", {}, SerializationFailure(), False)
+        return "committed"
+
+    sleeps: list[float] = []
+    result = run_write_transaction(
+        maker,
+        "write",
+        write,
+        sleep=sleeps.append,
+        random_value=lambda: 1.0,
+    )
+
+    assert result == "committed"
+    assert attempts == 3
+    assert sleeps == [0.025, 0.05]
+    assert observed_names == ["omnigent.test.write"] * 3
+    assert retry_metrics == [
+        ("omnigent.test.write", "scheduled"),
+        ("omnigent.test.write", "scheduled"),
+    ]
+    assert [session.rollback.call_count for session in maker.sessions] == [1, 1, 0]
+    assert [session.commit.call_count for session in maker.sessions] == [0, 0, 1]
+
+    maker.engine.dialect.name = "postgresql"
+    attempts = 0
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "write", write, sleep=sleeps.append)
+    assert attempts == 1
+
+    class DeadlockFailure(Exception):
+        sqlstate = "40P01"
+
+    maker.engine.dialect.name = "cockroachdb"
+
+    def deadlock(_session: object) -> None:
+        raise DBAPIError("statement", {}, DeadlockFailure(), False)
+
+    session_count = len(maker.sessions)
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "write", deadlock, sleep=sleeps.append)
+    assert len(maker.sessions) == session_count + 1
+
+    def serialization_failure(_session: object) -> None:
+        raise DBAPIError("statement", {}, SerializationFailure(), False)
+
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "exhausted", serialization_failure, max_retries=0)
+    assert retry_metrics[-1] == ("omnigent.test.exhausted", "exhausted")
+
+
+def test_missing_psycopg_translates_to_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Postgres URI whose driver is uninstalled must surface an actionable
+    install hint, not SQLAlchemy's bare ``No module named 'psycopg'``.
+
+    Simulates the driver being absent by making ``create_engine`` raise the
+    same ``ModuleNotFoundError`` SQLAlchemy raises when it lazily imports the
+    DBAPI. ``_create_engine`` must catch it and re-raise a message that names
+    the install command and the ``omnigent[postgres]`` extra.
+    """
+
+    def _raise_missing_driver(uri: str, **_kwargs: Any) -> MagicMock:
+        raise ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_missing_driver)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://user:pass@host:5432/db")
+
+    message = str(excinfo.value)
+    # Names the extra and at least one concrete install command.
+    assert "omnigent[postgres]" in message
+    assert "psycopg[binary]" in message
+    # ``name`` is preserved so callers keying on the missing module still work.
+    assert excinfo.value.name == "psycopg"
+    # The original SQLAlchemy-raised error stays chained for diagnostics.
+    assert excinfo.value.__cause__ is not None
+    # The credentials in the URI must never leak into the surfaced message.
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+@pytest.mark.parametrize(
+    "db_uri",
+    [
+        # A bare ``postgresql://`` makes SQLAlchemy select the legacy
+        # psycopg2 DBAPI — installing psycopg 3 would not fix it.
+        "postgresql://user:pass@host:5432/db",
+        "postgresql+psycopg2://user:pass@host:5432/db",
+    ],
+)
+def test_missing_psycopg2_guidance_is_dialect_correct(db_uri: str) -> None:
+    """
+    The psycopg2 dialects must NOT be told "install psycopg 3 and retry" —
+    that provably reproduces the same error. The guidance must lead with
+    switching the URI scheme to ``postgresql+psycopg://`` and offer the
+    explicit psycopg2 install as the alternative.
+    """
+    exc = ModuleNotFoundError("No module named 'psycopg2'", name="psycopg2")
+    translated = _translate_missing_driver_error(db_uri, exc)
+
+    assert translated is not exc
+    message = str(translated)
+    assert "postgresql+psycopg://" in message  # the preferred fix: switch dialect
+    assert "psycopg2-binary" in message  # the keep-the-dialect alternative
+    assert translated.name == "psycopg2"
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+def test_translate_missing_driver_passes_through_unrelated_errors() -> None:
+    """
+    ``_translate_missing_driver_error`` only rewrites a *Postgres driver*
+    import failure. A non-Postgres backend, or a ModuleNotFoundError for some
+    other module, is returned unchanged so real bugs are not masked.
+    """
+    # Non-Postgres backend: return the original untouched.
+    other_backend = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("sqlite:///x.db", other_backend) is other_backend
+
+    # Postgres backend, but the missing module is something unrelated (e.g. a
+    # transitive import failure) — not the driver, so leave it alone.
+    unrelated = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+    assert _translate_missing_driver_error("postgresql+psycopg://u@h/db", unrelated) is unrelated
+
+    # A URI make_url cannot parse must fall back to the scheme split, not
+    # blow up inside error handling.
+    garbage = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("not a uri at all", garbage) is garbage
+
+
+def test_paas_postgres_scheme_is_normalized_by_the_engine_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``postgres://`` is not a SQLAlchemy dialect at all, but it never reaches
+    SQLAlchemy: the central engine factory normalizes it to
+    ``postgresql+psycopg://`` (spawn-path parity), so a direct
+    ``--database-uri`` in the PaaS form simply works.
+    """
+    from omnigent.db import utils
+
+    captured: dict[str, Any] = {}
+
+    def capture(uri: str, **kwargs: Any) -> MagicMock:
+        captured["uri"] = uri
+        return MagicMock()
+
+    monkeypatch.setattr(utils, "create_engine", capture)
+    utils._create_engine("postgres://user:secret@host:5432/db")
+
+    assert captured["uri"] == "postgresql+psycopg://user:secret@host:5432/db"
+
+
+def test_unnormalizable_postgres_scheme_gets_conversion_guidance() -> None:
+    """
+    A Postgres-family scheme the factory cannot normalize still fails with an
+    opaque ``NoSuchModuleError`` *before* any driver import. The engine
+    factory must append conversion guidance pointing at
+    ``postgresql+psycopg://``. Credentials must not leak.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("postgres+asyncpg://user:secret@host:5432/db")
+
+    message = str(excinfo.value)
+    assert "postgresql+psycopg://" in message
+    assert "omnigent[postgres]" in message
+    assert "secret" not in message
+    assert excinfo.value.__cause__ is not None  # original plugin error chained
+
+
+def test_non_postgres_dialect_error_passes_through() -> None:
+    """
+    A bogus non-Postgres scheme must re-raise SQLAlchemy's original
+    ``NoSuchModuleError`` untouched — the Postgres guidance would only
+    mislead there.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("bogusdb://user@host/db")
+
+    assert "postgresql+psycopg" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None  # bare re-raise, nothing stamped
+
+
+def test_unrelated_import_error_reraises_without_self_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pass-through path must use a bare ``raise``: the surfaced exception is
+    the original object with ``__cause__`` untouched. A ``raise exc from exc``
+    would stamp a self-referential ``__cause__`` and confuse diagnostics
+    integrations even though traceback rendering survives via cycle detection.
+    """
+    original = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+
+    def _raise_unrelated(uri: str, **_kwargs: Any) -> MagicMock:
+        raise original
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_unrelated)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://u@h/db")
+
+    assert excinfo.value is original
+    assert excinfo.value.__cause__ is None
 
 
 def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
@@ -968,3 +1271,143 @@ def test_shared_read_scope_closes_session_when_init_fails(
     assert counts["out"] == counts["in"], (
         f"a session that failed mid-init leaked its checkout: {counts}"
     )
+
+
+# ── run_migrations_with_retry (cold-start resilience) ──────────────
+
+
+def _operational_error(msg: str = "the database system is starting up") -> Any:
+    """Build an OperationalError shaped like a cold-managed-DB failure."""
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(statement=None, params=None, orig=Exception(msg))
+
+
+def test_run_migrations_with_retry_succeeds_first_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy DB migrates on the first attempt with no sleeping."""
+    engine = MagicMock()
+    calls: dict[str, int] = {"migrate": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        calls["migrate"] += 1
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        engine_factory=lambda _uri: engine,
+        sleep=slept.append,
+    )
+
+    assert calls["migrate"] == 1
+    assert slept == []
+    # The engine is always disposed, even on the happy path.
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_recovers_after_cold_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient OperationalErrors are retried until one attempt succeeds.
+
+    Each attempt must use a FRESH engine (a poisoned pool from a failed
+    connect is never reused), and every engine created must be disposed.
+    """
+    engines: list[MagicMock] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock(name=f"engine{len(engines)}")
+        engines.append(e)
+        return e
+
+    attempts: dict[str, int] = {"n": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        backoff_seconds=2.0,
+        engine_factory=_factory,
+        sleep=slept.append,
+    )
+
+    assert attempts["n"] == 3
+    # A distinct engine per attempt, each disposed exactly once.
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # Linear backoff between the two failed attempts: 2.0*1, 2.0*2.
+    assert slept == [2.0, 4.0]
+
+
+def test_run_migrations_with_retry_raises_after_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB that never comes up fails loudly after max_attempts."""
+    from sqlalchemy.exc import OperationalError
+
+    def _always_cold(_engine: Any, _uri: str) -> None:
+        raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _always_cold)
+    engines: list[MagicMock] = []
+    slept: list[float] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock()
+        engines.append(e)
+        return e
+
+    with pytest.raises(OperationalError):
+        run_migrations_with_retry(
+            "postgresql://x",
+            max_attempts=3,
+            backoff_seconds=1.0,
+            engine_factory=_factory,
+            sleep=slept.append,
+        )
+
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # No sleep after the final (raising) attempt.
+    assert slept == [1.0, 2.0]
+
+
+def test_run_migrations_with_retry_propagates_non_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real migration/schema error is NOT retried — it surfaces at once."""
+
+    def _bad_migration(_engine: Any, _uri: str) -> None:
+        raise ValueError("bad revision")
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _bad_migration)
+    engine = MagicMock()
+    slept: list[float] = []
+
+    with pytest.raises(ValueError, match="bad revision"):
+        run_migrations_with_retry(
+            "postgresql://x",
+            engine_factory=lambda _uri: engine,
+            sleep=slept.append,
+        )
+
+    # Failed on the first attempt without retrying, but still disposed.
+    assert slept == []
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_rejects_bad_max_attempts() -> None:
+    """max_attempts < 1 is a programming error, not a runtime retry."""
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_migrations_with_retry("postgresql://x", max_attempts=0)

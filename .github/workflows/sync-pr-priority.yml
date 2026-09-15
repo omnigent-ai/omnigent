@@ -7,11 +7,14 @@ name: Sync PR Priority
 # files; it edits labels through the API.
 
 on:
+  # No `synchronize`: priority is derived from the linked issue's label and the
+  # PR body's closing reference, so pushing a new commit can't change it --
+  # re-running on every push was pure waste. The `edited` event still catches a
+  # closing link added/changed after open, and `issues` catches label changes.
   pull_request_target:
     types:
       - opened
       - edited
-      - synchronize
       - reopened
       - ready_for_review
   issues:

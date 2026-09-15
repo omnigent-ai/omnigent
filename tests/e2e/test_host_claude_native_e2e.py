@@ -12,7 +12,7 @@ pending terminal input when its TUI initializes. So a first message
 typed into that gap is silently dropped — the UI shows "Working…"
 forever and nothing is persisted. ``inject_user_message`` now waits for
 Claude's input prompt to render before typing (see
-``omnigent.claude_native_bridge._wait_for_claude_prompt_ready``).
+``omnigent.harnesses.claude_native.bridge._wait_for_claude_prompt_ready``).
 
 Making the race deterministic
 -----------------------------
@@ -79,7 +79,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 

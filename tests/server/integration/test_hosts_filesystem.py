@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -164,7 +165,6 @@ async def fs_setup(
     conn = registry.get(_HOST_ID)
     assert conn is not None
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
         """Drain outbound WS frames from the communicator and reply.
@@ -177,14 +177,10 @@ async def fs_setup(
         ``websocket.receive`` event — which the route's receive
         loop turns into a resolved future.
 
-        :returns: None when ``stop_drain`` is set or no events
-            arrive within the per-iteration timeout.
+        Runs until fixture teardown cancels the task.
         """
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -238,14 +234,36 @@ async def fs_setup(
     try:
         yield app, registry, comm, replies, drain_task
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
+
+
+async def test_list_filesystem_survives_idle_mock_host(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An idle mock host stays connected until fixture teardown."""
+    app, registry, comm, replies, _drain = fs_setup
+    replies["~"] = {"entries": []}
+    await asyncio.sleep(0.75)
+    assert not comm.future.done()
+    assert registry.get(_HOST_ID) is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem")
+    assert response.status_code == 200, response.text
 
 
 async def test_host_model_options_returns_prelaunch_catalog(
@@ -287,6 +305,71 @@ async def test_host_model_options_returns_prelaunch_catalog(
         # The frame's routable set reaches the web client instead of being
         # dropped at the route boundary.
         "routable_models": ["system.ai.claude-sonnet-4-6[1m]"],
+        # A healthy catalog has no reason to report.
+        "error": None,
+    }
+
+
+async def test_host_model_options_probe_failure_returns_bad_gateway(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """A failed host probe is a structured non-OK HTTP response."""
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "status": "failed",
+        "error": "the codex model probe failed — see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+        )
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "the codex model probe failed — see the host log"}
+
+
+async def test_host_model_options_reports_probe_error_without_500(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An empty catalog carries the host's reason instead of failing the request.
+
+    The host answers ``status="ok"`` with no models and an ``error`` string
+    explaining why (a failed probe is not a transport failure, so it is not a
+    502). The reason has to survive response serialization — a response model
+    that does not declare ``error`` drops the explanation, and a route
+    annotated ``dict[str, list[Any]]`` rejected the string outright as a 500.
+    """
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "status": "ok",
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
     }
 
 
@@ -700,3 +783,40 @@ async def test_list_filesystem_limit_above_max_rejected(
         )
     # FastAPI returns 422 for failed Query validation.
     assert resp.status_code == 422
+
+
+async def test_list_filesystem_windows_drive_path_is_not_posixified(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """Windows drive paths must reach the host without a leading slash.
+
+    FastAPI strips the URL leading slash; the handler used to always
+    prepend ``/``, turning ``C:/Users/me/work`` into ``/C:/Users/me/work``
+    which does not exist. The picker then fell through to the drive root.
+    """
+    from omnigent.host.frames import HostListDirEntry
+
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["C:/Users/alice/work"] = {
+        "entries": [
+            HostListDirEntry(
+                name="src",
+                path=r"C:\Users\alice\work\src",
+                type="directory",
+                bytes=None,
+                modified_at=1779980000,
+            ),
+        ],
+        "has_more": False,
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/C:/Users/alice/work")
+    assert resp.status_code == 200, resp.text
+    names = [entry["name"] for entry in resp.json()["data"]]
+    assert names == ["src"]

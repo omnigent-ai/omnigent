@@ -79,12 +79,26 @@ class SkillSourceContext:
     :param skills_filter: The spec's ``skills:`` filter
         (``"all"`` / ``"none"`` / list of names).
     :param bundle_dir: The materialized bundle root, or ``None``.
+    :param claude_config_dir: Claude Code's user config dir when configured
+        (``$CLAUDE_CONFIG_DIR``), else ``None`` for the ``home/.claude``
+        default; injected so tests can pin it.
+    :param codex_home: Codex's resolved host home when configured
+        (``$CODEX_HOME``), else ``None`` for the ``home/.codex`` default;
+        injected so tests can pin it. Used only for native codex, mirroring
+        the terminal, which honors ``$CODEX_HOME`` for its skills.
+    :param is_native: Whether the session's harness is a native CLI harness.
+        Set by :func:`resolve_harness_skills` from the harness id. Gates the
+        terminal-matching resolution (config-home tiers, ``.agents`` exclusion)
+        so it applies only to native harnesses, never the in-process SDK ones.
     """
 
     roots: tuple[Path, ...]
     home: Path
     skills_filter: str | list[str]
     bundle_dir: Path | None
+    claude_config_dir: Path | None = None
+    codex_home: Path | None = None
+    is_native: bool = False
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -110,6 +124,72 @@ def _generic_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return _dedup(out)
 
 
+def _claude_user_dir(ctx: SkillSourceContext) -> Path:
+    """
+    Claude Code's user-scope config dir (its skills/plugins/settings root).
+
+    For a native session this mirrors Claude's own resolution
+    (``CLAUDE_CONFIG_DIR`` when set, otherwise ``~/.claude``) the way
+    :mod:`omnigent.session_import.local` and ``claude_native_status_file``
+    already do. The in-process SDK path keeps its pre-scoping ``~/.claude``
+    root, so the ``$CLAUDE_CONFIG_DIR`` tier is honored only for native
+    harnesses.
+    """
+    if ctx.is_native and ctx.claude_config_dir is not None:
+        return ctx.claude_config_dir
+    return ctx.home / ".claude"
+
+
+def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """
+    The skill tiers Claude Code itself loads, and no others.
+
+    Claude Code reads workspace/ancestor ``.claude/skills`` plus the user
+    tier ``$CLAUDE_CONFIG_DIR/skills`` (default ``~/.claude/skills``). It
+    does NOT read ``.agents/skills`` (live-verified against its slash
+    menu), so the generic host walk over-reports for this family: a menu
+    entry the CLI can't expand just fails, since a native session sends
+    ``/name`` to the CLI as plaintext.
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names: set[str] | None = (
+        set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    )
+    dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+
+    def _add(candidate: Path) -> None:
+        if candidate in seen_dirs or not candidate.is_dir():
+            return
+        seen_dirs.add(candidate)
+        dirs.append(candidate)
+
+    # Workspace-first: each root's .claude/skills, then its ancestors'.
+    for root in ctx.roots:
+        current = root.resolve()
+        while True:
+            _add(current / ".claude" / "skills")
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    # User tier last, so a workspace skill wins a name collision.
+    _add(_claude_user_dir(ctx) / "skills")
+
+    out: list[SkillSpec] = []
+    for skills_dir in dirs:
+        skipped: list[str] = []
+        for spec in _discover_skills(skills_dir, skipped=skipped):
+            if filter_names is not None and spec.name not in filter_names:
+                continue
+            out.append(spec)
+        # Surface dropped skills so a missing command is diagnosable.
+        for detail in skipped:
+            _log.warning("Skipping skill under %s: %s", skills_dir, detail)
+    return _dedup(out)
+
+
 def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list[SkillSpec]:
     """
     Return the extra (non-bundled) skills the session's harness exposes.
@@ -125,9 +205,16 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
         internal orchestration skills, not user-typeable slash commands
         (applied uniformly across every harness).
     """
+    from omnigent.harness_aliases import is_native_harness
+
     family = _harness_family(harness)
     provider = _SKILL_SOURCES.get(family, _generic_host_skills)
-    return [s for s in _dedup(provider(ctx)) if s.user_invocable]
+    # The terminal-matching resolution — a native session types ``/name`` into
+    # the vendor CLI as plaintext, so its menu must mirror what that CLI loads —
+    # is native-only. Tag the context so providers keep the in-process SDK
+    # harnesses on their pre-scoping behavior (see ``claude_host_skills``).
+    native_ctx = replace(ctx, is_native=is_native_harness(harness))
+    return [s for s in _dedup(provider(native_ctx)) if s.user_invocable]
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -163,8 +250,13 @@ def _enabled_plugin_settings_files(ctx: SkillSourceContext) -> list[Path]:
     :returns: Candidate settings paths in increasing precedence order.
     """
     files: list[Path] = []
-    # ``reversed`` puts the primary workspace (roots[0]) last → strongest.
-    for scope in (ctx.home, *reversed(ctx.roots)):
+    # User scope first (weakest): $CLAUDE_CONFIG_DIR itself carries the
+    # settings files (default ~/.claude). ``reversed`` then puts the primary
+    # workspace (roots[0]) last → strongest.
+    user_dir = _claude_user_dir(ctx)
+    files.append(user_dir / "settings.json")
+    files.append(user_dir / "settings.local.json")
+    for scope in reversed(ctx.roots):
         files.append(scope / ".claude" / "settings.json")
         files.append(scope / ".claude" / "settings.local.json")
     return files
@@ -185,7 +277,7 @@ def _managed_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     :returns: The set of managed ``<plugin>@<marketplace>`` keys, empty when
         the file is absent, unreadable, or malformed.
     """
-    data = _read_json(ctx.home / ".claude" / "plugins" / "managed_plugins.json")
+    data = _read_json(_claude_user_dir(ctx) / "plugins" / "managed_plugins.json")
     if data is None:
         return set()
     managed = data.get("managed_plugins")
@@ -234,7 +326,7 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
 
 def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[str, Path]:
     """Map ``<plugin>@<marketplace>`` → installPath for enabled+installed plugins."""
-    data = _read_json(ctx.home / ".claude" / "plugins" / "installed_plugins.json")
+    data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
     if data is None:
         return {}
     plugins = data.get("plugins")
@@ -244,7 +336,7 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     # the Claude plugins cache root; anything pointing elsewhere is logged and
     # skipped so a tampered/odd manifest can't turn an arbitrary directory into
     # a discovery root.
-    plugins_root = (ctx.home / ".claude" / "plugins").resolve()
+    plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
         if key not in enabled or not isinstance(entries, list):
@@ -308,13 +400,26 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """Generic host walk (``~/.claude/skills`` etc.) plus enabled plugins."""
-    return _generic_host_skills(ctx) + _claude_plugin_skills(ctx)
+    """
+    Claude host skills, gated by native vs SDK, plus enabled plugins.
+
+    A native ``claude-native`` session types ``/name`` into the Claude CLI
+    as plaintext, so its menu must mirror exactly the tiers that CLI loads
+    (:func:`_claude_code_skills`: ``.claude/skills`` and the
+    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``). The in-process
+    ``claude-sdk`` harness has no such terminal to match, so it keeps the
+    generic host walk it used before this scoping — the terminal-matching
+    behavior only affects native harnesses. Enabled plugin slash-commands are
+    added in both cases (config-dir-resolved for native, ``~/.claude`` for SDK
+    via :func:`_claude_user_dir`).
+    """
+    walk = _claude_code_skills if ctx.is_native else _generic_host_skills
+    return walk(ctx) + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Codex skills: ``<bundle>/skills`` + ``~/.codex/skills`` under the filter.
+    Codex skills: ``<bundle>/skills`` + the host codex skills dir under the filter.
 
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
@@ -323,6 +428,12 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     that selection whose ``SKILL.md`` parses: the executor links by existence,
     so a present-but-unparseable skill is linked but not shown (correct — Codex
     won't register a malformed skill as a command either).
+
+    A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
+    the per-bridge home from the ``$CODEX_HOME``-resolved host home, so the menu
+    reads the same resolved home (``ctx.codex_home``) to stay in step with the
+    terminal. The in-process ``codex`` (SDK) harness has no such terminal, so it
+    keeps the ``~/.codex`` host dir it used before this scoping.
 
     Names are surfaced by **directory name** (the selector's key), not the
     frontmatter ``name``. Codex registers a skill's slash command under its
@@ -333,7 +444,8 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
 
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home)
+    host_override = ctx.codex_home if ctx.is_native else None
+    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
     out: list[SkillSpec] = []
     for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
         try:

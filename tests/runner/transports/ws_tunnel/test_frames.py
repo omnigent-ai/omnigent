@@ -151,6 +151,27 @@ def test_response_end_round_trip() -> None:
     decoded = decode_frame(encode_frame(f))
     assert isinstance(decoded, ResponseEndFrame)
     assert decoded.id == "req_abc"
+    assert decoded.error is None
+
+
+def test_response_end_with_error_round_trip() -> None:
+    """Error-flagged end frames carry the error string through encode/decode."""
+    f = ResponseEndFrame(id="req_xyz", error="runner_stream_error")
+    encoded = encode_frame(f)
+    decoded = decode_frame(encoded)
+    assert isinstance(decoded, ResponseEndFrame)
+    assert decoded.id == "req_xyz"
+    assert decoded.error == "runner_stream_error"
+    # The wire format must include the "error" key when set.
+    wire = json.loads(encoded)
+    assert wire.get("error") == "runner_stream_error"
+
+
+def test_response_end_clean_omits_error_key() -> None:
+    """Clean end frames must NOT include an "error" key on the wire."""
+    f = ResponseEndFrame(id="req_abc")
+    wire = json.loads(encode_frame(f))
+    assert "error" not in wire
 
 
 def test_request_cancel_round_trip() -> None:

@@ -1,6 +1,7 @@
 // Tests for the shared image lightbox: a ZoomableImage renders a button around
 // an <img>; activating it opens a full-screen Dialog showing the same source,
-// which closes via Escape or the "x" button.
+// which closes via Escape, the "x" button, or a click on the empty stage
+// around the image.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -82,5 +83,76 @@ describe("ZoomableImage + ImageLightboxProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reset zoom" }));
     expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("100%");
     expect(previewImg).toHaveStyle({ transform: "translate(0px, 0px) scale(1)" });
+  });
+});
+
+describe("dismissing the lightbox by clicking outside the image", () => {
+  /** Open the preview and return its image and the stage around it. */
+  function openPreview() {
+    renderWithProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom image: diagram" }));
+    const previewImg = screen.getAllByRole("img", { name: "diagram" }).at(-1)!;
+    const stage = previewImg.parentElement!;
+    // jsdom has no pointer capture; panning calls it on the stage.
+    stage.setPointerCapture = vi.fn();
+    stage.releasePointerCapture = vi.fn();
+    return { previewImg, stage };
+  }
+
+  it("closes when the click lands on the stage, not the image", () => {
+    const { stage } = openPreview();
+    fireEvent.click(stage);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("stays open when the click lands on the image itself", () => {
+    const { previewImg } = openPreview();
+    fireEvent.click(previewImg);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("stays open when a toolbar button is clicked", () => {
+    openPreview();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("closes on a stage click while zoomed in", () => {
+    const { stage } = openPreview();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    fireEvent.click(stage);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("stays open when a pan drag ends on the stage", () => {
+    // Panning a zoomed image releases the pointer over the stage, which the
+    // browser then reports as a click there. Dismissing on it would close the
+    // preview every time someone repositions the image.
+    const { stage } = openPreview();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+
+    fireEvent.pointerDown(stage, { pointerId: 1, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(stage, { pointerId: 1, clientX: 180, clientY: 140 });
+    fireEvent.pointerUp(stage, { pointerId: 1, clientX: 180, clientY: 140 });
+    fireEvent.click(stage);
+
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("closes on a plain click that follows a pan", () => {
+    // The drag suppression lasts for that gesture only.
+    const { stage } = openPreview();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+
+    fireEvent.pointerDown(stage, { pointerId: 1, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(stage, { pointerId: 1, clientX: 180, clientY: 140 });
+    fireEvent.pointerUp(stage, { pointerId: 1, clientX: 180, clientY: 140 });
+    fireEvent.click(stage);
+
+    fireEvent.pointerDown(stage, { pointerId: 2, clientX: 50, clientY: 50 });
+    fireEvent.pointerUp(stage, { pointerId: 2, clientX: 50, clientY: 50 });
+    fireEvent.click(stage);
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 });

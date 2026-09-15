@@ -405,12 +405,13 @@ def test_subagent_inherits_root_session_policies(db_uri: str) -> None:
     assert names.index("root_guard") < names.index("__ask_on_add_policy")
 
 
-def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
-    """When root and child both have a policy with the same name, child wins.
+def test_subagent_exact_duplicate_keeps_root_policy_order(db_uri: str) -> None:
+    """An identical child policy cannot move its root copy later.
 
-    The root's copy is dropped to avoid double-evaluation. The
-    child's version appears in the engine at the session-policy
-    position.
+    Root and child carry structurally identical policies (same name,
+    handler, params), so only the root copy should remain. Keeping its
+    original position prevents the child from moving the guardrail behind
+    a later root policy.
 
     :param db_uri: Per-test SQLite URI.
     """
@@ -424,13 +425,19 @@ def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
     )
 
     policy_store = SqlAlchemyPolicyStore(db_uri)
-    # Same-name policy on both root and child.
     policy_store.create(
         policy_id="c6de31de238a26c347a7c3d8d5a74c3a",
         session_id=root_conv.id,
         name="shared_guard",
         type="python",
         handler=handler,
+    )
+    policy_store.create(
+        policy_id="f4a8c2e6b0d1c3e5f7a9b2d4e6c8a0b1",
+        session_id=root_conv.id,
+        name="root_policy_after_guard",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_division",
     )
     policy_store.create(
         policy_id="86507aab3e1f97f6b1bace6058204f1a",
@@ -448,9 +455,119 @@ def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
     )
 
     names = [p.spec.name for p in engine.policies]
-    # "shared_guard" should appear exactly once (child's version).
     assert names.count("shared_guard") == 1, (
         f"expected exactly 1 'shared_guard', got {names.count('shared_guard')} in {names}"
+    )
+    assert names.index("shared_guard") < names.index("root_policy_after_guard"), (
+        f"expected the root guard to retain its original position; got {names}"
+    )
+
+
+def test_subagent_same_name_different_handler_keeps_root_policy(db_uri: str) -> None:
+    """A child policy squatting an inherited policy's name must not drop it.
+
+    Root has a guardrail; the child has a *different* policy reusing its
+    name. Both instances must be in the child's engine (the root's first),
+    so a name collision cannot neutralize the inherited guardrail.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    root_handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+    child_handler = "tests.resources.examples._shared.tool_functions.block_division"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="5b2c1f7a9d3e4c8ab6f0d1e2c3a4b5d6",
+        session_id=root_conv.id,
+        name="shared_guard",
+        type="python",
+        handler=root_handler,
+    )
+    policy_store.create(
+        policy_id="9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b",
+        session_id=child_conv.id,
+        name="shared_guard",
+        type="python",
+        handler=child_handler,
+    )
+
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+
+    shared = [
+        p
+        for p in engine.policies
+        if isinstance(p, FunctionPolicy) and p.spec.name == "shared_guard"
+    ]
+    handlers = [p.spec.function.path for p in shared if p.spec.function is not None]
+    assert handlers == [root_handler, child_handler], (
+        f"expected the inherited root policy to survive the name collision "
+        f"(root first, child appended); got handlers {handlers}"
+    )
+
+
+def test_subagent_same_name_different_params_keeps_root_policy(db_uri: str) -> None:
+    """A looser same-handler child policy must not replace the root's.
+
+    Root and child share name and handler but differ in factory params
+    (the child's limit is effectively no-op). Both must run so the
+    stricter root configuration still enforces.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    handler = "omnigent.policies.builtins.safety.max_tool_calls_per_session"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+        session_id=root_conv.id,
+        name="tool_budget",
+        type="python",
+        handler=handler,
+        factory_params={"limit": 1},
+    )
+    policy_store.create(
+        policy_id="6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a",
+        session_id=child_conv.id,
+        name="tool_budget",
+        type="python",
+        handler=handler,
+        factory_params={"limit": 100000},
+    )
+
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+
+    budgets = [
+        p
+        for p in engine.policies
+        if isinstance(p, FunctionPolicy) and p.spec.name == "tool_budget"
+    ]
+    args = [p.spec.function.arguments for p in budgets if p.spec.function is not None]
+    assert args == [{"limit": 1}, {"limit": 100000}], (
+        f"expected both same-named configurations to run (strict root first); got {args}"
     )
 
 

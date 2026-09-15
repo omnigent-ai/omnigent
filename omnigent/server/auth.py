@@ -48,14 +48,23 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
-# Path prefixes a delegated (device-grant) access token may reach.
+# Path prefixes a restricted (device-grant or machine client-credential)
+# access token may reach.
 # Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
 # any path not covered here, so it can never touch admin / user-management
 # endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
-# its underlying identity is an admin. Delegated clients only need these.
+# its underlying identity is an admin. Restricted clients only need these.
 # First-party login-grant tokens carry no ``scope`` and are NOT restricted
 # here — they renew the session JWT and keep its authority (see
 # ``_check_cookie`` and ``routes/device_auth.LOGIN_GRANT_CLIENT_ID``).
+#
+# The allowlist confines the PATH, not the privilege LEVEL within one: the
+# ``is_admin`` → ``LEVEL_OWNER`` override inside /v1/sessions keys off the
+# token's identity, so an admin subject reaches every tenant's sessions
+# there. For a device grant that is delegation working as intended — the
+# subject is the human who approved consent. The machine client-credential
+# grant delegates no human, so it additionally requires its configured
+# subject to be a non-admin principal; see routes/client_credentials.py.
 _DELEGATED_ALLOWED_PREFIXES = (
     "/health",
     "/v1/agents",
@@ -604,23 +613,31 @@ class UnifiedAuthProvider(AuthProvider):
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
 
-        # Grant-derived tokens carry a ``grant_id`` claim. They get
-        # request-scoped checks — a live revocation lookup, plus (for
-        # restricted tokens) a fail-closed path allowlist — so they are
-        # never served from the plain user-id cache (which would skip both).
+        # Machine-issued tokens carry ``grant_id`` (store-backed grant),
+        # ``scope`` (restricted authority), or both. Each claim gets its own
+        # request-scoped check below, and a token carrying either is never
+        # served from the plain user-id cache — the cache is token-keyed, so
+        # a hit on one path would replay past both checks on every other.
         grant_id = payload.get("grant_id")
-        if grant_id is not None:
-            if not isinstance(grant_id, str):
-                return None
-            if self._grant_revoked is not None and self._grant_revoked(grant_id):
-                return None
-            # The allowlist restricts DELEGATED tokens — a third-party
-            # client (e.g. Slack) acting on a user's behalf, marked by the
-            # ``scope`` claim. A first-party login grant carries no scope:
-            # its bearer is the user's own CLI/host, and the token renews
-            # the session JWT it replaced, so it keeps that same authority
-            # (still revocable via ``grant_id`` above).
-            if payload.get("scope") is not None and not delegated_path_allowed(request.url.path):
+        scope = payload.get("scope")
+        if grant_id is not None or scope is not None:
+            # A ``grant_id`` names a revocable stored grant, so it is checked
+            # live against the denylist. The client-credentials grant has no
+            # stored grant and omits the claim; the lookup is skipped for it
+            # (its revocation is secret rotation plus the capped TTL) rather
+            # than run with ``None``, which fails closed on every request.
+            if grant_id is not None:
+                if not isinstance(grant_id, str):
+                    return None
+                if self._grant_revoked is not None and self._grant_revoked(grant_id):
+                    return None
+            # The allowlist confines any token whose authority was RESTRICTED
+            # at mint — a third-party device client acting for a user, or a
+            # machine client acting as itself — both marked by ``scope``. A
+            # first-party login grant carries no scope: its bearer is the
+            # user's own CLI/host and the token renews the session JWT it
+            # replaced, so it keeps that authority (revocable via ``grant_id``).
+            if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
             return user_id
 

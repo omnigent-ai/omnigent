@@ -9,6 +9,7 @@ by the pty-driver tests in this directory).
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from collections.abc import Iterable
 
@@ -643,35 +644,15 @@ def test_output_wraps_urls_in_osc_8_hyperlink(
     that support shell integration (iTerm2, Ghostty, kitty,
     etc.) render them as ⌘-clickable links.
 
-    Pins the wiring between :meth:`TerminalHost.output` and
-    :func:`omnigent_ui_sdk.terminal._linkify.linkify_ansi`.
-    The detection logic itself is tested in
-    ``tests/frontends/sdk/test_linkify.py``; this test only
-    confirms the post-render hook is actually called on the
-    output path.
-
-    Failure mode caught: someone removes the ``linkify_ansi``
-    call from ``output()`` (or swaps it for a no-op), and
-    URLs in tool result panels / agent text stop being
-    clickable. The OSC 8 byte sequence
-    (``\\x1b]8;;<url>\\x1b\\``) doesn't show up by accident —
-    Rich does NOT auto-emit it for plain URLs in pre-built
-    Text/Panel/Group renderables, only when the URL is
-    explicitly wrapped in ``[link=...]...[/link]`` markup.
-    So if this assertion fails, the post-render linkify hook
-    is broken.
+    The optional OSC 8 parameters may include Rich's link ID.
     """
     host = TerminalHost(model_name="test")
     host.output(Text("Visit https://example.com here"))
     captured = capsys.readouterr()
-    # Pin the EXACT byte sequence — this is the wire format
-    # terminals consume. If it drifts, every ⌘-click breaks.
-    assert "\x1b]8;;https://example.com\x1b\\https://example.com\x1b]8;;\x1b\\" in captured.out, (
-        f"Expected OSC 8 hyperlink wrapping around the URL in "
-        f"output(); got {captured.out!r}. Likely cause: the "
-        f"``linkify_ansi(buf.getvalue())`` call in TerminalHost.output "
-        f"was removed or replaced with a no-op."
-    )
+    assert re.search(
+        r"\x1b\]8;[^;]*;https://example\.com\x1b\\https://example\.com\x1b\]8;;\x1b\\",
+        captured.out,
+    ), captured.out
 
 
 # ── Overlay sidebar viewport scrolling ──────────────────────

@@ -66,6 +66,12 @@ class Classification:
     evidence_kind: EvidenceKind = EvidenceKind.NONE
     information_status: InformationStatus = InformationStatus.NOT_APPLICABLE
     missing_information: tuple[MissingInformation, ...] = ()
+    help_wanted: bool = False
+    duplicate_decision: str = "none"
+    duplicate_of: int | None = None
+    similar_issues: tuple[int, ...] = ()
+    duplicate_confidence: float = 0.0
+    duplicate_reasoning: str = ""
 
 
 class Classifier(Protocol):
@@ -77,12 +83,14 @@ class PromptClassifier:
         self,
         query: Callable[[str], str],
         areas: AreaCatalog,
+        duplicate_candidates: tuple[dict[str, object], ...] = (),
     ) -> None:
         self.query = query
         self.areas = areas
+        self.duplicate_candidates = duplicate_candidates
 
     def classify(self, issue: IssueContent) -> Classification:
-        response = self.query(build_prompt(issue, self.areas))
+        response = self.query(build_prompt(issue, self.areas, self.duplicate_candidates))
         value = _parse_json_object(response)
         area_keys = tuple(
             key for key in _string_list(value.get("area_keys")) if key in self.areas.by_key
@@ -106,10 +114,20 @@ class PromptClassifier:
             evidence_kind=evidence_kind,
             information_status=information_status,
             missing_information=missing_information,
+            help_wanted=value.get("help_wanted") is True,
+            duplicate_decision=str(value.get("duplicate_decision") or "none"),
+            duplicate_of=_optional_int(value.get("duplicate_of")),
+            similar_issues=tuple(_int_list(value.get("similar_issues"))),
+            duplicate_confidence=_confidence(value.get("duplicate_confidence")),
+            duplicate_reasoning=str(value.get("duplicate_reasoning") or ""),
         )
 
 
-def build_prompt(issue: IssueContent, areas: AreaCatalog) -> str:
+def build_prompt(
+    issue: IssueContent,
+    areas: AreaCatalog,
+    duplicate_candidates: tuple[dict[str, object], ...] = (),
+) -> str:
     area_lines = [
         f"- {area.key}: label={area.issue_label}. {area.definition}"
         for area in sorted(areas.by_key.values(), key=lambda item: item.key)
@@ -121,6 +139,11 @@ def build_prompt(issue: IssueContent, areas: AreaCatalog) -> str:
         labels=", ".join(issue.labels) if issue.labels else "none",
         author=issue.author,
         body=issue.body[:12000],
+        duplicate_candidates=(
+            json.dumps(duplicate_candidates, ensure_ascii=False, indent=2)
+            if duplicate_candidates
+            else "None. This is a reclassification; return duplicate_decision=none."
+        ),
     )
 
 
@@ -176,6 +199,22 @@ def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value]
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _int_list(value: object) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int) and not isinstance(item, bool)]
+
+
+def _confidence(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return min(1.0, max(0.0, float(value)))
 
 
 def _classification_labels(labels: tuple[str, ...]) -> tuple[str, ...]:

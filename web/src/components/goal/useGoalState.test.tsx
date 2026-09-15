@@ -48,4 +48,19 @@ describe("useGoalState", () => {
     rerender({ enabled: false });
     expect(result.current.goal).toBeNull();
   });
+
+  it("reloads the goal when a session becomes reachable again", async () => {
+    mockGetGoal.mockResolvedValueOnce({ goal: GOAL });
+
+    const { result, rerender } = renderHook(({ reachable }) => useGoalState("conv", reachable), {
+      initialProps: { reachable: false },
+    });
+    expect(mockGetGoal).not.toHaveBeenCalled();
+
+    rerender({ reachable: true });
+
+    await waitFor(() => expect(result.current.goal).toEqual(GOAL));
+    expect(mockGetGoal).toHaveBeenCalledTimes(1);
+    expect(mockGetGoal).toHaveBeenCalledWith("conv");
+  });
 });

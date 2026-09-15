@@ -3,6 +3,7 @@
 from omnigent.runner.background_titles.service import (
     BackgroundTitleContext,
     BackgroundTitleHarnessError,
+    background_title_model,
     generate_background_title,
     generator_spec_for_harness,
 )
@@ -10,6 +11,7 @@ from omnigent.runner.background_titles.service import (
 __all__ = [
     "BackgroundTitleContext",
     "BackgroundTitleHarnessError",
+    "background_title_model",
     "generate_background_title",
     "generator_spec_for_harness",
 ]

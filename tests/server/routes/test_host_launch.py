@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._host_launch import (
+    host_absent_error,
     resolve_host_launch,
     resolve_host_owner,
 )
@@ -146,3 +147,28 @@ class TestResolveHostLaunch:
         )
         assert result.host.host_id == "host_1"
         assert result.conv.id == "s1"
+
+
+# ── host_absent_error (single-replica vs sharded) ─────────────────────
+
+
+class TestHostAbsentError:
+    def test_sharded_live_host_is_wrong_replica(self) -> None:
+        """On a sharded deployment a live-but-absent host re-addresses (400)."""
+        host = _FakeHost(host_id="host_1", status="online", updated_at=now_epoch())
+        err = host_absent_error(host, sharded=True)
+        assert err.code == ErrorCode.WRONG_REPLICA
+
+    def test_single_replica_live_host_is_offline(self) -> None:
+        """On a single-replica deployment there is no other replica to re-address
+        to, so a live-but-absent host is reported offline (409), not the
+        un-satisfiable WRONG_REPLICA that would drive an endless client poll."""
+        host = _FakeHost(host_id="host_1", status="online", updated_at=now_epoch())
+        err = host_absent_error(host, sharded=False)
+        assert err.code == ErrorCode.CONFLICT
+
+    def test_offline_host_is_conflict_regardless_of_sharding(self) -> None:
+        """A stale/offline row is a genuine 409 whether or not we're sharded."""
+        host = _FakeHost(host_id="host_1", status="offline", updated_at=0)
+        assert host_absent_error(host, sharded=True).code == ErrorCode.CONFLICT
+        assert host_absent_error(host, sharded=False).code == ErrorCode.CONFLICT

@@ -102,9 +102,9 @@ export function SidebarHeaderActions({
  * mobile breakpoint) and these stay flat 24px ghost icons in the header row.
  */
 const SIDEBAR_FLOAT_BUTTON =
-  "sidebar-glass-chip size-6 text-muted-foreground hover:text-foreground max-md:size-9 max-md:rounded-full max-md:text-foreground";
+  "sidebar-glass-chip size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:text-foreground";
 
-const SIDEBAR_FLOAT_ICON = "ui-icon max-md:size-[18px]";
+const SIDEBAR_FLOAT_ICON = "ui-icon max-md:size-[22px]";
 
 /**
  * Search (command palette) icon button.

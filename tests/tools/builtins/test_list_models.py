@@ -58,7 +58,7 @@ def test_invoke_returns_catalog(
         },
     }
     with patch(
-        "omnigent.model_catalog.catalog_for_spec",
+        "omnigent.models.model_catalog.catalog_for_spec",
         return_value=fake_catalog,
     ) as mock_catalog:
         tool = SysListModelsTool(spec=_make_spec())

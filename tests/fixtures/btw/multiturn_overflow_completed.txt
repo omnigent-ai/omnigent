@@ -1,0 +1,24 @@
+
+╭─── Claude Code v2.1.236 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│                    Welcome back!                   │ Run /init to create a CLAUDE.md file with instructions for Claude                                       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▛█                      │ What's new                                                                                              │
+│                      ▝▜██████▀                     │ Fixed Claude Code failing to launch on macOS 12 (Monterey), a regression introduced in 2.1.255          │
+│                        ▝▝ ▝▝                       │ Fixed remote and scheduled sessions failing with "user messages must have non-empty content" after a r… │
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+    /btw name a fruit that is red, one word only
+    /btw list the numbers 1 through 30, each on its own line, formatted as "N = word" (e.g. 1 = one)
+
+      1 = one
+      2 = two
+      3 = three
+      4 = four
+      5 = five
+      6 = six
+      7 = seven
+      8 = eight
+      9 = nine
+
+    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close

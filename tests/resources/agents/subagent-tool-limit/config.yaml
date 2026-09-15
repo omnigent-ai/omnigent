@@ -1,0 +1,39 @@
+spec_version: 1
+name: subagent-tool-limit
+description: >
+  Fixture bundle for the sub-agent tool-call-limit e2e test. The parent
+  declares a LOOSER max_tool_calls_per_session limit than its worker child.
+  Both limits must be enforced on the child (effective limit = min of the
+  two), so the child must be denied by its own child_tool_limit policy even
+  though the inherited parent policy still has headroom.
+
+# executor.model and an executor.auth api-key block are stamped per-test so
+# the openai-agents harness hits the mock LLM server.
+executor:
+  type: omnigent
+  model: mock-parent-model
+  config:
+    harness: openai-agents
+
+prompt: |
+  You are a supervisor. When asked to run, dispatch the worker sub-agent
+  with sys_session_send and wait for its result.
+
+tools:
+  agents:
+    - worker
+
+# Parent limit is deliberately LOOSER than the child's (see
+# agents/worker/config.yaml). The child's stricter limit must still apply.
+guardrails:
+  policies:
+    parent_tool_limit:
+      type: function
+      function:
+        path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+        arguments:
+          limit: 10
+
+os_env:
+  type: caller_process
+  cwd: .

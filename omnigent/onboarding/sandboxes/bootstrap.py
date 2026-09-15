@@ -506,7 +506,7 @@ def login_app_oauth_in_sandbox(
             "The in-sandbox login needs the server URL — pass --server, or --no-auth to skip."
         )
 
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     click.echo(f"▸ Logging sandbox '{sandbox_id}' in to {display_server_url(server_url)}")
     if workspace is not None:
@@ -674,7 +674,7 @@ def connect_sandbox_host(
         config.yaml (usually ``socket.gethostname()``).
     :raises click.ClickException: If the remote command exits non-zero.
     """
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     click.echo(
         f"▸ Registering sandbox '{sandbox_id}' as a host with {display_server_url(server_url)}"

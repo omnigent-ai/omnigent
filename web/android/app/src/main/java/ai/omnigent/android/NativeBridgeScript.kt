@@ -104,6 +104,26 @@ object NativeBridgeScript {
             },
           });
 
+          // getServerPicker waiters: each call parks a resolver here; native
+          // answers every request with one emit, resolving all of them.
+          const serverPickerWaiters = new Set();
+          Object.defineProperty(window, "__omnigentNativeEmitServerPicker", {
+            configurable: false, enumerable: false, writable: false,
+            value(payload) {
+              if (!payload || typeof payload !== "object") return;
+              if (typeof payload.currentOrigin !== "string" || !payload.currentOrigin) return;
+              const cleanList = (value) =>
+                Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+              const info = {
+                currentOrigin: payload.currentOrigin,
+                managedServers: cleanList(payload.managedServers),
+                recentServers: cleanList(payload.recentServers),
+              };
+              for (const resolve of serverPickerWaiters) { try { resolve(info); } catch (_) {} }
+              serverPickerWaiters.clear();
+            },
+          });
+
           const insetCallbacks = new Set();
           // Cache the last footprint so a subscriber that registers AFTER native
           // first emitted (the React app mounts later than document-start) still
@@ -249,6 +269,21 @@ object NativeBridgeScript {
               insetCallbacks.add(callback);
               if (lastInsets) { try { callback(lastInsets); } catch (_) {} }
               return () => insetCallbacks.delete(callback);
+            },
+            getServerPicker() {
+              // Fetch fresh per call (the sidebar picker re-reads on every menu
+              // open so a runtime MDM change appears without a reload); native
+              // answers each request with an emit, resolving every waiter.
+              const pending = new Promise((resolve) => { serverPickerWaiters.add(resolve); });
+              post({ method: "requestServerPicker" });
+              return pending;
+            },
+            switchServer(url) {
+              if (typeof url === "string") post({ method: "switchServer", url });
+              return Promise.resolve();
+            },
+            openServerSetup() {
+              post({ method: "openServerSetup" });
             },
           });
         })();

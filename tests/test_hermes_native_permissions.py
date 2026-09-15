@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.hermes_native_permissions import (
+from omnigent.harnesses.hermes_native.permissions import (
     hermes_permission_elicitation_id,
     parse_hermes_approval_prompt,
 )
@@ -73,7 +73,7 @@ def test_elicitation_id_is_per_episode_token() -> None:
 
 import asyncio  # noqa: E402
 
-import omnigent.hermes_native_permissions as hp  # noqa: E402
+import omnigent.harnesses.hermes_native.permissions as hp  # noqa: E402
 
 
 class _Resp:

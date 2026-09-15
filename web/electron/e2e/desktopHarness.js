@@ -21,7 +21,7 @@
 
 "use strict";
 
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
@@ -270,6 +270,81 @@ async function spawnServer(tmpDir) {
   return { serverUrl, close };
 }
 
+/** Whether ffmpeg is on PATH — needed for the composited display capture. */
+function ffmpegAvailable() {
+  try {
+    return spawnSync("ffmpeg", ["-version"], { stdio: "ignore" }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Record the composited X display into `recordDir` as a `display@*.webm`.
+ * Playwright's per-page `recordVideo` screencasts each webContents separately,
+ * so `WebContentsView` content composited over the shell window never appears
+ * in the window's own clip. Grabbing the display films what a user actually
+ * sees — the window WITH its embedded views — so `saveRecording` can promote
+ * it as the primary clip.
+ *
+ * @param {string} recordDir Directory the capture is written into.
+ * @param {string} display The X display to grab (e.g. ":99").
+ * @returns {{ stop: () => Promise<void> } | null} Null when capture can't run.
+ */
+function startDisplayCapture(recordDir, display) {
+  if (!display || !ffmpegAvailable()) return null;
+  const out = path.join(recordDir, `display@${Date.now()}.webm`);
+  const proc = spawn(
+    "ffmpeg",
+    [
+      "-v",
+      "error",
+      "-f",
+      "x11grab",
+      "-framerate",
+      "10",
+      // No -video_size: x11grab defaults to the full desktop, which always
+      // contains the shell window wherever it was placed.
+      "-i",
+      display,
+      "-c:v",
+      "libvpx",
+      "-b:v",
+      "1M",
+      "-deadline",
+      "realtime",
+      "-cpu-used",
+      "8",
+      "-y",
+      out,
+    ],
+    { stdio: ["pipe", "ignore", "ignore"] },
+  );
+  // ENOENT etc. fires async; a failed capture just leaves no/empty output and
+  // saveRecording falls back to the per-page clips.
+  proc.on("error", () => {});
+  const stop = () =>
+    new Promise((resolve) => {
+      if (proc.exitCode !== null) {
+        resolve();
+        return;
+      }
+      const hardKill = setTimeout(() => proc.kill("SIGKILL"), 5_000);
+      proc.on("close", () => {
+        clearTimeout(hardKill);
+        resolve();
+      });
+      try {
+        // 'q' asks ffmpeg to finalize the file cleanly (SIGINT can truncate).
+        proc.stdin.write("q");
+        proc.stdin.end();
+      } catch {
+        proc.kill("SIGINT");
+      }
+    });
+  return { stop };
+}
+
 /**
  * Launch the real desktop shell (Electron main process) under Playwright with
  * video recording on, in an isolated userData dir so it never touches the
@@ -284,7 +359,10 @@ async function spawnServer(tmpDir) {
  * @param {string} [opts.userDataDir] Override the isolated userData dir
  *   (defaults to a fresh temp dir).
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
- *   window: import("playwright").Page, userDataDir: string }>}
+ *   window: import("playwright").Page, userDataDir: string,
+ *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
+ *   awaited before `saveRecording` (it finalizes the composited capture; a
+ *   no-op when no display capture ran).
  */
 async function launchDesktop(opts) {
   const { _electron: electron } = require("playwright");
@@ -308,13 +386,31 @@ async function launchDesktop(opts) {
     args.push("--no-sandbox", "--disable-dev-shm-usage");
   }
 
-  const electronApp = await electron.launch({
-    args,
-    recordVideo: { dir: opts.recordDir },
-    // Dev builds read dev-app-update.yml and would try to reach the update
-    // endpoint; a version override keeps the app off the update path.
-    env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
-  });
+  // Film the composited display (window + embedded WebContentsViews) alongside
+  // Playwright's per-page clips: the per-page screencast of the shell window
+  // omits any WebContentsView composited over it, so on its own the "desktop
+  // recording" would silently drop the very content a journey renders inside
+  // an embedded browser view. The display capture becomes the primary clip in
+  // saveRecording; the per-page clips remain as context.
+  const displayCapture = startDisplayCapture(opts.recordDir, process.env.DISPLAY);
+
+  const stopDisplayCapture = async () => {
+    if (displayCapture) await displayCapture.stop();
+  };
+
+  let electronApp;
+  try {
+    electronApp = await electron.launch({
+      args,
+      recordVideo: { dir: opts.recordDir },
+      // Dev builds read dev-app-update.yml and would try to reach the update
+      // endpoint; a version override keeps the app off the update path.
+      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
+    });
+  } catch (err) {
+    await stopDisplayCapture();
+    throw err;
+  }
   // If firstWindow() throws after launch() succeeded, close the app here so the
   // Electron process isn't orphaned (the caller never got a handle to close).
   let window;
@@ -322,45 +418,54 @@ async function launchDesktop(opts) {
     window = await electronApp.firstWindow();
   } catch (err) {
     await electronApp.close().catch(() => {});
+    await stopDisplayCapture();
     throw err;
   }
-  return { electronApp, window, userDataDir };
+  return { electronApp, window, userDataDir, stopDisplayCapture };
 }
 
 /**
- * After the Electron app has closed (which flushes the video), rename the
- * recorded clip(s) to stable names at `recordDir`'s root. Playwright writes one
- * `page@<hash>.webm` per page context (the shell window, plus any OAuth popup /
- * in-window IdP `WebContentsView`). ALL clips are kept — the subject of a
- * popup/IdP bug is the popup, which is often shorter/smaller than the main
- * window, so we must not delete by size. Only the raw `page@<hash>.webm` names
- * (the ones the CURRENT launch produced) are renamed; already-named clips from
- * a prior `saveRecording` are left alone, so calling twice is safe.
+ * After the Electron app has closed (which flushes the video) and
+ * `stopDisplayCapture` resolved, rename the recorded clip(s) to stable names
+ * at `recordDir`'s root. Two kinds of raw clips exist: `display@*.webm` (the
+ * composited display capture — the window WITH its embedded views, i.e. what a
+ * user sees) and `page@<hash>.webm` (Playwright's per-webContents screencasts:
+ * the shell window, plus any OAuth popup / in-window IdP `WebContentsView`).
+ * ALL clips are kept — the subject of a popup/IdP bug is the popup, which is
+ * often shorter/smaller than the main window, so we must not delete by size.
+ * Only raw names are renamed; already-named clips from a prior `saveRecording`
+ * are left alone, so calling twice is safe.
  *
- * The largest raw clip (usually the main window) becomes `<name>.webm`; any
- * additional raw clips become `<name>-2.webm`, `<name>-3.webm`, … in
- * descending-size order. When multiple clips exist, inspect each and point the
- * handoff at the one that shows the failure (see e2e/README.md).
+ * The composited display capture (when present) becomes the primary
+ * `<name>.webm` — it is the only clip guaranteed to show embedded browser-view
+ * content. Without one, the largest per-page clip (usually the main window) is
+ * promoted instead. Remaining clips become `<name>-2.webm`, `<name>-3.webm`, …
+ * in descending-size order. When multiple clips exist, inspect each and point
+ * the handoff at the one that shows the failure (see e2e/README.md).
  *
- * Call this AFTER `electronApp.close()`.
+ * Call this AFTER `electronApp.close()` and `await stopDisplayCapture()`.
  *
  * @param {string} recordDir The dir passed to `launchDesktop`.
  * @param {string} name Stable base name, e.g. `"before-connect"` (no suffix).
- * @returns {string[]} Absolute paths of the saved `.webm`(s), largest first;
+ * @returns {string[]} Absolute paths of the saved `.webm`(s), primary first;
  *   empty when no video was produced.
  */
 function saveRecording(recordDir, name) {
   if (!fs.existsSync(recordDir)) return [];
-  // Only the raw per-context files this launch wrote; leave anything already
-  // renamed (from a prior call) untouched so repeat calls don't clobber.
-  const raw = fs
-    .readdirSync(recordDir)
-    .filter((f) => f.startsWith("page@") && f.endsWith(".webm"))
-    .map((f) => path.join(recordDir, f))
-    .filter((p) => fs.statSync(p).isFile());
+  // Only the raw files this launch wrote; leave anything already renamed
+  // (from a prior call) untouched so repeat calls don't clobber. Zero-byte
+  // files (a capture that never got a frame) are dropped.
+  const rawOf = (prefix) =>
+    fs
+      .readdirSync(recordDir)
+      .filter((f) => f.startsWith(prefix) && f.endsWith(".webm"))
+      .map((f) => path.join(recordDir, f))
+      .filter((p) => fs.statSync(p).isFile() && fs.statSync(p).size > 0)
+      .sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
+  // The display capture films the composited app (views included), so it is
+  // the primary; per-page clips follow, largest first.
+  const raw = [...rawOf("display@"), ...rawOf("page@")];
   if (raw.length === 0) return [];
-  // Largest first so the primary (usually the main window) takes the bare name.
-  raw.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
   const saved = [];
   raw.forEach((clip, i) => {
     const dest = path.join(recordDir, i === 0 ? `${name}.webm` : `${name}-${i + 1}.webm`);

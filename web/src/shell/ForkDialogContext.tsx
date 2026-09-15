@@ -10,14 +10,14 @@ import { createContext, useContext } from "react";
 export interface ForkDialogContextValue {
   /**
    * Whether the current session can be forked at all — mirrors the
-   * header Clone button's gating (top-level session, read access).
+   * header Fork menu's read-access gating.
    * Callers hide their fork affordance when false.
    */
   canFork: boolean;
   /**
    * Open the fork/clone dialog. With `upToResponseId` set, the dialog
    * submits a truncated fork ("fork from this response"); without it,
-   * a full clone (the header button's behavior).
+   * a full clone (the session-menu behavior).
    */
   openForkDialog: (opts?: { upToResponseId?: string }) => void;
 }

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
 
-from omnigent import model_catalog
+from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
     from openai import OpenAI, Stream
@@ -236,6 +236,35 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
     return None
 
 
+def _databricks_sdk_token_command(host: str, profile: str | None) -> str:
+    """Auth-command fallback that mints a bearer via the databricks-sdk.
+
+    ``databricks auth token`` (the mint in :func:`databricks_bearer_token_command`)
+    supports U2M only, so an OAuth **M2M** / service-principal profile — an agent
+    authenticating as a workload identity, e.g. on a self-hosted Fargate host —
+    yields no CLI token and the gateway request fails. The
+    :mod:`omnigent.inner.databricks_token` entrypoint resolves the bearer through
+    the databricks-sdk's unified ``Config.authenticate()``, which does the
+    client-credentials exchange (and also covers env / file OIDC and a static
+    PAT), so it reuses the SDK rather than reimplementing any OAuth. Runs only
+    after the CLI mint (and, for the connect profile, the broker) yield nothing.
+
+    ``--host`` is always passed (the gateway's workspace) so the entrypoint can
+    fail closed when a named profile resolves to a *different* workspace; a named
+    ``--profile`` is added on top and pins identity to that section.
+
+    :param host: Databricks workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :param profile: ``~/.databrickscfg`` profile name, or ``None`` to select by
+        host (env / OIDC service-principal credentials against that workspace).
+    :returns: Shell command that prints a bearer token on stdout, or nothing.
+    """
+    args = f"--host {shlex.quote(host.rstrip('/'))}"
+    if profile:
+        args += f" --profile {shlex.quote(profile)}"
+    return f"python3 -m omnigent.inner.databricks_token {args}"
+
+
 def databricks_bearer_token_command(
     host: str,
     profile: str | None = None,
@@ -265,11 +294,13 @@ def databricks_bearer_token_command(
     failure is still visible. ``--force-refresh`` only exists in Databricks CLI
     >= v0.296.0, so it stays behind the ``--help`` capability probe.
 
-    **Fallback command.** The named profile is the identity we *want*, but the
-    user may have authenticated under a different profile on the same host — a
-    config naming a credential-less profile would otherwise 401 every turn.
-    When the caller knows a token command that already worked (the one ucode
-    recorded, say), it runs last, once the named profile has yielded nothing.
+    **Fallbacks.** After the CLI mint, empty-token fallbacks run in order. A
+    caller-supplied command (the one ucode recorded, pinned to the named
+    profile) or the managed-connect broker runs first. The databricks-sdk mint
+    (:func:`_databricks_sdk_token_command`) is always appended last, so an M2M /
+    service-principal (or OIDC / PAT) profile the U2M CLI can't mint still
+    resolves — for every harness, including one that passed its own
+    ``fallback_command``.
 
     **Ambient bearer.** Prefer the configured profile because
     ``DATABRICKS_BEARER`` may be stale. Bound and silence that mint attempt so
@@ -281,19 +312,48 @@ def databricks_bearer_token_command(
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``, or
         ``None`` to select the workspace by host.
     :param fallback_command: Shell command printing a bearer token on stdout,
-        run only when the profile above yields an empty token.
+        run (before the databricks-sdk mint) when the profile above yields an
+        empty token.
     :returns: Shell command that prints a bearer token on stdout.
     """
+    # Fallbacks tried in order after the CLI mint, each only while the token is
+    # still empty. A caller-supplied command or the managed-connect broker runs
+    # first; the databricks-sdk mint is always the last resort so an M2M / OIDC /
+    # PAT profile the U2M CLI can't mint still resolves — for every harness.
+    fallbacks: list[str] = []
+    if fallback_command is not None:
+        fallbacks.append(fallback_command)
+    else:
+        # In a managed connect sandbox the owner's workspace profile is host-only
+        # (its bearer lives in the credential broker, not on disk), so
+        # ``databricks auth token`` finds no OAuth cache. Default ONLY that
+        # connect profile to the broker fetch. Gate on the profile, not the host:
+        # a *different* credential-less profile sharing the connected workspace
+        # host must not silently mint as the owner (distinct profiles on one host
+        # can be different users / service principals).
+        from omnigent.host.databricks_credential import HOST_DATABRICKS_PROFILE
+
+        if profile == HOST_DATABRICKS_PROFILE:
+            try:
+                from omnigent.host.databricks_credential import broker_token_command
+
+                broker = broker_token_command(host)
+            except Exception as exc:  # noqa: BLE001 - best-effort; no sidecar ⇒ no broker.
+                logger.info("databricks bearer: broker fallback lookup failed: %r", exc)
+                broker = None
+            if broker is not None:
+                fallbacks.append(broker)
+    fallbacks.append(_databricks_sdk_token_command(host, profile))
+
     selector = (
         f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
     )
     mint = f"env -u DATABRICKS_CONFIG_PROFILE databricks auth token {selector}"
-    fallback = (
-        # ``eval`` on a quoted string: the recorded command is opaque shell,
-        # and inlining it bare would let its own quoting reshape this script.
-        f'if [ -z "$token" ]; then token=$(eval {shlex.quote(fallback_command)}); fi; '
-        if fallback_command
-        else ""
+    fallback = "".join(
+        # ``eval`` on a quoted string: a recorded command is opaque shell, and
+        # inlining it bare would let its own quoting reshape this script.
+        f'if [ -z "$token" ]; then token=$(eval {shlex.quote(fc)}); fi; '
+        for fc in fallbacks
     )
     return (
         # An ambient bearer may be injected or stale: prefer a bounded,
