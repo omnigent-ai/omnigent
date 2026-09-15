@@ -306,7 +306,10 @@ def _format_codex_error_params(params: object) -> str:
     parts: list[str] = []
     message = params.get("message")
     if isinstance(message, str) and message.strip():
-        parts.append(message.strip())
+        # The top-level ``message`` can itself be a stringified provider
+        # error envelope (e.g. a Responses-API 400 relayed verbatim);
+        # unwrap it so the human-readable reason surfaces, not raw JSON.
+        parts.append(_unwrap_provider_error_json(message.strip()))
     # The app server's ``error`` events nest the actual upstream
     # failure under ``params["error"]`` (a dict with its own
     # ``message`` / ``codexErrorInfo`` / ``additionalDetails``
@@ -344,11 +347,14 @@ def _unwrap_provider_error_json(text: str) -> str:
     """
     Try to JSON-parse *text* and return its ``message`` field.
 
-    Codex relays provider HTTP errors as a stringified JSON blob
-    (e.g. ``'{"error_code":"BAD_REQUEST","message":"..."}'`` from
-    Databricks gateway). Returning the raw string is technically
-    accurate but visually noisy; extracting the human-readable
-    ``message`` field gives the user the actionable line directly.
+    Codex relays provider HTTP errors as a stringified JSON blob —
+    either flat (``'{"error_code":"BAD_REQUEST","message":"..."}'``
+    from Databricks gateway) or a Responses-API envelope
+    (``'{"type":"error","status":400,"error":{"type":
+    "invalid_request_error","message":"..."}}'`` from a ChatGPT
+    account). Returning the raw string is technically accurate but
+    visually noisy; extracting the human-readable ``message`` field
+    gives the user the actionable line directly.
 
     :param text: The candidate string. Expected to be either a JSON
         object with a ``message`` field, or a plain error string
@@ -370,6 +376,16 @@ def _unwrap_provider_error_json(text: str) -> str:
             if error_code:
                 return f"{provider_message.strip()} (error_code={error_code})"
             return provider_message.strip()
+        # Responses-API envelope: the reason nests one level down under
+        # ``error.message``, with the code in ``error.code``/``error.type``.
+        envelope_error = parsed.get("error")
+        if isinstance(envelope_error, dict):
+            envelope_message = envelope_error.get("message")
+            if isinstance(envelope_message, str) and envelope_message.strip():
+                error_code = envelope_error.get("code") or envelope_error.get("type")
+                if error_code:
+                    return f"{envelope_message.strip()} (error_code={error_code})"
+                return envelope_message.strip()
     return text
 
 
@@ -3072,10 +3088,12 @@ class _CodexAppServerSession:
                     )
                     if failed_turn_id is not None and failed_turn_id != active_turn_id:
                         continue
-                    error_text = str(
-                        params.get("message")
-                        or turn.get("error")
-                        or "Codex App Server turn failed"
+                    error_text = _unwrap_provider_error_json(
+                        str(
+                            params.get("message")
+                            or turn.get("error")
+                            or "Codex App Server turn failed"
+                        )
                     )
                     # turn/failed is a provider/runtime-level turn error
                     # (e.g. tool exit code, transient provider issue) —
