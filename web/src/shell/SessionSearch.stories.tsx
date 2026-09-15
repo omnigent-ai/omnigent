@@ -1,8 +1,7 @@
 import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useLocation, useNavigate } from "@/lib/routing";
-import { ActionsProvider, HANDLED, useRegisterAction } from "@/actions";
+import { ActionsProvider, HANDLED, KeybindingDispatcher, useRegisterAction } from "@/actions";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { CommandPalette } from "./CommandPalette";
 
@@ -27,18 +26,22 @@ function SessionSearch() {
   const activeId = useLocation().pathname.split("/").at(-1);
   const [open, setOpen] = useState(false);
   const [sessionsOnly, setSessionsOnly] = useState(true);
-  useCommandPaletteHotkey(
-    () => {
+  useRegisterAction("workbench.action.showCommands", {
+    acceptsKeybindings: true,
+    run: () => {
       setSessionsOnly(false);
       setOpen(true);
+      return HANDLED;
     },
-    true,
-    undefined,
-    () => {
+  });
+  useRegisterAction("workbench.action.showSessionSearch", {
+    acceptsKeybindings: true,
+    run: () => {
       setSessionsOnly(true);
       setOpen(true);
+      return HANDLED;
     },
-  );
+  });
   return (
     <main className="w-[600px] space-y-4 rounded-xl border bg-background p-6 text-foreground">
       <h1 className="text-xl font-semibold">
@@ -103,6 +106,7 @@ const meta = {
         }}
       >
         <ActionsProvider>
+          <KeybindingDispatcher />
           <Story />
         </ActionsProvider>
       </StoryQueryRouter>

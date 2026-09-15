@@ -59,7 +59,7 @@ export function KeybindingDispatcher({
     const dispatch = (event: KeyboardEvent, phase: "capture" | "bubble"): void => {
       const pending = phase === "capture" ? pendingCapture : pendingBubble;
       if (event.key === "Escape") clearPending(pending);
-      if (phase === "bubble" && (event.defaultPrevented || handledInCapture.has(event))) {
+      if (phase === "bubble" && handledInCapture.has(event)) {
         clearPending(pending);
         return;
       }
