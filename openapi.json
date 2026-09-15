@@ -172,7 +172,7 @@
       },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
-        "description": "Request body for the current-agent automatic rename endpoint.",
+        "description": "Proposed title for a framework or agent-initiated rename.",
         "properties": {
           "title": {
             "maxLength": 100,
@@ -196,7 +196,8 @@
                 "enum": [
                   "not_top_level",
                   "no_seed",
-                  "title_changed"
+                  "title_changed",
+                  "generation_failed"
                 ],
                 "type": "string"
               },
@@ -6789,6 +6790,18 @@
             "title": "Skills",
             "type": "array"
           },
+          "skills_status": {
+            "default": "unavailable",
+            "description": "Skill discovery state. A ready catalog may be empty; errors and disconnected runners must not leave clients loading.",
+            "enum": [
+              "loading",
+              "ready",
+              "error",
+              "unavailable"
+            ],
+            "title": "Skills Status",
+            "type": "string"
+          },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
@@ -6858,7 +6871,7 @@
             "title": "Title"
           },
           "todos": {
-            "description": "Current Claude Code todo list items for `omnigent claude` sessions, as raw dicts from Claude's todo JSON file. Each dict has `content`, `status`, and `activeForm` keys. Empty list for non-claude-native sessions or when no todos have been reported yet. Sourced from the Omnigent server's in-memory `_session_todos_cache`.",
+            "description": "Current native Plan items reported by a harness. Each has `content`, `status`, and `activeForm`. Persisted in conversation metadata; empty before the first report or after an explicit clear.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -6992,7 +7005,7 @@
         "type": "object"
       },
       "SessionSkillsEvent": {
-        "description": "Signal that a session's runner-owned skills have resolved.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` field (now cache-backed) stays the source of truth.",
+        "description": "Signal that a session's runner-owned skill discovery has settled.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache or first fails, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` and `skills_status` fields stay the source of truth.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed the menu from the session snapshot's `skills` field, which is populated by the runner-skills cache at snapshot build time.",
@@ -7330,7 +7343,7 @@
         "type": "object"
       },
       "SessionTodosEvent": {
-        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
+        "description": "Plan/TODO update from a native terminal-backed session.\n\nEmitted after an `external_session_todos` POST from a native\nharness forwarder, which captures structured Plan updates from\nClaude or Codex and forwards them to the Omnigent server. Lets web\nrender a live todo panel in the right column without polling.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -7351,7 +7364,7 @@
             "title": "Sequence Number"
           },
           "todos": {
-            "description": "Current todo items read from Claude's todo file. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, the gerund form) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is populated by `_session_todos_cache` at snapshot build time.",
+            "description": "Current native Plan/TODO items from a harness. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, display activity) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is restored from persisted metadata at snapshot build time.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -11206,6 +11219,59 @@
           }
         },
         "summary": "Update Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent-title": {
+      "post": {
+        "description": "Apply title requirements to an agent proposal before a guarded rename.",
+        "operationId": "rename_session_from_agent_v1_sessions__session_id__agent_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Session From Agent",
         "tags": [
           "sessions"
         ]

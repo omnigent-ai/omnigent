@@ -18,6 +18,7 @@ import {
   ENTER_KEY,
   Kbd,
   MOD_KEY,
+  SHIFT_KEY,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -70,6 +71,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Start a new session", keys: [MOD_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
+      { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
@@ -79,6 +81,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Open model picker", keys: [MOD_KEY, SHIFT_KEY, "M"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],

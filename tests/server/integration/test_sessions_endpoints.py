@@ -2118,6 +2118,76 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert "malformed skill resolution" in resp.json()["error"]["message"]
 
 
+async def test_skill_slash_command_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner ``session_agent_missing`` on ``/skills/resolve`` surfaces as a
+    typed 410, not a 500.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session, not a server fault. The proxy re-derives the typed 410 from the
+    runner body's error code with a client-safe message that never leaks the
+    internal resolver text or the raw agent id.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Return a typed 410 for resolve; 202 otherwise."""
+        if request.url.path.endswith("/skills/resolve"):
+            return httpx.Response(
+                410,
+                json={
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(session_id: str, runner_router: object) -> httpx.AsyncClient:
+        """Resolve every session to the fake runner."""
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(
+            client,
+            name="skill-agent-gone",
+            skills=[{"name": "grill-me", "description": "Stress-test a plan.", "content": "Ask."}],
+        )
+        session = await _create_session(client, agent["id"])
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "slash_command",
+                "data": {"kind": "skill", "name": "grill-me", "arguments": ""},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert resp.status_code == 410, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
+
+
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -8589,70 +8659,54 @@ async def test_post_external_session_todos_updates_snapshot(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``external_session_todos`` persists the list in the in-memory cache so
+    ``external_session_todos`` persists the list so
     the snapshot returned by GET /v1/sessions/{id} reflects it.
 
     The root bug this tests: ``_EXTERNAL_SESSION_TODOS_TYPE`` was missing
     from ``_ALLOWED_EVENT_TYPES``, so every POST was rejected with a 400
-    before ``_handle_external_session_todos`` could populate the cache.
+    before ``_handle_external_session_todos`` could update the snapshot.
     As a result the snapshot always returned ``todos: []`` even when
     Claude had active tasks.
     """
-    from omnigent.server.routes import sessions as sessions_module
-
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    sessions_module._session_todos_cache.pop(session["id"], None)
 
     todos = [
         {"content": "Do something", "status": "in_progress", "activeForm": "Doing it"},
     ]
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={"type": "external_session_todos", "data": {"todos": todos}},
-        )
-        assert resp.status_code in (200, 202), resp.text
-
-        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-        # The snapshot todos field must match exactly what was posted.
-        # A failure here means _session_todos_cache was not populated (the
-        # original bug), or the snapshot builder ignores the cache.
-        assert snapshot["todos"] == todos
-    finally:
-        sessions_module._session_todos_cache.pop(session["id"], None)
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_todos", "data": {"todos": todos}},
+    )
+    assert resp.status_code in (200, 202), resp.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["todos"] == todos
 
 
 async def test_post_external_session_todos_empty_list_clears_snapshot(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    An empty ``todos`` list is valid and overwrites the previous cache entry.
+    An empty ``todos`` list is valid and overwrites the persisted snapshot.
 
     Claude posts an empty list when all tasks are done. The panel should
     disappear (renders nothing on empty); the snapshot must reflect the
     cleared list so a page refresh also shows the empty state.
     """
-    from omnigent.server.routes import sessions as sessions_module
-
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    sessions_module._session_todos_cache[session["id"]] = [
-        {"content": "Old task", "status": "pending", "activeForm": "Doing it"}
-    ]
-
-    try:
+    old_todos = [{"content": "Old task", "status": "pending", "activeForm": "Doing it"}]
+    for todos in (old_todos, []):
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
-            json={"type": "external_session_todos", "data": {"todos": []}},
+            json={"type": "external_session_todos", "data": {"todos": todos}},
         )
         assert resp.status_code in (200, 202), resp.text
-
-        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-        # Empty list must replace the previous cache entry, not be ignored.
-        assert snapshot["todos"] == []
-    finally:
-        sessions_module._session_todos_cache.pop(session["id"], None)
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_todos", "data": {"todos": old_todos * 101}},
+    )
+    assert rejected.status_code == 400
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["todos"] == []
 
 
 async def test_post_external_session_todos_rejects_missing_todos(
@@ -8681,8 +8735,8 @@ async def test_post_external_session_todos_rejects_non_list_todos(
     """
     A non-list ``data.todos`` value is rejected with a 400.
 
-    The handler asserts ``isinstance(todos, list)`` before caching;
-    a dict or string would corrupt the cache and produce a malformed
+    The handler asserts ``isinstance(todos, list)`` before persistence;
+    a dict or string would corrupt the snapshot and produce a malformed
     ``session.todos`` SSE payload downstream.
     """
     agent = await create_test_agent(client)
@@ -8701,7 +8755,7 @@ async def test_post_external_session_todos_filters_malformed_items(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Individual malformed todo items are dropped before caching / broadcast.
+    Individual malformed todo items are dropped before persistence / broadcast.
 
     The top-level payload is a valid list (so this is not the 400-rejection
     path), but ``_handle_external_session_todos`` keeps only items with a
@@ -8710,8 +8764,6 @@ async def test_post_external_session_todos_filters_malformed_items(
     applies on the live path, so a buggy forwarder version can't poison the
     snapshot or the in-chat Plan tracker with half-formed entries.
     """
-    from omnigent.server.routes import sessions as sessions_module
-
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
@@ -8719,8 +8771,6 @@ async def test_post_external_session_todos_filters_malformed_items(
     )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    sessions_module._session_todos_cache.pop(session["id"], None)
-
     good = {"content": "Real task", "status": "in_progress", "activeForm": "Doing it"}
     todos = [
         good,
@@ -8730,23 +8780,16 @@ async def test_post_external_session_todos_filters_malformed_items(
         "not-a-dict",
         {"status": "pending", "activeForm": "x"},  # missing content
     ]
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={"type": "external_session_todos", "data": {"todos": todos}},
-        )
-        assert resp.status_code in (200, 202), resp.text
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_todos", "data": {"todos": todos}},
+    )
+    assert resp.status_code in (200, 202), resp.text
 
-        # Only the well-formed item survives — on both the live SSE channel
-        # and the cached snapshot the tracker reads on bind.
-        todo_events = [ev for _sid, ev in published if ev.get("type") == "session.todos"]
-        assert len(todo_events) == 1
-        assert todo_events[0]["todos"] == [good]
-
-        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-        assert snapshot["todos"] == [good]
-    finally:
-        sessions_module._session_todos_cache.pop(session["id"], None)
+    todo_events = [ev for _sid, ev in published if ev.get("type") == "session.todos"]
+    assert len(todo_events) == 1
+    assert todo_events[0]["todos"] == [good]
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["todos"] == [good]
 
 
 async def test_post_external_mcp_startup_publishes_session_mcp_startup(
@@ -9611,8 +9654,11 @@ async def test_patch_collaboration_mode_persists_label_and_forwards_event(
     plan_forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(plan_forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert plan_forwards[0].body == {"type": "plan_mode_change", "enabled": True}
-    assert [event["type"] for _, event in published] == ["session.collaboration_mode"]
-    assert published[0][1]["mode"] == "plan"
+    mode_events = [
+        event for _, event in published if event["type"] == "session.collaboration_mode"
+    ]
+    assert len(mode_events) == 1
+    assert mode_events[0]["mode"] == "plan"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
@@ -9691,7 +9737,10 @@ async def test_patch_collaboration_mode_requires_live_runner_before_persisting(
     assert resp.status_code == 503, resp.text
     assert "Could not enter Plan mode" in resp.text
     assert "omnigent.codex_native.collaboration_mode" not in snapshot["labels"]
-    assert published == []
+    mode_events = [
+        event for _, event in published if event["type"] == "session.collaboration_mode"
+    ]
+    assert mode_events == []
     if runner_status is None:
         assert captured == []
     else:
@@ -9792,8 +9841,11 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         "type": "codex_approval_mode_change",
         "approval_mode": "full-access",
     }
-    assert [event["type"] for _, event in published] == ["session.codex_approval_mode"]
-    assert published[0][1]["approval_mode"] == "full-access"
+    mode_events = [
+        event for _, event in published if event["type"] == "session.codex_approval_mode"
+    ]
+    assert len(mode_events) == 1
+    assert mode_events[0]["approval_mode"] == "full-access"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
@@ -9861,7 +9913,10 @@ async def test_patch_approval_mode_requires_live_runner_before_persisting(
     assert resp.status_code == 503, resp.text
     assert "Could not switch to full-access approval mode" in resp.text
     assert "omnigent.codex_native.approval_mode" not in snapshot["labels"]
-    assert published == []
+    mode_events = [
+        event for _, event in published if event["type"] == "session.codex_approval_mode"
+    ]
+    assert mode_events == []
 
 
 async def test_patch_approval_mode_rejects_non_codex_session(

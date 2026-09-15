@@ -31,6 +31,7 @@ from rich.console import Console
 from rich.table import Table
 
 from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
+from omnigent._startup_events import capture_cli_entry
 from omnigent.cli_common import (
     RESUME_PICKER_SENTINEL as _RESUME_PICKER_SENTINEL,
 )
@@ -2202,6 +2203,7 @@ def _ensure_stdio_survives_unencodable_output() -> None:
                 reconfigure(errors="replace")
 
 
+@capture_cli_entry
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.

@@ -555,7 +555,10 @@ class TestConstructor(unittest.TestCase):
         # Proves the selector is --profile, not --host. A regression to --host
         # makes a two-profiles-one-host workspace yield an empty token → 401.
         self.assertIn('databricks auth token --profile "oss"', helper)
-        self.assertNotIn("--host", helper)
+        # Scope to the CLI mint: it selects by --profile. The sdk fallback
+        # separately passes --host for its own workspace guard (identity is
+        # still pinned by --profile), so assert on the mint, not the whole helper.
+        self.assertNotIn("databricks auth token --host", helper)
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
         # stays behind a `--help` capability probe — an older CLI rejects the
         # unknown flag and yields an empty token → silent 401.

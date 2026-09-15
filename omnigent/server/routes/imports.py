@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
@@ -188,7 +189,9 @@ class _ImportLockEntry:
     users: int = 0
 
 
-_IMPORT_LOCKS: dict[tuple[ImportSource, str], _ImportLockEntry] = {}
+_IMPORT_LOCKS: WorkspaceScopedCache[tuple[ImportSource, str], _ImportLockEntry] = (
+    WorkspaceScopedCache()
+)
 _IMPORT_LOCKS_GUARD = threading.Lock()
 
 

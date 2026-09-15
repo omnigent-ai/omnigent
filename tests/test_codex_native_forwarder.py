@@ -1052,18 +1052,19 @@ def test_forward_failures_escalate_to_degraded_once() -> None:
     re-fire per dropped item.
     """
     fwd._reset_forward_health()
+    result = fwd._PostResult(response=None, transport_error="ConnectError")
 
     for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD - 1):
-        fwd._note_forward_failure("external_output_text_delta")
+        fwd._note_forward_failure("external_output_text_delta", result, "conv_x")
     # Below threshold: not yet degraded.
     assert fwd._forward_health.degraded_logged is False
 
-    fwd._note_forward_failure("external_output_text_delta")  # crosses threshold
+    fwd._note_forward_failure("external_output_text_delta", result, "conv_x")  # crosses threshold
     assert fwd._forward_health.degraded_logged is True
     assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD
 
     # The latch holds — further failures keep counting but don't re-escalate.
-    fwd._note_forward_failure("external_output_text_delta")
+    fwd._note_forward_failure("external_output_text_delta", result, "conv_x")
     assert fwd._forward_health.degraded_logged is True
     assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD + 1
 
@@ -1075,8 +1076,9 @@ def test_forward_success_resets_degraded_state() -> None:
     Recovery must re-arm the indicator so a later outage escalates again.
     """
     fwd._reset_forward_health()
+    result = fwd._PostResult(response=None, transport_error="ConnectError")
     for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD):
-        fwd._note_forward_failure("external_session_usage")
+        fwd._note_forward_failure("external_session_usage", result, "conv_x")
     assert fwd._forward_health.degraded_logged is True
 
     fwd._note_forward_success()
@@ -2136,6 +2138,52 @@ class _RaisingPostClient:
         raise self._exc
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["http", "connect", "ambiguous"])
+async def test_degraded_log_records_post_failure_classification(
+    failure: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A degraded period records its latest delivery outcome without copying the payload."""
+    fwd._reset_forward_health()
+    request = httpx.Request("POST", "https://example.test/events?secret=private")
+    client = (
+        _StatusClient(403)
+        if failure == "http"
+        else _RaisingPostClient(
+            httpx.ConnectError("private connection detail", request=request)
+            if failure == "connect"
+            else httpx.ReadTimeout("private timeout detail", request=request)
+        )
+    )
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD + 1):
+        await fwd._post_session_event(
+            client,
+            "conv_failed_post",
+            event_type="external_conversation_item",
+            data={"body": "private transcript"},
+            max_attempts=1,
+        )
+    records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "codex_forward_sync_degraded"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.session_id == "conv_failed_post"
+    assert record.attributes == {
+        "http_status": 403 if failure == "http" else None,
+        "transport_error": None
+        if failure == "http"
+        else "ConnectError"
+        if failure == "connect"
+        else "ReadTimeout",
+        "delivered_ambiguous": failure == "ambiguous",
+    }
+    assert "private" not in record.getMessage()
+    assert record.exc_info is None
+
+
 class _SequencedPostClient:
     """Return or raise configured POST outcomes in order."""
 
@@ -2787,11 +2835,11 @@ async def test_post_session_event_dead_letters_records_http_status(
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
+async def test_replay_dead_letters_before_resume_reposts_proven_undelivered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    On startup, a proven-undelivered record is re-POSTed and removed (#1579).
+    Before resume, a proven-undelivered record is re-POSTed and removed (#1579).
 
     :param tmp_path: Pytest temp dir standing in for the bridge dir.
     :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
@@ -2824,7 +2872,7 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
         )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _ok_inner)
-    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+    await fwd._replay_dead_letters_before_resume(MagicMock(), tmp_path)
 
     assert len(posted) == 1
     assert posted[0]["session_id"] == "conv_codex1"
@@ -2839,11 +2887,11 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_on_startup_skips_ambiguous(
+async def test_replay_dead_letters_before_resume_skips_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    On startup, an ambiguous record is never re-POSTed and is retained (#1579).
+    Before resume, an ambiguous record is never re-POSTed and is retained (#1579).
 
     :param tmp_path: Pytest temp dir standing in for the bridge dir.
     :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
@@ -2867,7 +2915,7 @@ async def test_replay_dead_letters_on_startup_skips_ambiguous(
         )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _inner)
-    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+    await fwd._replay_dead_letters_before_resume(MagicMock(), tmp_path)
 
     assert called is False
     # Ambiguous record retained as a forensic record.

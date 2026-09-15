@@ -245,8 +245,14 @@ class TestCodexExecutor(unittest.TestCase):
                 for override in executor._codex_config_overrides
             )
         )
+        # Scope to the CLI mint: it selects by --profile. The sdk fallback
+        # separately passes --host for its own workspace guard (identity is
+        # still pinned by --profile), so assert on the mint, not the overrides.
         self.assertFalse(
-            any("--host" in override for override in executor._codex_config_overrides)
+            any(
+                "databricks auth token --host" in override
+                for override in executor._codex_config_overrides
+            )
         )
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
         # stays behind a `--help` capability probe — an older CLI rejects the

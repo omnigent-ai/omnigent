@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerPrLink } from "./ComposerPrLink";
+import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 
 afterEach(cleanup);
 
@@ -21,7 +22,16 @@ describe("ComposerPrLink", () => {
     render(<ComposerPrLink prCount={1} prNumber={42} onOpen={onOpen} />);
     const link = screen.getByTestId("composer-pr-link");
     expect(link).toHaveTextContent("#42");
+    expect(link).toHaveClass("text-sm", "gap-1", "min-w-0");
+    expect(link).not.toHaveClass("shrink-0");
+    expect(link.querySelector("svg")).toHaveClass("shrink-0");
+    expect(screen.getByText("#42")).toHaveClass("truncate");
+    expect(screen.getByText("#42")).toHaveAttribute("title", "#42");
     expect(link).toHaveAttribute("title", "View this PR in the GitHub tab");
+    expect(link).toHaveAccessibleName("#42");
+    // A trigger for the bar's collapse, but never hidden by it.
+    expect(screen.getByText("#42")).toHaveAttribute("data-workspace-collapse-label");
+    expect(screen.getByText("#42")).not.toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
     fireEvent.click(link);
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
@@ -30,6 +40,8 @@ describe("ComposerPrLink", () => {
     render(<ComposerPrLink prCount={3} prNumber={42} onOpen={() => {}} />);
     const link = screen.getByTestId("composer-pr-link");
     expect(link).toHaveTextContent("3 PRs");
+    expect(link).toHaveClass("text-sm", "gap-1");
     expect(link).toHaveAttribute("title", "View these PRs in the GitHub tab");
+    expect(screen.getByText("3 PRs")).toHaveAttribute("title", "3 PRs");
   });
 });

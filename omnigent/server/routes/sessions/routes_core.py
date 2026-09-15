@@ -69,6 +69,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
@@ -186,6 +187,7 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionResponse,
     SessionSwitchAgentRequest,
+    SessionTodosEvent,
     UpdateSessionRequest,
 )
 from omnigent.stores import AgentStore, ConversationStore
@@ -217,6 +219,23 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+
+async def _reset_runner_and_clear_todos_after_switch(
+    session_id: str, conversation_store: ConversationStore
+) -> None:
+    """Finish retiring the old runner, then clear and broadcast its Plan."""
+    try:
+        await _reset_runner_resources_after_switch(session_id)
+    finally:
+        # Connected clients keep the old agent's Plan until teardown finishes, so
+        # clear after: a late old-runner Plan POST cannot survive this clear.
+        cleared = await asyncio.to_thread(conversation_store.set_session_todos, session_id, [])
+        if cleared:
+            from omnigent.server.routes import sessions as facade
+
+            event = SessionTodosEvent(type="session.todos", conversation_id=session_id, todos=[])
+            facade.session_stream.publish(session_id, event.model_dump())
 
 
 def register_core_routes(
@@ -516,7 +535,7 @@ def register_core_routes(
     )
     async def create_session(
         request: Request,
-    ) -> SessionResponse | CreatedSessionResponse | dict[str, Any]:
+    ) -> SessionResponse | CreatedSessionResponse:
         """
         Create a session.
 
@@ -539,18 +558,11 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            result, project_warnings = await _create_bundled_session_from_multipart(
-                request, user_id
-            )
+            result = await _create_bundled_session_from_multipart(request, user_id)
             # Surface the freshly-minted session id (the request path has no
             # {session_id} on create); the middleware promotes a bag session_id
             # to the audit row's session_id column.
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
-            if project_warnings:
-                return {
-                    **result.model_dump(mode="json"),
-                    "warnings": list(project_warnings),
-                }
             return result
 
         try:
@@ -584,7 +596,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
-        resp, project_warnings = await _create_session_from_existing_agent(
+        resp = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -720,17 +732,12 @@ def register_core_routes(
                 resp.host_id = launch_host_id
 
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
-        if project_warnings:
-            return {
-                **resp.model_dump(mode="json"),
-                "warnings": list(project_warnings),
-            }
         return resp
 
     async def _create_bundled_session_from_multipart(
         request: Request,
         user_id: str | None,
-    ) -> tuple[CreatedSessionResponse, tuple[dict[str, str], ...]]:
+    ) -> CreatedSessionResponse:
         """
         Handle multipart ``POST /v1/sessions`` with inline agent upload.
 
@@ -887,7 +894,7 @@ def register_core_routes(
                 workspace=parsed_metadata.workspace,
                 harness=canonicalize_harness(raw_harness) or raw_harness,
             )
-        return result, project_resolution.warnings
+        return result
 
     # ── GET /sessions/projects ────────────────────────────────────
     #
@@ -1825,6 +1832,55 @@ def register_core_routes(
     )
 
     # ── PATCH /sessions/{session_id} ────────────────────────────
+
+    @router.post(
+        "/sessions/{session_id}/agent-title",
+        response_model=AutomaticSessionRenameResponse,
+    )
+    async def rename_session_from_agent(
+        request: Request,
+        session_id: str,
+        body: AutomaticSessionRenameRequest,
+    ) -> AutomaticSessionRenameResponse:
+        """Apply title requirements to an agent proposal before a guarded rename."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.parent_conversation_id is not None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="not_top_level")
+
+        title = " ".join(body.title.split())
+        if "\n" in body.title or "\r" in body.title or len(title) < 2:
+            raise OmnigentError(
+                "title must be a single non-empty line",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if background_title_coordinator is not None:
+            title = await background_title_coordinator.format_agent_title(
+                BackgroundTitleRequest(
+                    session_id=session_id,
+                    prompt=title,
+                    agent_id=conv.agent_id,
+                    harness_override=conv.harness_override,
+                    model_override=conv.model_override,
+                    sub_agent_name=conv.sub_agent_name,
+                )
+            )
+            if title is None:
+                return AutomaticSessionRenameResponse(renamed=False, reason="generation_failed")
+        updated = await asyncio.to_thread(
+            conversation_store.rename_conversation_if_title_matches,
+            session_id,
+            conv.title or "",
+            title,
+        )
+        if updated is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.post(
         "/sessions/{session_id}/auto-title",
@@ -2839,10 +2895,7 @@ def register_core_routes(
 
         # Keep the fork filed in the source's first-class project, but route
         # that inherited (not caller-requested) decision through the same
-        # ownership/default chokepoint as a direct create. The fork never asked
-        # for a project, so a source whose agent mismatches its project emits
-        # no warnings here and is never strict-rejected — the mismatch belongs
-        # to the source session, not this request. Forks do not inherit
+        # ownership/default chokepoint as a direct create. Forks do not inherit
         # workspace or worktree settings, so explicit nulls preserve those fork
         # semantics. A shared source's foreign project retains the historical
         # terminal behavior: silently leave the fork unfiled.
@@ -2871,7 +2924,6 @@ def register_core_routes(
                 body=fork_create_body,
                 user_id=user_id,
                 project_store=project_store,
-                warn_on_mismatch=False,
             )
         except OmnigentError as exc:
             if source.project_id is None or exc.code != ErrorCode.NOT_FOUND:
@@ -3203,7 +3255,9 @@ def register_core_routes(
         # (doing it mid-turn would wedge the turn); the next access
         # re-materializes from the new agent's spec, preserving the workspace /
         # worktree (cwd comes from the runner workspace).
-        background_tasks.add_task(_reset_runner_resources_after_switch, session_id)
+        background_tasks.add_task(
+            _reset_runner_and_clear_todos_after_switch, session_id, conversation_store
+        )
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
         level = await _get_permission_level(user_id, session_id, permission_store)

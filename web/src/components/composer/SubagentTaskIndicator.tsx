@@ -78,7 +78,7 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
             size="xs"
             data-testid="subagent-task-pill"
             aria-label={countLabel}
-            className="shrink-0"
+            className="shrink-0 px-0 md:px-2"
           >
             <BotIcon className="size-3.5" aria-hidden="true" />
             {count}

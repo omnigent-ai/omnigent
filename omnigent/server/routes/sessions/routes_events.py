@@ -21,6 +21,7 @@ from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
@@ -243,10 +244,13 @@ from omnigent.util.session_lifecycle import (
     is_session_closed,
 )
 
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
-_retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+_retry_recovery_tasks: WorkspaceScopedCache[str, asyncio.Task[dict[str, bool | str]]] = (
+    WorkspaceScopedCache()
+)
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is
@@ -1455,6 +1459,7 @@ def register_events_routes(
                 session_id,
                 status,
                 status_error,
+                failure_origin="external_session_status",
                 response_id=response_id,
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
@@ -1585,6 +1590,7 @@ def register_events_routes(
                 session_id,
                 body,
                 conversation_store,
+                conv,
             )
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_CHANGE_TYPE:
@@ -1639,7 +1645,7 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            _handle_external_session_todos(session_id, body)
+            await _handle_external_session_todos(session_id, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id = await _persist_external_subagent_start(

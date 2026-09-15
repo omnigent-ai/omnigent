@@ -54,6 +54,7 @@ describe("SubagentTaskIndicator", () => {
     render(<SubagentTaskIndicator conversationId="conv-1" />);
     const pill = screen.getByTestId("subagent-task-pill");
     expect(pill).toHaveTextContent("1");
+    expect(pill).toHaveClass("px-0", "md:px-2");
     expect(pill).toHaveAttribute("aria-label", "1 sub-agent running");
   });
 

@@ -67,6 +67,18 @@ describe("ComposerConfigSections", () => {
     expect(screen.getByTestId("efforts-high")).toBeInTheDocument();
   });
 
+  it("omits the leading separator for a standalone effort submenu", () => {
+    renderSections({
+      efforts: {
+        testId: "efforts",
+        header: "Effort",
+        choices: [{ key: "high", label: "High", checked: true }],
+      },
+    });
+    expect(screen.getByRole("menuitemcheckbox", { name: "High" })).toBeVisible();
+    expect(screen.queryByRole("separator")).toBeNull();
+  });
+
   it("dispatches a choice's onSelect through the checkbox change handler", () => {
     const onSelect = vi.fn();
     renderSections({
