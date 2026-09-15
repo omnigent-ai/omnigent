@@ -6756,8 +6756,6 @@ def _explain_driver(store: SqlAlchemyConversationStore, statement: str, paramete
     Returns the plan as one string: PostgreSQL JSON, or SQLite's
     ``EXPLAIN QUERY PLAN`` rows joined.
     """
-    import json
-
     dialect = store._conv_engine.dialect.name
     with store._conv_session("test_setup") as session:
         conn = session.connection()
@@ -6774,8 +6772,6 @@ def _explain_driver(store: SqlAlchemyConversationStore, statement: str, paramete
 
 def _explain_json(store: SqlAlchemyConversationStore, sql: str, analyze: bool = False) -> str:
     """Return a PostgreSQL plan for *sql* as a JSON string (ANALYZE first)."""
-    import json
-
     from sqlalchemy import text as sql_text
 
     with store._conv_session("test_setup") as session:
@@ -7071,8 +7067,6 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
         return _explain_driver(conversation_store, statement, parameters)
 
     def _index_conds_and_filtered(plan: str) -> tuple[list[str], list[int]]:
-        import json as _json
-
         flat: list[dict[str, object]] = []
 
         def _walk(node: dict[str, object]) -> None:
@@ -7080,7 +7074,7 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
             for child in node.get("Plans", []) or []:
                 _walk(child)
 
-        for entry in _json.loads(plan):
+        for entry in json.loads(plan):
             _walk(entry["Plan"])
         return (
             [str(n.get("Index Cond", "")) for n in flat if "Index Cond" in n],
