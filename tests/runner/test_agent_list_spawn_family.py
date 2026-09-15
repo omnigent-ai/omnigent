@@ -158,6 +158,26 @@ async def test_routed_session_with_subagent_routing_off_sees_every_family() -> N
 
 
 @pytest.mark.asyncio
+async def test_subagent_switch_without_smart_routing_sees_every_family() -> None:
+    # A bundle session may route its spawns with Smart Routing off; those
+    # spawns go through session-create, which serves any family. The create
+    # gate answers the same, so the listing must not hide anything here.
+    remember_session_routing_class("conv_parent", SessionRoutingClass())
+    seen: list[str] = []
+    listing = await _agent_list(
+        {
+            "id": "conv_parent",
+            "harness": "codex-native",
+            "subagent_routing_override": "on",
+            "labels": {},
+        },
+        seen,
+    )
+    assert _names(listing) == ["claude-code", "codex", "pi", "mystery"]
+    assert "/v1/sessions/conv_parent" not in seen
+
+
+@pytest.mark.asyncio
 async def test_unreadable_session_leaves_the_listing_alone() -> None:
     remember_session_routing_class("conv_parent", _PINNED)
     seen: list[str] = []
