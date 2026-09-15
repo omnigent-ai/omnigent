@@ -183,6 +183,7 @@ async def test_first_message_schedules_background_semantic_title(
     async def get_runner_client(
         _session_id: str,
         _runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         return fake_runner
 
@@ -252,6 +253,7 @@ async def test_create_titled_session_keeps_title_after_first_message(
     async def get_runner_client(
         _session_id: str,
         _runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         return fake_runner
 
@@ -320,6 +322,7 @@ async def test_sidebar_rename_wins_in_flight_background_title(
     async def get_runner_client(
         _session_id: str,
         _runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         return fake_runner
 
@@ -393,6 +396,7 @@ async def test_background_title_failure_does_not_break_subsequent_user_turn(
     async def get_runner_client(
         _session_id: str,
         _runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         return fake_runner
 
@@ -463,6 +467,7 @@ async def test_initial_item_schedules_background_semantic_title(
     async def get_runner_client(
         _session_id: str,
         _runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         return fake_runner
 
@@ -1891,6 +1896,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         """
         Resolve every session to the fake runner client.
@@ -2023,6 +2029,7 @@ async def test_skill_slash_command_keeps_existing_title(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         """
         Resolve every session to the fake runner client.
@@ -2090,7 +2097,9 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
         base_url="http://runner",
     )
 
-    async def _fake_get_runner_client(session_id: str, runner_router: object) -> httpx.AsyncClient:
+    async def _fake_get_runner_client(
+        session_id: str, runner_router: object, **_kwargs: Any
+    ) -> httpx.AsyncClient:
         """Resolve every session to the fake runner."""
         del session_id, runner_router
         return fake_runner
@@ -4668,6 +4677,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     async def _get_runner_client(
         _session_id: str,
         _runner_router: Any,
+        **_kwargs: Any,
     ) -> _RecoveringRunnerClient:
         """
         Return the recovering runner client for the patched session.
@@ -4783,6 +4793,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         """
         Resolve the session to the fake runner client.
@@ -4894,6 +4905,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         """
         Resolve the session to the fake runner client.
@@ -5097,6 +5109,7 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         """
         Resolve every session to the fake runner client.
@@ -9423,6 +9436,7 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
         del session_id, runner_router
@@ -9480,6 +9494,7 @@ async def test_interrupt_forward_success_keeps_stop_fence(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         """Resolve every session to the accepting fake runner."""
         del session_id, runner_router
@@ -11261,6 +11276,7 @@ async def test_message_forward_failure_surfaces_runner_unavailable(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient | None:
         del session_id, runner_router
         return fake_runner
@@ -11322,6 +11338,7 @@ async def test_message_forward_rejection_surfaces_failed_with_reason(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient | None:
         del session_id, runner_router
         return fake_runner
