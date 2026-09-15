@@ -8509,7 +8509,10 @@ async def _claude_native_terminal_arrives_via_transfer(
     # Fresh bridge, or the new session is already active — nothing transfers in.
     if active_session_id is None or active_session_id == session_id:
         return False
-    return terminal_registry.get(active_session_id, "claude", "main") is not None
+    # A registered-but-dead terminal can't transfer in (transfer_terminal
+    # skips non-running entries), so it must not suppress auto-create.
+    instance = terminal_registry.get(active_session_id, "claude", "main")
+    return instance is not None and instance.running
 
 
 async def _antigravity_native_terminal_arrives_via_transfer(
@@ -8562,7 +8565,10 @@ async def _antigravity_native_terminal_arrives_via_transfer(
     # Fresh bridge, or the new session is already active — nothing transfers in.
     if state is None or state.session_id == session_id:
         return False
-    return terminal_registry.get(state.session_id, "antigravity", "main") is not None
+    # A registered-but-dead terminal can't transfer in (transfer_terminal
+    # skips non-running entries), so it must not suppress auto-create.
+    instance = terminal_registry.get(state.session_id, "antigravity", "main")
+    return instance is not None and instance.running
 
 
 async def _codex_native_terminal_arrives_via_transfer(
@@ -8617,7 +8623,10 @@ async def _codex_native_terminal_arrives_via_transfer(
     # Fresh bridge, or the new session is already active — nothing transfers in.
     if state is None or state.session_id == session_id:
         return False
-    return terminal_registry.get(state.session_id, "codex", "main") is not None
+    # A registered-but-dead terminal can't transfer in (transfer_terminal
+    # skips non-running entries), so it must not suppress auto-create.
+    instance = terminal_registry.get(state.session_id, "codex", "main")
+    return instance is not None and instance.running
 
 
 _SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS = 1.0
