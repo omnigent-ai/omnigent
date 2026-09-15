@@ -45,6 +45,7 @@ from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.server.ask_user_question import structured_ask_user_question
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
@@ -196,6 +197,15 @@ class ExecutorAdapter(HarnessApp):
         ):
             executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
                 self._stable_elicitation_choice_handler
+            )
+        # The claude-sdk executor also accepts an AskUserQuestion bridge that
+        # renders the question as a clickable form and feeds selections back;
+        # other executors don't define the attribute.
+        if (
+            hasattr(executor, "_ask_question_handler") and executor._ask_question_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._ask_question_handler = (  # type: ignore[attr-defined]
+                self._stable_ask_question_handler
             )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
@@ -678,6 +688,59 @@ class ExecutorAdapter(HarnessApp):
             return None
         answer = (result.content or {}).get("answer")
         return answer if isinstance(answer, str) else None
+
+    async def _stable_ask_question_handler(
+        self,
+        tool_input: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Stable bridge for a claude-sdk ``AskUserQuestion`` tool call.
+
+        Surfaces the tool's questions as a clickable elicitation form (the
+        ``ask_user_question`` extra the web UI renders) and, on accept, returns
+        the tool input with the user's selections merged under ``answers`` —
+        the shape Claude Code expects so it skips its own picker and returns
+        those selections as the tool result. Returns ``None`` to fall back to
+        Claude's native handling (declined, no active turn, or input that
+        carries no usable questions structure).
+
+        Reads ``_current_ctx`` at call time, mirroring
+        :meth:`_stable_elicitation_handler`.
+        """
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error(
+                "ask-question callback fired with no active turn context; "
+                "falling back to Claude's native handling",
+            )
+            return None
+        ask_payload = structured_ask_user_question(tool_input)
+        if ask_payload is None:
+            # No usable questions structure — let Claude handle it natively.
+            return None
+        try:
+            preview = json.dumps(tool_input, ensure_ascii=False)
+        except (TypeError, ValueError):
+            preview = repr(tool_input)
+        preview = preview[:300]
+        label = self._harness_label
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        params = ElicitationRequestParams(
+            mode="form",
+            message=f"{label} wants to call **AskUserQuestion**",
+            requestedSchema=None,
+            url=None,
+            phase="pre_tool_use",
+            policy_name=f"{label.lower()}_sdk_permission",
+            content_preview=f"AskUserQuestion({preview})",
+            ask_user_question=ask_payload,
+        )
+        result = await ctx.elicit(elicitation_id, params)
+        # Accept + MCP-shaped answers -> feed selections back via the tool
+        # input's ``answers`` field (same shape the native path builds at
+        # routes_hooks.py). Anything else falls back to native handling.
+        if result.action == "accept" and isinstance(result.content, dict) and result.content:
+            return {**tool_input, "answers": result.content}
+        return None
 
     async def _stable_policy_evaluator(
         self,
