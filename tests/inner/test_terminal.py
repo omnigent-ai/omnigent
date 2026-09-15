@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -194,6 +195,162 @@ def test_tmux_unavailable_error_log_carries_the_cause(
     assert "no server running" in message  # has-session stderr → whole-server death
     assert "since web client interaction" in message
     assert "Traceback" in message  # last pane tail carried into the exit log
+
+
+def test_tmux_gone_diagnostics_reports_socket_survival_and_age(tmp_path: Path) -> None:
+    """Whether the socket file outlived its server, and how old the terminal was.
+
+    A missing socket means the private directory was removed (a teardown, or a
+    temp-dir reaper); a present one means the server process died beneath it.
+    """
+    socket_path = tmp_path / "tmux.sock"
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert "socket file gone" in instance._tmux_gone_diagnostics()
+
+    socket_path.touch()
+    instance._launched_at = time.monotonic() - 4000
+    instance._recovered_capture_failures = 6
+    summary = instance._tmux_gone_diagnostics()
+    assert "socket file still present" in summary
+    assert "terminal age: 4000s" in summary
+    assert "6 earlier probe failures recovered" in summary
+
+
+def test_tmux_gone_diagnostics_omits_unmeasured_signals(tmp_path: Path) -> None:
+    """Signals with nothing to report stay out rather than logging zeroes."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    summary = instance._tmux_gone_diagnostics()
+    assert "terminal age" not in summary
+    assert "probe failures recovered" not in summary
+    assert "host stopped running" not in summary
+
+
+def test_poll_clock_gap_records_a_host_that_stopped_running(tmp_path: Path) -> None:
+    """A suspended host is measured as wall clock outrunning the monotonic one."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    # A poll whose wall clock advanced ~90 minutes while the monotonic clock
+    # barely moved: the machine was asleep in between.
+    instance._note_poll_clock_gap(time.time() - 5400.0, time.monotonic())
+    summary = instance._tmux_gone_diagnostics()
+    assert "host stopped running for ~5400s" in summary
+    assert "(suspend or clock step)" in summary
+
+    # A second absence reports itself, not the earlier larger one: the value and
+    # its timestamp must describe the same gap, and the gap that matters is the
+    # one directly before the exit. The earlier one is still counted.
+    instance._note_poll_clock_gap(time.time() - 30.0, time.monotonic())
+    assert instance._watch_clock_gap_s == pytest.approx(30.0, abs=1.0)
+    summary = instance._tmux_gone_diagnostics()
+    assert "host stopped running for ~30s" in summary
+    assert "1 earlier)" in summary
+
+
+def test_poll_clock_gap_ignores_ordinary_scheduling_delay(tmp_path: Path) -> None:
+    """Normal poll jitter must not read as the host having gone away."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    instance._note_poll_clock_gap(time.time(), time.monotonic())
+    assert instance._watch_clock_gap_at is None
+    assert "host stopped running" not in instance._tmux_gone_diagnostics()
+
+
+def test_tmux_unavailable_log_reports_a_suspended_host(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The exit ERROR carries the suspend measurement, not just "tmux is gone".
+
+    This is the discriminator the bare log lacked: a whole-server death right
+    after the host woke up is an expected teardown, while the same message with
+    no absence recorded is a fault worth chasing.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._launched_at = time.monotonic() - 120
+    instance._note_poll_clock_gap(time.time() - 3600.0, time.monotonic())
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+    exited = threading.Event()
+
+    with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+        assert exited.wait(timeout=2.0)
+
+    unavailable = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR and "tmux unavailable after" in record.getMessage()
+    ]
+    assert unavailable, "expected a 'tmux unavailable' ERROR"
+    message = unavailable[0]
+    assert "host stopped running for ~3600s" in message
+    assert "terminal age: " in message
+    assert "socket file gone" in message
+
+
+def test_recovered_capture_failures_are_counted_for_the_exit_log(tmp_path: Path) -> None:
+    """A flapping probe that keeps recovering is visible at exit time.
+
+    The consecutive counter resets on every recovery, so without this tally the
+    exit log cannot tell a first-ever failure from the last of a long streak.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    recovered = threading.Event()
+    probes = 0
+
+    def _session_exists() -> bool:
+        nonlocal probes
+        probes += 1
+        if probes >= 3:
+            recovered.set()
+        return True
+
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = _session_exists  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(on_exit=lambda: None, poll_interval_s=0.01)
+    assert recovered.wait(timeout=2.0)
+    instance._stop_idle_watcher_thread()
+
+    assert instance._recovered_capture_failures >= 3
+    assert "earlier probe failures recovered" in instance._tmux_gone_diagnostics()
 
 
 def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path) -> None:

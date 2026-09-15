@@ -57,6 +57,33 @@ SUSPEND_POLL_INTERVAL_S = 5.0
 SUSPEND_GAP_THRESHOLD_S = 15.0
 
 
+def suspend_gap_s(
+    wall_before: float,
+    mono_before: float,
+    *,
+    wall_clock: Callable[[], float] = time.time,
+    mono_clock: Callable[[], float] = time.monotonic,
+) -> float:
+    """Seconds the machine spent suspended across one interval.
+
+    The realtime clock keeps counting while a machine sleeps and the monotonic
+    clock does not, so their divergence over the same interval is the suspended
+    time. A merely-blocked caller (a long synchronous call, a GC pause) advances
+    both equally and measures ~0, so this never mistakes a stall for a sleep.
+    See the module docstring for the platform and clock-choice caveats.
+
+    Sample both clocks *before* the interval and pass them here after it.
+
+    :param wall_before: ``time.time()`` sampled before the interval.
+    :param mono_before: ``time.monotonic()`` sampled at the same point.
+    :param wall_clock: Realtime clock reader. Injectable for tests.
+    :param mono_clock: Monotonic clock reader. Injectable for tests.
+    :returns: Approximate seconds suspended; ~0 when the machine stayed awake,
+        and negative values are possible if the realtime clock stepped back.
+    """
+    return (wall_clock() - wall_before) - (mono_clock() - mono_before)
+
+
 async def watch_for_resume(
     on_resume: Callable[[float], None],
     *,
@@ -100,7 +127,7 @@ async def watch_for_resume(
         # Re-sample per iteration (not against a fixed baseline): a resume must
         # fire exactly once, on the poll that spanned the sleep. The next poll
         # sees gap ~0 again.
-        gap = (wall_clock() - wall_before) - (mono_clock() - mono_before)
+        gap = suspend_gap_s(wall_before, mono_before, wall_clock=wall_clock, mono_clock=mono_clock)
         if gap >= threshold_s:
             _logger.info("Resumed from suspend (~%.0fs asleep); notifying", gap)
             try:
