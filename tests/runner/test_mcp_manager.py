@@ -106,6 +106,8 @@ def patch_connection(
     conns: dict[str, _FakeConn] = {}
     raise_for: dict[str, Exception] = {}
     tools_for: dict[str, list[McpToolDef]] = {}
+    instructions_for: dict[str, str] = {}
+    info_names_for: dict[str, str] = {}
 
     class _PatchedConn:
         """Standin for ``McpServerConnection`` that pulls scripted behavior from the closure."""
@@ -115,6 +117,16 @@ def patch_connection(
             self._config = config
             self._inner = _FakeConn(tools_for.get(config.name, []))
             conns[config.name] = self._inner
+
+        @property
+        def initialize_instructions(self) -> str | None:
+            """Optional InitializeResult.instructions scripted per config name."""
+            return instructions_for.get(self._config.name)
+
+        @property
+        def server_info_name(self) -> str | None:
+            """Optional InitializeResult.serverInfo.name scripted per config name."""
+            return info_names_for.get(self._config.name)
 
         async def connect(self) -> list[McpToolDef]:
             """Surface either a scripted error or the canned tool list."""
@@ -138,6 +150,8 @@ def patch_connection(
     # calling schemas_for; the closure above honors the script.
     conns["__raise_for__"] = raise_for  # type: ignore[assignment]
     conns["__tools_for__"] = tools_for  # type: ignore[assignment]
+    conns["__instructions_for__"] = instructions_for  # type: ignore[assignment]
+    conns["__info_names_for__"] = info_names_for  # type: ignore[assignment]
     return conns
 
 
@@ -169,6 +183,78 @@ async def test_partial_failure_surfaces_healthy_servers(
     assert "bad" in result.failures, "Broken server must appear in failures"
     assert "upstream down" in result.failures["bad"]
     assert "good" not in result.failures
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_surfaces_initialize_instructions(
+    patch_connection: dict[str, Any],
+) -> None:
+    """Healthy servers' InitializeResult.instructions are keyed by unique config name."""
+    patch_connection["__tools_for__"]["pipeshub"] = [_make_tool_def("chat")]
+    patch_connection["__tools_for__"]["other"] = [_make_tool_def("ping")]
+    patch_connection["__instructions_for__"]["pipeshub"] = " Prefer pipeshub_chat. "
+    patch_connection["__info_names_for__"]["pipeshub"] = "PipesHub MCP"
+    # Whitespace-only / missing instructions must not pollute the map.
+    patch_connection["__instructions_for__"]["other"] = "   "
+
+    spec = _make_spec(_make_config("pipeshub"), _make_config("other"))
+    manager = RunnerMcpManager()
+    try:
+        result = await manager.schemas_for(spec)
+    finally:
+        await manager.shutdown()
+
+    assert result.server_instructions == {"pipeshub": "Prefer pipeshub_chat."}
+    assert result.server_labels == {"pipeshub": "PipesHub MCP"}
+    assert "other" not in result.server_instructions
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_falls_back_to_config_name_without_server_info(
+    patch_connection: dict[str, Any],
+) -> None:
+    """When serverInfo.name is absent, instructions are keyed by config.name."""
+    patch_connection["__tools_for__"]["alpha"] = [_make_tool_def("t")]
+    patch_connection["__instructions_for__"]["alpha"] = "Use alpha tools."
+
+    manager = RunnerMcpManager()
+    try:
+        result = await manager.schemas_for(_make_spec(_make_config("alpha")))
+    finally:
+        await manager.shutdown()
+
+    assert result.server_instructions == {"alpha": "Use alpha tools."}
+    assert result.server_labels == {"alpha": "alpha"}
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_keeps_colliding_display_names(
+    patch_connection: dict[str, Any],
+) -> None:
+    """Two servers advertising the same serverInfo.name must not overwrite each other."""
+    patch_connection["__tools_for__"]["pipeshub"] = [_make_tool_def("chat")]
+    patch_connection["__tools_for__"]["pipeshub-staging"] = [_make_tool_def("chat")]
+    patch_connection["__instructions_for__"]["pipeshub"] = "Prefer prod."
+    patch_connection["__instructions_for__"]["pipeshub-staging"] = "Prefer staging."
+    patch_connection["__info_names_for__"]["pipeshub"] = "PipesHub MCP"
+    patch_connection["__info_names_for__"]["pipeshub-staging"] = "PipesHub MCP"
+
+    manager = RunnerMcpManager()
+    try:
+        result = await manager.schemas_for(
+            _make_spec(_make_config("pipeshub"), _make_config("pipeshub-staging"))
+        )
+    finally:
+        await manager.shutdown()
+
+    assert result.server_instructions == {
+        "pipeshub": "Prefer prod.",
+        "pipeshub-staging": "Prefer staging.",
+    }
+    assert result.server_labels == {
+        "pipeshub": "PipesHub MCP",
+        "pipeshub-staging": "PipesHub MCP",
+    }
 
 
 @pytest.mark.asyncio
