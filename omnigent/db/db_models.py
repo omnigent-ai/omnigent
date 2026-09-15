@@ -874,12 +874,11 @@ class SqlConversation(ConversationBase):
     )
 
     __table_args__ = (
-        # The default sidebar (archived=false, updated_at DESC) is served by
-        # the archived_updated index; archived_created serves the sessions
-        # list's default created_at ordering now that the ACL filter is a
-        # correlated EXISTS rather than an id IN (...) resolved via the PK.
+        # Keep created_at unindexed here: ACL-selective listings may rationally
+        # use a semi-join plus sort, while an ordering index can encourage many
+        # permission probes. The default sidebar (archived=false, updated_at
+        # DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
-        Index("ix_conversations_archived_created", "workspace_id", "archived", "created_at", "id"),
         Index(
             "ix_conversations_root_conversation_id",
             "workspace_id",

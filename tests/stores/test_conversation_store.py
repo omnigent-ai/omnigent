@@ -7014,33 +7014,30 @@ table is large enough for an index plan to be the rational choice.
 """
 
 
-def test_seeded_listing_plans_and_deep_pagination(
+def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     conversation_store: SqlAlchemyConversationStore, db_uri: str
 ) -> None:
     """
-    Both listing contracts, explained against a realistically sized table.
+    ACL and cursor contracts against a realistically sized table.
 
     Two contracts share one seed because seeding is the expensive part:
 
-    1. The default listing pushes the ACL into a correlated EXISTS and reads
-       the page through the ordering index — no id round-trip through Python,
-       no sort of the whole workspace.
+    1. The default listing pushes the ACL into a correlated EXISTS, with no id
+       round-trip through Python.
     2. The cursor predicate is emitted as a row-values comparison, which
-       PostgreSQL can use as an index RANGE condition. The equivalent
+       PostgreSQL can use as an index RANGE condition when the sort has a
+       compatible index. The equivalent
        ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
        filter, so a deep cursor reads and discards every row above it, at a
        cost that grows with cursor depth.
 
-    Everything is asserted against the statement the STORE emitted, captured
-    from the engine: the SQL shape from the clause element, and the PLAN from
-    the driver-level statement with its adapted parameters. The plan is the
-    load-bearing half — an earlier version asserted only the SQL spelling, so
-    restoring the OR form failed on spelling and CI never checked whether the
-    comparison reached the index. EXPLAIN needs the driver form because the
-    cursor binds a 16-byte identifier that cannot be written as a SQL literal,
-    and re-binding raw values to a ``text()`` EXPLAIN skips the type decorator
-    — the exact trap that made the first row-values attempt fail only on
-    PostgreSQL.
+    The SQL shape is asserted for both sort columns. The PLAN assertion is
+    limited to ``updated_at``, which has an existing compatible index; a
+    ``created_at`` plan may rationally sort or hash-join without one. EXPLAIN
+    uses the driver form because the cursor binds a 16-byte identifier that
+    cannot be written as a SQL literal, and re-binding raw values to a
+    ``text()`` EXPLAIN skips the type decorator — the exact trap that made the
+    first row-values attempt fail only on PostgreSQL.
 
     Plan assertions are dialect-specific by nature (PostgreSQL EXPLAIN JSON,
     SQLite EXPLAIN QUERY PLAN); other dialects keep the behavioural coverage
@@ -7064,14 +7061,12 @@ def test_seeded_listing_plans_and_deep_pagination(
     )
     dialect = conversation_store._conv_engine.dialect.name
 
-    def _plan_of(driver_captured: list[tuple[str, object]]) -> str:
+    def _plan_of(driver_captured: list[tuple[str, object]], sort_by: str) -> str:
+        order_by = f"order by conversations.{sort_by}"
         statement, parameters = next(
-            (
-                (st, pr)
-                for st, pr in driver_captured
-                if "created_at" in st and "LIMIT" in st.upper()
-            ),
-            driver_captured[-1],
+            (st, pr)
+            for st, pr in driver_captured
+            if order_by in st.lower() and "limit" in st.lower()
         )
         return _explain_driver(conversation_store, statement, parameters)
 
@@ -7092,33 +7087,23 @@ def test_seeded_listing_plans_and_deep_pagination(
             [int(n.get("Rows Removed by Filter", 0) or 0) for n in flat],
         )
 
-    # ── 1. default listing: ACL pushdown + ordering index ───────────────
+    # ── 1. default listing: ACL pushdown ────────────────────────────────
     with _capture_conversation_selects(conversation_store) as clauses:
-        with _capture_driver_sql(conversation_store) as driver_captured:
-            page = conversation_store.list_conversations(
-                limit=20,
-                accessible_by="alice@example.com",
-                has_agent_id=True,
-                kind="default",
-                sort_by="created_at",
-                order="desc",
-            )
+        page = conversation_store.list_conversations(
+            limit=20,
+            accessible_by="alice@example.com",
+            has_agent_id=True,
+            kind="default",
+            sort_by="created_at",
+            order="desc",
+        )
     assert page.data, "seed must produce visible rows or the plan is not the real one"
     # On the uncompiled statement: without the pushdown the ACL becomes a
     # materialized list of binary ids, and anything that renders it dies before
     # reaching this assertion.
     assert "EXISTS" in str(clauses[0]).upper(), str(clauses[0])
-    listing_plan = _plan_of(driver_captured)
-    if dialect == "postgresql":
-        assert "ix_conversations_archived_created" in listing_plan, listing_plan
-        # A Sort here would mean the whole accessible set was ordered to return
-        # twenty rows.
-        assert '"Node Type": "Sort"' not in listing_plan, listing_plan
-    else:
-        assert "ix_conversations_archived_created" in listing_plan, listing_plan
-        assert "SCAN conversations" not in listing_plan, listing_plan
 
-    # ── 2. deep cursor: row values as an index range condition ──────────
+    # ── 2. deep cursor: row values and indexed updated_at range ─────────
     # A DEEP cursor with a NORMAL page size — the shape that distinguishes an
     # index range condition from a residual filter. Asking for half the table
     # in one page makes a sequential scan the planner's rational choice, and
@@ -7175,20 +7160,20 @@ def test_seeded_listing_plans_and_deep_pagination(
                             **{direction: cursor_id},
                         )
                 where = f"{sort_by}/{order}/{direction}"
-                # The PLAN first: a residual filter is the failure this form
-                # exists to avoid — it means the scan read every row past the
-                # cursor and threw it away.
-                cursor_plan = _plan_of(driver_captured)
-                if dialect == "postgresql":
-                    index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
-                    assert any(sort_by in c and "id" in c for c in index_conds), (
-                        where,
-                        cursor_plan,
-                    )
-                    assert all(r == 0 for r in rows_filtered), (where, cursor_plan)
-                else:
-                    assert "USING INDEX" in cursor_plan, (where, cursor_plan)
-                    assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
+                if sort_by == "updated_at":
+                    # With the existing compatible index, the row value must
+                    # become a range condition rather than a residual filter.
+                    cursor_plan = _plan_of(driver_captured, sort_by)
+                    if dialect == "postgresql":
+                        index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
+                        assert any(sort_by in c and "id" in c for c in index_conds), (
+                            where,
+                            cursor_plan,
+                        )
+                        assert all(r == 0 for r in rows_filtered), (where, cursor_plan)
+                    else:
+                        assert "USING INDEX" in cursor_plan, (where, cursor_plan)
+                        assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
 
                 # Then the emitted spelling, as a description of what produced
                 # that plan. ``after`` in a descending scan compares "<";
