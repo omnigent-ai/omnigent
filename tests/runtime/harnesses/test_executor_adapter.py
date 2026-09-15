@@ -161,6 +161,12 @@ def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_error_with_sdk_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields an ExecutorError carrying the caught SDK exception."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "error_with_sdk_cause")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -407,6 +413,41 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_executor_error_sdk_cause_classifies_response_failed(
+    use_error_with_sdk_cause: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """An ExecutorError's carried SDK exception classifies the failed response.
+
+    A provider-throttle failure (an upstream 429, e.g. "Selected model is at
+    capacity") reaches the adapter as an ExecutorError whose ``exception``
+    field carries the ``openai.RateLimitError`` the executor caught. The
+    adapter chains it onto its wrapper RuntimeError, so the scaffold's error
+    detail carries the semantic ``rate_limit_exceeded`` code.
+
+    Regression guard: pre-fix the executor flattened the SDK exception into
+    the message string, the classifier saw only a bare RuntimeError, and the
+    failed response carried the unclassified ``code="RuntimeError"`` — an
+    upstream capacity outage attributed to Omnigent.
+    """
+    conv_id = "conv_err_sdk_cause"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    error_detail = events[-1].data["response"]["error"]
+    assert error_detail is not None
+    # The semantic provider-throttle code, not the wrapper's class name.
+    assert error_detail["code"] == "rate_limit_exceeded"
+    # The upstream reason stays visible to the user alongside the code.
+    assert "Selected model is at capacity" in error_detail["message"]
 
 
 async def test_executor_error_usage_reaches_response_failed(
@@ -838,6 +879,46 @@ def test_classify_inner_exception_dispatches_across_sdks(
     # Fall-through: an exception no classifier recognizes
     # returns None. Caller is expected to use the class name.
     assert classify_inner_exception(RuntimeError("unknown")) is None
+
+
+def test_classify_inner_exception_walks_cause_chain() -> None:
+    """
+    :func:`classify_inner_exception` follows ``__cause__`` so a wrapper
+    raised with ``raise ... from sdk_exc`` classifies by the SDK
+    exception it carries.
+
+    What breaks if this fails: the executor adapter wraps every inner
+    ExecutorError as ``RuntimeError("inner executor error: …")`` chained
+    from the executor-caught SDK exception. Without the cause walk, a
+    provider-throttle 429 (``openai.RateLimitError``) surfaces as the
+    unclassified ``code="RuntimeError"`` — the upstream capacity outage
+    gets attributed to Omnigent and the retry allowlist never matches.
+    """
+    import openai
+
+    from omnigent.runtime.harnesses._executor_adapter import (
+        classify_inner_exception,
+    )
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    rate = openai.RateLimitError(
+        "Selected model is at capacity. Please try a different model.",
+        response=httpx.Response(429, request=request),
+        body=None,
+    )
+    wrapper = RuntimeError("inner executor error: OpenAI Agents SDK error: …")
+    wrapper.__cause__ = rate
+    assert classify_inner_exception(wrapper) == "rate_limit_exceeded"
+
+    # A chain with no classifiable link still falls through to None.
+    unknown = RuntimeError("inner executor error: boom")
+    unknown.__cause__ = ValueError("boom")
+    assert classify_inner_exception(unknown) is None
+
+    # A cyclic cause chain terminates instead of looping forever.
+    cyclic = RuntimeError("a")
+    cyclic.__cause__ = cyclic
+    assert classify_inner_exception(cyclic) is None
 
 
 class _StubExecutor(Executor):
