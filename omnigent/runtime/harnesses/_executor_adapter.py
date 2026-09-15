@@ -58,6 +58,19 @@ from omnigent.server.schemas import (
 
 _logger = logging.getLogger(__name__)
 
+
+class InnerExecutorTurnError(RuntimeError):
+    """Turn failure the inner executor reported as an :class:`ExecutorError` event.
+
+    Carries the semantic ``executor_error`` failure code: publishing the bare
+    exception class name instead leaves the failure code unmapped in the
+    failure-code description tables, so the error card degrades to the generic
+    "Something went wrong" headline.
+    """
+
+    code = "executor_error"
+
+
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
 _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _COMPLETED_TOOL_CALL_STATUS = "completed"
@@ -327,7 +340,7 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
-                        raise RuntimeError(f"inner executor error: {detail}")
+                        raise InnerExecutorTurnError(f"inner executor error: {detail}")
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
             _logger.info(
@@ -916,13 +929,17 @@ class ExecutorAdapter(HarnessApp):
     def _build_error_detail(self, exception: BaseException) -> Any:
         """Map an exception to a semantic code the Omnigent retry allowlist recognizes.
 
-        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``.
-        Unknown types fall back to base class (``type(exception).__name__``).
+        OmnigentError and the executor-event funnel carry their own ``code``;
+        others go through ``classify_inner_exception``. Unknown types fall back
+        to base class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, OmnigentError):
+            return ErrorDetail(code=exception.code, message=str(exception))
+
+        if isinstance(exception, InnerExecutorTurnError):
             return ErrorDetail(code=exception.code, message=str(exception))
 
         code = classify_inner_exception(exception)

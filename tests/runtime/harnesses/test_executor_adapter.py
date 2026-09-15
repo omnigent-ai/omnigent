@@ -404,9 +404,13 @@ async def test_executor_error_terminates_with_response_failed(
     error_detail = events[-1].data["response"]["error"]
     assert error_detail is not None
     # The mock script's error message ("mock error") propagates
-    # via the RuntimeError wrap in the adapter; the scaffold
-    # builds an ErrorDetail with the exception's str().
+    # via the InnerExecutorTurnError wrap in the adapter; the
+    # scaffold builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+    # The funnel publishes the semantic ``executor_error`` code. The class-name
+    # fallback ("RuntimeError") is unmapped in FAILURE_CODE_DESCRIPTIONS, so
+    # the error card degrades to the generic "Something went wrong" headline.
+    assert error_detail["code"] == "executor_error"
 
 
 async def test_executor_error_usage_reaches_response_failed(
@@ -510,6 +514,34 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
     # this assertion would fail.
     base_detail = HarnessApp._build_error_detail(adapter, RuntimeError("oops"))
     assert base_detail.code == "RuntimeError"
+
+
+def test_build_error_detail_maps_executor_event_failures_to_executor_error() -> None:
+    """
+    Failures the inner executor reports as an :class:`ExecutorError`
+    *event* (a harness CLI's terminal error text, e.g. claude's
+    ``ResultMessage(is_error=True)``) reach the adapter as an
+    :class:`InnerExecutorTurnError` — there is no SDK exception left to
+    classify, so the override must use the funnel's own semantic code.
+
+    What breaks if this fails: the ErrorDetail code falls back to the
+    exception class name, which no failure-code description table maps,
+    and a mid-turn model failure renders as the bare "Something went
+    wrong" card — the user can't tell whether the agent is still running
+    or what went wrong.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorTurnError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    detail = adapter._build_error_detail(
+        InnerExecutorTurnError("inner executor error: API Error: stream died mid-flight")
+    )
+
+    assert detail.code == "executor_error"
+    assert "stream died mid-flight" in detail.message
 
 
 def test_classify_openai_exception_maps_known_types() -> None:
