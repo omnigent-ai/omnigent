@@ -43,8 +43,10 @@ from urllib.parse import urlparse
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
+    AwsSigV4RewriteRule,
     CredentialRewriteRule,
 )
+from omnigent.inner.egress import aws_sigv4
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.rules import (
     EgressRule,
@@ -209,6 +211,11 @@ class EgressProxy:
         carries a synthetic placeholder; the proxy swaps that placeholder
         for the real secret and rejects the same placeholder sent to any
         other host with ``403`` (the cross-host leak guard).
+    :param aws_sigv4_rewrites: Optional host-scoped AWS SigV4 re-signing
+        rules — a separate mechanism from *credential_rewrites*. A bound
+        request's entire signature is discarded and rebuilt with the real
+        credential (see :mod:`omnigent.inner.egress.aws_sigv4`), since
+        SigV4 signs the whole request rather than one header value.
     """
 
     def __init__(
@@ -221,6 +228,7 @@ class EgressProxy:
         block_private_destinations: bool = True,
         auth_token: str | None = None,
         credential_rewrites: list[CredentialRewriteRule] | None = None,
+        aws_sigv4_rewrites: list[AwsSigV4RewriteRule] | None = None,
     ) -> None:
         self._rules = rules
         self._cert_cache = HostCertCache(ca_cert_path, ca_key_path)
@@ -260,6 +268,13 @@ class EgressProxy:
             self._cred_by_host[host] = rule
             if rule.synthetic is not None:
                 self._cred_by_synthetic.setdefault(rule.synthetic, {})[host] = rule
+        # AWS SigV4 re-signing: a separate host-keyed index, always
+        # force-replace (never swap-on-access-if-absent) — the parser
+        # rejects a host bound by more than one credential-proxy type, so
+        # a host never appears in both this map and _cred_by_host.
+        self._sigv4_by_host: dict[str, AwsSigV4RewriteRule] = {
+            rule.host.lower(): rule for rule in aws_sigv4_rewrites or []
+        }
         # Precompute the expected header bytes ONCE so the per-request
         # comparison is a constant-time memcmp instead of repeating
         # the base64 round-trip on every connection. Stored as bytes
@@ -588,7 +603,7 @@ class EgressProxy:
                         tls_writer, "HTTP/2 requires an unrestricted host rule"
                     )
                     return
-                if host.lower() in self._cred_by_host:
+                if host.lower() in self._cred_by_host or host.lower() in self._sigv4_by_host:
                     logger.warning(
                         "BLOCKED-H2-CREDENTIAL https://%s — opaque HTTP/2 "
                         "cannot rewrite credentials",
@@ -718,7 +733,12 @@ class EgressProxy:
 
     def _allows_http2_passthrough(self, host: str) -> bool:
         """Return whether opaque HTTP/2 relay is safe for *host*."""
-        return self._allows_unrestricted_host(host) and host.lower() not in self._cred_by_host
+        host_key = host.lower()
+        return (
+            self._allows_unrestricted_host(host)
+            and host_key not in self._cred_by_host
+            and host_key not in self._sigv4_by_host
+        )
 
     async def _forward_http2(
         self,
@@ -812,11 +832,23 @@ class EgressProxy:
             )
             await self._send_forbidden(client_writer, rewrite.error)
             return
+        # A host is bound by at most one credential-proxy type (parser-
+        # enforced), so at most one of the two rewrite calls ever does
+        # real work; the other is a cheap no-op passthrough.
+        sigv4_rewrite = await self._resign_aws_sigv4_async(
+            method=method, host=host, path=path, headers_raw=rewrite.headers, body=body
+        )
+        if sigv4_rewrite.error is not None:
+            logger.warning(
+                "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, sigv4_rewrite.error
+            )
+            await self._send_forbidden(client_writer, sigv4_rewrite.error)
+            return
         # Single-shot the upstream so ``_relay_response`` gets a prompt EOF
         # instead of blocking on a keep-alive socket — and so pipelining
         # clients (git's libcurl) don't stall waiting to reuse a tunnel the
         # proxy only services once. See ``_force_connection_close``.
-        headers_raw = self._force_connection_close(rewrite.headers)
+        headers_raw = self._force_connection_close(sigv4_rewrite.headers)
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(
@@ -967,9 +999,21 @@ class EgressProxy:
             )
             await self._send_forbidden(writer, rewrite.error)
             return
+        # A host is bound by at most one credential-proxy type (parser-
+        # enforced), so at most one of the two rewrite calls ever does
+        # real work; the other is a cheap no-op passthrough.
+        sigv4_rewrite = await self._resign_aws_sigv4_async(
+            method=method, host=host, path=path, headers_raw=rewrite.headers, body=body
+        )
+        if sigv4_rewrite.error is not None:
+            logger.warning(
+                "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, sigv4_rewrite.error
+            )
+            await self._send_forbidden(writer, sigv4_rewrite.error)
+            return
         # Single-shot the upstream (prompt EOF for the relay, no stalled
         # tunnel reuse). See ``_force_connection_close``.
-        headers_raw = self._force_connection_close(rewrite.headers)
+        headers_raw = self._force_connection_close(sigv4_rewrite.headers)
 
         # Connect to the IP pinned by the destination check (or the
         # hostname when blocking is disabled and ``pinned_ip`` is
@@ -1343,6 +1387,94 @@ class EgressProxy:
             # than round-tripping them through the serializer.
             return _AuthRewriteResult(headers=headers_raw, error=None)
         return _AuthRewriteResult(headers=msg.as_bytes(policy=email.policy.HTTP), error=None)
+
+    async def _resign_aws_sigv4_async(
+        self, *, method: str, host: str, path: str, headers_raw: bytes, body: bytes
+    ) -> _AuthRewriteResult:
+        """
+        Async wrapper around :meth:`_resign_aws_sigv4`.
+
+        Signing is cheap, but the lazy ``botocore`` import on first use
+        (and a refreshing STS-backed provider's occasional blocking
+        ``AssumeRole`` call) shouldn't stall the event loop — same
+        rationale as :meth:`_rewrite_authorization_async`. Short-circuits
+        inline when no ``aws_sigv4`` rule is configured.
+
+        :param method: HTTP method (case-insensitive), e.g. ``"PUT"``.
+        :param host: Upstream request host (case-insensitive).
+        :param path: Request path including query string, e.g.
+            ``"/key?partNumber=1"``.
+        :param headers_raw: Raw HTTP header block (CRLF-separated).
+        :param body: The literal request body forwarded upstream.
+        :returns: The rewrite result.
+        """
+        if not self._sigv4_by_host:
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            functools.partial(
+                self._resign_aws_sigv4,
+                method=method,
+                host=host,
+                path=path,
+                headers_raw=headers_raw,
+                body=body,
+            ),
+        )
+
+    def _resign_aws_sigv4(
+        self, *, method: str, host: str, path: str, headers_raw: bytes, body: bytes
+    ) -> _AuthRewriteResult:
+        """
+        Discard and rebuild a bound request's AWS SigV4 auth headers.
+
+        Unlike :meth:`_rewrite_authorization` (swap-on-access — inject
+        only when no ``Authorization`` header is present), this always
+        force-replaces: a ``boto3`` client always sends *some*
+        ``Authorization: AWS4-HMAC-SHA256 ...`` header, computed with the
+        sandbox's placeholder credentials, so "inject only if absent"
+        would never fire. A non-SigV4 (or absent) ``Authorization`` on a
+        bound host is left untouched instead — defense-in-depth against
+        clobbering an unrelated credential a tool deliberately sent.
+
+        No resigning happens on the loopback/diagnostic verbs in
+        :data:`_CREDENTIAL_INJECTION_FORBIDDEN_METHODS` (``TRACE`` /
+        ``OPTIONS``), matching :meth:`_rewrite_authorization`.
+
+        :param method: HTTP method (case-insensitive), e.g. ``"PUT"``.
+        :param host: Upstream request host (case-insensitive).
+        :param path: Request path including query string.
+        :param headers_raw: Raw HTTP header block (CRLF-separated).
+        :param body: The literal request body forwarded upstream —
+            forwarded unchanged; see
+            :func:`omnigent.inner.egress.aws_sigv4.resign_request` for why.
+        :returns: The rewrite result.
+        """
+        if method.upper() in _CREDENTIAL_INJECTION_FORBIDDEN_METHODS:
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+        if not self._sigv4_by_host:
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+        rule = self._sigv4_by_host.get(host.lower())
+        if rule is None:
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+        msg = _parse_http_headers(headers_raw)
+        existing = msg.get("Authorization")
+        if existing is None or not aws_sigv4.is_sigv4_authorization(existing):
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+        try:
+            resigned = aws_sigv4.resign_request(
+                method=method,
+                url=f"https://{host}{path}",
+                headers=msg,
+                body=body,
+                credentials=rule.resolve_credentials(),
+                region=rule.region,
+                service=rule.service,
+            )
+        except aws_sigv4.UnsupportedAwsSigV4RequestError as exc:
+            return _AuthRewriteResult(headers=headers_raw, error=str(exc))
+        return _AuthRewriteResult(headers=resigned.as_bytes(policy=email.policy.HTTP), error=None)
 
     @staticmethod
     def _extract_synthetic(auth_value: str) -> str | None:

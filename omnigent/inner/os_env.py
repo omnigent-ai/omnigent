@@ -29,6 +29,7 @@ from omnigent.util.json_types import JsonValue
 
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
+    AwsSigV4RewriteRule,
     CredentialProxyRuntime,
     CredentialRewriteRule,
     MaterializedFile,
@@ -270,6 +271,19 @@ def _build_credential_proxy_parent_env(
             value = parent_env.get(entry.source.env)
             if value is not None:
                 resolved[entry.source.env] = value
+    for aws_entry in spec.aws_sigv4:
+        # The assume_role shape needs no lifting here -- it resolves
+        # credentials via the parent's *ambient* AWS identity (STS), not a
+        # named source in this env map.
+        for source in (
+            aws_entry.credential.access_key_id,
+            aws_entry.credential.secret_access_key,
+            aws_entry.credential.session_token,
+        ):
+            if source is not None and source.kind == "env" and source.env:
+                value = parent_env.get(source.env)
+                if value is not None:
+                    resolved[source.env] = value
     return resolved
 
 
@@ -500,6 +514,11 @@ class _HelperProcessClient:
                 credential_rewrites=(
                     credential_runtime.rewrites if credential_runtime is not None else None
                 ),
+                aws_sigv4_rewrites=(
+                    credential_runtime.aws_sigv4_rewrites
+                    if credential_runtime is not None
+                    else None
+                ),
             )
 
         config: dict[str, JsonValue] = {
@@ -689,6 +708,7 @@ class _HelperProcessClient:
         env: dict[str, str],
         *,
         credential_rewrites: list[CredentialRewriteRule] | None = None,
+        aws_sigv4_rewrites: list[AwsSigV4RewriteRule] | None = None,
     ) -> SandboxPolicy:
         """Start the egress MITM proxy and inject env vars.
 
@@ -741,6 +761,8 @@ class _HelperProcessClient:
             are added in-place.
         :param credential_rewrites: Optional synthetic-to-real credential
             rewrites the proxy applies (secretless ``credential_proxy``).
+        :param aws_sigv4_rewrites: Optional AWS SigV4 re-signing rules the
+            proxy applies — a separate mechanism from *credential_rewrites*.
         :returns: Updated :class:`SandboxPolicy` with egress relay
             port and socket path set. The egress auth token is NOT
             stored on the policy (which serialises to JSON and
@@ -765,6 +787,7 @@ class _HelperProcessClient:
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,
             credential_rewrites=credential_rewrites,
+            aws_sigv4_rewrites=aws_sigv4_rewrites,
         )
 
         # S4 (security): hold the controller refs on the client so

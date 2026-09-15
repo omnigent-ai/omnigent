@@ -44,6 +44,8 @@ import pytest
 
 from omnigent.inner.credential_proxy import SYNTHETIC_CREDENTIAL_PREFIX
 from omnigent.inner.datamodel import (
+    AwsSigV4CredentialSpec,
+    AwsSigV4ProxyEntry,
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
@@ -1275,6 +1277,198 @@ def test_credential_proxy_databricks_cli_materializes_cfg_and_swaps(
     assert real_token not in cfg_dump["stdout"], (
         f"real token leaked into the sandbox Databricks config: {cfg_dump['stdout']!r}"
     )
+
+
+class _CapturingSigV4Upstream:
+    """A loopback HTTP server that records GET/HEAD/PUT headers + body.
+
+    Stands in for S3: an ``aws_sigv4``-bound request is forwarded here
+    after the egress proxy resigns it, so the captured request is exactly
+    what crossed the proxy boundary toward the real service.
+    """
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        captured: list[dict[str, object]] = []
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def _capture(self, method: str) -> None:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = self.rfile.read(length) if length else b""
+                captured.append(
+                    {
+                        "method": method,
+                        "path": self.path,
+                        "headers": {k.lower(): v for k, v in self.headers.items()},
+                        "body": body,
+                    }
+                )
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                self._capture("GET")
+
+            def do_HEAD(self) -> None:
+                self._capture("HEAD")
+
+            def do_PUT(self) -> None:
+                self._capture("PUT")
+
+            def log_message(self, *_args: object) -> None:
+                # Silence the default stderr access log.
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.captured = captured
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        """Stop the server and join its thread."""
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+def _boto3_put_object_probe(*, endpoint_url: str, bucket: str, key: str, body: str) -> str:
+    """
+    Build a probe that runs a real, unmodified ``boto3`` ``put_object``.
+
+    Deliberately does NOT pass credentials explicitly — boto3 must pick
+    up whatever ``AWS_ACCESS_KEY_ID``/``AWS_SECRET_ACCESS_KEY`` the
+    sandbox env carries (the placeholders ``prepare_credential_proxy_runtime``
+    injects), proving the real credential never needs to appear in the
+    sandboxed agent's own code.
+
+    :param endpoint_url: The local capturing upstream's URL.
+    :param bucket: S3 bucket name (never actually created — the local
+        upstream always replies 200).
+    :param key: S3 object key.
+    :param body: Object body text.
+    :returns: Python source for use with :func:`_python_probe_argv`.
+    """
+    return "\n".join(
+        [
+            "import boto3, os",
+            f"client = boto3.client('s3', endpoint_url={endpoint_url!r}, "
+            "region_name='us-east-1', use_ssl=False)",
+            f"resp = client.put_object(Bucket={bucket!r}, Key={key!r}, Body={body!r}.encode())",
+            "print('STATUS', resp['ResponseMetadata']['HTTPStatusCode'])",
+            "print('SANDBOX_AKID', os.environ.get('AWS_ACCESS_KEY_ID'))",
+            "print('SANDBOX_SECRET', os.environ.get('AWS_SECRET_ACCESS_KEY'))",
+        ]
+    )
+
+
+def test_credential_proxy_aws_sigv4_signs_boto3_put_object(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    aws_sigv4: a real, unmodified boto3 ``put_object`` call is resigned.
+
+    Full path: a static ``aws_sigv4`` credential resolves the real
+    access/secret key in the parent from env vars. The sandbox gets only
+    placeholder ``AWS_ACCESS_KEY_ID``/``AWS_SECRET_ACCESS_KEY`` values
+    (never the real ones). A stock ``boto3`` client inside the sandbox
+    signs its request with those placeholders — this is the DEFAULT
+    ``put_object`` shape (``aws-chunked`` + ``STREAMING-UNSIGNED-PAYLOAD-
+    TRAILER``, current botocore's default regardless of body size, see
+    ``omnigent.inner.egress.aws_sigv4``'s module docstring) — and the
+    egress proxy discards that garbage signature and resigns the request
+    with the real credential before forwarding. We assert:
+
+    - the call succeeds (200) against the local capturing upstream;
+    - the upstream's captured request carries a SigV4 signature that
+      independently verifies against the REAL credential;
+    - the sandbox environment held only the placeholder credential.
+    """
+    real_access_key = "FAKEREALE2ETESTKEY01"
+    real_secret_key = "realE2ETestSecretKeyExample1234567890ab"
+    monkeypatch.setenv("E2E_TEST_AWS_AKID", real_access_key)
+    monkeypatch.setenv("E2E_TEST_AWS_SECRET", real_secret_key)
+    upstream = _CapturingSigV4Upstream()
+
+    spec = active_sandbox_spec_factory(
+        egress_rules=["* 127.0.0.1/**"],
+        egress_allow_private_destinations=True,
+        credential_proxy=CredentialProxySpec(
+            entries=[],
+            aws_sigv4=[
+                AwsSigV4ProxyEntry(
+                    host="127.0.0.1",
+                    region="us-east-1",
+                    credential=AwsSigV4CredentialSpec(
+                        access_key_id=CredentialSourceSpec(kind="env", env="E2E_TEST_AWS_AKID"),
+                        secret_access_key=CredentialSourceSpec(
+                            kind="env", env="E2E_TEST_AWS_SECRET"
+                        ),
+                    ),
+                )
+            ],
+        ),
+    )
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
+    )
+    probe = _boto3_put_object_probe(
+        endpoint_url=f"http://127.0.0.1:{upstream.port}",
+        bucket="mybucket",
+        key="e2e-key",
+        body="hello from sandbox",
+    )
+    try:
+        result = run_async(os_env.shell(_python_probe_argv(probe)))
+    finally:
+        os_env.close()
+        upstream.close()
+
+    assert result["exit_code"] == 0, (
+        f"Probe failed. stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
+    )
+    assert "STATUS 200" in result["stdout"], result["stdout"]
+    assert f"SANDBOX_AKID {real_access_key}" not in result["stdout"], (
+        f"the REAL access key must never appear in the sandbox environment: {result['stdout']!r}"
+    )
+
+    assert len(upstream.captured) == 1
+    request = upstream.captured[0]
+    assert request["method"] == "PUT"
+    headers = request["headers"]
+    assert isinstance(headers, dict)
+    body = request["body"]
+    assert isinstance(body, bytes)
+
+    # Independently recompute the expected signature with the real
+    # credential over the captured (method, url, headers, body) — proving
+    # the upstream received a request genuinely signed with the real key,
+    # not merely that some Authorization header is present.
+    from botocore.auth import S3SigV4Auth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials as BotocoreCredentials
+
+    class _NoRehashS3SigV4Auth(S3SigV4Auth):  # type: ignore[misc]
+        def _modify_request_before_signing(self, request: object) -> None:
+            SigV4Auth._modify_request_before_signing(self, request)
+
+    managed = {"authorization", "x-amz-date", "date", "x-amz-security-token"}
+    filtered_headers = {k: v for k, v in headers.items() if k not in managed}
+    url = f"http://127.0.0.1:{upstream.port}{request['path']}"
+    aws_request = AWSRequest(method="PUT", url=url, data=body, headers=filtered_headers)
+    real_creds = BotocoreCredentials(real_access_key, real_secret_key)
+    _NoRehashS3SigV4Auth(real_creds, "s3", "us-east-1").add_auth(aws_request)
+
+    assert headers.get("authorization") == aws_request.headers["Authorization"], (
+        "upstream did not receive a request signed with the real credential"
+    )
+    assert real_access_key in headers.get("authorization", "")
 
 
 # Module guard so the helpers don't trigger lint warnings about

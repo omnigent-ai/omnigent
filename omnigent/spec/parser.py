@@ -15,6 +15,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, mo
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
     DEFAULT_BASIC_USERNAME,
+    AwsAssumeRoleSpec,
+    AwsSigV4CredentialSpec,
+    AwsSigV4ProxyEntry,
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
@@ -1394,6 +1397,131 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         return CredentialSourceSpec(kind="command", command=self.command.strip())
 
 
+class _AwsAssumeRoleModel(BaseModel):  # type: ignore[explicit-any]
+    """Pydantic boundary model for ``aws_sigv4[*].credential.assume_role``.
+
+    :param role_arn: ARN of the role to assume.
+    :param session_name: Optional ``RoleSessionName``.
+    :param duration_seconds: Requested credential lifetime.
+    :param external_id: Optional ``ExternalId`` for a third-party role.
+    :param profile: Optional named AWS profile to use as the caller
+        identity for the ``AssumeRole`` call, instead of boto3's default
+        credential chain.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role_arn: str
+    session_name: str | None = None
+    duration_seconds: int = 3600
+    external_id: str | None = None
+    profile: str | None = None
+
+    @field_validator("role_arn")
+    @classmethod
+    def _role_arn_nonempty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("assume_role 'role_arn' must be a non-empty string")
+        return value
+
+    @field_validator("duration_seconds")
+    @classmethod
+    def _duration_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("assume_role 'duration_seconds' must be positive")
+        return value
+
+    @field_validator("profile")
+    @classmethod
+    def _profile_nonempty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("assume_role 'profile' must be a non-empty string")
+        return value
+
+    def to_spec(self) -> AwsAssumeRoleSpec:
+        return AwsAssumeRoleSpec(
+            role_arn=self.role_arn,
+            session_name=self.session_name,
+            duration_seconds=self.duration_seconds,
+            external_id=self.external_id,
+            profile=self.profile,
+        )
+
+
+class _AwsSigV4CredentialModel(BaseModel):  # type: ignore[explicit-any]
+    """Pydantic boundary model for ``aws_sigv4[*].credential``.
+
+    Exactly one of three shapes: a static 3-part credential
+    (``access_key_id`` + ``secret_access_key`` + optional
+    ``session_token``), ``profile`` (the parent resolves the full
+    credential from a named profile in its shared AWS config/credentials
+    files), or ``assume_role`` (the parent mints and auto-refreshes
+    temporary credentials via an explicit STS call).
+
+    :param access_key_id: Static access key id source.
+    :param secret_access_key: Static secret key source.
+    :param session_token: Optional static session-token source.
+    :param profile: Named AWS profile to resolve the full credential from.
+    :param assume_role: STS ``AssumeRole`` parameters.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    access_key_id: _CredentialSourceModel | None = None
+    secret_access_key: _CredentialSourceModel | None = None
+    session_token: _CredentialSourceModel | None = None
+    profile: str | None = None
+    assume_role: _AwsAssumeRoleModel | None = None
+
+    @field_validator("profile")
+    @classmethod
+    def _profile_nonempty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("credential 'profile' must be a non-empty string")
+        return value
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> _AwsSigV4CredentialModel:
+        """
+        Enforce static-vs-profile-vs-assume_role exclusivity.
+
+        :returns: ``self`` once validated.
+        :raises ValueError: If more than one shape (or none) is set, or if
+            a static credential is missing a required part.
+        """
+        has_static = self.access_key_id is not None or self.secret_access_key is not None
+        has_profile = self.profile is not None
+        has_assume_role = self.assume_role is not None
+        shape_count = sum(
+            [has_static or self.session_token is not None, has_profile, has_assume_role]
+        )
+        if shape_count > 1:
+            raise ValueError(
+                "credential accepts exactly one of 'assume_role', 'profile', or "
+                "'access_key_id'/'secret_access_key'/'session_token', not more than one"
+            )
+        if has_assume_role or has_profile:
+            return self
+        if self.access_key_id is None or self.secret_access_key is None:
+            raise ValueError(
+                "credential requires both 'access_key_id' and 'secret_access_key' "
+                "when 'assume_role' and 'profile' are not set"
+            )
+        return self
+
+    def to_spec(self) -> AwsSigV4CredentialSpec:
+        if self.assume_role is not None:
+            return AwsSigV4CredentialSpec(assume_role=self.assume_role.to_spec())
+        if self.profile is not None:
+            return AwsSigV4CredentialSpec(profile=self.profile)
+        assert self.access_key_id is not None and self.secret_access_key is not None
+        return AwsSigV4CredentialSpec(
+            access_key_id=self.access_key_id.to_spec(),
+            secret_access_key=self.secret_access_key.to_spec(),
+            session_token=self.session_token.to_spec() if self.session_token else None,
+        )
+
+
 class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for one raw ``credential_proxy`` entry.
 
@@ -1420,11 +1548,19 @@ class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
         injection themselves.
     :param username: Optional Basic-auth username for ``https_basic`` /
         ``git_https`` (defaults to ``x-access-token``).
+    :param credential: AWS credential source for ``aws_sigv4`` (static or
+        ``assume_role``). Not applicable to any other type.
+    :param region: AWS region for ``aws_sigv4``. Not applicable to any
+        other type.
+    :param service: AWS SigV4 service name for ``aws_sigv4`` (default
+        ``"s3"``). Not applicable to any other type.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["https_bearer", "https_basic", "git_https", "gh_basic", "databricks_cli"]
+    type: Literal[
+        "https_bearer", "https_basic", "git_https", "gh_basic", "databricks_cli", "aws_sigv4"
+    ]
     source: _CredentialSourceModel | None = None
     target: str | None = None
     targets: list[str] | None = None
@@ -1432,6 +1568,9 @@ class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
     username: str | None = None
     profiles: list[str] | None = None
     default: str | None = None
+    credential: _AwsSigV4CredentialModel | None = None
+    region: str | None = None
+    service: str | None = None
 
     @field_validator("env")
     @classmethod
@@ -1480,6 +1619,8 @@ class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
         """
         if self.type == "databricks_cli":
             return self._check_databricks_cli()
+        if self.type == "aws_sigv4":
+            return self._check_aws_sigv4()
         # The host-keyed types resolve their secret from an explicit source.
         if self.source is None:
             raise ValueError("source is required")
@@ -1538,6 +1679,44 @@ class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
             raise ValueError(
                 f"databricks_cli 'default' {self.default!r} must be one of 'profiles'"
             )
+        return self
+
+    def _check_aws_sigv4(self) -> _CredentialProxyItemModel:
+        """
+        Validate an ``aws_sigv4`` entry.
+
+        ``aws_sigv4`` is host-keyed like ``https_bearer`` (the bucket's
+        host/region are known upfront in config, unlike the
+        runtime-resolved Databricks workspace host), but resolves its
+        credential from :attr:`credential` / :attr:`region` / :attr:`service`
+        rather than the generic ``source`` — those and every
+        ``https_*``/``gh_basic``-shaped field are rejected so typos fail
+        loud.
+
+        :returns: ``self`` once validated.
+        :raises ValueError: On a rejected field, a missing ``credential``
+            or ``region``, or a ``target``/``targets`` cardinality
+            violation.
+        """
+        for name, value in (
+            ("source", self.source),
+            ("env", self.env),
+            ("username", self.username),
+            ("profiles", self.profiles),
+            ("default", self.default),
+        ):
+            if value is not None:
+                raise ValueError(f"aws_sigv4 does not accept {name!r}")
+        if self.credential is None:
+            raise ValueError("aws_sigv4 requires 'credential'")
+        if self.region is None or not self.region.strip():
+            raise ValueError("aws_sigv4 requires a non-empty 'region'")
+        has_target = self.target is not None
+        has_targets = self.targets is not None
+        if has_targets and not self.targets:
+            raise ValueError("targets must be a non-empty list")
+        if has_target == has_targets:
+            raise ValueError("must declare exactly one of 'target' or 'targets'")
         return self
 
 
@@ -1611,6 +1790,7 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
     if not raw:
         return None
     entries: list[CredentialProxyEntry] = []
+    aws_sigv4_entries: list[AwsSigV4ProxyEntry] = []
     databricks_profiles: list[DatabricksProfileBinding] = []
     databricks_default: str | None = None
     databricks_seen: set[str] = set()
@@ -1632,6 +1812,9 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
                 index=i,
             )
             continue
+        if model.type == "aws_sigv4":
+            aws_sigv4_entries.extend(_normalize_aws_sigv4(model, index=i))
+            continue
         assert model.source is not None  # guaranteed by the model validator
         source = model.source.to_spec()
         if model.type == "gh_basic":
@@ -1647,8 +1830,11 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
     # silently last-win (one credential dropped). Reject it at parse time
     # rather than picking a binding nondeterministically. (Databricks
     # hosts are resolved at runtime, so their collision guard lives there.)
+    # aws_sigv4 entries are included: a host bound by both a header-swap
+    # type and aws_sigv4 would populate two separate proxy rewrite tables,
+    # which is exactly the kind of ambiguity this guard exists to reject.
     seen_hosts: dict[str, str] = {}
-    for entry in entries:
+    for entry in (*entries, *aws_sigv4_entries):
         host_key = entry.host.lower()
         if host_key in seen_hosts:
             raise OmnigentError(
@@ -1664,9 +1850,9 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
         if databricks_profiles
         else None
     )
-    if not entries and databricks is None:
+    if not entries and not aws_sigv4_entries and databricks is None:
         return None
-    return CredentialProxySpec(entries=entries, databricks=databricks)
+    return CredentialProxySpec(entries=entries, databricks=databricks, aws_sigv4=aws_sigv4_entries)
 
 
 def _merge_databricks_cli(
@@ -1746,6 +1932,14 @@ def _credential_proxy_macos_unsupported_reason(
     ``databricks_cli`` fails on macOS for the same reason — the ``databricks``
     CLI is also a Go binary — so it is rejected here too.
 
+    ``aws_sigv4`` is deliberately NOT rejected here. Its signing happens
+    entirely in the parent process (no client-side helper CLI at all), and
+    the sandboxed side is whatever HTTP client boto3 uses under the hood —
+    Python, which honors ``SSL_CERT_FILE``/``REQUESTS_CA_BUNDLE`` via the
+    proxy's existing CA-trust wiring like any other Python HTTP client. A
+    future credential-proxy type should not assume every new type needs a
+    macOS carve-out here — only Go-CLI-backed ones do.
+
     :param credential_proxy: Parsed credential-proxy spec, or ``None`` when the
         ``credential_proxy:`` field is absent.
     :param sandbox_type: Resolved sandbox backend, e.g. ``"darwin_seatbelt"``
@@ -1815,6 +2009,37 @@ def _normalize_https_bearer(
             source=source,
             inject_env=inject_env,
         )
+        for host in _resolve_credential_hosts(model, index=index)
+    ]
+
+
+def _normalize_aws_sigv4(
+    model: _CredentialProxyItemModel,
+    *,
+    index: int,
+) -> list[AwsSigV4ProxyEntry]:
+    """
+    Normalize an ``aws_sigv4`` entry into per-host re-signing bindings.
+
+    Unlike the header-swap types, ``aws_sigv4`` always discards and
+    rebuilds the request's auth-related headers — there is no
+    swap-on-access mode and no ``env`` injection shim (boto3 cannot build
+    a request at all without local credentials, so the sandbox always
+    gets placeholders — see
+    :func:`omnigent.inner.credential_proxy.prepare_credential_proxy_runtime`).
+
+    :param model: The validated ``aws_sigv4`` entry; carries
+        ``target``/``targets``, ``credential``, ``region``, and optional
+        ``service``.
+    :param index: Entry index for error messages.
+    :returns: One :class:`AwsSigV4ProxyEntry` per declared host.
+    :raises OmnigentError: If a host fails DNS-safety validation.
+    """
+    assert model.credential is not None and model.region is not None
+    credential = model.credential.to_spec()
+    service = model.service or "s3"
+    return [
+        AwsSigV4ProxyEntry(host=host, region=model.region, service=service, credential=credential)
         for host in _resolve_credential_hosts(model, index=index)
     ]
 

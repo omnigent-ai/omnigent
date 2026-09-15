@@ -10,6 +10,7 @@ injection through a real sandbox + proxy is covered in
 
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 from pathlib import Path
@@ -19,12 +20,18 @@ import pytest
 from omnigent.errors import OmnigentError
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
+    AwsSigV4CredentialProvider,
+    AwsSigV4ProfileCredentialProvider,
     CredentialProxyRuntime,
     DatabricksProfileTokenProvider,
+    _prepare_aws_sigv4_rewrite,
     _prepare_databricks_runtime,
     prepare_credential_proxy_runtime,
 )
 from omnigent.inner.datamodel import (
+    AwsAssumeRoleSpec,
+    AwsSigV4CredentialSpec,
+    AwsSigV4ProxyEntry,
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
@@ -395,3 +402,297 @@ def test_databricks_runtime_rejects_same_host_profiles() -> None:
 
     with pytest.raises(OmnigentError, match="resolve to workspace host"):
         _prepare_databricks_runtime(spec, CredentialProxyRuntime(), provider_factory=factory)
+
+
+# ---------------------------------------------------------------------------
+# aws_sigv4 — full-request re-signing (a separate mechanism from the
+# header-swap rewrites tested above; see omnigent.inner.egress.aws_sigv4).
+# ---------------------------------------------------------------------------
+
+
+def _aws_sigv4_static_spec(*, region: str = "us-east-1") -> CredentialProxySpec:
+    return CredentialProxySpec(
+        entries=[],
+        aws_sigv4=[
+            AwsSigV4ProxyEntry(
+                host="mybucket.s3.us-east-1.amazonaws.com",
+                region=region,
+                credential=AwsSigV4CredentialSpec(
+                    access_key_id=CredentialSourceSpec(kind="env", env="T_AKID"),
+                    secret_access_key=CredentialSourceSpec(kind="env", env="T_SECRET"),
+                ),
+            )
+        ],
+    )
+
+
+def test_aws_sigv4_runtime_resolves_static_credentials() -> None:
+    """Static credential parts resolve from parent_env; the sandbox only
+    ever sees placeholders, never the real key/secret."""
+    spec = _aws_sigv4_static_spec()
+    runtime = prepare_credential_proxy_runtime(
+        spec, parent_env={"T_AKID": "AKIDREAL", "T_SECRET": "realsecret"}
+    )
+
+    assert len(runtime.aws_sigv4_rewrites) == 1
+    rule = runtime.aws_sigv4_rewrites[0]
+    assert rule.host == "mybucket.s3.us-east-1.amazonaws.com"
+    assert rule.region == "us-east-1"
+    assert rule.service == "s3"
+    creds = rule.resolve_credentials()
+    assert creds.access_key_id == "AKIDREAL"
+    assert creds.secret_access_key == "realsecret"
+    assert creds.session_token is None
+
+    assert runtime.helper_env_updates["AWS_ACCESS_KEY_ID"] != "AKIDREAL"
+    assert runtime.helper_env_updates["AWS_SECRET_ACCESS_KEY"] != "realsecret"
+    assert runtime.helper_env_updates["AWS_DEFAULT_REGION"] == "us-east-1"
+    assert runtime.helper_env_updates["AWS_REGION"] == "us-east-1"
+    assert runtime.helper_env_updates["AWS_EC2_METADATA_DISABLED"] == "true"
+
+
+def test_aws_sigv4_runtime_resolves_session_token() -> None:
+    spec = CredentialProxySpec(
+        entries=[],
+        aws_sigv4=[
+            AwsSigV4ProxyEntry(
+                host="b.s3.us-east-1.amazonaws.com",
+                region="us-east-1",
+                credential=AwsSigV4CredentialSpec(
+                    access_key_id=CredentialSourceSpec(kind="env", env="T_AKID"),
+                    secret_access_key=CredentialSourceSpec(kind="env", env="T_SECRET"),
+                    session_token=CredentialSourceSpec(kind="env", env="T_TOKEN"),
+                ),
+            )
+        ],
+    )
+    runtime = prepare_credential_proxy_runtime(
+        spec, parent_env={"T_AKID": "AKID", "T_SECRET": "sek", "T_TOKEN": "tok"}
+    )
+    creds = runtime.aws_sigv4_rewrites[0].resolve_credentials()
+    assert creds.session_token == "tok"
+
+
+def test_aws_sigv4_runtime_fail_loud_on_missing_secret() -> None:
+    spec = _aws_sigv4_static_spec()
+    with pytest.raises(ValueError, match="missing or empty"):
+        prepare_credential_proxy_runtime(spec, parent_env={"T_AKID": "AKIDREAL"})
+
+
+def test_aws_sigv4_runtime_uses_assume_role_provider_when_configured() -> None:
+    """An assume_role entry produces a rule with credential_provider set
+    (not static_credentials), and a static entry produces the opposite."""
+    static_spec = _aws_sigv4_static_spec()
+    static_runtime = prepare_credential_proxy_runtime(
+        static_spec, parent_env={"T_AKID": "a", "T_SECRET": "b"}
+    )
+    static_rule = static_runtime.aws_sigv4_rewrites[0]
+    assert static_rule.static_credentials is not None
+    assert static_rule.credential_provider is None
+
+    assume_role_spec = CredentialProxySpec(
+        entries=[],
+        aws_sigv4=[
+            AwsSigV4ProxyEntry(
+                host="b.s3.us-west-2.amazonaws.com",
+                region="us-west-2",
+                credential=AwsSigV4CredentialSpec(
+                    assume_role=AwsAssumeRoleSpec(role_arn="arn:aws:iam::123:role/x")
+                ),
+            )
+        ],
+    )
+    assume_role_runtime = prepare_credential_proxy_runtime(assume_role_spec, parent_env={})
+    assume_role_rule = assume_role_runtime.aws_sigv4_rewrites[0]
+    assert assume_role_rule.static_credentials is None
+    assert assume_role_rule.credential_provider is not None
+
+
+class _FakeStsClient:
+    """Stand-in for a ``boto3.client("sts")`` in provider tests."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        self._tokens = tokens
+        self.assume_role_calls = 0
+
+    def assume_role(self, **kwargs: object) -> dict[str, object]:
+        idx = min(self.assume_role_calls, len(self._tokens) - 1)
+        self.assume_role_calls += 1
+        return {
+            "Credentials": {
+                "AccessKeyId": f"ASIA{idx}",
+                "SecretAccessKey": "sek",
+                "SessionToken": self._tokens[idx],
+                "Expiration": datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(seconds=3600),
+            }
+        }
+
+
+def test_aws_sigv4_credential_provider_assumes_role_and_refreshes() -> None:
+    """The provider caches within the refresh margin and re-mints once
+    the cached credentials near their STS-declared expiry."""
+    fake = _FakeStsClient(["tok-1", "tok-2"])
+    clock = {"now": 0.0}
+    provider = AwsSigV4CredentialProvider(
+        "arn:aws:iam::123456789012:role/x",
+        duration_seconds=3600,
+        refresh_margin_seconds=300.0,
+        sts_client_factory=lambda: fake,
+        clock=lambda: clock["now"],
+    )
+
+    creds = provider.resolve()
+    assert creds.session_token == "tok-1"
+    assert fake.assume_role_calls == 1
+
+    clock["now"] = 1000.0  # well within the ~3600s window minus margin -> cached
+    assert provider.resolve().session_token == "tok-1"
+    assert fake.assume_role_calls == 1
+
+    clock["now"] = 3400.0  # within refresh_margin_seconds of expiry -> re-mint
+    assert provider.resolve().session_token == "tok-2"
+    assert fake.assume_role_calls == 2
+
+
+def test_aws_sigv4_credential_provider_missing_boto3_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default STS client factory fails loud when boto3 is absent."""
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    provider = AwsSigV4CredentialProvider("arn:aws:iam::123456789012:role/x")
+    with pytest.raises(OmnigentError, match="requires 'boto3'"):
+        provider.resolve()
+
+
+def test_prepare_aws_sigv4_rewrite_static_and_assume_role() -> None:
+    """The runtime helper dispatches on entry.credential.assume_role."""
+    static_entry = AwsSigV4ProxyEntry(
+        host="b.s3.us-east-1.amazonaws.com",
+        region="us-east-1",
+        credential=AwsSigV4CredentialSpec(
+            access_key_id=CredentialSourceSpec(kind="env", env="T_AKID"),
+            secret_access_key=CredentialSourceSpec(kind="env", env="T_SECRET"),
+        ),
+    )
+    rule = _prepare_aws_sigv4_rewrite(static_entry, parent_env={"T_AKID": "a", "T_SECRET": "b"})
+    assert rule.static_credentials is not None
+
+    def factory(role_arn: str, **kwargs: object) -> AwsSigV4CredentialProvider:
+        return AwsSigV4CredentialProvider(
+            role_arn, sts_client_factory=lambda: _FakeStsClient(["tok"]), **kwargs
+        )
+
+    assume_role_entry = AwsSigV4ProxyEntry(
+        host="c.s3.us-west-2.amazonaws.com",
+        region="us-west-2",
+        credential=AwsSigV4CredentialSpec(
+            assume_role=AwsAssumeRoleSpec(role_arn="arn:aws:iam::123:role/x")
+        ),
+    )
+    rule2 = _prepare_aws_sigv4_rewrite(assume_role_entry, parent_env={}, provider_factory=factory)
+    assert rule2.credential_provider is not None
+    assert rule2.resolve_credentials().session_token == "tok"
+
+
+class _FakeFrozenCredentials:
+    """Stand-in for ``botocore.credentials.ReadOnlyCredentials``."""
+
+    def __init__(self, access_key: str, secret_key: str, token: str | None) -> None:
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.token = token
+
+
+class _FakeProfileCredentials:
+    """Stand-in for a ``boto3.Session(profile_name=...).get_credentials()``
+    result: ``get_frozen_credentials()`` re-reads current state each call,
+    the same way boto3's real object refreshes SSO/role-chained profiles."""
+
+    def __init__(self, access_key: str, secret_key: str, token: str | None = None) -> None:
+        self._access_key = access_key
+        self._secret_key = secret_key
+        self._token = token
+
+    def get_frozen_credentials(self) -> _FakeFrozenCredentials:
+        return _FakeFrozenCredentials(self._access_key, self._secret_key, self._token)
+
+
+def test_aws_sigv4_profile_credential_provider_resolves() -> None:
+    """The profile provider re-freezes the boto3 credentials object on
+    every ``resolve()``, matching a profile that role-chains or uses SSO."""
+    fake = _FakeProfileCredentials("AKIAPROFILE", "sek", "tok")
+    provider = AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: fake)
+    creds = provider.resolve()
+    assert creds.access_key_id == "AKIAPROFILE"
+    assert creds.secret_access_key == "sek"
+    assert creds.session_token == "tok"
+
+
+def test_aws_sigv4_profile_credential_provider_rejects_incomplete_credential() -> None:
+    """A profile that resolves to an empty secret key fails loud."""
+    fake = _FakeProfileCredentials("AKIAPROFILE", "")
+    provider = AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: fake)
+    with pytest.raises(OmnigentError, match="incomplete credential"):
+        provider.resolve()
+
+
+def test_aws_sigv4_profile_credential_provider_missing_boto3_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default profile-credentials factory fails loud when boto3 is
+    absent, at construction time rather than on first ``resolve()``."""
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    with pytest.raises(OmnigentError, match="requires 'boto3'"):
+        AwsSigV4ProfileCredentialProvider("prod")
+
+
+def test_aws_sigv4_profile_credential_provider_missing_profile_fails_loud() -> None:
+    """A profile with no resolvable credentials fails loud at construction."""
+    with pytest.raises(OmnigentError, match="resolved no credentials"):
+        AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: None)
+
+
+def test_prepare_aws_sigv4_rewrite_profile() -> None:
+    """The runtime helper dispatches on entry.credential.profile, letting
+    one ``~/.aws/credentials`` with multiple named profiles back different
+    ``aws_sigv4`` host entries."""
+    fake = _FakeProfileCredentials("AKIAPROFILE", "sek")
+
+    def profile_factory(profile: str) -> AwsSigV4ProfileCredentialProvider:
+        assert profile == "prod"
+        return AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: fake)
+
+    entry = AwsSigV4ProxyEntry(
+        host="d.s3.us-east-1.amazonaws.com",
+        region="us-east-1",
+        credential=AwsSigV4CredentialSpec(profile="prod"),
+    )
+    rule = _prepare_aws_sigv4_rewrite(
+        entry, parent_env={}, profile_provider_factory=profile_factory
+    )
+    assert rule.static_credentials is None
+    assert rule.credential_provider is not None
+    assert rule.resolve_credentials().access_key_id == "AKIAPROFILE"
+
+
+def test_prepare_aws_sigv4_rewrite_assume_role_passes_profile_through() -> None:
+    """``assume_role.profile`` reaches the provider factory as the caller
+    identity for the STS call, distinct from ``credential.profile``."""
+    seen: dict[str, object] = {}
+
+    def factory(role_arn: str, **kwargs: object) -> AwsSigV4CredentialProvider:
+        seen.update(kwargs)
+        return AwsSigV4CredentialProvider(
+            role_arn, sts_client_factory=lambda: _FakeStsClient(["tok"]), **kwargs
+        )
+
+    entry = AwsSigV4ProxyEntry(
+        host="e.s3.us-east-1.amazonaws.com",
+        region="us-east-1",
+        credential=AwsSigV4CredentialSpec(
+            assume_role=AwsAssumeRoleSpec(role_arn="arn:aws:iam::123:role/x", profile="prod")
+        ),
+    )
+    _prepare_aws_sigv4_rewrite(entry, parent_env={}, provider_factory=factory)
+    assert seen["profile"] == "prod"
