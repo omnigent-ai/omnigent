@@ -340,3 +340,79 @@ def test_no_permission_mode_omits_env_var(_isolate_config: Path) -> None:
     assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_spawn_env(
         _make_spec(harness="acp:goose")
     )
+
+
+# ── Curated model list + env denylist forwarding ────────────────────────────
+
+
+def _write_provider_config(tmp_path: Path, models: dict[str, str] | None = None) -> None:
+    provider = {
+        "kind": "gateway",
+        "default": True,
+        "anthropic": {
+            "base_url": "https://gw.example.com/anthropic",
+            "api_key": "sk-anthropic",
+        },
+        "openai": {
+            "base_url": "https://gw.example.com/openai",
+            "api_key": "sk-openai",
+            "wire_api": "chat",
+            "models": models or {},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"acp": {"agents": _AGENTS}, "providers": {"bifrost": provider}})
+    )
+
+
+def test_curated_model_list_forwards_launch_first(_isolate_config: Path) -> None:
+    """HARNESS_ACP_MODEL_LIST carries the launch model, then curated ids."""
+    _write_provider_config(
+        _isolate_config,
+        {"default": "gpt-5.4", "reasoner": "deepseek-v4-pro"},
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose", model="custom-model"))
+    assert env["HARNESS_ACP_MODEL"] == "custom-model"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "custom-model,gpt-5.4,deepseek-v4-pro"
+
+
+def test_provider_default_model_pins_launch_model(_isolate_config: Path) -> None:
+    """An unpinned spec/agent launches on the curated ``models["default"]`` tier.
+
+    Gateway deployments curate the default tier as the launch model for ACP
+    workers exactly as pi-native's ``enabledModels`` does: when the spec and
+    the configured agent leave the model to the deployment, the provider's
+    ``models["default"]`` value becomes ``HARNESS_ACP_MODEL`` (and leads the
+    curated list) instead of falling back to config order.
+    """
+    _write_provider_config(
+        _isolate_config,
+        {"default": "deepseek-v4-pro", "flash": "deepseek-v4-flash"},
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:gemini-cli"))
+    assert env["HARNESS_ACP_MODEL"] == "deepseek-v4-pro"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "deepseek-v4-pro,deepseek-v4-flash"
+
+
+def test_curated_model_list_absent_when_nothing_curated(_isolate_config: Path) -> None:
+    """No models: map anywhere → no HARNESS_ACP_MODEL_LIST (uncurated op)."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose", model="gpt-5.3"))
+    assert "HARNESS_ACP_MODEL_LIST" not in env
+
+
+def test_env_unset_denylist_forwarded(
+    monkeypatch: pytest.MonkeyPatch, _isolate_config: Path
+) -> None:
+    """OMNIGENT_ACP_ENV_UNSET rides the spawn env so the wrap can scrub the CLI env."""
+    _write_acp_config(_isolate_config)
+    monkeypatch.setenv("OMNIGENT_ACP_ENV_UNSET", "ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY")
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert env["HARNESS_ACP_ENV_UNSET"] == "ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY"
+
+
+def test_env_unset_absent_by_default(_isolate_config: Path) -> None:
+    """Unset operator denylist forwards nothing — no scrubbing (safe default)."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert "HARNESS_ACP_ENV_UNSET" not in env

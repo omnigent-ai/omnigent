@@ -1882,3 +1882,145 @@ def test_model_services_listing_stops_on_repeated_page_token(
 
     assert [entry.id for entry in entries]  # partial list kept, not an exception
     assert any("repeated a page token" in record.message for record in caplog.records)
+
+
+# ── Generic ACP curation (acp_curated_models) ───────────────────────────────
+
+
+_GATEWAY_WITH_MODELS = (
+    "providers:\n"
+    "  bifrost:\n"
+    "    kind: gateway\n"
+    "    default: true\n"
+    "    anthropic:\n"
+    "      base_url: https://gw.example.com/anthropic\n"
+    "      api_key: sk-anthropic\n"
+    "      models:\n"
+    "        default: claude-fable-5\n"
+    "        opus: claude-opus-x\n"
+    "    openai:\n"
+    "      base_url: https://gw.example.com/openai\n"
+    "      api_key: sk-openai\n"
+    "      wire_api: chat\n"
+    "      models:\n"
+    "        default: gpt-5.4\n"
+    "        reasoner: claude-fable-5\n"
+)
+
+
+def test_acp_curated_models_launch_first_deduped_config_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The launch model leads; the family models: maps union in config order.
+
+    The acp picker must always show the active model (never hide it), and
+    duplicate ids collapse so a tier map repeating the default does not
+    double-list the id.
+    """
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:custom", model="gpt-5.4")
+    assert model_catalog.acp_curated_models(spec) == (
+        "gpt-5.4",
+        "claude-fable-5",
+        "claude-opus-x",
+    )
+
+
+def test_acp_curated_models_without_models_map_keeps_launch_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No models: map yields just the launch model (nothing was curated)."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  bifrost:\n"
+        "    kind: gateway\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://gw.example.com/anthropic\n"
+        "      api_key: sk-anthropic\n",
+    )
+    spec = _worker_spec("acp:custom", model="claude-x")
+    assert model_catalog.acp_curated_models(spec) == ("claude-x",)
+
+
+def test_acp_curated_models_provider_default_leads_when_unpinned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The provider's ``models["default"]`` tier leads an unpinned shortlist.
+
+    Gateway deployments curate the default tier as the launch model. When
+    neither the spec nor the configured ACP agent pins a model, the picker
+    must present that tier first (it becomes the default row) instead of
+    falling back to raw config order.
+    """
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:custom")
+    assert model_catalog.acp_curated_models(spec) == (
+        "claude-fable-5",
+        "claude-opus-x",
+        "gpt-5.4",
+    )
+
+
+def test_acp_curated_models_default_alias_resolves_to_concrete_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``default:`` naming another tier resolves to the concrete model id.
+
+    Gateway deployments alias tier names (``deepseek-pro``) to model ids
+    (``deepseek-v4-pro``) and reference an alias from ``default:``. Launch
+    and picker rows must be concrete ids: the alias itself never appears as
+    launch or a list row, and the aliased tier's id stays deduplicated.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  bifrost:\n"
+        "    kind: gateway\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://gw.example.com/v1\n"
+        "      api_key: sk-openai\n"
+        "      wire_api: chat\n"
+        "      models:\n"
+        "        default: deepseek-pro\n"
+        "        deepseek-pro: deepseek-v4-pro\n"
+        "        gemma: gemma-4-31B-it\n",
+    )
+    spec = _worker_spec("acp:custom")
+    assert model_catalog.acp_curated_models(spec) == (
+        "deepseek-v4-pro",
+        "gemma-4-31B-it",
+    )
+
+
+def test_acp_curated_models_empty_without_provider_or_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No provider config and no model: empty shortlist, no picker."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    assert model_catalog.acp_curated_models(_worker_spec("acp")) == ()
+
+
+def test_resolve_provider_acp_slug_canonicalizes_and_prefers_anthropic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``acp:<slug>`` resolves like ``acp``: family-agnostic, anthropic first."""
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    provider = resolve_model_provider(
+        _worker_spec("acp:whatever", model="claude-fable-5"), "acp:whatever"
+    )
+    assert provider.kind == "gateway"
+    assert provider.family == "anthropic"
+
+
+def test_resolve_provider_acp_reports_none_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bare acp session with no provider resolves to kind=none, not an error."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec("acp"), "acp")
+    assert provider.kind == "none"
