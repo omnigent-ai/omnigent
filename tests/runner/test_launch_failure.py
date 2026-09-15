@@ -74,6 +74,88 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
+# Pane output proving the CLI was present and running: it self-updated and
+# printed a resume hint, then a stray flag hit the shell as command-not-found
+# (exit 127). This is a mid-session crash of a present CLI, not a missing
+# install.
+_PRESENT_CLI_CRASH_OUTPUT = "\n".join(
+    (
+        "● Unknown command: /restart",
+        "  Press Ctrl-C again to exit    ✔ Update installed · Restart to update",
+        "Resume this session with:",
+        "claude --resume be28caff-2e85-47de-8f17-9346d116106b",
+        "zsh:2: command not found: --model",
+    )
+)
+
+
+def test_present_cli_crash_with_stray_flag_is_not_missing_binary() -> None:
+    # The not-found line blames `--model`, not the claude command itself, and
+    # the rest of the pane proves the CLI ran. Must not say "install the
+    # harness" — unclassified is the honest answer.
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=127,
+        output=_PRESENT_CLI_CRASH_OUTPUT,
+    )
+    assert diagnosis is None
+
+
+def test_exit_127_with_output_not_blaming_command_is_not_missing_binary() -> None:
+    # A present CLI that produced output and then exited 127 for its own
+    # reasons is not a missing install.
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=127,
+        output="Welcome to Claude Code!\nSession crashed unexpectedly",
+    )
+    assert diagnosis is None
+
+
+def test_missing_binary_named_without_command_word_still_matches() -> None:
+    # dash prints ``claude: not found`` with no "command"; the line names the
+    # launched command, so it is still a missing install.
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=127,
+        output="sh: 1: claude: not found",
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent command not found"
+
+
+def test_missing_binary_matches_full_path_not_found_line() -> None:
+    diagnosis = classify_terminal_failure(
+        command="/usr/local/bin/claude",
+        exit_status=127,
+        output="bash: /usr/local/bin/claude: No such file or directory",
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent command not found"
+
+
+def test_command_name_matches_on_word_boundary_only() -> None:
+    # ``sh`` must not match inside ``zsh:``; the not-found line is about a
+    # stray flag, not the launched shell.
+    diagnosis = classify_terminal_failure(
+        command="sh",
+        exit_status=127,
+        output="zsh:2: command not found: --model",
+    )
+    assert diagnosis is None
+
+
+def test_unknown_command_keeps_strict_marker_match() -> None:
+    # With no command to cross-check, a shell not-found marker still counts.
+    diagnosis = classify_terminal_failure(
+        command=None,
+        exit_status=None,
+        output="bash: qwen: command not found",
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent command not found"
+
+
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
     # Ordering guard: the root case also reads like a permission problem, so it
     # must be matched before any broader rule.
