@@ -88,10 +88,14 @@ def _tmux(socket: str, *args: str) -> str:
 
 
 def _wait_for_pane_text(socket: str, text: str) -> None:
-    _wait_for(
-        lambda: text in _tmux(socket, "capture-pane", "-p", "-S", "-1000"),
-        f"replacement TUI to display {text!r}",
-    )
+    try:
+        _wait_for(
+            lambda: text in _tmux(socket, "capture-pane", "-p", "-S", "-1000"),
+            f"replacement TUI to display {text!r}",
+        )
+    except AssertionError as exc:
+        pane = _tmux(socket, "capture-pane", "-p", "-S", "-1000")
+        raise AssertionError(f"{exc}\nLast pane contents:\n{pane}") from exc
 
 
 def test_codex_terminal_recovery_preserves_inflight_turn(
