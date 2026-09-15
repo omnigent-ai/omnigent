@@ -20,6 +20,7 @@ import { useChatStore } from "@/store/chatStore";
 // The primary workspace environment is always "default".  This hook targets
 // the primary workspace; pass a different id if terminal environments are needed.
 const DEFAULT_ENVIRONMENT_ID = "default";
+const MAX_MODEL_PREVIEW_BYTES = 256 * 1024 * 1024;
 
 export interface FileContentResponse {
   object: "session.environment.filesystem.file_content";
@@ -111,6 +112,80 @@ function clickDownloadLink(href: string, filename: string): void {
   document.body.append(link);
   link.click();
   link.remove();
+}
+
+export class WorkspaceFilePreviewTooLargeError extends Error {
+  constructor(maxBytes: number) {
+    const limit =
+      maxBytes === MAX_MODEL_PREVIEW_BYTES ? "256 MiB" : `${maxBytes.toLocaleString()} bytes`;
+    super(`Workspace file exceeds the ${limit} preview limit.`);
+    this.name = "WorkspaceFilePreviewTooLargeError";
+  }
+}
+
+interface FetchWorkspaceFileBytesOptions {
+  signal?: AbortSignal;
+  maxBytes?: number;
+}
+
+/** Fetch bounded workspace bytes through the otherwise uncapped download route. */
+export async function fetchWorkspaceFileBytes(
+  conversationId: string,
+  path: string,
+  options: FetchWorkspaceFileBytesOptions = {},
+): Promise<ArrayBuffer> {
+  const maxBytes = options.maxBytes ?? MAX_MODEL_PREVIEW_BYTES;
+  const controller = new AbortController();
+  const abort = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abort();
+  else options.signal?.addEventListener("abort", abort, { once: true });
+
+  try {
+    const res = await authenticatedFetch(
+      workspaceFileUrl(conversationId, path, { download: "true" }),
+      { signal: controller.signal },
+    );
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+
+    const contentLength = Number(res.headers.get("Content-Length"));
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      controller.abort();
+      throw new WorkspaceFilePreviewTooLargeError(maxBytes);
+    }
+
+    if (!res.body) {
+      const buffer = await res.arrayBuffer();
+      if (buffer.byteLength > maxBytes) throw new WorkspaceFilePreviewTooLargeError(maxBytes);
+      return buffer;
+    }
+
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    const readNextChunk = async (): Promise<void> => {
+      const { done, value } = await reader.read();
+      if (done) return;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        controller.abort();
+        await reader.cancel().catch(() => undefined);
+        throw new WorkspaceFilePreviewTooLargeError(maxBytes);
+      }
+      chunks.push(value);
+      await readNextChunk();
+    };
+    await readNextChunk();
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes.buffer;
+  } finally {
+    options.signal?.removeEventListener("abort", abort);
+  }
 }
 
 /**
