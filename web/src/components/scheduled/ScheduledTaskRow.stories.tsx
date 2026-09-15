@@ -21,6 +21,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     permissionMode: null,
     workspace: null,
     hostId: null,
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
