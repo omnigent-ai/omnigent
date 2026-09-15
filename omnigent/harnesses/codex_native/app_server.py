@@ -1043,6 +1043,57 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     return home
 
 
+def drop_unroutable_rows(
+    rows: list[_JsonObject],
+    *,
+    gateway_routed: bool,
+) -> list[_JsonObject]:
+    """Drop catalog rows the launch's own endpoint cannot route.
+
+    The same invariant the claude side enforces: never offer a model the
+    launch would refuse. A gateway-routed launch reaches only catalog-spelled
+    ids (``system.ai.gpt-6-astra``); a bare vendor id is a 404 there.
+
+    Codex earns this cheaply — its ``model/list`` is the configured
+    endpoint's own answer, so a healthy probe loses nothing here. It is a
+    guard, not a repair: codex's listing is a real listing today, but the
+    claude side needed this exact rule because a CLI's *static* alias list
+    advertises tiers no endpoint serves, and a future codex that padded
+    ``model/list`` with bundled entries would put an unroutable row straight
+    into the picker.
+
+    :param rows: Raw ``model/list`` rows.
+    :param gateway_routed: Whether the launch routes through a gateway that
+        serves only its own spellings.
+    :returns: The rows this launch can actually run.
+    """
+    if not gateway_routed:
+        return rows
+    from omnigent.models.codex_model_vocabulary import gateway_spelled_model
+
+    kept = [
+        row
+        for row in rows
+        if gateway_spelled_model(str(row.get("id") or ""))
+        or gateway_spelled_model(str(row.get("model") or ""))
+    ]
+    if not kept:
+        # Every row looks unroutable, so the inference is what is wrong — an
+        # empty picker is worse than an honest one. Keep codex's own answer.
+        _logger.warning(
+            "codex catalog: every row looks unroutable on a gateway launch; "
+            "keeping the harness listing verbatim"
+        )
+        return rows
+    if len(kept) != len(rows):
+        dropped = sorted(str(row.get("id") or "") for row in rows if row not in kept)
+        _logger.info(
+            "codex catalog: dropped %s — not spelled for the gateway this launch routes to",
+            ", ".join(dropped),
+        )
+    return kept
+
+
 def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> list[_JsonObject]:
     """
     Reduce ``model/list`` rows to exactly one ``isDefault`` marker.
@@ -1150,7 +1201,11 @@ async def probe_codex_model_options(
             with contextlib.suppress(Exception):
                 await client.close()
         await _stop_codex_model_discovery_process(discovery)
-    return mark_launch_default(rows, pinned_model)
+    # A Databricks profile is what puts the launch behind the gateway; a
+    # generic provider routes through its own ``-c`` overrides, whose
+    # ``model/list`` already answers in that provider's vocabulary.
+    routable = drop_unroutable_rows(rows, gateway_routed=launch.profile is not None)
+    return mark_launch_default(routable, pinned_model)
 
 
 def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | None = None) -> str:

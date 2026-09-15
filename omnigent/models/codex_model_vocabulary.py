@@ -97,6 +97,20 @@ def bare_model_id(model: str) -> str:
     return bare
 
 
+def gateway_spelled_model(model: str) -> bool:
+    """Whether a model id carries a gateway catalog prefix.
+
+    A gateway routes only its own spellings, so the prefix is what says a row
+    came from one rather than from codex's bundled vocabulary.
+
+    :param model: Any model id, e.g. ``"system.ai.gpt-6-astra"``.
+    :returns: ``True`` for a catalog-prefixed id, ``False`` for a bare codex
+        slug such as ``"gpt-5.6-sol"``.
+    """
+    bare = model.strip().lower()
+    return any(bare.startswith(prefix) for prefix in _CATALOG_PREFIXES)
+
+
 def comparable_model_id(model: str) -> str:
     """Fold a model id to the spelling codex ids compare in.
 

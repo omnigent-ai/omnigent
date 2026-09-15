@@ -38,6 +38,7 @@ from omnigent.harnesses.codex_native.app_server import (
     build_codex_native_server,
     codex_terminal_env,
     discover_codex_model_options,
+    drop_unroutable_rows,
     framework_approved_tools,
     trust_all_codex_hooks,
     trust_codex_router_hooks,
@@ -3337,3 +3338,72 @@ async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:
     )
     with pytest.raises(RuntimeError, match=r"^Codex model discovery exited early \(1\)$"):
         await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)
+
+
+# ── never offer a row this launch's own endpoint would refuse ───────────────
+
+
+def _gateway_rows() -> list[dict[str, Any]]:
+    return [
+        {"id": "system.ai.gpt-6-astra", "model": "system.ai.gpt-6-astra"},
+        {"id": "system.ai.glm-5-2", "model": "system.ai.glm-5-2"},
+    ]
+
+
+def _bare_rows() -> list[dict[str, Any]]:
+    return [
+        {"id": "gpt-6-astra", "model": "gpt-6-astra"},
+        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol"},
+    ]
+
+
+def test_unroutable_filter_is_inert_off_a_gateway() -> None:
+    """A plain codex login routes bare ids, so every row stands."""
+    rows = _bare_rows()
+
+    assert drop_unroutable_rows(rows, gateway_routed=False) == rows
+
+
+def test_gateway_launch_keeps_catalog_spelled_rows() -> None:
+    """A healthy gateway probe answers in the gateway's own vocabulary."""
+    rows = _gateway_rows()
+
+    assert drop_unroutable_rows(rows, gateway_routed=True) == rows
+
+
+def test_gateway_launch_drops_a_bare_row() -> None:
+    """A bare vendor id is a 404 on a gateway, so it must not reach the picker."""
+    rows = [*_gateway_rows(), {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol"}]
+
+    kept = drop_unroutable_rows(rows, gateway_routed=True)
+
+    assert [row["id"] for row in kept] == ["system.ai.gpt-6-astra", "system.ai.glm-5-2"]
+
+
+def test_gateway_launch_accepts_a_row_spelled_only_in_model() -> None:
+    """``model`` carries the wire spelling when ``id`` is codex's own slug."""
+    rows = [{"id": "gpt-6-astra", "model": "databricks-gpt-6-astra"}]
+
+    assert drop_unroutable_rows(rows, gateway_routed=True) == rows
+
+
+def test_gateway_launch_never_empties_the_picker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """All rows unroutable means the INFERENCE is wrong, not the listing.
+
+    An empty model picker is a worse outcome than an honest one, so codex's
+    own answer stands and the disagreement is logged instead.
+    """
+    rows = _bare_rows()
+
+    with caplog.at_level("WARNING"):
+        kept = drop_unroutable_rows(rows, gateway_routed=True)
+
+    assert kept == rows
+    assert "every row looks unroutable" in caplog.text
+
+
+def test_unroutable_filter_handles_an_empty_listing() -> None:
+    """A failed probe yields no rows; the filter must not invent a decision."""
+    assert drop_unroutable_rows([], gateway_routed=True) == []

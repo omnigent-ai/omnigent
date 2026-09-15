@@ -10458,6 +10458,9 @@ async def test_claude_model_catalog_marks_the_enumerated_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The enumeration run's own model marks its row as the default."""
+    # Canonical alias rows only survive a launch that can route them, so pin
+    # the plain-subscription environment rather than the developer's shell.
+    _clear_claude_routing_env(monkeypatch)
 
     async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
         del config
@@ -10535,6 +10538,7 @@ async def test_claude_model_catalog_appends_an_off_list_default(
     ``settings.json`` ``ANTHROPIC_MODEL`` pin); the catalog appends it as a
     row so every visible row is launchable and the Default label is honest.
     """
+    _clear_claude_routing_env(monkeypatch)
 
     async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
         del config
@@ -10740,10 +10744,17 @@ def _subscription_catalog() -> list[dict[str, object]]:
     ],
 )
 def test_claude_catalog_serves_model(
-    model: str, config: claude_native.ClaudeNativeUcodeConfig | None, served: bool
+    model: str,
+    config: claude_native.ClaudeNativeUcodeConfig | None,
+    served: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Exact rows serve; a canonical id serves on a canonical endpoint when its family is listed."""
+    # The ``None`` rows mean "plain subscription launch", which is a statement
+    # about the environment as much as the config — say it, rather than
+    # inheriting whatever gateway the developer's shell exports.
+    _clear_claude_routing_env(monkeypatch)
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
@@ -11164,7 +11175,7 @@ async def test_claude_model_catalog_keeps_canonical_ids_without_ambient_gateway(
         )
 
     monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    _clear_claude_routing_env(monkeypatch)
 
     rows = await claude_native.claude_model_catalog(None)
 
@@ -11172,6 +11183,240 @@ async def test_claude_model_catalog_keeps_canonical_ids_without_ambient_gateway(
     # Both canonical models should be present
     assert [row["id"] for row in rows] == ["sonnet", "opus"]
     assert rows[1]["isDefault"] is True
+
+
+# ── the one servability decision, and the env it must read ─────────────────
+
+
+def _clear_claude_routing_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop every ambient variable that decides Claude Code's endpoint.
+
+    The developer machines this runs on really do export a gateway
+    ``ANTHROPIC_BASE_URL``, so a test that wants the plain-subscription
+    baseline has to say so.
+    """
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "CLAUDE_CODE_USE_BEDROCK"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _gateway_config(**env: str) -> claude_native.ClaudeNativeUcodeConfig:
+    return claude_native.ClaudeNativeUcodeConfig(
+        env=dict(env),
+        api_key_helper="printf token",
+        model="system.ai.claude-opus-4-8",
+    )
+
+
+def test_launch_serves_canonical_ids_without_any_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain subscription launch resolves canonical aliases natively."""
+    _clear_claude_routing_env(monkeypatch)
+    assert claude_native._launch_serves_canonical_anthropic_ids(None) is True
+
+
+def test_launch_refuses_canonical_ids_on_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``None`` config means omnigent configured nothing, NOT that canonical ids are safe."""
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv(
+        "ANTHROPIC_BASE_URL", "https://ws.example.databricks.com/ai-gateway/anthropic"
+    )
+    assert claude_native._launch_serves_canonical_anthropic_ids(None) is False
+
+
+def test_launch_serves_canonical_ids_on_ambient_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Anthropic API resolves aliases itself, so nothing is rewritten for it."""
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    assert claude_native._launch_serves_canonical_anthropic_ids(None) is True
+
+
+def test_launch_refuses_canonical_ids_on_ambient_bedrock_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bedrock names models ``us.anthropic.claude-…``; a canonical id is refused there."""
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.us-west-2.amazonaws.com")
+    assert claude_native._launch_serves_canonical_anthropic_ids(None) is False
+
+
+def test_launch_refuses_canonical_ids_on_ambient_bedrock_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bedrock mode is reachable by flag alone, with the region supplying the endpoint."""
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    assert claude_native._launch_serves_canonical_anthropic_ids(None) is False
+
+
+def test_launch_reads_bedrock_flag_as_a_flag_not_a_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly-disabled flag is off, not merely present."""
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "0")
+    assert claude_native._launch_serves_canonical_anthropic_ids(None) is True
+
+
+def test_launch_config_gateway_overrides_a_clean_ambient_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config that names its own gateway decides, whatever the ambient env says."""
+    _clear_claude_routing_env(monkeypatch)
+    config = _gateway_config(ANTHROPIC_BASE_URL="https://ws.example.databricks.com/anthropic")
+    assert claude_native._launch_serves_canonical_anthropic_ids(config) is False
+
+
+def test_launch_config_anthropic_endpoint_wins_over_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config's endpoint is layered OVER the ambient one, exactly as the probe launches."""
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ws.example.databricks.com/anthropic")
+    config = _gateway_config(ANTHROPIC_BASE_URL="https://api.anthropic.com")
+    assert claude_native._launch_serves_canonical_anthropic_ids(config) is True
+
+
+def test_launch_config_without_endpoint_inherits_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config overriding no endpoint still launches into the ambient env.
+
+    The gap #6684 left: it keyed the ambient check on ``claude_config is
+    None``, so a config carrying only unrelated env kept canonical ids alive
+    on a gateway-routed machine.
+    """
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ws.example.databricks.com/anthropic")
+    config = _gateway_config(CLAUDE_CODE_API_KEY_HELPER_TTL_MS="900000")
+    assert claude_native._launch_serves_canonical_anthropic_ids(config) is False
+
+
+# ── the validation gate that approved un-routable canonical ids ────────────
+
+
+def test_catalog_serves_model_refuses_canonical_id_on_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical id the gateway 404s must not validate as launchable.
+
+    The regression: with ``claude_config is None`` the gate skipped the
+    servability check entirely and approved ``claude-sonnet-4-6`` purely
+    because the catalog listed the ``sonnet`` family.
+    """
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ws.example.databricks.com/anthropic")
+    rows = [{"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"}]
+
+    assert claude_native.claude_catalog_serves_model(rows, "claude-sonnet-4-6", None) is False
+
+
+def test_catalog_serves_model_allows_canonical_id_off_a_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The family fold still serves a plain subscription launch."""
+    _clear_claude_routing_env(monkeypatch)
+    rows = [{"id": "sonnet", "model": "claude-sonnet-4-6"}]
+
+    assert claude_native.claude_catalog_serves_model(rows, "claude-sonnet-5", None) is True
+
+
+def test_catalog_serves_model_keeps_exact_rows_on_a_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An id the catalog names exactly serves regardless of endpoint spelling rules."""
+    _clear_claude_routing_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ws.example.databricks.com/anthropic")
+    rows = [{"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"}]
+
+    assert (
+        claude_native.claude_catalog_serves_model(rows, "system.ai.claude-sonnet-4-6[1m]", None)
+        is True
+    )
+
+
+# ── the un-entitled tier the "Available:" line advertises anyway ───────────
+
+
+def test_unpinned_tier_beside_gateway_siblings_is_dropped() -> None:
+    """The reported bug: Fable listed on a workspace that serves no Fable.
+
+    Claude Code's ``Available:`` line names every alias ``/model`` ACCEPTS,
+    so it prints ``fable`` unconditionally. The three provisioned tiers
+    resolve to the gateway's own ids; the un-provisioned one has nothing to
+    pin it and falls back to the canonical Anthropic spelling. That split is
+    the signal.
+    """
+    rows = [
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
+        {"id": "opus", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "haiku", "model": "system.ai.claude-haiku-4-5"},
+        {"id": "fable", "model": "claude-fable-5-1"},
+        {"id": "fable[1m]", "model": "claude-fable-5-1[1m]"},
+    ]
+
+    kept = claude_native._drop_rows_shadowed_by_gateway_siblings(rows)
+
+    assert [row["id"] for row in kept] == ["sonnet", "opus", "haiku"]
+
+
+def test_all_canonical_rows_are_left_alone() -> None:
+    """A plain subscription launch has no gateway sibling, so nothing is inferred."""
+    rows = [
+        {"id": "sonnet", "model": "claude-sonnet-4-6"},
+        {"id": "fable", "model": "claude-fable-5-1"},
+    ]
+
+    assert claude_native._drop_rows_shadowed_by_gateway_siblings(rows) == rows
+
+
+def test_all_gateway_rows_are_left_alone() -> None:
+    """Nothing to drop when every row already speaks the gateway's vocabulary."""
+    rows = [
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
+        {"id": "opus", "model": "databricks-claude-opus-4-8"},
+    ]
+
+    assert claude_native._drop_rows_shadowed_by_gateway_siblings(rows) == rows
+
+
+def test_empty_rows_survive_the_shadow_filter() -> None:
+    """A failed probe yields no rows; the filter must not invent a decision."""
+    assert claude_native._drop_rows_shadowed_by_gateway_siblings([]) == []
+
+
+async def test_catalog_drops_an_unentitled_tier_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full path: probe rows in, no Fable row out, default marker intact."""
+    _clear_claude_routing_env(monkeypatch)
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {
+                    "id": "opus",
+                    "model": "system.ai.claude-opus-4-8[1m]",
+                    "displayName": "Opus 4.8",
+                },
+                {"id": "fable", "model": "claude-fable-5-1", "displayName": "Fable 5.1"},
+            ],
+            default_model="system.ai.claude-opus-4-8[1m]",
+            default_label="Opus 4.8",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    assert [row["id"] for row in rows] == ["opus"]
+    assert rows[0]["isDefault"] is True
 
 
 def _isolate_to_connect_fallback(monkeypatch: pytest.MonkeyPatch) -> None:

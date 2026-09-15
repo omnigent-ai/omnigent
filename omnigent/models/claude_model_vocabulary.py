@@ -107,6 +107,20 @@ def prefix_folded_model_id(model: str) -> str:
     return bare
 
 
+def gateway_spelled_model(model: str) -> bool:
+    """Whether a model id carries a gateway catalog prefix.
+
+    A gateway routes only its own spellings, so the prefix is what says a row
+    came from one rather than from Claude Code's canonical vocabulary.
+
+    :param model: Any model id, e.g. ``"system.ai.claude-opus-4-8[1m]"``.
+    :returns: ``True`` for a catalog-prefixed id, e.g. ``True`` above and
+        ``False`` for ``"claude-opus-4-8"``.
+    """
+    bare = model.strip().lower()
+    return any(bare.startswith(prefix) for prefix in _CATALOG_PREFIXES)
+
+
 def normalized_model_id(model: str) -> str:
     """Lower-case a model id, dropping catalog prefix and ``[1m]`` suffix.
 

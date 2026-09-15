@@ -463,6 +463,49 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
 
 
+def _ambient_env_is_bedrock() -> bool:
+    """Whether the ambient process env routes Claude Code at Bedrock.
+
+    Bedrock is selected by flag or by its own base URL rather than by
+    ``ANTHROPIC_BASE_URL``, and it names models ``us.anthropic.claude-…`` —
+    so a canonical ``claude-*`` id is refused there exactly as a gateway
+    refuses it. Its ambient counterpart to
+    :func:`_ambient_env_is_non_anthropic_gateway`.
+    """
+    if os.environ.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
+        return True
+    flag = os.environ.get(_CLAUDE_CODE_USE_BEDROCK_ENV, "").strip().lower()
+    return flag in {"1", "true", "yes"}
+
+
+def _launch_serves_canonical_anthropic_ids(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """Whether the endpoint THIS launch reaches accepts canonical Anthropic ids.
+
+    The one decision every servability check must ask, so no caller can
+    consult the config alone and miss the environment. A ``None`` config
+    means omnigent configured nothing — not that canonical ids are safe:
+    managed settings (Isaac, a workspace profile) point the ambient env at a
+    gateway that rejects them, and a config that overrides no endpoint of
+    its own still launches into that same env.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: ``True`` when a bare ``claude-*`` id is launchable.
+    """
+    if claude_config is None:
+        return not (_ambient_env_is_non_anthropic_gateway() or _ambient_env_is_bedrock())
+    if not _serves_canonical_anthropic_ids(claude_config):
+        return False
+    own_env = claude_config.env
+    names_own_endpoint = own_env.get(_UCODE_CLAUDE_BASE_URL_ENV) or own_env.get(
+        _ANTHROPIC_BEDROCK_BASE_URL_ENV
+    )
+    if names_own_endpoint:
+        return True
+    return not (_ambient_env_is_non_anthropic_gateway() or _ambient_env_is_bedrock())
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -504,7 +547,7 @@ def claude_catalog_serves_model(
 
     if catalog_contains(rows, model):
         return True
-    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+    if not _launch_serves_canonical_anthropic_ids(claude_config):
         return False
     if not model.lower().startswith("claude-"):
         return False
@@ -843,7 +886,10 @@ def claude_native_model_options(
                     )
     if options:
         return options
-    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+    # The ``is not None`` half is a data requirement, not a servability one:
+    # the branch offers the config's own pinned model, which a None config
+    # cannot supply.
+    if claude_config is not None and not _launch_serves_canonical_anthropic_ids(claude_config):
         # No tier pins on a gateway/Bedrock endpoint: it rejects the
         # subscription aliases below, so offer the one model it routes.
         model_id = claude_config.model
@@ -1245,6 +1291,42 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     )
 
 
+def _drop_rows_shadowed_by_gateway_siblings(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Drop bare ``claude-*`` rows when sibling rows resolved to gateway ids.
+
+    Claude Code's ``Available:`` line is the set of alias NAMES ``/model``
+    accepts, not an entitlement list — it prints ``fable`` whether or not
+    anything serves it. When a tier is provisioned, its alias resolves to the
+    gateway's own spelling; an un-provisioned tier has nothing to pin it and
+    falls back to the canonical Anthropic id. So a bare id sitting beside
+    gateway-spelled siblings is an alias the endpoint cannot route.
+
+    This is the backstop for routing omnigent cannot read off the
+    environment — a ``~/.claude/settings.json`` ``env`` block, say, which
+    Claude Code applies to itself. Rows are left alone unless the split is
+    unambiguous.
+
+    :param rows: Probe rows, e.g. ``[{"id": "opus", "model": "system.ai.…"}]``.
+    :returns: The rows an endpoint-routable launch can offer.
+    """
+    from omnigent.models.claude_model_vocabulary import gateway_spelled_model
+
+    if not any(gateway_spelled_model(str(row.get("model", ""))) for row in rows):
+        return rows
+    # The gateway-spelled row that tripped the guard above cannot itself be
+    # dropped, so this never empties the catalog.
+    kept = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
+    if len(kept) != len(rows):
+        dropped = sorted(str(row.get("id", "")) for row in rows if row not in kept)
+        _logger.info(
+            "claude catalog: dropped %s — canonical ids beside gateway-routed siblings",
+            ", ".join(dropped),
+        )
+    return kept
+
+
 async def claude_model_catalog(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]] | None:
@@ -1274,11 +1356,14 @@ async def claude_model_catalog(
     if probe is None:
         return managed_rows or None
     rows = managed_rows or list(probe.alias_rows)
-    _non_canonical = (
-        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
-    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
-    if _non_canonical:
+    canonical_ids_ok = _launch_serves_canonical_anthropic_ids(claude_config)
+    if not canonical_ids_ok:
         rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
+    elif not managed_rows:
+        # Only the CLI's own alias list needs second-guessing: managed rows
+        # are an explicit curated picker, not a set of names ``/model`` merely
+        # accepts.
+        rows = _drop_rows_shadowed_by_gateway_siblings(rows)
 
     configured_pin = claude_config.model if claude_config is not None else None
     default_model = configured_pin or probe.default_model
@@ -1299,10 +1384,7 @@ async def claude_model_catalog(
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
-        _canonical_ids_ok = (
-            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
-        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
-        servable = _canonical_ids_ok or not default_model.startswith("claude-")
+        servable = canonical_ids_ok or not default_model.startswith("claude-")
         if servable:
             # The probe's printed label describes the ENUMERATION run's
             # model; it only names a config-pinned default when the two are

@@ -12,6 +12,7 @@ from omnigent.models.codex_model_vocabulary import (
     codex_reachable_model_slug,
     codex_spawn_model,
     comparable_model_id,
+    gateway_spelled_model,
 )
 from omnigent.util.reasoning_effort import clamp_effort_for_model
 
@@ -152,3 +153,19 @@ def test_catalog_prefixes_match_the_routing_defaults() -> None:
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES
+
+
+@pytest.mark.parametrize(
+    ("model", "spelled"),
+    [
+        pytest.param("system.ai.gpt-6-astra", True, id="route-prefix"),
+        pytest.param("databricks-gpt-6-astra", True, id="endpoint-prefix"),
+        pytest.param("SYSTEM.AI.gpt-6-astra", True, id="case-folded"),
+        pytest.param("  system.ai.gpt-6-astra  ", True, id="whitespace-trimmed"),
+        pytest.param("gpt-5.6-sol", False, id="bare-vendor-id"),
+        pytest.param("", False, id="empty"),
+    ],
+)
+def test_gateway_spelled_model(model: str, spelled: bool) -> None:
+    """A catalog prefix is what marks a row as the gateway's own spelling."""
+    assert gateway_spelled_model(model) is spelled

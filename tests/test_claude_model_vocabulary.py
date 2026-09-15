@@ -5,6 +5,7 @@ import pytest
 from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
+    gateway_spelled_model,
     model_vocabulary_env,
     normalized_model_id,
     prefix_folded_model_id,
@@ -287,3 +288,19 @@ def test_served_canonical_overrides_keep_the_first_of_two_equal_spellings() -> N
     assert served_canonical_overrides(["databricks-claude-opus-4-8", "gw-claude-opus-4-8"]) == {
         "claude-opus-4-8": "databricks-claude-opus-4-8"
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "spelled"),
+    [
+        pytest.param("system.ai.claude-opus-4-8", True, id="route-prefix"),
+        pytest.param("databricks-claude-opus-4-8", True, id="endpoint-prefix"),
+        pytest.param("SYSTEM.AI.claude-opus-4-8", True, id="case-folded"),
+        pytest.param("  system.ai.claude-opus-4-8  ", True, id="whitespace-trimmed"),
+        pytest.param("claude-opus-4-8", False, id="bare-vendor-id"),
+        pytest.param("", False, id="empty"),
+    ],
+)
+def test_gateway_spelled_model(model: str, spelled: bool) -> None:
+    """A catalog prefix is what marks a row as the gateway's own spelling."""
+    assert gateway_spelled_model(model) is spelled
