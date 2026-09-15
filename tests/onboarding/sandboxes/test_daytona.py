@@ -249,6 +249,8 @@ class _CreateParams:
     :param env_vars: Injected workload env, or ``None``.
     :param labels: Sandbox labels.
     :param auto_stop_interval: Idle auto-stop minutes (0 = disabled).
+    :param auto_delete_interval: Minutes a stopped sandbox lingers
+        before Daytona deletes it (``None`` = provider default: never).
     :param resources: The ``Resources`` instance passed.
     """
 
@@ -256,6 +258,7 @@ class _CreateParams:
     env_vars: dict[str, str] | None
     labels: dict[str, str]
     auto_stop_interval: int
+    auto_delete_interval: int | None
     resources: _FakeResources
 
 
@@ -266,10 +269,12 @@ class _FakeResources:
 
     :param cpu: vCPU count.
     :param memory: Memory in GiB.
+    :param disk: Disk in GiB, or ``None`` for Daytona's default.
     """
 
     cpu: int
     memory: int
+    disk: int | None = None
 
 
 @dataclass
@@ -439,11 +444,40 @@ def test_provision_defaults_official_image_and_disables_autostop(
     assert create.params.auto_stop_interval == 0
     assert create.params.env_vars is None
     assert create.params.labels == {"omnigent-name": "managed-abc"}
-    assert create.params.resources == _FakeResources(cpu=2, memory=4)
+    assert create.params.resources == _FakeResources(cpu=2, memory=4, disk=None)
+    # None = Daytona's default (auto-delete disabled), i.e. unchanged
+    # behaviour for a deployment that configures no sizing block.
+    assert create.params.auto_delete_interval is None
     # Cold creates pull + snapshot the image (minutes); the SDK's 60s
     # default only covers the warm path.
     assert create.timeout > 60
     assert create.has_log_callback is True
+
+
+def test_provision_applies_configured_sizing_and_auto_delete(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """
+    Configured ``cpu`` / ``memory`` / ``disk`` reach ``Resources`` and
+    ``auto_delete_interval`` reaches the create params — the sizing a
+    build/test workload needs, and the server-side reaper that keeps
+    stopped sandboxes from leaking when the API key cannot delete.
+    """
+    DaytonaSandboxLauncher(cpu=4, memory=8, disk=20, auto_delete_interval=60).provision(
+        "managed-big"
+    )
+
+    [create] = fake_daytona.create_calls
+    assert create.params.resources == _FakeResources(cpu=4, memory=8, disk=20)
+    assert create.params.auto_delete_interval == 60
+
+
+def test_provision_partial_sizing_keeps_defaults(fake_daytona: _FakeDaytonaState) -> None:
+    """Unset sizing fields fall back to the launcher defaults."""
+    DaytonaSandboxLauncher(memory=16).provision("managed-ram")
+
+    [create] = fake_daytona.create_calls
+    assert create.params.resources == _FakeResources(cpu=2, memory=16, disk=None)
 
 
 def test_provision_image_resolution_order(

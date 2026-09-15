@@ -329,6 +329,10 @@ def test_parse_valid_daytona_config_builds_parameterized_factory(
             "daytona": {
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "cpu": 4,
+                "memory": 8,
+                "disk": 20,
+                "auto_delete_interval": 60,
             },
         }
     )
@@ -342,15 +346,17 @@ def test_parse_valid_daytona_config_builds_parameterized_factory(
     assert cfg.launcher_factory() is fake
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert (fake.cpu, fake.memory, fake.disk) == (4, 8, 20)
+    assert fake.auto_delete_interval == 60
 
 
 def test_parse_daytona_without_section_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    `provider: daytona` + `server_url` is a complete config: image and
-    env are optional and reach the launcher as None (its own env-var
-    fallbacks / official-image default apply).
+    `provider: daytona` + `server_url` is a complete config: image,
+    env and sizing are optional and reach the launcher as None (its own
+    env-var fallbacks / official-image and size defaults apply).
     """
     cfg = parse_sandbox_config({"provider": "daytona", "server_url": "https://s.example.com"})
     assert cfg is not None
@@ -360,6 +366,7 @@ def test_parse_daytona_without_section_defaults(
     assert cfg.launcher_factory() is fake
     assert fake.image is None
     assert fake.env is None
+    assert (fake.cpu, fake.memory, fake.disk, fake.auto_delete_interval) == (None,) * 4
 
 
 def test_parse_valid_blaxel_config_builds_parameterized_factory(
@@ -1682,6 +1689,27 @@ def test_parse_microsandbox_public_server_keeps_explicit_host_ports(
         (
             {"provider": "daytona", "server_url": "https://s", "daytona": {"env": ["", "X"]}},
             "sandbox.daytona.env",
+        ),
+        (
+            {"provider": "daytona", "server_url": "https://s", "daytona": {"memory": 0}},
+            "sandbox.daytona.memory",
+        ),
+        (
+            {"provider": "daytona", "server_url": "https://s", "daytona": {"cpu": "4"}},
+            "sandbox.daytona.cpu",
+        ),
+        (
+            {
+                "provider": "daytona",
+                "server_url": "https://s",
+                "daytona": {"auto_delete_interval": -1},
+            },
+            "sandbox.daytona.auto_delete_interval",
+        ),
+        # A typo would otherwise be ignored and silently keep the default size.
+        (
+            {"provider": "daytona", "server_url": "https://s", "daytona": {"momory": 8}},
+            "sandbox.daytona",
         ),
         # blaxel section present but malformed.
         ({"provider": "blaxel", "server_url": "https://s", "blaxel": "x"}, "sandbox.blaxel"),
