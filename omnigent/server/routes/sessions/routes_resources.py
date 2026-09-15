@@ -388,7 +388,9 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
+        :raises OmnigentError: Typed ``not_found`` (404) or
+            ``session_agent_missing`` (410) re-derived from the runner body.
+        :raises HTTPException: 502 on any other runner failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -423,6 +425,22 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle error instead of
+            # flattening it to a generic 502 gateway failure: the session's
+            # bound agent was deleted or rebound, so a retry cannot succeed
+            # and the client must recreate the agent or start a new session.
+            # ``OmnigentError.http_status`` re-derives the 410 from the code,
+            # mirroring how ``create_session_terminal`` handles runner errors.
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error")
+                if (
+                    isinstance(error, dict)
+                    and error.get("code") == ErrorCode.SESSION_AGENT_MISSING
+                ):
+                    raise OmnigentError(
+                        str(error.get("message") or "session agent missing"),
+                        code=ErrorCode.SESSION_AGENT_MISSING,
+                    )
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"

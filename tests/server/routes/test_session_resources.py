@@ -1227,6 +1227,42 @@ async def test_get_resource_by_id_404_from_runner(
 
 
 @pytest.mark.asyncio
+async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The GET proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone")
+
+    assert resp.status_code == 410
+    assert resp.json()["error"]["code"] == "session_agent_missing"
+
+
+@pytest.mark.asyncio
 async def test_get_resource_by_id_404_with_non_mapping_body(
     client: httpx.AsyncClient,
 ) -> None:
