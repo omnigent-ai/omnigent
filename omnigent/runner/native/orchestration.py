@@ -8261,8 +8261,8 @@ async def _resolve_native_spawn_env(
     :param harness_name: Harness id, e.g. ``"codex-native"``.
     :param session_id: Omnigent conversation id.
     :param server_client: Runner's client to the Omnigent server, for label reads.
-    :param optional_labels: Envelope labels already in hand (claude prefers these
-        over a fresh fetch), or ``None``.
+    :param optional_labels: Envelope labels already in hand, preferred over a
+        fresh fetch for every label-backed native provider, or ``None``.
     :returns: The spawn env mapping, or ``None`` when *harness_name* is not a
         native harness with a registered spawn-env builder (caller keeps its
         existing ``spawn_env``).
@@ -8296,9 +8296,13 @@ async def _resolve_native_spawn_env(
         return _typed_spawn_env(builder(session_id))
 
     if provider.bridge_id_label_key is not None:
-        labels = await _session_labels_for_runner_spawn(
-            server_client=server_client,
-            session_id=session_id,
+        labels = (
+            optional_labels
+            if optional_labels is not None
+            else await _session_labels_for_runner_spawn(
+                server_client=server_client,
+                session_id=session_id,
+            )
         )
         return _typed_spawn_env(
             builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
@@ -8894,6 +8898,7 @@ async def _codex_native_terminal_arrives_via_transfer(
     server_client: httpx.AsyncClient | None,
     session_id: str,
     resource_registry: SessionResourceRegistry,
+    session_labels: Mapping[str, str] | None = None,
 ) -> bool:
     """
     Return whether a live Codex terminal will be transferred into a session.
@@ -8915,11 +8920,13 @@ async def _codex_native_terminal_arrives_via_transfer(
     :param session_id: Newly-bound session id, e.g. ``"conv_new"``.
     :param resource_registry: Registry probed for the original session's
         live ``codex:main`` terminal.
+    :param session_labels: Labels supplied by the initialization envelope.
+        ``None`` selects the legacy labels callback.
     :returns: ``True`` when a different session on the same bridge owns a
         live ``codex:main`` terminal (transfer inbound), else ``False``.
     """
     terminal_registry = resource_registry.terminal_registry
-    if terminal_registry is None or server_client is None:
+    if terminal_registry is None:
         return False
     # Lazy import keeps codex-native out of the generic runner import graph.
     from omnigent.harnesses.codex_native.bridge import (
@@ -8932,10 +8939,15 @@ async def _codex_native_terminal_arrives_via_transfer(
         read_bridge_state as read_codex_bridge_state,
     )
 
-    labels = await _session_labels_for_runner_spawn(
-        server_client=server_client,
-        session_id=session_id,
-    )
+    if session_labels is not None:
+        labels = session_labels
+    elif server_client is not None:
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    else:
+        return False
     bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
     state = read_codex_bridge_state(codex_bridge_dir_for_bridge_id(bridge_id))
     # Fresh bridge, or the new session is already active — nothing transfers in.
