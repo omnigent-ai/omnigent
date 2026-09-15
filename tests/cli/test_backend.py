@@ -958,6 +958,8 @@ def test_foreground_connect_registers_status_record(
         """Capture the foreground registry record during connect execution."""
         observed.extend(cli._list_daemon_records(include_legacy=False))
         assert server_url == "https://server.example.com"
+        # Remote mode owns no local server: nothing may be excluded.
+        assert _kw.get("local_server_pid") is None
 
     monkeypatch.setattr("omnigent.host.connect.run_host_process", _fake_run_host_process)
 
@@ -1111,6 +1113,35 @@ def test_foreground_connect_local_prompt_aborted_leaves_server(
     # Exit 0 (Abort swallowed, no traceback) and the server is left running.
     assert result.exit_code == 0, result.output
     assert "Left the local server running at http://127.0.0.1:8000." in result.output
+
+
+def test_foreground_connect_local_forwards_server_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Local mode hands the health-verified server pid to the host.
+
+    The adopted-orphan exclusion binds to exactly this incarnation, so
+    the pid the spawner verified must reach run_host_process.
+    """
+    forwarded: list[int | None] = []
+    _patch_foreground_host_local(
+        monkeypatch,
+        tmp_path,
+        run_host_process=lambda server_url, local_server_pid=None, **_kw: forwarded.append(
+            local_server_pid
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "ensure_local_omnigent_server",
+        lambda: LocalServerStartup(url="http://127.0.0.1:8000", spawned=True, pid=4242),
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+
+    result = CliRunner().invoke(cli_group, ["host", ""])
+
+    assert result.exit_code == 0, result.output
+    assert forwarded == [4242]
 
 
 def test_host_reset_id_mints_fresh_id_when_no_daemon_runs(
@@ -1291,8 +1322,11 @@ def test_foreground_connect_connection_failure_skips_prompt(
 ) -> None:
     """A connection failure (SystemExit) does not prompt over the error."""
 
+    reached: list[bool] = []
+
     def _fail(server_url: str, **_kw: object) -> None:
         """Simulate a permanent connection failure exiting non-zero."""
+        reached.append(True)
         raise SystemExit(1)
 
     _patch_foreground_host_local(monkeypatch, tmp_path, run_host_process=_fail)
@@ -1304,6 +1338,7 @@ def test_foreground_connect_connection_failure_skips_prompt(
 
     result = CliRunner().invoke(cli_group, ["host", ""])
 
+    assert reached == [True], "the exit code must come from the connect failure"
     assert result.exit_code == 1
 
 
