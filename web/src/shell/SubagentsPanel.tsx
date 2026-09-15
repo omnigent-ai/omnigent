@@ -11,8 +11,8 @@
 // the root id (walking the parent chain) and passes it as
 // ``rootSessionId``.
 //
-// Each row is a Link to the target conversation page so cmd/middle-
-// click opens it in a new tab, matching the sidebar's behavior.
+// Each row links to the session in its current host, so cmd/middle-click
+// still opens it in a new tab.
 
 import { lazy, Suspense, useState } from "react";
 import type { ComponentType, SVGProps } from "react";
@@ -33,6 +33,7 @@ import {
   SearchIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
+import { useSessionHref } from "@/lib/sessionNavigation";
 import { Badge } from "@/components/ui/badge";
 import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
@@ -71,35 +72,12 @@ import {
 } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
-// Session-scoped URL params that the file viewer / Files panel write
-// for one session and AppShell's restore effect re-reads on the next.
-// Stripping these on rail navigation prevents a sticky ``?file=`` from
-// the previous session yanking the user into the file viewer of the
-// next one. Other params (e.g. ``?debug=1`` for ``useDebugMode``) are
-// global and must be preserved across navigation.
-const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
 const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
-
-/**
- * Build a rail-link search string from the current URL, dropping the
- * session-scoped params and keeping anything else.
- *
- * @param search - The current ``location.search`` string,
- *   e.g. ``"?file=foo.txt&debug=1"``.
- * @returns A search string suitable for a ``<Link to={{ search }}>``,
- *   e.g. ``"?debug=1"`` or ``""`` when nothing remains.
- */
-function railLinkSearch(search: string): string {
-  const params = new URLSearchParams(search);
-  for (const key of SESSION_SCOPED_PARAMS) params.delete(key);
-  const next = params.toString();
-  return next ? `?${next}` : "";
-}
 
 interface SubagentsPanelProps {
   /** The conversation currently rendered in main. Used only to
@@ -520,7 +498,8 @@ function iconForWrapperOrHarness(
 
 function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
   const { session } = useSession(rootSessionId);
-  const search = railLinkSearch(useLocation().search);
+  const sessionHref = useSessionHref();
+  const { search } = useLocation();
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
   // TerminalFirstContext to decide a session is claude/codex-native.
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
@@ -536,12 +515,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   return (
     <li>
       <Link
-        // Drop session-scoped params (``file``, ``diff``, ``comment``,
-        // ``view``) when navigating in the rail — those are tied to
-        // one session's file-viewer state and must not bleed into the
-        // next. Global params like ``?debug=1`` are preserved by
-        // ``railLinkSearch`` so debug mode stays on across navigation.
-        to={{ pathname: `/c/${rootSessionId}`, search }}
+        to={sessionHref(rootSessionId, search)}
         data-testid="subagent-main-row"
         data-root-session-id={rootSessionId}
         data-agent-kind={
@@ -600,7 +574,8 @@ function SubagentRow({
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
-  const search = railLinkSearch(useLocation().search);
+  const sessionHref = useSessionHref();
+  const { search } = useLocation();
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
@@ -633,10 +608,7 @@ function SubagentRow({
           </button>
         )}
         <Link
-          // See MainRow: drop session-scoped params on rail navigation
-          // (preserving global ones like ``?debug=1``) so a sticky
-          // ``?file=`` from the previous session doesn't carry over.
-          to={{ pathname: `/c/${child.id}`, search }}
+          to={sessionHref(child.id, search)}
           data-testid="subagent-row"
           data-child-session-id={child.id}
           data-depth={depth}

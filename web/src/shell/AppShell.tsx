@@ -1,6 +1,7 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
+import { useSessionHref } from "@/lib/sessionNavigation";
 import {
   PROJECT_LABEL_KEY,
   type Conversation,
@@ -558,9 +559,10 @@ export function AppShell() {
   const headerProjectName =
     headerProjectSummary?.name ?? breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ?? null;
   const headerProjectIcon = headerProjectSummary?.icon ?? null;
+  const sessionHref = useSessionHref();
   const headerTitleLinkTo =
     isChildSession && activeSession?.parentSessionId
-      ? `/c/${activeSession.parentSessionId}`
+      ? sessionHref(activeSession.parentSessionId)
       : undefined;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:

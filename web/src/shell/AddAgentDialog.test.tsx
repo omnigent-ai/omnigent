@@ -8,6 +8,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AddAgentDialog } from "./AddAgentDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { createSession } from "@/lib/sessionsApi";
+import { SessionNavigationTestHost } from "@/lib/sessionNavigation.test-utils";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -48,13 +50,20 @@ function mockAgents(agents: AvailableAgent[]) {
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
-function renderDialog(parentSessionId = "conv_parent") {
+function renderDialog(parentSessionId = "conv_parent", canvasSearch?: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+  const dialog = <AddAgentDialog parentSessionId={parentSessionId} open onOpenChange={vi.fn()} />;
   const utils = render(
     <QueryClientProvider client={client}>
-      <MemoryRouter>
-        <AddAgentDialog parentSessionId={parentSessionId} open onOpenChange={vi.fn()} />
+      <MemoryRouter initialEntries={[canvasSearch === undefined ? "/" : `/canvas${canvasSearch}`]}>
+        {canvasSearch === undefined ? (
+          dialog
+        ) : (
+          <SessionNavigationTestHost resolveHref={canvasSessionHref}>
+            {dialog}
+          </SessionNavigationTestHost>
+        )}
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -102,6 +111,28 @@ describe("AddAgentDialog", () => {
     });
     // Rail refreshed for the parent, then navigated into the new child.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_child"));
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["conversation", "conv_parent", "child_sessions"],
+    });
+  });
+
+  it("opens the added agent inside the Canvas host", async () => {
+    createSessionMock.mockResolvedValue({
+      id: "conv_child",
+    } as unknown as Awaited<ReturnType<typeof createSession>>);
+    const { invalidateSpy } = renderDialog(
+      "conv_parent",
+      "?canvas=board&session=parent&file=old.txt&diff=1&comment=c1&view=terminal&o=123",
+    );
+    fireEvent.click(screen.getByTestId("agent-card-ag_claude"));
+    fireEvent.change(screen.getByTestId("add-agent-name-input"), { target: { value: "reviewer" } });
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
+
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith(
+        "/canvas?canvas=board&o=123&session=conv_child&view=chat",
+      ),
+    );
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["conversation", "conv_parent", "child_sessions"],
     });

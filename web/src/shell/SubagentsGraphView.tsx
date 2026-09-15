@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
 import { ReactFlow, Background, Position, Handle, useReactFlow } from "@xyflow/react";
 import { useLocation, useNavigate } from "@/lib/routing";
+import { useSessionHref } from "@/lib/sessionNavigation";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { ZoomInIcon, ZoomOutIcon, Maximize2Icon } from "lucide-react";
@@ -210,18 +211,13 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
   );
 
   const navigate = useNavigate();
+  const sessionHref = useSessionHref();
   const location = useLocation();
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node<AgentNodeData>) => {
-      const params = new URLSearchParams(location.search);
-      for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
-      const search = params.toString();
-      navigate({
-        pathname: `/c/${node.data.sessionId}`,
-        search: search ? `?${search}` : "",
-      });
+      navigate(sessionHref(node.data.sessionId, location.search));
     },
-    [navigate, location.search],
+    [navigate, sessionHref, location.search],
   );
 
   return (

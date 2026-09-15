@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "@/lib/routing";
+import { useNavigateToSession } from "@/lib/sessionNavigation";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Dialog,
@@ -45,7 +45,7 @@ export function AddAgentDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const navigate = useNavigate();
+  const navigateToSession = useNavigateToSession();
   const queryClient = useQueryClient();
   const { data: agents } = useAvailableAgents();
 
@@ -94,7 +94,7 @@ export function AddAgentDialog({
         queryKey: childSessionsQueryKey(parentSessionId),
       });
       handleOpenChange(false);
-      navigate(`/c/${session.id}`);
+      navigateToSession(session.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't add the agent. Try again.");
     } finally {
