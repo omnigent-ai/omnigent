@@ -19,7 +19,10 @@ import itertools
 import json
 import os
 
+import httpx
 from playwright.sync_api import Browser, Route, expect
+
+from tests.e2e_ui.terminal_helpers import mock_terminal_attach
 
 # iPhone-12-class portrait viewport -- comfortably below the Tailwind ``md``
 # breakpoint (768px) so every ``md:`` rule resolves to its mobile branch.
@@ -54,6 +57,13 @@ def test_queued_row_controls_meet_mobile_tap_target(
     phone viewport, making them difficult to activate accurately by touch.
     """
     base_url, session_id = seeded_session
+    # The stubbed first message never launches the embedded REPL. Supply its
+    # presentation label and terminal resource explicitly for the overlap check.
+    httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    ).raise_for_status()
     context = browser.new_context(
         viewport=_MOBILE_VIEWPORT,
         has_touch=True,
@@ -71,6 +81,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
             body=json.dumps({"queued": True, "item_id": "ci_tap_targets"}),
         )
 
+    mock_terminal_attach(page, [session_id], terminal_name="tui")
     page.route("**/v1/sessions/*/events", ack_event)
     try:
         page.goto(f"{base_url}/c/{session_id}")

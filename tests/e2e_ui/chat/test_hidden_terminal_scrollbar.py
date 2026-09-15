@@ -14,16 +14,15 @@ import math
 import re
 from collections.abc import Iterator
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 import pytest
 from PIL import Image, ImageChops
-from playwright.sync_api import Browser, Locator, Page, Route, WebSocketRoute, expect
+from playwright.sync_api import Browser, Locator, Page, WebSocketRoute, expect
 
-from tests.e2e_ui.conftest import _build_hello_world_bundle, fetch_with_retry
+from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.terminal_helpers import mock_terminal_attach
 
-_TERMINAL_ID = "terminal_codex_main"
 _BAR = ".xterm .scrollbar.vertical"
 _SLIDER = f"{_BAR} .slider"
 _RECT = """el => {
@@ -95,69 +94,6 @@ def terminal_scrollbar_session(live_server: str) -> Iterator[tuple[str, str]]:
             yield live_server, session_id
         finally:
             client.delete(f"/v1/sessions/{session_id}").raise_for_status()
-
-
-def _mock_terminal_attach(page: Page, session_ids: list[str]) -> dict[str, list[WebSocketRoute]]:
-    sockets: dict[str, list[WebSocketRoute]] = {session_id: [] for session_id in session_ids}
-
-    def session_snapshot(route: Route) -> None:
-        response = fetch_with_retry(route)
-        payload = response.json()
-        rows = payload.get("data", [payload])
-        for row in rows:
-            if row.get("id") in session_ids:
-                row.update(runner_id="runner_scrollbar_mock", runner_online=True)
-        route.fulfill(response=response, json=payload)
-
-    def terminal_inventory(route: Route) -> None:
-        route.fulfill(
-            json={
-                "object": "list",
-                "data": [
-                    {
-                        "id": _TERMINAL_ID,
-                        "object": "terminal",
-                        "name": "codex",
-                        "metadata": {
-                            "terminal_name": "codex",
-                            "session_key": "main",
-                            "running": True,
-                        },
-                    }
-                ],
-                "has_more": False,
-            }
-        )
-
-    def attach(ws: WebSocketRoute) -> None:
-        session_id = urlparse(ws.url).path.split("/")[3]
-        sockets[session_id].append(ws)
-        ws.on_message(lambda _message: None)
-
-    ids = "|".join(re.escape(session_id) for session_id in session_ids)
-    page.route(re.compile(rf"/v1/sessions(?:/(?:{ids}))?(?:\?|$)"), session_snapshot)
-    page.route(
-        re.compile(rf"/v1/sessions/(?:{ids})/resources/terminals(?:\?|$)"),
-        terminal_inventory,
-    )
-    page.route(
-        "**/health?session_ids=*",
-        lambda route: route.fulfill(
-            json={
-                "sessions": {
-                    session_id: {"runner_online": True, "host_online": None}
-                    for session_id in session_ids
-                }
-            }
-        ),
-    )
-    page.route_web_socket(
-        re.compile(rf"/v1/sessions/(?:{ids})/resources/terminals/{_TERMINAL_ID}/attach"),
-        attach,
-    )
-    # The fake online PTYs must not be contradicted by the unbound server rows.
-    page.route_web_socket("**/v1/sessions/updates*", lambda ws: ws.on_message(lambda _msg: None))
-    return sockets
 
 
 def _select_view(page: Page, view: str) -> None:
@@ -238,7 +174,7 @@ def test_hidden_terminal_scrollbar_never_paints_over_foreground(
         color_scheme="light",
     )
     page = context.new_page()
-    sockets = _mock_terminal_attach(page, [session_id])[session_id]
+    sockets = mock_terminal_attach(page, [session_id])[session_id]
     try:
         page.goto(f"{base_url}/c/{session_id}")
         composer = page.get_by_label("Message the agent")
