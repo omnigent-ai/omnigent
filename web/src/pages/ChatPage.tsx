@@ -590,6 +590,7 @@ export function ChatPage() {
     if (
       !shouldSendInitialPrompt({
         initialPrompt: initialPrompt?.prompt.text ?? null,
+        initialPromptFileCount: initialPrompt?.prompt.files?.length ?? 0,
         promptConversationId: initialPrompt?.conversationId ?? null,
         sentForConversationId: initialPromptSentForConvRef.current,
         conversationId: urlConvId,
@@ -3907,8 +3908,13 @@ export function computeShowsWorking(
  * dead host surfaces as a failed send rather than a silently-dropped
  * prompt on an empty composer.
  *
- * @param params.initialPrompt Carried prompt, or ``null``/``""`` when
- *   none was passed, e.g. ``"read the README"``. Empty/falsy never sends.
+ * @param params.initialPrompt Carried prompt text, or ``null``/``""``
+ *   when none was passed, e.g. ``"read the README"``. Falsy text sends
+ *   only when the prompt carries attachments (an image-only draft).
+ * @param params.initialPromptFileCount Number of attachments on the
+ *   carried prompt, e.g. ``1`` for an image-only draft, ``0`` when none.
+ *   Files count as content: blank text with files still sends, matching
+ *   the landing composer's submit gate.
  * @param params.promptConversationId The conversation id the prompt was
  *   consumed for, or ``null``. Must equal ``conversationId`` — a mismatch
  *   means the user switched sessions before the auto-send fired, so the
@@ -3927,15 +3933,19 @@ export function computeShowsWorking(
  */
 export function shouldSendInitialPrompt(params: {
   initialPrompt: string | null;
+  initialPromptFileCount: number;
   promptConversationId: string | null;
   sentForConversationId: string | null;
   conversationId: string | null | undefined;
   loadingConversation: boolean;
   agentId: string | null;
 }): boolean {
-  // Reject falsy (null or "") so a manipulated router state can't fire
-  // send("") — defense-in-depth alongside the dialog's blank guard.
-  if (!params.initialPrompt) return false;
+  // Reject a contentless prompt — falsy text (null or "") AND no files —
+  // so a manipulated router state can't fire send(""): defense-in-depth
+  // alongside the dialog's blank guard. Blank text WITH attachments is an
+  // image-only first message and passes; send() omits the input_text
+  // block for blank text, so the wire shape stays valid.
+  if (!params.initialPrompt && !params.initialPromptFileCount) return false;
   // The prompt must still belong to the active session. `initialPrompt` is
   // set by an effect whose `setInitialPrompt` doesn't flush until the next
   // render, so when the user switches `/c/:a` → `/c/:b` the auto-send effect
@@ -3970,8 +3980,10 @@ export function shouldSendInitialPrompt(params: {
  * @param prompt The consumed pending prompt, e.g.
  *   ``{ text: "/review-pr 123", skill: { name: "review-pr", args: "123" } }``.
  * @param agentId Resolved agent id, e.g. ``"ag_abc123"``.
- * @param send ``chatStore.send`` — posts a plain user message. Always
- *   called with no files: the landing composer has no attachments.
+ * @param send ``chatStore.send`` — posts a plain user message with the
+ *   prompt's landing attachments (an empty array when none). For an
+ *   image-only draft the text is ``""`` and send() omits the
+ *   ``input_text`` block, so the message is ``input_image`` blocks alone.
  * @param sendSlashCommand ``chatStore.sendSlashCommand`` — posts a
  *   ``slash_command`` event.
  */
