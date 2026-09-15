@@ -4769,6 +4769,7 @@ function useResolvedComposerModel(
     hostId !== undefined &&
       !sessionModelSeeded &&
       (!isReportedModelPicker || effectiveModel === llmModel),
+    codexModelOptions,
   );
   return {
     llmModel,

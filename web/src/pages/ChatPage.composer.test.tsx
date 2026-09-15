@@ -1283,30 +1283,33 @@ describe("Composer cached model labels", () => {
     useChatStore.setState({ sessionModelSeeded: false, sessionHostId: null, boundAgentId: null });
   });
 
-  it("waits for session labels while leaving host-probe menu choices usable", async () => {
+  it("uses host names for the label and menu until session metadata arrives", async () => {
     const view = renderWithTooltips(<Composer {...props()} />);
     const trigger = screen.getByTestId("composer-config-gear");
-    expect(screen.getByRole("status", { name: "Loading model" })).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Loading model" })).toBeNull();
     expect(trigger).toBeEnabled();
     expect(trigger).not.toHaveTextContent(model);
-    expect(trigger).not.toHaveTextContent("Team model");
+    expect(trigger).toHaveTextContent("Team model");
     expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBeNull();
     fireEvent.focus(trigger);
     const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
-    expect(tooltip).toHaveTextContent("Loading model…");
+    expect(tooltip).toHaveTextContent("Team model");
     expect(tooltip).not.toHaveTextContent(model);
     openSessionConfig();
-    expect(screen.getByTestId("composer-agent-model-summary")).toHaveTextContent("Loading model…");
+    expect(screen.getByTestId("composer-agent-model-summary")).toHaveTextContent("Team model");
     fireEvent.click(screen.getByTestId("composer-agent-edit"));
     expect(await screen.findByTestId("composer-agent-model-alias-a")).toBeEnabled();
 
     view.rerender(
       <TooltipProvider>
-        <Composer {...props()} modelLabelOptions={catalog} />
+        <Composer
+          {...props()}
+          modelLabelOptions={[{ ...catalog[0], displayName: "Session name" }]}
+        />
       </TooltipProvider>,
     );
     expect(screen.queryByTestId("composer-model-loading")).toBeNull();
-    expect(trigger).toHaveTextContent("Team model");
+    expect(trigger).toHaveTextContent("Session name");
   });
 
   it("uses the cached session display name immediately on remount, not a newer host probe", async () => {
@@ -1327,6 +1330,23 @@ describe("Composer cached model labels", () => {
     expect(screen.getByTestId("composer-agent-model-alias-a")).toBeEnabled();
   });
 
+  it("names the reported Codex model from the host catalog without changing the requested model", async () => {
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      sessionModelOverride: "another-model",
+    });
+    renderWithTooltips(<Composer {...props()} modelPickerKind="codex" />);
+    expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Team model");
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+    await openSessionModels();
+    expect(screen.getByTestId("composer-agent-model-alias-a")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(useChatStore.getState().llmModel).toBe(model);
+    expect(useChatStore.getState().sessionModelOverride).toBe("another-model");
+  });
+
   it("uses a loading label for the synthetic current row without a catalog", async () => {
     renderWithTooltips(<Composer {...props()} codexModelOptions={[]} />);
     await openSessionModels();
@@ -1341,7 +1361,7 @@ describe("Composer cached model labels", () => {
     composerSnapshotHost.id = "new-host";
     first.rerender(
       <TooltipProvider>
-        <Composer {...props()} />
+        <Composer {...props()} codexModelOptions={[]} />
       </TooltipProvider>,
     );
     expect(screen.getByTestId("composer-model-loading")).toBeInTheDocument();
