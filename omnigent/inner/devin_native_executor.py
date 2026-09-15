@@ -94,9 +94,10 @@ class DevinNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="devin native turn had no user text to send")
             return
-        # A forked clone replays its prior conversation on this first message;
-        # the preamble is cleared only after the injection lands, so a failure
-        # retries with the history instead of losing it.
+        # A session with carried-over history — a fork, or a resume with no Devin
+        # session to reattach to — replays it on this first message. The preamble
+        # is cleared only after the injection lands, so a failure retries with the
+        # history instead of losing it.
         preamble = read_fork_preamble(self._bridge_dir)
         if preamble:
             text = wrap_fork_preamble(preamble, text)

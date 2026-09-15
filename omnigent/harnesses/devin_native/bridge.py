@@ -515,9 +515,10 @@ _FORK_PREAMBLE_FILE = "fork_preamble.txt"
 #: sentinel text cursor-native uses, so a fork reads the same either side.
 FORK_HISTORY_OPEN_TAG = "<omnigent_fork_history>"
 FORK_HISTORY_CLOSE_TAG = "</omnigent_fork_history>"
-_FORK_HISTORY_HEADER = (
-    "Here is the conversation carried over from the session this one was forked from:"
-)
+# Neutral about *why* the history is replayed: the same block serves a fork and a
+# resume with no Devin session to reattach to, and telling a resumed session it
+# was forked would have it describe its own past wrongly.
+_FORK_HISTORY_HEADER = "Here is the earlier conversation this session continues from:"
 _FORK_HISTORY_FOOTER = "That is the end of the carried-over conversation; my message follows."
 
 
@@ -564,10 +565,10 @@ def _neutralize_fork_sentinels(text: str) -> str:
 
 
 def wrap_fork_preamble(preamble: str, user_text: str) -> str:
-    """Frame the replayed history ahead of the fork's first user message.
+    """Frame the replayed history ahead of the session's first user message.
 
     :param preamble: Rendered prior-conversation transcript.
-    :param user_text: The user's first message in the fork.
+    :param user_text: The user's first message in this Devin session.
     :returns: The framed transcript followed by the user text.
     """
     return (
