@@ -94,6 +94,22 @@ def _isolated_model_catalog_store(
 
 
 @pytest.fixture(autouse=True)
+def _isolated_config_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Point the ambient omnigent config home at an empty per-test directory.
+
+    Model-options frames decorate every row with the host's resolved provider
+    ``source``, read from ``~/.omnigent/config.yaml`` via ``load_config()``.
+    On a machine whose ambient config resolves subscription defaults (e.g. a
+    keyring-backed ``pi``/``claude``/``codex`` CLI login), that decoration
+    leaks into the exact-frame assertions here and fails a pristine tree.
+    ``$OMNIGENT_CONFIG_HOME`` is the onboarding layer's isolation seam.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path_factory.mktemp("config_home")))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep these tests from forking a real runner zygote.
 
