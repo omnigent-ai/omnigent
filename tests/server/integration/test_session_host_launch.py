@@ -312,10 +312,11 @@ async def _expect_no_launch(comm: ApplicationCommunicator, *, budget_s: float) -
         attempted), ``False`` if none arrived within the budget (the
         expected outcome for a deliberately stopped session).
     """
+    # Bound only the read: receive_output(timeout=...) cancels the ASGI app.
     try:
         # Bounded so a chatty ping loop can't spin forever.
         for _ in range(40):
-            output = await comm.receive_output(timeout=budget_s)
+            output = await asyncio.wait_for(comm.receive_output(timeout=None), timeout=budget_s)
             if output["type"] != "websocket.send":
                 continue
             if isinstance(decode_host_frame(output["text"]), HostLaunchRunnerFrame):
@@ -343,7 +344,7 @@ async def _wait_for_launch(
     try:
         # Bounded so a chatty ping loop can't spin forever.
         for _ in range(40):
-            output = await comm.receive_output(timeout=budget_s)
+            output = await asyncio.wait_for(comm.receive_output(timeout=None), timeout=budget_s)
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -380,7 +381,7 @@ async def _answer_runner_status_then_wait_for_launch(
     answered = False
     try:
         for _ in range(40):
-            output = await comm.receive_output(timeout=budget_s)
+            output = await asyncio.wait_for(comm.receive_output(timeout=None), timeout=budget_s)
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -404,9 +405,11 @@ async def _answer_runner_status_then_wait_for_launch(
     return None
 
 
+@pytest.mark.parametrize("observe_idle", [False, True], ids=["immediate", "after-idle"])
 async def test_inline_launch_binds_runner_and_returns_host(
     client: httpx.AsyncClient,
     app: FastAPI,
+    observe_idle: bool,
     db_uri: str,
 ) -> None:
     """Happy path: ``POST /v1/sessions`` with ``host_id`` + ``workspace``
@@ -417,6 +420,9 @@ async def test_inline_launch_binds_runner_and_returns_host(
     longer launches a runner — the user would get an unbound session.
     """
     comm = await _connect_host(app)
+    if observe_idle:
+        assert not await _expect_no_launch(comm, budget_s=0.05)
+        assert not comm.future.done()
     agent = await create_test_agent(client)
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
@@ -2473,7 +2479,7 @@ async def test_concurrent_relaunches_are_single_flight(
         # it since both requests are already in flight.
         with contextlib.suppress(asyncio.TimeoutError):
             for _ in range(40):
-                output = await comm.receive_output(timeout=2.0)
+                output = await asyncio.wait_for(comm.receive_output(timeout=None), timeout=2.0)
                 if output["type"] != "websocket.send":
                     continue
                 frame = decode_host_frame(output["text"])
@@ -2560,7 +2566,7 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
         served = 0
         with contextlib.suppress(asyncio.TimeoutError):
             for _ in range(40):
-                output = await comm.receive_output(timeout=2.0)
+                output = await asyncio.wait_for(comm.receive_output(timeout=None), timeout=2.0)
                 if output["type"] != "websocket.send":
                     continue
                 frame = decode_host_frame(output["text"])

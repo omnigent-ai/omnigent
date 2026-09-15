@@ -233,8 +233,9 @@ async def _route_requests_to_runner(
     :param runner_app: Runner FastAPI app receiving requests.
     :returns: None.
     """
+    # The fixture owns shutdown; an idle read must not cancel the ASGI app.
     while True:
-        output = await communicator.receive_output()
+        output = await communicator.receive_output(timeout=None)
         if output["type"] == "websocket.close":
             return
         if output["type"] != "websocket.send":
@@ -300,15 +301,19 @@ async def routed_tunnel_client(app: FastAPI) -> AsyncIterator[RoutedTunnelClient
             await communicator.wait(timeout=1.0)
 
 
+@pytest.mark.parametrize("idle_s", [0.0, 1.1], ids=["immediate", "after-idle"])
 async def test_ws_tunnel_route_round_trips_request_to_runner(
     routed_tunnel_client: RoutedTunnelClient,
+    idle_s: float,
 ) -> None:
     """GET /health must round-trip through the real FastAPI WS route.
 
     :param routed_tunnel_client: Client and registry wired through
         the real FastAPI route.
+    :param idle_s: Quiet period before sending the first request.
     :returns: None.
     """
+    await asyncio.sleep(idle_s)
     assert routed_tunnel_client.registry.online_runner_ids() == [_RUNNER_ID]
     response = await routed_tunnel_client.client.get("/health")
 
