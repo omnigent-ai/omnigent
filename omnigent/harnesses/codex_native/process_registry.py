@@ -370,7 +370,8 @@ def _process_cmdline(pid: int) -> str:
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2.0,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -451,11 +452,14 @@ def reap_codex_native_processes_for_state_dir(
         return 0
     needle = str(state_dir)
     try:
+        # macOS ps passes raw argv bytes through, so decode leniently: one
+        # foreign process with non-UTF-8 argv must not crash the reaper.
         listing = subprocess.run(
             ["ps", "-axww", "-o", "pid=,pgid=,command="],
             check=False,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5.0,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
