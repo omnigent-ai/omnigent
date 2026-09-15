@@ -3552,10 +3552,21 @@ class HostProcess:
                                 f"{self._silent_connect_streak} consecutive "
                                 "connections but never responded on any of them."
                             )
-                            _logger.error(
+                            # A server-side outage the host rides out on
+                            # backoff: WARNING with attribution, like the auth
+                            # and 404 streaks (ERROR is for terminal failures).
+                            _logger.warning(
                                 "%s Treating the endpoint as unhealthy; "
                                 "reconnecting on slow backoff until it responds.",
                                 cause,
+                                extra=debug_event(
+                                    "silent_endpoint_escalated",
+                                    server_url=self._server_url,
+                                    consecutive_silent_connections=self._silent_connect_streak,
+                                    error_category=ErrorCategory.SERVER.value,
+                                    error_impact=ErrorImpact.BLOCKING.value,
+                                    error_phase=ErrorPhase.UNKNOWN.value,
+                                ),
                             )
                             print(
                                 f"⚠ {cause} The server may be unhealthy. "
