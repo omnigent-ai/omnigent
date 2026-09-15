@@ -46,7 +46,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -61,6 +61,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.native.native_dispatch import resolve_hook
 from omnigent.process_logging import process_log_reference
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -161,6 +162,9 @@ def _publish_tmux_target_for_bridge(
 # forwarder on terminal re-create (else both mirror, double-posting items).
 _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
 
+# Task-keyed ownership survives session-key replacement until its done callback.
+_CODEX_FORWARDER_OWNERS: dict[asyncio.Task[object], CodexNativeAppServer] = {}
+
 # Bound how long terminal (re)creation waits for a cancelled forwarder.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 
@@ -173,7 +177,57 @@ class _CodexNativeModelOptionsNotReady(RuntimeError):
     """Raised when Codex model options are requested before bridge startup."""
 
 
-async def _cancel_auto_forwarder_task(session_id: str) -> None:
+def _codex_lifecycle_event(
+    session_id: str,
+    app_server: CodexNativeAppServer | None,
+    phase: str,
+    **attributes: object,
+) -> dict[str, object]:
+    """Correlate lifecycle metadata with the owning session and process lifetime."""
+    context: dict[str, object] = {
+        "harness": "codex-native",
+        "runner_id": os.environ.get(RUNNER_ID_ENV_VAR),
+    }
+    if app_server is not None:
+        context.update(app_server.diagnostic_attributes())
+    context.update(attributes)
+    return debug_event(
+        "codex_native_lifecycle",
+        session_id=session_id,
+        turn_id=None,
+        user_id=None,
+        phase=phase,
+        **context,
+    )
+
+
+def _record_codex_forwarder_cleanup(
+    session_id: str,
+    owner: CodexNativeAppServer | None,
+    target: CodexNativeAppServer | None,
+    reason: str,
+) -> None:
+    """Record the actual cleanup target without attributing a successor to its predecessor."""
+    if target is not None:
+        target.record_teardown_reason(reason)
+    target_context = target.diagnostic_attributes() if target is not None else {}
+    _logger.info(
+        "Codex native forwarder cleanup",
+        extra=_codex_lifecycle_event(
+            session_id,
+            owner,
+            "forwarder_cleanup",
+            reason=reason,
+            cleanup_target_matches_owner=target is owner if owner is not None else None,
+            cleanup_app_server_instance_id=target_context.get("app_server_instance_id"),
+            cleanup_app_server_pid=target_context.get("app_server_pid"),
+        ),
+    )
+
+
+async def _cancel_auto_forwarder_task(
+    session_id: str, *, reason: str = "forwarder_replaced"
+) -> None:
     """
     Cancel and await the session's registered transcript forwarder, if any.
 
@@ -185,11 +239,15 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
     for external conversation items).
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param reason: Lifecycle reason recorded before cancelling a Codex forwarder.
     :returns: None.
     """
     task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
     if task is None or task.done():
         return
+    app_server = _CODEX_FORWARDER_OWNERS.get(task) or _AUTO_CODEX_APP_SERVERS.get(session_id)
+    if app_server is not None:
+        app_server.record_teardown_reason(reason)
     task.cancel()
     # asyncio.wait absorbs the CancelledError and bounds the wait on a hung cancellation.
     _done, pending = await asyncio.wait({task}, timeout=_AUTO_FORWARDER_CANCEL_TIMEOUT_S)
@@ -201,7 +259,9 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
         )
 
 
-async def teardown_codex_native_app_server(session_id: str) -> None:
+async def teardown_codex_native_app_server(
+    session_id: str, *, reason: str = "session_teardown"
+) -> None:
     """
     Tear down a host-spawned codex-native session's app-server subprocess.
 
@@ -218,15 +278,18 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     required-session teardown paths regardless of harness.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param reason: Lifecycle reason identifying the initiating teardown path.
     :returns: None.
     """
-    if session_id not in _AUTO_CODEX_APP_SERVERS:
+    app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    if app_server is None:
         return
-    await _cancel_auto_forwarder_task(session_id)
+    app_server.record_teardown_reason(reason)
+    await _cancel_auto_forwarder_task(session_id, reason=reason)
     leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
     if leftover_app_server is not None:
         with contextlib.suppress(Exception):
-            await leftover_app_server.close()
+            await leftover_app_server.close(reason=reason)
 
 
 async def teardown_all_codex_native_app_servers() -> None:
@@ -252,10 +315,15 @@ async def teardown_all_codex_native_app_servers() -> None:
     """
     for session_id in list(_AUTO_CODEX_APP_SERVERS):
         with contextlib.suppress(Exception):
-            await teardown_codex_native_app_server(session_id)
+            await teardown_codex_native_app_server(session_id, reason="runner_shutdown")
 
 
-def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
+def _register_auto_forwarder_task(
+    session_id: str,
+    task: asyncio.Task[object],
+    *,
+    app_server: CodexNativeAppServer | None = None,
+) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.
 
@@ -266,15 +334,22 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param task: Freshly created forwarder task for this session.
+    :param app_server: Codex process owner for attributing cancellation intent.
     :returns: None.
     """
+    if app_server is not None:
+        _CODEX_FORWARDER_OWNERS[task] = app_server
     incumbent = _AUTO_FORWARDER_TASKS.get(session_id)
     if incumbent is not None and incumbent is not task:
+        incumbent_owner = _CODEX_FORWARDER_OWNERS.get(incumbent)
+        if incumbent_owner is not None and not incumbent.done():
+            incumbent_owner.record_teardown_reason("forwarder_replaced")
         incumbent.cancel()
     _AUTO_FORWARDER_TASKS[session_id] = task
 
     def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it; log the exit."""
+        _CODEX_FORWARDER_OWNERS.pop(done_task, None)
         if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
             del _AUTO_FORWARDER_TASKS[session_id]
         # Obituary: a stopped forwarder takes mirroring, status and the busy
@@ -4446,6 +4521,7 @@ async def _auto_create_codex_terminal(
         # review. See trust_all_codex_hooks.
         trust_all_hooks=True,
     )
+    app_server.session_id = session_id
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
     # the server decides per spawn whether to route. Any Smart Routing session,
@@ -4503,11 +4579,27 @@ async def _auto_create_codex_terminal(
                 event_client = retained_resume_client
         except BaseException as exc:
             if not isinstance(exc, Exception) or not is_unreadable_thread_error(exc):
+                reason = (
+                    "resume_preload_cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "resume_preload_failed"
+                )
+                app_server.record_teardown_reason(reason)
+                _logger.info(
+                    "Codex native resume preload stopped",
+                    extra=_codex_lifecycle_event(
+                        session_id,
+                        app_server,
+                        "launch_failed",
+                        reason=reason,
+                        error_type=type(exc).__name__,
+                    ),
+                )
                 # The app-server started above must not outlive a refused resume:
                 # without this close, every retry stacked another live codex
                 # process (and only the newest stayed tracked for teardown).
                 with contextlib.suppress(Exception):
-                    await app_server.close()
+                    await app_server.close(reason=reason)
                 _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
                 raise
             # Codex cannot load this thread's rollout, so no retry can resume
@@ -4536,13 +4628,29 @@ async def _auto_create_codex_terminal(
             # ``thread/started`` the TUI emits on startup (the client buffers
             # notifications, so there is no created-before-listening race).
             await event_client.connect()
-        except BaseException:
+        except BaseException as exc:
+            reason = (
+                "event_client_connect_cancelled"
+                if isinstance(exc, asyncio.CancelledError)
+                else "event_client_connect_failed"
+            )
+            app_server.record_teardown_reason(reason)
+            _logger.info(
+                "Codex native event listener connection stopped",
+                extra=_codex_lifecycle_event(
+                    session_id,
+                    app_server,
+                    "launch_failed",
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                ),
+            )
             # connect() may have half-opened the ws before the initialize
             # handshake failed, so close the listener too — not just the
             # app-server.
             with contextlib.suppress(Exception):
                 await event_client.close()
-            await app_server.close()
+            await app_server.close(reason=reason)
             _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             raise
 
@@ -4658,6 +4766,7 @@ async def _auto_create_codex_terminal(
             session_key="main",
             resource_role=CODEX_NATIVE_TERMINAL_ROLE,
             parent_os_env=agent_os_env,
+            diagnostic_context=app_server.diagnostic_attributes(),
             spec=TerminalEnvSpec(
                 os_env=OSEnvSpec(
                     type="caller_process",
@@ -4691,11 +4800,27 @@ async def _auto_create_codex_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
-    except BaseException:
+    except BaseException as exc:
+        reason = (
+            "terminal_launch_cancelled"
+            if isinstance(exc, asyncio.CancelledError)
+            else "terminal_launch_failed"
+        )
+        app_server.record_teardown_reason(reason)
+        _logger.info(
+            "Codex native terminal launch stopped",
+            extra=_codex_lifecycle_event(
+                session_id,
+                app_server,
+                "launch_failed",
+                reason=reason,
+                error_type=type(exc).__name__,
+            ),
+        )
         with contextlib.suppress(Exception):
             await event_client.close()
         with contextlib.suppress(Exception):
-            await app_server.close()
+            await app_server.close(reason=reason)
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
@@ -4710,6 +4835,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 workspace=workspace,
                 event_client=event_client,
+                app_server=app_server,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 subagent_router=_codex_router,
@@ -4722,13 +4848,14 @@ async def _auto_create_codex_terminal(
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
                 client=retained_resume_client,
+                app_server=app_server,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
         ),
         name=f"codex-forwarder-{session_id}",
     )
-    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _register_auto_forwarder_task(session_id, _forwarder_task, app_server=app_server)
 
     if pick_to_reset is not None and server_client is not None:
         await _clear_session_model_override(
@@ -4757,6 +4884,13 @@ async def _auto_create_codex_terminal(
     _logger.info(
         "Auto-created codex terminal + forwarder for session %s",
         session_id,
+        extra=_codex_lifecycle_event(
+            session_id,
+            app_server,
+            "terminal_launched",
+            terminal_lifecycle="auxiliary",
+            forwarder_mode="fresh" if launch_config.external_session_id is None else "resume",
+        ),
     )
     return terminal_view
 
@@ -4771,6 +4905,7 @@ async def _codex_discover_thread_and_forward(
     event_client: CodexAppServerClient,
     routing_summary: str,
     login_required: bool = False,
+    app_server: CodexNativeAppServer | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4807,6 +4942,8 @@ async def _codex_discover_thread_and_forward(
         the thread-start timeout), while thread discovery keeps listening
         so an interactive sign-in from the terminal still recovers the
         session.
+    :param app_server: This launch's process owner, retained for diagnostics
+        even if another launch replaces its registry entry.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4826,6 +4963,24 @@ async def _codex_discover_thread_and_forward(
     from omnigent.runner._entry import (
         _make_auth_token_factory,
         _RunnerDatabricksAuth,
+    )
+
+    if app_server is None:
+        app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    started_at = time.monotonic()
+    stop_reason = "forwarder_returned"
+    error_type: str | None = None
+    stage = "thread_discovery"
+    thread_id: str | None = None
+    _logger.info(
+        "Codex native thread discovery started",
+        extra=_codex_lifecycle_event(
+            session_id,
+            app_server,
+            "thread_discovery_started",
+            login_required=login_required,
+            discovery_has_deadline=not login_required,
+        ),
     )
 
     if login_required:
@@ -4861,6 +5016,12 @@ async def _codex_discover_thread_and_forward(
             else:
                 thread_id = await wait_for_thread_started(event_client)
         except (TimeoutError, RuntimeError) as exc:
+            stop_reason = (
+                "thread_discovery_timeout"
+                if isinstance(exc, TimeoutError)
+                else "thread_stream_ended"
+            )
+            error_type = type(exc).__name__
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
             # created. Stop forwarding (cleanup runs in ``finally``); any other
@@ -4868,6 +5029,15 @@ async def _codex_discover_thread_and_forward(
             _logger.exception(
                 "Codex TUI never started a thread for %s; chat will not forward",
                 session_id,
+                extra=_codex_lifecycle_event(
+                    session_id,
+                    app_server,
+                    "thread_discovery_failed",
+                    reason=stop_reason,
+                    error_type=error_type,
+                    elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    login_required=login_required,
+                ),
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
             cause = (
@@ -4883,6 +5053,17 @@ async def _codex_discover_thread_and_forward(
             )
             return
 
+        stage = "bridge_setup"
+        _logger.info(
+            "Codex native thread discovered",
+            extra=_codex_lifecycle_event(
+                session_id,
+                app_server,
+                "thread_discovered",
+                codex_thread_id=thread_id,
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            ),
+        )
         if login_required:
             # The user signed in (or the TUI otherwise started a thread):
             # the pre-recorded fail-fast cause no longer applies.
@@ -4946,6 +5127,17 @@ async def _codex_discover_thread_and_forward(
                 exc_info=True,
             )
 
+        stage = "forwarding"
+        _logger.info(
+            "Codex native forwarder started",
+            extra=_codex_lifecycle_event(
+                session_id,
+                app_server,
+                "forwarder_started",
+                codex_thread_id=thread_id,
+                forwarder_mode="fresh",
+            ),
+        )
         await supervise_forwarder(
             base_url=server_url,
             headers=headers,
@@ -4956,7 +5148,29 @@ async def _codex_discover_thread_and_forward(
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
         )
+    except asyncio.CancelledError:
+        stop_reason = "forwarder_cancelled"
+        error_type = "CancelledError"
+        raise
+    except BaseException as exc:
+        stop_reason = "forwarder_failed"
+        error_type = type(exc).__name__
+        raise
     finally:
+        _logger.info(
+            "Codex native forwarder stopped",
+            extra=_codex_lifecycle_event(
+                session_id,
+                app_server,
+                "forwarder_stopped",
+                reason=stop_reason,
+                error_type=error_type,
+                forwarder_stage=stage,
+                forwarder_mode="fresh",
+                codex_thread_id=thread_id,
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            ),
+        )
         # Tear down the listener and the per-session app-server whenever
         # forwarding ends — discovery failed, the app-server connection dropped
         # (``supervise_forwarder`` returned), or the task was cancelled on
@@ -4965,11 +5179,12 @@ async def _codex_discover_thread_and_forward(
         # subprocess is ours to stop, else it orphans one process per session.
         # Pop first so the dict never holds a closed reference.
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _record_codex_forwarder_cleanup(session_id, app_server, leftover_app_server, stop_reason)
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
-                await leftover_app_server.close()
+                await leftover_app_server.close(reason=stop_reason)
         await _shutdown_session_router_async(session_id, subagent_router)
         await _shutdown_session_turn_router_async(session_id, turn_router)
 
@@ -4981,6 +5196,7 @@ async def _codex_forward_known_thread(
     codex_ws_url: str,
     thread_id: str,
     client: CodexAppServerClient | None = None,
+    app_server: CodexNativeAppServer | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4994,6 +5210,8 @@ async def _codex_forward_known_thread(
     :param thread_id: Existing Codex app-server thread id, e.g.
         ``"thread_abc123"``.
     :param client: Retained preload subscription, owned and closed by this forwarder.
+    :param app_server: This launch's process owner, retained for diagnostics
+        even if another launch replaces its registry entry.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -5008,11 +5226,28 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
+    if app_server is None:
+        app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    started_at = time.monotonic()
+    stop_reason = "forwarder_returned"
+    error_type: str | None = None
+    stage = "bridge_setup"
     try:
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
         auth_token = auth_factory() if auth_factory is not None else None
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        stage = "forwarding"
+        _logger.info(
+            "Codex native forwarder started",
+            extra=_codex_lifecycle_event(
+                session_id,
+                app_server,
+                "forwarder_started",
+                codex_thread_id=thread_id,
+                forwarder_mode="resume",
+            ),
+        )
         await supervise_forwarder(
             base_url=server_url,
             headers=headers,
@@ -5023,14 +5258,37 @@ async def _codex_forward_known_thread(
             client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
         )
+    except asyncio.CancelledError:
+        stop_reason = "forwarder_cancelled"
+        error_type = "CancelledError"
+        raise
+    except BaseException as exc:
+        stop_reason = "forwarder_failed"
+        error_type = type(exc).__name__
+        raise
     finally:
+        _logger.info(
+            "Codex native forwarder stopped",
+            extra=_codex_lifecycle_event(
+                session_id,
+                app_server,
+                "forwarder_stopped",
+                reason=stop_reason,
+                error_type=error_type,
+                forwarder_stage=stage,
+                forwarder_mode="resume",
+                codex_thread_id=thread_id,
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            ),
+        )
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _record_codex_forwarder_cleanup(session_id, app_server, leftover_app_server, stop_reason)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
-                await leftover_app_server.close()
+                await leftover_app_server.close(reason=stop_reason)
         await _shutdown_session_router_async(session_id, subagent_router)
         await _shutdown_session_turn_router_async(session_id, turn_router)
 

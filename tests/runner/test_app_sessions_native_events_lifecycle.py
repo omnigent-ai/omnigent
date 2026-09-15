@@ -34,7 +34,7 @@ from tests.runner.conftest import (
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import CodexAppServerDiagnosticsMixin, NullServerClient
 
 
 class _EventRecordingServerClient(NullServerClient):
@@ -3523,7 +3523,7 @@ async def test_auxiliary_codex_tui_exit_preserves_app_server(
     conv_id = uuid.uuid4().hex
     teardown_calls: list[str] = []
 
-    async def _record_teardown(session_id: str) -> None:
+    async def _record_teardown(session_id: str, *, reason: str = "session_teardown") -> None:
         teardown_calls.append(session_id)
 
     monkeypatch.setattr(
@@ -3561,6 +3561,61 @@ async def test_auxiliary_codex_tui_exit_preserves_app_server(
         "session_id": conv_id,
     } in events
     assert not [event for event in events if event.get("type") == "session.status"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_close_fails", [False, True])
+async def test_codex_idle_reaper_records_intent_before_closing_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_close_fails: bool,
+) -> None:
+    """Pane cleanup cannot precede its causal app-server teardown record."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.terminals.pane_reaper import PaneRef
+
+    session_id = uuid.uuid4().hex
+    app_server = CodexAppServerDiagnosticsMixin()
+    app_server.session_id = session_id
+    calls: list[str] = []
+    registry = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    pane = PaneRef(session_id, "terminal_codex_main", "codex", tmp_path / "tmux.sock")
+
+    async def close_terminal(conversation_id: str, terminal_id: str) -> None:
+        assert (conversation_id, terminal_id) == (session_id, pane.terminal_id)
+        assert app_server.teardown_reason == "idle_pane_reap"
+        calls.append("terminal_close")
+        if terminal_close_fails:
+            raise RuntimeError("synthetic terminal close failure")
+
+    async def teardown(conversation_id: str, *, reason: str = "session_teardown") -> None:
+        assert conversation_id == session_id
+        assert reason == "idle_pane_reap"
+        assert app_server.teardown_reason == reason
+        calls.append("app_server_teardown")
+
+    monkeypatch.setattr(resources, "close_terminal", close_terminal)
+    monkeypatch.setattr(runner_app._native_runtime, "teardown_codex_native_app_server", teardown)
+    monkeypatch.setitem(runner_app._AUTO_CODEX_APP_SERVERS, session_id, app_server)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    try:
+        if terminal_close_fails:
+            with pytest.raises(RuntimeError, match="synthetic terminal close failure"):
+                await reaper._reap(pane)
+        else:
+            await reaper._reap(pane)
+    finally:
+        runner_app._session_event_queues_ref.pop(session_id, None)
+
+    assert calls == ["terminal_close", "app_server_teardown"]
 
 
 @pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])

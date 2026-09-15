@@ -14,7 +14,7 @@ import pytest
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -28,6 +28,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals import registry as terminal_registry_mod
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -109,6 +110,63 @@ def _seed_terminal(
         os_env=os_env,
         running=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", [TerminalLifecycle.REQUIRED, TerminalLifecycle.AUXILIARY])
+async def test_launch_diagnostics_are_bound_before_spawn_and_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lifecycle: TerminalLifecycle
+) -> None:
+    """The public resource launch carries identities through the real terminal registry."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("codex", "main", tmp_path, running=False)
+    association: dict[str, object] = {
+        "app_server_instance_id": "server_instance_1",
+        "app_server_pid": 123,
+    }
+    phases: list[str] = []
+
+    def _check(phase: str) -> None:
+        phases.append(phase)
+        assert instance._diagnostic_owner_session_id == "child_session"
+        attributes = instance.diagnostic_attributes()
+        assert attributes["terminal_lifecycle"] == lifecycle.value
+        assert all(attributes[key] == value for key, value in association.items())
+
+    async def _launch(*, cwd: Path | None = None) -> None:
+        del cwd
+        _check("launch")
+        instance.running = True
+
+    def _watcher(**_kwargs: object) -> None:
+        _check("watcher")
+
+    monkeypatch.setattr(instance, "launch", _launch)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", _watcher)
+    monkeypatch.setattr(
+        terminal_registry_mod,
+        "create_terminal_instance",
+        lambda *_args, **_kwargs: TerminalCreateResult(instance=instance, cwd=tmp_path),
+    )
+    registry.set_terminal_exit_publisher(lambda _event: None)
+    launch = (
+        registry.launch_required_terminal
+        if lifecycle is TerminalLifecycle.REQUIRED
+        else registry.launch_auxiliary_terminal
+    )
+    view = await launch(
+        "child_session",
+        "codex",
+        "main",
+        TerminalEnvSpec(command="codex"),
+        diagnostic_context=association,
+    )
+
+    assert phases == ["launch", "watcher"]
+    assert view.id == "terminal_codex_main"
+    assert "diagnostic_context" not in view.metadata
+    assert "app_server_instance_id" not in view.metadata
 
 
 def test_list_resources_includes_default_env() -> None:

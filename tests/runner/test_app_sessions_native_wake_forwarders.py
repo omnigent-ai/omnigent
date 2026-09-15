@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
 from omnigent.spec.types import AgentSpec, ExecutorSpec
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import CodexAppServerDiagnosticsMixin, NullServerClient
 
 
 @dataclass
@@ -401,8 +402,8 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
             run.cancelled = True
             raise
 
-    class _FakeAppServer:
-        async def close(self) -> None:
+    class _FakeAppServer(CodexAppServerDiagnosticsMixin):
+        async def close(self, *, reason: str = "caller_requested") -> None:
             nonlocal closed
             closed = True
 
@@ -486,11 +487,11 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
 
         return _parked
 
-    class _FakeAppServer:
+    class _FakeAppServer(CodexAppServerDiagnosticsMixin):
         def __init__(self, sid: str) -> None:
             self._sid = sid
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             closed.append(self._sid)
 
     try:
@@ -800,7 +801,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -816,7 +817,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         async def start(self) -> None:
             """:returns: None."""
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """:returns: None."""
 
     def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
@@ -889,6 +890,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """Return a terminal resource view for the codex TUI."""
             del terminal_name, session_key, spec, resource_role
@@ -1082,7 +1084,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
 
     closed: list[str] = []
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server recording whether it was closed."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1098,7 +1100,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         async def start(self) -> None:
             """:returns: None."""
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """Record the teardown the failure path owes."""
             closed.append("closed")
 
@@ -1263,7 +1265,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
 
     closed: list[str] = []
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server recording whether it was closed."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1279,7 +1281,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         async def start(self) -> None:
             """:returns: None."""
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """Record a teardown the fallback must not perform."""
             closed.append("closed")
 
@@ -1354,6 +1356,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """Record the launch argv and return a terminal resource view."""
             del terminal_name, session_key, resource_role, parent_os_env

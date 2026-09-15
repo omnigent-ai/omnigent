@@ -27,11 +27,16 @@ from tests.runner.conftest import (
     REAL_CODEX_LAUNCH_CATALOG,
     REAL_CODEX_REPROBED_LAUNCH_CATALOG,
 )
+from tests.runner.helpers import CodexAppServerDiagnosticsMixin
 
 _CODEX_PATH = "/missing-test-bin/codex"
 _SESSION_ID = "c91a9d508b344ad59c65628ed80b5230"
 _PROVIDER_DEFAULT = "gpt-5.6-terra"
 _RETIRED_PICK = "gpt-5.4-retired"
+
+
+class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin, SimpleNamespace):
+    """Scripted launch state plus the app-server diagnostics contract."""
 
 
 @dataclass
@@ -143,7 +148,7 @@ async def codex_launch_harness(
             snapshot["model_override"] = None
         return httpx.Response(200, json={"reset": applied})
 
-    app_server = SimpleNamespace(
+    app_server = _FakeCodexAppServer(
         codex_path=_CODEX_PATH,
         codex_cli_version=(0, 145, 0),
         codex_home=tmp_path / "unused-home",

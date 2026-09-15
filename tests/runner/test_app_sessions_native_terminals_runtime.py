@@ -8,6 +8,7 @@ import json
 import shutil
 import threading
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -43,7 +44,7 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import CodexAppServerDiagnosticsMixin, NullServerClient
 
 
 @pytest.mark.asyncio
@@ -490,7 +491,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -507,15 +508,24 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             # --remote TUI; empty here (no profile in this test).
             self.config_overrides: list[str] = []
 
+        def diagnostic_attributes(self) -> dict[str, object]:
+            """Identify the same app-server lifetime across launch and forwarding."""
+            return {
+                **super().diagnostic_attributes(),
+                "app_server_instance_id": "codex-owned-launch",
+                "app_server_pid": 1234,
+            }
+
         async def start(self) -> None:
             """:returns: None."""
+            assert self.session_id == session_id
             assert list(self.codex_home.glob(f"sessions/**/rollout-*-{thread_id}.jsonl")), (
                 "Codex resume rollout must be synthesized in app-server CODEX_HOME "
                 "before app-server start"
             )
             self.started = True
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """:returns: None."""
             self.closed = True
 
@@ -582,6 +592,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -597,6 +608,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert terminal_name == "codex"
             assert session_key == "main"
             assert resource_role == CODEX_NATIVE_TERMINAL_ROLE
+            assert app_server.session_id == session_id
+            assert diagnostic_context is not None
+            assert diagnostic_context == app_server.diagnostic_attributes()
+            assert diagnostic_context["app_server_instance_id"] == "codex-owned-launch"
+            assert diagnostic_context["app_server_pid"] == 1234
             assert not retained_client.closed
             launched_specs.append(spec)
             if cancel_launch:
@@ -739,6 +755,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
             "client": retained_client if retain_subscription else None,
+            "app_server": app_server,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
@@ -859,7 +876,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -878,7 +895,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             """:returns: None."""
             self.started = True
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """:returns: None."""
 
     app_server = _FakeCodexAppServer()
@@ -925,6 +942,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1143,7 +1161,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1161,7 +1179,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             """:returns: None."""
             self.started = True
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """:returns: None."""
 
     app_server = _FakeCodexAppServer()
@@ -1200,6 +1218,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1377,7 +1396,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1396,7 +1415,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             """:returns: None."""
             self.started = True
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """:returns: None."""
 
     app_server = _FakeCodexAppServer()
@@ -1456,6 +1475,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1607,7 +1627,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
                 request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1624,7 +1644,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         async def start(self) -> None:
             """:returns: None."""
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """:returns: None."""
 
     class _FakeDiscoveryClient:
@@ -1652,6 +1672,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """:returns: A fixed terminal resource view."""
             del terminal_name, session_key, spec, resource_role
@@ -3168,8 +3189,8 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
         async def close(self) -> None:
             closed.append("client")
 
-    class _AppServer:
-        async def close(self) -> None:
+    class _AppServer(CodexAppServerDiagnosticsMixin):
+        async def close(self, *, reason: str = "caller_requested") -> None:
             closed.append("server")
 
     client = _Client()
@@ -3231,8 +3252,8 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
         async def close(self) -> None:
             closed["client"] = True
 
-    class _AppServer:
-        async def close(self) -> None:
+    class _AppServer(CodexAppServerDiagnosticsMixin):
+        async def close(self, *, reason: str = "caller_requested") -> None:
             closed["app_server"] = True
 
     async def _raise_no_thread(*_args: object, **_kwargs: object) -> str:
@@ -3297,8 +3318,8 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
         async def close(self) -> None:
             return None
 
-    class _AppServer:
-        async def close(self) -> None:
+    class _AppServer(CodexAppServerDiagnosticsMixin):
+        async def close(self, *, reason: str = "caller_requested") -> None:
             return None
 
     async def _raise(*_args: object, **_kwargs: object) -> str:
@@ -3363,8 +3384,8 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         async def close(self) -> None:
             return None
 
-    class _AppServer:
-        async def close(self) -> None:
+    class _AppServer(CodexAppServerDiagnosticsMixin):
+        async def close(self, *, reason: str = "caller_requested") -> None:
             return None
 
     monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
@@ -3599,7 +3620,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -3617,7 +3638,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             """Mark the fake app-server started."""
             self.started = True
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """No-op close."""
 
     app_server = _FakeCodexAppServer()
@@ -3688,6 +3709,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """
             Accept the terminal launch request.
@@ -3837,7 +3859,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(CodexAppServerDiagnosticsMixin):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -3855,7 +3877,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
             """Mark the fake app-server started."""
             self.started = True
 
-        async def close(self) -> None:
+        async def close(self, *, reason: str = "caller_requested") -> None:
             """No-op close."""
 
     app_server = _FakeCodexAppServer()
@@ -3916,6 +3938,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            diagnostic_context: Mapping[str, object] | None = None,
         ) -> SessionResourceView:
             """Accept the terminal launch request."""
             del terminal_name, session_key, spec, resource_role, parent_os_env

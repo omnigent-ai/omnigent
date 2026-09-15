@@ -9,6 +9,28 @@ from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 
 
+class CodexAppServerDiagnosticsMixin:
+    """Lifecycle diagnostics for app-server fakes without real subprocesses."""
+
+    session_id: str | None = None
+    teardown_reason: str | None = None
+
+    def diagnostic_attributes(self) -> dict[str, object]:
+        """Report only state this process-free fake can establish."""
+        return {
+            "harness": "codex-native",
+            "app_server_instance_id": None,
+            "app_server_pid": None,
+            "app_server_returncode": None,
+            "app_server_state": "not_started",
+        }
+
+    def record_teardown_reason(self, reason: str) -> None:
+        """Keep the first cleanup intent, as the real app-server does."""
+        if self.teardown_reason is None:
+            self.teardown_reason = reason
+
+
 class NullServerClient:
     """Minimal fake Omnigent server client for tests that do not exercise Omnigent interactions.
 

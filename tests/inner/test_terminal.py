@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from typing import NoReturn
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
     TerminalInstance,
@@ -25,7 +27,7 @@ from omnigent.inner.terminal import (
     _is_utf8_locale_value,
     create_terminal_instance,
 )
-from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR, RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
 @dataclass
@@ -62,6 +64,244 @@ def contains_subsequence(values: list[str], expected: list[str]) -> bool:
     return any(
         values[index : index + len(expected)] == expected for index in range(last_start + 1)
     )
+
+
+def test_terminal_diagnostic_identity_is_private_and_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runtime associations cannot import arbitrary launch secrets into attributes."""
+    monkeypatch.setenv(RUNNER_ID_ENV_VAR, "runner_safe_id")
+    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "secret-bearer")
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "private-project" / "tmux.sock",
+        private_dir=tmp_path,
+        command="secret-command",
+        args=["secret-arg"],
+        env={"SECRET": "secret-environment"},
+    )
+    context: dict[str, object] = {
+        "app_server_instance_id": "server_instance_1",
+        "app_server_pid": 123,
+        "token": "secret-context",
+        "session_id": "incorrect_owner",
+    }
+    instance.bind_diagnostic_context(
+        session_id="child_session",
+        terminal_lifecycle="auxiliary",
+        diagnostic_context=context,
+    )
+    context["app_server_instance_id"] = "mutated_after_launch"
+    instance._remember_pane_snapshot("secret-terminal-text")
+
+    assert instance.diagnostic_attributes() == {
+        "terminal_instance_id": hashlib.sha256(str(instance.socket_path).encode()).hexdigest(),
+        "terminal_lifecycle": "auxiliary",
+        "app_server_instance_id": "server_instance_1",
+        "app_server_pid": 123,
+        "runner_id": "runner_safe_id",
+    }
+    assert "secret" not in str(instance._exit_diagnostic_attributes())
+
+
+def test_terminal_lifecycle_omits_free_form_identifiers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """User-provided terminal identifiers never reach managed lifecycle logs."""
+    instance = TerminalInstance(
+        name="private customer incident notes",
+        session_key="private session context " * 1024,
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance.bind_diagnostic_context(session_id="child_session")
+
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        instance.note_close_requested()
+
+    assert len(caplog.records) == 1
+    row = record_to_row(caplog.records[0], "runner")
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert (
+        attributes["terminal_instance_id"]
+        == hashlib.sha256(str(instance.socket_path).encode()).hexdigest()
+    )
+    assert "terminal_name" not in attributes
+    assert "terminal_session_key" not in attributes
+    assert instance.name not in str(row)
+    assert "private session context" not in str(row)
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        (None, {"probe_signature": "unknown"}),
+        ("no server running on /private/path", {"probe_signature": "no_server_running"}),
+        ("no current target", {"probe_signature": "no_current_target"}),
+        ("error connecting: No such file or directory", {"probe_signature": "socket_missing"}),
+        ("can't find session: main", {"probe_signature": "session_missing"}),
+        ("[Errno 24] secret-detail", {"probe_signature": "os_error", "probe_errno": 24}),
+        ("unexpected secret-detail", {"probe_signature": "other_tmux_error"}),
+    ],
+)
+def test_tmux_probe_attributes_are_bounded(
+    detail: str | None, expected: dict[str, object]
+) -> None:
+    """The structured signature never exports the raw probe error."""
+    assert terminal_mod._tmux_probe_attributes(detail) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("watcher", ["async", "threaded"])
+@pytest.mark.parametrize("lifecycle", ["required", "auxiliary"])
+async def test_tmux_unavailable_has_explicit_owner_and_runtime_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    watcher: str,
+    lifecycle: str,
+) -> None:
+    """Both watchers preserve child ownership through the production log serializer."""
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent_session")
+    monkeypatch.setenv(RUNNER_ID_ENV_VAR, "runner_safe_id")
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0)
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance.bind_diagnostic_context(
+        session_id="child_session",
+        terminal_lifecycle=lifecycle,
+        diagnostic_context={"app_server_instance_id": "server_1", "app_server_pid": 123},
+    )
+    instance._remember_pane_snapshot("private pane output")
+
+    def _fail(*_args: str) -> str:
+        raise RuntimeError("no server running on /private/path")
+
+    async def _fail_async(*args: str) -> str:
+        return _fail(*args)
+
+    monkeypatch.setattr(instance, "_tmux_output_sync", _fail)
+    monkeypatch.setattr(instance, "_tmux_output", _fail_async)
+    with (
+        caplog.at_level(logging.ERROR, logger=terminal_mod.__name__),
+        current_session_id_scope("ambient_parent_session"),
+    ):
+        if watcher == "async":
+            await instance._idle_watch_loop(lambda: None)
+        else:
+            instance._idle_watch_loop_threaded(threading.Event(), poll_interval_s=0)
+        rows = [record_to_row(record, "runner") for record in caplog.records]
+
+    assert len(rows) == 1, "metadata must not add a second failure ERROR"
+    row = rows[0]
+    assert row["session_id"] == "child_session"
+    assert row["event_name"] == "terminal_lifecycle"
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert attributes == {
+        **{key: str(value) for key, value in instance.diagnostic_attributes().items()},
+        "phase": "unavailable",
+        "watcher": watcher,
+        "consecutive_probe_failures": str(terminal_mod._IDLE_EXIT_FAILURE_THRESHOLD),
+        "pane_output_captured": "True",
+        "pane_output_chars": str(len("private pane output")),
+        "probe_signature": "no_server_running",
+        "session_probe_signature": "no_server_running",
+    }
+    assert "private" not in str(attributes)
+    assert instance.running is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("watcher", ["async", "threaded"])
+async def test_dead_pane_records_observed_exit_status_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    watcher: str,
+) -> None:
+    """Pane-exit telemetry is INFO and does not require enabling retained panes."""
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0)
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance.bind_diagnostic_context(session_id="child_session", terminal_lifecycle="auxiliary")
+
+    def _output(*args: str) -> str:
+        return "private last frame" if args[0] == "capture-pane" else "1 17"
+
+    async def _output_async(*args: str) -> str:
+        return _output(*args)
+
+    monkeypatch.setattr(instance, "_tmux_output_sync", _output)
+    monkeypatch.setattr(instance, "_tmux_output", _output_async)
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        if watcher == "async":
+            await instance._idle_watch_loop(lambda: None)
+        else:
+            instance._idle_watch_loop_threaded(threading.Event(), poll_interval_s=0)
+
+    assert len(caplog.records) == 1
+    row = record_to_row(caplog.records[0], "runner")
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert row["level"] == "INFO"
+    assert row["session_id"] == "child_session"
+    assert attributes["phase"] == "pane_exited"
+    assert attributes["pane_exit_status"] == "17"
+    assert attributes["pane_output_chars"] == str(len("private last frame"))
+    assert attributes["watcher"] == watcher
+    assert "private" not in str(row)
+    assert instance.keep_alive_after_exit is False
+
+
+@pytest.mark.asyncio
+async def test_expected_close_logs_intent_before_teardown_without_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A requested teardown is distinguishable from unexplained socket disappearance."""
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=private_dir / "tmux.sock",
+        private_dir=private_dir,
+        running=True,
+        command="secret-command",
+        args=["secret-arg"],
+        env={"SECRET": "secret-environment"},
+    )
+    instance.bind_diagnostic_context(session_id="child_session", terminal_lifecycle="auxiliary")
+    instance._remember_pane_snapshot("secret-terminal-text")
+
+    async def _tmux(*args: str) -> None:
+        assert args == ("kill-server",)
+        assert caplog.records[-1].attributes["phase"] == "close_requested"
+
+    monkeypatch.setattr(instance, "_tmux", _tmux)
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        instance.note_close_requested("replacement")
+        await instance.close()
+        await instance.close()
+
+    rows = [record_to_row(record, "runner") for record in caplog.records]
+    assert [row["attributes"]["phase"] for row in rows] == ["close_requested", "closed"]
+    assert all(row["session_id"] == "child_session" and row["level"] == "INFO" for row in rows)
+    assert all(row["attributes"]["close_reason"] == "replacement" for row in rows)
+    assert "secret" not in str(rows)
+    assert str(private_dir) not in str(rows)
 
 
 def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
@@ -1913,6 +2153,7 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
 def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A dead-owner instance with a socket gets ``tmux kill-server``.
@@ -1939,17 +2180,108 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
         "subprocess",
         SimpleNamespace(run=_record_run, TimeoutExpired=TimeoutError),
     )
-    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead2", _dead_pid())
+    owner_pid = _dead_pid()
+    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead2", owner_pid)
     socket_path = dead_dir / "tmux.sock"
     socket_path.touch()
 
-    reaped = terminal_mod.reap_orphaned_terminals()
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        reaped = terminal_mod.reap_orphaned_terminals()
 
     assert reaped == 1
     assert not dead_dir.exists()
     # kill-server targeted exactly this instance's socket; a missing
     # call means the tmux server (the real leak) survives dir removal.
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
+    rows = [record_to_row(record, "runner") for record in caplog.records]
+    assert [row["attributes"]["phase"] for row in rows] == [
+        "orphan_reap_requested",
+        "orphan_reap_finished",
+    ]
+    for row in rows:
+        attributes = row["attributes"]
+        assert isinstance(attributes, dict)
+        assert (
+            attributes["terminal_instance_id"]
+            == hashlib.sha256(str(socket_path).encode()).hexdigest()
+        )
+        assert attributes["recorded_owner_pid"] == str(owner_pid)
+        assert attributes["reaper_pid"] == str(terminal_mod.os.getpid())
+        assert attributes["emitting_context"] == "orphan_reaper"
+    assert rows[-1]["attributes"]["kill_server_returncode"] == "0"
+    assert str(socket_path) not in str(rows)
+
+
+@pytest.mark.parametrize("outcome", ["nonzero", "os_error", "timeout", "socket_absent"])
+def test_orphan_reap_logs_bounded_kill_outcome_without_changing_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+) -> None:
+    """A failed kill stays best-effort, with diagnostics distinct from directory removal."""
+    owner_pid = _dead_pid()
+    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-orphan", owner_pid)
+    socket_path = dead_dir / "tmux.sock"
+    if outcome != "socket_absent":
+        socket_path.touch()
+    calls: list[list[str]] = []
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        assert kwargs["timeout"] == terminal_mod._REAP_KILL_TIMEOUT_S
+        if outcome == "os_error":
+            raise OSError(errno.EACCES, "secret-error-message", "secret-filename")
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(
+                ["secret-command"],
+                timeout=10,
+                output=b"secret-output",
+                stderr=b"secret-stderr",
+            )
+        assert outcome == "nonzero", "an absent socket must never launch a kill probe"
+        return subprocess.CompletedProcess(
+            argv, 1, stdout=b"secret-output", stderr=b"secret-stderr"
+        )
+
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(run=_run, TimeoutExpired=subprocess.TimeoutExpired),
+    )
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        assert terminal_mod.reap_orphaned_terminals() == 1
+
+    assert not dead_dir.exists()
+    assert len(calls) == (0 if outcome == "socket_absent" else 1)
+    rows = [record_to_row(record, "runner") for record in caplog.records]
+    assert [row["attributes"]["phase"] for row in rows] == [
+        "orphan_reap_requested",
+        "orphan_reap_finished",
+    ]
+    attributes = rows[-1]["attributes"]
+    assert isinstance(attributes, dict)
+    assert attributes["private_dir_removed"] == "True"
+    assert attributes["socket_present"] == str(outcome != "socket_absent")
+    assert attributes["kill_server_attempted"] == str(outcome != "socket_absent")
+    if outcome == "nonzero":
+        assert attributes["kill_server_returncode"] == "1"
+        assert "kill_server_error_type" not in attributes
+    elif outcome == "os_error":
+        assert attributes["kill_server_error_type"] == "PermissionError"
+        assert attributes["kill_server_errno"] == str(errno.EACCES)
+        assert "kill_server_returncode" not in attributes
+    elif outcome == "timeout":
+        assert attributes["kill_server_error_type"] == "TimeoutExpired"
+        assert "kill_server_returncode" not in attributes
+        assert "kill_server_errno" not in attributes
+    else:
+        assert "kill_server_error_type" not in attributes
+        assert "kill_server_returncode" not in attributes
+    assert "secret" not in str(rows)
+    assert str(socket_path) not in str(rows)
 
 
 @pytest.mark.skipif(

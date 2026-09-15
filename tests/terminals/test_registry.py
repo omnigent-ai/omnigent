@@ -15,6 +15,7 @@ empty list, active_conversation_ids) run regardless.
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import threading
 from collections.abc import AsyncIterator
@@ -23,6 +24,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
 from omnigent.terminals import TerminalRegistry
@@ -245,6 +247,7 @@ async def test_close_expected_closes_its_own_instance(tmp_path: Path) -> None:
 async def test_launch_replaces_stale_running_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """``launch`` verifies a cached running entry before returning it."""
 
@@ -291,16 +294,23 @@ async def test_launch_replaces_stale_running_entry(
 
     monkeypatch.setattr(registry_mod, "create_terminal_instance", _fake_create_terminal_instance)
 
-    result = await reg.launch(
-        "conv_x",
-        "shell",
-        "s1",
-        TerminalEnvSpec(command="bash"),
-    )
+    with caplog.at_level(logging.INFO):
+        result = await reg.launch(
+            "conv_x",
+            "shell",
+            "s1",
+            TerminalEnvSpec(command="bash"),
+        )
 
     assert result is created
     assert stale.closed is True
     assert reg.get("conv_x", "shell", "s1") is created
+    assert (
+        stale.diagnostic_attributes()["terminal_instance_id"]
+        != (created.diagnostic_attributes()["terminal_instance_id"])
+    )
+    intent = next(record for record in caplog.records if record.msg == "Terminal close requested")
+    assert intent.attributes["close_reason"] == "replacement"
 
 
 def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:
@@ -333,6 +343,95 @@ def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:
     assert reg.get_instance_lock("conv_old", "claude", "main") is None
     assert reg.get_instance_lock("conv_new", "claude", "main") is lock
     assert reg.active_conversation_ids() == ["conv_new"]
+
+
+def test_transfer_updates_watcher_owner_without_changing_terminal_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A transferred pane's errors follow its new owner, never the runner parent."""
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance.bind_diagnostic_context(
+        session_id="old_owner",
+        terminal_lifecycle="auxiliary",
+        diagnostic_context={"app_server_instance_id": "server_1"},
+    )
+    identity_before = instance.diagnostic_attributes()
+    reg._by_conversation["old_owner"] = {("codex", "main"): instance}
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "runner_parent")
+
+    def _fail(*_args: str) -> str:
+        raise RuntimeError("no current target")
+
+    monkeypatch.setattr(instance, "_tmux_output_sync", _fail)
+    with caplog.at_level(logging.INFO):
+        assert reg.transfer("old_owner", "new_owner", "codex", "main")
+        instance._idle_watch_loop_threaded(threading.Event(), poll_interval_s=0)
+
+    rows = [
+        record_to_row(record, "runner")
+        for record in caplog.records
+        if record.msg == "Terminal ownership transferred" or record.levelno == logging.ERROR
+    ]
+    assert len(rows) == 2
+    assert all(row["session_id"] == "new_owner" for row in rows)
+    assert instance.diagnostic_attributes() == identity_before
+    assert rows[0]["attributes"]["previous_owner_session_id"] == "old_owner"
+
+
+@pytest.mark.asyncio
+async def test_launch_binds_diagnostics_before_spawn_and_preserves_reused_association(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The app-server association is fixed to the actual terminal, not later callers."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    expected_context = {"app_server_instance_id": "server_1", "app_server_pid": 123}
+
+    async def _launch(*, cwd: Path | None = None) -> None:
+        del cwd
+        attributes = instance.diagnostic_attributes()
+        assert instance._diagnostic_owner_session_id == "child_session"
+        assert attributes["terminal_lifecycle"] == "auxiliary"
+        assert all(attributes[key] == value for key, value in expected_context.items())
+        instance.running = True
+
+    monkeypatch.setattr(instance, "launch", _launch)
+    monkeypatch.setattr(instance, "is_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        registry_mod,
+        "create_terminal_instance",
+        lambda *_args, **_kwargs: TerminalCreateResult(instance=instance, cwd=tmp_path),
+    )
+    reg = TerminalRegistry()
+    first = await reg.launch(
+        "child_session",
+        "codex",
+        "main",
+        TerminalEnvSpec(command="codex"),
+        terminal_lifecycle="auxiliary",
+        diagnostic_context=expected_context,
+    )
+    second = await reg.launch(
+        "child_session",
+        "codex",
+        "main",
+        TerminalEnvSpec(command="codex"),
+        terminal_lifecycle="auxiliary",
+        diagnostic_context={"app_server_instance_id": "unrelated_server"},
+    )
+    assert first is second is instance
+    assert instance.diagnostic_attributes()["app_server_instance_id"] == "server_1"
 
 
 def test_transfer_rejects_target_collision_without_moving_source(tmp_path: Path) -> None:

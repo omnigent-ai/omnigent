@@ -39,10 +39,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
 
@@ -167,6 +169,8 @@ class TerminalRegistry:
         parent_os_env: OSEnvSpec | None = None,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
+        terminal_lifecycle: str | None = None,
+        diagnostic_context: Mapping[str, object] | None = None,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -198,6 +202,10 @@ class TerminalRegistry:
             ``allow_cwd_override`` flag.
         :param sandbox_override: Optional sandbox override, already
             vetted against ``allow_sandbox_override``.
+        :param terminal_lifecycle: Runtime-only required/auxiliary relationship
+            for diagnostic correlation; does not affect terminal policy.
+        :param diagnostic_context: Allowlisted, immutable runtime identities
+            associated with a newly created terminal.
         :returns: The (possibly newly created) :class:`TerminalInstance`.
         :raises RuntimeError: If tmux isn't on PATH or the launch
             fails. Inner code surfaces a clear error; the caller
@@ -209,9 +217,9 @@ class TerminalRegistry:
         if existing is not None and existing.running:
             if await existing.is_alive():
                 return existing
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, reason="replacement")
         elif existing is not None:
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, reason="replacement")
 
         # Lock-free section: ``create_terminal_instance`` and
         # ``launch`` may take real time (tmux spawn). Holding the
@@ -227,8 +235,14 @@ class TerminalRegistry:
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
+        created.instance.bind_diagnostic_context(
+            session_id=conversation_id,
+            terminal_lifecycle=terminal_lifecycle,
+            diagnostic_context=diagnostic_context,
+        )
         await created.instance.launch(cwd=created.cwd)
         if not await created.instance.is_alive():
+            created.instance.note_close_requested("launch_unavailable")
             try:
                 await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -266,6 +280,7 @@ class TerminalRegistry:
                 )
 
         if instance_to_close is not None:
+            instance_to_close.note_close_requested("launch_race_loser")
             try:
                 await asyncio.wait_for(instance_to_close.close(), timeout=_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -421,9 +436,22 @@ class TerminalRegistry:
             if not source_slot:
                 self._by_conversation.pop(source_conversation_id, None)
             target_slot[key] = instance
+            instance.bind_diagnostic_context(session_id=target_conversation_id)
 
             lock = self._instance_locks.pop(source_lock_key, None)
             self._instance_locks[target_lock_key] = lock or threading.Lock()
+        logger.info(
+            "Terminal ownership transferred",
+            extra=debug_event(
+                "terminal_lifecycle",
+                session_id=target_conversation_id,
+                turn_id=None,
+                user_id=None,
+                phase="ownership_transferred",
+                previous_owner_session_id=source_conversation_id,
+                **instance.diagnostic_attributes(),
+            ),
+        )
         return True
 
     async def close(
@@ -433,6 +461,7 @@ class TerminalRegistry:
         session_key: str,
         *,
         expected: TerminalInstance | None = None,
+        reason: str = "caller_requested",
     ) -> bool:
         """Close one terminal and remove it from the registry.
 
@@ -451,6 +480,7 @@ class TerminalRegistry:
             alone would terminate that successor instead. Compared under
             the registry lock, so no other writer can swap the instance
             between the check and the removal.
+        :param reason: Bounded cleanup reason for diagnostics only.
         :returns: ``True`` if a live instance was closed, ``False``
             if no live instance was found (already-closed or
             never-launched), or if *expected* no longer occupies the key.
@@ -474,6 +504,7 @@ class TerminalRegistry:
             self._instance_locks.pop((conversation_id, terminal_name, session_key), None)
         if instance is None:
             return False
+        instance.note_close_requested(reason)
         try:
             await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
         except asyncio.TimeoutError:
@@ -516,6 +547,7 @@ class TerminalRegistry:
         if not slot:
             return
         for (name, key), instance in slot.items():
+            instance.note_close_requested("conversation_cleanup")
             try:
                 await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -551,6 +583,7 @@ class TerminalRegistry:
             self._instance_locks.clear()
         for conversation_id, slot in slots:
             for (name, key), instance in slot.items():
+                instance.note_close_requested("registry_shutdown")
                 try:
                     await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
                 except asyncio.TimeoutError:

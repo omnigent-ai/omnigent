@@ -3340,7 +3340,9 @@ def create_runner_app(
         # A required terminal exit ends the session. Tear down any registered
         # Codex app-server alongside it; this is a no-op for other harnesses.
         _teardown_task = asyncio.create_task(
-            _native_runtime.teardown_codex_native_app_server(event.session_id)
+            _native_runtime.teardown_codex_native_app_server(
+                event.session_id, reason="required_terminal_exit"
+            )
         )
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
@@ -4523,7 +4525,7 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
-        await _cancel_auto_forwarder_task(session_id)
+        await _cancel_auto_forwarder_task(session_id, reason="session_deleted")
 
         if process_manager is not None:
             await process_manager.forward_cancel(session_id)
@@ -12146,6 +12148,9 @@ def create_runner_app(
             )
 
         async def _reap_native_pane(pane: PaneRef) -> None:
+            app_server = _native_runtime._AUTO_CODEX_APP_SERVERS.get(pane.conversation_id)
+            if app_server is not None:
+                app_server.record_teardown_reason("idle_pane_reap")
             try:
                 await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
             finally:
@@ -12154,7 +12159,9 @@ def create_runner_app(
                 # down in ``finally`` so an idle-reaped codex session can't orphan
                 # a ``codex app-server`` for the runner's lifetime even when the
                 # pane close above partially fails (the very leak this guards).
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                await _native_runtime.teardown_codex_native_app_server(
+                    pane.conversation_id, reason="idle_pane_reap"
+                )
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
                     terminal_name=pane.terminal_name,

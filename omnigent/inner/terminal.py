@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import hashlib
 import logging
 import os
 import re
@@ -17,14 +18,15 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.debug_logging import debug_event
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR, strip_runner_auth_secrets
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
@@ -73,6 +75,42 @@ _REAP_KILL_TIMEOUT_S = 10.0
 # Literal tmux empty option value. Passing this as an argv value clears
 # status segments and window formats; it is not an application sentinel.
 _TMUX_EMPTY_OPTION_VALUE = ""
+_TERMINAL_CLOSE_REASONS = frozenset(
+    {
+        "caller_requested",
+        "replacement",
+        "launch_unavailable",
+        "launch_race_loser",
+        "conversation_cleanup",
+        "registry_shutdown",
+        "observed_exit",
+    }
+)
+
+
+def _terminal_instance_id(socket_path: Path) -> str:
+    """Correlate a private tmux socket without logging its filesystem path."""
+    return hashlib.sha256(str(socket_path.absolute()).encode()).hexdigest()
+
+
+def _tmux_probe_attributes(detail: str | None) -> dict[str, object]:
+    """Classify probe evidence without exporting stderr or command arguments."""
+    if detail is None:
+        return {"probe_signature": "unknown"}
+    number = re.search(r"\[Errno (\d+)\]", detail)
+    if number is not None:
+        return {"probe_signature": "os_error", "probe_errno": int(number.group(1))}
+    lowered = detail.lower()
+    for text, signature in (
+        ("no server running", "no_server_running"),
+        ("no current target", "no_current_target"),
+        ("no such file or directory", "socket_missing"),
+        ("can't find session", "session_missing"),
+        ("connection refused", "connection_refused"),
+    ):
+        if text in lowered:
+            return {"probe_signature": signature}
+    return {"probe_signature": "other_tmux_error"}
 
 
 def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
@@ -761,9 +799,25 @@ def reap_orphaned_terminals() -> int:
         if _process_alive(pid):
             continue
         socket_path = entry / "tmux.sock"
-        if socket_path.exists():
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                subprocess.run(
+        logger.info(
+            "Reaping orphaned terminal",
+            extra=debug_event(
+                "terminal_lifecycle",
+                phase="orphan_reap_requested",
+                emitting_context="orphan_reaper",
+                terminal_instance_id=_terminal_instance_id(socket_path),
+                recorded_owner_pid=pid,
+                reaper_pid=os.getpid(),
+                runner_id=os.environ.get(RUNNER_ID_ENV_VAR),
+            ),
+        )
+        socket_present = socket_path.exists()
+        kill_server_returncode: int | None = None
+        kill_server_error_type: str | None = None
+        kill_server_errno: int | None = None
+        if socket_present:
+            try:
+                result = subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
                     # kill-server on an already-dead server exits non-zero;
                     # that is the common case for half-torn-down orphans.
@@ -771,7 +825,31 @@ def reap_orphaned_terminals() -> int:
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                kill_server_error_type = type(exc).__name__
+                if isinstance(exc, OSError):
+                    kill_server_errno = exc.errno
+            else:
+                kill_server_returncode = result.returncode
         shutil.rmtree(entry, ignore_errors=True)
+        logger.info(
+            "Orphaned terminal cleanup finished",
+            extra=debug_event(
+                "terminal_lifecycle",
+                phase="orphan_reap_finished",
+                emitting_context="orphan_reaper",
+                terminal_instance_id=_terminal_instance_id(socket_path),
+                recorded_owner_pid=pid,
+                reaper_pid=os.getpid(),
+                runner_id=os.environ.get(RUNNER_ID_ENV_VAR),
+                socket_present=socket_present,
+                kill_server_attempted=socket_present,
+                kill_server_returncode=kill_server_returncode,
+                kill_server_error_type=kill_server_error_type,
+                kill_server_errno=kill_server_errno,
+                private_dir_removed=not entry.exists(),
+            ),
+        )
         reaped += 1
     return reaped
 
@@ -978,6 +1056,86 @@ class TerminalInstance:
     # session"). ``None`` until such a probe fails.
     _last_capture_probe_error: str | None = field(default=None, repr=False)
     _last_session_probe_error: str | None = field(default=None, repr=False)
+    _diagnostic_owner_session_id: str | None = field(default=None, repr=False)
+    _diagnostic_lifecycle: str = field(default="unknown", repr=False)
+    _diagnostic_context: dict[str, object] = field(default_factory=dict, repr=False)
+    _diagnostic_close_reason: str | None = field(default=None, repr=False)
+    _diagnostic_closed: bool = field(default=False, repr=False)
+
+    def bind_diagnostic_context(
+        self,
+        *,
+        session_id: str,
+        terminal_lifecycle: str | None = None,
+        diagnostic_context: Mapping[str, object] | None = None,
+    ) -> None:
+        """Bind the actual owner and safe runtime identity before starting a watcher."""
+        self._diagnostic_owner_session_id = session_id
+        if terminal_lifecycle in {"required", "auxiliary"}:
+            self._diagnostic_lifecycle = terminal_lifecycle
+        if diagnostic_context is not None:
+            context: dict[str, object] = {}
+            instance_id = diagnostic_context.get("app_server_instance_id")
+            if isinstance(instance_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", instance_id):
+                context["app_server_instance_id"] = instance_id
+            pid = diagnostic_context.get("app_server_pid")
+            if type(pid) is int and pid > 0:
+                context["app_server_pid"] = pid
+            self._diagnostic_context = context
+
+    def diagnostic_attributes(self) -> dict[str, object]:
+        """Return bounded identity attributes, never argv, environment or pane text."""
+        attributes: dict[str, object] = {
+            "terminal_instance_id": _terminal_instance_id(self.socket_path),
+            "terminal_lifecycle": self._diagnostic_lifecycle,
+            **self._diagnostic_context,
+        }
+        runner_id = os.environ.get(RUNNER_ID_ENV_VAR)
+        if runner_id:
+            attributes["runner_id"] = runner_id
+        return attributes
+
+    def _lifecycle_event(self, phase: str, **attributes: object) -> dict[str, object]:
+        return debug_event(
+            "terminal_lifecycle",
+            session_id=self._diagnostic_owner_session_id,
+            turn_id=None,
+            user_id=None,
+            phase=phase,
+            **self.diagnostic_attributes(),
+            **attributes,
+        )
+
+    def _exit_diagnostic_attributes(self) -> dict[str, object]:
+        """Report only cached observations; no additional tmux probe or pane text."""
+        snapshot = self._last_pane_snapshot
+        return {
+            "pane_output_captured": snapshot is not None,
+            "pane_output_chars": len(snapshot) if snapshot is not None else 0,
+            "pane_exit_status": self._last_exit_status,
+            "close_reason": self._diagnostic_close_reason,
+            **_tmux_probe_attributes(self._last_capture_probe_error),
+            **{
+                f"session_{key}": value
+                for key, value in _tmux_probe_attributes(self._last_session_probe_error).items()
+            },
+        }
+
+    def note_close_requested(self, reason: str = "caller_requested") -> None:
+        """Record one bounded cleanup intent before any terminal destruction starts."""
+        if self._diagnostic_close_reason is not None:
+            return
+        self._diagnostic_close_reason = (
+            reason if reason in _TERMINAL_CLOSE_REASONS else "caller_requested"
+        )
+        logger.info(
+            "Terminal close requested",
+            extra=self._lifecycle_event(
+                "close_requested",
+                close_reason=self._diagnostic_close_reason,
+                terminal_running=self.running,
+            ),
+        )
 
     @property
     def tmux_target(self) -> str:
@@ -1119,6 +1277,7 @@ class TerminalInstance:
         """Start the tmux session."""
         if self.running:
             return
+        logger.info("Terminal launch started", extra=self._lifecycle_event("launch_started"))
         effective_cwd = str(cwd or self.private_dir)
 
         # Do NOT advertise the tmux control socket path to the
@@ -1257,6 +1416,7 @@ class TerminalInstance:
 
         self.running = True
         self.launch_cwd = effective_cwd
+        logger.info("Terminal launched", extra=self._lifecycle_event("launched"))
 
     async def send(
         self,
@@ -1401,6 +1561,7 @@ class TerminalInstance:
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
+        self.note_close_requested()
         # Cancel both idle-watcher variants first so they don't race
         # the socket teardown. Order doesn't matter — they're
         # independent.
@@ -1440,6 +1601,16 @@ class TerminalInstance:
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():
             shutil.rmtree(self.private_dir, ignore_errors=True)
+        if not self._diagnostic_closed:
+            self._diagnostic_closed = True
+            logger.info(
+                "Terminal cleanup finished",
+                extra=self._lifecycle_event(
+                    "closed",
+                    close_reason=self._diagnostic_close_reason,
+                    private_dir_removed=not self.private_dir.exists(),
+                ),
+            )
 
     def start_idle_watcher(
         self,
@@ -1498,6 +1669,7 @@ class TerminalInstance:
                     kind,
                     self.name,
                     self.session_key,
+                    extra=self._lifecycle_event("watcher_callback_failed", callback_kind=kind),
                 )
                 return False
             return True
@@ -1522,6 +1694,11 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     exc,
+                    extra=self._lifecycle_event(
+                        "probe_start_failed",
+                        probe="capture_pane",
+                        **_tmux_probe_attributes(str(exc)),
+                    ),
                 )
                 consecutive_capture_failures = 0
                 await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
@@ -1533,6 +1710,9 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     exc,
+                    extra=self._lifecycle_event(
+                        "probe_failed", probe="capture_pane", **_tmux_probe_attributes(str(exc))
+                    ),
                 )
                 session_exists = await self._tmux_session_exists_async()
                 if session_exists is not False:
@@ -1549,6 +1729,12 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     self._tmux_gone_diagnostics(),
+                    extra=self._lifecycle_event(
+                        "unavailable",
+                        consecutive_probe_failures=consecutive_capture_failures,
+                        watcher="async",
+                        **self._exit_diagnostic_attributes(),
+                    ),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1562,6 +1748,12 @@ class TerminalInstance:
                 await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
                 continue
             if pane_dead:
+                logger.info(
+                    "Terminal pane exited",
+                    extra=self._lifecycle_event(
+                        "pane_exited", watcher="async", **self._exit_diagnostic_attributes()
+                    ),
+                )
                 # remain-on-exit kept the server alive after the inner CLI
                 # exited; report the exit rather than treating the frozen pane
                 # as an idle agent. Detach all clients so attached tmux attach
@@ -1732,6 +1924,11 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     exc,
+                    extra=self._lifecycle_event(
+                        "probe_start_failed",
+                        probe="capture_pane",
+                        **_tmux_probe_attributes(str(exc)),
+                    ),
                 )
                 consecutive_capture_failures = 0
                 if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
@@ -1755,6 +1952,12 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     self._tmux_gone_diagnostics(),
+                    extra=self._lifecycle_event(
+                        "unavailable",
+                        consecutive_probe_failures=consecutive_capture_failures,
+                        watcher="threaded",
+                        **self._exit_diagnostic_attributes(),
+                    ),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1768,6 +1971,12 @@ class TerminalInstance:
                     return
                 continue
             if pane_dead:
+                logger.info(
+                    "Terminal pane exited",
+                    extra=self._lifecycle_event(
+                        "pane_exited", watcher="threaded", **self._exit_diagnostic_attributes()
+                    ),
+                )
                 # The inner CLI exited but remain-on-exit kept the server, so
                 # capture-pane still succeeds (the snapshot above is the final
                 # frame, now remembered for diagnostics). Report the exit
@@ -1833,6 +2042,9 @@ class TerminalInstance:
                 self.name,
                 self.session_key,
                 exc,
+                extra=self._lifecycle_event(
+                    "probe_failed", probe="capture_pane", **_tmux_probe_attributes(str(exc))
+                ),
             )
             return None
 
@@ -1847,6 +2059,9 @@ class TerminalInstance:
                 self.name,
                 self.session_key,
                 exc,
+                extra=self._lifecycle_event(
+                    "probe_start_failed", probe="has_session", **_tmux_probe_attributes(str(exc))
+                ),
             )
             return None
         except RuntimeError as exc:
@@ -1881,6 +2096,9 @@ class TerminalInstance:
                 self.name,
                 self.session_key,
                 exc,
+                extra=self._lifecycle_event(
+                    "probe_start_failed", probe="pane_death", **_tmux_probe_attributes(str(exc))
+                ),
             )
             return None
         except RuntimeError:
@@ -1933,6 +2151,7 @@ class TerminalInstance:
                 kind,
                 self.name,
                 self.session_key,
+                extra=self._lifecycle_event("watcher_callback_failed", callback_kind=kind),
             )
             return False
         return True
@@ -2001,6 +2220,9 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     exc,
+                    extra=self._lifecycle_event(
+                        "probe_start_failed", probe="liveness", **_tmux_probe_attributes(str(exc))
+                    ),
                 )
                 return self.running
             self.running = False
@@ -2041,6 +2263,9 @@ class TerminalInstance:
                 self.name,
                 self.session_key,
                 exc,
+                extra=self._lifecycle_event(
+                    "probe_start_failed", probe="pane_death", **_tmux_probe_attributes(str(exc))
+                ),
             )
             return None
         except RuntimeError:
@@ -2059,6 +2284,9 @@ class TerminalInstance:
                 self.name,
                 self.session_key,
                 exc,
+                extra=self._lifecycle_event(
+                    "probe_start_failed", probe="has_session", **_tmux_probe_attributes(str(exc))
+                ),
             )
             return None
         except RuntimeError as exc:

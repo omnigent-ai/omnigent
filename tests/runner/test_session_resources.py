@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1651,6 +1651,8 @@ class _LaunchReturningRegistry:
         parent_os_env: Any | None = None,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
+        terminal_lifecycle: str | None = None,
+        diagnostic_context: Mapping[str, object] | None = None,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
@@ -1661,6 +1663,8 @@ class _LaunchReturningRegistry:
         :param parent_os_env: Agent os_env (unused).
         :param cwd_override: cwd override (unused).
         :param sandbox_override: sandbox override (unused).
+        :param terminal_lifecycle: Diagnostic lifecycle (unused).
+        :param diagnostic_context: Runtime association metadata (unused).
         :returns: The prepared terminal instance.
         """
         del (
@@ -1671,6 +1675,8 @@ class _LaunchReturningRegistry:
             parent_os_env,
             cwd_override,
             sandbox_override,
+            terminal_lifecycle,
+            diagnostic_context,
         )
         return self._instance
 

@@ -17,7 +17,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -923,6 +923,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        diagnostic_context: Mapping[str, object] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal required for the owning session to execute.
 
@@ -943,6 +944,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            diagnostic_context=diagnostic_context,
         )
 
     async def launch_auxiliary_terminal(
@@ -956,6 +958,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        diagnostic_context: Mapping[str, object] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -976,6 +979,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            diagnostic_context=diagnostic_context,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -990,6 +994,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        diagnostic_context: Mapping[str, object] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1003,6 +1008,8 @@ class SessionResourceRegistry:
             parent_os_env=parent_os_env,
             cwd_override=cwd_override,
             sandbox_override=sandbox_override,
+            terminal_lifecycle=lifecycle.value,
+            diagnostic_context=diagnostic_context,
         )
         return await self._observe_terminal_with_lifecycle(
             lifecycle,
@@ -1075,7 +1082,11 @@ class SessionResourceRegistry:
         if not getattr(instance, "running", False) or not await instance.is_alive():
             # Close by instance, not key — a successor may hold the key now.
             await self._terminal_registry.close(
-                session_id, terminal_name, session_key, expected=instance
+                session_id,
+                terminal_name,
+                session_key,
+                expected=instance,
+                reason="launch_unavailable",
             )
             raise RuntimeError(
                 f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
@@ -1094,6 +1105,18 @@ class SessionResourceRegistry:
             self._terminal_lifecycles[(session_id, resource_id)] = lifecycle
             if resource_role is not None:
                 self._terminal_roles[(session_id, resource_id)] = resource_role
+        instance.bind_diagnostic_context(session_id=session_id, terminal_lifecycle=lifecycle.value)
+        _logger.info(
+            "Terminal lifecycle observed",
+            extra=debug_event(
+                "terminal_lifecycle",
+                session_id=session_id,
+                turn_id=None,
+                user_id=None,
+                phase="observed",
+                **instance.diagnostic_attributes(),
+            ),
+        )
         self._start_terminal_activity_watcher(
             session_id,
             terminal_name,
@@ -1444,7 +1467,11 @@ class SessionResourceRegistry:
         if self._terminal_registry is not None:
             try:
                 await self._terminal_registry.close(
-                    session_id, terminal_name, session_key, expected=instance
+                    session_id,
+                    terminal_name,
+                    session_key,
+                    expected=instance,
+                    reason="observed_exit",
                 )
             except Exception:
                 _logger.exception(

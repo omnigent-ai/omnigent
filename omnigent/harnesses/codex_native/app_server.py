@@ -13,9 +13,10 @@ import shlex
 import socket
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
@@ -69,6 +71,7 @@ from omnigent.inner.databricks_executor import (
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
 from omnigent.process_logging import log_info_once, log_once, redact_log_text
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 
 _logger = logging.getLogger(__name__)
 
@@ -80,6 +83,7 @@ CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
+_APP_SERVER_EXIT_POLL_SECONDS = 0.25
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
@@ -1288,6 +1292,56 @@ def _build_native_codex_app_server_argv(
 
 
 @dataclass
+class _CodexAppServerLifecycle:
+    """Identity and outcome of one app-server spawn, retained after close."""
+
+    instance_id: str
+    session_id: str | None
+    runner_id: str | None
+    proc: asyncio.subprocess.Process | None = None
+    pid: int | None = None
+    returncode: int | None = None
+    codex_cli_version: tuple[int, int, int] | None = None
+    spawned_at: float | None = None
+    exited_at: float | None = None
+    closed: bool = False
+    teardown_reason: str | None = None
+    exit_expected: bool | None = None
+    exit_task: asyncio.Task[None] | None = None
+    startup_failure_recorded: bool = False
+
+    def attributes(self) -> dict[str, object]:
+        """Return bounded process metadata without configuration or output."""
+        returncode = self.proc.returncode if self.proc is not None else self.returncode
+        if self.closed:
+            state = "closed"
+        elif self.pid is None:
+            state = "not_started"
+        else:
+            state = "exited" if returncode is not None else "running"
+        lifetime_ms = (
+            max(0, int(((self.exited_at or time.monotonic()) - self.spawned_at) * 1000))
+            if self.spawned_at is not None
+            else None
+        )
+        return {
+            "harness": "codex-native",
+            "runner_id": self.runner_id,
+            "app_server_instance_id": self.instance_id,
+            "app_server_pid": self.pid,
+            "app_server_returncode": returncode,
+            "app_server_state": state,
+            "app_server_lifetime_ms": lifetime_ms,
+            "app_server_exit_signal": -returncode
+            if returncode is not None and returncode < 0
+            else None,
+            "app_server_exit_expected": self.exit_expected,
+            "codex_cli_version": _format_codex_version(self.codex_cli_version),
+            "teardown_reason": self.teardown_reason,
+        }
+
+
+@dataclass
 class CodexNativeAppServer:
     """
     Running native Codex app-server subprocess.
@@ -1347,6 +1401,8 @@ class CodexNativeAppServer:
         surfaces it to Omnigent (which posts a single durable banner). Prevents
         re-posting the same notice on every subsequent ensure. Not a
         constructor input.
+    :param session_id: Owning Omnigent session for lifecycle diagnostics,
+        including child sessions sharing a runner with their parent.
     """
 
     codex_path: str
@@ -1374,6 +1430,77 @@ class CodexNativeAppServer:
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
+    session_id: str | None = None
+    _lifecycle: _CodexAppServerLifecycle | None = field(default=None, init=False, repr=False)
+
+    def diagnostic_attributes(self) -> dict[str, object]:
+        """Return the latest process identity and outcome, including after close."""
+        if self._lifecycle is not None:
+            return self._lifecycle.attributes()
+        return {
+            "harness": "codex-native",
+            "runner_id": os.environ.get(RUNNER_ID_ENV_VAR),
+            "app_server_instance_id": None,
+            "app_server_pid": None,
+            "app_server_returncode": None,
+            "app_server_state": "not_started",
+        }
+
+    @staticmethod
+    def _log_lifecycle(
+        lifecycle: _CodexAppServerLifecycle, phase: str, **attributes: object
+    ) -> None:
+        _logger.info(
+            "Codex native app-server lifecycle: %s",
+            phase,
+            extra=debug_event(
+                "codex_native_lifecycle",
+                session_id=lifecycle.session_id,
+                turn_id=None,
+                user_id=None,
+                phase=phase,
+                **lifecycle.attributes(),
+                **attributes,
+            ),
+        )
+
+    def record_teardown_reason(self, reason: str) -> None:
+        """Record first teardown intent before cancellation; accept only reason codes."""
+        lifecycle = self._lifecycle
+        if lifecycle is None or lifecycle.closed or lifecycle.teardown_reason is not None:
+            return
+        # A close that discovers an already-dead process did not cause its exit.
+        if lifecycle.proc is not None:
+            self._record_process_exit(lifecycle, lifecycle.proc)
+        lifecycle.teardown_reason = (
+            reason if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason) else "unspecified"
+        )
+        self._log_lifecycle(lifecycle, "teardown_requested", reason=lifecycle.teardown_reason)
+
+    def _record_process_exit(
+        self, lifecycle: _CodexAppServerLifecycle, proc: asyncio.subprocess.Process
+    ) -> None:
+        if lifecycle.exited_at is not None or proc.returncode is None:
+            return
+        lifecycle.returncode = proc.returncode
+        lifecycle.exited_at = time.monotonic()
+        lifecycle.exit_expected = lifecycle.teardown_reason is not None
+        self._log_lifecycle(lifecycle, "process_exited")
+
+    async def _observe_process_exit(
+        self, lifecycle: _CodexAppServerLifecycle, proc: asyncio.subprocess.Process
+    ) -> None:
+        # wait() can stall after process exit while descendants hold stderr open.
+        while proc.returncode is None:
+            await asyncio.sleep(_APP_SERVER_EXIT_POLL_SECONDS)
+        self._record_process_exit(lifecycle, proc)
+
+    def _record_startup_failure(
+        self, lifecycle: _CodexAppServerLifecycle, exc: BaseException
+    ) -> None:
+        if not lifecycle.startup_failure_recorded:
+            lifecycle.startup_failure_recorded = True
+            self._log_lifecycle(lifecycle, "startup_failed", error_type=type(exc).__name__)
 
     async def start(self) -> None:
         """
@@ -1381,6 +1508,23 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        lifecycle = _CodexAppServerLifecycle(
+            instance_id=f"codex-native-{uuid.uuid4().hex}",
+            session_id=self.session_id,
+            runner_id=os.environ.get(RUNNER_ID_ENV_VAR),
+        )
+        self._lifecycle = lifecycle
+        self.process_registry_tag = lifecycle.instance_id
+        self._log_lifecycle(lifecycle, "starting")
+        try:
+            await self._start_process(lifecycle)
+        except BaseException as exc:
+            self._record_startup_failure(lifecycle, exc)
+            raise
+        self._log_lifecycle(lifecycle, "ready")
+
+    async def _start_process(self, lifecycle: _CodexAppServerLifecycle) -> None:
+        """Prepare the private config and start the owned subprocess."""
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -1398,6 +1542,7 @@ class CodexNativeAppServer:
         # caught below.
         codex_version = await _codex_cli_version(self.codex_path)
         self.codex_cli_version = codex_version
+        lifecycle.codex_cli_version = codex_version
         policy_hooks_supported = (
             codex_version is None or codex_version >= _MIN_POLICY_HOOK_CODEX_VERSION
         )
@@ -1502,10 +1647,9 @@ class CodexNativeAppServer:
                 )
         reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
-        self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
-            f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
+            f"{codex_native_session_tag_cmdline_arg(lifecycle.instance_id)}"
         )
         argv = _build_native_codex_app_server_argv(
             tagged_argv0=tagged_argv0,
@@ -1530,11 +1674,15 @@ class CodexNativeAppServer:
                 self.process_owner_lock.close()
                 self.process_owner_lock = None
             raise
+        lifecycle.proc = self.proc
+        lifecycle.pid = self.proc.pid
+        lifecycle.spawned_at = time.monotonic()
+        self._log_lifecycle(lifecycle, "spawned")
         if self.process_owner_lock is not None:
             register_codex_native_process(
                 pid=self.proc.pid,
                 pgid=_process_group_id(self.proc),
-                session_tag=self.process_registry_tag,
+                session_tag=lifecycle.instance_id,
                 owner_lock_path=self.process_owner_lock.path,
             )
         self.recent_stderr = []
@@ -1556,14 +1704,24 @@ class CodexNativeAppServer:
         # blocking session creation (fail-open). ``BaseException`` on the
         # outer guard so a cancellation mid-trust still tears down.
         try:
+            lifecycle.exit_task = asyncio.create_task(
+                self._observe_process_exit(lifecycle, self.proc),
+                name="codex-native-app-server-exit",
+            )
             await self._wait_until_ready()
             if self.policy_hook_disabled_reason is None:
                 try:
                     await self._trust_policy_hooks()
                 except Exception as exc:  # noqa: BLE001 - degrade, never block startup
                     self._disable_policy_hook(f"Codex policy hook could not be trusted: {exc}")
-        except BaseException:
-            await self.close()
+        except BaseException as exc:
+            self._record_startup_failure(lifecycle, exc)
+            reason = (
+                "startup_cancelled"
+                if isinstance(exc, asyncio.CancelledError)
+                else "startup_failed"
+            )
+            await self.close(reason=reason)
             raise
 
     async def _trust_policy_hooks(self) -> None:
@@ -1704,12 +1862,15 @@ class CodexNativeAppServer:
         else:
             _logger.info(message, self.policy_hook_disabled_reason)
 
-    async def close(self) -> None:
+    async def close(self, *, reason: str = "caller_requested") -> None:
         """
         Stop the app-server subprocess.
 
+        :param reason: Bounded lowercase snake_case teardown reason code.
         :returns: None.
         """
+        lifecycle = self._lifecycle
+        self.record_teardown_reason(reason)
         if self.proc is not None and self.proc.returncode is None:
             _terminate_process_tree(self.proc)
             try:
@@ -1717,6 +1878,8 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
+        if lifecycle is not None and lifecycle.proc is not None:
+            self._record_process_exit(lifecycle, lifecycle.proc)
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -1725,10 +1888,21 @@ class CodexNativeAppServer:
             self.stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.stderr_task
+        if lifecycle is not None and lifecycle.exit_task is not None:
+            task = lifecycle.exit_task
+            lifecycle.exit_task = None
+            if task is not asyncio.current_task():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         self.proc = None
         self.stderr_task = None
         self.process_registry_tag = None
         self.process_owner_lock = None
+        if lifecycle is not None and not lifecycle.closed:
+            lifecycle.proc = None
+            lifecycle.closed = True
+            self._log_lifecycle(lifecycle, "closed")
 
     async def _wait_until_ready(self) -> None:
         """
