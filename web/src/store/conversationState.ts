@@ -65,6 +65,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   runnerLaunchedAt: true,
   failedSendDraft: true,
   pendingRetryStableId: true,
+  restoredSendDraft: true,
   sendLatchedAt: true,
   historyGeneration: true,
 };
@@ -134,6 +135,7 @@ export function createInitialConversationState(): ConversationState {
     runnerLaunchedAt: null,
     failedSendDraft: null,
     pendingRetryStableId: null,
+    restoredSendDraft: null,
     sendLatchedAt: null,
     historyGeneration: 0,
   };

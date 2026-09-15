@@ -136,18 +136,24 @@ async def test_bad_source_id_is_rejected(client: httpx.AsyncClient) -> None:
     assert resp.status_code == 400
 
 
-def test_client_cannot_smuggle_a_stable_id() -> None:
-    """``stable_id`` is internal-only: a client key inside event data is
-    dropped by the item builder, never bound onto the entity."""
-    from omnigent.server.routes._sessions.helpers import _build_new_item
+def test_forwarder_cannot_smuggle_a_stable_id() -> None:
+    """External-item stable ids are server-derived only: a ``stable_id`` key
+    inside ``item_data`` is never bound onto the entity — ids come from
+    ``source_id`` (uuid5) or stay store-assigned. A web user message's own
+    32-hex ``stable_id`` is a separate, deliberate contract (see
+    test_sessions_web_send_stable_id.py)."""
+    from omnigent.server.routes._sessions.helpers import _parse_external_conversation_item
     from omnigent.server.schemas import SessionEventInput
 
     body = SessionEventInput(
-        type="message",
+        type="external_conversation_item",
         data={
-            "role": "user",
-            "content": [{"type": "input_text", "text": "x"}],
-            "stable_id": "ab" * 16,
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "x"}],
+                "stable_id": "ab" * 16,
+            },
         },
     )
-    assert _build_new_item(body, "resp").stable_id is None
+    assert _parse_external_conversation_item(body).stable_id is None
