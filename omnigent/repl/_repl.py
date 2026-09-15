@@ -16,6 +16,7 @@ import pathlib
 import re
 import sys
 import tempfile
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
@@ -225,6 +226,14 @@ _LIST_ITEMS_PAGE_SIZE = 100
 # session's direct children) while sub-agents are active.
 _MAX_SUBAGENT_TREE_DEPTH = 3
 _SUBAGENT_POLL_SECONDS = 2.0
+
+# Turn-completion backstop. ``_stream_pump`` sets ``_turn_done`` from the
+# terminal ``session.status`` event; the snapshot poll only covers a terminal
+# event the stream could not deliver. A stream that is still delivering events
+# needs no snapshot, and each consecutive quiet snapshot doubles the wait.
+_BACKSTOP_MIN_INTERVAL_S = 1.0
+_BACKSTOP_MAX_INTERVAL_S = 5.0
+_BACKSTOP_STREAM_QUIET_S = 1.0
 
 
 def _load_startup_theme() -> TerminalTheme:
@@ -1403,6 +1412,9 @@ class _SessionsChatReplAdapter:
         self._last_total_tokens: int | None = None
         self._pending_local_tasks: dict[str, asyncio.Task[None]] = {}
         self._turn_done: asyncio.Event
+        # Monotonic stamp of the last event ``_stream_pump`` received. Proves the
+        # subscription is live, so the turn backstop can skip its snapshot poll.
+        self._last_stream_event_at: float = 0.0
         # FIFO counter: local sends are already echoed by ``on_input``,
         # so their ``session.input.consumed`` events are suppressed.
         self._pending_local_user_sends: int = 0
@@ -2233,6 +2245,7 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    self._last_stream_event_at = time.monotonic()
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2291,6 +2304,50 @@ class _SessionsChatReplAdapter:
                     )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
+
+    async def _await_turn_done(self, session_id: str) -> None:
+        """
+        Block until the running turn reaches a terminal state.
+
+        ``_stream_pump`` sets ``_turn_done`` from the terminal
+        ``session.status`` event, so the common path costs no extra
+        requests. The snapshot poll is a backstop for the two cases
+        the stream cannot cover: a terminal event published while the
+        subscription is reconnecting (the pub-sub has no replay), and
+        an httpx ASGI subscription that is not yet active because that
+        transport does not flush streaming body chunks eagerly.
+
+        A stream that is still delivering events will deliver the
+        terminal one too, so the poll fires only after
+        ``_BACKSTOP_STREAM_QUIET_S`` of stream silence, and backs off
+        to ``_BACKSTOP_MAX_INTERVAL_S`` while consecutive snapshots
+        keep reporting the turn running. ``GET /v1/sessions/{id}`` is
+        not cheap (it scales with conversation history), so a fixed
+        one-per-second cadence costs a multiple of the turn's own
+        dispatch work.
+
+        :param session_id: Session whose turn to wait for, e.g.
+            ``"conv_abc123"``.
+        :returns: None.
+        """
+        interval = _BACKSTOP_MIN_INTERVAL_S
+        while not self._turn_done.is_set():
+            try:
+                # Event.wait() is cancellation-safe (its finally block
+                # removes the waiter from Event._waiters), so no
+                # asyncio.shield() is needed — shield leaks orphaned
+                # Tasks on each timeout iteration.
+                await asyncio.wait_for(self._turn_done.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                if time.monotonic() - self._last_stream_event_at < _BACKSTOP_STREAM_QUIET_S:
+                    # Stream is live; it owns turn completion.
+                    interval = _BACKSTOP_MIN_INTERVAL_S
+                    continue
+                snap = await self._client.sessions.get(session_id)
+                if snap.status in ("idle", "failed"):
+                    self._turn_done.set()
+                else:
+                    interval = min(interval * 2.0, _BACKSTOP_MAX_INTERVAL_S)
 
     async def send(
         self,
@@ -2380,26 +2437,7 @@ class _SessionsChatReplAdapter:
             # Wait for the turn to complete. The stream pump sets
             # _turn_done when it sees session.status idle/failed;
             # the _on_event callback (when wired) also sets it.
-            #
-            # Fallback polling: httpx's ASGI transport does not
-            # flush streaming body chunks eagerly, so the pump's
-            # SSE subscription may not be active when the workflow
-            # publishes its terminal event (no-replay pub-sub).
-            # We poll the snapshot every second as a backstop.
-            while not self._turn_done.is_set():
-                try:
-                    # Event.wait() is cancellation-safe (its finally block
-                    # removes the waiter from Event._waiters), so no
-                    # asyncio.shield() is needed — shield leaks orphaned
-                    # Tasks on each timeout iteration.
-                    await asyncio.wait_for(
-                        self._turn_done.wait(),
-                        timeout=1.0,
-                    )
-                except asyncio.TimeoutError:
-                    snap = await self._client.sessions.get(session_id)
-                    if snap.status in ("idle", "failed"):
-                        self._turn_done.set()
+            await self._await_turn_done(session_id)
             # Yield a terminal event so callers iterating send()
             # observe completion. Rendering already happened via
             # _on_event.
@@ -2470,16 +2508,7 @@ class _SessionsChatReplAdapter:
                     flush=True,
                 )
             await self._client.sessions.post_event(session_id, event_payload)
-            while not self._turn_done.is_set():
-                try:
-                    await asyncio.wait_for(
-                        self._turn_done.wait(),
-                        timeout=1.0,
-                    )
-                except asyncio.TimeoutError:
-                    snap = await self._client.sessions.get(session_id)
-                    if snap.status in ("idle", "failed"):
-                        self._turn_done.set()
+            await self._await_turn_done(session_id)
             from omnigent_client._events import ResponseCompleted
             from omnigent_client._types import Response as SDKResponse
 
