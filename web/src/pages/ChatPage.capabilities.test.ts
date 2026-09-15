@@ -21,16 +21,25 @@ describe("effortLevelsForConv", () => {
     ]);
   });
 
-  it("returns the extended ladder for devin-native-ui (effort is a model suffix)", () => {
-    // WHY: Devin has no --effort flag; its rung set is the Anthropic ladder,
-    // which the executor recombines onto the model id.
-    expect(effortLevelsForConv({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toEqual([
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]);
+  it("returns only the selected model's rungs for devin-native-ui", () => {
+    // WHY: Devin has no --effort flag — effort is a suffix on the model id, and
+    // the rungs are per model. swe-2 has no low/xhigh (`swe-2-low` is a different
+    // Fusion model), so offering them would compose an id Devin resolves back to
+    // the bare family, and the pick would look like it did nothing.
+    const conv = { labels: { "omnigent.wrapper": "devin-native-ui" } };
+    const catalog = [
+      {
+        id: "swe-2",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "max" },
+        ],
+      },
+    ];
+    expect(effortLevelsForConv(conv, catalog, "swe-2")).toEqual(["medium", "high", "max"]);
+    // No catalog yet, or a model with no effort dimension: nothing to offer.
+    expect(effortLevelsForConv(conv)).toEqual([]);
   });
 
   it("returns the base three levels for a non-native wrapper", () => {

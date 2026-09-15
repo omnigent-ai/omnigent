@@ -297,6 +297,35 @@ const CLAUDE_MODEL_OPTIONS_RESULT = {
     { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
   ],
 };
+// Devin's catalog carries per-model effort rungs, which the effort picker derives
+// from: swe-2 exposes only medium/high/max (`swe-2-low` is a different Fusion
+// model), while claude-opus-5 exposes the full ladder.
+const DEVIN_MODEL_OPTIONS_RESULT = {
+  ...SUCCESS_QUERY_STATE,
+  data: [
+    {
+      id: "swe-2",
+      displayName: "SWE-2",
+      isDefault: true,
+      supportedReasoningEfforts: [
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "max" },
+      ],
+    },
+    {
+      id: "claude-opus-5",
+      displayName: "Claude Opus 5",
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low" },
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "xhigh" },
+        { reasoningEffort: "max" },
+      ],
+    },
+  ],
+};
 const CODEX_MODEL_OPTIONS_RESULT = {
   ...SUCCESS_QUERY_STATE,
   data: [
@@ -1128,7 +1157,11 @@ function setupLandingMocks() {
   } as unknown as ReturnType<typeof useHostWorktrees>);
   mockHosts([host("online")]);
   mockModelQueries((harness) =>
-    harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+    harness === "codex-native"
+      ? CODEX_MODEL_OPTIONS_RESULT
+      : harness === "devin-native"
+        ? DEVIN_MODEL_OPTIONS_RESULT
+        : CLAUDE_MODEL_OPTIONS_RESULT,
   );
   mockAgents(DEFAULT_LANDING_AGENTS);
 }
@@ -3264,7 +3297,7 @@ describe("NewChatLandingScreen", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
-  it("renders Devin's own model families and effort ladder from the devinMode capability", () => {
+  it("renders Devin's own model families and only the selected model's effort rungs", () => {
     // Devin declares only `devinMode` (not modelPicker/permissionMode). Both the
     // config-content gate and the models-section gate must honour that flag, or a
     // Devin chat opens with no way to pick a model or effort at launch.
@@ -3290,14 +3323,7 @@ describe("NewChatLandingScreen", () => {
     useHostModelOptionsMock.mockImplementation(
       (_hostId, harness) =>
         (harness === "devin-native"
-          ? {
-              data: [
-                { id: "swe-2", displayName: "SWE-2", isDefault: true },
-                { id: "claude-opus-5", displayName: "Claude Opus 5" },
-              ],
-              isLoading: false,
-              isError: false,
-            }
+          ? DEVIN_MODEL_OPTIONS_RESULT
           : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
     );
     renderLanding();
@@ -3307,10 +3333,14 @@ describe("NewChatLandingScreen", () => {
     expect(models).toHaveTextContent("SWE-2");
     expect(screen.getByTestId("new-chat-landing-agent-model-claude-opus-5")).toBeTruthy();
 
-    // No --effort flag: the runner recombines (model, effort) at launch, so the
-    // picker offers the fixed Anthropic ladder regardless of the drafted model.
-    for (const rung of ["low", "medium", "high", "xhigh", "max"]) {
+    // Effort is a model-variant suffix and the rungs are PER MODEL: swe-2 (the
+    // default here) has only medium/high/max, so offering "low" would compose an
+    // id that is a different model and silently fall back to the bare family.
+    for (const rung of ["medium", "high", "max"]) {
       expect(screen.getByTestId(`new-chat-landing-agent-effort-${rung}`)).toBeTruthy();
+    }
+    for (const rung of ["low", "xhigh"]) {
+      expect(screen.queryByTestId(`new-chat-landing-agent-effort-${rung}`)).toBeNull();
     }
   });
 
