@@ -279,6 +279,46 @@ def user_config_path(env: Mapping[str, str] | None = None) -> Path:
     return base / "devin" / "config.json"
 
 
+def _strip_jsonc_comments(raw: str) -> str:
+    """Drop ``//`` and ``/* */`` comments, leaving string contents untouched."""
+    out: list[str] = []
+    index = 0
+    length = len(raw)
+    in_string = False
+    while index < length:
+        char = raw[index]
+        if in_string:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(raw[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < length:
+            following = raw[index + 1]
+            if following == "/":
+                while index < length and raw[index] != "\n":
+                    index += 1
+                continue
+            if following == "*":
+                index += 2
+                while index + 1 < length and not (raw[index] == "*" and raw[index + 1] == "/"):
+                    index += 1
+                index += 2
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _read_user_config(path: Path) -> _JsonObject:
     """Return the user's Devin config, or ``{}`` when absent/unparseable.
 
@@ -294,7 +334,13 @@ def _read_user_config(path: Path) -> _JsonObject:
     try:
         parsed = json.loads(raw)
     except ValueError:
-        return {}
+        # Devin accepts JSONC, so retry without comments before giving up —
+        # discarding the whole config would silently drop the user's permissions,
+        # org and read_config_from settings that `--config` is meant to preserve.
+        try:
+            parsed = json.loads(_strip_jsonc_comments(raw))
+        except ValueError:
+            return {}
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -1268,6 +1314,36 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
             raise
 
 
+#: Flags Omnigent itself puts in Devin's argv. A passthrough copy hijacks the
+#: session (``--resume``), defeats the policy gate (``--config``), redirects the
+#: transcript (``--export``) or re-arms the trust prompt — and Devin refuses a
+#: repeated flag outright, so the launch would otherwise fail cryptically. This is
+#: the funnel every ingress reaches (CLI args, ``harness.devin-native.args`` from
+#: config, and API-persisted ``terminal_launch_args``), which the CLI-only guard
+#: in ``cli.py`` never saw.
+#:
+#: ``--permission-mode`` is deliberately NOT reserved: the web create flow
+#: delivers the user's picked mode through these very args.
+_RESERVED_PASSTHROUGH_FLAGS = frozenset(
+    {"--config", "--export", "--resume", "-r", "--continue", "-c", "--respect-workspace-trust"}
+)
+
+
+def _reject_reserved_passthrough(passthrough: Sequence[str]) -> None:
+    """Refuse launch args that would override Omnigent's own Devin flags.
+
+    :param passthrough: Extra args destined for Devin's argv.
+    :raises RuntimeError: If any names an Omnigent-owned flag.
+    """
+    named = {arg.split("=", 1)[0] for arg in passthrough}
+    reserved = sorted(named & _RESERVED_PASSTHROUGH_FLAGS)
+    if reserved:
+        raise RuntimeError(
+            "devin-native launch args may not override Omnigent-owned flags: "
+            f"{', '.join(reserved)}"
+        )
+
+
 def build_devin_launch_args(
     passthrough: Sequence[str],
     *,
@@ -1292,6 +1368,7 @@ def build_devin_launch_args(
     :param resume_id: Devin session id to resume.
     :param sandbox: Whether to enable Devin's OS-level sandbox.
     """
+    _reject_reserved_passthrough(passthrough)
     args = ["--config", str(config_path), "--export", str(export_path_value)]
     # Omnigent owns workspace trust: the runner only launches in a workspace the
     # user already chose, and an un-dismissable trust prompt would wedge the pane.

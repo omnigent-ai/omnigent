@@ -9,6 +9,7 @@ import pytest
 
 from omnigent.harnesses.devin_native.bridge import (
     DEVIN_HOOK_EVENTS,
+    _read_user_config,
     build_devin_launch_args,
     build_devin_mcp_server,
     build_devin_native_spawn_env,
@@ -651,3 +652,65 @@ class TestSlashCommandSafety:
     def test_still_requires_a_leading_slash(self, tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="must start with"):
             inject_slash_command(tmp_path, command="model swe-2", timeout_s=0.01)
+
+
+class TestReservedLaunchArgs:
+    """Passthrough args must not override the flags Omnigent owns."""
+
+    def _args(self, passthrough: list[str]) -> list[str]:
+        return build_devin_launch_args(
+            passthrough, config_path=Path("/c.json"), export_path_value=Path("/e.json")
+        )
+
+    def test_rejects_a_session_hijack(self) -> None:
+        # Omnigent only passes --resume when it means to; an injected one would
+        # attach a different Devin session to this conversation.
+        for flag in ("--resume", "-r", "--continue", "-c"):
+            with pytest.raises(RuntimeError, match="Omnigent-owned"):
+                self._args([flag, "someone-elses-session"])
+
+    def test_rejects_overriding_the_policy_gate_and_transcript(self) -> None:
+        # --config carries the Omnigent hooks block: replacing it would disable
+        # the PreToolUse policy gate. --export is where the forwarder reads.
+        for flag in ("--config", "--export", "--respect-workspace-trust"):
+            with pytest.raises(RuntimeError, match="Omnigent-owned"):
+                self._args([flag, "/tmp/other"])
+
+    def test_rejects_the_equals_form(self) -> None:
+        with pytest.raises(RuntimeError, match="Omnigent-owned"):
+            self._args(["--config=/tmp/evil.json"])
+
+    def test_allows_the_permission_mode_omnigent_itself_passes(self) -> None:
+        # The web create flow delivers the user's picked mode through these very
+        # args, so reserving it would break permission modes entirely.
+        assert "dangerous" in self._args(["--permission-mode", "dangerous"])
+
+    def test_allows_an_ordinary_arg(self) -> None:
+        assert self._args(["--verbose"])[-1] == "--verbose"
+
+
+class TestUserConfigJsonc:
+    """Devin accepts JSONC, so a commented config must not be discarded."""
+
+    def _write(self, tmp_path: Path, body: str) -> Path:
+        cfg = tmp_path / "config.json"
+        cfg.write_text(body, encoding="utf-8")
+        return cfg
+
+    def test_line_and_block_comments_survive(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path,
+            '{\n  // note\n  "theme_mode": "dark",\n  /* block */\n'
+            '  "devin": {"org_id": "org-42"}\n}',
+        )
+        parsed = _read_user_config(cfg)
+        # Dropping these would silently lose the user's org and permissions.
+        assert parsed["theme_mode"] == "dark"
+        assert parsed["devin"] == {"org_id": "org-42"}
+
+    def test_comment_markers_inside_a_string_are_kept(self, tmp_path: Path) -> None:
+        cfg = self._write(tmp_path, '{"note": "keep // this and /* this */ inside"}')
+        assert _read_user_config(cfg)["note"] == "keep // this and /* this */ inside"
+
+    def test_truly_malformed_config_still_degrades_to_empty(self, tmp_path: Path) -> None:
+        assert _read_user_config(self._write(tmp_path, "{not json at all")) == {}
