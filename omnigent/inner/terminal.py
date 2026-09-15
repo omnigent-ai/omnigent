@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, default_interactive_shell
 from omnigent.cli_invocation import cli_invocation
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
@@ -2282,7 +2282,9 @@ def create_terminal_instance(
         socket_path=socket_path,
         private_dir=private_dir,
         os_env=os_env,
-        command=spec.command or "bash",
+        # An unpinned command runs the user's login shell ($SHELL), resolved
+        # here because this process runs on the host the pane spawns on.
+        command=spec.command or default_interactive_shell(),
         args=list(spec.args),
         env=dict(spec.env),
         env_unset=list(spec.env_unset),
