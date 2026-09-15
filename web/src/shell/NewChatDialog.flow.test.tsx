@@ -1317,9 +1317,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Claude's hand menu stays on Manual and never offers Codex approval presets.
+    // Claude's hand menu starts on Default (its no-flag default) and never
+    // offers Codex approval presets; Manual is still a selectable option.
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Manual",
+      "Permission mode: Default",
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-permission-option-default")).toHaveTextContent(

@@ -158,7 +158,7 @@ export function ModelEffortFields({
             className="w-(--radix-select-trigger-width)"
           >
             <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
-            {CLAUDE_NATIVE_PERMISSION_MODES.map((m) => (
+            {CLAUDE_NATIVE_PERMISSION_MODES.filter((m) => m.value !== "inherit").map((m) => (
               <SelectItem key={m.value} value={m.value}>
                 {m.label}
               </SelectItem>

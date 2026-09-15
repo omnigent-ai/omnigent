@@ -26,13 +26,15 @@ describe("claudePermissionMode", () => {
     // The start-session picker passes --permission-mode, which accepts modes
     // the live switcher can't reach; that vocabulary must stay wider.
     const startup = CLAUDE_NATIVE_PERMISSION_MODES.map((m) => m.value);
+    expect(startup).toContain("inherit");
     expect(startup).toContain("dontAsk");
     expect(startup).toContain("bypassPermissions");
   });
 
-  it("labels the prompting mode the way Claude Code does", () => {
-    // Claude's own TUI renders "manual mode on" for the `default` value, so
-    // the web label matches what users see in the pane.
+  it("labels inherit as Default and the prompting mode as Manual", () => {
+    // "inherit" = no flag, uses the user's configured mode → labelled "Default".
+    // "default" = --permission-mode default, explicit prompting → labelled "Manual".
+    expect(claudePermissionModeLabel("inherit")).toBe("Default");
     expect(claudePermissionModeLabel("default")).toBe("Manual");
     expect(claudePermissionModeLabel("auto")).toBe("Auto");
   });
