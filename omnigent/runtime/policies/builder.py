@@ -248,8 +248,10 @@ def any_policies_apply(
     :param conversation: The conversation row when the caller holds one. For
         sub-agent conversations this lets the check see the CHILD spec's own
         guardrails (which :func:`build_policy_engine` enforces), so a bundle
-        whose only policies live on a sub-agent is not fast-path skipped.
-        ``None`` checks the passed *spec* alone.
+        whose only policies live on a sub-agent is not fast-path skipped, and
+        supplies ``root_conversation_id`` so the check also sees the ROOT
+        session's policies (which the engine inherits into every descendant).
+        ``None`` checks the passed *spec* and the session's own policies alone.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
@@ -270,6 +272,17 @@ def any_policies_apply(
     # Session policies are LRU-cached per (workspace_id, conversation_id) —
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
+        return True
+    # Sub-agents inherit the ROOT conversation's session policies (see
+    # build_policy_engine), so a policy-free child must not fast-path skip
+    # the engine that would gate it. The row's root id is the same suggestion
+    # the builder verifies; this read hits the same per-session LRU cache.
+    root_conversation_id = conversation.root_conversation_id if conversation is not None else None
+    if (
+        root_conversation_id
+        and root_conversation_id != conversation_id
+        and _load_session_policy_specs(root_conversation_id, policy_store)
+    ):
         return True
     return False
 
