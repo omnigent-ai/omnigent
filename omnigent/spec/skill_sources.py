@@ -25,7 +25,7 @@ from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
 
-_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity"})
+_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity", "devin"})
 
 # The bare ``antigravity`` harness is the in-process Gemini SDK executor, NOT the
 # agy CLI. It never launches agy, so ~/.gemini plugin/builtin skills are not its
@@ -614,6 +614,51 @@ def antigravity_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+def devin_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """
+    The skill tiers Devin itself loads: its own directories plus compat.
+
+    Devin sources user-invocable skills from each workspace root's
+    ``.devin/skills`` and the user tier ``~/.config/devin/skills``, plus the
+    ``.claude/skills`` / ``.agents/skills`` compat tiers. The Devin-owned
+    tiers come first so they win a name collision; the compat tiers reuse the
+    generic walk, which already covers them. Unlike the native families there
+    is no terminal to mirror — Devin runs on the generic ACP wrap, where a
+    picked skill is resolved server-side and its ``SKILL.md`` instructions
+    are injected into the prompt — so every listed skill is invocable.
+
+    Honors ``skills_filter`` (``"none"`` hermetic, ``"all"`` everything, a
+    list selecting by the skill's bare name).
+
+    :param ctx: Session discovery context.
+    :returns: Parsed skills; unparseable ones are logged and skipped.
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names: set[str] | None = (
+        set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    )
+    dirs: list[Path] = []
+    for root in ctx.roots:
+        candidate = root / ".devin" / "skills"
+        if candidate.is_dir():
+            dirs.append(candidate)
+    user_tier = ctx.home / ".config" / "devin" / "skills"
+    if user_tier.is_dir():
+        dirs.append(user_tier)
+    out: list[SkillSpec] = []
+    for skills_dir in dirs:
+        skipped: list[str] = []
+        for spec in _discover_skills(skills_dir, skipped=skipped):
+            if filter_names is not None and spec.name not in filter_names:
+                continue
+            out.append(spec)
+        # Surface dropped skills so a missing command is diagnosable.
+        for detail in skipped:
+            _log.warning("Skipping skill under %s: %s", skills_dir, detail)
+    return _dedup(out + _generic_host_skills(ctx))
+
+
 def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Pi exposes no *extra* discoverable skills to the menu.
@@ -652,7 +697,7 @@ def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 #
 #   no mechanism            -> generic walk (omnigent injects the skill text)
 #   mechanism, enumerable   -> dedicated provider listing what the agent has
-#                              (claude, codex, cursor, antigravity/agy)
+#                              (claude, codex, cursor, antigravity/agy, devin)
 #   mechanism, unenumerable -> explicit no-op (pi) — listing anything would
 #                              risk surfacing a command the harness can't run
 #
@@ -664,4 +709,5 @@ _SKILL_SOURCES: dict[str | None, SkillSource] = {
     "cursor": cursor_host_skills,
     "pi": pi_host_skills,
     "antigravity": antigravity_host_skills,
+    "devin": devin_host_skills,
 }

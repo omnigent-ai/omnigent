@@ -67,6 +67,8 @@ def _ctx(
         ("antigravity-native", "antigravity"),
         ("native-antigravity", "antigravity"),
         ("qwen", None),
+        ("devin", "devin"),
+        ("devin-native", "devin"),
         (None, None),
         ("", None),
     ],
@@ -1045,3 +1047,88 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
 
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
     assert names == ["neutral-skill"]
+
+
+def test_devin_provider_surfaces_devin_tier_alongside_compat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skill in workspace ``.devin/skills`` lists next to the compat tiers.
+
+    The compat ``.claude/skills`` skill is the control (the generic walk
+    already finds it); the ``.devin/skills`` one is the tier that walk never
+    scanned, so a Devin session's own skills were missing from the menu.
+    """
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".devin" / "skills", "devin-tier-skill")
+    _write_skill(ws / ".claude" / "skills", "compat-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = sorted(s.name for s in resolve_harness_skills(_ctx(ws, home), "devin"))
+    assert names == ["compat-skill", "devin-tier-skill"]
+
+
+def test_devin_provider_surfaces_user_config_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_skill(home / ".config" / "devin" / "skills", "user-tier-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "devin")]
+    assert names == ["user-tier-skill"]
+
+
+def test_devin_provider_devin_tier_wins_name_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same-named compat copy loses to Devin's own tier (first wins)."""
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".devin" / "skills", "shared-name")
+    _write_skill(ws / ".claude" / "skills", "shared-name")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(ws, home), "devin")
+    (skill,) = [s for s in out if s.name == "shared-name"]
+    assert skill.skill_dir is not None
+    assert skill.skill_dir.resolve() == (ws / ".devin" / "skills" / "shared-name").resolve()
+
+
+def test_devin_provider_respects_none_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".devin" / "skills", "devin-tier-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    assert resolve_harness_skills(_ctx(ws, home, skills_filter="none"), "devin") == []
+
+
+def test_devin_provider_list_filter_selects_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".devin" / "skills", "wanted")
+    _write_skill(ws / ".devin" / "skills", "unwanted")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(ws, home, skills_filter=["wanted"]), "devin")
+    ]
+    assert names == ["wanted"]
+
+
+def test_devin_provider_filters_user_invocable_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".devin" / "skills", "internal-skill", user_invocable=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    assert resolve_harness_skills(_ctx(ws, home), "devin") == []
