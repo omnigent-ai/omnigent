@@ -692,7 +692,7 @@ def prewarm_detect_providers() -> None:
     threading.Thread(target=_run, name="ambient-detect-prewarm", daemon=True).start()
 
 
-def detect_providers() -> list[DetectedProvider]:
+def detect_providers(*, allow_keychain: bool = True) -> list[DetectedProvider]:
     """Detect credentials already present on the machine.
 
     Consumes (one-shot) a pending :func:`prewarm_detect_providers` result
@@ -722,9 +722,13 @@ def detect_providers() -> list[DetectedProvider]:
     :func:`_ollama_reachable`). On macOS, a ``claude auth status`` subprocess
     may run as the Claude Keychain fallback (see :func:`_claude_login_detected`).
 
+    :param allow_keychain: Permit the Claude CLI Keychain fallback. False uses
+        file-only login metadata and bypasses speculative prewarmed probes.
     :returns: One :class:`DetectedProvider` per credential found, in the
         priority order above. Empty when nothing is detected.
     """
+    if not allow_keychain:
+        return _detect_providers_now(allow_keychain=False)
     global _prewarmed_detection
     with _prewarm_lock:
         prewarmed = _prewarmed_detection
@@ -739,7 +743,7 @@ def detect_providers() -> list[DetectedProvider]:
     return _detect_providers_now()
 
 
-def _detect_providers_now() -> list[DetectedProvider]:
+def _detect_providers_now(*, allow_keychain: bool = True) -> list[DetectedProvider]:
     """Run the ambient-credential sweep (see :func:`detect_providers`)."""
     detected: list[DetectedProvider] = []
 
@@ -801,7 +805,11 @@ def _detect_providers_now() -> list[DetectedProvider]:
                 source="Claude Code managed settings",
             )
         )
-    elif _claude_login_detected():
+    elif (
+        _claude_login_detected()
+        if allow_keychain
+        else claude_auth_has_credential(_claude_credentials_path())
+    ):
         detected.append(
             DetectedProvider(
                 name="claude",

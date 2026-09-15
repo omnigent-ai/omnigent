@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
-import json
 import os
 import shutil
 import subprocess
@@ -32,6 +31,13 @@ import click
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
+from omnigent.onboarding.setup_operations import (
+    acp_entries_settings,
+    cleanup_removed_harness_secret,
+    copilot_host_settings,
+    harness_key_removal_settings,
+    harness_key_settings,
+)
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
     find_ucode_command,
@@ -404,15 +410,9 @@ def _existing_key_name_for_ref(  # type: ignore[explicit-any]  # config is a yam
     :returns: The provider name whose *family* block references the same
         secret, e.g. ``"anthropic"``, or ``None`` when no such key exists.
     """
-    from omnigent.onboarding.provider_config import KEY_KIND, load_providers
+    from omnigent.onboarding.setup_operations import existing_key_name_for_ref
 
-    for name, entry in load_providers(config).items():
-        if entry.kind != KEY_KIND:
-            continue
-        fam = entry.families.get(family)
-        if fam is not None and fam.api_key_ref == api_key_ref:
-            return name
-    return None
+    return existing_key_name_for_ref(config, family, api_key_ref)
 
 
 def _unique_provider_name(  # type: ignore[explicit-any]  # config is a yaml-boundary mapping
@@ -432,15 +432,9 @@ def _unique_provider_name(  # type: ignore[explicit-any]  # config is a yaml-bou
     :returns: *candidate* if unused, else the first free ``<candidate>-<n>``
         (``n`` starting at 2), e.g. ``"anthropic-2"``.
     """
-    from omnigent.onboarding.provider_config import load_providers
+    from omnigent.onboarding.setup_operations import unique_provider_name
 
-    existing = set(load_providers(config))
-    if candidate not in existing:
-        return candidate
-    n = 2
-    while f"{candidate}-{n}" in existing:
-        n += 1
-    return f"{candidate}-{n}"
+    return unique_provider_name(config, candidate)
 
 
 def _resolve_key_provider_name(  # type: ignore[explicit-any]  # config is a yaml-boundary mapping
@@ -449,29 +443,10 @@ def _resolve_key_provider_name(  # type: ignore[explicit-any]  # config is a yam
     candidate: str,
     api_key_ref: str,
 ) -> str:
-    """Pick the entry name for an API key being added — update vs keep-both.
+    """Delegate update-versus-add naming to setup_operations.resolve_key_provider_name."""
+    from omnigent.onboarding.setup_operations import resolve_key_provider_name
 
-    Realizes the "allow multiple API keys, keep both if source differs"
-    behavior: a key whose secret source (*api_key_ref*) matches an existing
-    key on *family* reuses that entry's name (an in-place update of the same
-    credential); a key from a new source takes a fresh, unique name so it
-    coexists with the others.
-
-    :param config: The parsed global config mapping (``providers:`` block).
-    :param family: The harness family the key serves, ``"anthropic"`` or
-        ``"openai"``.
-    :param candidate: The preferred name (the vendor id for a preset, or the
-        user-typed name for "Other provider"), e.g. ``"anthropic"``.
-    :param api_key_ref: The key's secret reference, e.g.
-        ``"env:ANTHROPIC_API_KEY"`` or ``"keychain:anthropic"``.
-    :returns: The existing same-source entry's name (update in place), else a
-        unique name derived from *candidate* (keep both), e.g.
-        ``"anthropic-2"``.
-    """
-    same_source = _existing_key_name_for_ref(config, family, api_key_ref)
-    if same_source is not None:
-        return same_source
-    return _unique_provider_name(config, candidate)
+    return resolve_key_provider_name(config, family, candidate, api_key_ref)
 
 
 def _credential_source_hint(entry: ProviderEntry, family: str) -> str | None:
@@ -615,14 +590,11 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         BEDROCK_KIND,
         CHAT_WIRE_API,
         CLI_CONFIG_KIND,
-        DATABRICKS_KIND,
         OPENAI_FAMILY,
         PI_SURFACE,
         RESPONSES_WIRE_API,
         SUBSCRIPTION_KIND,
         load_providers,
-        provider_entry_settings,
-        set_default_provider,
     )
 
     # The ucode agent that backs each harness surface's model serving. When the
@@ -835,13 +807,6 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             console.print(f"  [dim]Signing in to {disp} (its login will open)…[/dim]")
             if not harness_login(login_family):
                 return f"✗ {disp} login not completed — subscription not added"
-        # Drop the existing subscription(s) now that we know we're proceeding.
-        # Done after any login so a failed login leaves the existing entry intact.
-        if existing_subs:
-            block = _load_global_config().get("providers")
-            if isinstance(block, dict):
-                remaining = {k: v for k, v in block.items() if k not in existing_subs}
-                _save_global_config({"providers": remaining})
         # Subscription name is derived from the CLI — no prompt.
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
@@ -1047,47 +1012,38 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         entry = build_databricks_provider_entry(profile)
 
     from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.provider_config import (
-        provider_families,
-        surface_default_provider,
-    )
+    from omnigent.onboarding.setup_operations import provider_add_settings, subscription_settings
 
-    # Persist the entry (deep-merge — doesn't disturb sibling entries).
-    _save_global_config(
-        provider_entry_settings(name, entry, make_default=False),
-        deep_merge_keys=("providers",),
-    )
-    # Become the default for any surface it serves that has NO default yet,
-    # so a first provider "just works". An existing default is left alone —
-    # the user changes defaults by selecting a provider in the harness tree
-    # (per-surface, so a shared provider can default one harness, not both).
-    # The pi surface checks its *effective* default: a family default already
-    # drives pi via the fallback, so claiming the explicit pi scope then
-    # would silently re-route pi away from it.
-    parsed = load_providers({"providers": {name: entry}})[name]
-    # Databricks routing is configured in ucode PER HARNESS (we only ran
-    # `ucode configure` for the surface the user drilled into), so it must only
-    # become the default for THAT surface — defaulting the other harnesses too
-    # would route them through a workspace ucode never configured for them.
-    # Other kinds (a gateway serving both families with one base_url + key)
-    # still default every surface they serve.
-    if entry["kind"] == DATABRICKS_KIND and family is not None:
-        default_families = [family]
+    previous_secret_ref: str | None = None
+    if entry["kind"] == "subscription":
+        settings, became_default = subscription_settings(_load_global_config(), str(entry["cli"]))
     else:
-        default_families = sorted(provider_families(parsed))
-    became_default: list[str] = []
-    for fam in default_families:
-        cfg = _load_global_config()
-        if surface_default_provider(cfg, fam) is not None:
-            continue
-        block = cfg.get("providers")
-        if isinstance(block, dict):
-            _save_global_config({"providers": set_default_provider(block, name, fam)})
-            became_default.append(fam)
+        config_for_save = _load_global_config()
+        if entry["kind"] == "key":
+            old_provider = load_providers(config_for_save).get(name)
+            old_family = (
+                old_provider.families.get(family) if old_provider and family is not None else None
+            )
+            previous_secret_ref = old_family.api_key_ref if old_family else None
+        settings, became_default = provider_add_settings(
+            config_for_save, name, entry, surface=family
+        )
+    _save_global_config(settings)
+    cleaned = True
+    if previous_secret_ref is not None:
+        from omnigent.onboarding.setup_operations import cleanup_unreferenced_secret
+
+        try:
+            cleanup_unreferenced_secret(previous_secret_ref, name)
+        except Exception:  # noqa: BLE001 - the config was saved before cleanup
+            cleaned = False
+    status = f"✓ Added {name}"
+    if not cleaned:
+        status += "; stored secret cleanup did not complete"
     if became_default:
         labels = " · ".join(family_label(f) for f in became_default)
-        return f"✓ Added {name} — default for {labels}"
-    return f"✓ Added {name}"
+        return f"{status} — default for {labels}"
+    return status
 
 
 def _adopt_detected_providers() -> list[str]:
@@ -1581,10 +1537,8 @@ def _manage_cursor_sdk_harness() -> None:
         write the ``cursor:`` block of ``~/.omnigent/config.yaml`` and the
         secret store.
     """
-    from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.cursor_auth import (
         cursor_api_key_configured,
-        cursor_api_key_ref,
         cursor_sdk_installed,
     )
     from omnigent.onboarding.interactive import select
@@ -1621,12 +1575,9 @@ def _manage_cursor_sdk_harness() -> None:
         if action == "set_key":
             status = _set_cursor_api_key()
         elif action == "remove_key":
-            ref = cursor_api_key_ref(config)
-            # Only a keychain-stored secret is ours to delete; an ``env:`` ref
-            # points at the user's own environment, so just drop the config.
-            if ref is not None and ref.startswith("keychain:"):
-                secret_store.delete_secret(ref[len("keychain:") :])
-            _save_global_config({}, unset_keys=("cursor",))
+            settings, unset = harness_key_removal_settings(_load_global_config(), "cursor")
+            _save_global_config(settings, unset_keys=unset)
+            cleanup_removed_harness_secret(config, "cursor")
             status = "✓ Removed Cursor API key"
 
 
@@ -1643,10 +1594,8 @@ def _set_cursor_api_key() -> str | None:
     :returns: A confirmation string for the menu's transient status, or
         ``None`` when the user aborted (empty input / declined the warning).
     """
-    from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.cursor_auth import (
         CURSOR_SECRET_NAME,
-        cursor_api_key_settings,
         looks_like_cursor_api_key,
     )
     from omnigent.onboarding.interactive import prompt_text
@@ -1664,7 +1613,9 @@ def _set_cursor_api_key() -> str | None:
             "$CURSOR_API_KEY doesn't start with 'crsr_'. Use it anyway?", default=False
         ):
             return None
-        _save_global_config(cursor_api_key_settings("env:CURSOR_API_KEY"))
+        _save_global_config(
+            harness_key_settings(_load_global_config(), "cursor", "env:CURSOR_API_KEY")
+        )
         return "✓ Cursor API key set (from $CURSOR_API_KEY)"
 
     pasted = prompt_text("Cursor API key (CURSOR_API_KEY)", hide_input=True).strip()
@@ -1674,8 +1625,12 @@ def _set_cursor_api_key() -> str | None:
         "That doesn't start with 'crsr_'. Store it anyway?", default=False
     ):
         return None
+    from omnigent.onboarding import secrets as secret_store
+
     secret_store.store_secret(CURSOR_SECRET_NAME, pasted)
-    _save_global_config(cursor_api_key_settings(f"keychain:{CURSOR_SECRET_NAME}"))
+    _save_global_config(
+        harness_key_settings(_load_global_config(), "cursor", f"keychain:{CURSOR_SECRET_NAME}")
+    )
     return "✓ Cursor API key stored"
 
 
@@ -1832,13 +1787,9 @@ def _manage_antigravity_harness() -> None:
         ``antigravity`` extra, and write the ``antigravity:`` config block and
         secret store.
     """
-    from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
-        ANTIGRAVITY_CONFIG_KEY,
         ANTIGRAVITY_ENV_VARS,
-        ANTIGRAVITY_SECRET_NAME,
         antigravity_api_key_configured,
-        antigravity_api_key_ref,
         antigravity_sdk_installed,
     )
     from omnigent.onboarding.harness_install import (
@@ -1916,14 +1867,9 @@ def _manage_antigravity_harness() -> None:
         elif action == "set_key":
             status = _set_antigravity_api_key()
         elif action == "remove_key":
-            ref = antigravity_api_key_ref(config)
-            # Only the secret we own (``keychain:antigravity``) is ours to
-            # delete: a hand-edited block may point at a shared ``keychain:<other>``
-            # secret, and an ``env:`` ref names the user's own environment. In
-            # both of those cases just drop the config block and leave the secret.
-            if ref == f"keychain:{ANTIGRAVITY_SECRET_NAME}":
-                secret_store.delete_secret(ANTIGRAVITY_SECRET_NAME)
-            _save_global_config({}, unset_keys=(ANTIGRAVITY_CONFIG_KEY,))
+            settings, unset = harness_key_removal_settings(_load_global_config(), "antigravity")
+            _save_global_config(settings, unset_keys=unset)
+            cleanup_removed_harness_secret(config, "antigravity")
             status = "✓ Removed Gemini API key"
 
 
@@ -1938,12 +1884,10 @@ def _set_antigravity_api_key() -> str | None:
 
     :returns: A status string for the menu, or ``None`` if the user aborted.
     """
-    from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_API_KEY_PREFIX_HINT,
         ANTIGRAVITY_ENV_VARS,
         ANTIGRAVITY_SECRET_NAME,
-        antigravity_api_key_settings,
         looks_like_gemini_api_key,
     )
     from omnigent.onboarding.interactive import prompt_text
@@ -1959,7 +1903,9 @@ def _set_antigravity_api_key() -> str | None:
             default=False,
         ):
             return None
-        _save_global_config(antigravity_api_key_settings(f"env:{detected_var}"))
+        _save_global_config(
+            harness_key_settings(_load_global_config(), "antigravity", f"env:{detected_var}")
+        )
         return f"✓ Gemini API key set (from ${detected_var})"
 
     pasted = prompt_text("Gemini API key (GEMINI_API_KEY)", hide_input=True).strip()
@@ -1970,54 +1916,22 @@ def _set_antigravity_api_key() -> str | None:
         default=False,
     ):
         return None
+    from omnigent.onboarding import secrets as secret_store
+
     secret_store.store_secret(ANTIGRAVITY_SECRET_NAME, pasted)
-    _save_global_config(antigravity_api_key_settings(f"keychain:{ANTIGRAVITY_SECRET_NAME}"))
+    _save_global_config(
+        harness_key_settings(
+            _load_global_config(), "antigravity", f"keychain:{ANTIGRAVITY_SECRET_NAME}"
+        )
+    )
     return "✓ Gemini API key stored"
 
 
 def _qwen_auth_configured() -> bool:
-    """Best-effort check whether Qwen Code can authenticate non-interactively.
+    """Return the shared Qwen credential-state check."""
+    from omnigent.onboarding.qwen_auth import qwen_auth_configured
 
-    Qwen has **no CLI login** — its ``auth`` subcommand was removed. For our
-    ``qwen --acp`` executor, auth must come from one of:
-
-    - API-key / provider env vars (the headless path): ``OPENAI_API_KEY``,
-      ``BAILIAN_CODING_PLAN_API_KEY``, or ``OPENROUTER_API_KEY``; or
-    - an auth type selected via the interactive ``/auth`` flow (API key or the
-      Alibaba Cloud Coding Plan), persisted to ``~/.qwen/settings.json``.
-
-    (Qwen OAuth was discontinued on 2026-04-15, so it is not an auth path here.)
-
-    Best-effort: the env-var check is reliable; the on-disk check keys off
-    ``settings.json`` fields whose schema is not contract-stable (see
-    docs/QWEN_FOLLOWUPS.md). Returns ``False`` for a fresh install with no auth —
-    the case that must NOT render as "signed in".
-
-    :returns: ``True`` when auth is detectable, else ``False``.
-    """
-    from pathlib import Path
-
-    if any(
-        os.environ.get(v)
-        for v in ("OPENAI_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "OPENROUTER_API_KEY")
-    ):
-        return True
-    settings = Path.home() / ".qwen" / "settings.json"
-    if settings.is_file():
-        try:
-            data = json.loads(settings.read_text())
-        except (OSError, ValueError):
-            return False
-        if isinstance(data, dict):
-            if data.get("selectedAuthType"):
-                return True
-            security = data.get("security")
-            auth = security.get("auth") if isinstance(security, dict) else None
-            if isinstance(auth, dict) and (
-                auth.get("selectedType") or auth.get("selectedAuthType")
-            ):
-                return True
-    return False
+    return qwen_auth_configured()
 
 
 def _print_qwen_auth_help() -> None:
@@ -2320,7 +2234,6 @@ def _add_acp_agent() -> None:
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
         acp_agents,
-        acp_agents_settings,
         slugify,
     )
     from omnigent.onboarding.interactive import console, prompt_text
@@ -2338,7 +2251,7 @@ def _add_acp_agent() -> None:
 
     entries = list(acp_agents())
     entries.append(AcpAgentEntry(slug=slugify(name), name=name, command=command, model=model))
-    _save_global_config(acp_agents_settings(entries))
+    _save_global_config(acp_entries_settings(_load_global_config(), entries))
     console.print(f"  ✓ Added {name}")
 
 
@@ -2398,7 +2311,7 @@ def _import_openclaw_agents() -> None:
     """Import selected OpenClaw/acpx agents into the generic ``acp:`` block."""
     from rich.markup import escape
 
-    from omnigent.onboarding.acp_auth import acp_agents_settings, command_binary_on_path
+    from omnigent.onboarding.acp_auth import command_binary_on_path
     from omnigent.onboarding.interactive import console
     from omnigent.onboarding.openclaw_config import (
         merge_imported_acp_entries,
@@ -2441,7 +2354,7 @@ def _import_openclaw_agents() -> None:
             console.print("  [yellow]Skipped OpenClaw import.[/yellow]")
             return
 
-        _save_global_config(acp_agents_settings(merged))
+        _save_global_config(acp_entries_settings(_load_global_config(), merged))
         noun = "agent" if len(added) == 1 else "agents"
         console.print(f"  ✓ Imported {len(added)} OpenClaw/acpx {noun}.")
         return
@@ -2456,7 +2369,7 @@ def _manage_acp_agent(slug: str) -> None:
 
     :param slug: The agent's slug (see :func:`omnigent.onboarding.acp_auth.slugify`).
     """
-    from omnigent.onboarding.acp_auth import acp_agents, acp_agents_settings
+    from omnigent.onboarding.acp_auth import acp_agents
     from omnigent.onboarding.interactive import console, select
 
     agents = list(acp_agents())
@@ -2472,7 +2385,9 @@ def _manage_acp_agent(slug: str) -> None:
     idx = select(header, [r.label for r in rows], clear_on_exit=True)
     if idx < 0 or rows[idx].action == "back":
         return
-    _save_global_config(acp_agents_settings([a for a in agents if a.slug != slug]))
+    _save_global_config(
+        acp_entries_settings(_load_global_config(), [a for a in agents if a.slug != slug])
+    )
     console.print(f"  ✓ Removed {agent.name}")
 
 
@@ -2836,15 +2751,10 @@ def _manage_copilot_harness() -> None:
         write the ``copilot:`` block of ``~/.omnigent/config.yaml`` and the
         secret store.
     """
-    from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.copilot_auth import (
-        COPILOT_CONFIG_KEY,
-        COPILOT_SECRET_NAME,
         copilot_github_host,
         copilot_github_token_configured,
-        copilot_github_token_ref,
         copilot_sdk_installed,
-        copilot_token_removal_settings,
         gh_cli_github_token,
     )
     from omnigent.onboarding.interactive import select
@@ -2900,24 +2810,12 @@ def _manage_copilot_harness() -> None:
         elif action == "set_host":
             status = _set_copilot_github_host()
         elif action == "clear_host":
-            from omnigent.onboarding.copilot_auth import copilot_github_host_settings
-
-            _save_global_config(copilot_github_host_settings(None))
+            _save_global_config(copilot_host_settings(_load_global_config(), None))
             status = "✓ Cleared Copilot GitHub Enterprise host"
         elif action == "remove_key":
-            ref = copilot_github_token_ref(config)
-            # Only the secret we own (``keychain:copilot``) is ours to delete: a
-            # hand-edited block may point at a shared ``keychain:<other>`` secret,
-            # and an ``env:`` ref names the user's own environment. In both of
-            # those cases just drop the config block and leave the secret.
-            if ref == f"keychain:{COPILOT_SECRET_NAME}":
-                secret_store.delete_secret(COPILOT_SECRET_NAME)
-            # Keep a configured GHE host: the saver replaces the whole block, so
-            # unsetting it wholesale would discard the host along with the token.
-            if (remaining := copilot_token_removal_settings()) is not None:
-                _save_global_config(remaining)
-            else:
-                _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            settings, unset = harness_key_removal_settings(_load_global_config(), "copilot")
+            _save_global_config(settings, unset_keys=unset)
+            cleanup_removed_harness_secret(config, "copilot")
             status = "✓ Removed Copilot GitHub token"
 
 
@@ -2931,13 +2829,12 @@ def _set_copilot_github_host() -> str | None:
 
     :returns: A status string for the menu, or ``None`` if the user aborted.
     """
-    from omnigent.onboarding.copilot_auth import copilot_github_host_settings
     from omnigent.onboarding.interactive import prompt_text
 
     entered = prompt_text("GitHub Enterprise hostname (e.g. acme.ghe.com)").strip()
     if not entered:
         return None
-    _save_global_config(copilot_github_host_settings(entered))
+    _save_global_config(copilot_host_settings(_load_global_config(), entered))
     from omnigent.onboarding.copilot_auth import copilot_github_host
 
     return f"✓ Copilot GitHub Enterprise host set ({copilot_github_host()})"
@@ -2955,11 +2852,9 @@ def _set_copilot_github_token() -> str | None:
 
     :returns: A status string for the menu, or ``None`` if the user aborted.
     """
-    from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.copilot_auth import (
         COPILOT_SECRET_NAME,
         COPILOT_TOKEN_ENV_VARS,
-        copilot_github_token_settings,
         looks_like_github_copilot_token,
     )
     from omnigent.onboarding.interactive import prompt_text
@@ -2975,7 +2870,9 @@ def _set_copilot_github_token() -> str | None:
             default=False,
         ):
             return None
-        _save_global_config(copilot_github_token_settings(f"env:{detected_var}"))
+        _save_global_config(
+            harness_key_settings(_load_global_config(), "copilot", f"env:{detected_var}")
+        )
         return f"✓ Copilot GitHub token set (from ${detected_var})"
 
     pasted = prompt_text("GitHub token with Copilot access", hide_input=True).strip()
@@ -2987,8 +2884,12 @@ def _set_copilot_github_token() -> str | None:
         default=False,
     ):
         return None
+    from omnigent.onboarding import secrets as secret_store
+
     secret_store.store_secret(COPILOT_SECRET_NAME, pasted)
-    _save_global_config(copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"))
+    _save_global_config(
+        harness_key_settings(_load_global_config(), "copilot", f"keychain:{COPILOT_SECRET_NAME}")
+    )
     return "✓ Copilot GitHub token stored"
 
 
@@ -3196,15 +3097,9 @@ def _clear_detection_dismissal(name: str) -> None:
     :returns: None. Side effect: writes ``~/.omnigent/config.yaml`` when the
         name was dismissed; no write otherwise.
     """
-    from omnigent.onboarding.detected import (
-        DISMISSED_DETECTIONS_KEY,
-        dismissed_detection_names,
-    )
+    from omnigent.onboarding.setup_operations import detection_dismissal_settings
 
-    dismissed = dismissed_detection_names(_load_global_config())
-    if name not in dismissed:
-        return
-    _save_global_config({DISMISSED_DETECTIONS_KEY: sorted(dismissed - {name})})
+    _save_global_config(detection_dismissal_settings(_load_global_config(), name, False))
 
 
 def _remove_credential(provider: str) -> str | None:
@@ -3222,10 +3117,6 @@ def _remove_credential(provider: str) -> str | None:
         configure open does not silently re-adopt it).
     """
     from omnigent.onboarding.ambient import detect_providers
-    from omnigent.onboarding.detected import (
-        DISMISSED_DETECTIONS_KEY,
-        dismissed_detection_names,
-    )
     from omnigent.onboarding.provider_config import load_providers
 
     config = _load_global_config()
@@ -3234,23 +3125,12 @@ def _remove_credential(provider: str) -> str | None:
         return None
     entry = load_providers({"providers": block}).get(provider)
     label = _credential_label(provider, entry) if entry is not None else provider
-    remaining = {k: v for k, v in block.items() if k != provider}
-    settings: dict[str, Any] = {"providers": remaining}  # type: ignore[explicit-any]  # yaml-boundary mapping
-    # If a live ambient detection backs this entry, removing the entry alone
-    # is a no-op: the next configure open re-detects and re-adopts it (the
-    # "Remove doesn't remove" bug). Subscriptions are exempt — their removal
-    # path signs out of the CLI instead, and a future re-login SHOULD
-    # re-adopt. Everything else (env API key, codex config.toml provider,
-    # local Ollama) gets a persisted dismissal that the add menu's detected
-    # option clears on re-add.
-    backing = next(
-        (d for d in detect_providers() if d.name == provider and d.kind != "subscription"),
-        None,
-    )
-    if backing is not None:
-        settings[DISMISSED_DETECTIONS_KEY] = sorted(dismissed_detection_names(config) | {provider})
-    _save_global_config(settings)  # wholesale replace per key
-    if backing is not None:
+    from omnigent.onboarding.setup_operations import provider_removal_settings
+
+    detected_names = {d.name for d in detect_providers() if d.kind != "subscription"}
+    backing = provider in detected_names
+    _save_global_config(provider_removal_settings(config, provider, detected_names=detected_names))
+    if backing:
         return f"✓ Removed {label} — it stays on your machine but won't be auto-configured again"
     return f"✓ Removed {label}"
 

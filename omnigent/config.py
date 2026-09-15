@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeAlias
@@ -99,6 +100,7 @@ def save_global_config(
     *,
     deep_merge_keys: tuple[str, ...] = (),
     path: Path | None = None,
+    unset_keys: tuple[str, ...] = (),
 ) -> None:
     """Merge *settings* into the user-level config and write it back atomically.
 
@@ -113,9 +115,12 @@ def save_global_config(
     :param deep_merge_keys: Keys whose mapping value is merged one level deep
         rather than replacing the existing mapping.
     :param path: Config path override (defaults to :func:`global_config_path`).
+    :param unset_keys: Keys to remove after merging the provided settings.
     """
     resolved = path or global_config_path()
     cfg = load_global_config(resolved)
+    if not isinstance(cfg, dict):
+        raise ValueError("The global config must be a mapping")
     for key, value in settings.items():
         if key in deep_merge_keys and isinstance(value, Mapping):
             existing = cfg.get(key)
@@ -124,12 +129,18 @@ def save_global_config(
             cfg[key] = merged
         else:
             cfg[key] = value
+    for key in unset_keys:
+        cfg.pop(key, None)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     # Atomic replace so a crash mid-write can't truncate the user's config.
-    tmp = resolved.with_name(resolved.name + ".tmp")
-    with tmp.open("w") as config_file:
-        yaml.safe_dump(cfg, config_file, default_flow_style=False, sort_keys=True)
-    os.replace(tmp, resolved)
+    fd, temporary = tempfile.mkstemp(prefix=f".{resolved.name}.", dir=resolved.parent)
+    try:
+        with os.fdopen(fd, "w") as config_file:
+            yaml.safe_dump(cfg, config_file, default_flow_style=False, sort_keys=True)
+        os.replace(temporary, resolved)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _github_accounts(cfg: _Config) -> dict[str, object]:

@@ -29,6 +29,12 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     under these tests. Antigravity similarly accepts ``GEMINI_API_KEY``.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi"))
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    from omnigent.onboarding import gemini_auth
+
+    monkeypatch.setattr(gemini_auth, "GEMINI_OAUTH_CRED_PATHS", (tmp_path / "gemini.json",))
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
@@ -624,6 +630,9 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(hi, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.harness_cli_installed", lambda _key, **_kw: False
+    )
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
     result = configured_harness_map()
     for harness in (

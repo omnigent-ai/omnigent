@@ -1243,6 +1243,13 @@ def harness_login(key: str) -> bool:
     return harness_cli_logged_in(key)
 
 
+def invalidate_harness_login_cache(key: str) -> None:
+    """Forget cached positive login verdicts for one harness."""
+    with _PROBE_CACHE_LOCK:
+        for cache_key in [k for k in _LOGIN_PROBE_CACHE if k[0] == key]:
+            del _LOGIN_PROBE_CACHE[cache_key]
+
+
 def harness_logout(key: str) -> bool:
     """Run the harness CLI's logout; return whether it is now logged out.
 
@@ -1269,7 +1276,5 @@ def harness_logout(key: str) -> bool:
         return False
     # Drop cached logged-in verdicts so the confirmation below re-probes —
     # a cached positive would report this successful logout as failed.
-    with _PROBE_CACHE_LOCK:
-        for cache_key in [k for k in _LOGIN_PROBE_CACHE if k[0] == key]:
-            del _LOGIN_PROBE_CACHE[cache_key]
+    invalidate_harness_login_cache(key)
     return not harness_cli_logged_in(key)

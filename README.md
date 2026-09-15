@@ -411,7 +411,7 @@ omnigent setup
 ```
 
 Add a credential, set a default, or remove one, grouped by agent. Omnigent
-works with four kinds of credentials:
+supports credentials including:
 
 | | Kind | What it is |
 |---|---|---|
@@ -420,8 +420,49 @@ works with four kinds of credentials:
 | 🌐 | **Gateway** | Any OpenAI- or Anthropic-compatible `base_url` and key (OpenRouter, LiteLLM, Ollama, vLLM, Azure) |
 | 🧱 | **Databricks** | A Databricks workspace profile (requires the `databricks` extra) |
 
+In the browser or desktop app, open **Settings → Providers** for graphical
+setup. Select the execution computer, then an agent to manage its connections,
+defaults, and available install or sign-in actions. A sole host is selected
+automatically; with several hosts, choose one explicitly. The selection stays
+on that computer if it disconnects. Older hosts may need an update before they
+support Providers.
+
+CLI readiness warnings take precedence over saved-connection counts. If an agent
+shows **Update needed**, update its CLI on the selected computer, then use
+**Check status**; guided sign-in is disabled while the CLI is outdated.
+
+Opening Providers only reads setup metadata. **Find credentials on this computer**
+(**Detect credentials** in Advanced provider tools) explicitly looks for existing
+credentials and checks model catalogs; **Check status** runs the selected
+agent's CLI setup checks and may request access to stored credentials.
+For Pi, **Check Pi default** explicitly reads local CLI configuration when a
+compatible default needs detection. **Use Pi’s local configuration** saves routing
+to Pi without checking its sign-in.
+Configured connections and saved keys do not prove vendor authentication.
+Sign-in uses the embedded guided terminal on the selected host when an
+interactive step is needed. **Sign in to Antigravity** first checks whether that
+computer is already signed in and can show **Connected** without opening a
+terminal. During interactive Antigravity sign-in, finish the vendor step and
+choose **Check connection**; an unverified check leaves the terminal running
+so you can retry. While setup is running, conflicting actions are disabled;
+the **Return to Antigravity** banner brings you back from another agent.
+For a remote host, a vendor redirect to `localhost` reaches your browser's
+computer: use the vendor's device-code/remote flow, or a browser on that host.
+
+When explicit discovery finds no catalog default for an API-key vendor, the form
+shows **Default model** outside **More options** and requires a nonblank value
+before saving. Otherwise, a blank model uses the catalog default when available.
+
+**Advanced provider tools** exposes all connections, API-key/gateway/Bedrock
+forms, and custom ACP agents. See the [OpenClaw guide](docs/openclaw.md#import-coding-agents)
+for importing an existing ACP registry. Removing a Claude or ChatGPT
+subscription also signs out of its standalone CLI on that host.
+
 Defaults are per agent, so a Claude default and a Codex default coexist. You
 can also switch models in the middle of a session with the `/model` command.
+Changing a provider default affects subsequent process launches; it does not
+restart running agents. Resumed sessions without a pinned provider continue to
+use the CLI's normal default resolution.
 
 <details>
 <summary>Gateway base URLs (OpenRouter, Ollama)</summary>

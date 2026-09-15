@@ -8,6 +8,7 @@ agent keeps its own authentication.
 from __future__ import annotations
 
 import shlex
+import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -188,6 +189,9 @@ def merge_imported_acp_entries(
 
 
 def _load_config(path: Path) -> Any:
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+        raise ValueError("import config must be a regular file smaller than 1 MiB")
     text = path.read_text(encoding="utf-8")
     try:
         return json5.loads(text)

@@ -11,6 +11,7 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   BlocksIcon,
+  CloudCogIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -33,6 +34,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
+  | "providers"
   | "general"
   | "git"
   | "integrations"
@@ -48,6 +50,7 @@ export type SettingsSectionId =
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
+  "providers",
   "general",
   "git",
   "integrations",
@@ -94,6 +97,7 @@ export function settingsNavGroups(
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
+    { id: "providers", label: "Providers", icon: CloudCogIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },

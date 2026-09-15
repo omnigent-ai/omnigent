@@ -1184,9 +1184,9 @@ def _save_global_config(  # type: ignore[explicit-any]
         cfg.pop(key, None)
     path = _effective_global_config_path()
     _normalize_harness_scalar_on_write(cfg, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+    from omnigent.config import save_global_config
+
+    save_global_config(cfg, path=path, unset_keys=unset_keys)
 
 
 def _materialize_bundled_example(name: str) -> Path:

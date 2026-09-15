@@ -247,6 +247,7 @@ import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
+import { ProviderSettingsSection } from "@/pages/ProviderSettingsSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -305,6 +306,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
+      {section === "providers" && <ProviderSettingsSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
