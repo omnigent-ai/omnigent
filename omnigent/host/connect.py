@@ -2399,12 +2399,28 @@ class HostProcess:
                     # Dead tunnel: abort the batch (recovery is owned upstream),
                     # never a per-session skip — nothing more can be sent.
                     raise
-                except Exception:
-                    # Any other failure reading, normalizing, encoding, or sending
-                    # one session must not drop the rest of the batch: count it and
-                    # move on so the remaining sessions still upload.
-                    _logger.exception(
-                        "import_local: skipping session source=%r id=%r", source, session_id
+                except Exception as exc:  # noqa: BLE001 — recovered skip, counted below
+                    # A per-session failure (read, normalize, encode, send) is
+                    # recovered — counted on the done frame, the rest of the batch
+                    # still uploads — so log the skip below ERROR (traceback at DEBUG).
+                    _logger.warning(
+                        "import_local: skipping session source=%r id=%r (%s: %s)",
+                        source,
+                        session_id,
+                        type(exc).__name__,
+                        exc,
+                        extra=debug_event(
+                            "import_local_session_skipped",
+                            source=source,
+                            error_category=ErrorCategory.UNKNOWN.value,
+                            error_impact=ErrorImpact.BENIGN.value,
+                        ),
+                    )
+                    _logger.debug(
+                        "import_local: skip traceback source=%r id=%r",
+                        source,
+                        session_id,
+                        exc_info=True,
                     )
                     load_failed += 1
                     continue
