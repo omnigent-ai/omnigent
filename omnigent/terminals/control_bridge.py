@@ -536,7 +536,7 @@ async def bridge_tmux_control_to_websocket(
     tmux = shutil.which("tmux")
     if tmux is None:
         _logger.error("tmux not found on PATH; cannot control-attach target=%s", tmux_target)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="tmux not found")
         return
 
@@ -570,7 +570,7 @@ async def bridge_tmux_control_to_websocket(
         )
     except (OSError, ValueError):
         _logger.exception("control-attach spawn failed target=%s", tmux_target)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="control attach failed")
         return
 
@@ -864,7 +864,10 @@ async def bridge_tmux_control_to_websocket(
                 proc.kill()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
-        with contextlib.suppress(RuntimeError):
+        # close() on an already-dead client transport raises WebSocketDisconnect
+        # (starlette wraps the transport's OSError); a RuntimeError means the
+        # socket was closed by the other task first. Both are benign here.
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             if control_ended_first:
                 # The control client ended: distinguish a genuine session-gone
                 # (%exit with a dead/absent pane) from a mere detach. Reuse the
