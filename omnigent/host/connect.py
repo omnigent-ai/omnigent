@@ -148,6 +148,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runtime.websocket_metrics import (
+    classify_disconnect_reason,
     record_websocket_connected,
     record_websocket_disconnected,
     websocket_close_code,
@@ -1064,6 +1065,10 @@ class HostProcess:
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        self._conn_started_at: float | None = None
+        self._conn_attempt = 0
+        self._conn_phase = "not_started"
+        self._conn_hello_sent = False
         # Live tunnel connection, set by _serve_frames for the watcher
         # tasks (which outlive any single connection) to report on.
         self._ws: websockets.asyncio.client.ClientConnection | None = None
@@ -3556,6 +3561,7 @@ class HostProcess:
                                 "%s Treating the endpoint as unhealthy; "
                                 "reconnecting on slow backoff until it responds.",
                                 cause,
+                                extra=self._connection_log_extra("host_tunnel_unresponsive", exc),
                             )
                             print(
                                 f"⚠ {cause} The server may be unhealthy. "
@@ -3627,6 +3633,12 @@ class HostProcess:
                         " (resumed from suspend — prompt reconnect)"
                         if woke
                         else (" (recycle — prompt reconnect)" if recycle else ""),
+                        extra=self._connection_log_extra(
+                            "host_tunnel_reconnecting",
+                            exc,
+                            reconnect_delay_s=wait_s,
+                            resumed_from_suspend=woke,
+                        ),
                     )
                     # Interruptible backoff: wake early if the lifecycle
                     # monitor loses ownership mid-backoff so the top-of-loop
@@ -3746,6 +3758,42 @@ class HostProcess:
                 handle.proc.kill()
         self._runners.clear()
 
+    def _connection_log_extra(
+        self,
+        event_name: str,
+        error: BaseException | None = None,
+        *,
+        reconnect_delay_s: float | None = None,
+        resumed_from_suspend: bool = False,
+    ) -> dict[str, object]:
+        """Describe the connection attempt without headers, URLs, or peer-provided text."""
+        return debug_event(
+            event_name,
+            host_id=self._identity.host_id,
+            host_process_id=os.getpid(),
+            connection_attempt=self._conn_attempt,
+            connection_phase=self._conn_phase,
+            connection_elapsed_ms=(
+                round((time.monotonic() - self._conn_started_at) * 1000)
+                if self._conn_started_at is not None
+                else None
+            ),
+            upgrade_accepted=self._conn_upgrade_accepted,
+            hello_sent=self._conn_hello_sent,
+            frame_received=self._conn_frame_received,
+            consecutive_silent_connections=self._silent_connect_streak,
+            tracked_runner_count=len(self._runners),
+            exception_type=type(error).__name__ if error is not None else None,
+            websocket_close_code=websocket_close_code(error),
+            disconnect_reason=(
+                classify_disconnect_reason(error, resumed_from_suspend=resumed_from_suspend)
+                if error is not None
+                else None
+            ),
+            http_status=error.response.status_code if isinstance(error, InvalidStatus) else None,
+            reconnect_delay_s=reconnect_delay_s,
+        )
+
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.
 
@@ -3755,6 +3803,10 @@ class HostProcess:
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        self._conn_started_at = time.monotonic()
+        self._conn_attempt += 1
+        self._conn_phase = "prepare"
+        self._conn_hello_sent = False
         url = self._tunnel_url()
         headers = self._build_connect_headers()
 
@@ -3782,6 +3834,7 @@ class HostProcess:
                 ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
                 ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             )
+            self._conn_phase = "upgrade"
             ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:
             # The upgrade itself was rejected. Fail loud on permanent
@@ -3806,6 +3859,7 @@ class HostProcess:
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
+            self._conn_phase = "owner_lookup"
             await self._ensure_owner_user_id()
             await self._serve_frames(ws)
         except BaseException as exc:
@@ -3968,7 +4022,10 @@ class HostProcess:
             encoded_hello = encode_host_frame(hello)
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
+        self._conn_phase = "send_hello"
         await ws.send(encoded_hello)
+        self._conn_hello_sent = True
+        self._conn_phase = "report_runner_exits"
         self._ws = ws
         # Reports raised while disconnected must wait until registration; the
         # server cannot route them before this connection owns the host.
@@ -3995,9 +4052,17 @@ class HostProcess:
             self._prewarm_model_options(), name="host-model-options-prewarm"
         )
         try:
+            self._conn_phase = "receive"
             while True:
                 raw = await ws.recv()
+                recovered = not self._conn_frame_received and self._silent_connect_streak > 0
                 self._conn_frame_received = True
+                if recovered:
+                    _logger.info(
+                        "Host tunnel received a frame after %d silent connections",
+                        self._silent_connect_streak,
+                        extra=self._connection_log_extra("host_tunnel_responsive"),
+                    )
                 if isinstance(raw, str):
                     # Connection-control frames decide whether this receive
                     # loop exits or reconnects, so handle them inline. Ordinary
