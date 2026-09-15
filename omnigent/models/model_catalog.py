@@ -1479,10 +1479,13 @@ def _models_url(base_url: str) -> str:
         ``"https://openrouter.ai/api/v1"`` or
         ``"https://api.anthropic.com"``.
     :returns: The listing URL — ``<base>/models`` when the base already
-        ends in ``/v1``, else ``<base>/v1/models``.
+        ends in a version segment (``/v1``, ``/v4``, …), else
+        ``<base>/v1/models``.
     """
     trimmed = base_url.rstrip("/")
-    if trimmed.endswith("/v1"):
+    # A base that already names its API version lists at <base>/models;
+    # appending /v1 again builds a path no server serves.
+    if re.search(r"/v\d+$", trimmed):
         return f"{trimmed}/models"
     return f"{trimmed}/v1/models"
 
