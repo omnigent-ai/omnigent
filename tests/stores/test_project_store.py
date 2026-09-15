@@ -496,6 +496,7 @@ def test_original_array_format_preserves_manual_order(store: SqlAlchemyProjectSt
     from omnigent.db.db_models import SqlUser
 
     project = store.create(_uid("original-format"), "A", None)
+    store.save_order([], user_id=None)
     with Session(store._engine) as session:
         session.execute(
             update(SqlUser)
@@ -532,3 +533,33 @@ def test_concurrent_order_saves_and_mode_changes_retain_manual_ids(
     preference = store.get_order_preference(user_id="new-owner")
     assert preference["sort_mode"] == "alphabetical"
     assert preference["ordered_project_ids"] in orders
+
+
+def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProjectStore) -> None:
+    """The maximum accepted order survives storage on every supported backend."""
+    from sqlalchemy import func, insert, select
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlProject, SqlUser
+    from omnigent.server.schemas import ProjectOrderRequest
+
+    ids = [_uid(f"large-order-{i}") for i in range(10000)]
+    with Session(store._engine) as session:
+        session.execute(
+            insert(SqlProject),
+            [
+                {"workspace_id": 0, "id": id, "name": id, "user_id": "large", "created_at": 0}
+                for id in ids
+            ],
+        )
+        session.commit()
+    request = ProjectOrderRequest(ordered_project_ids=ids)
+    store.save_order(request.ordered_project_ids, user_id="large")
+    assert store.get_order(user_id="large") == ids
+    with Session(store._engine) as session:
+        size = session.scalar(
+            select(func.length(SqlUser.project_order)).where(
+                SqlUser.workspace_id == 0, SqlUser.id == "large"
+            )
+        )
+    assert size is not None and size > 65535

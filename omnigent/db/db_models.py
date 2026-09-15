@@ -30,7 +30,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from omnigent.db.compression import CompressedText
+from omnigent.db.compression import CompressedLargeText, CompressedText
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
@@ -394,7 +394,9 @@ class SqlUser(OmnigentBase):
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Keep the opaque preference out of routine authentication reads.
-    project_order: Mapped[str | None] = mapped_column(CompressedText, nullable=True, deferred=True)
+    project_order: Mapped[str | None] = mapped_column(
+        CompressedLargeText, nullable=True, deferred=True
+    )
 
 
 class SqlAccountToken(OmnigentBase):

@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 
 revision: str = "gh1b2c3d4e5f"
 down_revision: str | None = "gg1b2c3d4e5f"
@@ -14,7 +15,13 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     """Missing preferences retain alphabetical sorting; no backfill is needed."""
     with op.batch_alter_table("users") as batch:
-        batch.add_column(sa.Column("project_order", sa.LargeBinary(), nullable=True))
+        batch.add_column(
+            sa.Column(
+                "project_order",
+                sa.LargeBinary().with_variant(MEDIUMBLOB(), "mysql"),
+                nullable=True,
+            )
+        )
 
 
 def downgrade() -> None:

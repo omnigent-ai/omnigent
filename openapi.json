@@ -3759,6 +3759,9 @@
             "anyOf": [
               {
                 "items": {
+                  "maxLength": 32,
+                  "minLength": 32,
+                  "pattern": "^[0-9a-f]{32}$",
                   "type": "string"
                 },
                 "maxItems": 10000,

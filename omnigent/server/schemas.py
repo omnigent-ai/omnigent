@@ -4980,7 +4980,9 @@ HarnessStreamEvent = (
 class ProjectOrderRequest(BaseModel):
     """Complete manual order; null selects alphabetical mode without erasing it."""
 
-    ordered_project_ids: list[str] | None = Field(..., max_length=10000)
+    ordered_project_ids: (
+        list[Annotated[str, Field(min_length=32, max_length=32, pattern="^[0-9a-f]{32}$")]] | None
+    ) = Field(..., max_length=10000)
 
 
 class ProjectOrderResponse(BaseModel):

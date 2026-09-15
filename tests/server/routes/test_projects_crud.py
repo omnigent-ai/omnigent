@@ -521,6 +521,14 @@ async def test_project_order_rejects_invalid_payload(project_client: httpx.Async
     }
 
 
+@pytest.mark.parametrize("ids", [["a" * 33], ["g" * 32], ["a" * 32] * 10001])
+async def test_project_order_rejects_oversized_or_malformed_ids(
+    project_client: httpx.AsyncClient, ids: list[str]
+) -> None:
+    response = await project_client.put("/v1/projects/order", json={"ordered_project_ids": ids})
+    assert response.status_code == 422
+
+
 async def test_order_endpoints_enforce_owner_and_announce_changes(
     multi_user_client: httpx.AsyncClient,
 ) -> None:

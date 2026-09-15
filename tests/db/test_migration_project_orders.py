@@ -52,3 +52,28 @@ def test_project_orders_migration_round_trip(tmp_path: Path) -> None:
     assert store.get(project.id, user_id=None) == project
     store.save_order([project.id], user_id=None)
     assert store.get_order(user_id=None) == [project.id]
+
+
+def test_mysql_project_order_column_has_large_capacity() -> None:
+    """Both model bootstrap and Alembic must create a column larger than BLOB."""
+    from importlib import import_module
+    from io import StringIO
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy.dialects import mysql
+
+    from omnigent.db.db_models import SqlUser
+
+    dialect = mysql.dialect()
+    assert SqlUser.__table__.c.project_order.type.compile(dialect=dialect) == "MEDIUMBLOB"
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect=dialect, opts={"as_sql": True, "output_buffer": output}
+    )
+    migration = import_module(
+        "omnigent.db.migrations.versions.gh1b2c3d4e5f_add_user_project_order"
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    assert "ADD COLUMN project_order MEDIUMBLOB" in output.getvalue()
