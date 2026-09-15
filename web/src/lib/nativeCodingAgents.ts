@@ -54,7 +54,8 @@ export type NativeCodingAgentCapability =
   | "cursorMode"
   | "skipPermissions"
   | "modelPicker"
-  | "devinMode";
+  | "devinMode"
+  | "devinPermission";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -135,10 +136,11 @@ export const NATIVE_CODING_AGENTS = [
     // `devinMode` owns Devin's own Model + Effort rows. It is deliberately the
     // ONLY capability here:
     //   * `permissionMode` would render Claude's vocabulary AND the server
-    //     hard-gates `permission_mode` to claude-native agents
-    //     (_PERMISSION_MODE_HARNESS in routes/_session_create_validation.py),
-    //     so a Devin session created with one is rejected 4xx. Devin's
-    //     `--permission-mode` stays reachable via `omnigent devin`.
+    //     hard-gates the `permission_mode` FIELD to claude-native agents
+    //     (_PERMISSION_MODE_HARNESS in routes/_session_create_validation.py).
+    //     `devinPermission` instead carries Devin's own four rungs
+    //     (auto/accept-edits/smart/dangerous) as `terminal_launch_args`, the
+    //     same channel cursor/agy/codex modes use, so no gated field is sent.
     //   * `modelPicker` would render pi's model list.
     key: "devin",
     agentName: "devin-native-ui",
@@ -148,7 +150,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Devin",
     iconKind: "devin",
     sortRank: 28,
-    capabilities: ["devinMode"],
+    capabilities: ["devinMode", "devinPermission"],
     // Deliberately NOT fullySupported: that flag pins the picker's primary list
     // to Claude Code + Codex and is guarded by a test asserting exactly those
     // two, so promoting a brand-new harness there is a product call for a

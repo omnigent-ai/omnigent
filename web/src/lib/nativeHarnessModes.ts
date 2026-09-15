@@ -84,6 +84,37 @@ export const CURSOR_NATIVE_EXEC_MODES: NativeHarnessMode[] = [
   },
 ];
 
+// Devin's own permission vocabulary (`devin --help`), deliberately NOT Claude's:
+// Devin's rungs differ, and it reads them from `--permission-mode`. "auto" is
+// Devin's own default, so it sends no flag. Keep in sync with `devin --help`.
+export const DEVIN_NATIVE_DEFAULT_PERMISSION_MODE = "auto";
+export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
+  {
+    value: "auto",
+    label: "Auto",
+    description: "Auto-approves read-only tools; prompts for anything else",
+    args: [],
+  },
+  {
+    value: "accept-edits",
+    label: "Accept edits",
+    description: "Also auto-approves edits inside the workspace",
+    args: ["--permission-mode", "accept-edits"],
+  },
+  {
+    value: "smart",
+    label: "Smart",
+    description: "Also auto-runs actions a fast model judges safe",
+    args: ["--permission-mode", "smart"],
+  },
+  {
+    value: "dangerous",
+    label: "Dangerous",
+    description: "Auto-approves every tool, with no prompts",
+    args: ["--permission-mode", "dangerous"],
+  },
+];
+
 // Codex approval presets matching the `/permissions` TUI popup.
 // Each preset bundles a sandbox profile + approval policy, mirroring
 // codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
