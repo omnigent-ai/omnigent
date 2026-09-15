@@ -397,7 +397,10 @@ def _try_resolve_from_cfg(profile: str | None, cfg_path: Path) -> WorkspaceCreds
     if not cfg_path.exists():
         return None
 
-    config = configparser.ConfigParser()
+    # strict=False: tolerate duplicate sections/keys in ~/.databrickscfg (e.g.
+    # written by the Databricks VS Code extension); the last value wins,
+    # matching the databricks-sdk and the executor's file readers.
+    config = configparser.ConfigParser(strict=False)
     config.read(cfg_path)
 
     if profile is not None:

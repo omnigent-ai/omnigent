@@ -2015,6 +2015,72 @@ def test_stream_ended_without_finish_reason_with_content_completes() -> None:
     _run(_t())
 
 
+def test_read_databrickscfg_fallback_tolerates_duplicate_default_section(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """
+    A ``~/.databrickscfg`` with a duplicate ``[DEFAULT]`` section (as written by
+    the Databricks VS Code extension) must not crash the file readers.
+
+    ``configparser.ConfigParser`` defaults to ``strict=True`` and raised
+    ``DuplicateOptionError`` on such files. The readers now parse in
+    non-strict mode, where the last value wins.
+    """
+    contents = textwrap.dedent(
+        """
+        [DEFAULT]
+        host = https://first.cloud.databricks.com
+        token = dapi-first
+
+        [DEFAULT]
+        host = https://second.cloud.databricks.com
+        token = dapi-second
+        """
+    ).lstrip()
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    creds = _read_databrickscfg_file_fallback()
+    assert creds is not None
+    assert creds.host == "https://second.cloud.databricks.com"
+    assert creds.token == "dapi-second"
+
+    # The host-only reader must survive the same file too.
+    assert _read_databrickscfg_host() == "https://second.cloud.databricks.com"
+
+
+def test_workspace_id_helpers_tolerate_duplicate_default_section(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """
+    The ``workspace_id`` readers must survive a ``~/.databrickscfg`` with a
+    duplicate ``[DEFAULT]`` section. Their ``configparser.Error`` guard used
+    to swallow the strict-mode parse failure and return ``None``, silently
+    losing the recorded workspace id. Non-strict parsing keeps the last value.
+    """
+    contents = textwrap.dedent(
+        """
+        [DEFAULT]
+        host = https://first.cloud.databricks.com
+        workspace_id = 1111111111111111
+
+        [DEFAULT]
+        host = https://second.cloud.databricks.com
+        workspace_id = 2222222222222222
+        """
+    ).lstrip()
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    assert databrickscfg_workspace_id_for_profile("DEFAULT") == "2222222222222222"
+    assert (
+        databrickscfg_workspace_id_for_host("https://second.cloud.databricks.com")
+        == "2222222222222222"
+    )
+
+
 def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
     tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
 ) -> None:
