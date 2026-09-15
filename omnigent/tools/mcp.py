@@ -521,6 +521,19 @@ class McpServerConnection:
     # ``_call_lock`` so only one call is active at a time.
     _active_session_id: str | None = field(default=None, init=False, repr=False)
     _session: ClientSession | None = field(default=None, init=False, repr=False)
+    # True once connect() has established a live session at least
+    # once. Distinguishes "never connected" (genuine caller misuse
+    # — call_tool before connect) from "the session died and needs
+    # rebuilding" (a transient transport fault that cleared, e.g. a
+    # steady-state 401 from an expired bearer that has since
+    # refreshed). Only the former is a hard error; the latter must
+    # reconnect on the next call instead of wedging forever.
+    _connected: bool = field(default=False, init=False, repr=False)
+    # Single-flights session rebuilds: once a session dies, every
+    # pooled caller classifies as needs-reconnect, so without this
+    # lock they would all run _reconnect() concurrently and tear
+    # down each other's freshly built lifecycles.
+    _reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     # Most recent network-level transport failure, recorded by
     # ``_TransportErrorRecordingTransport``. The MCP SDK can swallow
     # a mid-response network error entirely (leaving ``_session``
@@ -627,11 +640,18 @@ class McpServerConnection:
             context. ``None`` when no session is available.
         :returns: The tool result as a string. For multi-content
             results, text blocks are joined with newlines.
-        :raises RuntimeError: If ``connect()`` has not been called.
+        :raises RuntimeError: If ``connect()`` has never been called.
         :raises McpServerDisabledError: If the circuit breaker is
             tripped.
         """
-        if self._session is None:
+        # A None session with no prior successful connect is caller
+        # misuse (call_tool before connect) — hard error. A None
+        # session *after* a successful connect means the lifecycle
+        # task died on a transient transport fault (e.g. a
+        # steady-state 401 that has since cleared); don't wedge here,
+        # let _call_tool_with_reconnect rebuild the session so a
+        # recovered server keeps working.
+        if self._session is None and not self._connected:
             raise RuntimeError(
                 f"MCP server {self.config.name!r} has no live "
                 f"session — call connect() before call_tool()"
@@ -792,25 +812,40 @@ class McpServerConnection:
             )
         return _format_call_result(result)
 
-    async def _reconnect(self) -> None:
+    async def _reconnect(self, *, dead_session: ClientSession | None = None) -> None:
         """
         Tear down the dead session and open a fresh one.
 
         Called by ``call_tool()`` after detecting a connection
-        error. Does not re-discover tools — the tool list from
-        the original ``connect()`` is still valid, but the
-        session needs to be live for the next ``call_tool``.
+        error or a session already cleared by a lifecycle death.
+        Does not re-discover tools — the tool list from the
+        original ``connect()`` is still valid, but the session
+        needs to be live for the next ``call_tool``.
+
+        Single-flight: concurrent callers coalesce on
+        :attr:`_reconnect_lock` so only one rebuilds. A caller that
+        waited its turn and finds a live session other than the one
+        it observed dead returns without tearing that session down.
 
         Same task-identity rule as :meth:`connect` applies: the
         new lifecycle task owns the new transport + session
         end to end.
+
+        :param dead_session: The session this caller observed as
+            dead, or ``None`` when it observed no session at all.
+            Used to detect that another caller already rebuilt.
         """
-        await self.close()
-        loop = asyncio.get_running_loop()
-        self._ready_future = loop.create_future()
-        self._close_event = asyncio.Event()
-        self._lifecycle_task = asyncio.create_task(self._run_lifecycle())
-        await self._ready_future
+        async with self._reconnect_lock:
+            # Another caller already rebuilt while we waited: a live
+            # session exists and it is not the one we saw die.
+            if self._session is not None and self._session is not dead_session:
+                return
+            await self._teardown()
+            loop = asyncio.get_running_loop()
+            self._ready_future = loop.create_future()
+            self._close_event = asyncio.Event()
+            self._lifecycle_task = asyncio.create_task(self._run_lifecycle())
+            await self._ready_future
 
     async def _run_lifecycle(self) -> None:
         """
@@ -877,6 +912,7 @@ class McpServerConnection:
                 # signal recorded on the previous connection.
                 self._transport_error = None
                 discovered = await self._discover_or_use_cache()
+                self._connected = True
                 ready.set_result(discovered)
                 # Hold transport + session open until close() signals.
                 # All call_tool() invocations during this window run
@@ -941,13 +977,27 @@ class McpServerConnection:
 
     async def close(self) -> None:
         """
-        Tear down the MCP session and transport.
+        Deliberately tear down the MCP session and transport.
+
+        Also drops the connected latch, so a later ``call_tool()``
+        is caller misuse again (hard error) rather than a dead
+        session to silently resurrect — a closed connection must
+        stay closed. Safe to call multiple times or if
+        :meth:`connect` was never called.
+        """
+        self._connected = False
+        await self._teardown()
+
+    async def _teardown(self) -> None:
+        """
+        Tear down session + transport, keeping the connected latch.
 
         Signals the lifecycle task to exit its
         ``async with AsyncExitStack`` block, then awaits the
         task's completion so resource teardown is observable
-        from the caller. Safe to call multiple times or if
-        :meth:`connect` was never called.
+        from the caller. Used by :meth:`_reconnect` so callers
+        arriving mid-rebuild still classify as "session died,
+        reconnect" instead of hitting the never-connected guard.
         """
         if self._close_event is not None:
             self._close_event.set()
@@ -1657,9 +1707,17 @@ async def _call_tool_with_reconnect(
     """
     last_exc: Exception | None = None
     total_tries = retry.max_retries + 1
-    needs_reconnect = False
+    # A session that died before the call (lifecycle task torn down
+    # by an earlier fault) must be rebuilt before the first attempt,
+    # not only after an in-call failure — otherwise a cleared 401
+    # never gets a live session to run against.
+    needs_reconnect = conn._session is None
+    # The session THIS caller observed as dead; lets _reconnect skip
+    # the rebuild when a concurrent caller already replaced it.
+    dead_session: ClientSession | None = None
 
     for attempt in range(total_tries):
+        attempt_session: ClientSession | None = None
         try:
             # Reconnect first when the previous attempt broke the
             # session. Inside the try so a reconnect that fails on a
@@ -1667,14 +1725,19 @@ async def _call_tool_with_reconnect(
             # retried on the next attempt instead of aborting the
             # whole call.
             if needs_reconnect:
-                await conn._reconnect()
+                await conn._reconnect(dead_session=dead_session)
                 needs_reconnect = False
+            attempt_session = conn._session
             return await conn._invoke_tool(name, arguments, session_id=session_id)
         except Exception as exc:
             if not (_is_connection_error(exc) or _is_dead_session_timeout(exc, conn)):
                 raise
             last_exc = exc
             needs_reconnect = True
+            # Only a session this attempt actually ran against can be
+            # marked dead; a failed reconnect leaves the token as-is.
+            if attempt_session is not None:
+                dead_session = attempt_session
             # Last attempt — don't reconnect, just raise.
             if attempt + 1 >= total_tries:
                 break
