@@ -37,6 +37,7 @@ from omnigent.databricks_ai_gateway import (
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
+from omnigent.harnesses.pi_native.model_scope import ScopableModel, scope_models
 from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
 from omnigent.models.model_metadata import ModelWireAPI
@@ -413,13 +414,28 @@ def _read_json_object(path: Path) -> dict[str, object]:
     return raw if _is_str_object_dict(raw) else {}
 
 
+def _pi_enabled_model_patterns(root: Path) -> list[str]:
+    """Read Pi's own model curation (``settings.json`` ``enabledModels``).
+
+    :param root: Pi agent dir whose settings to read.
+    :returns: The non-empty string patterns, ``[]`` when unset or malformed.
+    """
+    raw = _read_json_object(root / "settings.json").get("enabledModels")
+    if not isinstance(raw, list):
+        return []
+    return [pattern for pattern in raw if isinstance(pattern, str) and pattern.strip()]
+
+
 def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
     """Enumerate the models Pi's own login can use (the unmanaged fallback).
 
     When no omnigent-managed provider is configured, the launched Pi runs on
     its own credentials, so the pre-launch picker must offer the models that
     login can actually drive: Pi's ``models-store.json`` catalog filtered to
-    providers with an ``auth.json`` entry.
+    providers with an ``auth.json`` entry, scoped by the ``enabledModels``
+    curation in Pi's ``settings.json`` when it selects anything (Pi's own
+    pickers cycle exactly that scope; a scope matching nothing means "no
+    curation" to Pi, so the full catalog stays the fallback).
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's
         own Pi agent dir.
@@ -431,7 +447,7 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
     logged_in = set(_read_json_object(root / "auth.json"))
     if not logged_in:
         return []
-    options: dict[str, dict[str, object]] = {}
+    catalog: dict[str, ScopableModel] = {}
     for provider_id, payload in _read_json_object(root / "models-store.json").items():
         if provider_id not in logged_in or not _is_str_object_dict(payload):
             continue
@@ -442,14 +458,28 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
             model_id = model.get("id")
             if not isinstance(model_id, str) or not model_id:
                 continue
-            qualified = f"{provider_id}/{model_id}"
             name = model.get("name")
-            options[qualified] = {
-                "id": qualified,
-                "model": qualified,
-                "displayName": name if isinstance(name, str) and name else model_id,
-            }
-    return [options[model_id] for model_id in sorted(options)]
+            entry = ScopableModel(
+                provider=provider_id,
+                model_id=model_id,
+                name=name if isinstance(name, str) and name else None,
+            )
+            catalog[entry.reference] = entry
+    entries = list(catalog.values())
+    patterns = _pi_enabled_model_patterns(root)
+    if patterns:
+        scoped = scope_models(patterns, entries)
+        if scoped:
+            entries = scoped
+    options: dict[str, dict[str, object]] = {
+        entry.reference: {
+            "id": entry.reference,
+            "model": entry.reference,
+            "displayName": entry.name or entry.model_id,
+        }
+        for entry in entries
+    }
+    return [options[reference] for reference in sorted(options)]
 
 
 def pi_own_login_model_arg(selection: str) -> str | None:
