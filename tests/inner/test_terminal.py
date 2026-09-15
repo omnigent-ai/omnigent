@@ -1987,9 +1987,54 @@ def test_reap_orphaned_terminals_logs_what_it_killed(
 
     reap_logs = [r.getMessage() for r in caplog.records if "orphan sweep reaped" in r.getMessage()]
     assert len(reap_logs) == 1
-    # Both the socket (the join key) and the owner pid are recorded.
+    # The instance dir, socket (the join key), and owner pid are recorded.
+    assert dead_dir.name in reap_logs[0]
     assert str(socket_path) in reap_logs[0]
     assert str(dead_pid) in reap_logs[0]
+    # A socket existed, so the line must not claim it was already gone.
+    assert "already gone" not in reap_logs[0]
+
+
+def test_reap_orphaned_terminals_logs_reap_when_socket_is_already_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A socketless orphan's reap log says the socket was already gone.
+
+    No tmux server existed for such a dir, so the log must not imply one
+    was killed while still recording the dir, socket path, and owner pid.
+
+    :param tmp_path: Fake temp root the sweep scans.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Captures emitted log records.
+    :returns: None.
+    """
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    kill_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda *a, **k: kill_calls.append(list(a[0])) or SimpleNamespace(returncode=0),
+            TimeoutExpired=TimeoutError,
+        ),
+    )
+    dead_pid = _dead_pid()
+    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead4", dead_pid)
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.logger.name):
+        assert terminal_mod.reap_orphaned_terminals() == 1
+
+    assert kill_calls == []
+    reap_logs = [r.getMessage() for r in caplog.records if "orphan sweep reaped" in r.getMessage()]
+    assert len(reap_logs) == 1
+    assert dead_dir.name in reap_logs[0]
+    assert str(dead_dir / "tmux.sock") in reap_logs[0]
+    assert str(dead_pid) in reap_logs[0]
+    # No server existed, and the wording must say so.
+    assert "already gone" in reap_logs[0]
 
 
 @pytest.mark.skipif(
