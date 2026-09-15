@@ -87,33 +87,6 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
-    # Devin (Cognition's ``devin`` CLI) drives ``devin acp`` — its ACP stdio
-    # server. Ships via a curl installer (not npm) and authenticates through its
-    # own ``devin auth login``, which writes a credential file it reads back at
-    # spawn; Omnigent stores nothing. The row runs Devin's account-default model:
-    # a row carries no per-user model, and ``DEVIN_MODEL`` cannot reach the agent
-    # (see the env note above), so pinning a model needs a user-configured
-    # ``acp:<slug>`` agent whose command passes ``--model``.
-    #
-    # Keyed ``devin-acp``, not ``devin``: the bare vendor spelling now
-    # canonicalizes to the native wrap (``devin-native``, see ``aliases`` in
-    # omnigent/harness_plugins.py), the way ``opencode`` resolves to
-    # ``opencode-native``. Deprecated: native Devin replaced it as the offered
-    # Devin, so it is skipped in ``omnigent config`` setup (see cli_config.py).
-    # It stays registered and resolvable via ``--harness devin-acp`` — keeping
-    # Devin's ACP path and the sub-agent dialect in ``omnigent.inner.devin`` —
-    # so existing ACP sessions still resume.
-    "devin-acp": AcpCliHarness(
-        install=HarnessInstallSpec(
-            "Devin (ACP)",
-            "devin",
-            None,
-            login_args=("auth", "login"),
-            install_hint="curl -fsSL https://cli.devin.ai/install.sh | bash",
-            auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
-        ),
-        args=("acp",),
-    ),
     # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
     # curl installer (not npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no

@@ -3,15 +3,18 @@
 `omnigent devin` wraps the resident **Devin CLI** TUI (Cognition) in a
 runner-owned tmux pane and mirrors it into an Omnigent conversation.
 
-It **replaces** Devin's ACP harness as the offered Devin. The ACP path
-(`devin-acp`) is **deprecated**: it stays registered and resolvable via
-`--harness devin-acp` (and for existing sessions), but is no longer offered in
-`omnigent config` setup, so native Devin is the sole "Devin" row.
+It **replaces** Devin's built-in ACP harness. That row (`devin-acp`, and the
+`omnigent.inner.devin` dialect behind it) was **removed in 0.14**: the id is
+aliased onto `devin-native`, so a session, bundle or `--harness devin-acp`
+script that still names it resolves onto the native wrap instead of failing.
+Nothing that worked is lost — the ACP path never warm-resumed (`COLD_ONLY`, no
+`session/load`). A **user-configured** `acp:devin` is untouched: it
+canonicalizes to `acp` and runs the generic executor from the user's own config.
 
 | Harness id | What it is | Notable |
 |---|---|---|
 | `devin-native` | This wrap: the real Devin TUI in a tmux pane, mirrored into Chat | Policy enforcement, approval cards, model + effort, resume, cost, sub-agents as child sessions |
-| `devin-acp` (deprecated) | `devin acp` through the generic ACP executor + `omnigent.inner.devin` | Reachable via `--harness devin-acp`; not offered in setup |
+| `devin-acp` (removed 0.14) | was `devin acp` through the generic ACP executor | Id aliased onto `devin-native` so old references still resolve |
 
 The bare spelling `devin` canonicalizes to `devin-native` (as `opencode` does to
 `opencode-native`), so `--harness devin` and `omnigent devin` both land on the

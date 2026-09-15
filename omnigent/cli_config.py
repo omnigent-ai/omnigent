@@ -4025,11 +4025,6 @@ def _run_configure_harnesses_interactive() -> None:
         for _acp_cli_name, _acp_cli_row in sorted(ACP_CLI_HARNESSES.items()):
             if _acp_cli_name in _shadowed_acp_rows:
                 continue
-            # devin-acp is deprecated: native Devin (the `devin` row above) is the
-            # sole offered Devin. The ACP path stays resolvable via
-            # `--harness devin-acp` and for existing sessions, just not offered here.
-            if _acp_cli_name == "devin-acp":
-                continue
             _acp_cli_key = _ACP_CLI_PREFIX + _acp_cli_name
             if resolve_cli_binary(_acp_cli_row.binary) is None:
                 rows.append(

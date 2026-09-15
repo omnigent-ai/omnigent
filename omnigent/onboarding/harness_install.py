@@ -399,7 +399,7 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # Native Devin TUI (``devin-native``, via ``omni devin``) wraps the ``devin``
     # CLI; ``native-devin`` gates on the same binary. The bare ``devin`` spelling
     # canonicalizes to ``devin-native``, so it lands here too, and the ACP row
-    # (``devin-acp``) gates on the same binary through the catalog.
+    # gates on the same binary through the catalog.
     "devin-native": DEVIN_KEY,
     "native-devin": DEVIN_KEY,
 }

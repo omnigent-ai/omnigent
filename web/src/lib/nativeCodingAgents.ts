@@ -127,11 +127,11 @@ export const NATIVE_CODING_AGENTS = [
     // pick.)
   },
   {
-    // Devin's native TUI (Cognition). Added ALONGSIDE Devin's ACP harness
-    // (`devin-acp`, see omnigent/inner/devin) — they are distinct rows. Both now
-    // surface Devin's `run_subagent` delegates as child sessions: the native
-    // forwarder reconstructs each one's transcript from Devin's session store.
-    // The bare `devin` harness spelling resolves to this native wrap.
+    // Devin's native TUI (Cognition). Replaced the built-in ACP row, removed in
+    // 0.14 — both `devin` and the retired `devin-acp` id resolve here, while a
+    // user-configured `acp:devin` still runs the generic ACP executor. Devin's
+    // `run_subagent` delegates surface as child sessions: the forwarder
+    // reconstructs each one's transcript from Devin's session store.
     //
     // `devinMode` owns Devin's own Model + Effort rows. It is deliberately the
     // ONLY capability here:

@@ -53,7 +53,8 @@ export function iconForAgent(
   if (agent.harness?.includes("hermes")) return HermesIcon;
   if (agent.harness?.includes("kiro")) return KiroIcon;
   if (agent.harness?.includes("goose")) return GooseIcon;
-  // Covers `devin-native`, `devin-acp`, and a user-configured `acp:devin`.
+  // Covers `devin-native`, the retired `devin-acp` id, and a user-configured
+  // `acp:devin`.
   if (agent.harness?.includes("devin")) return DevinIcon;
   // Both the SDK "kimi"/"kimi-code" harness and "kimi-native" get the Kimi glyph.
   if (agent.harness?.includes("kimi")) return KimiIcon;

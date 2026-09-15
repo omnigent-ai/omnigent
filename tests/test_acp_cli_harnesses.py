@@ -228,10 +228,11 @@ def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # Rows whose vendor behavior earns their own thin wrap, which injects an
-# AcpExtension into the same shared ACP executor (see omnigent.inner.devin).
-# Listing one here is deliberate: it declares that the row no longer runs the
-# shared wrap and may declare capabilities the generic profile does not.
-_VENDOR_WRAPS = {"devin-acp": "omnigent.inner.devin.harness"}
+# AcpExtension into the same shared ACP executor. Listing one here is deliberate:
+# it declares that the row no longer runs the shared wrap and may declare
+# capabilities the generic profile does not. Empty since Devin's ACP row was
+# replaced by the native wrap; the check stays for the next vendor row.
+_VENDOR_WRAPS: dict[str, str] = {}
 
 
 @pytest.mark.parametrize("name", sorted(ACP_CLI_HARNESSES))

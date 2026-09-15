@@ -45,7 +45,6 @@ from omnigent.harness_capabilities import (
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
-from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 
 _logger = logging.getLogger(__name__)
 
@@ -748,15 +747,6 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
-# Devin (the ACP row) is the one row that diverges: its own wrap injects a vendor extension
-# (omnigent.inner.devin), so it surfaces the agent's sub-agents as child sessions
-# where a generic ACP agent cannot. Derived from the extension so this declared
-# capability cannot drift from the dialect that implements it.
-_BUILTIN_CAPABILITIES["devin-acp"] = dataclasses.replace(
-    _BUILTIN_CAPABILITIES["acp"],
-    subagents=DEVIN_ACP_EXTENSION.surfaces_subagents,
-)
-
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
@@ -796,9 +786,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # Every catalog row runs the shared generic ACP wrap...
         **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
-        # ...except a row with vendor behavior, which runs its own thin wrap to
-        # inject an AcpExtension into the same shared executor.
-        "devin-acp": "omnigent.inner.devin.harness",
         "devin-native": "omnigent.inner.devin_native_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
@@ -828,15 +815,16 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "agy": "antigravity",
         "agy-native": "antigravity-native",
         "claude": "claude-sdk",
-        # The bare vendor name resolves to the native wrap, mirroring
-        # ``opencode`` -> ``opencode-native``. Devin's ACP path keeps its own
-        # id (``devin-acp``) so both stay addressable.
-        # Known break (accepted): a session persisted before this cutover with
-        # harness ``devin`` (which meant ACP then) now resolves to the native
-        # wrap on resume. Not fixable by a static alias — bare ``devin`` must
-        # mean native for a fresh launch yet ACP for an old session — and the ACP
-        # harness shipped only recently, so pre-cutover ACP sessions are thin.
+        # Both vendor spellings resolve to the native wrap, mirroring
+        # ``opencode`` -> ``opencode-native``. ``devin-acp`` was the built-in ACP
+        # row, removed in 0.14: keeping the id aliased is what stops a session,
+        # bundle or ``--harness devin-acp`` script that still names it from
+        # failing to resolve a harness at all. The ACP path never warm-resumed
+        # (COLD_ONLY, no session/load), so nothing that worked is lost. A
+        # user-configured ``acp:devin`` is untouched — it canonicalizes to
+        # ``acp`` and reads the user's own config.
         "devin": "devin-native",
+        "devin-acp": "devin-native",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
