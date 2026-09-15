@@ -5847,24 +5847,20 @@ _SESSION_AGENT_MISSING_CLIENT_MESSAGE = (
 )
 
 
-def _raise_if_runner_session_agent_missing(resp: httpx.Response) -> None:
-    """Re-raise a runner ``session_agent_missing`` error as a typed 410.
+def _raise_if_session_agent_missing_payload(payload: object) -> None:
+    """Re-raise a runner ``session_agent_missing`` error body as a typed 410.
 
-    Inspects a non-200 runner response body for the typed
+    Inspects an already-parsed runner error body for the typed
     ``session_agent_missing`` code and re-derives the ``OmnigentError``
     (``http_status`` 410, matching ``create_session_terminal``'s code
     passthrough) so server proxies surface the session-lifecycle condition
-    instead of flattening it into a generic 5xx gateway failure. Uses a
-    fixed client-safe message — never the runner's internal resolver text.
-    No-op for any other body, code, or a non-JSON payload.
+    instead of flattening it into a generic gateway failure or forwarding
+    the runner's raw message. Uses a fixed client-safe message — never the
+    runner's internal resolver text. No-op for any other body or code.
 
-    :param resp: Runner HTTP response with a non-2xx status.
+    :param payload: Parsed runner response body, e.g. ``resp.json()``.
     :raises OmnigentError: Typed ``session_agent_missing`` (HTTP 410).
     """
-    try:
-        payload: object = resp.json()
-    except ValueError:
-        return
     if not isinstance(payload, dict):
         return
     error = payload.get("error")
@@ -5873,6 +5869,23 @@ def _raise_if_runner_session_agent_missing(resp: httpx.Response) -> None:
             _SESSION_AGENT_MISSING_CLIENT_MESSAGE,
             code=ErrorCode.SESSION_AGENT_MISSING,
         )
+
+
+def _raise_if_runner_session_agent_missing(resp: httpx.Response) -> None:
+    """Re-raise a runner ``session_agent_missing`` error as a typed 410.
+
+    Response-level wrapper over
+    :func:`_raise_if_session_agent_missing_payload` for proxies that hold
+    the raw ``httpx.Response``. No-op for a non-JSON payload.
+
+    :param resp: Runner HTTP response with a non-2xx status.
+    :raises OmnigentError: Typed ``session_agent_missing`` (HTTP 410).
+    """
+    try:
+        payload: object = resp.json()
+    except ValueError:
+        return
+    _raise_if_session_agent_missing_payload(payload)
 
 
 async def _proxy_get_session_resources_to_runner(
@@ -6844,6 +6857,9 @@ async def _resolve_skill_meta_text_via_runner(
         # Re-derive the typed session-lifecycle 410 (agent deleted or
         # rebound) instead of flattening it into an INTERNAL_ERROR 500 —
         # the exact server-fault mis-attribution this code path must avoid.
+        # This branch is reached because SESSION_AGENT_MISSING maps to 410
+        # (non-404); if that HTTP mapping ever changed to 404, the 404 arm
+        # below would swallow it as a skill-not-found INVALID_INPUT.
         _raise_if_runner_session_agent_missing(resp)
         raise OmnigentError(
             f"Runner failed to resolve skill {skill_name!r}: HTTP {resp.status_code}",

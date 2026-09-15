@@ -81,6 +81,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
     _raise_if_runner_session_agent_missing,
+    _raise_if_session_agent_missing_payload,
     _read_upload_capped,
     _stored_file_to_resource,
 )
@@ -373,6 +374,10 @@ def register_resources_routes(
             payload = None
         if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
             raise HTTPException(status_code=502, detail="runner download failed")
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) with its client-safe message instead of forwarding the
+        # runner's raw resolver text verbatim.
+        _raise_if_session_agent_missing_payload(payload)
         return JSONResponse(status_code=resp.status_code, content=payload)
 
     async def _proxy_get_to_runner(
@@ -2018,6 +2023,10 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) with its client-safe message instead of forwarding
+            # the runner's raw resolver text verbatim.
+            _raise_if_session_agent_missing_payload(payload)
             error = payload.get("error", {})
             message = error.get("message", "filesystem operation failed")
             if status == 404:
