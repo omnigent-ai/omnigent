@@ -307,3 +307,46 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     # Then
     assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_claude_config_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Claude's profile selector survives the CLI→daemon strip in both modes.
+
+    Without it the detached daemon's claude-native panes run on the default
+    ``~/.claude`` profile instead of the one the user selected.
+    """
+    # Given
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/profiles/work")
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then
+    assert env.get("CLAUDE_CONFIG_DIR") == "/profiles/work"
+
+
+def test_runner_env_preserves_claude_config_dir() -> None:
+    """Claude's profile selector survives the daemon→runner strip.
+
+    The runner env is what the claude-native pane inherits, so a drop here puts
+    the session on the default profile.
+    """
+    # Given
+    base_env = {"PATH": "/usr/bin", "CLAUDE_CONFIG_DIR": "/profiles/work"}
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_claude_profile",
+        binding_token="binding-claude-profile",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert env.get("CLAUDE_CONFIG_DIR") == "/profiles/work"

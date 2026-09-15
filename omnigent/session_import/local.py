@@ -12,6 +12,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import get_args
 
+from omnigent.claude_paths import claude_config_dir
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
@@ -207,9 +208,7 @@ def _recent_local_sessions_with_recency(
 ) -> list[tuple[str, float]]:
     """List recent ``(session_id, recency)`` pairs for one local harness, newest first."""
     if source == "claude":
-        configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
-        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
-        root = home / "projects"
+        root = claude_config_dir() / "projects"
         candidates = [
             (path, path.stem)
             for path in root.rglob("*.jsonl")
@@ -421,9 +420,7 @@ def load_claude_session(
     claude_home: Path | None = None,
 ) -> LocalSessionImport:
     """Load one Claude Code parent session from its local JSONL transcript."""
-    configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
-    home = claude_home or (Path(configured_home).expanduser() if configured_home else None)
-    root = (home or Path.home() / ".claude") / "projects"
+    root = (claude_home or claude_config_dir()) / "projects"
     transcript_path = _find_transcript(root, session_id)
     if transcript_path is None:
         raise SessionImportNotFoundError(f"Claude Code session {session_id!r} was not found")
