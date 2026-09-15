@@ -93,8 +93,9 @@ async def test_publish_without_subscriber_is_silent_noop() -> None:
     session_stream.publish("conv_unknown", {"type": "x", "i": 1})
     # If publish were silently creating a slot, the registry would
     # have grown. The contract: only ``subscribe`` adds slots.
-    assert session_stream._subscribers == {}, (
-        f"publish must NOT create subscriber slots. State: {session_stream._subscribers!r}"
+    assert session_stream._subscribers.all_values() == [], (
+        f"publish must NOT create subscriber slots. "
+        f"State: {session_stream._subscribers.all_values()!r}"
     )
 
 

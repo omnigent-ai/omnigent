@@ -21,6 +21,7 @@ from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
@@ -245,7 +246,9 @@ from omnigent.util.session_lifecycle import (
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
-_retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+_retry_recovery_tasks: WorkspaceScopedCache[str, asyncio.Task[dict[str, bool | str]]] = (
+    WorkspaceScopedCache()
+)
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is

@@ -41,6 +41,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     Agent,
@@ -1661,7 +1662,7 @@ def _publish_input_consumed(
 # re-announces in_progress on every status poll; carrying one stable
 # started_at lets clients anchor their elapsed counter to the true start,
 # even across a page reload (the live stream has no replay).
-_compaction_started_at: dict[str, int] = {}
+_compaction_started_at: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 def _publish_compaction_in_progress(session_id: str) -> None:
@@ -5282,7 +5283,7 @@ async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttemp
 # surfaces THAT flight's structured refusal instead of a generic connect
 # timeout), and strong refs to the detached superseded-runner stops.
 _relaunch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-_relaunch_last_attempt: dict[str, _HostLaunchAttempt] = {}
+_relaunch_last_attempt: WorkspaceScopedCache[str, _HostLaunchAttempt] = WorkspaceScopedCache()
 # Riders read the memo within a flight's own window (milliseconds), so it only
 # has to outlive the racing callers, not the conversation. Cap it: a
 # weak-valued map would drop entries the racers still need, and an uncapped one

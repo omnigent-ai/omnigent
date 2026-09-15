@@ -23,6 +23,7 @@ from typing import Any
 
 import cachetools
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
@@ -81,7 +82,9 @@ _ASK_ON_ADD_POLICY_SPEC = FunctionPolicySpec(
 # per-tool-call engine build. Only non-``None`` owners are cached (a
 # session is granted its owner atomically at creation, so ``None`` is a
 # transient single-user/pre-grant state, not worth caching).
-_SESSION_OWNER_CACHE: cachetools.LRUCache[str, str] = cachetools.LRUCache(maxsize=4096)
+_SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096)
+)
 
 # TTL cache of ``workspace_id -> list[PolicySpec]`` for DB-stored default
 # policies. Default policies are admin-managed and change infrequently, so
@@ -91,16 +94,16 @@ _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachet
     maxsize=256, ttl=30
 )
 
-# TTL+LRU cache of ``(workspace_id, conversation_id) -> list[PolicySpec]``
-# for session-scoped policies. Mutations call invalidate_session_policy_specs_cache
-# for immediate local eviction (single-instance or lucky same-replica routing).
-# The TTL (30 s) is the safety ceiling for horizontally-scaled deployments where
-# a DELETE/PATCH on one replica cannot evict another replica's in-process cache —
-# without it, a deleted session policy would remain enforced on other replicas
-# indefinitely (no natural expiry). Keyed by workspace to prevent cross-tenant
-# leakage. TTLCache subsumes LRU eviction, bounding memory the same way.
-_SESSION_POLICY_SPECS_CACHE: cachetools.TTLCache[tuple[int, str], list[PolicySpec]] = (
-    cachetools.TTLCache(maxsize=4096, ttl=30)
+# TTL+LRU cache of ``conversation_id -> list[PolicySpec]`` for session-scoped
+# policies, workspace-namespaced by the wrapper. Mutations call
+# invalidate_session_policy_specs_cache for immediate local eviction
+# (single-instance or lucky same-replica routing). The TTL (30 s) is the safety
+# ceiling for horizontally-scaled deployments where a DELETE/PATCH on one replica
+# cannot evict another replica's in-process cache — without it, a deleted session
+# policy would remain enforced on other replicas indefinitely (no natural expiry).
+# TTLCache subsumes LRU eviction, bounding memory the same way.
+_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=30)
 )
 
 
@@ -1536,9 +1539,7 @@ def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
     """
-    from omnigent.db.db_models import current_workspace_id
-
-    _SESSION_POLICY_SPECS_CACHE.pop((current_workspace_id(), conversation_id), None)
+    _SESSION_POLICY_SPECS_CACHE.pop(conversation_id, None)
 
 
 def _load_session_policy_specs(
@@ -1575,10 +1576,7 @@ def _load_session_policy_specs(
     """
     if policy_store is None:
         return []
-    from omnigent.db.db_models import current_workspace_id
-
-    key = (current_workspace_id(), conversation_id)
-    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(key)
+    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
     if cached is not None:
         return cached
     stored = policy_store.list_for_session(conversation_id)
@@ -1587,7 +1585,7 @@ def _load_session_policy_specs(
         if not policy.enabled:
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _SESSION_POLICY_SPECS_CACHE[key] = specs
+    _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
     return specs
 
 

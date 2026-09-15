@@ -29,6 +29,7 @@ from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
     Agent,
@@ -5730,7 +5731,7 @@ async def _record_create_route_prompt(
 # session list reports them as running so a booting session spins instead of
 # reading idle until the runner accepts the message. Process-local and
 # best-effort: with several replicas only the one handling the POST knows.
-_dispatch_in_flight: dict[str, int] = {}
+_dispatch_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 @contextlib.contextmanager

@@ -33,6 +33,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
     audit_event_logger,
     debug_event,
@@ -60,10 +61,10 @@ class SubscriberOverflowError(RuntimeError):
 # (queue, event_loop) pairs. The event_loop reference is needed
 # so the sync producer thread can safely deliver items via
 # ``call_soon_threadsafe`` into the queue's owning loop.
-_subscribers: dict[
+_subscribers: WorkspaceScopedCache[
     str,
     set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
-] = {}
+] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
@@ -321,7 +322,9 @@ def shutdown_all() -> None:
     :func:`close` per-conversation instead.
     """
     with _lock:
-        all_subs = [entry for subs in _subscribers.values() for entry in subs]
+        # Shutdown spans every workspace and runs context-free, so sweep the
+        # whole backing rather than the current workspace's slice.
+        all_subs = [entry for subs in _subscribers.all_values() for entry in subs]
     for queue, _ in all_subs:
         _enqueue_or_overflow(queue, _DONE)
 

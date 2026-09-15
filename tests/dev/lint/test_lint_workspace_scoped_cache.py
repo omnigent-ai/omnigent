@@ -1,0 +1,103 @@
+"""Tests for ``dev/lint/lint_workspace_scoped_cache.py``.
+
+The hook requires module-level caches under omnigent/server and
+omnigent/runtime to be WorkspaceScopedCache / WorkspaceScopedSet so keys can't
+leak across tenants. Detection is over ``cachetools`` caches and EMPTY mutable
+collections; constant lookup tables and wrapped caches pass.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import dev.lint.lint_workspace_scoped_cache as lint
+from dev.lint.lint_workspace_scoped_cache import flagged_globals, main, scan
+
+
+def _names(source: str) -> list[str]:
+    return [name for _line, name in flagged_globals(source)]
+
+
+def test_flags_raw_cachetools_caches() -> None:
+    """A bare cachetools cache global is flagged."""
+    src = (
+        "import cachetools\n"
+        "_a = cachetools.LRUCache(maxsize=4096)\n"
+        "_b = cachetools.TTLCache(maxsize=256, ttl=30)\n"
+    )
+    assert _names(src) == ["_a", "_b"]
+
+
+def test_flags_empty_mutable_collections() -> None:
+    """Empty dict/set/defaultdict/Weak* globals are runtime caches → flagged."""
+    src = (
+        "import weakref\n"
+        "from collections import defaultdict\n"
+        "_a: dict[str, int] = {}\n"
+        "_b = dict()\n"
+        "_c: set[str] = set()\n"
+        "_d = defaultdict(list)\n"
+        "_e = weakref.WeakValueDictionary()\n"
+        "_f = weakref.WeakKeyDictionary()\n"
+    )
+    assert _names(src) == ["_a", "_b", "_c", "_d", "_e", "_f"]
+
+
+def test_passes_workspace_scoped_wrappers() -> None:
+    """WorkspaceScopedCache / WorkspaceScopedSet globals pass, incl. a factory."""
+    src = (
+        "import cachetools\n"
+        "_a: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()\n"
+        "_b = WorkspaceScopedSet()\n"
+        "_c = WorkspaceScopedCache(lambda: cachetools.LRUCache(maxsize=10))\n"
+    )
+    assert _names(src) == []
+
+
+def test_ignores_constant_tables_and_declarations() -> None:
+    """Non-empty literals, frozensets, and bare annotations are not caches."""
+    src = (
+        "import cachetools\n"
+        "_TABLE = {'a': 1, 'b': 2}\n"  # constant lookup table
+        "_SKIP = frozenset({'x', 'y'})\n"  # immutable
+        "_SEEDED = dict(a=1)\n"  # constructed with content
+        "_SEEDED2 = set(('x',))\n"  # constructed with content
+        "_lock = threading.Lock()\n"  # not a collection
+        "_only_declared: dict[str, int]\n"  # annotation, no value
+    )
+    assert _names(src) == []
+
+
+def test_scan_skips_files_outside_scanned_roots(tmp_path: Path) -> None:
+    """A cache-like global outside omnigent/server|runtime is not scanned."""
+    f = tmp_path / "outside.py"
+    f.write_text("_c = {}\n")
+    # Default roots are omnigent/server|runtime; a tmp file matches neither.
+    assert scan(f) == []
+
+
+def test_scan_respects_allowlist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An allow-listed (path, name) is not reported; a sibling still is."""
+    f = tmp_path / "mod.py"
+    f.write_text("_ok = {}\n_bad = {}\n")
+    rel = lint._repo_relative(f)
+    # Make the tmp file in-scope, and allow-list only ``_ok``.
+    monkeypatch.setattr(lint, "SCANNED_ROOTS", (rel,))
+    monkeypatch.setattr(lint, "ALLOWLIST", {(rel, "_ok"): "test reason"})
+    hits = scan(f)
+    assert [h.name for h in hits] == ["_bad"]
+
+
+def test_main_clean_tree_returns_zero() -> None:
+    """The real tree must be free of un-scoped caches (regression guard)."""
+    assert main(["lint_workspace_scoped_cache.py"]) == 0
+
+
+def test_main_flags_dirty_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``main`` returns 1 when an in-scope file has an un-scoped cache."""
+    f = tmp_path / "dirty.py"
+    f.write_text("import cachetools\n_c = cachetools.LRUCache(maxsize=1)\n")
+    monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
+    assert main(["lint_workspace_scoped_cache.py", str(f)]) == 1

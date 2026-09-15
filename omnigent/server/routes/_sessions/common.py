@@ -20,6 +20,7 @@ from pydantic import TypeAdapter
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
@@ -507,31 +508,33 @@ _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(Serve
 _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
-_session_status_cache: dict[str, str] = {}
+_session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
-_session_active_response_cache: dict[str, str] = {}
+_session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
-_session_background_task_count_cache: dict[str, int] = {}
+_session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 # Per-shell detail behind the tally above, kept sticky in lockstep with it (see
 # ``_publish_status``) so a reload/reconnect can restore it. Absent when the
 # count cache is absent, or when a runner reported only the count with no detail.
-_session_background_tasks_cache: dict[str, list[BackgroundTaskInfo]] = {}
+_session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
+    WorkspaceScopedCache()
+)
 
 
-_read_last_seen: dict[str, dict[str, int]] = {}
+_read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
 
 
-_read_explicit_unread: dict[str, set[str]] = {}
+_read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCache()
 
 
-_interrupt_fenced_sessions: set[str] = set()
+_interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-_intentional_stop_sessions: set[str] = set()
+_intentional_stop_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(
@@ -564,40 +567,42 @@ _SESSION_UPDATES_MAX_WATCHED: int = 500
 _SHARED_DISCOVERY_KEY = "__all__"
 
 
-_session_todos_cache: dict[str, list[dict[str, Any]]] = {}
+_session_todos_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
 
 
-_session_terminal_pending_cache: dict[str, bool] = {}
+_session_terminal_pending_cache: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache()
 
 
-_session_sandbox_status_cache: dict[str, SandboxStatus] = {}
+_session_sandbox_status_cache: WorkspaceScopedCache[str, SandboxStatus] = WorkspaceScopedCache()
 
 
-_session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
+_session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup]] = (
+    WorkspaceScopedCache()
+)
 
 
-_runner_skills_cache: dict[str, list[SkillSummary]] = {}
+_runner_skills_cache: WorkspaceScopedCache[str, list[SkillSummary]] = WorkspaceScopedCache()
 
 
 # Sessions whose cached skills need a re-fetch but should keep serving until it
 # lands. A browser reload asks for one, and dropping the entry outright would
 # empty the composer's slash-command menu for the reload that requested it.
-_runner_skills_stale: set[str] = set()
+_runner_skills_stale: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-_runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
+_runner_skills_inflight: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
 
 
-_model_options_cache: dict[str, list[dict[str, Any]]] = {}
+_model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
 
 
-_model_options_inflight: dict[str, asyncio.Task[None]] = {}
+_model_options_inflight: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
 
 
 # Sessions whose cached catalog should be re-fetched at the next snapshot
 # that has a live runner. A stale entry still SERVES in the meantime (and
 # whenever no runner is bound) so the model picker survives runner death.
-_model_options_stale: set[str] = set()
+_model_options_stale: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
 _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
@@ -608,7 +613,9 @@ _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 _catalog_prefetch_tasks: set[asyncio.Task[None]] = set()
 
 
-_pushed_model_options_cache: dict[str, list[dict[str, Any]]] = {}
+_pushed_model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = (
+    WorkspaceScopedCache()
+)
 
 
 @dataclass
@@ -686,7 +693,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # active relay for the session (routes_hooks), and the entry is popped at
 # every consume point, on each new turn, and when the relay task ends
 # (the relay's done-callback), so an entry can never outlive its relay.
-_llm_response_denied_turns: dict[str, str] = {}
+_llm_response_denied_turns: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
@@ -713,7 +720,7 @@ class _RelayHandle:
     ready: asyncio.Event
 
 
-_runner_relay_tasks: dict[str, _RelayHandle] = {}
+_runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
 
 
 _deferred_elicitation_clear_tasks: set[asyncio.Task[None]] = set()
