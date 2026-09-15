@@ -4455,7 +4455,7 @@ export function NewChatLandingScreen() {
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
   const canSubmit =
-    message.trim().length > 0 &&
+    (message.trim().length > 0 || files.length > 0) &&
     !pickerLoading &&
     !workspaceLoading &&
     pickerSelectionError === null &&
@@ -4485,7 +4485,7 @@ export function NewChatLandingScreen() {
                 ? "Please choose a host and working directory"
                 : configuredAgentUnavailable && selectedAgent == null
                   ? "This project's configured agent is unavailable — pick an agent to continue"
-                  : message.trim().length === 0
+                  : message.trim().length === 0 && files.length === 0
                     ? "Enter a message to get started"
                     : null;
 
