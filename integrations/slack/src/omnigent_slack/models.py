@@ -104,3 +104,6 @@ class SlackTurn:
     workspace: str | None = None
     host_id: str | None = None
     host_type: HostType = "external"
+    # Raw Slack ``files`` entries from the triggering event, carried until the
+    # turn uploads them as session attachments.
+    files: tuple[dict[str, Any], ...] = ()

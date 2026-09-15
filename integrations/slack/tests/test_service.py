@@ -3,8 +3,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import omnigent_slack.service as service_module
 import pytest
+import respx
 from omnigent_slack.approvals import Verdict, parse_action_value
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
@@ -166,6 +168,7 @@ class FakeSlackClient:
         self.stream_close_after: int | None = None
         # The Slack error code a closed stream raises (see FakeStream).
         self.stream_close_error: str = "message_not_in_streaming_state"
+        self.token = "xoxb-test"
 
     def _tick(self) -> int:
         # Monotonic rank stamped on each post/stream-open so tests can assert
@@ -244,6 +247,8 @@ class FakeOmnigentClient:
         self.launched: list[tuple[str, str, str | None]] = []
         self.deleted: list[str] = []
         self.turns: list[tuple[str, str]] = []
+        self.turn_attachments: list[list[dict[str, Any]] | None] = []
+        self.uploads: list[tuple[str, str, str | None, bytes]] = []
         self.resolved: list[tuple[str, str, bool]] = []
         self.resolved_content: list[dict[str, Any] | None] = []
         self.next_session_id = "conv_1"
@@ -298,6 +303,17 @@ class FakeOmnigentClient:
     async def delete_session(self, session_id: str) -> None:
         self.deleted.append(session_id)
 
+    async def upload_session_file(
+        self,
+        session_id: str,
+        *,
+        filename: str,
+        content_type: str | None,
+        data: bytes,
+    ) -> dict[str, Any]:
+        self.uploads.append((session_id, filename, content_type, data))
+        return {"id": f"file_{len(self.uploads)}", "filename": filename}
+
     async def run_turn(
         self,
         session_id: str,
@@ -306,9 +322,11 @@ class FakeOmnigentClient:
         workspace: str | None = None,
         host_id: str | None = None,
         host_type: str = "external",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         self.turn_host_types.append(host_type)
+        self.turn_attachments.append(attachments)
         yield {"type": "response.output_text.delta", "delta": "hel"}
         yield {"type": "response.output_text.delta", "delta": "lo"}
         yield {
@@ -3562,3 +3580,86 @@ async def test_interruption_preserves_chronological_order(tmp_path: Path) -> Non
     deny = next(p for p in slack.posts if "Blocked by policy" in str(p.get("text")))
     # Chronological: segment-1 opened, then the deny posted, then segment-2 opened.
     assert slack.streams[0].open_order < deny["order"] < slack.streams[1].open_order
+
+
+async def _wait_for_attachment_turn(omnigent: FakeOmnigentClient) -> None:
+    for _ in range(50):
+        if omnigent.turns:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("Timed out waiting for attachment turn")
+
+
+@respx.mock
+async def test_dm_with_file_uploads_and_references_attachment(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+    cdn = respx.get("https://files.slack.test/f1").mock(
+        return_value=httpx.Response(200, content=b"\x89PNGdata")
+    )
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "100.1",
+            "user": "U1",
+            "text": "",
+            "files": [{
+                "id": "F1",
+                "name": "shot.png",
+                "mimetype": "image/png",
+                "size": 9,
+                "url_private_download": "https://files.slack.test/f1",
+            }],
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_attachment_turn(omnigent)
+    await service.shutdown()
+
+    assert cdn.calls.last.request.headers["authorization"] == "Bearer xoxb-test"
+    assert omnigent.uploads == [("conv_1", "shot.png", "image/png", b"\x89PNGdata")]
+    assert omnigent.turns == [("conv_1", "(file attached)")]
+    assert omnigent.turn_attachments == [
+        [{"type": "input_image", "file_id": "file_1", "filename": "shot.png"}]
+    ]
+
+
+async def test_dm_attachment_over_size_cap_is_skipped_with_note(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "100.1",
+            "user": "U1",
+            "text": "huge file",
+            "files": [{
+                "id": "F1",
+                "name": "big.bin",
+                "mimetype": "application/octet-stream",
+                "size": 26 * 1024 * 1024,
+                "url_private_download": "https://files.slack.test/big",
+            }],
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_attachment_turn(omnigent)
+    await service.shutdown()
+
+    assert omnigent.uploads == []
+    assert omnigent.turn_attachments == [None]
+    assert "big.bin (too large)" in omnigent.turns[0][1]
