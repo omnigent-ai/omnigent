@@ -2427,27 +2427,28 @@ async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [401, 403, 500, 502])
-async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_resolve_agent_spec_from_server_raises_immediately_for_4xx(
     tmp_path: Path,
     status_code: int,
 ) -> None:
-    """Auth and server failures are not reported as missing agents.
+    """Deterministic 4xx rejections raise at once, unretried and un-404-like.
 
     :param tmp_path: Temporary spec cache root.
-    :param status_code: Non-404 HTTP status returned by the AP
+    :param status_code: Non-404 4xx HTTP status returned by the AP
         server.
     :returns: None.
     """
+    requested_paths: list[str] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """
-        Return the parametrized server failure.
+        Return the parametrized client-side rejection.
 
         :param request: Incoming mocked HTTP request.
         :returns: A response with ``status_code``.
         """
-        assert request.url.path == "/v1/sessions/conv_test/agent/contents"
+        requested_paths.append(request.url.path)
         return httpx.Response(status_code)
 
     async with httpx.AsyncClient(
@@ -2462,6 +2463,196 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     message = str(exc_info.value)
     assert f"HTTP {status_code}" in message
     assert "/v1/sessions/conv_test/agent/contents" in message
+    # A 4xx is a deterministic answer; a retry cannot change it.
+    assert requested_paths == ["/v1/sessions/conv_test/agent/contents"]
+
+
+def _minimal_bundle_tar_gz(agent_name: str) -> bytes:
+    """Build a one-file agent bundle whose config names *agent_name*.
+
+    :param agent_name: Spec ``name`` to embed, e.g. ``"blip-agent"``.
+    :returns: A gzipped tarball with a single ``config.yaml``.
+    """
+    config_bytes = (
+        f"spec_version: 1\nname: {agent_name}\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    ).encode()
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+    return bundle_buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_retries_transient_5xx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short 5xx window on the bundle fetch self-heals instead of raising.
+
+    A restarting backend or proxy blip serves a few 5xx responses before
+    recovering; the resolver must ride that window out rather than abort
+    the caller's turn setup on the first one.
+
+    :param tmp_path: Temporary spec cache root.
+    :param monkeypatch: Used to zero the backoff delays for test speed.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    requested_paths: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve two 503s, then a valid bundle.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A 503 for the first two calls, then a 200 bundle.
+        """
+        requested_paths.append(request.url.path)
+        if len(requested_paths) <= 2:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            content=_minimal_bundle_tar_gz("blip-agent"),
+            headers={"X-Agent-Version": "1"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        spec = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_blip", session_id="conv_test"
+        )
+
+    assert spec is not None
+    assert spec.name == "blip-agent"
+    assert len(requested_paths) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [500, 502, 503])
+async def test_resolve_agent_spec_from_server_5xx_retry_budget_is_bounded(
+    tmp_path: Path,
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent 5xx still raises — after exactly the bounded budget.
+
+    :param tmp_path: Temporary spec cache root.
+    :param status_code: 5xx HTTP status persistently returned by the AP
+        server.
+    :param monkeypatch: Used to zero the backoff delays for test speed.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    requested_paths: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Return the parametrized server failure on every attempt.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A response with ``status_code``.
+        """
+        requested_paths.append(request.url.path)
+        return httpx.Response(status_code)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(RuntimeError) as exc_info:
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_test", session_id="conv_test"
+            )
+
+    message = str(exc_info.value)
+    assert f"HTTP {status_code}" in message
+    assert "/v1/sessions/conv_test/agent/contents" in message
+    # Initial attempt plus one retry per backoff delay — no unbounded loop.
+    assert len(requested_paths) == 4
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_retries_transport_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped connection on the bundle fetch is retried like a 5xx.
+
+    :param tmp_path: Temporary spec cache root.
+    :param monkeypatch: Used to zero the backoff delays for test speed.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    calls: list[int] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Fail at the transport level twice, then serve a valid bundle.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A 200 bundle on the third call.
+        :raises httpx.ConnectError: On the first two calls.
+        """
+        calls.append(1)
+        if len(calls) <= 2:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(
+            200,
+            content=_minimal_bundle_tar_gz("reconnect-agent"),
+            headers={"X-Agent-Version": "1"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        spec = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_reconnect", session_id="conv_test"
+        )
+
+    assert spec is not None
+    assert spec.name == "reconnect-agent"
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_propagates_persistent_transport_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable server still surfaces its transport error — bounded.
+
+    :param tmp_path: Temporary spec cache root.
+    :param monkeypatch: Used to zero the backoff delays for test speed.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    calls: list[int] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Fail at the transport level on every attempt.
+
+        :param request: Incoming mocked HTTP request.
+        :raises httpx.ConnectError: Always.
+        """
+        calls.append(1)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(httpx.ConnectError):
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_test", session_id="conv_test"
+            )
+
+    assert len(calls) == 4
 
 
 def test_main_reports_tunnel_rejection_without_traceback(
