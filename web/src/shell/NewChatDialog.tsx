@@ -295,7 +295,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
-import { promoteSessionDraft } from "@/lib/sessionDrafts";
+import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -4784,10 +4784,16 @@ export function NewChatLandingScreen() {
   // No session was created after all, so the draft is the user's again —
   // including when they navigated away and the unmount cleanup already
   // dropped it on the strength of the submit.
-  function returnDraftToUser() {
+  function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
-    if (!onScreenRef.current) writeLandingDraft(draftRef.current);
+    const returnedDraft = recoverFailedSessionDraft(draftRef.current, temporaryConversationId);
+    if (onScreenRef.current) {
+      setMessage(returnedDraft.message);
+      setFiles(returnedDraft.files);
+    } else {
+      writeLandingDraft(returnedDraft);
+    }
   }
 
   async function handleCreate() {
@@ -5157,7 +5163,7 @@ export function NewChatLandingScreen() {
         // the workspace and agent, so winning on the push can't skip past an
         // error the user needed to see on this screen.
         if ("error" in created) {
-          returnDraftToUser();
+          returnDraftToUser(localConv?.tempConvId);
           // On the navigate-first path the landing screen is unmounted, so tear
           // down the phantom chat, return to landing, and surface the error as a
           // toast (survives the remount); inline error only when still on landing.
@@ -5286,8 +5292,8 @@ export function NewChatLandingScreen() {
       }
     } catch {
       const msg = "Couldn't reach the server. Check your connection and try again.";
+      returnDraftToUser(localConv?.tempConvId);
       tearDownLocalConversation();
-      returnDraftToUser();
       // Toast when the landing screen is gone (navigate-first); inline otherwise.
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);

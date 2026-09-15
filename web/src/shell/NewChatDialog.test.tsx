@@ -70,6 +70,7 @@ import {
   readNewChatWorkspaceCache,
 } from "@/lib/newChatPickerCache";
 import { setPendingInitialPrompt } from "@/store/chatStore";
+import { clearSessionDrafts } from "@/lib/sessionDrafts";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 describe("ComposerAddMenu", () => {
@@ -1116,6 +1117,7 @@ function setupLandingMocks() {
   vi.mocked(useInstallingHarnesses).mockReturnValue(new Set<string>());
   setOmnigentHostConfig({});
   resetLandingDraft();
+  clearSessionDrafts();
   localStorage.clear();
   // host_1's most-recent workspace seeds the field (so submit can enable
   // without manual picks). Tests that exercise the home fallback clear this.

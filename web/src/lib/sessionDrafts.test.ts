@@ -73,4 +73,32 @@ describe("session drafts", () => {
     expect(hasSessionDraft("conversation")).toBe(false);
     expect(sessionStorage.getItem(key)).toBeNull();
   });
+
+  it("recovers a failed temporary draft and ignores its late cleanup write", async () => {
+    const { getSessionDraft, recoverFailedSessionDraft, setSessionDraft } =
+      await import("./sessionDrafts");
+    const originalFile = new File(["initial"], "initial.txt");
+    const followUpFile = new File(["follow-up"], "follow-up.txt");
+    const temporaryDraft = {
+      text: "follow-up typed during startup",
+      files: [followUpFile],
+    };
+    setSessionDraft("temp:failed", temporaryDraft);
+
+    expect(
+      recoverFailedSessionDraft(
+        { message: "original create prompt", files: [originalFile], project: "docs" },
+        "temp:failed",
+      ),
+    ).toEqual({
+      message: "original create prompt\n\nfollow-up typed during startup",
+      files: [originalFile, followUpFile],
+      project: "docs",
+    });
+    expect(getSessionDraft("temp:failed")).toBeUndefined();
+
+    setSessionDraft("temp:failed", temporaryDraft);
+    expect(getSessionDraft("temp:failed")).toBeUndefined();
+    expect(sessionStorage.getItem(key)).toBeNull();
+  });
 });
