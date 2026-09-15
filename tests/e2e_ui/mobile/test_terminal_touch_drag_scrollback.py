@@ -192,7 +192,7 @@ def test_touch_drag_scrolls_terminal_scrollback(
         textarea.focus()
         page.keyboard.type(_FILL_COMMAND, delay=40)
         page.keyboard.press("Enter")
-        m = _wait_for_metrics(
+        _wait_for_metrics(
             page,
             _has_scrollback,
             "the command output to overflow one screen into scrollback",
@@ -213,8 +213,9 @@ def test_touch_drag_scrolls_terminal_scrollback(
         page.mouse.wheel(0, -600)
         _wait_for_metrics(
             page,
-            lambda mm: mm["sliderTop"] is not None
-            and mm["sliderTop"] < pinned_top - _MIN_SLIDER_PX,
+            lambda mm: (
+                mm["sliderTop"] is not None and mm["sliderTop"] < pinned_top - _MIN_SLIDER_PX
+            ),
             "the wheel scroll to move the scrollback (sanity precondition)",
             timeout_s=10.0,
         )
