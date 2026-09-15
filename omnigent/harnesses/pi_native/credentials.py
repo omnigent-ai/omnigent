@@ -74,6 +74,8 @@ from omnigent.util.reasoning_effort import (
 )
 
 if TYPE_CHECKING:
+    import httpx
+
     # Annotation-only import (the runtime import is lazy inside the function,
     # since ``ambient`` pulls in onboarding-only deps this module avoids on the
     # runner's session-create hot path).
@@ -232,6 +234,11 @@ class PiProviderConfig:
         reachable with this provider's credential, keyed by surface. Set by the
         Databricks builders; lets a model the live catalog didn't list be routed
         by family instead of stranded on the Claude-only primary.
+    :param listing_provider: Model-catalog descriptor of the key/gateway/local
+        endpoint whose live model inventory the pre-launch picker enumerates.
+        Metadata for the picker only — never rendered into ``models.json`` — and
+        ``None`` for the Databricks / cli-config / subscription paths, which
+        resolve their models elsewhere.
     """
 
     provider_id: str
@@ -250,6 +257,11 @@ class PiProviderConfig:
     # Keys are provider ids; values are complete Pi provider config dicts.
     additional_providers: dict[str, _PiProviderPayload] = field(default_factory=dict, hash=False)
     databricks_surfaces: dict[DatabricksPiSurface, str] = field(default_factory=dict, hash=False)
+    # Excluded from __hash__/__eq__ too: two configs that render the same
+    # models.json are equal regardless of how the picker discovered the ids.
+    listing_provider: model_catalog.ResolvedModelProvider | None = field(
+        default=None, hash=False, compare=False
+    )
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -474,16 +486,40 @@ def pi_own_login_model_arg(selection: str) -> str | None:
     return None if "/" in split[1] else split[1]
 
 
-def pi_native_model_options() -> list[dict[str, object]]:
+def pi_native_model_options(
+    *,
+    config_loader: Callable[[], dict[str, object]] | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> list[dict[str, object]]:
     """Return the pre-launch Pi model choices for this host.
 
     Prefers the provider configured through ``omni setup``; when none is
     configured the launched Pi runs on its own login, so that login's models
     (:func:`pi_own_login_model_options`) are the honest catalog.
+    Key/gateway/local providers render their endpoint's live model listing, so
+    the picker offers the models the endpoint actually serves rather than only
+    the configured default.
+
+    :param config_loader: Injection seam for tests; ``None`` uses
+        :func:`load_config` through
+        :func:`resolve_pi_native_provider`.
+    :param transport: Optional httpx transport override for tests, forwarded to
+        the live listing fetch.
+    :returns: One pre-launch option per model, sorted by qualified id.
     """
-    provider = resolve_pi_native_provider()
+    # Forward only the config_loader seam: tests replace the module-level
+    # resolver with a zero-argument callable, so a bare picker call must stay
+    # bare. The transport is NOT threaded through resolution — the listing is
+    # fetched below, off the launch path.
+    if config_loader is None:
+        provider = resolve_pi_native_provider()
+    else:
+        provider = resolve_pi_native_provider(config_loader=config_loader)
     if provider is None:
         return pi_own_login_model_options()
+    provider = replace(
+        provider, extra_models=_live_family_model_entries(provider, transport=transport)
+    )
 
     options: dict[str, dict[str, object]] = {}
     for provider_id, payload in provider.to_models_config()["providers"].items():
@@ -1275,6 +1311,45 @@ def _catalog_entry_for_model(model_id: str) -> model_catalog.ModelEntry | None:
     return None
 
 
+def _live_family_model_entries(
+    provider: PiProviderConfig,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> list[_PiModelEntry]:
+    """Enumerate a key/gateway endpoint's models for the pre-launch picker.
+
+    The rendered ``models.json`` otherwise carries only the configured default,
+    so the picker offered one row while the endpoint served several. Go through
+    the shared, cached catalog listing (:func:`model_catalog.listing_for_provider`)
+    — the same lane the Databricks paths use, so repeated picker opens replay
+    from its TTL cache instead of re-hitting the endpoint, and the kind/family
+    routing lives in one place. Keep the configured default first: it still
+    launches when the listing is unreachable.
+
+    :param provider: The resolved provider; its ``listing_provider`` names the
+        endpoint to list and ``extra_models`` holds the configured default.
+    :param transport: Optional httpx transport override for tests.
+    :returns: The configured entries followed by every live model id, deduped;
+        unchanged when the listing is unreachable.
+    """
+    listing_provider = provider.listing_provider
+    if listing_provider is None:
+        return list(provider.extra_models)
+    # listing_for_provider swallows fetch failures into an unverified, empty
+    # listing (and caches successes), so an unreachable endpoint degrades to
+    # just the configured default rather than breaking the picker.
+    listing = model_catalog.listing_for_provider(listing_provider, transport=transport)
+
+    entries = list(provider.extra_models)
+    seen = {entry.get("id") for entry in entries}
+    for model_entry in listing.models:
+        if model_entry.id in seen:
+            continue
+        seen.add(model_entry.id)
+        entries.append(_gateway_pi_model_entry(model_entry.id))
+    return entries
+
+
 def _inline_family_pi_provider(
     entry: ProviderEntry, *, model: str | None
 ) -> PiProviderConfig | None:
@@ -1342,6 +1417,16 @@ def _inline_family_pi_provider(
             # passthrough endpoint rejects it, and silence reads as a hang.
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
             extra_models=[model_entry],
+            # Record the endpoint the pre-launch picker can enumerate live; no
+            # I/O happens here so session launch stays off the network.
+            listing_provider=model_catalog.ResolvedModelProvider(
+                kind=entry.kind,
+                family=family_name,
+                base_url=family.base_url,
+                api_key=family.api_key,
+                auth_command=family.auth_command,
+                detail=f"provider {entry.name!r}",
+            ),
         )
     return None
 
