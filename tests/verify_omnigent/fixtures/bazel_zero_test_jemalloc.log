@@ -1,0 +1,4 @@
+ERROR: Compiling src/zone.c failed
+jemalloc_internal_defs.h:145:10: fatal error: 'features.h' file not found
+ERROR: Build did NOT complete successfully
+Executed 0 out of 3 tests: 1 fails to build and 2 were skipped.
