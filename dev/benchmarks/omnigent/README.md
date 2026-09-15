@@ -409,3 +409,36 @@ seeding.
   handles, not frames on the persistent server↔runner WebSocket tunnel.
   Counting those (for a true per-turn round-trip figure) would mean
   instrumenting the tunnel transport's `RequestFrame` dispatch.
+
+
+### Project-order latency
+
+The default suite includes eight scenarios at each of **10, 100, and 1,000
+projects**: order GET (alphabetical/custom), order save/reset, and both project
+list endpoints (alphabetical/custom). Stable names start with `project_order_`.
+For a quick focused run:
+
+```bash
+uv run --no-sync dev/benchmarks/omnigent/run.py \
+  --journeys project_order_save_1000,project_order_reset_1000,project_order_projects_custom_1000,project_order_session_projects_custom_1000 \
+  --iterations 100 --runs 3 --output /tmp/project-order-benchmark.json
+```
+
+These journeys own the `benchmark-project-order-{10,100,1000}` accounts, using
+the benchmark server's trusted identity header. Setup creates exactly the
+specified number of empty projects via the API, outside timing; repeated runs
+reuse them. Existing corpus sessions and the local user's preference are
+untouched. Use a benchmark database, as with the rest of this suite.
+
+Saves alternate between two orders. Reset samples first install a custom order,
+then switch to alphabetical mode while verifying that the manual IDs are retained.
+Persistence checks and reset preconditioning run outside each operation's
+latency timer; they do contribute to request counters and wall-clock throughput.
+Read samples validate exact counts and ordering, including alphabetical mode.
+These scenarios measure project-count scaling with empty projects; the existing
+`list_projects` journey continues covering the local user's seeded sessions.
+
+The existing nightly backend matrix collects these names automatically. PR
+comparisons start gating them once a nightly baseline includes the new names;
+until then the comparator labels them as new. Existing regression thresholds
+are unchanged.

@@ -3752,6 +3752,64 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "ProjectOrderRequest": {
+        "description": "Complete manual order; null selects alphabetical mode without erasing it.",
+        "properties": {
+          "ordered_project_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 10000,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ordered Project Ids"
+          }
+        },
+        "required": [
+          "ordered_project_ids"
+        ],
+        "title": "ProjectOrderRequest",
+        "type": "object"
+      },
+      "ProjectOrderResponse": {
+        "description": "Current sorting mode and the manual order retained in either mode.",
+        "properties": {
+          "ordered_project_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ordered Project Ids"
+          },
+          "sort_mode": {
+            "enum": [
+              "alphabetical",
+              "manual"
+            ],
+            "title": "Sort Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sort_mode",
+          "ordered_project_ids"
+        ],
+        "title": "ProjectOrderResponse",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -10400,6 +10458,68 @@
         ]
       }
     },
+    "/v1/projects/order": {
+      "get": {
+        "description": "Read the caller's custom order.",
+        "operationId": "get_project_order_v1_projects_order_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOrderResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Project Order",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Save the caller's order and notify their connected clients.",
+        "operationId": "save_project_order_v1_projects_order_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOrderResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Project Order",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}": {
       "delete": {
         "description": "Delete one of the caller's projects.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`).\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
@@ -10922,7 +11042,7 @@
     },
     "/v1/sessions/projects": {
       "get": {
-        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** List of `SessionProjectSummary` ordered by name.",
+        "description": "Return the caller's project summaries in their preferred display order.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** Project summaries in custom order, or alphabetical order by default.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
         "responses": {
           "200": {

@@ -890,8 +890,7 @@ def register_core_routes(
         request: Request,
     ) -> list[SessionProjectSummary]:
         """
-        Return the caller's projects as ``{"id", "name"}`` pairs, ordered
-        alphabetically by name.
+        Return the caller's project summaries in their preferred display order.
 
         Dual-reads both project representations and unions them by name:
         - **First-class projects** (``project_store``) — carry an ``id`` and
@@ -906,7 +905,7 @@ def register_core_routes(
         their owned rows) — a project shared to them but owned by another user
         does not surface as one of their own folders.
 
-        :returns: List of :class:`SessionProjectSummary` ordered by name.
+        :returns: Project summaries in custom order, or alphabetical order by default.
         """
         user_id = _require_user(request, auth_provider)
 
@@ -922,9 +921,17 @@ def register_core_routes(
                         icon=icon if isinstance(icon, str) else None,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
-            for name in conversation_store.list_projects(owned_by=user_id):
+            for name in sorted(conversation_store.list_projects(owned_by=user_id)):
                 by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
-            return [by_name[name] for name in sorted(by_name)]
+            from omnigent.stores.project_store import apply_project_order
+
+            order = project_store.get_order(user_id=user_id) if project_store is not None else None
+            return apply_project_order(
+                list(by_name.values()),
+                order,
+                project_id=lambda p: p.id,
+                project_name=lambda p: p.name,
+            )
 
         return await asyncio.to_thread(_list_union)
 

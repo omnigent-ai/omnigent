@@ -327,7 +327,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           // Another client created/renamed/deleted a project (or changed its
           // config/icon). Only the mutating client invalidates locally, so
           // refresh the project-row caches here to converge without a reload.
-          void queryClient.invalidateQueries({ queryKey: ["projects"] });
+          if (queryClient.isMutating({ mutationKey: ["project-order"] }) === 0) {
+            void queryClient.invalidateQueries({ queryKey: ["projects"] });
+            void queryClient.invalidateQueries({ queryKey: ["project-order"] });
+          }
           void queryClient.invalidateQueries({ queryKey: ["project-config"] });
           return;
         case "removed":

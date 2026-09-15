@@ -4977,6 +4977,19 @@ HarnessStreamEvent = (
 # ── Projects ──────────────────────────────────────────────────────
 
 
+class ProjectOrderRequest(BaseModel):
+    """Complete manual order; null selects alphabetical mode without erasing it."""
+
+    ordered_project_ids: list[str] | None = Field(..., max_length=10000)
+
+
+class ProjectOrderResponse(BaseModel):
+    """Current sorting mode and the manual order retained in either mode."""
+
+    sort_mode: Literal["alphabetical", "manual"]
+    ordered_project_ids: list[str] | None
+
+
 class ProjectObject(BaseModel):
     """
     A first-class project (see ``designs/PROJECTS_PRD.md``).

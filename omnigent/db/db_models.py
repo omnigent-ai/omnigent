@@ -393,6 +393,8 @@ class SqlUser(OmnigentBase):
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Keep the opaque preference out of routine authentication reads.
+    project_order: Mapped[str | None] = mapped_column(CompressedText, nullable=True, deferred=True)
 
 
 class SqlAccountToken(OmnigentBase):
@@ -772,8 +774,7 @@ class SqlProject(OmnigentBase):
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with
         # created_at in the key so the ORDER BY created_at, id is served by the
-        # index (no filesort). Server returns a stable order; reorder, if ever
-        # added, is a client-only concern, so there is no ``position`` column.
+        # index (no filesort). Personal display order lives in users.project_order.
         #
         # Also covers the two name lookups via its (workspace_id, user_id)
         # prefix: the store's ``_name_taken`` probe and the ``?project=<name>``
