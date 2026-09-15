@@ -980,6 +980,7 @@ class TestPermissionRequestReauth:
         from omnigent.harnesses.devin_native import hook as devin_hook
 
         attempts: list[dict[str, str]] = []
+        elicitation_ids: list[str] = []
 
         class _ScriptedClient:
             def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
@@ -993,7 +994,13 @@ class TestPermissionRequestReauth:
                 del args
 
             def post(self, url: str, json: object = None) -> httpx.Response:
-                del json
+                assert isinstance(json, dict)
+                elicitation_id = json["_omnigent_elicitation_id"]
+                assert elicitation_id.startswith("elicit_devin_")
+                elicitation_ids.append(elicitation_id)
+                assert len(set(elicitation_ids)) == 1, (
+                    "auth retries must retain the same request id"
+                )
                 attempts.append(dict(self._headers))
                 spec = responses[min(len(attempts) - 1, len(responses) - 1)]
                 req = httpx.Request("POST", url)

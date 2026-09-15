@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -210,10 +211,12 @@ def _mirror_permission_request(
     timeout = httpx.Timeout(_PERMISSION_READ_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     headers = policy_hook_request_headers()
     reauth = policy_hook_reauth(server_url, headers)
+    # Identify the requesting harness and retain one id across an auth retry.
+    body = {**payload, "_omnigent_elicitation_id": f"elicit_devin_{secrets.token_hex(16)}"}
     try:
         for attempt in range(2):
             with httpx.Client(headers=headers, timeout=timeout) as client:
-                response = client.post(url, json=payload)
+                response = client.post(url, json=body)
                 if attempt == 0 and _is_login_redirect_or_unauthorized(response):
                     refreshed = reauth()
                     if refreshed:
