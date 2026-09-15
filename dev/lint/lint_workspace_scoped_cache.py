@@ -45,9 +45,10 @@ _CACHETOOLS_CACHES = frozenset(
 )
 # Workspace-safe wrapper types — the required construction.
 _WRAPPER_TYPES = frozenset({"WorkspaceScopedCache", "WorkspaceScopedSet"})
-# Bare collection constructors that start empty.
-_EMPTY_CTOR_NAMES = frozenset({"dict", "set", "defaultdict"})
 _WEAK_MAP_NAMES = frozenset({"WeakValueDictionary", "WeakKeyDictionary"})
+# Compound statements whose bodies still run at import time (a cache declared
+# inside one is module-level state). def/class bodies are NOT descended into.
+_CONTROL_FLOW_TYPES = (ast.If, ast.Try, ast.With, ast.For, ast.While)
 
 
 @dataclass(frozen=True)
@@ -107,8 +108,9 @@ def _is_cache_like(value: ast.expr) -> bool:
     base, attr = _callee_attr(value)
     if attr is None:
         return False
-    # cachetools.<X>Cache(...)
-    if base == "cachetools" and attr in _CACHETOOLS_CACHES:
+    # cachetools.<X>Cache(...), or the direct-import form ``LRUCache(...)`` after
+    # ``from cachetools import LRUCache`` (base is None).
+    if attr in _CACHETOOLS_CACHES and base in ("cachetools", None):
         return True
     # weakref.WeakValueDictionary() / WeakKeyDictionary() (any args → still a registry)
     if attr in _WEAK_MAP_NAMES:
@@ -123,6 +125,27 @@ def _is_cache_like(value: ast.expr) -> bool:
     return False
 
 
+def _module_level_statements(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Statements that run at import time, flattening module-level control flow.
+
+    Descends into ``if`` / ``try`` / ``with`` / ``for`` / ``while`` bodies (a
+    cache declared in one is still module-level state) but never into
+    ``def`` / ``class`` bodies (those are locals / class attributes).
+    """
+    statements: list[ast.stmt] = []
+    for node in body:
+        statements.append(node)
+        if not isinstance(node, _CONTROL_FLOW_TYPES):
+            continue
+        for block_name in ("body", "orelse", "finalbody"):
+            block = getattr(node, block_name, None)
+            if isinstance(block, list):
+                statements.extend(_module_level_statements(block))
+        for handler in getattr(node, "handlers", []) or []:
+            statements.extend(_module_level_statements(handler.body))
+    return statements
+
+
 def flagged_globals(source: str) -> list[tuple[int, str]]:
     """Return ``(lineno, name)`` for every un-scoped cache-like module global.
 
@@ -135,7 +158,7 @@ def flagged_globals(source: str) -> list[tuple[int, str]]:
     except (SyntaxError, UnicodeDecodeError):
         return []
     found: list[tuple[int, str]] = []
-    for node in tree.body:
+    for node in _module_level_statements(tree.body):
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue
         value = node.value

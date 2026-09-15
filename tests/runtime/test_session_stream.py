@@ -279,6 +279,31 @@ async def test_has_subscribers_tracks_live_subscription() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subscribers_are_isolated_across_workspaces() -> None:
+    """The same conversation id in two workspaces has independent subscribers.
+
+    Regression for OMNI-7361: conversation ids collide across workspaces
+    (imported sessions), so a subscriber registered in one tenant's workspace
+    must not be seen — or fed — by a publish in another's, even for the same id.
+    """
+    from omnigent.db.db_models import workspace_scope
+
+    conv = "conv_shared"
+    with workspace_scope(1):
+        task = asyncio.create_task(_collect(conv, expected=1))
+        await asyncio.sleep(0)  # let the subscriber register under workspace 1
+        assert session_stream.has_subscribers(conv) is True
+    with workspace_scope(2):
+        # Same id, other workspace: no subscriber, and a publish reaches nobody.
+        assert session_stream.has_subscribers(conv) is False
+        assert session_stream.publish(conv, {"type": "ws2-only"}) == 0
+    with workspace_scope(1):
+        assert session_stream.publish(conv, {"type": "ws1-only"}) == 1
+    events = await asyncio.wait_for(task, timeout=2.0)
+    assert events == [{"type": "ws1-only"}]
+
+
+@pytest.mark.asyncio
 async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

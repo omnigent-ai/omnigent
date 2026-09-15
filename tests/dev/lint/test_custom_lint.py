@@ -9,7 +9,6 @@ from __future__ import annotations
 import pytest
 
 import dev.lint.custom_lint as custom_lint
-from dev.lint.custom_lint import Rule, main
 
 
 def test_workspace_scoped_cache_is_the_first_registered_rule() -> None:
@@ -20,7 +19,7 @@ def test_workspace_scoped_cache_is_the_first_registered_rule() -> None:
 
 def test_clean_tree_passes() -> None:
     """With every rule clean on the real tree, the runner returns 0."""
-    assert main() == 0
+    assert custom_lint.main() == 0
 
 
 def test_any_rule_violation_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -28,9 +27,9 @@ def test_any_rule_violation_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         custom_lint,
         "RULES",
-        [Rule(name="fake", check=lambda: ["path.py:1: boom"], hint="fix it")],
+        [custom_lint.Rule(name="fake", check=lambda: ["path.py:1: boom"], hint="fix it")],
     )
-    assert main() == 1
+    assert custom_lint.main() == 1
 
 
 def test_all_rules_clean_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -38,6 +37,6 @@ def test_all_rules_clean_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         custom_lint,
         "RULES",
-        [Rule(name="a", check=list), Rule(name="b", check=list)],
+        [custom_lint.Rule(name="a", check=list), custom_lint.Rule(name="b", check=list)],
     )
-    assert main() == 0
+    assert custom_lint.main() == 0

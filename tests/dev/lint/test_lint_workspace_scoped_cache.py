@@ -13,11 +13,10 @@ from pathlib import Path
 import pytest
 
 import dev.lint.lint_workspace_scoped_cache as lint
-from dev.lint.lint_workspace_scoped_cache import flagged_globals, main, scan
 
 
 def _names(source: str) -> list[str]:
-    return [name for _line, name in flagged_globals(source)]
+    return [name for _line, name in lint.flagged_globals(source)]
 
 
 def test_flags_raw_cachetools_caches() -> None:
@@ -70,12 +69,30 @@ def test_ignores_constant_tables_and_declarations() -> None:
     assert _names(src) == []
 
 
+def test_flags_direct_imported_cachetools() -> None:
+    """The direct-import form `from cachetools import LRUCache; _c = LRUCache()` is flagged."""
+    src = "from cachetools import LRUCache\n_c = LRUCache(maxsize=1)\n"
+    assert _names(src) == ["_c"]
+
+
+def test_flags_cache_inside_module_level_control_flow() -> None:
+    """A cache declared inside a module-level try/except is still module-level state."""
+    src = "try:\n    _a = {}\nexcept ImportError:\n    _b = {}\n"
+    assert _names(src) == ["_a", "_b"]
+
+
+def test_ignores_cache_inside_function_body() -> None:
+    """A cache-like local inside a function/class is not module-level state."""
+    src = "def f():\n    _local = {}\n    return _local\n"
+    assert _names(src) == []
+
+
 def test_scan_skips_files_outside_scanned_roots(tmp_path: Path) -> None:
     """A cache-like global outside omnigent/server|runtime is not scanned."""
     f = tmp_path / "outside.py"
     f.write_text("_c = {}\n")
     # Default roots are omnigent/server|runtime; a tmp file matches neither.
-    assert scan(f) == []
+    assert lint.scan(f) == []
 
 
 def test_scan_respects_inline_disable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,7 +100,7 @@ def test_scan_respects_inline_disable(tmp_path: Path, monkeypatch: pytest.Monkey
     f = tmp_path / "mod.py"
     f.write_text("_ok = {}  # custom-lint: disable=workspace-scoped-cache -- safe\n_bad = {}\n")
     monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
-    assert [h.name for h in scan(f)] == ["_bad"]
+    assert [h.name for h in lint.scan(f)] == ["_bad"]
 
 
 def test_scan_respects_disable_next(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -93,7 +110,7 @@ def test_scan_respects_disable_next(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         "# custom-lint: disable-next=workspace-scoped-cache -- safe\n_ok = {}\n_bad = {}\n"
     )
     monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
-    assert [h.name for h in scan(f)] == ["_bad"]
+    assert [h.name for h in lint.scan(f)] == ["_bad"]
 
 
 def test_scan_ignores_disable_for_other_rule(
@@ -103,12 +120,12 @@ def test_scan_ignores_disable_for_other_rule(
     f = tmp_path / "mod.py"
     f.write_text("_c = {}  # custom-lint: disable=some-other-rule\n")
     monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
-    assert [h.name for h in scan(f)] == ["_c"]
+    assert [h.name for h in lint.scan(f)] == ["_c"]
 
 
 def test_main_clean_tree_returns_zero() -> None:
     """The real tree must be free of un-scoped caches (regression guard)."""
-    assert main(["lint_workspace_scoped_cache.py"]) == 0
+    assert lint.main(["lint_workspace_scoped_cache.py"]) == 0
 
 
 def test_main_flags_dirty_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,4 +133,4 @@ def test_main_flags_dirty_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     f = tmp_path / "dirty.py"
     f.write_text("import cachetools\n_c = cachetools.LRUCache(maxsize=1)\n")
     monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
-    assert main(["lint_workspace_scoped_cache.py", str(f)]) == 1
+    assert lint.main(["lint_workspace_scoped_cache.py", str(f)]) == 1

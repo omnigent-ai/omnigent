@@ -28,12 +28,13 @@ there because its key is already globally unique (``call_id``,
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, MutableMapping
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar, overload
 
 from omnigent.db.db_models import current_workspace_id
 
 K = TypeVar("K")
 V = TypeVar("V")
+D = TypeVar("D")
 
 # Sentinel distinguishing "no default supplied" from an explicit ``None``
 # default in :meth:`WorkspaceScopedCache.pop`.
@@ -78,11 +79,15 @@ class WorkspaceScopedCache(Generic[K, V]):
     def setdefault(self, key: K, default: V) -> V:
         return self._backing.setdefault(self._scoped(key), default)
 
-    def pop(self, key: K, default: V | object = _MISSING) -> V:
+    @overload
+    def pop(self, key: K) -> V: ...
+    @overload
+    def pop(self, key: K, default: D) -> V | D: ...
+    def pop(self, key: K, default: Any = _MISSING) -> Any:
         scoped = self._scoped(key)
         if default is _MISSING:
             return self._backing.pop(scoped)
-        return self._backing.pop(scoped, default)  # type: ignore[arg-type]
+        return self._backing.pop(scoped, default)
 
     def keys(self) -> list[K]:
         """Current workspace's keys, in backing order (a snapshot)."""

@@ -644,9 +644,11 @@ class _MirroredToolCall:
     tool_input: dict[str, Any]
 
 
-# custom-lint: disable-next=workspace-scoped-cache -- keyed by call_id
-_recent_mirrored_tool_calls: cachetools.LRUCache[str, _MirroredToolCall] = cachetools.LRUCache(
-    maxsize=2048
+# Workspace-scoped: a native call_id can be derived from the conversation id
+# (e.g. Antigravity's ``agy_call_<conversation_id>_<step>``), which collides
+# across workspaces for an imported session.
+_recent_mirrored_tool_calls: WorkspaceScopedCache[str, _MirroredToolCall] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=2048)
 )
 
 
@@ -680,9 +682,10 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
 
 
-# custom-lint: disable-next=workspace-scoped-cache -- elicitation_id is globally unique
-_pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
-    cachetools.LRUCache(maxsize=512)
+# Workspace-scoped: keyed by a harness elicitation id, which can be
+# deterministic and collide across workspaces for an imported session.
+_pending_policy_ask_writes: WorkspaceScopedCache[str, _PendingPolicyAskWrites] = (
+    WorkspaceScopedCache(lambda: cachetools.LRUCache(maxsize=512))
 )
 
 

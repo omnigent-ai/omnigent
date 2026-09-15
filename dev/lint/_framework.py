@@ -44,5 +44,8 @@ def disabled_rules_by_line(source: str) -> dict[int, set[str]]:
             rules = {rule.strip() for rule in match.group(2).split(",")}
             disabled.setdefault(target, set()).update(rules)
     except tokenize.TokenError:
+        # Incomplete/malformed source (e.g. a file mid-edit): degrade to "no
+        # suppressions found so far" per the docstring, rather than crashing
+        # the whole lint run.
         pass
     return disabled

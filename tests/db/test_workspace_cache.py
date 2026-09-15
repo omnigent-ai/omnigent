@@ -55,10 +55,14 @@ def test_pop_scoped_and_default() -> None:
     with workspace_scope(1):
         cache["k"] = "v"
     with workspace_scope(2):
-        assert cache.pop("k", None) is None
+        # pop() mutates, so run it as a statement, not inside assert (which -O strips).
+        other_ws = cache.pop("k", None)
+        assert other_ws is None
     with workspace_scope(1):
-        assert cache.pop("k") == "v"
-        assert cache.pop("k", "fallback") == "fallback"
+        popped = cache.pop("k")
+        assert popped == "v"
+        missing = cache.pop("k", "fallback")
+        assert missing == "fallback"
 
 
 def test_iteration_is_workspace_scoped() -> None:
