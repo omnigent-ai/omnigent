@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.app.Application
+import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
@@ -19,6 +20,7 @@ class NativeNotificationManagerTest {
     private lateinit var context: Application
     private lateinit var manager: NativeNotificationManager
     private lateinit var shadow: ShadowNotificationManager
+    private lateinit var notificationManager: NotificationManager
 
     // The reserved badge-summary notification id (NativeNotificationManager's
     // BADGE_NOTIFICATION_ID is private; the contract is "id 1").
@@ -28,13 +30,34 @@ class NativeNotificationManagerTest {
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
         manager = NativeNotificationManager(context)
-        shadow =
-            shadowOf(
-                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
-            )
+        notificationManager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        shadow = shadowOf(notificationManager)
     }
 
     private fun badgeNotification() = shadow.getNotification(badgeId)
+
+    @Test
+    fun `constructing the manager creates the sessions channel`() {
+        // The background poll worker constructs a fresh manager in a process
+        // where no Activity ran; the channel must exist so an O+ post isn't
+        // silently dropped. `manager` is built in setUp — assert the channel is
+        // present with the expected id and importance.
+        val channel: NotificationChannel? =
+            notificationManager.getNotificationChannel(
+                "omnigent.sessions",
+            )
+        assertNotNull(channel)
+        assertEquals(NotificationManager.IMPORTANCE_HIGH, channel!!.importance)
+    }
+
+    @Test
+    fun `ensureChannel is idempotent and keeps the channel present`() {
+        // Cheap to call repeatedly — the worker path relies on this being safe.
+        manager.ensureChannel()
+        manager.ensureChannel()
+        assertNotNull(notificationManager.getNotificationChannel("omnigent.sessions"))
+    }
 
     @Test
     fun `badge posts a summary notification with the count and tap intent`() {
@@ -88,6 +111,100 @@ class NativeNotificationManagerTest {
         manager.setBadgeCount(0)
         manager.replayBadge()
         assertNull(badgeNotification())
+    }
+
+    @Test
+    fun `tagged posts with a colliding numeric id coexist instead of replacing`() {
+        // "Aa" and "BB" have equal String.hashCode, so their derived numeric
+        // notification ids collide. The session-id tag must keep them distinct —
+        // an untagged post would let the second silently replace the first.
+        val idA = notificationIdFor("Aa")
+        val idB = notificationIdFor("BB")
+        assertEquals(idA, idB)
+
+        manager.notify(
+            title = "A",
+            body = "a",
+            navigatePath = "/c/Aa",
+            notificationId = idA,
+            tag = "Aa",
+        )
+        manager.notify(
+            title = "B",
+            body = "b",
+            navigatePath = "/c/BB",
+            notificationId = idB,
+            tag = "BB",
+        )
+
+        assertEquals(2, shadow.size())
+        assertNotNull(shadow.getNotification("Aa", idA))
+        assertNotNull(shadow.getNotification("BB", idB))
+    }
+
+    @Test
+    fun `re-posting the same tag and id updates in place`() {
+        val id = notificationIdFor("conv_a")
+        manager.notify(
+            title = "first",
+            body = "b",
+            navigatePath = "/c/conv_a",
+            notificationId = id,
+            tag = "conv_a",
+        )
+        manager.notify(
+            title = "second",
+            body = "b",
+            navigatePath = "/c/conv_a",
+            notificationId = id,
+            tag = "conv_a",
+        )
+        assertEquals(1, shadow.size())
+    }
+
+    @Test
+    fun `cancelAll cancels tagged session notifications too`() {
+        manager.notify(
+            title = "A",
+            body = "a",
+            navigatePath = "/c/Aa",
+            notificationId = notificationIdFor("Aa"),
+            tag = "Aa",
+        )
+        manager.setBadgeCount(1)
+        assertEquals(2, shadow.size())
+
+        manager.cancelAll()
+
+        assertEquals(0, shadow.size())
+    }
+
+    @Test
+    fun `colliding-id tap intents route to their own session`() {
+        // Same numeric id ⇒ same PendingIntent requestCode. The intents must
+        // still be distinct (unique data Uri), or FLAG_UPDATE_CURRENT would
+        // overwrite the first session's extras and both taps would deep-link
+        // to the second session.
+        val idA = notificationIdFor("Aa")
+        manager.notify(
+            title = "A",
+            body = "a",
+            navigatePath = "/c/Aa",
+            notificationId = idA,
+            tag = "Aa",
+        )
+        manager.notify(
+            title = "B",
+            body = "b",
+            navigatePath = "/c/BB",
+            notificationId = idA,
+            tag = "BB",
+        )
+
+        val intentA = shadowOf(shadow.getNotification("Aa", idA)!!.contentIntent).savedIntent
+        val intentB = shadowOf(shadow.getNotification("BB", idA)!!.contentIntent).savedIntent
+        assertEquals("/c/Aa", intentA.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
+        assertEquals("/c/BB", intentB.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
     }
 
     @Test

@@ -39,16 +39,32 @@ fun buildProperty(key: String): String? =
 val appVersionCode = buildProperty("versionCode")?.toIntOrNull() ?: 9
 val appVersionName = buildProperty("versionName") ?: "0.1.3"
 
+// Side-by-side installs for personal/nightly builds: -PapplicationIdSuffix=.dev
+// gives the APK its own package id (and a launcher label naming the suffix) so
+// it never collides with the store-signed app. Absent/blank keeps the canonical
+// id and label.
+val appIdSuffix = buildProperty("applicationIdSuffix")
+
 android {
     namespace = "ai.omnigent.android"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "ai.omnigent.android"
+        // Guarded with isNullOrBlank (not just null): a blank
+        // -PapplicationIdSuffix= must keep the canonical id AND label — a
+        // null-only guard would render the label as "Omnigent ()".
+        applicationId =
+            "ai.omnigent.android" + (appIdSuffix.takeUnless { it.isNullOrBlank() } ?: "")
         minSdk = 28
         targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
+        manifestPlaceholders["appLabel"] =
+            if (!appIdSuffix.isNullOrBlank()) {
+                "Omnigent (${appIdSuffix.trimStart('.')})"
+            } else {
+                "@string/app_name"
+            }
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
@@ -123,6 +139,7 @@ dependencies {
     implementation(libs.androidx.activity)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.webkit)
+    implementation(libs.androidx.work.runtime.ktx)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
