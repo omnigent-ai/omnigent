@@ -1618,6 +1618,9 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
             # Session policies self-select: on=None means the
             # engine skips phase filtering and always dispatches.
             on=None,
+            # Carry the row's owning workspace so a denial can be
+            # attributed to it in logs.
+            workspace_id=policy.workspace_id,
             function=FunctionRef(
                 path=policy.handler,
                 arguments=policy.factory_params,
