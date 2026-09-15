@@ -376,15 +376,16 @@ function truncateTitle(raw: string, max = 60): string {
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
 
-/**
- * Single component that drives the chat surface. Streaming + history
- * state lives in `useChatStore` (a Zustand store at module scope), so
- * this component is reactive but not stateful — it observes the store
- * and triggers `switchTo` when the URL changes. The store owns the
- * items fetch (no useConversationItems here).
- */
 export function ChatPage() {
-  const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+  const { conversationId } = useParams<{ conversationId: string }>();
+  return <ChatSession conversationId={conversationId} />;
+}
+
+/**
+ * Chat surface for an explicitly selected session; undefined shows the landing page.
+ * Uses the shared active chat store and shell contexts, so only one may be mounted.
+ */
+export function ChatSession({ conversationId: urlConvId }: { conversationId: string | undefined }) {
   // The id for every server-scoped fetch/hook — `undefined` while the URL holds
   // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
   // the session exists. `switchTo` still gets the raw `urlConvId`.
@@ -444,16 +445,9 @@ export function ChatPage() {
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
-  // Sync the store's active conversation to the URL. Single source of
-  // truth: URL is what's "current"; store mirrors it. The effect is
-  // the minimal unified surface for all URL change paths — sidebar
-  // clicks (which also navigate), browser Back/Forward (no handler),
-  // initial mount with a deep-linked URL, and the eager URL update
-  // from `send` (no-op due to switchTo's self-skip).
-  //
-  // switchTo is async (it fetches items on conv-id transitions); we
-  // intentionally don't await it here. The store's `loadingConversation` flag
-  // drives the loading UI below; `conversationLoadError` drives the error UI.
+  // Mirror the host's selected session into the shared active store.
+  // switchTo fetches history asynchronously; the store's loading/error
+  // fields drive the hydration gates below.
   useEffect(() => {
     // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
     // conversation is gone) has no forward path: landing is URL-keyed, so the
