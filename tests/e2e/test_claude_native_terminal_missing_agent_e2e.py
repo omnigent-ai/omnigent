@@ -62,6 +62,7 @@ Run::
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -452,16 +453,13 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
         )
         # The spec-resolver cause remains in the log for operators.
         assert "session spec resolver: agent" in runner_log_text, (
-            f"runner log missing the spec-resolver cause; tail:\n"
-            f"{runner_log_text[-3000:]}"
+            f"runner log missing the spec-resolver cause; tail:\n{runner_log_text[-3000:]}"
         )
         assert "was not found" in runner_log_text, (
-            f"runner log missing the agent-not-found cause; tail:\n"
-            f"{runner_log_text[-3000:]}"
+            f"runner log missing the agent-not-found cause; tail:\n{runner_log_text[-3000:]}"
         )
         assert error_id in runner_log_text, (
-            f"runner log missing correlation id {error_id!r}; tail:\n"
-            f"{runner_log_text[-3000:]}"
+            f"runner log missing correlation id {error_id!r}; tail:\n{runner_log_text[-3000:]}"
         )
         # The client-safe message must NOT leak the raw agent id / cause.
         assert "session spec resolver" not in message, message
@@ -715,10 +713,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         while time.monotonic() < deadline:
             for it in _error_items():
                 blob = json.dumps(it)
-                if (
-                    "session_agent_missing" in blob
-                    and "agent is no longer available" in blob
-                ):
+                if "session_agent_missing" in blob and "agent is no longer available" in blob:
                     error_item = it
                     break
             if error_item is not None:
@@ -751,10 +746,8 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
 
         def _server_log_text() -> str:
             texts: list[str] = []
-            try:
+            with contextlib.suppress(OSError):
                 texts.append(server_stdio_log.read_text())
-            except OSError:
-                pass
             for log_dir in server_log_dirs:
                 for candidate in log_dir.glob("server-*.log"):
                     try:
@@ -778,8 +771,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         # The turn-failed log now carries the lifecycle message, not the
         # generic terminal-startup defect message.
         assert "agent is no longer available" in server_log_text, (
-            f"server log missing the lifecycle failure message; tail:\n"
-            f"{server_log_text[-3000:]}"
+            f"server log missing the lifecycle failure message; tail:\n{server_log_text[-3000:]}"
         )
         assert "Native Claude terminal failed to start" not in server_log_text, (
             f"server log still emits the generic terminal-startup defect message "
