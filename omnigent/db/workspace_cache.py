@@ -80,9 +80,13 @@ class WorkspaceScopedCache(Generic[K, V]):
         return self._backing.setdefault(self._scoped(key), default)
 
     @overload
-    def pop(self, key: K) -> V: ...
+    def pop(self, key: K) -> V:
+        """Pop the current workspace's value; raise ``KeyError`` if absent."""
+
     @overload
-    def pop(self, key: K, default: D) -> V | D: ...
+    def pop(self, key: K, default: D) -> V | D:
+        """Pop the current workspace's value, or return *default* if absent."""
+
     def pop(self, key: K, default: Any = _MISSING) -> Any:
         scoped = self._scoped(key)
         if default is _MISSING:
