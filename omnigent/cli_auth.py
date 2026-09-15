@@ -783,6 +783,12 @@ def open_server_client(
     this factory is routed correctly by construction, which is why it exists
     rather than each site building headers by hand.
 
+    For non-loopback targets, TLS trust comes from
+    :func:`omnigent.util.tls.client_ssl_context` (a validated CA bundle with
+    certifi fallback) rather than httpx's raw ``SSL_CERT_FILE`` /
+    ``SSL_CERT_DIR`` environment loading, so a stale CA env var (e.g. a rotated
+    bundle path) cannot crash client construction.
+
     :param server_url: The server base URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``. Both the client's
         ``base_url`` and the input to the routing-header builder.
@@ -824,13 +830,21 @@ def open_server_client(
         kwargs["timeout"] = timeout
     if transport is not None:
         kwargs["transport"] = transport
+    # A proxy cannot reach a loopback server, so local targets bypass it.
+    trust_env = not is_loopback_url(server_url)
+    if trust_env and transport is None:
+        # trust_env makes httpx load SSL_CERT_FILE/SSL_CERT_DIR eagerly at
+        # construction (even for http URLs); a stale path would raise. Resolve
+        # trust through util.tls instead: validated bundle, certifi fallback.
+        from omnigent.util.tls import client_ssl_context
+
+        kwargs["verify"] = client_ssl_context()
     return httpx.AsyncClient(
         base_url=server_url,
         headers=pinned,
         auth=auth,
         follow_redirects=follow_redirects,
-        # A proxy cannot reach a loopback server, so local targets bypass it.
-        trust_env=not is_loopback_url(server_url),
+        trust_env=trust_env,
         **kwargs,
     )
 
