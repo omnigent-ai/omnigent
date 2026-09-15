@@ -1137,10 +1137,10 @@ function setupLandingMocks() {
   useHostModelOptionsMock.mockReset();
   vi.mocked(useSkills).mockReset();
   vi.mocked(useSkills).mockImplementation(
-    ({ enabled = true, starting = false }) =>
+    ({ target, enabled = true, starting = false }) =>
       ({
         skills: [],
-        skillsStatus: enabled ? "ready" : starting ? "loading" : "unavailable",
+        skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
       }) as ReturnType<typeof useSkills>,
   );
@@ -6004,13 +6004,15 @@ describe("NewChatLandingScreen skills menu", () => {
 
   function mockSkills(state: Partial<ReturnType<typeof useSkills>>) {
     vi.mocked(useSkills).mockImplementation(
-      ({ enabled = true, starting = false }) =>
+      ({ target, enabled = true, starting = false }) =>
         ({
           skills: [],
           skillsStatus: "ready",
           refetch: vi.fn(),
           ...state,
-          ...(!enabled ? { skills: [], skillsStatus: starting ? "loading" : "unavailable" } : {}),
+          ...(!target || !enabled
+            ? { skills: [], skillsStatus: starting ? "loading" : "unavailable" }
+            : {}),
         }) as ReturnType<typeof useSkills>,
     );
   }
@@ -6108,9 +6110,11 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByTestId("slash-menu-item-host-only")).not.toBeInTheDocument();
     expect(useSkills).toHaveBeenLastCalledWith(
       expect.objectContaining({
-        hostId: "host_1",
-        harness: "claude-sdk",
-        path: "/Users/corey/repo",
+        target: {
+          hostId: "host_1",
+          harness: "claude-sdk",
+          path: "/Users/corey/repo",
+        },
         enabled: false,
       }),
     );

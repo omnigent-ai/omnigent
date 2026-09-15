@@ -1,8 +1,8 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useSkills } from "./useSkills";
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { useSkills, type SkillsTarget } from "./useSkills";
 
 const fetchMock = vi.fn();
 const target = { hostId: "host", harness: "claude-native", path: "/repo" };
@@ -25,6 +25,17 @@ afterEach(() => {
 });
 
 describe("useSkills", () => {
+  it("requires either a session ID or a complete host target", () => {
+    expectTypeOf<{ sessionId: string }>().toExtend<SkillsTarget>();
+    expectTypeOf<typeof target>().toExtend<SkillsTarget>();
+    expectTypeOf<{}>().not.toExtend<SkillsTarget>();
+    expectTypeOf<Omit<typeof target, "hostId">>().not.toExtend<SkillsTarget>();
+    expectTypeOf<Omit<typeof target, "harness">>().not.toExtend<SkillsTarget>();
+    expectTypeOf<Omit<typeof target, "path">>().not.toExtend<SkillsTarget>();
+    expectTypeOf<typeof target & { sessionId: string }>().not.toExtend<SkillsTarget>();
+    expectTypeOf<{ hostId: null; harness: string; path: string }>().not.toExtend<SkillsTarget>();
+  });
+
   it.each([undefined, "session-a"])(
     "settles directly from the discovery response (session: %s)",
     async (sessionId) => {
@@ -35,9 +46,10 @@ describe("useSkills", () => {
             resolve = done;
           }),
       );
-      const { result } = renderHook(() => useSkills({ ...target, sessionId, starting: true }), {
-        wrapper,
-      });
+      const { result } = renderHook(
+        () => useSkills({ target: sessionId ? { sessionId } : target, starting: true }),
+        { wrapper },
+      );
       expect(result.current.skillsStatus).toBe("loading");
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
       const [url, init] = fetchMock.mock.calls[0]!;
@@ -59,29 +71,43 @@ describe("useSkills", () => {
     },
   );
 
-  it.each([{ hostId: null }, { harness: null }, { path: "" }, { enabled: false }])(
-    "does not discover with incomplete or disabled input: %j",
-    async (change) => {
-      const { result } = renderHook(() => useSkills({ ...target, ...change }), { wrapper });
+  it.each([{ target: null }, { target, enabled: false }])(
+    "does not discover with an unavailable or disabled target: %j",
+    async (options) => {
+      const { result } = renderHook(() => useSkills(options), { wrapper });
       await act(async () => {});
       expect(result.current.skillsStatus).toBe("unavailable");
       expect(fetchMock).not.toHaveBeenCalled();
     },
   );
 
-  it("lets the server determine the session's harness", async () => {
+  it("keeps session cache dependencies out of the request", async () => {
     fetchMock.mockResolvedValue(response());
     const { result } = renderHook(
-      () => useSkills({ ...target, sessionId: "session-a", harness: null }),
+      () =>
+        useSkills({
+          target: {
+            sessionId: "session-a",
+            scope: {
+              hostId: "host",
+              workspace: "/repo",
+              harness: null,
+              agentId: "agent",
+              subAgentName: null,
+            },
+          },
+        }),
       { wrapper },
     );
     await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/skills?session_id=session-a");
   });
 
   it("waits for a sandbox host binding and starts when it arrives", async () => {
     fetchMock.mockResolvedValue(response());
     const { result, rerender } = renderHook(
-      ({ hostId }) => useSkills({ ...target, hostId, sessionId: "session-a", starting: true }),
+      ({ hostId }) =>
+        useSkills({ target: hostId ? { sessionId: "session-a" } : null, starting: true }),
       { wrapper, initialProps: { hostId: null as string | null } },
     );
     expect(result.current.skillsStatus).toBe("loading");
@@ -92,7 +118,7 @@ describe("useSkills", () => {
 
   it("stops loading when launch fails and no host is available", () => {
     const { result, rerender } = renderHook(
-      ({ starting }) => useSkills({ sessionId: "session-a", starting }),
+      ({ starting }) => useSkills({ target: null, starting }),
       { wrapper, initialProps: { starting: true } },
     );
     expect(result.current.skillsStatus).toBe("loading");
@@ -102,13 +128,30 @@ describe("useSkills", () => {
   });
 
   it.each([
-    { hostId: "other" },
-    { harness: "codex-native" },
-    { path: "/other" },
-    { sessionId: "session-a" },
-    { agentId: "other" },
-    { subAgentName: "child" },
-  ])("aborts stale discovery when the target changes: %j", async (change) => {
+    { initial: target, next: { ...target, hostId: "other" } },
+    { initial: target, next: { ...target, harness: "codex-native" } },
+    { initial: target, next: { ...target, path: "/other" } },
+    { initial: { sessionId: "session-a" }, next: { sessionId: "session-b" } },
+    ...[
+      { hostId: "other" },
+      { harness: "codex-native" },
+      { workspace: "/other" },
+      { agentId: "other" },
+      { subAgentName: "child" },
+    ].map((change) => {
+      const scope = {
+        hostId: "host",
+        harness: "claude-native",
+        workspace: "/repo",
+        agentId: "agent",
+        subAgentName: null,
+      };
+      return {
+        initial: { sessionId: "session-a", scope },
+        next: { sessionId: "session-a", scope: { ...scope, ...change } },
+      };
+    }),
+  ])("aborts stale discovery when the target changes: %j", async ({ initial, next }) => {
     let resolveOld!: (value: Response) => void;
     fetchMock
       .mockImplementationOnce(
@@ -119,12 +162,12 @@ describe("useSkills", () => {
       )
       .mockResolvedValueOnce(response());
     const { result, rerender } = renderHook(
-      (options: Parameters<typeof useSkills>[0]) => useSkills(options),
-      { wrapper, initialProps: target },
+      (discoveryTarget: SkillsTarget) => useSkills({ target: discoveryTarget }),
+      { wrapper, initialProps: initial },
     );
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const signal = fetchMock.mock.calls[0][1].signal as AbortSignal;
-    rerender({ ...target, ...change });
+    rerender(next);
     expect(signal.aborted).toBe(true);
     await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
     await act(async () => resolveOld(response([{ name: "old", description: "Old target" }])));
@@ -134,7 +177,7 @@ describe("useSkills", () => {
   it("skips discovery for a read-only composer and hides cached skills when disabled", async () => {
     fetchMock.mockResolvedValue(response());
     const { result, rerender } = renderHook(
-      ({ enabled }) => useSkills({ ...target, sessionId: "shared-session", enabled }),
+      ({ enabled }) => useSkills({ target: { sessionId: "shared-session" }, enabled }),
       { wrapper, initialProps: { enabled: false } },
     );
     await act(async () => {});
@@ -149,7 +192,7 @@ describe("useSkills", () => {
 
   it("retries a failed request and accepts an empty catalog", async () => {
     fetchMock.mockResolvedValueOnce(response([], 502));
-    const { result } = renderHook(() => useSkills(target), { wrapper });
+    const { result } = renderHook(() => useSkills({ target }), { wrapper });
     await waitFor(() => expect(result.current.skillsStatus).toBe("error"));
     fetchMock.mockResolvedValueOnce(response([]));
     await act(async () => {
@@ -162,7 +205,7 @@ describe("useSkills", () => {
 
   it("rejects malformed catalogs", async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({})));
-    const { result } = renderHook(() => useSkills(target), { wrapper });
+    const { result } = renderHook(() => useSkills({ target }), { wrapper });
     await waitFor(() => expect(result.current.skillsStatus).toBe("error"));
   });
 });
