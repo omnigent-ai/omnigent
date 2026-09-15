@@ -2258,6 +2258,44 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
+class _CodexRequestError(RuntimeError):
+    """A Codex app-server JSON-RPC request was rejected.
+
+    Carries the structured ``error`` payload so callers can translate known
+    rejections into user-facing messages instead of leaking the raw dict.
+    """
+
+    def __init__(self, error: object) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _input_too_large_error(error: object) -> str | None:
+    """
+    Return a user-facing message for an ``input_too_large`` rejection.
+
+    :param error: The JSON-RPC ``error`` payload from the app-server.
+    :returns: A clear rejection message, or ``None`` when the error is not
+        an oversized-input rejection.
+    """
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual = data.get("actual_chars")
+    limit = data.get("max_chars")
+    if isinstance(actual, int) and isinstance(limit, int):
+        return (
+            f"Turn input is {actual} characters; Codex allows at most {limit}. "
+            "Shorten the message or split large pasted content across turns."
+        )
+    return (
+        "Turn input exceeds Codex's maximum length. "
+        "Shorten the message or split large pasted content across turns."
+    )
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -2709,10 +2747,19 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = reasoning_effort
             turn_params["summary"] = "detailed"
-        start_response = await self._request(
-            "turn/start",
-            turn_params,
-        )
+        try:
+            start_response = await self._request(
+                "turn/start",
+                turn_params,
+            )
+        except _CodexRequestError as exc:
+            # Preserve a clear failure reason for oversized input instead of
+            # leaking the app-server's raw JSON-RPC error dict to the user.
+            too_large = _input_too_large_error(exc.error)
+            if too_large is None:
+                raise
+            yield ExecutorError(message=too_large)
+            return
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -3183,7 +3230,7 @@ class _CodexAppServerSession:
         response = await future
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise _CodexRequestError(error)
         return response
 
     async def _send_response(self, request_id: int, result: CodexParams) -> None:
