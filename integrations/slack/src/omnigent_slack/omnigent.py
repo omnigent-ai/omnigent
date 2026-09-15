@@ -212,12 +212,18 @@ class ValidatedServer:
     runs no host of their own. ``managed_host_provider`` names the backing
     provider (e.g. ``"modal"``) for the menu label, and is ``None`` when the
     server doesn't name one.
+
+    ``managed_support_known`` is whether the capability probe was actually
+    readable. A failed probe leaves ``managed_hosts`` False — the option is
+    still withheld — but callers must not then tell a user the server
+    provisions no sandboxes, which is a claim we never established.
     """
 
     agents: list[dict[str, Any]]
     online_hosts: list[dict[str, Any]]
     managed_hosts: bool = False
     managed_host_provider: str | None = None
+    managed_support_known: bool = True
 
 
 class ClientAuth:
@@ -390,28 +396,34 @@ class OmnigentClient:
         agents = await self.list_agents()
         hosts = await self.list_hosts()
         online_hosts = [host for host in hosts if _is_host_online(host)]
-        managed_hosts, provider = await self.managed_host_support()
+        managed_supported, provider = await self.managed_host_support()
         return ValidatedServer(
             agents=agents,
             online_hosts=online_hosts,
-            managed_hosts=managed_hosts,
+            # An unreadable probe withholds the option exactly as a "no" does;
+            # only ``managed_support_known`` tells the two apart.
+            managed_hosts=managed_supported is True,
             managed_host_provider=provider,
+            managed_support_known=managed_supported is not None,
         )
 
-    async def managed_host_support(self) -> tuple[bool, str | None]:
+    async def managed_host_support(self) -> tuple[bool | None, str | None]:
         """Whether the server provisions managed sandboxes, and which provider.
 
         Reads ``managed_sandboxes_enabled`` / ``sandbox_provider`` off the
         unauthenticated ``GET /v1/info`` — the same gate the web UI's
         new-session sandbox option uses, so a server whose ``sandbox:`` config
         is missing or can't actually launch never advertises the option.
-        Best-effort: an unreadable probe reports "not supported", so setup
-        offers a managed session only when the create would be accepted.
+
+        ``None`` means the probe could not be READ (``_get_json`` swallows
+        transport/HTTP/JSON errors), which is not the same answer as ``False``.
+        Callers must still withhold the option — offering one the server would
+        422 is worse — but must not report non-support as a fact.
         """
         info = await self._get_json("/v1/info")
         if info is None:
             self._logger.info("Omnigent server info unavailable; managed sandboxes not offered")
-            return False, None
+            return None, None
         enabled = info.get("managed_sandboxes_enabled") is True
         provider = info.get("sandbox_provider")
         self._logger.debug("Omnigent managed sandboxes enabled=%s provider=%s", enabled, provider)
