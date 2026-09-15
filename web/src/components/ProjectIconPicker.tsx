@@ -1,9 +1,12 @@
-// Emoji icon picker for projects. Two exports:
+// Emoji icon picker for projects. Three exports:
 //   - `EmojiPicker`: a themed emoji-mart picker, code-split so its ~600KB
 //     dataset never lands in the main bundle (loaded on first open).
-//   - `ProjectLandingIcon`: the big project-header icon on the new-chat landing
-//     — pink folder by default, the chosen emoji in a gray tile once set, with
-//     hover-revealed edit/remove affordances (the OMNI-3742 design).
+//   - `ProjectIconControl`: the controlled project-icon tile — the chosen emoji
+//     (or a pink folder default) in a tile, with hover-revealed edit / remove
+//     affordances and the picker popover. Never persists on its own; the host
+//     owns the write, so a form can stage the pick and commit it on submit.
+//   - `ProjectLandingIcon`: the write-immediately wrapper for the new-chat
+//     landing — drives `ProjectIconControl` with a project-config mutation.
 
 import { type CSSProperties, lazy, Suspense, useState } from "react";
 import { FolderIcon, Loader2Icon, PencilIcon, Trash2Icon } from "lucide-react";
@@ -42,48 +45,34 @@ export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }
 }
 
 /**
- * The project-header icon on the new-chat landing. Reads/writes the emoji
- * through the project's `config.icon`, merging so the other stored defaults
- * (host / workspace / agent) survive an icon change or removal. A label-only
- * folder (`projectId === null`) is promoted on demand by the mutation.
+ * The project-icon tile: the chosen emoji in a gray tile (a pink folder by
+ * default) with hover-revealed edit / remove affordances and an emoji-picker
+ * popover. Fully controlled — it never persists on its own. Picking an emoji
+ * calls `onChange(glyph)`; the trash button calls `onChange(undefined)`. The
+ * host decides when, or whether, to write: a form can stage the pick in local
+ * state and emit it in a single submit — so Cancel discards it and no write
+ * races the form's own save — while the landing page wires `onChange` straight
+ * to a mutation.
  *
- * `configReady` gates editing: the PATCH replaces the whole config blob, so a
- * write before the config has loaded would merge onto `{}` and silently wipe
- * those defaults. The caller passes `true` only once the config has resolved
- * (or when there's no first-class config to lose).
+ * `pending` shows the busy spinner on the tile. `disabled` gates editing: a
+ * host whose backing config hasn't loaded passes `true`, since a write before
+ * then would merge onto an empty blob and wipe the stored defaults.
  */
-export function ProjectLandingIcon({
-  projectId,
-  projectName,
-  config,
-  configReady,
+export function ProjectIconControl({
+  value,
+  onChange,
+  pending = false,
+  disabled = false,
 }: {
-  projectId: string | null;
-  projectName: string;
-  config: ProjectConfig | undefined;
-  configReady: boolean;
+  value: string | undefined;
+  onChange: (glyph: string | undefined) => void;
+  pending?: boolean;
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const update = useUpdateProjectConfig();
-  const icon = config?.icon;
 
   const openPicker = () => {
-    if (configReady) setOpen(true);
-  };
-  const save = (native: string) => {
-    if (!configReady) return;
-    update.mutate({
-      id: projectId,
-      name: projectName,
-      config: { ...(config ?? {}), icon: native },
-    });
-    setOpen(false);
-  };
-  const clear = () => {
-    if (!configReady) return;
-    const next = { ...(config ?? {}) };
-    delete next.icon;
-    update.mutate({ id: projectId, name: projectName, config: next });
+    if (!disabled) setOpen(true);
   };
 
   return (
@@ -97,20 +86,20 @@ export function ProjectLandingIcon({
           size="icon-xs"
           aria-label="Change project icon"
           data-testid="project-icon-edit"
-          disabled={!configReady}
+          disabled={disabled}
           onClick={openPicker}
         >
           <PencilIcon className="size-3.5" />
         </Button>
-        {icon ? (
+        {value ? (
           <Button
             type="button"
             variant="ghost"
             size="icon-xs"
             aria-label="Remove project icon"
             data-testid="project-icon-remove"
-            disabled={!configReady}
-            onClick={clear}
+            disabled={disabled}
+            onClick={() => onChange(undefined)}
           >
             <Trash2Icon className="size-3.5" />
           </Button>
@@ -125,13 +114,16 @@ export function ProjectLandingIcon({
             onClick={openPicker}
             className={cn(
               "flex size-14 cursor-pointer items-center justify-center rounded-xl transition-colors",
-              icon ? "bg-muted" : "bg-tag-pink",
+              value ? "bg-muted" : "bg-tag-pink",
             )}
           >
-            {update.isPending ? (
-              <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
-            ) : icon ? (
-              <span className="text-[30px] leading-none">{icon}</span>
+            {pending ? (
+              <Loader2Icon
+                className="size-6 animate-spin text-muted-foreground"
+                data-testid="project-icon-pending"
+              />
+            ) : value ? (
+              <span className="text-[30px] leading-none">{value}</span>
             ) : (
               <FolderIcon className="size-6 text-brand-accent" />
             )}
@@ -150,9 +142,57 @@ export function ProjectLandingIcon({
           }
           className="emoji-picker-popover w-auto border-0 bg-transparent p-0 shadow-none ring-0"
         >
-          <EmojiPicker onSelect={save} />
+          <EmojiPicker
+            onSelect={(native) => {
+              onChange(native);
+              setOpen(false);
+            }}
+          />
         </PopoverContent>
       </Popover>
     </span>
+  );
+}
+
+/**
+ * The project-header icon on the new-chat landing, where there's no form around
+ * it — edits persist immediately. Wraps {@link ProjectIconControl} with a
+ * mutation that merges the change onto the project's stored `config` (so the
+ * other defaults — host / workspace / agent — survive an icon change or
+ * removal) and promotes a label-only folder (`projectId === null`) on demand.
+ *
+ * `configReady` gates editing: the PATCH replaces the whole config blob, so a
+ * write before the config has loaded would merge onto `{}` and silently wipe
+ * those defaults. The caller passes `true` only once the config has resolved
+ * (or when there's no first-class config to lose).
+ */
+export function ProjectLandingIcon({
+  projectId,
+  projectName,
+  config,
+  configReady,
+}: {
+  projectId: string | null;
+  projectName: string;
+  config: ProjectConfig | undefined;
+  configReady: boolean;
+}) {
+  const update = useUpdateProjectConfig();
+
+  const write = (glyph: string | undefined) => {
+    if (!configReady) return;
+    const next = { ...(config ?? {}) };
+    if (glyph) next.icon = glyph;
+    else delete next.icon;
+    update.mutate({ id: projectId, name: projectName, config: next });
+  };
+
+  return (
+    <ProjectIconControl
+      value={config?.icon}
+      onChange={write}
+      pending={update.isPending}
+      disabled={!configReady}
+    />
   );
 }
