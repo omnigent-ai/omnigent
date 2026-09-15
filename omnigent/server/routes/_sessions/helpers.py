@@ -5851,7 +5851,10 @@ async def _proxy_get_session_resources_to_runner(
     :param resource_type: Optional ``?type=`` filter forwarded to the
         runner, e.g. ``"environment"``. ``None`` returns all types.
     :returns: The runner's validated resource page.
-    :raises HTTPException: 502 on runner failure or malformed response.
+    :raises OmnigentError: Typed ``session_agent_missing`` (410) re-derived
+        from the runner body when the session's agent is gone.
+    :raises HTTPException: 502 on any other runner failure or malformed
+        response.
     """
     try:
         resp = await runner_client.get(
@@ -5861,6 +5864,26 @@ async def _proxy_get_session_resources_to_runner(
             timeout=10.0,
         )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle error instead of
+            # flattening it to a generic 502 gateway failure: the session's
+            # bound agent was deleted or rebound, so a retry cannot succeed
+            # and the client must recreate the agent or start a new session.
+            # ``OmnigentError.http_status`` re-derives the 410 from the code,
+            # matching ``_proxy_get_to_runner`` and ``create_session_terminal``.
+            try:
+                error_body: object = resp.json()
+            except ValueError:
+                error_body = None
+            if isinstance(error_body, dict):
+                error = error_body.get("error")
+                if (
+                    isinstance(error, dict)
+                    and error.get("code") == ErrorCode.SESSION_AGENT_MISSING
+                ):
+                    raise OmnigentError(
+                        str(error.get("message") or "session agent missing"),
+                        code=ErrorCode.SESSION_AGENT_MISSING,
+                    )
             _logger.warning(
                 "session resources: runner returned %d for session=%s",
                 resp.status_code,

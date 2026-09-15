@@ -638,6 +638,42 @@ async def test_list_session_resources_rejects_malformed_runner_response(
 
 
 @pytest.mark.asyncio
+async def test_list_session_resources_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The list proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
+
+    assert resp.status_code == 410
+    assert resp.json()["error"]["code"] == "session_agent_missing"
+
+
+@pytest.mark.asyncio
 async def test_list_session_resources_local_fallback_lists_default(
     client: httpx.AsyncClient,
 ) -> None:
