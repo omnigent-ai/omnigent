@@ -4169,6 +4169,9 @@ def _message_text(content: list[dict[str, Any]]) -> str | None:
 def _latest_assistant_text_from_store(
     conversation_store: ConversationStore,
     session_id: str,
+    *,
+    response_id: str | None = None,
+    stop_at_user_message: bool = False,
 ) -> str | None:
     """
     Return the latest persisted assistant message text for a session.
@@ -4181,6 +4184,9 @@ def _latest_assistant_text_from_store(
     :param conversation_store: Store used to read conversation items.
     :param session_id: Session/conversation id, e.g.
         ``"conv_child123"``.
+    :param response_id: When known, only return text belonging to this turn.
+    :param stop_at_user_message: Without a response id, stop at the latest
+        non-meta user message so a failure cannot borrow an earlier reply.
     :returns: Latest assistant text, or ``None`` when none is
         persisted yet.
     """
@@ -4193,7 +4199,13 @@ def _latest_assistant_text_from_store(
     for item in page.data:
         if not isinstance(item.data, MessageData):
             continue
-        if item.data.role != "assistant" or item.data.is_meta:
+        if item.data.is_meta:
+            continue
+        if response_id is not None and item.response_id != response_id:
+            continue
+        if stop_at_user_message and response_id is None and item.data.role == "user":
+            return None
+        if item.data.role != "assistant":
             continue
         text = _message_text(item.data.content)
         if text is not None:

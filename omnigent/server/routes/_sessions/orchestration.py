@@ -2581,11 +2581,9 @@ async def _enrich_terminal_status_with_subagent_output(
     with the terminal edge.
 
     A ``failed`` edge is filled only when the forwarder attached no detail of
-    its own. On a failed turn the latest assistant message is the harness's own
-    error report (e.g. Claude's "There's an issue with the selected model
-    (…)"), which otherwise reaches only the child's transcript while the
-    parent inbox falls back to the generic "Error: native sub-agent turn
-    failed" and the session's ``last_task_error`` stays empty.
+    its own. Its fallback must belong to the failed response, or (for older
+    forwarders without response ids) follow the latest user message. A failure
+    before any assistant output must not borrow an earlier turn's reply.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
@@ -2601,10 +2599,14 @@ async def _enrich_terminal_status_with_subagent_output(
     existing = data.get("output")
     if status == "failed" and isinstance(existing, str) and existing.strip():
         return data
+    raw_response_id = data.get("response_id") if status == "failed" else None
+    response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
         conversation_store,
         session_id,
+        response_id=response_id,
+        stop_at_user_message=status == "failed",
     )
     if output is None:
         return data
