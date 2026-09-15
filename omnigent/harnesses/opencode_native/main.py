@@ -60,6 +60,7 @@ from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native.native_terminal import url_component
+from omnigent.native.terminal_attach import attach_native_terminal, attach_terminal_websocket
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -255,7 +256,16 @@ def _run_with_remote_server(  # pragma: no cover
                 enabled=auto_open_conversation,
                 warn=lambda message: click.echo(message, err=True),
             )
-            await _attach_terminal_resource(prepared)
+            await attach_native_terminal(
+                default_attach=lambda: _attach_terminal_resource(prepared),
+                control_mode_attach=lambda: attach_terminal_websocket(
+                    base_url=base_url,
+                    headers=headers,
+                    session_id=prepared.session_id,
+                    terminal_id=prepared.terminal_id,
+                    session_name="OpenCode",
+                ),
+            )
             if resolved_session_id is None:
                 echo_native_resume_hint(
                     native_command="opencode",
