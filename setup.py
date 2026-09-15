@@ -46,13 +46,28 @@ class _GenerateBuildInfo(build_py):
         self._bundle_scripts()
 
     def _bundle_scripts(self) -> None:
-        """Copy top-level maintenance scripts into package resources."""
+        """Copy top-level maintenance scripts into package resources.
+
+        A missing source script aborts the build: silently skipping it
+        would ship a wheel whose ``omnigent uninstall`` dies with
+        "uninstall script is missing from this installation" (the script
+        lives outside the package, so only this copy puts it in the
+        wheel). MANIFEST.in includes it in the sdist so from-sdist
+        builds have it too.
+        """
         import shutil
 
         root = Path(__file__).resolve().parent
         src = root / "scripts" / "uninstall_oss.sh"
         if not src.is_file():
-            return
+            raise SystemExit(
+                f"omnigent build: {src} is missing, so the uninstall "
+                "script cannot be bundled into the wheel and `omnigent "
+                "uninstall` would fail at runtime. If this is a "
+                "from-sdist build, the sdist was produced without "
+                "MANIFEST.in's `include scripts/uninstall_oss.sh` — "
+                "rebuild the sdist from a full checkout."
+            )
         dest = Path(self.build_lib) / "omnigent" / "resources" / "scripts" / src.name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
