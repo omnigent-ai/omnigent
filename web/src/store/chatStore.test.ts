@@ -6713,10 +6713,9 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().sideChatRailRequest).toBeNull();
     });
 
-    it("opens the awaited side chat on the /side latch even when the isSideChat marker is present", () => {
-      // Reliability first: the child arriving under the parent the user armed
-      // with /side is revealed and followed. (The server-sent `isSideChat`
-      // marker is carried but not gated on here yet — see the handler comment.)
+    it("opens the awaited side chat on the /side latch", () => {
+      // The child arriving under the parent the user armed with /side is
+      // revealed and followed.
       const parent = bindConversationForTest("conv_race", { awaitingSideChatFor: "conv_race" });
       useChatStore.setState({ redirectToConversationId: null, sideChatRailRequest: null });
 
@@ -6726,7 +6725,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         childSessionId: "conv_side",
         agentId: "ag_xyz",
         parentSessionId: "conv_race",
-        isSideChat: true,
       } as SessionCreatedEvent);
 
       // redirect + rail request are app-global; awaitingSideChatFor is the

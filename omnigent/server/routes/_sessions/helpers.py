@@ -155,7 +155,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CODEX_NATIVE_SUBAGENT_PARENT_THREAD_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY,
-    _CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -3490,8 +3489,6 @@ def _publish_session_created(
     parent_id: str,
     child_session_id: str,
     agent_id: str | None,
-    *,
-    is_side_chat: bool | None = None,
 ) -> None:
     """
     Emit ``session.created`` on the parent's stream for a child session.
@@ -3506,9 +3503,6 @@ def _publish_session_created(
     :param agent_id: Agent id stamped on the child (the parent's
         agent), e.g. ``"ag_abc123"``. ``None`` only for legacy parents
         without one.
-    :param is_side_chat: ``True`` for a codex ``/side`` side-chat fork,
-        ``False`` for an ordinary codex sub-agent, ``None`` when the spawn
-        path does not classify (non-codex).
     """
     event = SessionCreatedEvent(
         type="session.created",
@@ -3516,7 +3510,6 @@ def _publish_session_created(
         child_session_id=child_session_id,
         agent_id=agent_id,
         parent_session_id=parent_id,
-        is_side_chat=is_side_chat,
     )
     session_stream.publish(parent_id, event.model_dump())
 
@@ -3989,10 +3982,6 @@ def _codex_subagent_labels_from_body(
         value = body.data.get(data_key)
         if isinstance(value, str) and value:
             labels[label_key] = value
-    # A ``/side`` fork marks itself so clients open only the side chat they
-    # asked for, never a concurrent ordinary sub-agent.
-    if body.data.get("side_chat") is True:
-        labels[_CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY] = "true"
     return labels
 
 
@@ -4018,9 +4007,6 @@ async def _create_and_publish_codex_child(
     # Stable title so the (parent, title) unique index prevents race-condition
     # duplicate rows when the forwarder retries a failed registration.
     title = f"codex-native-ui-subagent:{thread_id}"
-    # Classify the child so session.created lets a client open only the side
-    # chat it asked for; an ordinary sub-agent emits False, never None here.
-    _is_side_chat = labels.get(_CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY) == "true"
     try:
         child = await asyncio.to_thread(
             conversation_store.create_conversation,
@@ -4057,13 +4043,11 @@ async def _create_and_publish_codex_child(
             # this child — emit it now. In the concurrent-race case the
             # winner also published; the duplicate is a harmless extra
             # cache invalidation.
-            _publish_session_created(
-                parent_id, existing.id, parent_conv.agent_id, is_side_chat=_is_side_chat
-            )
+            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id, is_side_chat=_is_side_chat)
+    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
     return child.id
 
 

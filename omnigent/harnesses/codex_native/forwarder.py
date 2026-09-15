@@ -5426,8 +5426,6 @@ async def _register_child_session(
     nickname = item.get("agent_nickname")
     if isinstance(nickname, str) and nickname:
         data["agent_nickname"] = nickname
-    if item.get("side_chat") is True:
-        data["side_chat"] = True
     response = await _post_session_event(
         client,
         parent_session_id,

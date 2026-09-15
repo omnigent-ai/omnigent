@@ -6739,10 +6739,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         if (!event.childSessionId || s.awaitingSideChatFor !== event.conversationId) return {};
         // Open on the user's explicit /side latch: they just asked for a side
         // chat on THIS parent, so the child arriving under it is the one to
-        // reveal and follow. The server also classifies the child (`isSideChat`)
-        // to fend off a concurrent ordinary sub-agent, but that marker's
-        // end-to-end delivery is not yet verified live — gating the open on it
-        // stranded real side chats, so reliability wins here until it is.
+        // reveal and follow. (A concurrent ordinary sub-agent under the same
+        // parent could in theory be opened instead — a known, narrow edge; the
+        // latch is armed only by an explicit /side, so it is rare in practice.)
         return {
           awaitingSideChatFor: null,
           redirectToConversationId: event.childSessionId,

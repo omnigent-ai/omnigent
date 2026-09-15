@@ -203,11 +203,6 @@ _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY = "omnigent.codex_native.prompt"
 _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
 
 
-# Marks a codex child that is a ``/side`` side-chat fork (value ``"true"``), so
-# clients open only the side chat they asked for, never a concurrent sub-agent.
-_CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY = "omnigent.codex_native.side_chat"
-
-
 _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 
 
@@ -954,7 +949,6 @@ __all__ = [
     "_CODEX_NATIVE_SUBAGENT_PARENT_THREAD_ID_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY",
-    "_CODEX_NATIVE_SUBAGENT_SIDE_CHAT_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",

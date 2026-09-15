@@ -804,13 +804,6 @@ export interface SessionCreatedEvent {
   agentId: string | null;
   /** Echo of `conversationId` for forward-compat. May be absent on the wire. */
   parentSessionId: string | null;
-  /**
-   * Whether this child is a codex `/side` side-chat fork: `true` for a side
-   * chat, `false` for an ordinary sub-agent, `undefined` when the spawn path
-   * doesn't classify (non-codex, or an older server). Lets a `/side` latch open
-   * only the side-chat child, never a concurrent normal sub-agent.
-   */
-  isSideChat?: boolean;
 }
 
 /**

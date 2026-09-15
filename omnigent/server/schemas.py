@@ -3693,11 +3693,6 @@ class SessionCreatedEvent(_SSEEventBase):
     child_session_id: str
     agent_id: str | None = None
     parent_session_id: str | None = None
-    #: Whether this child is a codex ``/side`` side-chat fork. ``True`` for a
-    #: side chat, ``False`` for an ordinary sub-agent, ``None`` when the spawn
-    #: path does not classify (non-codex). Lets a client that armed a ``/side``
-    #: latch open ONLY the side-chat child, never a concurrent normal sub-agent.
-    is_side_chat: bool | None = None
 
 
 class SessionSupersededEvent(_SSEEventBase):

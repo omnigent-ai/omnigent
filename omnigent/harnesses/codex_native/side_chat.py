@@ -284,7 +284,7 @@ async def register_side_fork_child(
         parent_session_id=parent_session_id,
         parent_thread_id=parent_thread_id,
         child_thread_id=child_thread_id,
-        item={"agent_nickname": SIDE_CHAT_DISPLAY_NAME, "side_chat": True},
+        item={"agent_nickname": SIDE_CHAT_DISPLAY_NAME},
         forwarder_state=forwarder_state,
     )
     return forwarder_state.session_for_child_thread(child_thread_id)
