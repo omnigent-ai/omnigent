@@ -665,11 +665,15 @@ class _PendingPolicyAskWrites:
         itself, so the events handler skips write application for
         these entries to avoid double-applying non-idempotent ops
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
+    :param reviewed_arguments: Original MCP arguments shown for approval.
+    :param transformed_arguments: Policy transform stored with that approval.
     """
 
     state_updates: list[StateUpdate] | None
     set_labels: dict[str, str] | None
     from_mcp: bool = False
+    reviewed_arguments: dict[str, Any] | None = None
+    transformed_arguments: dict[str, Any] | None = None
 
 
 _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
