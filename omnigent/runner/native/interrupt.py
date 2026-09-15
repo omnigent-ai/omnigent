@@ -45,7 +45,10 @@ from omnigent.runner.native.orchestration import (
     _claude_native_bridge_id_for_session,
     _session_labels_for_runner_spawn,
 )
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import (
+    _STATUS_EMITTING_TERMINAL_ROLES,
+    SessionResourceRegistry,
+)
 
 if TYPE_CHECKING:
     from omnigent.harness_plugins import NativeCodingAgent
@@ -347,7 +350,7 @@ class NativeInterruptRunner:
         spec = _UNIFORM_INTERRUPT.get(key)
         if spec is None:
             return None
-        return await self._uniform_interrupt(spec, conv_id)
+        return await self._uniform_interrupt(spec, conv_id, terminal_role=agent.harness)
 
     async def stop(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch a stop_session to the harness's bridge.
@@ -415,7 +418,9 @@ class NativeInterruptRunner:
                 publish_event=self._publish_event,
             )
 
-    async def _uniform_interrupt(self, spec: _UniformInterrupt, conv_id: str) -> Response:
+    async def _uniform_interrupt(
+        self, spec: _UniformInterrupt, conv_id: str, *, terminal_role: str | None = None
+    ) -> Response:
         module = importlib.import_module(spec.module)
         bridge_dir = module.bridge_dir_for_session_id(conv_id)
         inject = getattr(module, spec.inject_fn)
@@ -436,6 +441,12 @@ class NativeInterruptRunner:
                     "detail": self._client_safe_error_detail(exc, context=spec.context),
                 },
             )
+        # A harness excluded from PTY-derived status owns its own cancel edge: an
+        # interrupt fires no lifecycle hook, so without this the web spins forever.
+        # The ones still on the watcher get their idle from pane quiescence, which
+        # is why publishing here would double it.
+        if terminal_role is not None and terminal_role not in _STATUS_EMITTING_TERMINAL_ROLES:
+            self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
         self._wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 

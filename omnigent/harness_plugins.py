@@ -7,7 +7,6 @@ packages contribute additional harnesses through the
 
 from __future__ import annotations
 
-import dataclasses
 import importlib
 import importlib.metadata
 import logging

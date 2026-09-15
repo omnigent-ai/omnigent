@@ -67,7 +67,6 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-
 from omnigent.server.routes._sessions.helpers import (
     _allow_all_edits_eligible,
     _allow_auto_mode_eligible,

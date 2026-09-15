@@ -1921,7 +1921,9 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["17", "", "", "q"]) + "\n"
+    # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
+    # row after it one lower (see the dispatch table's note).
+    stdin = "\n".join(["16", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1943,7 +1945,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["17", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1960,7 +1962,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["17", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
