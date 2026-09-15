@@ -295,6 +295,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { promoteSessionDraft } from "@/lib/sessionDrafts";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -1328,6 +1329,7 @@ export function AgentHarnessPicker({
   hasAgents,
   loading = false,
   interactiveWhileLoading = false,
+  disabledLabel,
   cacheKey = null,
   host,
   onSelectAgent,
@@ -1362,6 +1364,8 @@ export function AgentHarnessPicker({
   hasAgents: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
+  /** Non-interactive placeholder when no execution target is selected. */
+  disabledLabel?: string;
   cacheKey?: string | null;
   host: Host | undefined | null;
   onSelectAgent: (agent: AvailableAgent) => void;
@@ -1697,31 +1701,36 @@ export function AgentHarnessPicker({
         }
       }}
       trigger={{
-        disabled: previewOnly || !hasAgents,
+        disabled: disabledLabel !== undefined || previewOnly || !hasAgents,
         "aria-busy": loading || undefined,
-        label: cachedPreview?.label ?? triggerAccessibleName,
-        model: cachedPreview?.model ?? triggerText,
-        effort: cachedPreview?.effort ?? visibleEffortText,
-        icon: cachedPreview ? (
-          <span
-            className="flex size-4 shrink-0 items-center justify-center"
-            data-testid="new-chat-landing-agent-icon"
-          >
-            {cachedPreview.smartRouting ? (
-              <WandSparklesIcon className="size-4" aria-hidden="true" />
-            ) : (
-              <ComposerAgentIcon agent={cachedPreview.agent} />
-            )}
-          </span>
-        ) : (
-          triggerIcon
+        label: disabledLabel ?? cachedPreview?.label ?? triggerAccessibleName,
+        model: disabledLabel ?? cachedPreview?.model ?? triggerText,
+        effort:
+          disabledLabel === undefined ? (cachedPreview?.effort ?? visibleEffortText) : undefined,
+        icon:
+          disabledLabel !== undefined ? undefined : cachedPreview ? (
+            <span
+              className="flex size-4 shrink-0 items-center justify-center"
+              data-testid="new-chat-landing-agent-icon"
+            >
+              {cachedPreview.smartRouting ? (
+                <WandSparklesIcon className="size-4" aria-hidden="true" />
+              ) : (
+                <ComposerAgentIcon agent={cachedPreview.agent} />
+              )}
+            </span>
+          ) : (
+            triggerIcon
+          ),
+        className: cn(
+          triggerClassName,
+          (loading || disabledLabel !== undefined) && "disabled:opacity-100",
         ),
-        className: cn(triggerClassName, loading && "disabled:opacity-100"),
         labelClassName: triggerLabelClassName,
         testIdPrefix: "new-chat-landing",
         "data-testid": "new-chat-landing-agent-select",
       }}
-      tooltip={cachedPreview?.label ?? triggerTooltipContent}
+      tooltip={disabledLabel ?? cachedPreview?.label ?? triggerTooltipContent}
       tooltipTestId="new-chat-landing-agent-tooltip"
       contentAlign={contentAlign}
       contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
@@ -2386,20 +2395,34 @@ export function NewChatLandingScreen() {
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => restoredDraft?.sandboxProvider ?? null,
   );
+  const hostSelected = !sandboxSelected && selectedHostId !== null;
+  const rememberedHostChoice = readLastHostChoice();
+  const executionTargetSelectionPending =
+    !sandboxSelected &&
+    selectedHostId === null &&
+    (hostsLoading ||
+      info === "loading" ||
+      (rememberedHostChoice === SANDBOX_HOST_CHOICE
+        ? managedSandboxesEnabled
+        : rememberedHostChoice
+          ? (hosts ?? []).some((host) => host.host_id === rememberedHostChoice)
+          : managedSandboxesEnabled || (hosts ?? []).some((host) => host.status === "online")));
+  const noExecutionTargetSelected =
+    !sandboxSelected && selectedHostId === null && !executionTargetSelectionPending;
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
     error: hostClaudeModelsError,
-  } = useHostModelOptions(selectedHostId, "claude-native", !sandboxSelected);
+  } = useHostModelOptions(selectedHostId, "claude-native", hostSelected);
   const {
     data: hostCodexModelOptions,
     isLoading: hostCodexModelsLoading,
     error: hostCodexModelsError,
-  } = useHostModelOptions(selectedHostId, "codex-native", !sandboxSelected);
+  } = useHostModelOptions(selectedHostId, "codex-native", hostSelected);
   const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
     selectedHostId,
     "pi-native",
-    !sandboxSelected,
+    hostSelected,
   );
   // Only bridge this host's first fetch. Empty/error responses and host changes
   // must never inherit another catalog or keep retired choices alive.
@@ -4484,7 +4507,7 @@ export function NewChatLandingScreen() {
       ? "Connecting to Arca…"
       : sandboxSelected
         ? selectedSandboxLabel
-        : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
+        : (selectedHostDisplayName ?? "No host selected");
   const worktreeControlAvailable =
     !sandboxSelected &&
     (branchName.trim() !== "" ||
@@ -5236,6 +5259,7 @@ export function NewChatLandingScreen() {
       // it's safe to POST the first message with it.
       if (localConv !== null && effectiveAgentId !== null) {
         const tempRouteSuffix = `/c/${localConv.tempConvId}`;
+        promoteSessionDraft(localConv.tempConvId, data.id);
         // Hydrate the temp id onto the real id and POST the first message.
         hydrateLocalConversation(
           localConv.tempConvId,
@@ -5330,12 +5354,20 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <ComposerWorkspaceTrigger
       kind="directory"
-      label={visibleWorktreeHeader.repositoryLabel}
-      aria-label={`Working directory: ${visibleWorkspace || "Not selected"}`}
-      title={visibleWorkspace || "Working directory not selected"}
-      disabled={workspaceLoading}
+      label={noExecutionTargetSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
+      aria-label={
+        noExecutionTargetSelected
+          ? "Working directory: No host selected"
+          : `Working directory: ${visibleWorkspace || "Not selected"}`
+      }
+      title={
+        noExecutionTargetSelected
+          ? "No host selected"
+          : visibleWorkspace || "Working directory not selected"
+      }
+      disabled={noExecutionTargetSelected || workspaceLoading}
       aria-busy={workspaceLoading || undefined}
-      className={workspaceLoading ? "disabled:opacity-100" : undefined}
+      className={noExecutionTargetSelected || workspaceLoading ? "disabled:opacity-100" : undefined}
       data-testid="new-chat-landing-workspace-chip"
     />
   );
@@ -5449,14 +5481,26 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <ComposerWorkspaceTrigger
                       kind="worktree"
-                      label={visibleWorktreeHeader.branchLabel}
-                      aria-label={visibleWorktreeHeader.branchDescription}
-                      title={
-                        workspaceLoading || worktreeControlAvailable
-                          ? visibleWorktreeHeader.branchDescription
-                          : "Choose a Git working directory to use worktrees"
+                      label={
+                        noExecutionTargetSelected
+                          ? "No host selected"
+                          : visibleWorktreeHeader.branchLabel
                       }
-                      disabled={workspaceLoading || !worktreeControlAvailable}
+                      aria-label={
+                        noExecutionTargetSelected
+                          ? "No host selected"
+                          : visibleWorktreeHeader.branchDescription
+                      }
+                      title={
+                        noExecutionTargetSelected
+                          ? "No host selected"
+                          : workspaceLoading || worktreeControlAvailable
+                            ? visibleWorktreeHeader.branchDescription
+                            : "Choose a Git working directory to use worktrees"
+                      }
+                      disabled={
+                        noExecutionTargetSelected || workspaceLoading || !worktreeControlAvailable
+                      }
                       aria-busy={workspaceLoading || undefined}
                       className={workspaceLoading ? "disabled:opacity-100" : undefined}
                       data-testid="new-chat-landing-branch-chip"
@@ -6038,7 +6082,16 @@ export function NewChatLandingScreen() {
                       </DropdownMenuContent>
                     </DropdownMenu>
 
-                    {pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
+                    {noExecutionTargetSelected ? (
+                      <ComposerPermissionPicker
+                        label="Permission mode"
+                        value="No host selected"
+                        disabled
+                        options={directModeOptions}
+                        onSelect={selectDirectMode}
+                        testIdPrefix="new-chat-landing"
+                      />
+                    ) : pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
                       <NewChatPickerLoading
                         label="Loading permissions"
                         testId="new-chat-landing-permission-loading"
@@ -6284,6 +6337,7 @@ export function NewChatLandingScreen() {
                         hasAgents={agentList.length > 0}
                         loading={pickerLoading}
                         interactiveWhileLoading={interactiveWhileLoading}
+                        disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}
                         cacheKey={pickerCacheKey}
                         host={harnessWarningHost}
                         onSelectAgent={handleSelectAgent}

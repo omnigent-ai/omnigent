@@ -927,11 +927,9 @@ describe("computeShowsWorking", () => {
     ).toBe(true);
   });
 
-  it("a spin-up in flight yields the slot to the Starting-up cue", () => {
-    // ChatPage passes `localSendInFlight: status === "streaming" && !spinUpInFlight`.
-    // `RunnerStartingIndicator` renders only when the shimmer is absent, and its
-    // copy ("Starting up…" / "Cloning repository…") is strictly more informative
-    // than a generic shimmer — so during a boot the optimistic path stands down.
+  it("a managed-sandbox spin-up yields the slot to its stage cue", () => {
+    // ChatPage suppresses the optimistic Working indicator only while a
+    // managed sandbox is reporting a more specific launch stage.
     expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
   });
 

@@ -74,8 +74,6 @@ export interface TranscriptProps {
   agentsError: unknown;
   /** True while a managed-sandbox launch is in flight (cold-launch spinner). */
   sandboxLaunching: boolean;
-  /** Terminal-first spin-up bits for the cold-launch empty state. */
-  terminalFirst: { isTerminalFirst: boolean; terminalStartingUp?: boolean } | null | undefined;
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
 }
@@ -114,7 +112,6 @@ function TranscriptImpl({
   showsWorking,
   agentsError,
   sandboxLaunching,
-  terminalFirst,
   spacerMeasureRef,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
@@ -333,7 +330,6 @@ function TranscriptImpl({
               rowCount={display.streamBubbles.length}
             />
             {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
-              (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
               sandboxLaunching ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (
@@ -382,8 +378,7 @@ function TranscriptImpl({
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
                 {showWorkingIndicator && <WorkingIndicator />}
-                {/* Terminal-first spin-up cue; self-gates to null off the
-                spin-up window, and only when not already showing Working…. */}
+                {/* Managed-sandbox stage cue; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
                 round settles (failures stay in host logs, not the chat). */}

@@ -71,6 +71,20 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   notifyListeners();
 }
 
+/** Move an unsent draft when a temporary conversation receives its real id. */
+export function promoteSessionDraft(
+  temporaryConversationId: string,
+  conversationId: string,
+): SessionDraft | undefined {
+  const draft = sessionDrafts.get(temporaryConversationId);
+  if (draft === undefined) return undefined;
+  sessionDrafts.delete(temporaryConversationId);
+  sessionDrafts.set(conversationId, draft);
+  saveDraftsToStorage();
+  notifyListeners();
+  return draft;
+}
+
 export function hasSessionDraft(conversationId: string): boolean {
   const draft = sessionDrafts.get(conversationId);
   return draft !== undefined && (draft.text.trim() !== "" || draft.files.length > 0);

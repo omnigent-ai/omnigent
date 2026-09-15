@@ -114,7 +114,7 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
   serializeReplyDraft,
   snapshotReplyDraft,
@@ -523,9 +523,6 @@ export function ChatPage() {
   // handling). Overrides the liveness-derived unreachable affordances
   // below, which misread the not-yet-host-bound session as stranded.
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
-  // Terminal-first spin-up state, read here (not just in the child surfaces) so
-  // the working-indicator gate below can defer to the "Starting up…" cue.
-  const chatTerminalFirst = useTerminalFirst();
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
@@ -717,16 +714,10 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  // A spin-up in flight owns the in-progress slot with more specific copy
-  // ("Starting up…" / "Cloning repository…") than the generic shimmer, and
-  // `RunnerStartingIndicator` only renders when the shimmer is absent. So the
-  // OPTIMISTIC path must stand down here: a send that has to boot a runner is
-  // exactly when the user needs to know it's booting, not just that we asked.
-  // A server-confirmed `running`/`waiting` still wins — by then the harness is
-  // up and the spin-up cue has self-gated to null.
-  const spinUpInFlight =
-    sandboxLaunching ||
-    Boolean(chatTerminalFirst?.isTerminalFirst && chatTerminalFirst.terminalStartingUp);
+  // Managed-sandbox stages own the in-progress slot with specific pipeline
+  // copy. A normal terminal runner launch keeps the standard Working shimmer
+  // so startup does not introduce a second, special chat state.
+  const spinUpInFlight = sandboxLaunching;
   const showsWorking = computeShowsWorking(sessionStatus, {
     hasPendingElicitation,
     runnerOnline,
@@ -1010,11 +1001,11 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  // Client-only conversation: no server session to POST a follow-up to yet, so
-  // the composer stays read-only until the create resolves and the id hydrates.
-  const readOnlyReason = isTempConvId(urlConvId)
-    ? "Starting the session…"
-    : readOnlyReasonForSessionLabels(activeSession, activeConv);
+  // A client-only conversation has no server session to POST to yet. Keep the
+  // composer editable so the user can draft the next message during creation,
+  // but gate submission until the temp id is promoted below.
+  const sendDisabledReason = isTempConvId(urlConvId) ? "Starting the session…" : null;
+  const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
@@ -1112,6 +1103,7 @@ export function ChatPage() {
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
       readOnlyReason={readOnlyReason}
+      sendDisabledReason={sendDisabledReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
       showModels={modelPickerKind !== null}
@@ -1355,6 +1347,8 @@ interface MainAgentSurfaceProps {
   permissionLevel: number | null;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
+  /** Keeps drafting enabled while temporarily blocking submission. */
+  sendDisabledReason: string | null;
   effortLevels: readonly string[];
   /** Show effort controls. */
   showEffort: boolean;
@@ -1507,6 +1501,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   loadingMoreHistory,
   permissionLevel,
   readOnlyReason,
+  sendDisabledReason,
   effortLevels,
   showEffort,
   showModels,
@@ -1782,7 +1777,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showsWorking={showsWorking}
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
-            terminalFirst={terminalFirst}
             spacerMeasureRef={spacerMeasureRef}
           />
           {/* Floating reply button — scoped to the conversation container. */}
@@ -1803,6 +1797,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             selectedAgentId={selectedAgentId}
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
+            sendDisabledReason={sendDisabledReason}
             effortLevels={effortLevels}
             showEffort={showEffort}
             showModels={showModels}
@@ -1920,6 +1915,8 @@ interface ComposerProps {
    * leaves the existing ``permissionLevel`` gate alone.
    */
   readOnlyReason: string | null;
+  /** Keeps drafting enabled while temporarily blocking submission. */
+  sendDisabledReason?: string | null;
   /** Reasoning-effort options to render in `/effort` and the picker dropdown. */
   effortLevels: readonly string[];
   /** Show `/effort` and the Effort picker section. */
@@ -2266,6 +2263,7 @@ function ComposerImpl(
     selectedAgentId,
     permissionLevel,
     readOnlyReason,
+    sendDisabledReason = null,
     effortLevels,
     showEffort,
     showModels,
@@ -2358,6 +2356,7 @@ function ComposerImpl(
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
   const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
+  const draftConversationIdRef = useRef<string | null>(null);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -2384,7 +2383,8 @@ function ComposerImpl(
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
   // explains *why* this specific row can't receive input.
-  const isReadOnly = permissionLevel === 1 || readOnlyReason !== null;
+  const isReadOnly =
+    readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
   // A pending elicitation addressed to this session parks the turn
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
@@ -2553,7 +2553,15 @@ function ComposerImpl(
   isMobileRef.current = isMobile;
 
   useEffect(() => {
-    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
+    const previousConversationId = draftConversationIdRef.current;
+    const promoted =
+      conversationId &&
+      previousConversationId &&
+      isTempConvId(previousConversationId) &&
+      !isTempConvId(conversationId)
+        ? promoteSessionDraft(previousConversationId, conversationId)
+        : undefined;
+    const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
     replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
@@ -2563,6 +2571,7 @@ function ComposerImpl(
     // hold the OUTGOING conversation's text during this commit — it waits for
     // this to settle rather than mistaking that for "the user is typing".
     setSettledConversationId(conversationId ?? null);
+    draftConversationIdRef.current = conversationId ?? null;
     if (!isMobileRef.current) textareaRef.current?.focus();
 
     return () => {
@@ -3054,6 +3063,7 @@ function ComposerImpl(
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
       disabled ||
+      sendDisabledReason !== null ||
       hasPendingElicitation
     )
       return;
@@ -3461,17 +3471,20 @@ function ComposerImpl(
               ? readOnlyReason
               : isReadOnly
                 ? "You have read-only access to this session"
-                : unreachable
+                : unreachable && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
-                    : disabled
+                    : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
                       : isStreaming
                         ? "Send a follow-up (queued) — Esc to stop"
                         : "Send a message…",
           rows: 1,
-          disabled: disabled || isReadOnly || unreachable || composerLockedByBtw,
+          disabled:
+            ((disabled || unreachable) && sendDisabledReason === null) ||
+            isReadOnly ||
+            composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
@@ -3777,9 +3790,13 @@ function ComposerImpl(
                       disabled={
                         showInterruptButton
                           ? isReadOnly
-                          : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                          : !hasDraft ||
+                            disabled ||
+                            isReadOnly ||
+                            sendDisabledReason !== null ||
+                            hasPendingElicitation
                       }
-                      title={showInterruptButton ? "Interrupt" : undefined}
+                      title={showInterruptButton ? "Interrupt" : (sendDisabledReason ?? undefined)}
                       label={showInterruptButton ? "Interrupt" : "Send"}
                     />
                   </TooltipTrigger>

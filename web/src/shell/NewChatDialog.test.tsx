@@ -1435,7 +1435,7 @@ describe("NewChatLandingScreen initial picker loading", () => {
     mockAgents(DEFAULT_LANDING_AGENTS);
     editDraft("Draft typed while hosts load");
     expect(expectLoading()).toBe(loading);
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", true);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", false);
 
     mockHosts([host("online")]);
     editDraft("Draft typed while models load");
@@ -1558,8 +1558,26 @@ describe("NewChatLandingScreen initial picker loading", () => {
       mockModelQueries(() => pendingModels);
       renderLanding();
 
-      expectReadyPicker();
-      expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", true);
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        expect.stringContaining("No host selected"),
+      );
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        "Working directory: No host selected",
+      );
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeDisabled();
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
+        "No host selected",
+      );
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeDisabled();
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        "No host selected",
+      );
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toBeDisabled();
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent(
+        "No host selected",
+      );
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toBeDisabled();
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", false);
     },
   );
 
@@ -2643,7 +2661,9 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     const chip = screen.getByTestId("new-chat-landing-host-chip");
-    await waitFor(() => expect(chip).toHaveAccessibleName(expect.stringContaining("Choose host")));
+    await waitFor(() =>
+      expect(chip).toHaveAccessibleName(expect.stringContaining("No host selected")),
+    );
 
     // Model the fresh /v1/hosts response. Because the stale Mac never filled
     // selectedHostId, the remembered VM can still win when it appears.
@@ -2662,7 +2682,7 @@ describe("NewChatLandingScreen", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
-        expect.stringContaining("Choose host"),
+        expect.stringContaining("No host selected"),
       ),
     );
   });
@@ -2674,7 +2694,7 @@ describe("NewChatLandingScreen", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
-        expect.stringContaining("Choose host"),
+        expect.stringContaining("No host selected"),
       ),
     );
   });
@@ -4207,7 +4227,7 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     // The chip reads the empty state…
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
-    expect(hostChip).toHaveAccessibleName(expect.stringContaining("No hosts"));
+    expect(hostChip).toHaveAccessibleName(expect.stringContaining("No host selected"));
     expect(hostChip.querySelector(".bg-success")).toBeNull();
     expect(hostChip.querySelector(".lucide-laptop")).not.toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
