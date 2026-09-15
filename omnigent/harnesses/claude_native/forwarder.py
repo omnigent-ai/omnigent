@@ -3917,6 +3917,18 @@ async def _ensure_state_for_transcript(
         if validated != disk_state:
             await _write_forward_state_async(bridge_dir, validated)
         return validated
+    # Claude moves the transcript on EnterWorktree/ExitWorktree (into the new
+    # cwd's project dir). The bytes before the cursor are unchanged, so keep
+    # tailing from the same offset instead of re-seeding at byte 0 or EOF.
+    for cursor in (state, disk_state):
+        if cursor is None or cursor.byte_offset is None or cursor.cursor_fingerprint is None:
+            continue
+        if _jsonl_cursor_fingerprint(transcript_path, cursor.byte_offset) == (
+            cursor.cursor_fingerprint
+        ):
+            moved = replace(cursor, transcript_path=transcript_path)
+            await _write_forward_state_async(bridge_dir, moved)
+            return moved
     byte_offset = 0
     if start_at_offset is not None:
         # Cold resume: the caller wrote the prefix and measured it before

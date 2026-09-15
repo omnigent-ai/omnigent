@@ -2608,6 +2608,66 @@ async def test_measured_prefix_never_seeks_past_the_transcript_end(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_relocated_transcript_keeps_the_cursor(tmp_path: Path) -> None:
+    """
+    A moved transcript is followed from the same cursor, not re-seeded.
+
+    ``EnterWorktree`` moves ``<old-cwd-slug>/<sid>.jsonl`` into the worktree's
+    project dir and Claude keeps appending there. The bytes before the cursor
+    are unchanged, so the fingerprint still matches at the new path and the
+    cursor must carry over: re-seeding at EOF would skip the tool result
+    appended after the move, and byte 0 would re-post the whole turn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    old_path = tmp_path / "projects" / "-repo" / "sid.jsonl"
+    new_path = tmp_path / "projects" / "-worktree" / "sid.jsonl"
+    old_path.parent.mkdir(parents=True)
+    new_path.parent.mkdir(parents=True)
+    old_path.write_text(
+        json.dumps({"type": "user", "uuid": "before-move", "message": {"role": "user"}}) + "\n",
+        encoding="utf-8",
+    )
+    forwarded_up_to = old_path.stat().st_size
+    state = forwarder.TranscriptForwardState(
+        transcript_path=old_path,
+        line_cursor=1,
+        byte_offset=forwarded_up_to,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_path, forwarded_up_to),
+        seen_source_ids=("before-move",),
+    )
+
+    os.replace(old_path, new_path)
+    with new_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "after-move",
+                    "message": {"role": "user", "content": "entered the worktree"},
+                }
+            )
+            + "\n"
+        )
+
+    moved = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=state,
+        transcript_path=new_path,
+        start_at_end=True,
+        session_id="conv_moved",
+    )
+
+    assert moved.transcript_path == new_path
+    assert moved.byte_offset == forwarded_up_to
+    assert moved.seen_source_ids == ("before-move",)
+    assert forwarder._read_forward_state(bridge_dir) == moved
+    result = forwarder._read_transcript_items_for_state(moved, "claude-native-ui", None)
+    assert len(result.items) == 1
+    assert result.items[0].source_id.startswith("after-move")
+
+
+@pytest.mark.asyncio
 async def test_forwarder_skips_to_end_on_stale_byte_cursor_state(tmp_path: Path) -> None:
     """
     Stale byte-offset state skips to end of the replaced transcript.

@@ -1994,9 +1994,13 @@ def build_hook_settings(
         # calls ``TaskUpdate`` to change a native task's status (e.g.
         # to ``"in_progress"``). The payload carries ``tool_input.taskId``
         # and ``tool_input.status``.
+        # ``EnterWorktree`` / ``ExitWorktree`` move the session transcript
+        # into the new cwd's ``~/.claude/projects/<slug>/`` dir; observing
+        # them hands the forwarder the moved path now, not at the turn's Stop.
         "PostToolUse": [
             {"matcher": "TodoWrite", "hooks": [hook]},
             {"matcher": "TaskUpdate", "hooks": [hook]},
+            {"matcher": "EnterWorktree|ExitWorktree", "hooks": [hook]},
         ],
         # ``PreCompact`` fires right before Claude compacts its own
         # context — for both a manual ``/compact`` (web-UI button or

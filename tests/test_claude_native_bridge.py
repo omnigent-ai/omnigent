@@ -3087,6 +3087,28 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:
+    """
+    ``EnterWorktree`` / ``ExitWorktree`` PostToolUse events reach the observer hook.
+
+    Both tools move the session transcript into the new cwd's project dir, and
+    only the observer hook updates the bridge's ``transcript_path``. Without
+    this entry the forwarder tails the vanished pre-move file until the turn's
+    ``Stop``, so nothing the tool did (its own result included) is mirrored.
+    """
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    worktree_entries = [
+        entry
+        for entry in settings["hooks"]["PostToolUse"]
+        if entry.get("matcher") == "EnterWorktree|ExitWorktree"
+    ]
+    assert len(worktree_entries) == 1
+    assert (
+        "omnigent.harnesses.claude_native.hook --bridge-dir"
+        in worktree_entries[0]["hooks"][0]["command"]
+    )
+
+
 @pytest.mark.parametrize(
     "api_key_helper",
     (
