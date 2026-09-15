@@ -135,20 +135,20 @@ the executor declares `supports_live_message_queue()`.
 
 ## Known gaps
 
-* **Sub-agents.** Devin spawns its own via the `run_subagent` tool and
-  `.devin/agents/*.md` profiles. Those calls are mirrored as ordinary tool cards
-  (the `PreToolUse`/`PostToolUse` hooks carry them), but they are **not** promoted
-  to Omnigent sub-agent sessions, so `capabilities.subagents` is `False` and the
-  row carries no `subagent_wrapper_label`. The `devin-acp` harness *does* surface
-  them (via `DevinSubAgentSource` in `omnigent/inner/devin/subagents.py`), so
-  that path is the one to use when sub-agent child sessions matter. Porting the
-  dialect onto the hook stream is the obvious follow-up.
-* **Permission mode in the web composer.** `omnigent devin --permission-mode`
-  works, but the New Chat dialog offers only Model + Effort. The server hard-gates
-  `permission_mode` to `claude-native`
+* **Sub-agent children arrive on completion, not at spawn.** A `run_subagent`
+  delegate is mirrored as a child session only once it finishes: Devin persists
+  the delegate's chain in its own session store and injects a
+  `<subagent_completion_notification>` into the parent, which is the point the
+  chain is complete and stable. So there is no live child view while a delegate
+  runs. Delegates launched with the *same* task text are told apart by the final
+  report that notification quotes (`chain_index_for_report`), since a delegate's
+  own chain carries no `agent_id`.
+* **Permission mode is launch-time only.** The New Chat dialog offers Devin's own
+  rungs (auto / accept-edits / smart / dangerous) as `terminal_launch_args`,
+  because the `permission_mode` *field* is still hard-gated to `claude-native`
   (`_PERMISSION_MODE_HARNESS` in `server/routes/_session_create_validation.py`)
-  and validates it against Claude's vocabulary, so offering Devin's five modes
-  there would fail session creation with a 4xx until that gate is harness-aware.
+  and validated against Claude's vocabulary. Consequence: the mode is fixed at
+  launch — there is no mid-session switch as there is for model and effort.
 * **Token-level streaming.** The forwarder mirrors whole hook events, so it posts
   no `external_output_text_delta`; `capabilities.streaming` is `False` by
   construction. The embedded terminal still shows Devin's own live output.

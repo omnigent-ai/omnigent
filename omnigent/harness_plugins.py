@@ -211,12 +211,13 @@ GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
 )
 
 
-# Devin spawns its own sub-agents in-TUI via the `run_subagent` tool. Those
-# calls are mirrored as ordinary tool cards (the PreToolUse/PostToolUse hooks
-# carry them), but they are NOT promoted to Omnigent sub-agent sessions, so no
-# `subagent_wrapper_label` — which is also what keeps `capabilities.subagents`
-# False (tests/test_harness_capabilities.py derives one from the other). The
-# ACP row (`devin-acp`) does surface them, via `omnigent.inner.devin`.
+# Devin spawns its own sub-agents in-TUI via the `run_subagent` tool. Each call
+# is mirrored as an ordinary tool card (the PreToolUse/PostToolUse hooks carry
+# it) AND promoted to an Omnigent child session once the delegate finishes: the
+# forwarder reconstructs its chain from Devin's own session store (see
+# `harnesses/devin_native/subagents.py`). Hence the `subagent_wrapper_label`
+# below, which is what makes `capabilities.subagents` True
+# (tests/test_harness_capabilities.py derives one from the other).
 DEVIN_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="devin",
     display_name="Devin",
