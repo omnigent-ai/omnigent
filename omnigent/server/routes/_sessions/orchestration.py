@@ -16,7 +16,9 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -80,7 +82,7 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, _runner_supports_harness
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
@@ -371,6 +373,8 @@ from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
 from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -742,7 +746,15 @@ async def _archive_stop(
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return
+        conv = None
+    # Archive is a tombstone: once closed, the session must not keep
+    # reporting a mid-turn status. A dead or wedged runner can't deliver the
+    # stop above, and the disconnect grace would otherwise keep answering
+    # "running" for seconds — settle to the quiet stopped state the Stop
+    # path publishes. Runs even when the row lookup failed, off the cache.
+    live = _session_status_cache.get(session_id, conv.live_status if conv is not None else None)
+    if live in _MID_TURN_STATUSES:
+        _publish_status(session_id, "idle")
     if conv is None or not conv.host_id or not conv.runner_id:
         return
     # Mark the tunnel drop intentional BEFORE tearing it down so the relay
@@ -2932,6 +2944,544 @@ async def _mark_runner_sessions_offline_impl(
             continue
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
+
+
+@dataclass(frozen=True)
+class _OrphanedSubagent:
+    """A mid-turn sub-agent child whose runner died with no live successor.
+
+    :param dead_runner_id: The runner the child was co-located onto when it
+        died, e.g. ``"runner_token_abc123"``.
+    :param owner: The child's effective owner at parking time (the root
+        session's owner when the child carries no direct grant — see
+        :func:`_subagent_effective_owner`), or ``None`` in single-user /
+        no-auth mode.
+    """
+
+    dead_runner_id: str
+    owner: str | None
+
+
+# Orphans parked for adoption by the owner's next connecting runner, keyed by
+# session id. In-memory and per-replica like the status cache the disconnect
+# reconciliation reads; every entry is re-validated against the store before
+# an adoption, so a stale entry can only ever be dropped, never mis-adopted.
+_orphaned_subagent_sessions: OrderedDict[str, _OrphanedSubagent] = OrderedDict()
+_ORPHANED_SUBAGENT_CAP = 512
+
+# Init handshake for an adopted session, supplied by the app wiring (the
+# initializer lives in app scope). Its crash-recovery scan is what resumes a
+# turn the session history shows as interrupted. Must raise when the runner
+# rejects the handshake, so the caller keeps the orphan parked for retry.
+_AdoptedSessionInitializer = Callable[[Conversation, httpx.AsyncClient], Awaitable[None]]
+
+
+def _subagent_is_adoptable(conv: Conversation) -> bool:
+    """
+    Whether an interrupted session belongs to the adoptable population.
+
+    Only a plain sub-agent child qualifies: a host-bound session has a
+    dedicated runner with its own respawn path, and a top-level session's
+    runner is the user-facing process itself — neither may be silently
+    repointed at another runner. A closed or archived child was ended on
+    purpose and is never revived.
+
+    :param conv: The candidate conversation row.
+    :returns: ``True`` when the session may be adopted onto a live runner.
+    """
+    if conv.kind != "sub_agent" or conv.host_id is not None or conv.agent_id is None:
+        return False
+    if conv.archived:
+        return False
+    closed = labels_with_closed_status(conv.labels, conv.title)
+    return closed.get(CLOSED_LABEL_KEY) != CLOSED_LABEL_VALUE
+
+
+async def _subagent_effective_owner(
+    conv: Conversation, conversation_store: ConversationStore
+) -> str | None:
+    """
+    The owner adoption matches runners against.
+
+    A sub-agent child usually carries no direct owner grant — only the root
+    session does — so the direct lookup falls back to the root session's
+    owner, the same resolution :func:`_record_daily_cost` uses. ``None``
+    means single-user / no-auth mode.
+
+    :param conv: The orphaned sub-agent conversation.
+    :param conversation_store: Store for the permission lookups.
+    :returns: The effective owner's user id, or ``None``.
+    """
+    owner = await asyncio.to_thread(conversation_store.get_session_owner, conv.id)
+    if owner is None and conv.root_conversation_id and conv.root_conversation_id != conv.id:
+        owner = await asyncio.to_thread(
+            conversation_store.get_session_owner, conv.root_conversation_id
+        )
+    return owner
+
+
+def _orphan_harness_kind(conv: Conversation, agent_store: AgentStore | None) -> str | None:
+    """
+    The canonical harness the orphan's resumed turn dispatches on.
+
+    :param conv: The orphaned sub-agent conversation.
+    :param agent_store: Store for the agent-spec lookup, or ``None`` when
+        not wired (the capability filter is then skipped).
+    :returns: The canonical harness id, or ``None`` when unresolvable.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    if conv.harness_override:
+        return canonicalize_harness(conv.harness_override) or conv.harness_override
+    if agent_store is None:
+        return None
+    try:
+        spec = _load_agent_spec_for_session(conv, agent_store)
+    except Exception:  # noqa: BLE001 — an unloadable spec means "harness unknown"
+        return None
+    return _spec_harness(spec) if spec is not None else None
+
+
+def _runner_is_session_dedicated(runner_id: str, conversation_store: ConversationStore) -> bool:
+    """
+    Whether a runner is the dedicated runner of a host-bound session.
+
+    Host-launched and managed-sandbox runners serve one session's workspace;
+    adopting a foreign orphan there would resume its work inside the wrong
+    sandbox, so they are never adoption targets.
+
+    :param runner_id: The candidate runner.
+    :param conversation_store: Store for the bound-session lookup.
+    :returns: ``True`` when any session bound to the runner is host-bound.
+    """
+    return any(
+        bound.host_id is not None
+        for bound in conversation_store.list_conversations_by_runner_id(runner_id)
+    )
+
+
+async def _live_ancestor_runner_id(
+    conv: Conversation,
+    dead_runner_id: str,
+    *,
+    conversation_store: ConversationStore,
+    tunnel_registry: TunnelRegistry,
+) -> str | None:
+    """
+    The nearest live ancestor runner — the adoption target to prefer.
+
+    Mirrors the reactive heal's target choice
+    (:func:`_heal_subagent_runner_binding_via_parent`): the parent's (or
+    root's) current runner is the child's natural home — same user, same
+    workspace context, and it hosted this child's harness before.
+
+    :param conv: The orphaned sub-agent conversation.
+    :param dead_runner_id: The departed runner (never a target).
+    :param conversation_store: Store for the ancestor lookups.
+    :param tunnel_registry: Live-runner registry.
+    :returns: A live ancestor runner id, or ``None``.
+    """
+    ancestor_ids: list[str] = []
+    if conv.parent_conversation_id and conv.parent_conversation_id != conv.id:
+        ancestor_ids.append(conv.parent_conversation_id)
+    if (
+        conv.root_conversation_id
+        and conv.root_conversation_id != conv.id
+        and conv.root_conversation_id not in ancestor_ids
+    ):
+        ancestor_ids.append(conv.root_conversation_id)
+    for ancestor_id in ancestor_ids:
+        ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
+        if ancestor is None or ancestor.runner_id is None:
+            continue
+        if ancestor.runner_id == dead_runner_id:
+            continue
+        if tunnel_registry.get(ancestor.runner_id) is not None:
+            return ancestor.runner_id
+    return None
+
+
+async def _orphan_candidate_runner_ok(
+    candidate_id: str,
+    *,
+    owner: str | None,
+    dead_runner_id: str,
+    harness: str | None,
+    conversation_store: ConversationStore,
+    tunnel_registry: TunnelRegistry,
+) -> bool:
+    """
+    Whether a generic online runner may receive an orphan.
+
+    Applies the checks dispatch enforces when validating a pinned runner
+    (owner and harness capability, per
+    :meth:`RunnerRouter._routed_pinned_runner`), plus the dedicated-runner
+    exclusion adoption needs because it *selects* a runner rather than
+    validating one.
+
+    :param candidate_id: The online runner under consideration.
+    :param owner: The orphan's effective owner to match.
+    :param dead_runner_id: The departed runner (never a target).
+    :param harness: The orphan's canonical harness, or ``None`` to skip the
+        capability check.
+    :param conversation_store: Store for the dedicated-runner lookup.
+    :param tunnel_registry: Live-runner registry.
+    :returns: ``True`` when the candidate may adopt the orphan.
+    """
+    if candidate_id == dead_runner_id:
+        return False
+    session = tunnel_registry.get(candidate_id)
+    if session is None:
+        return False
+    if tunnel_registry.runner_owner(candidate_id) != owner:
+        return False
+    if harness is not None and not _runner_supports_harness(session, harness):
+        return False
+    return not await asyncio.to_thread(
+        _runner_is_session_dedicated, candidate_id, conversation_store
+    )
+
+
+async def _adopt_subagent_onto_runner(
+    conv: Conversation,
+    live_runner_id: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter,
+    initialize_session: _AdoptedSessionInitializer | None,
+) -> bool:
+    """
+    Re-bind one orphaned sub-agent to a live runner and restart it there.
+
+    Composes the existing recovery primitives: the row re-bind
+    (:meth:`ConversationStore.replace_runner_id`), the runner session-init
+    handshake — whose crash-recovery scan restarts a turn the persisted
+    history shows as interrupted, exactly as it does for a managed relaunch —
+    and the SSE relay. Adoption counts only when the re-bind AND the resume
+    handshake both land: for an orphan whose parent shares the dead runner no
+    later message ever arrives to initialize it lazily, so a failed client
+    resolution or a rejected init rolls the binding back and reports
+    ``False``, leaving the orphan parked for the next candidate or connect.
+
+    :param conv: The orphaned sub-agent conversation.
+    :param live_runner_id: The live runner to adopt the session onto.
+    :param conversation_store: Store used to persist the re-bind.
+    :param runner_router: Router used to resolve the adopted runner's client.
+    :param initialize_session: Session-init handshake, or ``None`` to skip.
+        Must raise when the runner rejects the handshake.
+    :returns: ``True`` when the session was re-bound and resumed on
+        ``live_runner_id``.
+    """
+    previous_runner_id = conv.runner_id
+    try:
+        adopted = await asyncio.to_thread(
+            conversation_store.replace_runner_id, conv.id, live_runner_id
+        )
+    except ConversationNotFoundError:
+        # Deleted between the orphan scan and the adoption — nothing to do.
+        return False
+
+    async def _roll_back_binding() -> None:
+        # Restore the dead-runner binding so the parked record stays valid
+        # and the next candidate or connecting runner can retry.
+        if previous_runner_id is None:
+            return
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(
+                conversation_store.replace_runner_id, conv.id, previous_runner_id
+            )
+
+    try:
+        routed = runner_router.client_for_session_resources(conv.id)
+    except OmnigentError:
+        _logger.warning(
+            "Adoption: could not resolve a client for runner %s; leaving orphaned "
+            "sub-agent %s parked for retry",
+            live_runner_id,
+            conv.id,
+            extra={"session_id": conv.id},
+        )
+        await _roll_back_binding()
+        return False
+    if initialize_session is not None:
+        try:
+            await initialize_session(adopted, routed.client)
+        except Exception:  # noqa: BLE001 — a failed resume must keep the orphan recoverable
+            _logger.exception(
+                "Adoption: session-init failed for %s on runner %s; leaving it parked",
+                conv.id,
+                live_runner_id,
+                extra={"session_id": conv.id},
+            )
+            await _roll_back_binding()
+            return False
+    _ensure_runner_relay(conv.id, live_runner_id, routed.client, conversation_store)
+    _logger.info(
+        "Adoption: orphaned sub-agent %s re-bound from dead runner %s to %s",
+        conv.id,
+        previous_runner_id,
+        live_runner_id,
+        extra={"session_id": conv.id},
+    )
+    return True
+
+
+_RUNNER_DEATH_ERROR_CODES = ("runner_disconnected", "runner_failed_to_start")
+
+
+async def _dead_runner_orphaned_subagent(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+) -> Conversation | None:
+    """
+    Return the fresh row when a bound session is an adoptable orphan.
+
+    A dead runner's interrupted sessions are settled ``failed`` by whichever
+    watcher notices first — the per-session relay's give-up branch or the
+    disconnect-grace reconciliation — so the orphan test must not depend on
+    that ordering: a session still mid-turn counts, and so does one already
+    failed whose persisted cause is the runner's death. A failure with any
+    other cause is a genuine task error and is left alone.
+
+    :param conv: A session bound to the departed runner.
+    :param conversation_store: Store used to re-read the row (the failure
+        labels may have been persisted after ``conv`` was listed).
+    :returns: The re-read row to adopt, or ``None`` when not an orphan.
+    """
+    if not _subagent_is_adoptable(conv):
+        return None
+    if conv.id in _intentional_stop_sessions:
+        return None
+    live = _session_status_cache.get(conv.id, conv.live_status)
+    if live not in (*_MID_TURN_STATUSES, "failed"):
+        # Idle: the child finished its work before the runner died.
+        return None
+    fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+    if fresh is None or not _subagent_is_adoptable(fresh):
+        return None
+    if live == "failed":
+        last_error = _last_task_error_from_labels(fresh.labels)
+        if last_error is None or last_error.get("code") not in _RUNNER_DEATH_ERROR_CODES:
+            return None
+    return fresh
+
+
+async def _adopt_or_park_orphaned_subagents(
+    affected: list[Conversation],
+    dead_runner_id: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    initialize_session: _AdoptedSessionInitializer | None,
+    agent_store: AgentStore | None = None,
+) -> None:
+    """
+    Proactively recover the mid-turn sub-agent children a dead runner orphaned.
+
+    Runs after the disconnect/crash reconciliation settled the runner's
+    sessions. A sub-agent child inherits its parent's runner at create time,
+    and the reactive stale-binding heal only fires when someone messages the
+    child — with the parent on the same dead runner, nobody ever does, so
+    every child's in-flight work stayed lost until an explicit message
+    arrived. Each orphan (see :func:`_dead_runner_orphaned_subagent`) is
+    re-bound to the nearest live ancestor runner when one is online, else to
+    a live same-owner runner that passes
+    :func:`_orphan_candidate_runner_ok`, and otherwise parked for the
+    owner's next connecting runner
+    (:func:`_adopt_parked_orphans_onto_connected_runner`).
+
+    :param affected: The departed runner's bound sessions, as listed by the
+        reconciliation.
+    :param dead_runner_id: The departed runner those sessions were bound to.
+    :param conversation_store: Store for owner lookups and re-binds.
+    :param runner_router: Router for client resolution; ``None`` (in-process
+        setups) disables adoption.
+    :param tunnel_registry: Live-runner registry; ``None`` disables adoption.
+    :param initialize_session: Session-init handshake for adopted sessions.
+    :param agent_store: Store for the harness-capability filter, or ``None``
+        to skip that filter.
+    :returns: None.
+    """
+    if runner_router is None or tunnel_registry is None:
+        return
+    for listed in affected:
+        try:
+            await _adopt_or_park_one_orphan(
+                listed,
+                dead_runner_id,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                tunnel_registry=tunnel_registry,
+                initialize_session=initialize_session,
+                agent_store=agent_store,
+            )
+        except Exception:  # noqa: BLE001 — one orphan's failure must not strand the rest
+            _logger.exception(
+                "Adoption: recovering orphan %s from dead runner %s failed",
+                listed.id,
+                dead_runner_id,
+                extra={"session_id": listed.id},
+            )
+
+
+async def _adopt_or_park_one_orphan(
+    listed: Conversation,
+    dead_runner_id: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter,
+    tunnel_registry: TunnelRegistry,
+    initialize_session: _AdoptedSessionInitializer | None,
+    agent_store: AgentStore | None,
+) -> None:
+    """Adopt one orphan onto a live runner, or park it for the next connect.
+
+    :param listed: One of the dead runner's bound sessions.
+    :param dead_runner_id: The departed runner.
+    :param conversation_store: Store for owner lookups and re-binds.
+    :param runner_router: Router for client resolution.
+    :param tunnel_registry: Live-runner registry.
+    :param initialize_session: Session-init handshake for adopted sessions.
+    :param agent_store: Store for the harness-capability filter, or ``None``.
+    :returns: None.
+    """
+    conv = await _dead_runner_orphaned_subagent(listed, conversation_store)
+    if conv is None:
+        return
+    owner = await _subagent_effective_owner(conv, conversation_store)
+    harness = await asyncio.to_thread(_orphan_harness_kind, conv, agent_store)
+    targets: list[str] = []
+    ancestor_runner = await _live_ancestor_runner_id(
+        conv,
+        dead_runner_id,
+        conversation_store=conversation_store,
+        tunnel_registry=tunnel_registry,
+    )
+    if ancestor_runner is not None and tunnel_registry.runner_owner(ancestor_runner) == owner:
+        targets.append(ancestor_runner)
+    for candidate_id in tunnel_registry.online_runner_ids():
+        if candidate_id not in targets and await _orphan_candidate_runner_ok(
+            candidate_id,
+            owner=owner,
+            dead_runner_id=dead_runner_id,
+            harness=harness,
+            conversation_store=conversation_store,
+            tunnel_registry=tunnel_registry,
+        ):
+            targets.append(candidate_id)
+    for target_id in targets:
+        if await _adopt_subagent_onto_runner(
+            conv,
+            target_id,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            initialize_session=initialize_session,
+        ):
+            _orphaned_subagent_sessions.pop(conv.id, None)
+            return
+    while len(_orphaned_subagent_sessions) >= _ORPHANED_SUBAGENT_CAP:
+        evicted_id, _ = _orphaned_subagent_sessions.popitem(last=False)
+        _logger.warning(
+            "Adoption: parked-orphan cap reached; dropping oldest entry %s",
+            evicted_id,
+            extra={"session_id": evicted_id},
+        )
+    _orphaned_subagent_sessions[conv.id] = _OrphanedSubagent(
+        dead_runner_id=dead_runner_id, owner=owner
+    )
+
+
+async def _adopt_parked_orphans_onto_connected_runner(
+    runner_id: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    initialize_session: _AdoptedSessionInitializer | None,
+    agent_store: AgentStore | None = None,
+) -> None:
+    """
+    Adopt previously parked orphans onto a runner that just connected.
+
+    The complementary half of :func:`_adopt_or_park_orphaned_subagents`, for
+    the ordering where the dead runner's sessions were reconciled before any
+    live successor existed — the reported incident shape: the orchestrator's
+    runner dies, and the user's next runner comes online minutes later under
+    a fresh id (a relaunch mints a new binding token). Every entry is
+    re-validated against the store, so a session that was healed, closed,
+    archived, or deleted in the meantime is dropped instead of adopted, and
+    the connecting runner must pass the same owner / dedicated / harness
+    checks as a reconciliation-time candidate.
+
+    :param runner_id: The runner that just connected.
+    :param conversation_store: Store for row re-validation and re-binds.
+    :param runner_router: Router for client resolution; ``None`` disables.
+    :param tunnel_registry: Live-runner registry; ``None`` disables.
+    :param initialize_session: Session-init handshake for adopted sessions.
+    :param agent_store: Store for the harness-capability filter, or ``None``
+        to skip that filter.
+    :returns: None.
+    """
+    if runner_router is None or tunnel_registry is None or not _orphaned_subagent_sessions:
+        return
+    owner = tunnel_registry.runner_owner(runner_id)
+    for session_id, record in list(_orphaned_subagent_sessions.items()):
+        try:
+            if record.dead_runner_id == runner_id:
+                # The dead runner came back under its own id; the reconnect
+                # loop already re-initializes its bound sessions.
+                _orphaned_subagent_sessions.pop(session_id, None)
+                continue
+            if record.owner != owner:
+                continue
+            if tunnel_registry.get(record.dead_runner_id) is not None:
+                # The old runner reconnected elsewhere in the meantime.
+                _orphaned_subagent_sessions.pop(session_id, None)
+                continue
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                conv is None
+                or conv.runner_id != record.dead_runner_id
+                or not _subagent_is_adoptable(conv)
+            ):
+                _orphaned_subagent_sessions.pop(session_id, None)
+                continue
+            harness = await asyncio.to_thread(_orphan_harness_kind, conv, agent_store)
+            target_id = await _live_ancestor_runner_id(
+                conv,
+                record.dead_runner_id,
+                conversation_store=conversation_store,
+                tunnel_registry=tunnel_registry,
+            )
+            if target_id is not None and tunnel_registry.runner_owner(target_id) != owner:
+                target_id = None
+            if target_id is None and await _orphan_candidate_runner_ok(
+                runner_id,
+                owner=owner,
+                dead_runner_id=record.dead_runner_id,
+                harness=harness,
+                conversation_store=conversation_store,
+                tunnel_registry=tunnel_registry,
+            ):
+                target_id = runner_id
+            if target_id is None:
+                continue
+            if await _adopt_subagent_onto_runner(
+                conv,
+                target_id,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                initialize_session=initialize_session,
+            ):
+                _orphaned_subagent_sessions.pop(session_id, None)
+        except Exception:  # noqa: BLE001 — one orphan's failure must not strand the rest
+            _logger.exception(
+                "Adoption: draining parked orphan %s onto runner %s failed",
+                session_id,
+                runner_id,
+                extra={"session_id": session_id},
+            )
 
 
 async def _wait_for_host_bound_runner_client(
@@ -10356,6 +10906,8 @@ async def _get_session_snapshot(
 
 __all__ = [
     "_accumulate_session_usage",
+    "_adopt_or_park_orphaned_subagents",
+    "_adopt_parked_orphans_onto_connected_runner",
     "_archive_stop",
     "_best_effort_stop",
     "_bind_and_launch_managed_runner",

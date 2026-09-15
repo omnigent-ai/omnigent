@@ -605,6 +605,8 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _accumulate_session_usage as _accumulate_session_usage,
+    _adopt_or_park_orphaned_subagents as _adopt_or_park_orphaned_subagents,
+    _adopt_parked_orphans_onto_connected_runner as _adopt_parked_orphans_onto_connected_runner,
     _best_effort_stop as _best_effort_stop,
     _context_labels_from_turn_usage as _context_labels_from_turn_usage,
     _bind_and_launch_managed_runner as _bind_and_launch_managed_runner,
@@ -747,6 +749,8 @@ from omnigent.util.session_lifecycle import (
 
 if TYPE_CHECKING:
     __all__ = [
+        "_adopt_or_park_orphaned_subagents",
+        "_adopt_parked_orphans_onto_connected_runner",
         "_agent_carries_native_fork_history",
         "_agent_is_native",
         "_build_policy_engine_from_spec",
