@@ -24,7 +24,6 @@ from omnigent.onboarding.sandboxes.agent_sandbox import (
     API_GROUP,
     API_VERSION,
     DEFAULT_SHUTDOWN_WINDOW_S,
-    MIN_SHUTDOWN_WINDOW_S,
     SANDBOX_PLURAL,
     SHUTDOWN_WINDOW_ENV_VAR,
     STORAGE_CLASS_ENV_VAR,
@@ -32,6 +31,7 @@ from omnigent.onboarding.sandboxes.agent_sandbox import (
     WORKSPACE_VOLUME_NAME,
     AgentSandboxLauncher,
     build_sandbox_manifest,
+    min_shutdown_window_s,
     resolve_shutdown_window_s,
     resolve_workspace_volume,
 )
@@ -314,26 +314,77 @@ def test_window_below_the_floor_is_clamped_up(monkeypatch: pytest.MonkeyPatch) -
     anything pushed it forward, suspending every sandbox mid-run. Clamp, don't
     honour it.
     """
+    floor = min_shutdown_window_s()
     monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "60")
-    assert resolve_shutdown_window_s() == MIN_SHUTDOWN_WINDOW_S
-    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(MIN_SHUTDOWN_WINDOW_S - 1))
-    assert resolve_shutdown_window_s() == MIN_SHUTDOWN_WINDOW_S
+    assert resolve_shutdown_window_s() == floor
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(floor - 1))
+    assert resolve_shutdown_window_s() == floor
     # At or above the floor is honoured verbatim.
-    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(MIN_SHUTDOWN_WINDOW_S))
-    assert resolve_shutdown_window_s() == MIN_SHUTDOWN_WINDOW_S
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(floor))
+    assert resolve_shutdown_window_s() == floor
     monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "1800")
     assert resolve_shutdown_window_s() == 1800
 
 
-def test_floor_outlives_two_server_refresh_intervals() -> None:
+def test_default_window_is_floored_when_interval_is_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    The floor is declared locally to keep the onboarding layer free of a server
-    import; this is what stops the two constants drifting apart.
+    Regression: with a configurable interval, DEFAULT is no longer guaranteed
+    >= floor. Every window path (empty-env, malformed, non-positive) must still
+    be floored, or a busy sandbox suspends between refreshes.
     """
-    from omnigent.server.managed_host_keepalive import _MIN_INTERVAL_S
+    # 1000s interval (under the 3600 cap) -> floor 2000, above the 300 default.
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "1000")
+    monkeypatch.delenv(SHUTDOWN_WINDOW_ENV_VAR, raising=False)  # default path
+    assert min_shutdown_window_s() == 2000
+    assert resolve_shutdown_window_s() == 2000
+    for bad in ("soon", "0", "-5"):
+        monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, bad)
+        assert resolve_shutdown_window_s() >= min_shutdown_window_s()
 
-    assert MIN_SHUTDOWN_WINDOW_S >= 2 * _MIN_INTERVAL_S
-    assert DEFAULT_SHUTDOWN_WINDOW_S >= MIN_SHUTDOWN_WINDOW_S
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_non_finite_interval_falls_back_instead_of_crashing(
+    bad: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    "nan"/"inf" parse as floats but blow up in ceil(2 * x); they must fail safe
+    to the default, not crash launch/keepalive.
+    """
+    from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
+
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", bad)
+    # falls back to the provider-scoped default (agent_sandbox: 60)
+    assert resolve_managed_keepalive_interval_s("agent_sandbox") == 60.0
+    assert min_shutdown_window_s() == 120  # no OverflowError / ValueError
+
+
+def test_lowering_the_interval_lowers_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The experimentation path: a low keepalive interval lets a correspondingly low
+    window through, so a sandbox can be watched suspending seconds after it idles.
+    """
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "15")
+    assert min_shutdown_window_s() == 30
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "30")
+    assert resolve_shutdown_window_s() == 30
+
+
+def test_keep_alive_extend_is_logged_at_debug(
+    fake_clients: tuple[_FakeCore, _FakeCustom], caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The provider logs the new deadline at debug (detail); the user-visible INFO
+    is emitted by the server keepalive loop (see test_managed_host_keepalive),
+    because onboarding-layer loggers do not surface in the server log.
+    """
+    with caplog.at_level(logging.DEBUG, logger="omnigent.onboarding.sandboxes.agent_sandbox"):
+        _launcher().keep_alive(_SANDBOX_ID)
+    matching = [r for r in caplog.records if "extended agent-sandbox" in r.getMessage()]
+    # pins the level, not just the text: an INFO here would double-log with the
+    # server-layer INFO, so the provider line must stay at DEBUG.
+    assert matching and all(r.levelno == logging.DEBUG for r in matching)
 
 
 # ── keep_alive ─────────────────────────────────────────
@@ -345,7 +396,7 @@ def test_keep_alive_pushes_shutdown_time_forward(
     """A single-field merge patch moves the deadline one window out."""
     _, custom = fake_clients
     monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "1800")
-    _launcher().keep_alive(_SANDBOX_ID)
+    assert _launcher().keep_alive(_SANDBOX_ID) is True  # confirmed patch
 
     assert custom.calls == ["patch"]
     name, body = custom.patches[0]
@@ -377,7 +428,9 @@ def test_keep_alive_soft_fails_on_api_error(
     _, custom = fake_clients
     custom.patch_error = _FakeApiException(status=500, reason="ServerTimeout")
     with caplog.at_level(logging.WARNING):
-        _launcher().keep_alive(_SANDBOX_ID)
+        # returns False (attempted, not confirmed) so the server loop skips its
+        # success INFO; must not raise
+        assert _launcher().keep_alive(_SANDBOX_ID) is False
     assert "could not extend agent-sandbox" in caplog.text
 
 
@@ -388,7 +441,8 @@ def test_keep_alive_ignores_a_vanished_sandbox(
     _, custom = fake_clients
     custom.patch_error = _FakeApiException(status=404, reason="NotFound")
     with caplog.at_level(logging.WARNING):
-        _launcher().keep_alive(_SANDBOX_ID)
+        # gone sandbox: nothing extended, so False (no success INFO), but silent
+        assert _launcher().keep_alive(_SANDBOX_ID) is False
     assert caplog.text == ""
 
 
@@ -566,3 +620,19 @@ def test_terminate_still_hard_deletes(
 
     assert custom.deleted == [_SANDBOX_ID]
     assert core.deleted_secrets == [f"{_SANDBOX_ID}-token"]
+
+
+def test_initial_window_floors_at_boot_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A steady window shorter than the boot grace still gets a boot-safe initial
+    (create/wake) deadline, so a short window never reaps a still-booting pod."""
+    from omnigent.onboarding.sandboxes.agent_sandbox import (
+        _BOOT_GRACE_S,
+        initial_shutdown_window_s,
+    )
+
+    # A short steady window (below the boot grace); interval low so it clears the floor.
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "10")
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "30")
+    assert resolve_shutdown_window_s() == 30
+    assert resolve_shutdown_window_s() < _BOOT_GRACE_S
+    assert initial_shutdown_window_s() == _BOOT_GRACE_S
