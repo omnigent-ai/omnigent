@@ -1809,36 +1809,6 @@ async def test_session_snapshot_retries_503_model_options(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_skills_empty_without_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    With no runner bound (neither router nor singleton resolves a
-    client), the deprecated skills fields retain their defaults.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    monkeypatch.setattr(
-        "omnigent.runtime.get_runner_client",
-        lambda: None,
-    )
-    monkeypatch.setattr(
-        "omnigent.runtime.get_runner_router",
-        lambda: None,
-    )
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6222f438412b74067ff5915857f79312",
-    )
-
-    assert snapshot.skills == []
-    assert snapshot.skills_status == "unavailable"
-
-
-@pytest.mark.asyncio
 async def test_session_snapshot_prefers_router_over_singleton(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2453,7 +2423,7 @@ async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
     monkeypatch.setattr(mod, "session_stream", Stream)
     snapshot = await _get_session_snapshot(_ConversationStore([]), "session-menu-independent")  # type: ignore[arg-type]
     await asyncio.sleep(0)
-    assert snapshot.skills == []
-    assert snapshot.skills_status == "unavailable"
+    assert "skills" not in snapshot.model_dump()
+    assert "skills_status" not in snapshot.model_dump()
     assert all(not url.endswith("/skills") for url in calls)
     assert all(event.get("type") != "session.skills" for event in published)

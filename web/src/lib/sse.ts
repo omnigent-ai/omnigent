@@ -45,7 +45,6 @@ import type {
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSupersededEvent,
-  SessionSkillsEvent,
   SessionViewer,
   SessionTerminalActivityEvent,
   SessionStatusEvent,
@@ -944,15 +943,6 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       sessionId,
       terminalId,
     } satisfies SessionTerminalActivityEvent;
-  }
-  if (eventType === "session.skills") {
-    const conversationId = data.conversation_id;
-    if (typeof conversationId !== "string" || !conversationId) return null;
-    // Deprecated server event; retained for wire compatibility until 0.15.0.
-    return {
-      type: "session_skills",
-      conversationId,
-    } satisfies SessionSkillsEvent;
   }
   if (eventType === "session.model_options") {
     const conversationId = data.conversation_id;

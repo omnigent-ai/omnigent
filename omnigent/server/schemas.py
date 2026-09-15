@@ -2102,8 +2102,6 @@ class SessionResponse(BaseModel):
     :param todos: Current native Plan items reported by a harness. Each has
         ``content``, ``status``, and ``activeForm``. Persisted in conversation
         metadata; empty before the first report or after an explicit clear.
-    :param skills: Deprecated; use GET /skills?session_id={id}. Removed in 0.15.0.
-    :param skills_status: Deprecated; removed in 0.15.0 with snapshot skills.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
         each model's supported reasoning efforts. Empty while unavailable.
@@ -2189,12 +2187,6 @@ class SessionResponse(BaseModel):
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
-    skills: list[SkillSummary] = Field(
-        default_factory=list, deprecated="Use GET /skills?session_id={id}; removed in 0.15.0."
-    )
-    skills_status: Literal["loading", "ready", "error", "unavailable"] = Field(
-        default="unavailable", deprecated="Use GET /skills?session_id={id}; removed in 0.15.0."
-    )
     model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
@@ -3462,13 +3454,6 @@ class SessionMcpStartupEvent(_SSEEventBase):
     servers: dict[str, McpServerStartup]
 
 
-class SessionSkillsEvent(_SSEEventBase):
-    """Deprecated discovery nudge; no longer emitted. Removed in 0.15.0."""
-
-    type: Literal["session.skills"]
-    conversation_id: str
-
-
 class SessionModelOptionsEvent(_SSEEventBase):
     """
     Signal that a native session's model catalog has resolved.
@@ -4726,7 +4711,6 @@ ServerStreamEvent = Annotated[
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionMcpStartupEvent
-    | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent

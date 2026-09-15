@@ -28,7 +28,6 @@ from omnigent.server.schemas import (
     ServerStreamEvent,
     SessionCreatedEvent,
     SessionModelOptionsEvent,
-    SessionSkillsEvent,
     SessionStatusEvent,
     is_known_event,
 )
@@ -281,26 +280,6 @@ def test_session_status_waiting_round_trips_through_union() -> None:
     # other variant); status is preserved.
     assert isinstance(parsed, SessionStatusEvent)
     assert parsed.status == "waiting"
-
-
-def test_session_skills_event_round_trips_through_union() -> None:
-    """The deprecated skill event remains parseable until removal in 0.15.0."""
-    event = SessionSkillsEvent(
-        type="session.skills",
-        conversation_id="conv_abc",
-    )
-    dumped = event.model_dump()
-    assert dumped == {
-        "type": "session.skills",
-        "conversation_id": "conv_abc",
-        "sequence_number": None,
-    }
-    parsed = _ADAPTER.validate_python(dumped)
-    # Discriminator must route to SessionSkillsEvent, not some other
-    # ``session.*`` variant; a misroute would mean a duplicate or
-    # shadowed wire type.
-    assert isinstance(parsed, SessionSkillsEvent)
-    assert parsed.conversation_id == "conv_abc"
 
 
 def test_session_model_options_event_round_trips_through_union() -> None:
