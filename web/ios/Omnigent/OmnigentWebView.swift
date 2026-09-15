@@ -350,6 +350,9 @@ struct OmnigentWebView: UIViewRepresentable {
     /// Derived, never stored: a cached copy would be one more thing to keep in sync
     /// with `pinnedURL`.
     private var pinnedOrigin: String? { pinnedURL?.omnigentOrigin }
+    private var pinnedAuthentication: ServerAuthentication {
+      ServerAuthentication(origin: pinnedOrigin)
+    }
     /// Bare-root → mount bounces since the last app page loaded; see
     /// `workspaceRootBounceTarget` for why they're capped.
     private var rootBounces = 0
@@ -521,7 +524,7 @@ struct OmnigentWebView: UIViewRepresentable {
       if let url = webView.url,
         ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
         url.omnigentOrigin != pinnedOrigin,
-        !usesInWebViewAuth(pinnedOrigin)
+        !pinnedAuthentication.usesInWebViewAuth
       {
         webView.stopLoading()
         startLogin(in: webView)
@@ -619,7 +622,7 @@ struct OmnigentWebView: UIViewRepresentable {
         ["http", "https"].contains(scheme),
         url.omnigentOrigin != pinnedOrigin
       {
-        if usesInWebViewAuth(pinnedOrigin) {
+        if pinnedAuthentication.usesInWebViewAuth {
           // Databricks authentication sets its session cookies through the
           // WebView redirect chain. Keep IdP interactions inline, but preserve
           // normal external-link behavior for links tapped on the app page.
