@@ -38,6 +38,7 @@ def _run_gate(
             "release.yml": [101, 102],
             "merge-ready.yml": [201],
             "polly-review.yml": [301],
+            "polly-review-approval-dispatch.yml": [302],
         },
         "fail_api": fail_api,
     }
@@ -99,6 +100,8 @@ else:
         _check("plan", "in_progress", "-", 103),
         _check("evaluate", "completed", "failure", 201),
         _check("Polly AI Review", "in_progress", "-", 301),
+        _check("dispatch", "completed", "failure", 302),
+        _check("dispatch", "in_progress", "-", 302),
     ],
     ids=[
         "previous-release",
@@ -106,6 +109,8 @@ else:
         "current-release",
         "pr-gate",
         "pr-review",
+        "pr-approval-dispatch-failed",
+        "pr-approval-dispatch-pending",
     ],
 )
 def test_release_ignores_its_own_and_pr_automation_checks(tmp_path: Path, ignored: str) -> None:
@@ -152,7 +157,14 @@ def test_release_preserves_accepted_conclusions(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "api", ["release.yml", "merge-ready.yml", "polly-review.yml", "check-runs"]
+    "api",
+    [
+        "release.yml",
+        "merge-ready.yml",
+        "polly-review.yml",
+        "polly-review-approval-dispatch.yml",
+        "check-runs",
+    ],
 )
 def test_release_fails_closed_when_api_lookup_fails(tmp_path: Path, api: str) -> None:
     result = _run_gate(tmp_path, [_check("Pytest", "completed", "success", 401)], fail_api=api)

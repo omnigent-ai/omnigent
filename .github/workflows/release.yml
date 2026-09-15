@@ -186,7 +186,9 @@ jobs:
           # Exclude their workflow run IDs, preserving real CI with similar job names.
           # Include this run explicitly in case the API has not indexed it yet.
           ignored_runs="${GITHUB_RUN_ID}"
-          for workflow in release.yml merge-ready.yml polly-review.yml; do
+          # workflow_run approval relays also attach checks to main, not the PR head.
+          # Revisit these exclusions if any listed workflow starts validating release code.
+          for workflow in release.yml merge-ready.yml polly-review.yml polly-review-approval-dispatch.yml; do
             workflow_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs?head_sha=${BASE_SHA}&per_page=100" \
               --paginate --jq '.workflow_runs[].id')"
             ignored_runs="${ignored_runs}"$'\n'"${workflow_runs}"
