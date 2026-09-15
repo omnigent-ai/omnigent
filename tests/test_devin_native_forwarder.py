@@ -140,19 +140,20 @@ class _FakeClient:
         self.patches.append((url, json or {}))
         return _FakeResponse()
 
-    def _items(self, session_id: str, item_type: str) -> list[dict[str, Any]]:
+    def _items(self, session_id: str, item_type: str | None) -> list[dict[str, Any]]:
+        """Items posted to *session_id*; ``item_type=None`` returns every type."""
         return [
             body["data"]["item_data"]
             for url, body in self.posts
             if url == f"/v1/sessions/{session_id}/events"
             and body.get("type") == "external_conversation_item"
-            and body["data"]["item_type"] == item_type
+            and (item_type is None or body["data"]["item_type"] == item_type)
         ]
 
     def items(self, item_type: str) -> list[dict[str, Any]]:
         return self._items("conv_abc", item_type)
 
-    def child_items(self, child_id: str, item_type: str) -> list[dict[str, Any]]:
+    def child_items(self, child_id: str, item_type: str | None) -> list[dict[str, Any]]:
         return self._items(child_id, item_type)
 
     def events(self, event_type: str, *, session_id: str = "conv_abc") -> list[dict[str, Any]]:
@@ -747,6 +748,73 @@ async def test_completed_subagent_is_mirrored_as_a_child(
     assert len(statuses) == 1 and statuses[0]["status"] == "idle"
     assert statuses[0]["response_id"] == "devin:subagent:690d786b"
     assert state.subagents["690d786b"]["mirrored"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_partial_subagent_mirror_resumes_instead_of_duplicating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure mid-transcript must not re-post what already landed.
+
+    ``external_conversation_item`` is not idempotent and the sub-agent's chain is
+    stable once its completion notification is in, so the retry continues from the
+    item that failed rather than replaying the child from the top.
+    """
+    import omnigent.harnesses.devin_native.forwarder as fwd
+
+    monkeypatch.setattr(fwd, "devin_sessions_db_path", lambda _env: tmp_path / "sessions.db")
+    monkeypatch.setattr(fwd, "load_message_nodes", lambda _db, _sid: _SUBAGENT_FIXTURE)
+
+    class _FailsMidTranscript(_FakeClient):
+        """Rejects the 3rd child item once, then behaves."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.child_item_posts = 0
+            self.failed = False
+
+        async def post(self, url: str, json: dict[str, Any] | None = None) -> _FakeResponse:
+            body = json or {}
+            if body.get("type") == "external_conversation_item" and "conv_child" in url:
+                self.child_item_posts += 1
+                if self.child_item_posts == 3 and not self.failed:
+                    self.failed = True
+                    raise httpx.ConnectError("dropped mid-transcript")
+            return await super().post(url, json=body)
+
+    client = _FailsMidTranscript()
+    payloads = [
+        {"hook_event_name": "SessionStart", "source": "startup", "session_id": "possible-umbra"},
+        _run_subagent_post("690d786b", _ONE_TASK, "Write one.txt"),
+        {"hook_event_name": "Stop", "session_id": "possible-umbra", "prompt_id": "p1"},
+    ]
+    state, _turn = await _drive(client, payloads, tmp_path)
+    info = state.subagents["690d786b"]
+    assert info["mirrored"] is False, "a partial mirror must not look complete"
+    assert info["items_posted"] == 2, "the cursor records only what landed"
+    partial = len(client.child_items("conv_child_690d786b", None))
+
+    # The next turn-end retries; nothing already posted is sent twice.
+    await _drive(
+        client, [{"hook_event_name": "Stop", "session_id": "possible-umbra"}], tmp_path, state
+    )
+    assert state.subagents["690d786b"]["mirrored"] is True
+
+    starts = [
+        b["data"] for _u, b in client.posts if b.get("type") == "external_devin_subagent_start"
+    ]
+    assert len(starts) == 1, "the retry must reuse the child, not mint a second one"
+
+    all_items = client.child_items("conv_child_690d786b", None)
+    assert len(all_items) > partial, "the retry delivered the rest"
+    # Every message text appears exactly once across both attempts.
+    texts = [
+        part.get("text")
+        for item in all_items
+        for part in (item.get("content") or [])
+        if isinstance(part, dict) and part.get("text")
+    ]
+    assert len(texts) == len(set(texts)), f"duplicate items re-posted: {texts}"
 
 
 @pytest.mark.asyncio

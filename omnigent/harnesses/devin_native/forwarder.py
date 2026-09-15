@@ -485,11 +485,10 @@ async def _mirror_completed_subagents(
     is complete and stable — reconstruct it and post it once.
 
     Best-effort per sub-agent: one child's POST failure is suppressed so it never
-    kills the main mirror, and ``mirrored`` is set only on full success.
-
-    # ponytail: a failure after the child is minted but mid-transcript re-posts
-    # that sub-agent's items on the next turn-end (external_conversation_item is
-    # not idempotent). Rare and cosmetic; add a per-item cursor if it bites.
+    kills the main mirror, and ``mirrored`` is set only on full success. A partial
+    failure resumes from its own cursor — the minted child and the count of items
+    already posted are both recorded, because ``external_conversation_item`` is
+    not idempotent and the chain is stable once the completion notification is in.
     """
     pending = {aid: info for aid, info in state.subagents.items() if not info.get("mirrored")}
     if not pending or not state.devin_session_id:
@@ -525,17 +524,24 @@ async def _mirror_completed_subagents(
         claimed.add(index)
         chain = chains_by_task[task][index]
         try:
-            child_id = await _start_subagent_child(
-                client,
-                session_id=session_id,
-                agent_id=agent_id,
-                title=str(info.get("title") or ""),
-                tool_use_id=str(info.get("tool_use_id") or ""),
-            )
-            if child_id is None:
-                continue
+            # Reuse the child a previous partial attempt minted, so a retry adds
+            # to that transcript instead of opening a second one.
+            child_id = info.get("child_id")
+            if not isinstance(child_id, str) or not child_id:
+                child_id = await _start_subagent_child(
+                    client,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    title=str(info.get("title") or ""),
+                    tool_use_id=str(info.get("tool_use_id") or ""),
+                )
+                if child_id is None:
+                    continue
+                info["child_id"] = child_id
             response_id = f"devin:subagent:{agent_id}"
-            for item_type, item_data in transcript_items(chain, agent_name):
+            posted = info.get("items_posted")
+            posted = posted if isinstance(posted, int) and posted > 0 else 0
+            for item_type, item_data in transcript_items(chain, agent_name)[posted:]:
                 await _post_item(
                     client,
                     session_id=child_id,
@@ -543,6 +549,8 @@ async def _mirror_completed_subagents(
                     item_data=item_data,
                     response_id=response_id,
                 )
+                posted += 1
+                info["items_posted"] = posted
             await post_external_session_status(
                 client, session_id=child_id, status="idle", response_id=response_id
             )
