@@ -151,6 +151,15 @@ the executor declares `supports_live_message_queue()`.
   control cycles the mode in the TUI (`inject_permission_mode` presses Shift+Tab
   and re-reads the composer marker), so the stored mode is always the one the
   pane confirmed.
+* **A `!` shell command typed in the pane is invisible to Chat.** Devin's bang
+  prefix is a TUI-local shell escape: it fires no hook, writes no `message_nodes`
+  entry, and never reaches the ATIF export, so there is no channel to mirror it
+  from (claude-native can only do this because Claude Code writes `<bash-input>` /
+  `<bash-stdout>` records into the transcript the forwarder tails). Sending the
+  same `!cmd` from the web composer *does* appear, because the injected paste
+  bypasses Devin's bang interception: Devin takes it as a message and the agent
+  runs it as an `exec` tool call — governed by policy, with a tool card — rather
+  than as a local shell.
 * **Token-level streaming.** The forwarder mirrors whole hook events, so it posts
   no `external_output_text_delta`; `capabilities.streaming` is `False` by
   construction. The embedded terminal still shows Devin's own live output.
