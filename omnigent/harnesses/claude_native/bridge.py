@@ -4477,10 +4477,13 @@ def set_permission_mode(
         )
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path, tmux_target = info["socket_path"], info["tmux_target"]
-    # The footer only renders once the input box is mounted; without
-    # this gate a shift+tab sent mid-boot is dropped and the read below
-    # reports a mode the keystroke never reached.
-    _wait_for_claude_prompt_ready(socket_path, tmux_target, timeout_s=timeout_s)
+    # Confirm the input box is mounted by reading the permission-mode footer
+    # (every cycleable mode renders one, and it stays on screen while a turn
+    # is running). Gating on the idle chat composer instead — the
+    # message-delivery readiness gate — spuriously fails a mode toggle sent
+    # mid-turn or during a brief repaint, even though shift+tab would cycle
+    # the footer fine. A settled footer read proves the box is mounted, so the
+    # shift+tab below is not dropped, without requiring the composer be idle.
     current = _read_settled_permission_mode(socket_path, tmux_target)
     if current is None:
         pane = _capture_pane(socket_path, tmux_target)

@@ -5292,6 +5292,72 @@ def test_set_permission_mode_raises_when_footer_never_renders(
         claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
 
 
+class _FakeBusyModeCycleTmux:
+    """tmux stand-in whose pane shows the mode footer while a turn is running.
+
+    The input box is mounted (the footer renders) but the composer is not at
+    an idle ``❯`` prompt, so the idle-composer readiness gate would time out.
+    Cycling still works: shift+tab advances the footer mid-turn.
+    """
+
+    _FOOTERS = {
+        "default": "⏸ manual mode on",
+        "acceptEdits": "⏵⏵ accept edits on (shift+tab to cycle)",
+        "plan": "⏸ plan mode on (shift+tab to cycle)",
+        "auto": "⏵⏵ auto mode on (shift+tab to cycle)",
+    }
+
+    def __init__(self, cycle: list[str], start: str = "default") -> None:
+        self.cycle = cycle
+        self.index = cycle.index(start)
+        self.presses = 0
+
+    def run(self, cmd: list[str], **kwargs: object) -> object:
+        del kwargs
+        if "capture-pane" in cmd:
+            # A running indicator sits where the idle ❯ composer would be, so
+            # _claude_prompt_rendered is False — but the mode footer still
+            # renders below the box rule.
+            pane = (
+                "✻ Crunching… (12s · esc to interrupt)\n"
+                "──────────────────────────────────────\n"
+                "  Opus 5 │ 42.0k/1M (4%)\n"
+                f"  {self._FOOTERS[self.cycle[self.index]]}\n"
+            )
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if cmd[-1] == "BTab":
+            self.presses += 1
+            self.index = (self.index + 1) % len(self.cycle)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def test_set_permission_mode_switches_mid_turn_without_an_idle_composer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A mode toggle lands while a turn is running.
+
+    Cycling shift+tab only needs the input box mounted — proven by the mode
+    footer — not the idle ``❯`` composer. Requiring the idle composer made a
+    toggle sent mid-turn time out and fail on a healthy terminal; gating on
+    the footer lets the switch proceed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeBusyModeCycleTmux(["default", "acceptEdits", "plan", "auto"])
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert got == "auto", f"Expected the mid-turn toggle to reach auto, got {got!r}."
+    assert fake.presses == 3, f"Expected 3 presses (default->auto), got {fake.presses}."
+
+
 def test_set_permission_mode_raises_when_tmux_target_never_published(
     tmp_path: Path,
 ) -> None:
