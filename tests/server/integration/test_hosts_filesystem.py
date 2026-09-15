@@ -31,6 +31,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -187,6 +189,23 @@ async def fs_setup(
             if not isinstance(text, str):
                 continue
             frame = decode_host_frame(text)
+            if isinstance(frame, HostSkillsFrame):
+                reply = replies[f"skills:{frame.harness}:{frame.path}"]
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostSkillsResultFrame(
+                                request_id=frame.request_id,
+                                status=reply.get("status", "ok"),
+                                skills=reply.get("skills", []),
+                                error=reply.get("error"),
+                                error_code=reply.get("error_code"),
+                            )
+                        ),
+                    }
+                )
+                continue
             if isinstance(frame, HostModelOptionsFrame):
                 reply = replies.get(f"model:{frame.harness}", {})
                 await comm.send_input(
@@ -264,6 +283,96 @@ async def test_list_filesystem_survives_idle_mock_host(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem")
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    "reply,status,expected",
+    [
+        (
+            {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
+            200,
+            {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
+        ),
+        ({"skills": []}, 200, {"skills": []}),
+        (
+            {"status": "failed", "error_code": "not_directory", "error": "directory missing"},
+            404,
+            {"detail": "directory missing"},
+        ),
+        (
+            {"status": "failed", "error_code": "invalid_path", "error": "invalid directory"},
+            400,
+            {"detail": "invalid directory"},
+        ),
+        (
+            {"status": "failed", "error_code": "discovery_failed", "error": "discovery failed"},
+            502,
+            {"detail": "discovery failed"},
+        ),
+    ],
+)
+async def test_host_skills_round_trip_without_session(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+    reply: dict[str, Any],
+    status: int,
+    expected: dict[str, Any],
+) -> None:
+    app, registry, _comm, replies, _drain = fs_setup
+    replies["skills:claude-sdk:~/project with spaces"] = reply
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/claude/skills",
+            params={"path": "~/project with spaces"},
+        )
+    assert response.status_code == status, response.text
+    assert response.json() == expected
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    assert conn.pending_skills == {}
+
+
+@pytest.mark.parametrize("params", [{}, {"path": ""}])
+async def test_host_skills_requires_directory(
+    fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    params: dict[str, str],
+) -> None:
+    app, _registry, _host_store, _conv_store = fs_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/skills",
+            params=params,
+        )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "host_state,status", [("missing", 404), ("offline", 409), ("other_replica", 400)]
+)
+async def test_host_skills_requires_connected_host(
+    fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    host_state: str,
+    status: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.server.routes._host_launch._deployment_is_sharded", lambda: True)
+    app, registry, host_store, _conv_store = fs_app
+    if host_state != "missing":
+        host_store.upsert_on_connect(_HOST_ID, "test-host", "local")
+        if host_state == "offline":
+            host_store.set_offline(_HOST_ID)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/skills",
+            params={"path": "~"},
+        )
+    assert response.status_code == status, response.text
+    assert registry.get(_HOST_ID) is None
 
 
 async def test_host_model_options_returns_prelaunch_catalog(

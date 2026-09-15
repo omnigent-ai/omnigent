@@ -885,15 +885,7 @@ export interface SessionTerminalActivityEvent {
   terminalId: string;
 }
 
-/**
- * `session.skills` — the session's runner-owned skills just resolved
- * (the server's background fetch populated its per-session skills cache).
- * Skills are fetched off the snapshot hot path, so the snapshot serves
- * an empty list until the fetch lands; this event is the "skills are
- * ready, re-read the snapshot" nudge. Consumers refetch the session
- * snapshot and apply its now-populated `skills` to fill the composer's
- * slash-command menu. Carries no payload beyond the conversation id.
- */
+/** @deprecated No longer emitted or consumed; removed in 0.15.0. */
 export interface SessionSkillsEvent {
   type: "session_skills";
   conversationId: string;

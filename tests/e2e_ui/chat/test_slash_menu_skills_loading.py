@@ -1,4 +1,4 @@
-"""The open slash menu settles skill discovery through the real SSE consumer."""
+"""The open slash menu settles directly from a host discovery response."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _mock_starting_runner(page: Page, session_id: str) -> None:
 
 @pytest.mark.parametrize("empty", [False, True], ids=["skills-found", "no-skills"])
 @pytest.mark.parametrize("phase", ["discovery", "runner-starting", "sandbox-starting"])
-def test_open_slash_menu_resolves_skills_on_sse(
+def test_open_slash_menu_resolves_skills_from_host(
     page: Page,
     seeded_session: tuple[str, str],
     empty: bool,
@@ -47,34 +47,26 @@ def test_open_slash_menu_resolves_skills_on_sse(
     base_url, session_id = seeded_session
     session_path = f"/v1/sessions/{session_id}"
     resolved = False
-    snapshot_reads = 0
+    skill_requests: list[Route] = []
     if phase != "discovery":
         _mock_starting_runner(page, session_id)
 
     def snapshot(route: Route) -> None:
-        nonlocal snapshot_reads
         if urlparse(route.request.url).path != session_path or route.request.method != "GET":
-            route.continue_()
+            route.fallback()
             return
         response = route.fetch()
         body = response.json()
-        snapshot_reads += 1
-        body["skills_status"] = (
-            "ready" if resolved else "loading" if phase == "discovery" else "unavailable"
-        )
+        body.update(host_id="menu-host", workspace="/workspace")
         if phase != "discovery":
             body["created_at"] = time.time()
             body["runner_online"] = False
         if phase == "sandbox-starting":
             body["sandbox_status"] = None if resolved else {"stage": "provisioning"}
-        body["skills"] = (
-            [{"name": "code-review", "description": "Review the current change"}]
-            if resolved and not empty
-            else []
-        )
         route.fulfill(response=response, json=body)
 
     page.route(f"**{session_path}*", snapshot)
+    page.route(f"**{session_path}/skills", lambda route: skill_requests.append(route))
     _install_stream_controller(page, session_id)
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
@@ -89,13 +81,16 @@ def test_open_slash_menu_resolves_skills_on_sse(
     # Filter out built-ins: the loading subsection must keep the menu open.
     composer.fill("/review")
     expect(page.get_by_text("Loading skills…", exact=True)).to_be_visible()
-    reads_before_event = snapshot_reads
+    assert len(skill_requests) == 1
     resolved = True
-    _push_sse(page, "session.skills", {"type": "session.skills", "conversation_id": session_id})
-
-    # The fallback read waits five seconds; this must settle directly from SSE.
+    skill_requests[0].fulfill(
+        json={
+            "skills": []
+            if empty
+            else [{"name": "code-review", "description": "Review the current change"}]
+        }
+    )
     expect(page.get_by_text("Loading skills…", exact=True)).not_to_be_visible(timeout=3_000)
-    assert snapshot_reads > reads_before_event
     expect(composer).to_have_value("/review")
     if empty:
         expect(page.get_by_text("No matching skills", exact=True)).to_be_visible()
@@ -180,14 +175,14 @@ def test_slash_menu_stops_loading_when_sandbox_launch_fails(
 
     def snapshot(route: Route) -> None:
         if urlparse(route.request.url).path != session_path or route.request.method != "GET":
-            route.continue_()
+            route.fallback()
             return
         response = route.fetch()
         body = response.json()
         body.update(
             created_at=time.time(),
-            skills=[],
-            skills_status="unavailable",
+            host_id=None,
+            workspace=None,
             sandbox_status={"stage": "provisioning"},
         )
         route.fulfill(response=response, json=body)

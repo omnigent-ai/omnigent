@@ -1,3 +1,4 @@
+import { useSessionSkills } from "@/hooks/useSessionSkills";
 import {
   HarnessPicker,
   HarnessPickerConfigRow,
@@ -171,7 +172,7 @@ import {
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
@@ -2079,8 +2080,7 @@ interface ComposerProps {
  * menu iterates ``Object.entries`` and the user sees built-ins
  * before skills.
  *
- * :param skills: ``Session.skills`` from the snapshot, defaulting
- *     to ``[]`` when the wire field is absent (older servers).
+ * :param skills: Session skill metadata returned by host discovery.
  * :param showEffort: Whether this session supports Web UI effort controls.
  * :param showModel: Whether to include ``/model`` (in-process sessions
  *     and claude-native, which both honor ``conv.model_override``; see
@@ -2122,7 +2122,7 @@ export function buildSlashCommandMap(
  * known skill to a ``slash_command`` event (in-process) or plaintext
  * (native sessions).
  *
- * :param skills: ``Session.skills`` from the snapshot.
+ * :param skills: Session skill metadata returned by host discovery.
  * :param showEffort: Whether ``/effort`` should be selectable.
  * :param showModel: Whether ``/model`` should be selectable (same gate
  *     as :func:`buildSlashCommandMap`'s ``showModel``).
@@ -2685,17 +2685,13 @@ function ComposerImpl(
     setSessionDraft(conversationId, { text: fullText, files, replyDraft: storedReplyDraft });
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
-  // Session skills (bundled + host-discovered) come from the snapshot
-  // on bind. Codex-native invokes skills with `$`; other harnesses use `/`.
-  const skills = useChatStore((s) => s.skills);
-  const reportedSkillsStatus = useChatStore((s) => s.skillsStatus);
   const terminalPending = useChatStore((s) => s.terminalPending);
-  // Discovery cannot start until the runner connects; its launch is still loading.
-  const skillsStatus =
-    reportedSkillsStatus === "unavailable" && (runnerStarting || terminalPending)
-      ? "loading"
-      : reportedSkillsStatus;
-  const refreshSkills = useChatStore((s) => s.refreshSkills);
+  const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);
+  const {
+    skills,
+    skillsStatus,
+    refetch: refreshSkills,
+  } = useSessionSkills(composerSession, hostOnline, runnerStarting || terminalPending);
   // ``/model`` writes ``conv.model_override`` (the same column the REPL's
   // ``/model`` and native pickers write). In-process harnesses re-resolve
   // it each turn; native wrappers expose it only when they have a picker
@@ -2773,27 +2769,23 @@ function ComposerImpl(
   const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
 
   // New queries select the first match; asynchronous arrivals retain the selected name.
-  const prevMenuMatchesRef = useRef<{ query: string; names: string[] }>({ query: "", names: [] });
+  const [previousMenuMatches, setPreviousMenuMatches] = useState<{
+    query: string;
+    names: string[];
+  }>({ query: "", names: [] });
   if (
-    menuQuery !== prevMenuMatchesRef.current.query ||
-    menuMatches.length !== prevMenuMatchesRef.current.names.length ||
-    menuMatches.some((m, i) => m !== prevMenuMatchesRef.current.names[i])
+    menuQuery !== previousMenuMatches.query ||
+    menuMatches.length !== previousMenuMatches.names.length ||
+    menuMatches.some((m, i) => m !== previousMenuMatches.names[i])
   ) {
-    const previousName = prevMenuMatchesRef.current.names[menuIndex];
+    const previousName = previousMenuMatches.names[menuIndex];
     const retainedIndex =
-      prevMenuMatchesRef.current.query === menuQuery && previousName
+      previousMenuMatches.query === menuQuery && previousName
         ? menuMatches.indexOf(previousName)
         : -1;
-    prevMenuMatchesRef.current = { query: menuQuery, names: menuMatches };
+    setPreviousMenuMatches({ query: menuQuery, names: menuMatches });
     setMenuIndex(retainedIndex >= 0 ? retainedIndex : menuMatches.length > 0 ? 0 : -1);
   }
-
-  useEffect(() => {
-    if (!menuOpen || skillsStatus !== "loading") return;
-    // Recover a missed SSE nudge once while the user is waiting for this menu.
-    const timer = window.setTimeout(() => void refreshSkills(false), 5_000);
-    return () => window.clearTimeout(timer);
-  }, [menuOpen, skillsStatus, refreshSkills]);
 
   // "@"-mention is a drill-down file/folder browser. The token after "@"
   // doubles as a path: text up to the last "/" is the directory being

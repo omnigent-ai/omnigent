@@ -1,3 +1,6 @@
+import { create } from "zustand";
+import type { SkillSummary, SkillsStatus } from "@/lib/types";
+
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -10,7 +13,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore } from "@/store/chatStore";
+import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -114,7 +117,6 @@ import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, shouldQueueSend } from "./ChatPage";
-import type { QueuedMessage } from "@/store/chatStore";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -388,7 +390,7 @@ describe("Composer send shortcut", () => {
   beforeEach(() => {
     localStorage.clear();
     clearSessionDrafts();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_shortcut",
       skills: [{ name: "deslop", description: "Remove AI slop" }],
     });
@@ -563,7 +565,7 @@ describe("Composer slash-command menu", () => {
     // Skills fill the textarea (with a trailing space) on selection rather
     // than executing, which lets us assert the completed value directly
     // without invoking store actions like compact().
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
@@ -721,7 +723,7 @@ describe("Composer slash-command submit routing", () => {
   const realSetModel = useChatStore.getState().setModel;
 
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
@@ -1268,7 +1270,7 @@ describe("Composer cached model labels", () => {
     composerSnapshotHost.id = scope.hostId;
     vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
-    useChatStore.setState({
+    setComposerState({
       conversationId: scope.sessionId,
       sessionHostId: scope.hostId,
       boundAgentId: scope.agentId,
@@ -1394,7 +1396,7 @@ describe("Composer cached model labels", () => {
 
 describe("Composer model/effort label", () => {
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       selectedModel: null,
@@ -1966,7 +1968,7 @@ describe("Composer shared visible controls", () => {
 
 describe("Composer effort slash-command visibility", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
 
   afterEach(() => {
@@ -2068,7 +2070,7 @@ describe("Composer Codex Plan-mode control", () => {
   const realSetCodexPlanMode = useChatStore.getState().setCodexPlanMode;
 
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       codexPlanMode: false,
       skills: [],
@@ -2253,7 +2255,7 @@ describe("Composer native skill menu", () => {
 describe("Composer asynchronous skills", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_loading_skills",
       skills: [],
       skillsStatus: "loading",
@@ -2263,7 +2265,7 @@ describe("Composer asynchronous skills", () => {
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
-    useChatStore.setState({ skills: [], skillsStatus: null, terminalPending: false });
+    setComposerState({ skills: [], skillsStatus: null, terminalPending: false });
     vi.useRealTimers();
   });
 
@@ -2271,7 +2273,7 @@ describe("Composer asynchronous skills", () => {
     { runnerStarting: true, terminalPending: false },
     { runnerStarting: false, terminalPending: true },
   ])("waits for skills while the session starts: %j", ({ runnerStarting, terminalPending }) => {
-    useChatStore.setState({ skillsStatus: "unavailable", terminalPending });
+    setComposerState({ skillsStatus: "unavailable", terminalPending });
     const props = composerProps({ runnerStarting });
     render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "/review" } });
@@ -2280,7 +2282,7 @@ describe("Composer asynchronous skills", () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).not.toHaveBeenCalled();
     act(() =>
-      useChatStore.setState({
+      setComposerState({
         skills: [{ name: "code-review", description: "Review code" }],
         skillsStatus: "ready",
       }),
@@ -2291,7 +2293,7 @@ describe("Composer asynchronous skills", () => {
   });
 
   it("stops showing startup loading when the runner stays disconnected", () => {
-    useChatStore.setState({ skillsStatus: "unavailable" });
+    setComposerState({ skillsStatus: "unavailable" });
     const props = composerProps({ runnerStarting: true });
     const { rerender } = render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
@@ -2302,7 +2304,7 @@ describe("Composer asynchronous skills", () => {
   });
 
   it("shows discovery errors even when the session is still starting", () => {
-    useChatStore.setState({ skillsStatus: "error" });
+    setComposerState({ skillsStatus: "error" });
     render(<Composer {...composerProps({ runnerStarting: true })} />);
     fireEvent.change(textarea(), { target: { value: "/review" } });
     expect(screen.queryByText("Loading skills…")).toBeNull();
@@ -2319,32 +2321,12 @@ describe("Composer asynchronous skills", () => {
     expect(screen.queryByText("Loading skills…")).toBeNull();
   });
 
-  it("recovers a missed notification once without polling while discovery stays loading", async () => {
-    vi.useFakeTimers();
-    const original = useChatStore.getState().refreshSkills;
-    const refreshSkills = vi.fn(async () => {
-      await Promise.resolve();
-      useChatStore.setState({ skills: [], skillsStatus: "loading" });
-    });
-    useChatStore.setState({ refreshSkills });
-    try {
-      render(<Composer {...composerProps()} />);
-      fireEvent.change(textarea(), { target: { value: "/review" } });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(5_000);
-      });
-      expect(refreshSkills).toHaveBeenCalledExactlyOnceWith(false);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(15_000);
-      });
-      expect(refreshSkills).toHaveBeenCalledOnce();
-      act(() => useChatStore.setState({ skillsStatus: "ready" }));
-      act(() => vi.advanceTimersByTime(5_000));
-      expect(refreshSkills).toHaveBeenCalledOnce();
-    } finally {
-      cleanup();
-      useChatStore.setState({ refreshSkills: original });
-    }
+  it("retries the host catalog directly", () => {
+    setComposerState({ skillsStatus: "error" });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(skillsFixture.getState().refetch).toHaveBeenCalledOnce();
   });
 
   it("preserves the highlighted command when skills arrive", () => {
@@ -2353,7 +2335,7 @@ describe("Composer asynchronous skills", () => {
     fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     const selected = activeRow()?.textContent;
     act(() =>
-      useChatStore.setState({
+      setComposerState({
         skills: [{ name: "review", description: "Review code" }],
         skillsStatus: "ready",
       }),
@@ -2373,7 +2355,7 @@ describe("Composer asynchronous skills", () => {
     expect(props.onSend).not.toHaveBeenCalled();
     expect(textarea()).toHaveValue("/review");
     act(() =>
-      useChatStore.setState({
+      setComposerState({
         skills: [{ name: "code-review", description: "Review code" }],
         skillsStatus: "ready",
       }),
@@ -2467,7 +2449,7 @@ describe("SlashCommandMenu", () => {
 // regression where the WHOLE draft tints (not just the token) is caught.
 describe("Composer slash-command highlight overlay", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
   afterEach(() => cleanup());
 
@@ -2618,7 +2600,7 @@ describe("Composer pending elicitation", () => {
   }
 
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
 
   afterEach(() => {
@@ -2700,7 +2682,7 @@ describe("Composer reply quotes", () => {
   beforeEach(() => {
     clearSessionDrafts();
     localStorage.clear();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       blocks: [],
@@ -3257,7 +3239,7 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
 // the next keystroke does nothing until the chat box is clicked again.
 describe("Composer file-attachment focus", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
     // Drafts persist per conversation: without this, a file attached by one
     // test is restored into the next one's composer.
     clearSessionDrafts();
@@ -3383,7 +3365,7 @@ describe("Composer file-attachment focus", () => {
 // sub-agent so the composer reads as messaging the child, not the orchestrator.
 describe("Composer sub-agent tray", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
 
   afterEach(() => {
@@ -3465,7 +3447,7 @@ describe("Composer trays dock onto the workspace bar", () => {
   }
 
   it("renders the queued strip inside the workspace bar's column wrapper", () => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
@@ -3479,7 +3461,7 @@ describe("Composer trays dock onto the workspace bar", () => {
   });
 
   it("renders the sub-agent tray inside the workspace bar's column wrapper", () => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
     render(<Composer {...composerProps({ subAgentLabel: "check-account-eligibility" })} />);
     const tray = document.querySelector('[data-testid="composer-subagent-tray"]');
     expect(tray).not.toBeNull();
@@ -3531,7 +3513,7 @@ describe("Composer — queued-message flush gating", () => {
 
 describe("Composer config gear", () => {
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       selectedModel: null,
@@ -4251,3 +4233,33 @@ describe("shouldQueueSend", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")], false, true)).toBe(false);
   });
 });
+
+const skillsFixture = create<{
+  skills: SkillSummary[];
+  skillsStatus: SkillsStatus | null;
+  refetch: ReturnType<typeof vi.fn>;
+}>(() => ({ skills: [], skillsStatus: null, refetch: vi.fn() }));
+
+vi.mock("@/hooks/useSessionSkills", () => ({
+  useSessionSkills: (_session: unknown, _online: unknown, starting: boolean) => {
+    const state = skillsFixture();
+    return {
+      ...state,
+      skillsStatus:
+        state.skillsStatus === "unavailable" && starting ? "loading" : state.skillsStatus,
+    };
+  },
+}));
+
+beforeEach(() => skillsFixture.setState({ skills: [], skillsStatus: null, refetch: vi.fn() }));
+
+function setComposerState(
+  patch: Partial<ChatState> & { skills?: SkillSummary[]; skillsStatus?: SkillsStatus | null },
+) {
+  const { skills, skillsStatus, ...chat } = patch;
+  useChatStore.setState(chat);
+  skillsFixture.setState({
+    ...(skills === undefined ? {} : { skills }),
+    ...(skillsStatus === undefined ? {} : { skillsStatus }),
+  });
+}

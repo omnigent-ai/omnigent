@@ -957,6 +957,38 @@ async def test_get_host_403_wrong_owner(
     )
 
 
+@pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])
+async def test_host_skills_requires_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    user: str | None,
+    status: int,
+) -> None:
+    from fastapi.responses import JSONResponse
+
+    from omnigent.errors import OmnigentError
+
+    app, registry, host_store, _cs = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    conn = registry.get(host_id)
+    assert conn is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{host_id}/harnesses/claude-native/skills",
+            params={"path": "~"},
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status, response.text
+    assert conn.outbound_queue.empty()
+    assert conn.pending_skills == {}
+
+
 async def test_launch_runner_403_wrong_owner(
     multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
