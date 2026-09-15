@@ -14,7 +14,7 @@ import { CliCommandBlock } from "./CliCommandBlock";
 import { ForkSessionForm } from "./ForkSessionDialog";
 import { SwitchHostDialog } from "./SwitchHostDialog";
 
-const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
+import { nativeCodingAgentForWrapper } from "@/lib/nativeCodingAgents";
 
 const HOST_OWNER_DESCRIPTION =
   "This session's host is offline. Run the command below from the host machine to reconnect.";
@@ -73,9 +73,14 @@ export function buildReconnectCommand({
   if (state === "host_offline") {
     return ["omnigent host \\", `  --server ${quotedServerUrl}`].join("\n");
   }
-  if (wrapper === CLAUDE_NATIVE_WRAPPER) {
+  // Every native TUI wrapper resumes through its own verb (`omnigent devin
+  // --resume …`), and the verb is the registry key — the generic
+  // `omnigent run <agent.yaml>` below cannot resume one at all, so it was wrong
+  // for every native harness except claude.
+  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
+  if (nativeAgent !== undefined) {
     return [
-      "omnigent claude \\",
+      `omnigent ${nativeAgent.key} \\`,
       `  --resume ${conversationId} \\`,
       `  --server ${quotedServerUrl}`,
     ].join("\n");
