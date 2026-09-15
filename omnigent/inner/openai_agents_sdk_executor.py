@@ -1735,6 +1735,10 @@ class OpenAIAgentsSDKExecutor(Executor):
                     # maps it to ``context_length_exceeded`` and the
                     # runner surfaces the overflow to the user.
                     raise
+                from omnigent.runtime.harnesses._executor_adapter import (
+                    classify_inner_exception,
+                )
+
                 from .databricks_executor import DatabricksAuthError
 
                 if isinstance(exc, DatabricksAuthError) or (
@@ -1751,6 +1755,12 @@ class OpenAIAgentsSDKExecutor(Executor):
                     )
                     logger.error("OpenAIAgentsSDKExecutor: auth failed: %s", auth_msg)
                     yield ExecutorError(message=auth_msg)
+                elif classify_inner_exception(exc) is not None:
+                    # Semantic failure (connection drop, rate limit, timeout,
+                    # upstream 5xx): re-raise so the ExecutorAdapter's classifier
+                    # stamps its code instead of a stringified generic error.
+                    logger.error("OpenAIAgentsSDKExecutor: run failed: %s", exc)
+                    raise
                 else:
                     logger.error("OpenAIAgentsSDKExecutor: run failed: %s", exc)
                     yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}")

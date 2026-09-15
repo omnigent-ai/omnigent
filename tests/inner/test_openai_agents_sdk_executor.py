@@ -2415,6 +2415,72 @@ def test_context_length_exceeded_re_raises() -> None:
     _run(_t())
 
 
+def test_connection_error_re_raises_for_classification() -> None:
+    """
+    ``openai.APIConnectionError`` from the SDK propagates as an exception
+    rather than being stringified into an ``ExecutorError``.
+
+    The ``ExecutorAdapter``'s classifier maps it to the semantic
+    ``connection_error`` code on the harness ``ErrorDetail``. Swallowing
+    it into ``ExecutorError`` erased the type, so the failure surfaced
+    as a generic ``RuntimeError``/``runner_error`` blob — an upstream
+    transport blip mis-attributed as an Omnigent runner defect.
+    """
+    import openai
+
+    conn_error = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://127.0.0.1:9/v1/responses")
+    )
+
+    async def _t() -> None:
+        executor = OpenAIAgentsSDKExecutor(client=object())
+
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=conn_error)
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            with pytest.raises(openai.APIConnectionError):
+                await _collect(
+                    executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s_conn_reraise"}],
+                        [],
+                        "Be helpful.",
+                    )
+                )
+
+    _run(_t())
+
+
+def test_unclassifiable_error_still_yields_executor_error() -> None:
+    """An exception no classifier recognizes keeps the stringified fallback."""
+
+    async def _t() -> None:
+        executor = OpenAIAgentsSDKExecutor(client=object())
+
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = _FakeResult(
+            events=[], final_output="", exception=ValueError("boom")
+        )
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s_generic_error"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert len(errors) == 1, f"expected one ExecutorError, got events: {events!r}"
+        assert errors[0].message == "OpenAI Agents SDK error: boom"
+
+    _run(_t())
+
+
 # ── LLM_REQUEST policy evaluation wiring ─────────────────────────────────────
 
 
