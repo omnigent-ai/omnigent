@@ -2230,6 +2230,17 @@ def _ui_defaults() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
+    """Keep unrelated UI tests explicit about requiring an open Workspace panel."""
+    if request.node.get_closest_marker("workspace_panel_product_default") is not None:
+        return
+    if "page" not in request.fixturenames:
+        return
+    page = request.getfixturevalue("page")
+    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+
+
+@pytest.fixture(autouse=True)
 def _record_video(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
