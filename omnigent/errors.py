@@ -187,6 +187,13 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
+    :cvar UPSTREAM_CANCELLED: A backing upstream call (e.g. a gRPC
+        dependency behind an embedding route) was cancelled by its peer
+        mid-flight — an upstream teardown or restart, not our fault and
+        not the caller's input. HTTP 499 (the "client closed request"
+        family the gRPC CANCELLED status conventionally maps to): a 4xx
+        keeps this expected, retryable condition out of 5xx fault-rate
+        signals, the same reasoning as ``WRONG_REPLICA``.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -204,6 +211,7 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     WORKSPACE_MISSING = "workspace_missing"
+    UPSTREAM_CANCELLED = "upstream_cancelled"
 
 
 # Single source of truth for error code → HTTP status.
@@ -234,6 +242,9 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.WORKSPACE_MISSING: 410,
+    # 499, not 5xx: the peer cancelling an in-flight backing call is expected
+    # and retryable, so it must not read as a server fault (see the cvar).
+    ErrorCode.UPSTREAM_CANCELLED: 499,
 }
 
 
@@ -263,6 +274,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
+    # A dependency tore down the in-flight call; the fix (if any) is upstream.
+    ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
 }
 
 
@@ -291,10 +304,12 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorImpact.BLOCKING,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorImpact.BLOCKING,
     ErrorCode.WORKSPACE_MISSING: ErrorImpact.BLOCKING,
-    # Self-healing: a session state that resumes on reconnect, and a routing
-    # artifact the client re-addresses. No progress is lost.
+    # Self-healing: a session state that resumes on reconnect, a routing
+    # artifact the client re-addresses, and an upstream cancellation a retry
+    # outlives. No progress is lost.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorImpact.TRANSIENT,
     ErrorCode.WRONG_REPLICA: ErrorImpact.TRANSIENT,
+    ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
     # A single rejected request; the session stays healthy and usable.
     ErrorCode.FORBIDDEN: ErrorImpact.BENIGN,
     ErrorCode.NOT_FOUND: ErrorImpact.BENIGN,
@@ -334,6 +349,8 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
+    # Context-driven: a backing call can be cancelled while serving any stage.
+    ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
 }
 
 
@@ -464,6 +481,29 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
+def is_cancelled_rpc_error(exc: BaseException) -> bool:
+    """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
+
+    Matched structurally — an ``RpcError`` ancestor by class name plus a
+    ``code()`` whose status is named ``CANCELLED`` — so a vendored copy of
+    grpc (a different class identity than pypi grpcio) still matches and this
+    module imports no grpc.
+
+    :param exc: The exception to inspect.
+    :returns: ``True`` only for a peer-cancelled RPC error.
+    """
+    if not any(klass.__name__ == "RpcError" for klass in type(exc).__mro__):
+        return False
+    code = getattr(exc, "code", None)
+    if not callable(code):
+        return False
+    try:
+        status = code()
+    except Exception:  # noqa: BLE001 — a status reader that itself fails is not a cancellation
+        return False
+    return getattr(status, "name", None) == "CANCELLED"
+
+
 def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     """Best-effort (category, impact) for any logged exception.
 
@@ -474,6 +514,8 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     - :class:`OmnigentError` (and its subclasses) keep their own axes.
     - Transport failures (connection/timeout, plus httpx / WebSocket disconnects
       matched by type name) read as a transient upstream blip.
+    - A peer-cancelled gRPC call (see :func:`is_cancelled_rpc_error`) reads the
+      same way: the dependency tore down the in-flight call, not our fault.
     - Anything else is genuinely unattributed: UNKNOWN on both axes rather than a
       guessed owner. The turn's terminal outcome remains the authoritative
       blocking signal.
@@ -489,5 +531,7 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     if isinstance(exc, (ConnectionError, TimeoutError)):
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
     if _TRANSPORT_EXC_NAMES.intersection(klass.__name__ for klass in type(exc).__mro__):
+        return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
+    if is_cancelled_rpc_error(exc):
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
     return ErrorCategory.UNKNOWN, ErrorImpact.UNKNOWN

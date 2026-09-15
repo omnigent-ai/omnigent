@@ -907,6 +907,9 @@ export function useArchiveConversation() {
     },
     onSuccess: (updated, { archived }, context) => {
       markConversationSeen(updated.id, updated.updated_at);
+      queryClient.setQueryData<Session>(["session", updated.id], (old) =>
+        old ? { ...old, archived } : old,
+      );
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
       }

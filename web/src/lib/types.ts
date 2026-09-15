@@ -288,6 +288,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Whether the session is archived. Carried on the snapshot because it is
+   * the only carrier for a session opened directly by URL — the default
+   * sidebar list excludes archived rows. `false`/absent for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -464,10 +470,9 @@ export interface Session {
    */
   kind: "default" | "sub_agent";
   /**
-   * Current Claude Code todo list for `omnigent claude` sessions.
-   * Sourced from the server's `_session_todos_cache` at snapshot
-   * build time so the panel survives page refresh. Empty array for
-   * non-claude-native sessions or before the first turn creates todos.
+   * Current native Plan/TODO list reported by a harness. Restored from
+   * persisted session metadata at snapshot build time so the panel survives
+   * page refresh. Empty before the first Plan update.
    */
   todos?: {
     content: string;
@@ -482,6 +487,8 @@ export interface Session {
    * users can fire ``/skill-name``.
    */
   skills?: SkillSummary[];
+  /** Discovery state; absent on older servers. */
+  skillsStatus?: SkillsStatus;
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
   /**
@@ -556,6 +563,8 @@ export interface SkillSummary {
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
 }
+
+export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";
 
 /** Reasoning-effort metadata advertised for a native model. */
 export interface NativeReasoningEffortOption {

@@ -1,8 +1,8 @@
 # Sandbox providers
 
 Omnigent supports running agent hosts in remote sandboxes. Built-in providers
-(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Islo, OpenShell, Boxlite,
-Kubernetes, microsandbox)
+(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
+Boxlite, Kubernetes, microsandbox)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
 
@@ -13,9 +13,9 @@ Each sandbox provider implements the
 Providers that exec into a running sandbox (Modal, Daytona, …) inherit
 `ExecModelHostLauncher`, which provides a default `start_host` that probes
 `$HOME`, creates a workspace, clones a repo, and backgrounds `omnigent host`.
-Providers whose sandbox boots running the host directly (Kubernetes) inherit
-`SandboxHostLauncher` and override `start_host` to build the infrastructure
-manifest instead.
+Providers whose sandbox boots running the host directly (Kubernetes), or whose
+control plane owns host startup (Gensee), inherit `SandboxHostLauncher` and
+override `start_host` without exposing a general-purpose exec transport.
 
 ## Creating a community sandbox provider
 

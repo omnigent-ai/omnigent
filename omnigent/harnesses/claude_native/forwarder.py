@@ -347,12 +347,13 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(retry_key: str) -> None:
+def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
     """
     Record a forward post failure; escalate once when sync degrades.
 
     :param retry_key: Stable retry key of the failed post, e.g.
         ``"item:source-1"``.
+    :param exc: The latest failed post's HTTP exception.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -366,6 +367,13 @@ def _note_forward_failure(retry_key: str) -> None:
             "(latest key=%s)",
             _forward_health.consecutive_failures,
             retry_key,
+            extra={
+                "event_name": "claude_forward_sync_degraded",
+                "attributes": {
+                    "exception_type": type(exc).__name__,
+                    "http_status": _http_status_for_log(exc),
+                },
+            },
         )
         _forward_health.degraded_logged = True
 
@@ -925,7 +933,7 @@ class _PostRetryTracker:
         """
         # Count every failed post (transient or permanent) so a sustained
         # outage escalates once to a degraded-sync signal (#1120).
-        _note_forward_failure(key)
+        _note_forward_failure(key, exc)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
@@ -4459,18 +4467,13 @@ async def _forward_available_items(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-    # Report the transcript's model verbatim. This transcript-derived
-    # observation only fires when a turn produces a fresh
-    # ``message.model``, so it lags an in-pane switch by one turn — the
-    # per-poll statusLine sync (:func:`_forward_model_from_status`) is the
-    # primary, low-latency source; this stays as a fallback for cold-resume
-    # before the first statusLine render. Both share ``dedupe`` so neither
-    # double-posts.
+    status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
+    status_model = concrete_reported_model(status_state.get("model")) if status_state else None
     await _post_model_change_if_new(
         client,
         session_id=session_id,
         dedupe=dedupe,
-        model=result.latest_model,
+        model=status_model or result.latest_model,
     )
     # Mirror a TUI-side `/rename` to the web session list. Claude writes the
     # operator's title as a `custom-title` metadata record, which renders no

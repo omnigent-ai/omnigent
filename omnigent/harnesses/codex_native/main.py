@@ -17,13 +17,14 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import click
 import httpx
 import yaml
 
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
+from omnigent._startup_events import record_startup_event
 from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
 )
@@ -47,6 +48,7 @@ from omnigent.harnesses.codex_native.app_server import (
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
+    codex_remote_resume_omits_permission_args,
     codex_session_meta_model_provider,
     codex_terminal_env,
     native_codex_launch_base_url,
@@ -66,7 +68,10 @@ from omnigent.harnesses.codex_native.bridge import (
     socket_path_for_bridge_dir,
     write_bridge_state,
 )
-from omnigent.harnesses.codex_native.forwarder import supervise_forwarder
+from omnigent.harnesses.codex_native.forwarder import (
+    _replay_dead_letters_before_resume,
+    supervise_forwarder,
+)
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 from omnigent.host.daemon_launch import (
     error_text,
@@ -381,7 +386,8 @@ class PreparedCodexTerminal:
         invocation owns it. ``None`` for reattached live terminals.
     :param event_client: App-server client already listening for the
         Codex thread. Fresh sessions keep this listener open after it
-        observes the TUI-created ``thread/started`` event.
+        observes the TUI-created ``thread/started`` event; resumed sessions
+        retain the preload subscription until forwarder teardown.
     :param reattached: ``True`` when an existing terminal was reused.
     """
 
@@ -853,6 +859,7 @@ def _run_with_remote_server(
                     prompt=prompt,
                     auth=attach_auth,
                 )
+                record_startup_event("initial_prompt_submitted")
             await _attach_terminal_resource(
                 base_url=base_url,
                 headers=headers,
@@ -938,6 +945,7 @@ async def _prepare_codex_terminal_via_daemon(
         else:
             _update_startup_progress(startup_progress, "Loading Codex session...")
             payload = await _fetch_codex_session(client, session_id)
+            record_startup_event("session_resolved", session_id=session_id)
             labels = payload.get("labels") if isinstance(payload, dict) else None
             if (
                 not isinstance(labels, dict)
@@ -956,6 +964,7 @@ async def _prepare_codex_terminal_via_daemon(
                         "terminal; restart the session terminal to apply them.",
                         err=True,
                     )
+                record_startup_event("terminal_available", session_id=session_id)
                 _update_startup_progress(startup_progress, "Codex terminal ready.")
                 return PreparedCodexTerminal(
                     session_id=session_id,
@@ -989,6 +998,7 @@ async def _prepare_codex_terminal_via_daemon(
         if not fresh_session:
             await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
+        record_startup_event("runner_requested", session_id=session_id)
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
@@ -998,11 +1008,13 @@ async def _prepare_codex_terminal_via_daemon(
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
+        record_startup_event("runner_connected")
         # Must run AFTER wait_for_runner_online — unregistered runners
         # 400 on replace_runner_id. The daemon bind paths don't route
         # through replace_runner_id, so without this re-bind a stopped
         # session stays stopped.
         await _bind_session_runner(client, session_id, runner_id)
+        record_startup_event("session_runner_bound")
         _update_startup_progress(startup_progress, "Starting Codex terminal...")
         await _ensure_codex_terminal_on_runner(client, session_id)
         terminal = await _wait_for_codex_terminal_ready(
@@ -1010,6 +1022,7 @@ async def _prepare_codex_terminal_via_daemon(
             session_id,
             timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S,
         )
+        record_startup_event("terminal_available", session_id=session_id)
         _update_startup_progress(startup_progress, "Codex terminal ready.")
     return PreparedCodexTerminal(
         session_id=session_id,
@@ -1267,10 +1280,13 @@ async def _prepare_codex_terminal(
                 )
                 await event_client.connect()
             else:
-                await preload_codex_thread_for_resume(
+                event_client = await preload_codex_thread_for_resume(
                     codex_ws_url,
                     thread_id,
                     terminal_launch_args=codex_args,
+                    retain_client=codex_remote_resume_omits_permission_args(
+                        app_server.codex_cli_version
+                    ),
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -1297,20 +1313,25 @@ async def _prepare_codex_terminal(
                 # the app-server so it resolves the Omnigent provider
                 # and skips the OpenAI-login onboarding screen.
                 config_overrides=tuple(app_server.config_overrides),
+                codex_cli_version=app_server.codex_cli_version,
             )
             terminal_id = launched_terminal.terminal_id
             _update_startup_progress(startup_progress, "Codex terminal ready.")
-        except Exception:
-            if terminal_id is not None:
-                await _close_codex_terminal(
-                    base_url=base_url,
-                    headers=headers,
-                    session_id=session_id,
-                    terminal_id=terminal_id,
-                )
-            if event_client is not None:
-                await event_client.close()
-            await app_server.close()
+        except BaseException:
+            try:
+                if terminal_id is not None:
+                    await _close_codex_terminal(
+                        base_url=base_url,
+                        headers=headers,
+                        session_id=session_id,
+                        terminal_id=terminal_id,
+                    )
+            finally:
+                try:
+                    if event_client is not None:
+                        await event_client.close()
+                finally:
+                    await app_server.close()
             raise
     if launched_terminal is None:
         raise click.ClickException("Codex terminal was not launched.")
@@ -1408,10 +1429,15 @@ async def _attach_with_forwarder(
                 recover=recover,
             )
     finally:
-        if forwarder is not None:
-            forwarder.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await forwarder
+        try:
+            if forwarder is not None:
+                forwarder.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await forwarder
+        finally:
+            if prepared.event_client is not None:
+                with contextlib.suppress(Exception):
+                    await prepared.event_client.close()
         if not prepared.reattached:
             active_session_id = (
                 _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
@@ -1614,7 +1640,9 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
         tmux_target,
         env=env,
     )
-    await process.wait()
+    record_startup_event("terminal_attach_started")
+    exit_code = await process.wait()
+    record_startup_event("terminal_attach_exited", exit_code=exit_code)
 
 
 async def _create_codex_session(
@@ -1659,6 +1687,7 @@ async def _create_codex_session(
     new_session_id = body.get("session_id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise click.ClickException("Codex session creation response did not include session_id.")
+    record_startup_event("session_resolved", session_id=new_session_id)
     return new_session_id
 
 
@@ -1881,16 +1910,20 @@ async def _ensure_local_codex_resume_rollout(
     terminal_launch_args: Sequence[str] | None = None,
 ) -> Path:
     """
-    Ensure Codex has a local rollout JSONL for cold resume.
+    Refresh Codex's local rollout JSONL for cold resume.
 
     Cross-machine resume has the Omnigent conversation and Codex thread id on
     the server, but not necessarily the app-server's local
     ``$CODEX_HOME/sessions/.../rollout-*-<thread>.jsonl`` file. Codex
     ``resume <thread>`` reads that local rollout, so before launching a
-    known-thread terminal we synthesize the rollout from committed AP
-    items when the local rollout is missing. Existing local rollout files
-    are left untouched because Codex treats them as append-only runtime
-    state, not a cache that Omnigent should rewrite.
+    known-thread terminal we rewrite it from committed Omnigent items. This
+    keeps the server transcript authoritative when a previous local rollout
+    has diverged. Before fetching that transcript, we best-effort replay any
+    proven-undelivered dead letters so successful recovery is reflected in the
+    same snapshot. If server history is temporarily unavailable, a valid local
+    rollout remains a best-effort fallback. A successful server fetch wins even
+    when its committed history is empty or shorter than the local file;
+    local-only records are intentionally discarded.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -1913,21 +1946,34 @@ async def _ensure_local_codex_resume_rollout(
         rollout, but treats the value as informational, so a flaky probe
         must not cost the carried history.
     :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
-    :returns: Path to the existing or written rollout.
-    :raises click.ClickException: If Omnigent history cannot be fetched or the
-        rollout cannot be written, or if the persisted Codex thread id is
-        unsafe for use in a rollout filename.
+    :returns: Path to the refreshed rollout, or to a valid local fallback when
+        server history is temporarily unavailable.
+    :raises click.ClickException: If Omnigent history cannot be fetched and no
+        valid local fallback exists, if the rollout cannot be written, or if
+        the persisted Codex thread id is unsafe for use in a rollout filename.
     """
     if not _CODEX_THREAD_ID_RE.fullmatch(external_session_id):
         raise click.ClickException(
             f"Cannot resume Codex session {session_id!r}: persisted thread id "
             f"{external_session_id!r} is not a safe Codex rollout id."
         )
-    existing = _find_codex_rollout(codex_home, external_session_id)
-    if existing is not None:
-        return existing
+    await _replay_dead_letters_before_resume(client, codex_home.parent)
+    try:
+        items = await _fetch_all_session_items_for_codex_resume(client, session_id)
+    except _CodexResumeHistoryUnavailableError:
+        existing = _find_codex_rollout(codex_home, external_session_id)
+        if existing is not None and _is_resumable_codex_rollout(
+            existing, external_session_id=external_session_id
+        ):
+            _logger.warning(
+                "Could not fetch server history for %r; resuming from the "
+                "existing local Codex rollout %s",
+                session_id,
+                existing,
+            )
+            return existing
+        raise
     target = _codex_resume_rollout_path(codex_home, external_session_id)
-    items = await _fetch_all_session_items_for_codex_resume(client, session_id)
     cli_version = None
     if codex_path is not None:
         from omnigent.inner.codex_executor import _codex_cli_version
@@ -1945,19 +1991,37 @@ async def _ensure_local_codex_resume_rollout(
         terminal_launch_args=terminal_launch_args,
     )
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = target.with_suffix(".jsonl.tmp")
+    tmp: Path | None = None
     try:
-        with tmp.open("w", encoding="utf-8") as handle:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp = Path(handle.name)
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        assert tmp is not None
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(
             f"Failed to write Codex resume rollout {target}: {exc}"
         ) from exc
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
+        if tmp is not None:
+            with contextlib.suppress(FileNotFoundError):
+                tmp.unlink()
+    _logger.info(
+        "Refreshed Codex resume rollout from server history: "
+        "session=%s thread=%s items=%d target=%s",
+        session_id,
+        external_session_id,
+        len(items),
+        target,
+    )
     return target
 
 
@@ -1986,6 +2050,41 @@ def _codex_resume_rollout_path(codex_home: Path, external_session_id: str) -> Pa
     return partition / f"rollout-{stamp}-{external_session_id}.jsonl"
 
 
+def _is_resumable_codex_rollout(path: Path, *, external_session_id: str) -> bool:
+    """
+    Return whether *path* starts with matching Codex session metadata.
+
+    Codex rejects empty, binary, malformed, or mismatched rollouts on
+    ``resume``. Validate the local fallback before preferring it over a
+    temporarily unavailable server transcript.
+
+    :param path: Candidate ``rollout-*.jsonl`` path.
+    :param external_session_id: Expected Codex thread id.
+    :returns: ``True`` when the first non-empty record is matching
+        ``session_meta``.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    return False
+                if not isinstance(record, dict) or record.get("type") != "session_meta":
+                    return False
+                payload = record.get("payload")
+                return isinstance(payload, dict) and payload.get("id") == external_session_id
+    except (OSError, UnicodeDecodeError):
+        return False
+    return False
+
+
+class _CodexResumeHistoryUnavailableError(click.ClickException):
+    """Server history is temporarily unavailable for Codex cold resume."""
+
+
 async def _fetch_all_session_items_for_codex_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -1997,8 +2096,10 @@ async def _fetch_all_session_items_for_codex_resume(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :returns: Flat API item dicts from
         ``GET /v1/sessions/{id}/items``.
-    :raises click.ClickException: If an item page cannot be fetched or
-        parsed.
+    :raises _CodexResumeHistoryUnavailableError: If transport or server errors
+        prevent fetching an item page.
+    :raises click.ClickException: If the server rejects the request or returns
+        an invalid page.
     """
     items: list[_JsonObject] = []
     after: str | None = None
@@ -2006,10 +2107,20 @@ async def _fetch_all_session_items_for_codex_resume(
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
         if after is not None:
             params["after"] = after
-        resp = await client.get(
-            f"/v1/sessions/{url_component(session_id)}/items",
-            params=params,
-        )
+        try:
+            resp = await client.get(
+                f"/v1/sessions/{url_component(session_id)}/items",
+                params=params,
+            )
+        except httpx.TransportError as exc:
+            raise _CodexResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r}: {exc}"
+            ) from exc
+        if resp.status_code >= 500:
+            raise _CodexResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r} "
+                f"({resp.status_code}): {error_text(resp)}"
+            )
         if resp.status_code >= 400:
             raise click.ClickException(
                 f"Failed to fetch history for {session_id!r} "
@@ -2026,9 +2137,13 @@ async def _fetch_all_session_items_for_codex_resume(
             raise click.ClickException(
                 f"History fetch for {session_id!r} returned an invalid item list."
             )
-        for item in data:
-            if isinstance(item, dict):
-                items.append(item)
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise click.ClickException(
+                    f"History fetch for {session_id!r} returned a non-object "
+                    f"item at index {index}."
+                )
+            items.append(item)
         if not payload.get("has_more"):
             return items
         last_id = payload.get("last_id")
@@ -2385,17 +2500,24 @@ def _codex_function_call_payload_from_session_item(
     Convert an Omnigent function call item into a Codex function call payload.
 
     :param item: Omnigent function call item.
-    :returns: Codex function call payload, or ``None`` when optional
-        routing fields are absent.
+    :returns: Codex function call payload.
     :raises click.ClickException: If the Omnigent item violates required tool
         history fields.
     """
     name = item.get("name")
     call_id = item.get("call_id")
     if not isinstance(name, str) or not name:
-        return None
+        item_id = item.get("id")
+        raise click.ClickException(
+            "Cannot synthesize Codex resume rollout: Omnigent function_call "
+            f"{item_id!r} has an invalid name."
+        )
     if not isinstance(call_id, str) or not call_id:
-        return None
+        item_id = item.get("id")
+        raise click.ClickException(
+            "Cannot synthesize Codex resume rollout: Omnigent function_call "
+            f"{item_id!r} has an invalid call_id."
+        )
     arguments = item.get("arguments")
     if not isinstance(arguments, str):
         item_id = item.get("id")
@@ -2418,14 +2540,17 @@ def _codex_function_call_output_payload_from_session_item(
     Convert an Omnigent function output item into a Codex function output payload.
 
     :param item: Omnigent function output item.
-    :returns: Codex function output payload, or ``None`` when optional
-        routing fields are absent.
+    :returns: Codex function output payload.
     :raises click.ClickException: If the Omnigent item violates required tool
         output fields.
     """
     call_id = item.get("call_id")
     if not isinstance(call_id, str) or not call_id:
-        return None
+        item_id = item.get("id")
+        raise click.ClickException(
+            "Cannot synthesize Codex resume rollout: Omnigent function_call_output "
+            f"{item_id!r} has an invalid call_id."
+        )
     output = item.get("output")
     if not isinstance(output, str):
         item_id = item.get("id")
@@ -2596,6 +2721,7 @@ async def _launch_codex_terminal(
     remote_url: str,
     env: dict[str, str],
     config_overrides: tuple[str, ...] = (),
+    codex_cli_version: tuple[int, int, int] | None = None,
 ) -> LaunchedCodexTerminal:
     """
     Launch the server-backed Codex terminal resource.
@@ -2615,6 +2741,7 @@ async def _launch_codex_terminal(
         screen). See :func:`build_codex_remote_args`. Empty for a plain
         Codex-login launch. E.g.
         ``('model_provider="omnigent_databricks"',)``.
+    :param codex_cli_version: Probed CLI version used to preserve older resume behavior.
     :returns: Launched terminal resource details.
     """
     terminal_args = build_codex_remote_args(
@@ -2622,6 +2749,7 @@ async def _launch_codex_terminal(
         thread_id=thread_id,
         remote_url=remote_url,
         config_overrides=config_overrides,
+        codex_cli_version=codex_cli_version,
     )
     body = {
         "terminal": _TERMINAL_NAME,

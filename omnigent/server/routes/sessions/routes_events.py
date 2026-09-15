@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     session_stream,
@@ -1436,16 +1437,16 @@ def register_events_routes(
             output = data.get("output")
             status_error: ErrorDetail | None = None
             if status == "failed" and isinstance(output, str) and output.strip():
+                if data.get("reauth_required") is True:
+                    error_code = "codex_reauth_required"
+                else:
+                    # Store-enriched failures are harness-neutral; wire output
+                    # retains the Codex fallback unless a rate limit is known.
+                    error_code = (
+                        "codex_turn_error" if body.data.get("output") else "native_turn_error"
+                    )
                 status_error = ErrorDetail(
-                    code=(
-                        "codex_reauth_required"
-                        if data.get("reauth_required") is True
-                        # The store-enriched detail keeps a harness-neutral
-                        # code; a forwarder-sent detail keeps codex's.
-                        else (
-                            "codex_turn_error" if body.data.get("output") else "native_turn_error"
-                        )
-                    ),
+                    code=classify_native_turn_error(error_code, output),
                     message=output.strip(),
                 )
             if status_error is not None:
@@ -1458,6 +1459,7 @@ def register_events_routes(
                 session_id,
                 status,
                 status_error,
+                failure_origin="external_session_status",
                 response_id=response_id,
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
@@ -1588,6 +1590,7 @@ def register_events_routes(
                 session_id,
                 body,
                 conversation_store,
+                conv,
             )
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_CHANGE_TYPE:
@@ -1642,7 +1645,7 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            _handle_external_session_todos(session_id, body)
+            await _handle_external_session_todos(session_id, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id = await _persist_external_subagent_start(

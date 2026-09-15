@@ -1877,7 +1877,17 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
     :returns: None.
     """
     updates: list[str] = []
+    startup_events: list[tuple[str, str | None]] = []
     progress = RunnerStartupProgress(update=updates.append)
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     async def fake_create_session(
         client: object,
@@ -1996,6 +2006,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         )
 
     monkeypatch.setattr(claude_native, "_create_claude_session", fake_create_session)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     monkeypatch.setattr(claude_native, "wait_for_host_online", fake_wait_for_host_online)
     monkeypatch.setattr(
         claude_native,
@@ -2030,6 +2041,12 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         "Starting runner...",
         "Starting Claude terminal...",
         "Claude terminal ready.",
+    ]
+    assert startup_events == [
+        ("runner_requested", "conv_daemon_progress"),
+        ("session_runner_bound", None),
+        ("runner_connected", None),
+        ("terminal_available", "conv_daemon_progress"),
     ]
 
 
@@ -2416,6 +2433,16 @@ async def test_prepare_reattaches_existing_claude_terminal(
     terminal instead of attaching to the live one.
     """
     calls: list[str] = []
+    startup_events: list[tuple[str, str | None]] = []
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     async def fake_find(client: object, session_id: str) -> str | None:
         """
@@ -2473,6 +2500,7 @@ async def test_prepare_reattaches_existing_claude_terminal(
         return {"omnigent.claude_native.bridge_id": "bridge_abc"}
 
     monkeypatch.setattr(claude_native, "_find_running_claude_terminal", fake_find)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     monkeypatch.setattr(claude_native, "_bind_session_runner", fail_bind)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", fail_launch)
     monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", fake_fetch_labels)
@@ -2494,6 +2522,10 @@ async def test_prepare_reattaches_existing_claude_terminal(
         reattached=True,
     )
     assert calls == ["find:conv_abc"]
+    assert startup_events == [
+        ("session_resolved", "conv_abc"),
+        ("terminal_available", "conv_abc"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2562,6 +2594,77 @@ async def test_find_running_claude_terminal_miss_statuses_relaunch(
         found = await claude_native._find_running_claude_terminal(client, "conv_abc")
 
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_ready_wait_surfaces_recorded_launch_failure() -> None:
+    """
+    A dead launch fails the wait fast with the runner's recorded cause.
+
+    When ``claude`` exits at startup (e.g. it rejects its argv), the
+    terminal never comes up but the runner persists an error item with
+    the captured pane output. The wait must raise that real cause
+    promptly instead of burning the full timeout and reporting only a
+    generic "did not create the Claude terminal" message — the failure
+    mode where the user's TTY hides the actual error in the runner log.
+    """
+    items_calls = 0
+    recorded_cause = (
+        "Claude Code exited during startup.\n\nLast captured terminal output:\n"
+        "Error: Invalid MCP configuration:\nMCP config file not found: /work/hello"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal items_calls
+        if request.url.path.endswith("/items"):
+            items_calls += 1
+            if items_calls == 1:
+                # Baseline read before the launch failure lands.
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "item_err_1", "type": "error", "message": recorded_cause}]},
+            )
+        # The terminal resource never appears.
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    transport = httpx.MockTransport(handler)
+    started = asyncio.get_event_loop().time()
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException) as excinfo:
+            await claude_native._wait_for_claude_terminal_ready(client, "conv_abc", timeout_s=5.0)
+    elapsed = asyncio.get_event_loop().time() - started
+
+    assert "could not start the Claude terminal" in excinfo.value.message
+    assert "MCP config file not found" in excinfo.value.message
+    # Fail-fast, not at the deadline: the cause was visible on the first
+    # polls, so the wait must not sit out the timeout.
+    assert elapsed < 2.0
+
+
+@pytest.mark.asyncio
+async def test_terminal_ready_wait_ignores_stale_error_items() -> None:
+    """
+    An error persisted before the wait began does not abort the launch.
+
+    A resumed session may carry an old failure item; that is not this
+    launch's outcome, so the wait keeps polling and times out with the
+    generic message rather than blaming the stale error.
+    """
+    stale = {"id": "item_err_old", "type": "error", "message": "an earlier failure"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/items"):
+            return httpx.Response(200, json={"data": [stale]})
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException) as excinfo:
+            await claude_native._wait_for_claude_terminal_ready(client, "conv_abc", timeout_s=0.3)
+
+    assert "did not create the Claude terminal" in excinfo.value.message
+    assert "an earlier failure" not in excinfo.value.message
 
 
 # ── same-machine tmux attach (Phase 4) ─────────────────────
@@ -2657,6 +2760,59 @@ async def test_read_claude_terminal_tmux_unavailable(response: httpx.Response) -
 
     assert result.socket is None
     assert result.target is None
+
+
+@pytest.mark.asyncio
+async def test_direct_tmux_attach_records_start_and_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Direct tmux attachment records the foreground handoff lifecycle."""
+    from omnigent.terminals import ws_common
+
+    startup_events: list[tuple[str, int | None]] = []
+
+    class Process:
+        returncode = 0
+
+        async def wait(self) -> int:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        del args, kwargs
+        return Process()
+
+    async def pane_dead(socket_path: str, tmux_target: str) -> bool:
+        assert socket_path == str(tmp_path / "tmux.sock")
+        assert tmux_target == "claude:main"
+        return True
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del session_id
+        startup_events.append((event, exit_code))
+
+    monkeypatch.setattr(claude_native.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(ws_common, "_check_pane_dead_definitive", pane_dead)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
+
+    outcome = await claude_native._attach_direct_tmux(
+        tmp_path / "tmux.sock",
+        "claude:main",
+    )
+
+    assert outcome is claude_native._AttachOutcome.EXITED
+    assert startup_events == [
+        ("terminal_attach_started", None),
+        ("terminal_attach_exited", 0),
+    ]
 
 
 def test_can_attach_direct_tmux_true_when_socket_local_and_tmux_present(
@@ -3341,7 +3497,9 @@ async def test_ensure_local_claude_resume_transcript_survives_malformed_file_met
 
 
 @pytest.mark.asyncio
-async def test_create_claude_session_omits_title_for_generic_seed_path() -> None:
+async def test_create_claude_session_omits_title_for_generic_seed_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Session creation must not seed a title in create-time metadata.
 
@@ -3357,7 +3515,17 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
     sidebar fallback keys off the wrapper label.
     """
     captured_metadata: dict[str, object] = {}
+    startup_events: list[tuple[str, str | None]] = []
     session_id_returned = "conv_0123456789abcdef"
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -3382,6 +3550,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
         )
 
     transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
         session_id = await claude_native._create_claude_session(
             client,
@@ -3390,6 +3559,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
         )
 
     assert session_id == session_id_returned
+    assert startup_events == [("session_resolved", session_id_returned)]
     # No title in metadata: any title here would defeat the generic seed
     # path and resurrect the claude-specific carve-out we just removed.
     assert "title" not in captured_metadata, (
