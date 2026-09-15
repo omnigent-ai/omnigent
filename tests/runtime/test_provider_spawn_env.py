@@ -1327,6 +1327,34 @@ def test_codex_databricks_broker_fails_without_model_egress(config_home: Path) -
         _build_codex_spawn_env(spec, workdir=None)
 
 
+def test_codex_databricks_broker_rejects_ordinary_egress_rules(
+    config_home: Path,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {})
+    spec = _make_spec(
+        harness="codex",
+        model="databricks-gpt-5",
+        auth=DatabricksAuth(profile="test-dbx-ws"),
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                egress_rules=["GET api.github.com/repos/company/**"],
+            )
+        ),
+        model_egress=[
+            "POST workspace.databricks.com/ai-gateway/codex/v1/responses",
+        ],
+    )
+
+    with pytest.raises(
+        OmnigentError,
+        match=r"does not support os_env\.sandbox\.egress_rules",
+    ):
+        _build_codex_spawn_env(spec, workdir=None)
+
+
 # ── cli-config kind: model_provider pinning ─────────────────────────────────
 
 

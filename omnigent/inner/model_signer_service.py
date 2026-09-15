@@ -194,7 +194,7 @@ def _parse_strict_response_head(status_line: bytes, headers_raw: bytes) -> _Pars
     status = int(match.group(1))
     parsed = _parse_strict_header_lines(
         headers_raw,
-        repeatable_names=frozenset({"set-cookie"}),
+        repeatable_names=frozenset({"alt-svc", "set-cookie"}),
     )
     by_name = {name.lower(): value for name, value in parsed}
     transfer_encoding = by_name.get("transfer-encoding")

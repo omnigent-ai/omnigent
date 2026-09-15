@@ -97,9 +97,9 @@ from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
-from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.inner.model_egress import UCODE_SIGNER_BINDING_ID, registered_model_provider_binding
 from omnigent.inner.model_signer import SignerLaunchConfig
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 

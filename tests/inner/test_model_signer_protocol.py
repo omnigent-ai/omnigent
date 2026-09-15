@@ -158,6 +158,27 @@ async def test_response_strips_sensitive_and_hop_headers_and_reframes() -> None:
     )
 
 
+async def test_repeated_alt_svc_is_accepted_and_stripped() -> None:
+    relay = object.__new__(_SignerRelay)
+    relay._credential_source = Mock()
+    upstream = _reader(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b'Alt-Svc: h3=":443"; ma=86400\r\n'
+        b'Alt-Svc: h3-29=":443"; ma=86400\r\n'
+        b"Content-Length: 2\r\n\r\n{}"
+    )
+    client = _Writer()
+
+    relayed, status, keep_alive = await relay._relay_response_observing_status(upstream, client)
+
+    assert status == 200
+    assert relayed > 0
+    assert keep_alive
+    assert b"Alt-Svc" not in client.data
+    assert bytes(client.data).endswith(b"\r\n\r\n{}")
+
+
 async def test_chunked_sse_is_decoded_and_streamed_without_te_or_cl() -> None:
     relay = object.__new__(_SignerRelay)
     relay._credential_source = Mock()
@@ -188,6 +209,7 @@ async def test_chunked_sse_is_decoded_and_streamed_without_te_or_cl() -> None:
         b"HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\n folded: bad\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nX-Dupe: one\r\nX-Dupe: two\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\n",

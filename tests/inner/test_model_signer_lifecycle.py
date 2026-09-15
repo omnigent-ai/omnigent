@@ -167,6 +167,29 @@ async def test_signer_preflights_before_codex_state_and_worker_spawn(
     await session.close()
 
 
+async def test_required_catalog_failure_stops_before_worker_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    prepare = Mock()
+    spawn = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._populate_codex_home_config",
+        Mock(side_effect=RuntimeError("valid bundled model catalog")),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", prepare)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    session = _session(tmp_path, signer)
+
+    with pytest.raises(RuntimeError, match="valid bundled model catalog"):
+        await session.start()
+
+    prepare.assert_not_called()
+    spawn.assert_not_awaited()
+    assert signer.closed
+
+
 async def test_signer_exit_before_worker_spawn_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -247,6 +270,11 @@ async def test_signer_backed_home_excludes_host_credential_files(
 
     assert populate.call_args.kwargs["include_credentials"] is False
     assert populate.call_args.kwargs["minimal_config"] is True
+    probe_path, probe_cwd, probe_os_env = populate.call_args.kwargs["required_brokered_probe"]
+    assert probe_path == "/bin/echo"
+    assert probe_cwd == tmp_path
+    assert probe_os_env.sandbox is not None
+    assert probe_os_env.sandbox.type == "darwin_seatbelt"
     await session.close()
 
 

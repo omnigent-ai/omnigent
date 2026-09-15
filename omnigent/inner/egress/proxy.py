@@ -819,7 +819,7 @@ class EgressProxy:
         if rewrite.error is not None:
             if rewrite.status_code == 502:
                 await self._send_bad_gateway(client_writer, rewrite.error)
-                return
+                return False
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
             )

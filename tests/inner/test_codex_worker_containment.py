@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from omnigent.inner.codex_executor import _CodexAppServerSession
-from omnigent.inner.codex_worker import _BROKERED_AUTH_SECRET_ENV, prepare_codex_worker
+from omnigent.inner.codex_worker import (
+    _BROKERED_AUTH_SECRET_ENV,
+    prepare_codex_catalog_probe,
+    prepare_codex_worker,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.model_signer import SignerReadiness
 from omnigent.inner.sandbox import SandboxPolicy, with_additional_write_roots
@@ -153,6 +157,58 @@ def test_successful_active_sandbox_returns_owned_launcher(
 
     worker.close()
     worker.close()
+    assert not launcher.exists()
+
+
+def test_brokered_catalog_probe_is_network_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.touch()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    launcher = tmp_path / "launcher"
+    launcher.touch()
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = [
+        "/usr/bin/sandbox-exec",
+        str(codex),
+        "debug",
+        "models",
+        "--bundled",
+    ]
+    captured: dict[str, SandboxPolicy] = {}
+
+    def _create_launcher(target: str, policy: SandboxPolicy) -> str:
+        assert target == str(codex)
+        captured["policy"] = policy
+        return str(launcher)
+
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox",
+        Mock(return_value=_active_policy(tmp_path)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
+
+    probe = prepare_codex_catalog_probe(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        spawn_env_names=["PATH", "HOME", "CODEX_HOME"],
+    )
+
+    policy = captured["policy"]
+    assert not policy.allow_network
+    assert policy.egress_relay_port is None
+    assert policy.egress_socket_path is None
+    assert policy.spawn_env_allowlist == ["CODEX_HOME", "HOME", "PATH"]
+    assert codex_home.resolve() in policy.write_roots
+
+    probe.close()
     assert not launcher.exists()
 
 
@@ -358,6 +414,34 @@ def test_signer_readiness_adds_only_relay_and_public_ca(
     assert str(readiness.socket_path) not in worker_env.values()
     assert "token" not in str(policy.to_jsonable()).lower()
     worker.close()
+
+
+def test_signer_readiness_rejects_ordinary_egress_rules(tmp_path: Path) -> None:
+    readiness = SignerReadiness(
+        relay_port=43123,
+        socket_path=Path("/private/signer/relay.sock"),
+        ca_bundle_path=Path("/private/signer/ca-bundle.pem"),
+        placeholder="oa_cred_session",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"does not support os_env\.sandbox\.egress_rules",
+    ):
+        prepare_codex_worker(
+            codex_path=str(tmp_path / "codex"),
+            cwd=tmp_path,
+            codex_home=tmp_path / "codex-home",
+            os_env=OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(
+                    type="darwin_seatbelt",
+                    egress_rules=["GET api.github.com/repos/company/**"],
+                )
+            ),
+            spawn_env_names=[],
+            signer_readiness=readiness,
+            worker_env={},
+        )
 
 
 def test_signer_readiness_rejects_unwrapped_worker(tmp_path: Path) -> None:

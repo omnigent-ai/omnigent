@@ -375,6 +375,12 @@ def _configure_brokered_codex_with_ucode(
             "signer-backed Codex requires an explicit model_egress grant",
             code=ErrorCode.INVALID_INPUT,
         )
+    if sandbox.egress_rules:
+        raise OmnigentError(
+            "signer-backed Codex does not support os_env.sandbox.egress_rules; "
+            "brokered sessions are model-only",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if not profile:
         raise OmnigentError(
             "signer-backed Codex requires an explicit Databricks profile",

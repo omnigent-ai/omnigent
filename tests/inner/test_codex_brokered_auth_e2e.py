@@ -121,6 +121,9 @@ from urllib.parse import urlsplit
 if "--version" in sys.argv:
     print("codex-cli 0.146.0")
     raise SystemExit(0)
+if sys.argv[1:] == ["debug", "models", "--bundled"]:
+    print(json.dumps({"models": [{"slug": "gpt-5.4-mini"}]}))
+    raise SystemExit(0)
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
