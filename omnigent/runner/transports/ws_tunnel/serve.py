@@ -32,6 +32,7 @@ from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+    touch_connect_marker,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -372,6 +373,8 @@ async def serve_tunnel(
         nonlocal login_redirect_streak
         nonlocal http_auth_rejection_streak
         record_websocket_connected("runner", reconnect=ever_connected)
+        # Tell the launching host's connect watchdog this runner made it.
+        touch_connect_marker()
         connected_this_attempt = True
         ever_connected = True
         login_redirect_streak = 0

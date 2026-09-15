@@ -10,10 +10,12 @@ import pytest
 
 from omnigent.runner.identity import (
     RUNNER_AUTH_SECRET_ENV_VARS,
+    RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     strip_runner_auth_secrets,
     token_bound_runner_id,
+    touch_connect_marker,
 )
 
 
@@ -143,3 +145,51 @@ def test_importing_identity_does_not_pull_in_fastapi() -> None:
         f"identity import pulled in the FastAPI stack (lazy runner "
         f"package __init__ regressed). stderr:\n{result.stderr}"
     )
+
+
+def test_touch_connect_marker_creates_the_stamped_file(tmp_path) -> None:
+    """The runner records its first tunnel connect at the host-stamped path.
+
+    The launching host arms a connect-deadline watchdog on this file; a
+    missing touch turns every healthy launch into a false never-connected
+    ERROR on the host.
+
+    :param tmp_path: Pytest temp dir.
+    :returns: None.
+    """
+    marker = tmp_path / "runner-abc.connected"
+
+    touch_connect_marker({RUNNER_CONNECT_MARKER_ENV_VAR: str(marker)})
+
+    assert marker.exists()
+    # Reconnects re-touch the same file without erroring.
+    touch_connect_marker({RUNNER_CONNECT_MARKER_ENV_VAR: str(marker)})
+    assert marker.exists()
+
+
+def test_touch_connect_marker_noop_without_env(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CLI-local runner (no host, no marker env) touches nothing.
+
+    :param tmp_path: Pytest temp dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv(RUNNER_CONNECT_MARKER_ENV_VAR, raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    touch_connect_marker()
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_touch_connect_marker_survives_unwritable_path(tmp_path) -> None:
+    """A failed touch is logged, never raised — the tunnel connect must win.
+
+    :param tmp_path: Pytest temp dir.
+    :returns: None.
+    """
+    marker = tmp_path / "missing-dir" / "runner.connected"
+
+    touch_connect_marker({RUNNER_CONNECT_MARKER_ENV_VAR: str(marker)})
+
+    assert not marker.exists()

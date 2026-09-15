@@ -130,6 +130,7 @@ from omnigent.process_logging import (
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
+    RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
@@ -248,6 +249,29 @@ _LOG_TAIL_MAX_LINES = 15
 # steady-state online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
+
+# Deadline for a launched runner's first tunnel connect. A healthy runner
+# dials within seconds (zygote fork) to ~20s (direct spawn on a loaded
+# machine); one silent past this is hung, exited pre-connect, or unable to
+# reach the server, and no other funnel phase says so at ERROR level —
+# _watch_runner fires only on process exit (and a clean pre-connect exit is
+# deliberately quiet), while the server's connect wait logs INFO before
+# failing the send generically. Kept well under the 5-minute window
+# operators use to correlate launch-time telemetry.
+_RUNNER_CONNECT_DEADLINE_S = 120.0
+
+
+def _connect_marker_path(log_path: Path) -> Path:
+    """Marker file the runner touches on its first tunnel connect.
+
+    Lives next to the runner's log so it shares the log dir's lifecycle
+    and is unique per launch.
+
+    :param log_path: The runner's process log file.
+    :returns: The sibling marker path, e.g. ``runner-ab12-….connected``.
+    """
+    return log_path.with_suffix(".connected")
+
 
 # Cadence of the orphan-reaper sweep. The host installs itself as a child
 # subreaper (Linux — see :func:`_install_child_subreaper`), so a harness's
@@ -957,11 +981,16 @@ class _RunnerHandle:
         previous runner (the server rotates the binding token per
         attempt, so the runner id alone can't identify a predecessor).
         ``None`` for frames from servers that predate ``session_id``.
+    :param connect_marker: File the runner touches on its first tunnel
+        connect (see :data:`RUNNER_CONNECT_MARKER_ENV_VAR`). Checked by
+        :meth:`HostProcess._watch_runner_connect` at the connect
+        deadline. ``None`` disables that watchdog for this handle.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
     session_id: str | None = None
+    connect_marker: Path | None = None
 
 
 class HostRetryableConnectionError(Exception):
@@ -1837,11 +1866,19 @@ class HostProcess:
                 self._runners.pop(rid, None)
                 self._spawn_superseded_stop(rid, handle, frame.session_id)
         self._runners[runner_id] = _RunnerHandle(
-            proc=proc, log_path=log_path, session_id=frame.session_id or None
+            proc=proc,
+            log_path=log_path,
+            session_id=frame.session_id or None,
+            connect_marker=_connect_marker_path(log_path),
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
+        connect_watchdog = asyncio.create_task(
+            self._watch_runner_connect(runner_id, exit_watcher=watcher)
+        )
+        self._watcher_tasks.add(connect_watchdog)
+        connect_watchdog.add_done_callback(self._watcher_tasks.discard)
         _logger.info(
             "Launched runner %s for workspace %s (pid=%d)",
             runner_id,
@@ -1921,6 +1958,9 @@ class HostProcess:
         log_path, log_fh = open_process_log_file("runner", prefix=f"runner-{session_slug}")
         try:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+            # The runner touches this on its first tunnel connect;
+            # _watch_runner_connect checks it at the connect deadline.
+            env[RUNNER_CONNECT_MARKER_ENV_VAR] = str(_connect_marker_path(log_path))
 
             zygote = self._ensure_zygote_started()
             if zygote is not None:
@@ -2204,6 +2244,58 @@ class HostProcess:
             ),
         )
         await self._report_runner_exit(runner_id, error)
+
+    async def _watch_runner_connect(
+        self, runner_id: str, *, exit_watcher: asyncio.Task[None]
+    ) -> None:
+        """Emit one ERROR when a launched runner never connects its tunnel.
+
+        The launch funnel is otherwise silent about this failure:
+        :meth:`_watch_runner` fires only when the runner process *exits*
+        (and a clean pre-connect exit is deliberately quiet), and the
+        server's connect wait logs INFO before failing the send with a
+        generic ``runner_unavailable``. A runner that is launched but
+        never dials — hung at boot, blocked egress, silent self-exit —
+        left the user's session stuck with zero ERROR-level records
+        correlated with the launch. This watchdog is that bounded
+        diagnostic: one check when the connect deadline expires (or as
+        soon as the runner exits, since an exited runner can never
+        connect), at most one ERROR naming the runner token and session.
+
+        :param runner_id: The runner to watch, e.g.
+            ``"runner_token_abc123..."``.
+        :param exit_watcher: This runner's :meth:`_watch_runner` task.
+            Awaited (bounded by the deadline) instead of polling the
+            process again, so the zygote's control socket sees no extra
+            traffic and this task ends promptly once the runner exits.
+        """
+        handle = self._runners.get(runner_id)
+        if handle is None or handle.connect_marker is None:  # pragma: no cover
+            return
+        await asyncio.wait({exit_watcher}, timeout=_RUNNER_CONNECT_DEADLINE_S)
+        if self._runners.get(runner_id) is not handle:
+            # Stopped or superseded on purpose — nothing to report.
+            return
+        if await asyncio.to_thread(handle.connect_marker.exists):
+            return
+        _logger.error(
+            "Runner %s for session %s never connected its tunnel within "
+            "%.0fs of launch (pid=%d): the runner process is hung, exited "
+            "before connecting, or cannot reach the server. Runner log: %s",
+            runner_id,
+            handle.session_id or "<unknown>",
+            _RUNNER_CONNECT_DEADLINE_S,
+            handle.proc.pid,
+            handle.log_path,
+            extra=debug_event(
+                "runner_never_connected",
+                session_id=handle.session_id,
+                runner_id=runner_id,
+                error_category=ErrorCategory.RUNNER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+            ),
+        )
 
     async def _report_runner_exit(self, runner_id: str, error: str) -> None:
         """Send a ``host.runner_exited`` report, queueing on failure.
