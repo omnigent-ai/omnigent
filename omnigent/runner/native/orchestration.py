@@ -4024,6 +4024,7 @@ async def _auto_create_codex_terminal(
         codex_remote_resume_omits_permission_args,
         codex_session_meta_model_provider,
         codex_terminal_env,
+        fresh_codex_launch_catalog,
         is_unreadable_thread_error,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
@@ -4063,6 +4064,23 @@ async def _auto_create_codex_terminal(
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    _catalog_launch = None
+    _fresh_codex_catalog: list[_JsonObject] | None = None
+    try:
+        _catalog_launch = await asyncio.to_thread(
+            resolve_native_codex_launch, model=None, spec=_launch_spec
+        )
+        _fresh_codex_catalog = fresh_codex_launch_catalog(
+            codex_path=_codex_cli_path,
+            launch=_catalog_launch,
+        )
+    except Exception:  # noqa: BLE001 — startup falls back to codex's migration probe
+        _logger.debug(
+            "fresh codex launch catalog unavailable for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
     pick_to_reset: str | None = None
     # Explicit launches (model-flows design §4): validate an explicit request
     # against the shared catalog, and give a Default launch on codex's own
@@ -4073,8 +4091,6 @@ async def _auto_create_codex_terminal(
     if launch_config.model_override or (
         _codex_launch.model is None and _codex_launch.profile is None
     ):
-        from dataclasses import replace as _dataclass_replace
-
         from omnigent.harnesses.codex_native.app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
@@ -4085,11 +4101,11 @@ async def _auto_create_codex_terminal(
 
         _codex_catalog: list[_JsonObject] | None = None
         _codex_catalog_was_stale = False
-        _catalog_launch = None
         try:
-            _catalog_launch = await asyncio.to_thread(
-                resolve_native_codex_launch, model=None, spec=_launch_spec
-            )
+            if _catalog_launch is None:
+                _catalog_launch = await asyncio.to_thread(
+                    resolve_native_codex_launch, model=None, spec=_launch_spec
+                )
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
             _codex_catalog_was_stale = await codex_launch_catalog_is_stale(
@@ -4158,7 +4174,9 @@ async def _auto_create_codex_terminal(
                     else None
                 )
                 if _default_id:
-                    _codex_launch = _dataclass_replace(_codex_launch, model=_default_id)
+                    _codex_launch = dataclasses.replace(_codex_launch, model=_default_id)
+        if _codex_catalog and not _codex_catalog_was_stale:
+            _fresh_codex_catalog = _codex_catalog
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
@@ -4435,6 +4453,7 @@ async def _auto_create_codex_terminal(
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
         reasoning_effort=launch_config.reasoning_effort,
+        model_catalog_rows=_fresh_codex_catalog,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
