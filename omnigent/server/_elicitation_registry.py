@@ -13,11 +13,13 @@ from typing import Any
 
 from omnigent.server.schemas import ElicitationResult
 
+# custom-lint: disable-next=workspace-scoped-cache -- elicitation_id is globally unique
 _harness_elicitation_registry: dict[str, asyncio.Future[ElicitationResult]] = {}
 
 # Maps ``elicitation_id`` to the conversation id that issued it, so
 # the PATCH handler can verify the caller owns the elicitation
 # before resolving the Future.
+# custom-lint: disable-next=workspace-scoped-cache -- elicitation_id is globally unique
 _harness_elicitation_owners: dict[str, str] = {}
 
 
@@ -101,6 +103,7 @@ class _PreResolvedHarnessElicitation:
 
 # Maps ``elicitation_id`` to its parked-elicitation state. Populated
 # while a harness hook long-poll is parked; popped when it returns.
+# custom-lint: disable-next=workspace-scoped-cache -- elicitation_id is globally unique
 _harness_parked_elicitations: dict[str, _ParkedHarnessElicitation] = {}
 
 # Maps deterministic ``elicitation_id`` values to the session that
@@ -108,6 +111,7 @@ _harness_parked_elicitations: dict[str, _ParkedHarnessElicitation] = {}
 # hook consumes the tombstone at registration time, which closes the
 # race between a native client answering instantly and the Omnigent hook
 # request reaching this process.
+# custom-lint: disable-next=workspace-scoped-cache -- elicitation_id is globally unique
 _harness_pre_resolved_elicitations: dict[str, _PreResolvedHarnessElicitation] = {}
 
 

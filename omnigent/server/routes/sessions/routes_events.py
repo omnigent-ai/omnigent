@@ -243,6 +243,7 @@ from omnigent.util.session_lifecycle import (
     is_session_closed,
 )
 
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )

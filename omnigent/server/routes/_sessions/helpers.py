@@ -5282,6 +5282,7 @@ async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttemp
 # conversation (so a rider that short-circuits onto another flight's binding
 # surfaces THAT flight's structured refusal instead of a generic connect
 # timeout), and strong refs to the detached superseded-runner stops.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _relaunch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 _relaunch_last_attempt: WorkspaceScopedCache[str, _HostLaunchAttempt] = WorkspaceScopedCache()
 # Riders read the memo within a flight's own window (milliseconds), so it only
@@ -5289,6 +5290,7 @@ _relaunch_last_attempt: WorkspaceScopedCache[str, _HostLaunchAttempt] = Workspac
 # weak-valued map would drop entries the racers still need, and an uncapped one
 # would keep a row for every conversation this process ever relaunched.
 _RELAUNCH_MEMO_MAX = 512
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_supersede_stops: set[asyncio.Task[None]] = set()
 
 
@@ -10415,6 +10417,7 @@ _CATALOG_PREFETCH_CONCURRENCY = 4
 
 #: One semaphore per event loop: the server runs a single loop, but an asyncio
 #: primitive cannot be shared across the loops the test suite creates.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by object identity
 _catalog_prefetch_semaphores: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Semaphore
 ] = weakref.WeakKeyDictionary()

@@ -78,16 +78,32 @@ def test_scan_skips_files_outside_scanned_roots(tmp_path: Path) -> None:
     assert scan(f) == []
 
 
-def test_scan_respects_allowlist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """An allow-listed (path, name) is not reported; a sibling still is."""
+def test_scan_respects_inline_disable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `# custom-lint: disable=` on the declaration line suppresses it."""
     f = tmp_path / "mod.py"
-    f.write_text("_ok = {}\n_bad = {}\n")
-    rel = lint._repo_relative(f)
-    # Make the tmp file in-scope, and allow-list only ``_ok``.
-    monkeypatch.setattr(lint, "SCANNED_ROOTS", (rel,))
-    monkeypatch.setattr(lint, "ALLOWLIST", {(rel, "_ok"): "test reason"})
-    hits = scan(f)
-    assert [h.name for h in hits] == ["_bad"]
+    f.write_text("_ok = {}  # custom-lint: disable=workspace-scoped-cache -- safe\n_bad = {}\n")
+    monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
+    assert [h.name for h in scan(f)] == ["_bad"]
+
+
+def test_scan_respects_disable_next(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `# custom-lint: disable-next=` on the line above suppresses the decl."""
+    f = tmp_path / "mod.py"
+    f.write_text(
+        "# custom-lint: disable-next=workspace-scoped-cache -- safe\n_ok = {}\n_bad = {}\n"
+    )
+    monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
+    assert [h.name for h in scan(f)] == ["_bad"]
+
+
+def test_scan_ignores_disable_for_other_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disable for a different rule id does not suppress this rule."""
+    f = tmp_path / "mod.py"
+    f.write_text("_c = {}  # custom-lint: disable=some-other-rule\n")
+    monkeypatch.setattr(lint, "SCANNED_ROOTS", (lint._repo_relative(f),))
+    assert [h.name for h in scan(f)] == ["_c"]
 
 
 def test_main_clean_tree_returns_zero() -> None:

@@ -11,9 +11,12 @@ This hook requires every module-level cache-like global under
 ``omnigent/server`` and ``omnigent/runtime`` to be a
 :class:`~omnigent.db.workspace_cache.WorkspaceScopedCache` /
 :class:`~omnigent.db.workspace_cache.WorkspaceScopedSet` (which namespace
-every key by workspace), unless the global is in :data:`ALLOWLIST` because
-its key is already globally unique (``call_id``, ``runner_id``,
-``elicitation_id``, task objects, …) or already contains the workspace id.
+every key by workspace). A global whose key is already globally unique
+(``call_id``, ``runner_id``, ``elicitation_id``, task objects, …) or already
+contains the workspace id is exempted inline, ruff-style, with a
+``# custom-lint: disable=workspace-scoped-cache -- <reason>`` comment on the
+declaration line (or ``disable-next`` on the line above); see
+:mod:`dev.lint._framework`.
 
 "Cache-like" = a module-level assignment whose value is a ``cachetools``
 cache, or an EMPTY mutable collection (``{}`` / ``dict()`` / ``set()`` /
@@ -30,6 +33,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from dev.lint._framework import disabled_rules_by_line
+
 # Roots whose module-level caches must be workspace-scoped. These are the
 # request-handling surfaces where a cross-tenant read is possible.
 SCANNED_ROOTS = ("omnigent/server/", "omnigent/runtime/")
@@ -43,132 +48,6 @@ _WRAPPER_TYPES = frozenset({"WorkspaceScopedCache", "WorkspaceScopedSet"})
 # Bare collection constructors that start empty.
 _EMPTY_CTOR_NAMES = frozenset({"dict", "set", "defaultdict"})
 _WEAK_MAP_NAMES = frozenset({"WeakValueDictionary", "WeakKeyDictionary"})
-
-# Globals allowed to skip workspace scoping, each with the reason. Keyed by
-# ``(repo-relative-path, variable-name)``. Add here only when the key is
-# genuinely globally unique across workspaces (or already workspace-scoped);
-# adding an entry is visible in review.
-ALLOWLIST: dict[tuple[str, str], str] = {
-    # Keyed by an already-globally-unique id — no cross-workspace collision.
-    ("omnigent/runtime/_globals.py", "_dispatch_capabilities"): "keyed by process-local task_id",
-    (
-        "omnigent/server/_elicitation_registry.py",
-        "_harness_elicitation_registry",
-    ): "keyed by elicitation_id (unique UUID)",
-    (
-        "omnigent/server/_elicitation_registry.py",
-        "_harness_elicitation_owners",
-    ): "keyed by elicitation_id (unique UUID)",
-    (
-        "omnigent/server/_elicitation_registry.py",
-        "_harness_parked_elicitations",
-    ): "keyed by elicitation_id (unique UUID)",
-    (
-        "omnigent/server/_elicitation_registry.py",
-        "_harness_pre_resolved_elicitations",
-    ): "keyed by elicitation_id (unique UUID)",
-    (
-        "omnigent/server/managed_host_keepalive.py",
-        "_last_kept",
-    ): "keyed by runner_id (globally unique)",
-    (
-        "omnigent/server/managed_host_keepalive.py",
-        "_inflight",
-    ): "keyed by runner_id (globally unique)",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_browser_action_registry",
-    ): "keyed by server-minted action_id (globally unique)",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_browser_action_owners",
-    ): "keyed by server-minted action_id (globally unique)",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_browser_action_claims",
-    ): "keyed by server-minted action_id (globally unique)",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_browser_action_claim_events",
-    ): "keyed by server-minted action_id (globally unique)",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_recent_mirrored_tool_calls",
-    ): "keyed by call_id (globally unique per turn)",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_pending_policy_ask_writes",
-    ): "keyed by elicitation_id (unique UUID)",
-    # Keyed solely by workspace_id, or a key that already contains it.
-    (
-        "omnigent/runtime/policies/builder.py",
-        "_DEFAULT_POLICY_SPECS_CACHE",
-    ): "keyed solely by workspace_id",
-    ("omnigent/server/scheduled/fire.py", "_IN_FLIGHT_TASKS"): "keyed by (workspace_id, task_id)",
-    # Static process-wide registries — not tenant data, populated at import /
-    # startup with a fixed keyspace.
-    ("omnigent/server/dictation.py", "_ENGINE_REGISTRY"): "static engine-name registry",
-    (
-        "omnigent/runtime/filesystem_registry.py",
-        "_untracked_cache_enabled",
-    ): "keyed by git-root filesystem path, not a tenant id",
-    (
-        "omnigent/server/sharing_settings.py",
-        "_cache",
-    ): "keyed by filesystem path (config-file mtime cache)",
-    # Sets of asyncio.Task / TimerHandle objects — keyed by object identity,
-    # so no id collision is possible.
-    ("omnigent/server/routes/_sessions/common.py", "_WATCHER_TASKS"): "set of Task objects",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_catalog_prefetch_tasks",
-    ): "set of Task objects",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_deferred_elicitation_clear_tasks",
-    ): "set of Task objects",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_native_popup_forward_tasks",
-    ): "set of Task objects",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_managed_launch_tasks",
-    ): "set of Task objects",
-    (
-        "omnigent/server/routes/_sessions/helpers.py",
-        "_detached_supersede_stops",
-    ): "set of Task objects",
-    (
-        "omnigent/server/routes/_sessions/orchestration.py",
-        "_detached_stop_tasks",
-    ): "set of Task objects",
-    ("omnigent/server/scheduled/fire.py", "_PENDING_FIRES"): "set of Task objects",
-    ("omnigent/server/scheduled/scheduler.py", "_PENDING_FIRES"): "set of Task objects",
-    # Lock / semaphore registries. A cross-workspace key collision causes at
-    # most benign extra serialization of unrelated work — never a data read —
-    # and the DATA these guard is workspace-scoped in its own cache.
-    (
-        "omnigent/server/managed_hosts.py",
-        "_resume_locks",
-    ): "lock registry keyed by host_id; collision only serializes",
-    (
-        "omnigent/server/routes/_sessions/common.py",
-        "_native_ask_gate_locks",
-    ): "lock registry; collision only serializes, no data read",
-    (
-        "omnigent/server/routes/_sessions/helpers.py",
-        "_catalog_prefetch_semaphores",
-    ): "semaphore registry keyed by object identity",
-    (
-        "omnigent/server/routes/_sessions/helpers.py",
-        "_relaunch_locks",
-    ): "lock registry; collision only serializes, no data read",
-    (
-        "omnigent/server/routes/sessions/routes_events.py",
-        "_retry_recovery_locks",
-    ): "lock registry; collision only serializes, no data read",
-}
 
 
 @dataclass(frozen=True)
@@ -247,9 +126,9 @@ def _is_cache_like(value: ast.expr) -> bool:
 def flagged_globals(source: str) -> list[tuple[int, str]]:
     """Return ``(lineno, name)`` for every un-scoped cache-like module global.
 
-    Pure detection over source text — no path, root, or allowlist filtering — so
-    it is directly unit-testable. :func:`scan` layers the root and allowlist
-    filters on top.
+    Pure detection over source text — no path, root, or suppression filtering —
+    so it is directly unit-testable. :func:`scan` layers the root filter and
+    inline ``# custom-lint: disable`` suppression on top.
     """
     try:
         tree = ast.parse(source)
@@ -268,7 +147,11 @@ def flagged_globals(source: str) -> list[tuple[int, str]]:
 
 
 def scan(path: Path) -> list[Hit]:
-    """Return un-scoped cache globals declared at module top level in *path*."""
+    """Return un-scoped cache globals in *path*, honoring inline disables.
+
+    A cache carrying ``# custom-lint: disable=workspace-scoped-cache`` on its
+    declaration line (or ``disable-next`` on the line above) is skipped.
+    """
     rel = _repo_relative(path)
     if not any(rel.startswith(root) for root in SCANNED_ROOTS):
         return []
@@ -276,10 +159,11 @@ def scan(path: Path) -> list[Hit]:
         source = path.read_text()
     except (OSError, UnicodeDecodeError):
         return []
+    disabled = disabled_rules_by_line(source)
     return [
         Hit(path, line, name)
         for line, name in flagged_globals(source)
-        if (rel, name) not in ALLOWLIST
+        if RULE_NAME not in disabled.get(line, frozenset())
     ]
 
 
@@ -289,27 +173,50 @@ def _iter_scannable_paths() -> list[Path]:
     return [Path(raw) for raw in output.decode().split("\0") if raw.endswith(".py")]
 
 
+# Rule identity + fix guidance, consumed by the dev/lint/custom_lint.py runner.
+RULE_NAME = "workspace-scoped-cache"
+HINT = (
+    "Module-level caches under omnigent/server and omnigent/runtime must be "
+    "WorkspaceScopedCache / WorkspaceScopedSet (omnigent.db.workspace_cache) so keys are "
+    "namespaced by workspace and cannot leak across tenants. If the key is already "
+    "globally unique (call_id, runner_id, elicitation_id, task objects) or already "
+    "contains the workspace id, exempt it inline with "
+    "`# custom-lint: disable=workspace-scoped-cache -- <reason>` on the declaration line "
+    "(or `disable-next` on the line above)."
+)
+
+
+def check() -> list[str]:
+    """Rule entry point for the custom-lint runner: full-surface scan → messages.
+
+    Returns one ``path:line: message`` string per violation; empty means clean.
+    """
+    return [
+        f"{_repo_relative(hit.path)}:{hit.line}: module-level cache `{hit.name}` is not "
+        "workspace-scoped"
+        for path in _iter_scannable_paths()
+        for hit in scan(path)
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     """Scan the given paths (or the full surface) and reject un-scoped caches."""
     args = argv if argv is not None else sys.argv
     explicit = [Path(a) for a in args[1:]]
-    paths = explicit or _iter_scannable_paths()
-    hits = [hit for path in paths for hit in scan(path)]
-    if not hits:
-        return 0
-    for hit in hits:
-        sys.stdout.write(
+    if explicit:
+        messages = [
             f"{_repo_relative(hit.path)}:{hit.line}: module-level cache `{hit.name}` is not "
-            "workspace-scoped\n"
-        )
-    sys.stdout.write(
-        "\nModule-level caches under omnigent/server and omnigent/runtime must be "
-        "WorkspaceScopedCache / WorkspaceScopedSet (omnigent.db.workspace_cache) so keys are "
-        "namespaced by workspace and cannot leak across tenants. If the key is already "
-        "globally unique (call_id, runner_id, elicitation_id, task objects) or already "
-        "contains the workspace id, add it to ALLOWLIST in "
-        "dev/lint/lint_workspace_scoped_cache.py with a reason.\n"
-    )
+            "workspace-scoped"
+            for path in explicit
+            for hit in scan(path)
+        ]
+    else:
+        messages = check()
+    if not messages:
+        return 0
+    for message in messages:
+        sys.stdout.write(f"{message}\n")
+    sys.stdout.write(f"\n{HINT}\n")
     return 1
 
 

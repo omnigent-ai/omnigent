@@ -90,6 +90,7 @@ _SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
 # policies. Default policies are admin-managed and change infrequently, so
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
 # evaluation while still propagating changes within half a minute.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
 _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachetools.TTLCache(
     maxsize=256, ttl=30
 )

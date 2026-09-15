@@ -380,15 +380,19 @@ _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
 _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_registry: dict[str, asyncio.Future[dict[str, Any]]] = {}  # -> parked Future
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_owners: dict[str, str] = {}  # -> issuing session_id (result POST must match)
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_claims: dict[str, str] = {}
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_claim_events: dict[str, asyncio.Event] = {}
 
 
@@ -505,6 +509,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
@@ -610,6 +615,7 @@ _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 # Strong references to fire-and-forget catalog prefetches, so a task cannot be
 # garbage-collected mid-flight. Entries remove themselves when they finish.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _catalog_prefetch_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -638,6 +644,7 @@ class _MirroredToolCall:
     tool_input: dict[str, Any]
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by call_id
 _recent_mirrored_tool_calls: cachetools.LRUCache[str, _MirroredToolCall] = cachetools.LRUCache(
     maxsize=2048
 )
@@ -673,6 +680,7 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- elicitation_id is globally unique
 _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
     cachetools.LRUCache(maxsize=512)
 )
@@ -696,6 +704,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 _llm_response_denied_turns: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -723,6 +732,7 @@ class _RelayHandle:
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _deferred_elicitation_clear_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -735,12 +745,14 @@ _MODEL_TOKEN_KEYS = (
 )
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _native_popup_forward_tasks: set[asyncio.Task[None]] = set()
 
 
 _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 

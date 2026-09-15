@@ -58,11 +58,13 @@ _sandbox_config: ManagedSandboxDeployment | None = None
 _executor: ThreadPoolExecutor | None = None
 
 # runner_id -> monotonic seconds of its last keep_alive attempt.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _last_kept: dict[str, float] = {}
 
 # Runners with work queued or running on the executor. The throttle alone bounds
 # the queue only while calls finish inside the interval; this also keeps a stalled
 # provider from stacking a second job for the same runner behind the first.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _inflight: set[str] = set()
 _inflight_lock = threading.Lock()
 
