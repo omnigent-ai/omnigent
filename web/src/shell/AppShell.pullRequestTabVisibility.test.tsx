@@ -8,6 +8,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+import type * as BreakpointsModule from "@/lib/breakpoints";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext, useState } from "react";
@@ -63,13 +64,16 @@ vi.mock("@/hooks/useAgents", () => ({
   useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
+vi.mock("@/lib/breakpoints", async (importOriginal) => ({
+  ...(await importOriginal<typeof BreakpointsModule>()),
+  isMobileViewport: vi.fn(() => false),
+}));
 vi.mock("./Sidebar", () => ({
   Sidebar: () => (
     <div data-testid="sidebar">
       <Link to="/inbox">Inbox</Link>
     </div>
   ),
-  isMobileViewport: vi.fn(() => false),
 }));
 vi.mock("./PullRequestPanel", () => ({
   PullRequestPanel: () => {
@@ -103,9 +107,9 @@ vi.mock("./TerminalsPanel", () => ({
 import { AppShell } from "./AppShell";
 import { FileViewerContext, useFolderOpener, useOpenGithubTab } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
-import { isMobileViewport } from "./Sidebar";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
+import { isMobileViewport } from "@/lib/breakpoints";
 
 const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
 const routeError = new Error("Route rendering failed");
