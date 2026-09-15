@@ -58,6 +58,7 @@ import ipaddress
 import json
 import logging
 import os
+import secrets
 import struct
 import subprocess
 from collections.abc import AsyncIterator, Iterable
@@ -158,6 +159,97 @@ _MAX_FALLBACK_PROBE_PORTS = 32
 # in ``conversation_id_owned_by_pid`` so a pathological candidate set cannot blow
 # up a log line.
 _MAX_LOGGED_AMBIGUOUS_IDS = 10
+
+# agy >= 1.2 gates its connect-RPC surface behind a CSRF token: a request must
+# echo the server's launch-time token in this header or agy rejects it with
+# ``401 {"code":"unauthenticated","message":"missing CSRF token"}`` — which
+# starves Heartbeat port discovery, the cold-start's ``GetAvailableModels``,
+# the reader, and turn delivery. Pre-1.2 agy ignores the header.
+_CSRF_HEADER = "x-codeium-csrf-token"
+
+
+def _csrf_token_file() -> Path:
+    """Return the path of the shared agy CSRF token file.
+
+    One stable per-user token (rather than a per-launch one) because the RPC
+    callers span processes and lifetimes the launcher cannot reach: port
+    discovery Heartbeats candidate ports before knowing which session owns
+    them, and a restarted runner must still address an agy launched before the
+    restart. Resolved at call time so a test ``$HOME`` redirects it.
+
+    :returns: ``~/.omnigent/antigravity-native/csrf_token``.
+    """
+    return Path.home() / ".omnigent" / "antigravity-native" / "csrf_token"
+
+
+def ensure_agy_csrf_token() -> str | None:
+    """Return the stable CSRF token for omnigent-launched agy, minting it once.
+
+    The launcher (:func:`omnigent.harnesses.antigravity_native.launch.build_agy_launch`)
+    passes this token to agy via its hidden ``--csrf_token`` flag, and every RPC
+    in this module echoes it back in :data:`_CSRF_HEADER`, satisfying the
+    connect-RPC CSRF gate agy 1.2 introduced. First-writer-wins (``O_EXCL``) so
+    two concurrent first launches cannot clobber each other's token.
+
+    :returns: The token string, or ``None`` when the token file can neither be
+        read nor created (callers then behave as before the CSRF gate existed).
+    """
+    token = _read_agy_csrf_token()
+    if token is not None:
+        return token
+    path = _csrf_token_file()
+    minted = secrets.token_hex(32)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another process minted concurrently; adopt its token.
+        return _read_agy_csrf_token()
+    except OSError:
+        _logger.warning("could not create agy CSRF token file %s", path, exc_info=True)
+        return None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(minted + "\n")
+    except OSError:
+        _logger.warning("could not write agy CSRF token file %s", path, exc_info=True)
+        return None
+    return minted
+
+
+def _read_agy_csrf_token() -> str | None:
+    """Return the shared agy CSRF token, or ``None`` when none exists.
+
+    Read-only: the RPC client never mints — the launcher owns the token's
+    lifecycle, and a token agy was not launched with could never validate.
+
+    :returns: The token string, or ``None`` when the file is missing, empty, or
+        unreadable.
+    """
+    try:
+        token = _csrf_token_file().read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        _logger.warning("could not read agy CSRF token file %s", _csrf_token_file(), exc_info=True)
+        return None
+    return token or None
+
+
+def _rpc_headers(content_type: str = "application/json") -> dict[str, str]:
+    """Build request headers for a connect-RPC call, with agy's CSRF token.
+
+    :param content_type: The request content type — ``"application/json"`` for
+        unary RPCs, ``"application/connect+json"`` for the connect stream.
+    :returns: Headers carrying ``Content-Type`` and, when the shared token
+        exists, :data:`_CSRF_HEADER`. Without a token the header is omitted
+        (the pre-1.2 request shape).
+    """
+    headers = {"Content-Type": content_type}
+    token = _read_agy_csrf_token()
+    if token is not None:
+        headers[_CSRF_HEADER] = token
+    return headers
 
 
 def _assert_loopback_url(url: str) -> None:
@@ -425,7 +517,7 @@ def _heartbeat_ok(port: int) -> bool:
         with _sync_client(_PROBE_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(),
                 content=b"{}",
             )
     except httpx.HTTPError:
@@ -463,7 +555,7 @@ def _conversation_matches(port: int, conversation_id: str) -> bool:
         with _sync_client(_PROBE_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(),
                 content=json.dumps({"conversationId": conversation_id}).encode("utf-8"),
             )
     except httpx.HTTPError:
@@ -506,7 +598,7 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(),
             content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -537,7 +629,7 @@ def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
         with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(),
                 content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
             )
     except Exception:  # deliberate fail-open: ssl.SSLError etc. outside httpx hierarchy
@@ -584,7 +676,7 @@ def _post_rpc_raising(port: int, method: str, body: dict[str, object]) -> None:
         with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(),
                 content=json.dumps(body).encode("utf-8"),
             )
     except httpx.HTTPError as e:
@@ -783,7 +875,7 @@ def get_available_models(port: int) -> dict[str, object]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(),
             content=b"{}",
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -856,7 +948,7 @@ def get_all_cascade_trajectories(port: int) -> dict[str, object]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(),
             content=b"{}",
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -979,7 +1071,7 @@ async def stream_agent_state_updates(
         client.stream(
             "POST",
             url,
-            headers={"Content-Type": "application/connect+json"},
+            headers=_rpc_headers("application/connect+json"),
             content=body,
         ) as response,
     ):

@@ -369,3 +369,77 @@ class TestShouldSkipPermissions:
     def test_none_mode_headless_true(self) -> None:
         """``None`` mode + headless skips (headless wins regardless of mode)."""
         assert should_skip_permissions(permission_mode=None, headless=True) is True
+
+
+# ---------------------------------------------------------------------------
+# CSRF token launch seeding (agy >= 1.2 connect-RPC gate)
+# ---------------------------------------------------------------------------
+
+
+class TestAgyRequiresCsrfToken:
+    """Tests for :func:`_agy_requires_csrf_token` (the ``--version`` gate probe)."""
+
+    @staticmethod
+    def _fake_versioned_agy(tmp_path: Path, version_output: str) -> str:
+        binary = tmp_path / "agy"
+        binary.write_text(f"#!/bin/sh\necho '{version_output}'\n")
+        binary.chmod(0o755)
+        return str(binary)
+
+    def test_gate_introducing_version_true(self, tmp_path: Path) -> None:
+        """1.2.x (the release that added the gate) requires the token."""
+        assert _mod._agy_requires_csrf_token(self._fake_versioned_agy(tmp_path, "1.2.2")) is True
+
+    def test_newer_version_true(self, tmp_path: Path) -> None:
+        """Later releases keep the gate."""
+        assert _mod._agy_requires_csrf_token(self._fake_versioned_agy(tmp_path, "2.0.0")) is True
+
+    def test_pre_gate_version_false(self, tmp_path: Path) -> None:
+        """A pre-1.2 agy (no gate, flag acceptance unverified) is left alone."""
+        assert _mod._agy_requires_csrf_token(self._fake_versioned_agy(tmp_path, "1.1.9")) is False
+
+    def test_missing_binary_false(self, tmp_path: Path) -> None:
+        """A probe failure fails toward the unchanged (flag-free) launch."""
+        assert _mod._agy_requires_csrf_token(str(tmp_path / "missing-agy")) is False
+
+    def test_unparseable_version_false(self, tmp_path: Path) -> None:
+        """Unparseable version output also fails toward the flag-free launch."""
+        assert (
+            _mod._agy_requires_csrf_token(self._fake_versioned_agy(tmp_path, "dev build")) is False
+        )
+
+
+class TestBuildAgyLaunchCsrfToken:
+    """build_agy_launch seeds a gated agy with the shared CSRF token."""
+
+    def test_gated_agy_gets_token_flag(
+        self, fake_agy: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """agy >= 1.2 is launched with ``--csrf_token <shared token>``."""
+        monkeypatch.setattr(_mod, "_agy_requires_csrf_token", lambda _binary: True)
+        monkeypatch.setattr(_mod, "ensure_agy_csrf_token", lambda: "shared-token")
+        argv, _ = build_agy_launch(conversation_id=None, model=None, resume=False)
+        flag_at = argv.index("--csrf_token")
+        assert argv[flag_at + 1] == "shared-token"
+
+    def test_pre_gate_agy_launch_unchanged(
+        self, fake_agy: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pre-gate agy gets neither the flag nor a minted token."""
+        monkeypatch.setattr(_mod, "_agy_requires_csrf_token", lambda _binary: False)
+
+        def _must_not_mint() -> str | None:
+            raise AssertionError("no token may be minted for a pre-gate agy")
+
+        monkeypatch.setattr(_mod, "ensure_agy_csrf_token", _must_not_mint)
+        argv, _ = build_agy_launch(conversation_id=None, model=None, resume=False)
+        assert "--csrf_token" not in argv
+
+    def test_no_flag_when_token_unavailable(
+        self, fake_agy: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unmintable token degrades to the pre-fix launch, not a broken flag."""
+        monkeypatch.setattr(_mod, "_agy_requires_csrf_token", lambda _binary: True)
+        monkeypatch.setattr(_mod, "ensure_agy_csrf_token", lambda: None)
+        argv, _ = build_agy_launch(conversation_id=None, model=None, resume=False)
+        assert "--csrf_token" not in argv

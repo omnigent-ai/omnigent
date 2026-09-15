@@ -2219,3 +2219,60 @@ def test_pid_listen_ports_empty_when_neither_source_attributes(
     monkeypatch.setattr(rpc.psutil, "Process", _Proc)
     monkeypatch.setattr(rpc, "_run_lsof_listen_ports", lambda _pid: "")
     assert rpc._pid_listen_ports(72753) == []
+
+
+# ---------------------------------------------------------------------------
+# CSRF token (agy >= 1.2 connect-RPC gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scratch_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Redirect ``$HOME`` so token tests never touch the real shared token file."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path
+
+
+def test_ensure_csrf_token_mints_once_and_persists(scratch_home: Path) -> None:
+    """The first call mints a token; later calls return the persisted value."""
+    token = rpc.ensure_agy_csrf_token()
+    assert token
+    assert rpc.ensure_agy_csrf_token() == token
+    on_disk = scratch_home / ".omnigent" / "antigravity-native" / "csrf_token"
+    assert on_disk.read_text(encoding="utf-8").strip() == token
+
+
+def test_read_csrf_token_never_mints(scratch_home: Path) -> None:
+    """The client-side read helper returns None (and creates nothing) unminted."""
+    assert rpc._read_agy_csrf_token() is None
+    assert not (scratch_home / ".omnigent").exists()
+
+
+def test_rpc_headers_without_token_keep_pre_gate_shape(scratch_home: Path) -> None:
+    """No shared token -> the plain pre-1.2 request headers, no empty header."""
+    assert rpc._rpc_headers() == {"Content-Type": "application/json"}
+
+
+def test_rpc_headers_echo_shared_token(scratch_home: Path) -> None:
+    """A minted token rides every content type in agy's CSRF header."""
+    token = rpc.ensure_agy_csrf_token()
+    assert rpc._rpc_headers("application/connect+json") == {
+        "Content-Type": "application/connect+json",
+        "x-codeium-csrf-token": token,
+    }
+
+
+def test_heartbeat_sends_csrf_token_on_the_wire(
+    scratch_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Heartbeat probe echoes the shared token, clearing agy's CSRF gate."""
+    token = rpc.ensure_agy_csrf_token()
+    seen: list[httpx.Headers] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(_handler))
+    assert rpc._heartbeat_ok(52548) is True
+    assert seen and seen[0].get("x-codeium-csrf-token") == token

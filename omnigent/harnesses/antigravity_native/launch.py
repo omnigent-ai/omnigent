@@ -1,8 +1,9 @@
 """Launch-config helpers for native Antigravity (agy) TUI sessions.
 
 This module assembles the ``agy`` command-line arguments and environment
-overrides needed to start or resume a native agy session.  It contains only
-pure functions and a frozen dataclass — no live agy calls are made here.
+overrides needed to start or resume a native agy session.  Besides a
+``--version`` probe of the agy binary (to gate version-dependent flags), no
+live agy calls are made here.
 
 Key design points:
 
@@ -33,15 +34,25 @@ Key design points:
 * **Auth is inherited** — current agy releases accept either their persisted
   Google OAuth login or ``GEMINI_API_KEY``. The isolated settings prepared by
   the bridge select the Gemini provider when the key is present.
+
+* **CSRF token is launch-supplied** — agy >= 1.2 gates its local connect-RPC
+  endpoint behind a CSRF token that omnigent cannot discover after the fact
+  (agy mints one in-process when none is supplied). The launcher therefore
+  seeds agy with omnigent's own shared token via the hidden ``--csrf_token``
+  flag, and every client in :mod:`omnigent.harnesses.antigravity_native.rpc`
+  echoes it back.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from omnigent.harnesses.antigravity_native.rpc import ensure_agy_csrf_token
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 
 _logger = logging.getLogger(__name__)
@@ -57,6 +68,13 @@ _logger = logging.getLogger(__name__)
 _SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 # Omnigent permission mode that maps to agy's all-or-nothing bypass.
 _BYPASS_PERMISSION_MODE = "bypassPermissions"
+# The agy (major, minor) that introduced the connect-RPC CSRF gate. The same
+# releases accept the hidden ``--csrf_token`` flag (live-verified on 1.2.2), so
+# the flag is passed exactly where the gate exists — an older agy, whose flag
+# acceptance is unverified, keeps its unchanged (gate-free) launch.
+_AGY_CSRF_GATE_MIN_VERSION = (1, 2)
+# Wall-clock cap on the launch-time ``agy --version`` probe.
+_AGY_VERSION_PROBE_TIMEOUT_S = 30.0
 # Fallback binary path when ``agy`` is not on PATH.
 _AGY_FALLBACK_PATH = Path.home() / ".local" / "bin" / "agy"
 # Install instructions surfaced in the RuntimeError when agy is missing.
@@ -140,6 +158,36 @@ def resolve_native_antigravity_launch(
             "agy will prompt for login on first run."
         )
     return NativeAntigravityLaunch(auth_mode="subscription", model=model)
+
+
+def _agy_requires_csrf_token(binary: str) -> bool:
+    """Return whether *binary* is an agy release with the connect-RPC CSRF gate.
+
+    Probes ``<binary> --version`` and compares the leading ``major.minor``
+    against :data:`_AGY_CSRF_GATE_MIN_VERSION`. Fails toward ``False`` (no
+    ``--csrf_token`` flag appended) on any probe or parse failure: an unknown
+    flag could abort an older agy's launch outright, while a gated agy without
+    the flag only degrades to the pre-fix RPC behavior.
+
+    :param binary: The agy executable to probe, e.g. ``"/usr/local/bin/agy"``.
+    :returns: ``True`` when the probed version is >= the CSRF-gate minimum.
+    """
+    try:
+        completed = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_AGY_VERSION_PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    match = re.search(
+        r"(\d+)\.(\d+)(?:\.\d+)?", (completed.stdout or "") + "\n" + (completed.stderr or "")
+    )
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2))) >= _AGY_CSRF_GATE_MIN_VERSION
 
 
 def should_skip_permissions(
@@ -226,6 +274,13 @@ def build_agy_launch(
     gate for this harness is post-hoc/audit-only). The flag is not duplicated
     when *extra_args* already carries it.
 
+    **CSRF token.** For an agy release carrying the connect-RPC CSRF gate
+    (>= 1.2, see :func:`_agy_requires_csrf_token`), ``--csrf_token <token>`` is
+    appended with the shared token from
+    :func:`omnigent.harnesses.antigravity_native.rpc.ensure_agy_csrf_token`, so the RPC
+    clients (port discovery, cold-start, reader, executor) can authenticate.
+    Older agy launches are unchanged.
+
     In both modes auth is inherited from the ambient environment / agy state,
     and the workspace is the agy process cwd (set by the terminal spec), so no
     ``--add-dir`` is emitted. No env overrides are produced: agy ignores
@@ -269,6 +324,13 @@ def build_agy_launch(
         _SKIP_PERMISSIONS_FLAG not in extra_args
     ):
         argv.append(_SKIP_PERMISSIONS_FLAG)
+    # Seed agy with omnigent's shared CSRF token so the connect-RPC clients can
+    # satisfy the >= 1.2 CSRF gate; without it agy mints an undiscoverable
+    # in-process token and every RPC 401s (port discovery, cold-start, reader).
+    if _agy_requires_csrf_token(argv[0]):
+        csrf_token = ensure_agy_csrf_token()
+        if csrf_token is not None:
+            argv.extend(["--csrf_token", csrf_token])
     argv.extend(extra_args)
 
     # agy ignores every env knob we tried (sidecar port, conversation id, data

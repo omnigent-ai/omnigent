@@ -5641,6 +5641,7 @@ async def _cold_start_agy_conversation(
 
     deadline = time.monotonic() + timeout_s
     port: int | None = None
+    auth_denial: str | None = None
     while True:
         # Scope to THIS session's pane agy (avoids binding a foreign agy on a
         # multi-agy host); falls back to the lowest validated candidate when no
@@ -5649,6 +5650,13 @@ async def _cold_start_agy_conversation(
         if port is not None:
             try:
                 catalog = await asyncio.to_thread(get_available_models, port)
+            except httpx.HTTPStatusError as exc:
+                # An auth denial (agy's CSRF gate, a 401/403) is not a
+                # not-ready-yet: remember it so the timeout warning names the
+                # real failure instead of suggesting startup latency.
+                if exc.response.status_code in (401, 403):
+                    auth_denial = f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
+                catalog = {}
             except (httpx.HTTPError, ValueError):
                 catalog = {}
             models = catalog.get("models")
@@ -5658,9 +5666,16 @@ async def _cold_start_agy_conversation(
             _logger.warning(
                 "Antigravity cold-start: agy did not expose a ready model catalog within "
                 "%.0fs for session %s; leaving the placeholder conversation id for the "
-                "reader to bind once a turn creates the conversation.",
+                "reader to bind once a turn creates the conversation.%s",
                 timeout_s,
                 session_id,
+                (
+                    " agy DENIED the RPC ({}) - an auth failure, not startup latency; "
+                    "agy >= 1.2 requires the CSRF token omnigent passes at launch "
+                    "(--csrf_token).".format(auth_denial)
+                    if auth_denial is not None
+                    else ""
+                ),
             )
             return None
         await _agy_cold_start_poll_sleep(_AGY_COLD_START_PORT_POLL_INTERVAL_S)

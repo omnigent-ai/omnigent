@@ -2606,6 +2606,59 @@ async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
 
 
 @pytest.mark.asyncio
+async def test_cold_start_agy_conversation_names_auth_denial_in_timeout_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A CSRF/auth 401 surfaces in the timeout WARN instead of hiding as latency."""
+    import logging
+
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
+    from omnigent.runner.native import orchestration as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "0e803c4b62a94ff09a45f3ac9de9563e"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    placeholder = f"agy_conv_{'c' * 32}"
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=placeholder,
+        ),
+    )
+    monkeypatch.setattr(rpc_mod, "resolve_cold_start_agy_rpc_port", lambda *_args: 52548)
+
+    def _denied(_port: int) -> dict[str, object]:
+        request = httpx.Request("POST", "https://127.0.0.1:52548/rpc")
+        response = httpx.Response(
+            401,
+            text='{"code":"unauthenticated","message":"missing CSRF token"}',
+            request=request,
+        )
+        raise httpx.HTTPStatusError("401", request=request, response=response)
+
+    monkeypatch.setattr(rpc_mod, "get_available_models", _denied)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        result = await runner_app_mod._cold_start_agy_conversation(
+            bridge_dir,
+            session_id,
+            timeout_s=0.0,
+        )
+
+    assert result is None
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == placeholder
+    warnings = "\n".join(r.getMessage() for r in caplog.records)
+    assert "missing CSRF token" in warnings
+    assert "auth failure" in warnings
+
+
+@pytest.mark.asyncio
 async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
