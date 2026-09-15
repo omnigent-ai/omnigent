@@ -31,7 +31,9 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -50,6 +52,10 @@ _HOOKS_FILE = "hooks.jsonl"
 _FORWARDER_READY_FILE = "devin_forwarder_ready.json"
 #: Session-scoped ``--config`` file (user config + Omnigent hooks).
 _SESSION_CONFIG_FILE = "devin_config.json"
+#: Token file the shared ``serve-mcp`` reads at boot.
+_MCP_BRIDGE_CONFIG_FILE = "bridge.json"
+#: Name Devin lists the Omnigent relay under (``devin mcp list``).
+_MCP_SERVER_NAME = "omnigent"
 #: ``0o700`` shell wrapper every hook is launched as; bakes the server URL,
 #: session id and one-shot auth headers so the hook itself stays import-light.
 _HOOK_WRAPPER_FILE = "devin_hook.sh"
@@ -328,6 +334,98 @@ def write_devin_session_config(
 #: ignores config-level instructions (verified), so a Windsurf always-on rule is
 #: the only channel that reaches every turn's system prompt. Stable name so each
 #: launch overwrites rather than accumulating.
+#: Devin keeps MCP servers in a project-local file, not the ``--config`` user
+#: config, so the Omnigent relay is registered per workspace (same shape as the
+#: agent rule below). Verified against ``devin mcp add`` on 3000.10.21.
+_MCP_CONFIG_RELPATH = (".devin", "mcp_config.local.json")
+
+
+def write_relay_bridge_config(bridge_dir: Path) -> None:
+    """Write a token-only ``bridge.json`` so the shared ``serve-mcp`` can boot.
+
+    Carries only a token — no ``workspace`` key, so no ``sys_os_*`` tools are
+    served (Devin owns its own filesystem tools); the relay tools themselves come
+    from ``tool_relay.json``. Idempotent, so a relaunch never rotates a token the
+    relay was already started with. Mirrors the opencode/cursor writers.
+
+    :param bridge_dir: Per-session Devin bridge directory.
+    """
+    config_path = bridge_dir / _MCP_BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = bridge_dir / (_MCP_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(
+        json.dumps({"token": secrets.token_urlsafe(32)}, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp, config_path)
+
+
+def build_devin_mcp_server(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> _JsonObject:
+    """Build Devin's stdio entry for the shared Omnigent MCP relay.
+
+    :param bridge_dir: Per-session bridge dir the relay serves from.
+    :param python_executable: Interpreter to run ``serve-mcp`` with (tests).
+    :returns: One ``mcpServers`` entry in Devin's own schema.
+    """
+    return {
+        "command": python_executable or sys.executable,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        "transport": "stdio",
+        "env": {"TMPDIR": os.environ.get("TMPDIR", "/tmp")},
+    }
+
+
+def write_devin_mcp_config(
+    workspace: Path,
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Register the Omnigent relay in ``<workspace>/.devin/mcp_config.local.json``.
+
+    Devin reads MCP servers from this project-local file (``--config`` replaces
+    only the *user* config, which carries no MCP), so this is where the relay has
+    to land. Merges into any existing file so the user's own servers survive; a
+    hand-edited file of any other shape is discarded rather than crashing launch.
+
+    :param workspace: Session workspace (Devin's cwd).
+    :param bridge_dir: Per-session bridge dir.
+    :param python_executable: Interpreter for the relay command (tests).
+    :returns: Path to the written MCP config.
+    """
+    write_relay_bridge_config(bridge_dir)
+    path = workspace.joinpath(*_MCP_CONFIG_RELPATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        loaded = None
+    existing: _JsonObject = loaded if isinstance(loaded, dict) else {}
+    servers = existing.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+        existing["mcpServers"] = servers
+    servers[_MCP_SERVER_NAME] = build_devin_mcp_server(
+        bridge_dir, python_executable=python_executable
+    )
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 _AGENT_RULE_RELPATH = (".windsurf", "rules", "omnigent-agent-instructions.md")
 
 

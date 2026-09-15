@@ -12,6 +12,7 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_launch_args,
     build_devin_native_spawn_env,
     build_hook_config,
+    build_devin_mcp_server,
     devin_input_ready,
     devin_queue_pending,
     hooks_size,
@@ -19,6 +20,7 @@ from omnigent.harnesses.devin_native.bridge import (
     record_hook_event,
     session_config_path,
     write_devin_agent_rule,
+    write_devin_mcp_config,
     write_devin_session_config,
 )
 from omnigent.harnesses.devin_native.hook import _normalize_tool_result
@@ -465,3 +467,61 @@ class TestQueuedPane:
     def test_the_word_queued_alone_is_not_a_queue(self) -> None:
         # A turn that merely talks about queues must not trip the flush.
         assert devin_queue_pending("I queued the job for you.\n") is False
+
+
+class TestMcpConfig:
+    """Omnigent's MCP relay is registered where Devin actually reads servers."""
+
+    def test_writes_the_project_local_mcp_file(self, tmp_path: Path) -> None:
+        # Devin's `--config` user config carries no MCP servers; `devin mcp add`
+        # writes this project-local file, so the relay has to land there.
+        path = write_devin_mcp_config(tmp_path / "ws", tmp_path / "bridge")
+        assert path == tmp_path / "ws" / ".devin" / "mcp_config.local.json"
+
+    def test_relay_entry_is_stdio_serve_mcp_for_this_bridge(self, tmp_path: Path) -> None:
+        bridge = tmp_path / "bridge"
+        path = write_devin_mcp_config(tmp_path / "ws", bridge, python_executable="/py")
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["omnigent"]
+        assert entry["command"] == "/py"
+        assert entry["transport"] == "stdio"
+        assert entry["args"][:2] == ["-I", "-m"]
+        assert "serve-mcp" in entry["args"]
+        assert str(bridge) in entry["args"]
+
+    def test_user_servers_survive(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        (workspace / ".devin").mkdir(parents=True)
+        (workspace / ".devin" / "mcp_config.local.json").write_text(
+            json.dumps({"mcpServers": {"glean": {"command": "/bin/glean"}}}), encoding="utf-8"
+        )
+        path = write_devin_mcp_config(workspace, tmp_path / "bridge")
+        servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+        assert sorted(servers) == ["glean", "omnigent"]
+
+    def test_a_malformed_file_does_not_break_the_launch(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        (workspace / ".devin").mkdir(parents=True)
+        (workspace / ".devin" / "mcp_config.local.json").write_text("not json", encoding="utf-8")
+        path = write_devin_mcp_config(workspace, tmp_path / "bridge")
+        assert "omnigent" in json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+
+    def test_seeds_a_stable_relay_token(self, tmp_path: Path) -> None:
+        bridge = tmp_path / "bridge"
+        write_devin_mcp_config(tmp_path / "ws", bridge)
+        token = json.loads((bridge / "bridge.json").read_text(encoding="utf-8"))["token"]
+        assert token
+        # A relaunch must not rotate a token the relay already booted with.
+        write_devin_mcp_config(tmp_path / "ws", bridge)
+        assert json.loads((bridge / "bridge.json").read_text(encoding="utf-8"))["token"] == token
+
+    def test_no_workspace_key_so_no_os_tools_are_served(self, tmp_path: Path) -> None:
+        # Devin owns its own filesystem tools; a token-only bridge.json keeps
+        # serve-mcp to the relay (same choice as opencode/cursor).
+        bridge = tmp_path / "bridge"
+        write_devin_mcp_config(tmp_path / "ws", bridge)
+        assert set(json.loads((bridge / "bridge.json").read_text(encoding="utf-8"))) == {"token"}
+
+    def test_entry_shape_matches_devins_own_writer(self, tmp_path: Path) -> None:
+        # `devin mcp add` (3000.10.21) emits exactly these keys.
+        entry = build_devin_mcp_server(tmp_path / "bridge", python_executable="/py")
+        assert set(entry) == {"command", "args", "transport", "env"}

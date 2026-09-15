@@ -3367,6 +3367,7 @@ async def _auto_create_devin_terminal(
         prepare_bridge_dir,
         session_config_path,
         write_devin_agent_rule,
+        write_devin_mcp_config,
         write_hook_wrapper,
         write_tmux_target,
     )
@@ -3392,6 +3393,10 @@ async def _auto_create_devin_terminal(
     write_devin_agent_rule(
         workspace_path, _native_startup_raw_instructions_from_spec(agent_spec)
     )
+
+    # Register Omnigent's MCP relay before the TUI starts — Devin reads its MCP
+    # servers at launch, from a project-local file (its user config carries none).
+    write_devin_mcp_config(workspace_path, bridge_dir)
 
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
