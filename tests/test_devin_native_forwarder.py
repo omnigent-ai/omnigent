@@ -537,6 +537,73 @@ class TestPoisonEventSkip:
         assert [p["hook_event_name"] for p in remaining] == ["UserPromptSubmit"]
 
 
+class TestSessionIdPersistence:
+    """The resume id must survive a failed PATCH.
+
+    ``SessionStart`` fires once per launch, so a single swallowed failure used to
+    leave the server without Devin's session id for the whole session — and the
+    next resume cold-started instead of reattaching.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_patch_is_retried_on_the_next_event(self, tmp_path: Path) -> None:
+        class _FlakyClient(_FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.patch_attempts = 0
+
+            async def patch(self, url: str, json: dict[str, Any] | None = None) -> _FakeResponse:
+                self.patch_attempts += 1
+                if self.patch_attempts == 1:
+                    raise httpx.ConnectError("server briefly down")
+                return await super().patch(url, json=json)
+
+        client = _FlakyClient()
+        state = _ForwardState()
+        turn = _TurnState()
+        kwargs: dict[str, Any] = {
+            "session_id": "conv",
+            "bridge_dir": tmp_path,
+            "agent_name": "devin",
+            "state": state,
+            "turn": turn,
+        }
+        await _handle_event(client, payload=_SESSION_START, **kwargs)
+        assert state.devin_session_id == "childish-receipt"
+        assert state.session_id_persisted is False, "a failed PATCH must not look done"
+
+        # The next event carries it through, with no second SessionStart.
+        await _handle_event(client, payload=_STOP, **kwargs)
+        assert state.session_id_persisted is True
+        assert client.patch_attempts == 2
+        assert any(
+            body.get("external_session_id") == "childish-receipt" for _, body in client.patches
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_id_is_not_patched_again(self, tmp_path: Path) -> None:
+        client = _FakeClient()
+        state = _ForwardState()
+        kwargs: dict[str, Any] = {
+            "session_id": "conv",
+            "bridge_dir": tmp_path,
+            "agent_name": "devin",
+            "state": state,
+            "turn": _TurnState(),
+        }
+        await _handle_event(client, payload=_SESSION_START, **kwargs)
+        await _handle_event(client, payload=_STOP, **kwargs)
+        assert len(client.patches) == 1
+
+    def test_the_persisted_flag_round_trips(self, tmp_path: Path) -> None:
+        # A restart must not re-PATCH an id the server already has, nor believe a
+        # failed one landed.
+        _write_state(tmp_path, _ForwardState(devin_session_id="x", session_id_persisted=True))
+        assert _read_state(tmp_path).session_id_persisted is True
+        _write_state(tmp_path, _ForwardState(devin_session_id="x"))
+        assert _read_state(tmp_path).session_id_persisted is False
+
+
 class TestStatePersistence:
     """A supervisor restart resumes rather than replaying the conversation."""
 

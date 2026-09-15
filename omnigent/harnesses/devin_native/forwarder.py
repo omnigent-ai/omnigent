@@ -106,6 +106,11 @@ class _ForwardState:
 
     hooks_offset: int = 0
     devin_session_id: str | None = None
+    #: Whether the server has been told :attr:`devin_session_id`. Tracked apart
+    #: from knowing it, because ``SessionStart`` fires once: without this a single
+    #: failed PATCH would leave the id unrecorded for the session's whole life and
+    #: the next resume would cold-start instead of reattaching.
+    session_id_persisted: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
@@ -119,6 +124,7 @@ class _ForwardState:
         return {
             "hooks_offset": self.hooks_offset,
             "devin_session_id": self.devin_session_id,
+            "session_id_persisted": self.session_id_persisted,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cached_tokens": self.cached_tokens,
@@ -164,6 +170,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     devin_session_id = parsed.get("devin_session_id")
     if isinstance(devin_session_id, str) and devin_session_id:
         state.devin_session_id = devin_session_id
+        state.session_id_persisted = bool(parsed.get("session_id_persisted"))
     for key in ("input_tokens", "output_tokens", "cached_tokens"):
         value = parsed.get(key)
         if isinstance(value, int) and value >= 0:
@@ -234,18 +241,30 @@ async def _persist_devin_session_id(
     *,
     session_id: str,
     devin_session_id: str,
-) -> None:
+) -> bool:
     """Record Devin's session id so a later resume can reattach the TUI.
 
     This is what ``omnigent devin --resume <conversation>`` reads back to pass
     ``devin --resume <devin_session_id>``.
+
+    :returns: ``True`` once the server has it. A failure is not raised — the
+        caller retries on the next event, since losing this id costs a warm
+        resume rather than the session.
     """
-    with contextlib.suppress(httpx.HTTPError):
+    try:
         resp = await client.patch(
             f"/v1/sessions/{session_id}",
             json={"external_session_id": devin_session_id},
         )
         resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "devin-native: could not record Devin session id for %s; will retry",
+            session_id,
+            exc_info=True,
+        )
+        return False
+    return True
 
 
 def _read_export_metrics(bridge_dir: Path) -> tuple[_JsonObject | None, str | None]:
@@ -553,9 +572,17 @@ async def _handle_event(
         if isinstance(devin_session_id, str) and devin_session_id:
             if devin_session_id != state.devin_session_id:
                 state.devin_session_id = devin_session_id
-                await _persist_devin_session_id(
-                    client, session_id=session_id, devin_session_id=devin_session_id
-                )
+                state.session_id_persisted = False
+        # Fall through: the retry below covers both the first attempt and a
+        # SessionStart whose PATCH failed.
+
+    # Any event is a chance to land an id the server still lacks.
+    if state.devin_session_id and not state.session_id_persisted:
+        state.session_id_persisted = await _persist_devin_session_id(
+            client, session_id=session_id, devin_session_id=state.devin_session_id
+        )
+
+    if event == _SESSION_START:
         return
 
     if event == _USER_PROMPT_SUBMIT:
