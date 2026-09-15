@@ -3397,23 +3397,29 @@ async def _auto_create_devin_terminal(
     # servers at launch, from a project-local file (its user config carries none).
     write_devin_mcp_config(workspace_path, bridge_dir)
 
-    # A forked clone replays its prior conversation as a preamble on the first
-    # injected message: Devin's own session store is read-only to us, so there is
-    # no local transcript to rebuild for `--resume`. Best-effort — a failure just
-    # starts the fork without the carried context.
-    if launch_config.fork_carry_history and server_client is not None:
+    # Replay prior turns as a preamble on the first injected message whenever
+    # there is history but no Devin session to reattach to: a forked clone, or a
+    # conversation whose `--resume` id is absent (an ACP-era row, or one predating
+    # the native wrap). Devin's own store is read-only to us, so text replay is the
+    # only carry-over available. Costs one items GET on a launch without a resume
+    # id; the assistant-turn check keeps a brand-new session from replaying its own
+    # pending prompt. Best-effort — a failure just starts without the context.
+    if server_client is not None and (
+        launch_config.fork_carry_history or not launch_config.external_session_id
+    ):
         try:
             from omnigent.harnesses.claude_native.main import (
                 _fetch_all_session_items_for_claude_resume,
             )
 
-            fork_items = await _fetch_all_session_items_for_claude_resume(
+            carried_items = await _fetch_all_session_items_for_claude_resume(
                 server_client, session_id
             )
-            write_fork_preamble(bridge_dir, _cursor_fork_history_preamble(fork_items))
+            if launch_config.fork_carry_history or _devin_has_replayable_history(carried_items):
+                write_fork_preamble(bridge_dir, _cursor_fork_history_preamble(carried_items))
         except Exception:  # noqa: BLE001 — context carry-over is best-effort
             _logger.warning(
-                "devin-native: could not carry fork history for %s",
+                "devin-native: could not carry prior history for %s",
                 session_id,
                 exc_info=True,
             )
@@ -6156,6 +6162,26 @@ def _cursor_message_item_text(content: object) -> str:
 #: replayed history reads as close to that as a single text block allows:
 #: capitalized speaker labels, blank-line-separated turns.
 _CURSOR_FORK_ROLE_LABELS = {"user": "You", "assistant": "Assistant"}
+
+
+def _devin_has_replayable_history(items: list[_JsonObject]) -> bool:
+    """Whether *items* hold a finished exchange worth replaying to Devin.
+
+    A launch with no Devin session to reattach to covers two very different
+    cases: a brand-new session, whose items may already include the prompt being
+    dispatched (replaying that would prepend the message to itself), and a session
+    with real history and no resumable id — an ACP-era row, say. An assistant turn
+    is what separates them.
+
+    :param items: Committed Omnigent items, chronological.
+    :returns: ``True`` when at least one assistant message carries text.
+    """
+    return any(
+        item.get("type") == "message"
+        and item.get("role") == "assistant"
+        and _cursor_message_item_text(item.get("content"))
+        for item in items
+    )
 
 
 def _cursor_fork_history_preamble(items: list[_JsonObject]) -> str:
