@@ -33,6 +33,7 @@ import {
   toWorkspaceRelativePath,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
+  useWorkspaceDirectories,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
@@ -154,6 +155,11 @@ function DirectoryProbe({ id, path }: { id: string | undefined; path: string | n
   return null;
 }
 
+function DirectoriesProbe({ id, paths }: { id: string | undefined; paths: string[] }) {
+  useWorkspaceDirectories(id, paths);
+  return null;
+}
+
 function FileSearchProbe({
   id,
   query,
@@ -270,18 +276,28 @@ describe("useWorkspaceChangedFiles gating", () => {
     );
   });
 
-  it("fetches when the runner is offline but host liveness is still unknown", async () => {
+  it("holds fetches while host liveness is unknown for an offline runner", async () => {
     // Transient window (e.g. a stream push flipped the runner before host
-    // liveness resolved): host `undefined` stays "unknown → serve" so the
-    // query fires rather than blanking the panel; if the host is really
-    // down it just 503s and shows the reconnect hint.
+    // liveness resolved): the runner is known-offline, so firing now would
+    // just 503 (and get logged server-side). Hold until the host resolves;
+    // if it comes up `true` the host tunnel serves the panel.
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(undefined);
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
       .mockResolvedValueOnce(changedFilesResponse());
 
-    render(
+    const view = render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_unknown_host" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Host resolves up → the held queries fire over the host tunnel.
+    hostOnlineMock.mockReturnValue(true);
+    view.rerender(
       <Wrap>
         <ChangedFilesProbe id="conv_unknown_host" />
       </Wrap>,
@@ -310,15 +326,27 @@ describe("useWorkspaceChangedFiles gating", () => {
     );
   });
 
-  it("fetches when status is unknown (undefined)", async () => {
-    // Don't block first render of healthy sessions before the
-    // sidebar's /health batch has reported.
+  it("holds fetches until runner liveness resolves, then fires", async () => {
+    // Opening a session before the first /health resolves must not fan
+    // out resource GETs: a session whose runner went away (host reboot,
+    // idle-reap) would 503 on every one, each also logged server-side.
+    // The open session is always in the health fallback poll, so the
+    // hold lasts one /health round-trip; on `true` the fetches fire.
     onlineMock.mockReturnValue(undefined);
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
       .mockResolvedValueOnce(changedFilesResponse());
 
-    render(
+    const view = render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_unknown" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    onlineMock.mockReturnValue(true);
+    view.rerender(
       <Wrap>
         <ChangedFilesProbe id="conv_unknown" />
       </Wrap>,
@@ -639,6 +667,22 @@ describe("useWorkspaceDirectory gating", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/filesystem/src/inner?limit=1000&order=asc",
     );
+  });
+
+  it("holds the batched directory listings until runner liveness resolves", async () => {
+    // The virtualized tree's batched form shares the singular hook's cache
+    // and must share its gate: expanded dirs on a fresh open must not fire
+    // before the first /health resolves.
+    onlineMock.mockReturnValue(undefined);
+
+    render(
+      <Wrap>
+        <DirectoriesProbe id="conv_unknown" paths={["src", "docs"]} />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("does not fetch when path is null (pre-existing gate)", async () => {
@@ -1131,10 +1175,14 @@ describe("runner-offline retry liveness gate", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("does not retry a 503 for an old session with unknown liveness", async () => {
+  it("does not retry a 503 for an old idle session served over the host tunnel", async () => {
+    // The runner is known-offline but the host can serve, so the query fires
+    // (queries never fire while liveness is unknown - the serveable gate
+    // holds them). An old idle session isn't recovering: one 503, no storm.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
-    onlineMock.mockReturnValue(undefined);
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
     stubSession({ createdAtSecondsAgo: 3600 });
     fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
 
@@ -1145,9 +1193,13 @@ describe("runner-offline retry liveness gate", () => {
   });
 
   it("retries while a fresh session is cold-booting", async () => {
+    // Cold boot: the server reports the runner offline until it registers,
+    // and the host tunnel serves meanwhile. The 503 is worth retrying - the
+    // runner is coming up.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
-    onlineMock.mockReturnValue(undefined);
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
     stubSession({ createdAtSecondsAgo: 1 });
     fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
 
@@ -1160,8 +1212,11 @@ describe("runner-offline retry liveness gate", () => {
   });
 
   it("retries while the session snapshot is loading", async () => {
+    // Session age unknown (snapshot still loading) -> assume recovering, so
+    // a 503 on a query that fired (runner offline, host serving) retries.
     vi.useFakeTimers();
-    onlineMock.mockReturnValue(undefined);
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
     sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
     fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
 
