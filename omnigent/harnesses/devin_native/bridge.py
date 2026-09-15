@@ -504,6 +504,19 @@ def write_devin_mcp_config(
 
 
 _AGENT_RULE_RELPATH = (".windsurf", "rules", "omnigent-agent-instructions.md")
+#: Frontmatter key naming the session a rule belongs to, so a launch never
+#: deletes or overwrites instructions another session is running under.
+_AGENT_RULE_STAMP_KEY = "omnigent_session"
+
+#: A custom agent's instructions, staged for the first injected message when the
+#: rule channel is not safe to use for this workspace.
+_INSTRUCTIONS_PREAMBLE_FILE = "instructions_preamble.txt"
+AGENT_INSTRUCTIONS_OPEN_TAG = "<omnigent_agent_instructions>"
+AGENT_INSTRUCTIONS_CLOSE_TAG = "</omnigent_agent_instructions>"
+_AGENT_INSTRUCTIONS_HEADER = (
+    "These are your operating instructions for this session; follow them "
+    "throughout, not just for this message:"
+)
 
 
 #: Prior conversation a forked clone replays on its first message: written by the
@@ -581,7 +594,50 @@ def wrap_fork_preamble(preamble: str, user_text: str) -> str:
     )
 
 
-def write_devin_agent_rule(workspace: Path, instructions: str | None) -> None:
+def _rule_dir_is_machine_global(workspace: Path) -> bool:
+    """Whether this workspace's rules dir is one Devin reads from every cwd.
+
+    Devin scans ``.windsurf/rules`` under the home directory in addition to the
+    cwd, so a session whose workspace *is* the home directory would publish its
+    instructions to every Devin invocation on the machine — including the user's
+    own, outside Omnigent. Those workspaces take the preamble instead.
+
+    :param workspace: The session's workspace directory.
+    :returns: ``True`` when writing the rule would escape the workspace.
+    """
+    try:
+        return workspace.resolve() == Path.home().resolve()
+    except OSError:
+        return False
+
+
+def _read_agent_rule(rule_path: Path) -> tuple[str | None, str]:
+    """Return ``(owning session id, full file text)`` for an existing rule.
+
+    :param rule_path: The rule file, which need not exist.
+    :returns: The stamped session id (``None`` when absent or unstamped) and the
+        raw text (``""`` when the file cannot be read).
+    """
+    try:
+        text = rule_path.read_text(encoding="utf-8")
+    except OSError:
+        return None, ""
+    for line in text.splitlines()[:8]:
+        key, _, value = line.partition(":")
+        if key.strip() == _AGENT_RULE_STAMP_KEY and value.strip():
+            return value.strip(), text
+    return None, text
+
+
+def _render_agent_rule(instructions: str, session_id: str) -> str:
+    """Render the always-on rule file body for *instructions*."""
+    return (
+        f"---\ntrigger: always_on\n{_AGENT_RULE_STAMP_KEY}: {session_id}\n---\n"
+        f"{instructions.strip()}\n"
+    )
+
+
+def write_devin_agent_rule(workspace: Path, instructions: str | None, *, session_id: str) -> bool:
     """Deliver a custom agent's instructions to Devin as an always-on rule.
 
     Writes ``<workspace>/.windsurf/rules/omnigent-agent-instructions.md`` with the
@@ -593,20 +649,110 @@ def write_devin_agent_rule(workspace: Path, instructions: str | None) -> None:
     :param workspace: The session's workspace directory (Devin reads rules
         relative to its CWD, which is this workspace).
     :param instructions: The verbatim ``AgentSpec.instructions``, or ``None``.
+    :param session_id: The Omnigent conversation id, stamped as the rule's owner.
+    :returns: ``True`` when the instructions are live in the rule file. ``False``
+        means the caller must deliver them another way (see
+        :func:`write_agent_instructions_preamble`).
     """
     # ponytail: this writes into the user's workspace — the only always-on
     # channel Devin exposes (rules are CWD-relative; there is no out-of-tree
-    # rules dir and config-level instructions are ignored). Stable name keeps it
-    # to one overwritten file, removed when the agent carries no instructions.
+    # rules dir and config-level instructions are ignored). One fixed filename,
+    # because Devin loads EVERY always-on rule in the dir: per-session names
+    # would stack one session's instructions onto another's rather than isolate
+    # them. Ownership is tracked in frontmatter instead.
     rule_path = workspace.joinpath(*_AGENT_RULE_RELPATH)
-    if instructions and instructions.strip():
+    text = instructions.strip() if instructions else ""
+    owner, existing = _read_agent_rule(rule_path)
+
+    if not text:
+        # Nothing to deliver. Remove only a rule this session owns — an unstamped
+        # file predates ownership tracking and is ours by filename; another
+        # session's stamp is left alone so its live instructions survive.
+        if existing and owner in (None, session_id):
+            with contextlib.suppress(OSError):
+                rule_path.unlink(missing_ok=True)
+        return False
+
+    if _rule_dir_is_machine_global(workspace):
+        return False
+
+    rendered = _render_agent_rule(text, session_id)
+    if existing == rendered:
+        return True
+    if owner is not None and owner != session_id and _stamped_session_is_running(owner):
+        # A different agent's instructions are live in this shared workspace.
+        # Overwriting them would silently re-brief a running session.
+        return False
+    try:
         rule_path.parent.mkdir(parents=True, exist_ok=True)
-        rule_path.write_text(
-            f"---\ntrigger: always_on\n---\n{instructions.strip()}\n", encoding="utf-8"
-        )
-    else:
-        with contextlib.suppress(OSError):
-            rule_path.unlink(missing_ok=True)
+        rule_path.write_text(rendered, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _stamped_session_is_running(session_id: str) -> bool:
+    """Whether *session_id* still looks like a live devin-native session.
+
+    The bridge dir is created at launch and removed with the session, so its
+    presence is the cheapest cross-process signal available here. Errs toward
+    "running", which costs a preamble rather than another session's rule.
+    """
+    try:
+        return bridge_dir_for_session_id(session_id).is_dir()
+    except OSError:
+        return True
+
+
+def write_agent_instructions_preamble(bridge_dir: Path, instructions: str) -> None:
+    """Stage instructions for the first injected message.
+
+    The fallback for workspaces where the rule channel is not session-scoped.
+    Unlike the rule this is not always-on, so it is a weaker delivery — used only
+    when the alternative is leaking instructions into other sessions.
+
+    :param bridge_dir: Per-session bridge directory.
+    :param instructions: Verbatim agent instructions; blank writes nothing.
+    """
+    if not instructions.strip():
+        return
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).write_text(instructions, encoding="utf-8")
+
+
+def read_agent_instructions_preamble(bridge_dir: Path) -> str | None:
+    """Return staged instructions, or ``None`` when there are none."""
+    try:
+        text = (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text or None
+
+
+def clear_agent_instructions_preamble(bridge_dir: Path) -> None:
+    """Drop the staged instructions once they have been delivered."""
+    with contextlib.suppress(OSError):
+        (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).unlink()
+
+
+def wrap_agent_instructions(instructions: str, user_text: str) -> str:
+    """Frame staged instructions ahead of the session's first user message.
+
+    :param instructions: Verbatim agent instructions.
+    :param user_text: The message text this call prefixes.
+    :returns: The framed instructions followed by the user text.
+    """
+    body = instructions.strip()
+    body = body.replace(AGENT_INSTRUCTIONS_OPEN_TAG, "[omnigent_agent_instructions]").replace(
+        AGENT_INSTRUCTIONS_CLOSE_TAG, "[/omnigent_agent_instructions]"
+    )
+    return (
+        f"{AGENT_INSTRUCTIONS_OPEN_TAG}\n"
+        f"{_AGENT_INSTRUCTIONS_HEADER}\n\n"
+        f"{body}\n"
+        f"{AGENT_INSTRUCTIONS_CLOSE_TAG}\n\n"
+        f"{user_text}"
+    )
 
 
 def write_hook_wrapper(

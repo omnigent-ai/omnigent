@@ -43,6 +43,8 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.devin_native.bridge import (
+    AGENT_INSTRUCTIONS_CLOSE_TAG,
+    AGENT_INSTRUCTIONS_OPEN_TAG,
     DEVIN_POLICY_BLOCKED_KEY,
     FORK_HISTORY_CLOSE_TAG,
     FORK_HISTORY_OPEN_TAG,
@@ -76,9 +78,16 @@ _SUPERVISE_MAX_BACKOFF_S = 30.0
 #: context for Devin, not something the user typed, so it is stripped from the
 #: mirrored user turn (an unterminated block strips to end-of-text so a truncated
 #: paste degrades instead of mirroring raw history).
-_FORK_HISTORY_RE = re.compile(
-    rf"{re.escape(FORK_HISTORY_OPEN_TAG)}.*?{re.escape(FORK_HISTORY_CLOSE_TAG)}"
-    rf"|{re.escape(FORK_HISTORY_OPEN_TAG)}.*",
+# Blocks the launch path injects ahead of the user's first message. Each pair also
+# matches unterminated, so a truncated injection never leaks into the timeline.
+_INJECTED_BLOCK_RE = re.compile(
+    "|".join(
+        rf"{re.escape(open_tag)}.*?{re.escape(close_tag)}|{re.escape(open_tag)}.*"
+        for open_tag, close_tag in (
+            (FORK_HISTORY_OPEN_TAG, FORK_HISTORY_CLOSE_TAG),
+            (AGENT_INSTRUCTIONS_OPEN_TAG, AGENT_INSTRUCTIONS_CLOSE_TAG),
+        )
+    ),
     re.DOTALL,
 )
 
@@ -562,7 +571,7 @@ async def _handle_event(
         turn.prompt_id = prompt_id
         await _open_turn(client, session_id=session_id, turn=turn)
         if isinstance(prompt, str):
-            prompt = _FORK_HISTORY_RE.sub("", prompt).strip()
+            prompt = _INJECTED_BLOCK_RE.sub("", prompt).strip()
         if isinstance(prompt, str) and prompt.strip():
             await _post_item(
                 client,

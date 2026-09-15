@@ -9,10 +9,13 @@ from pathlib import Path
 
 from omnigent.harnesses.devin_native.bridge import (
     DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR,
+    clear_agent_instructions_preamble,
     clear_fork_preamble,
     inject_model_command,
     inject_user_message,
+    read_agent_instructions_preamble,
     read_fork_preamble,
+    wrap_agent_instructions,
     wrap_fork_preamble,
 )
 from omnigent.inner.executor import (
@@ -101,6 +104,11 @@ class DevinNativeExecutor(Executor):
         preamble = read_fork_preamble(self._bridge_dir)
         if preamble:
             text = wrap_fork_preamble(preamble, text)
+        # Instructions frame the whole message, history included, so the agent
+        # reads its brief before the conversation it applies to.
+        instructions = read_agent_instructions_preamble(self._bridge_dir)
+        if instructions:
+            text = wrap_agent_instructions(instructions, text)
         wanted_model = await self._resolve_variant(config)
         try:
             async with self._inject_lock:
@@ -112,6 +120,8 @@ class DevinNativeExecutor(Executor):
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
                 if preamble:
                     clear_fork_preamble(self._bridge_dir)
+                if instructions:
+                    clear_agent_instructions_preamble(self._bridge_dir)
         except RuntimeError as exc:
             yield ExecutorError(message=describe_exception(exc))
             return

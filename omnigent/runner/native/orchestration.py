@@ -3366,6 +3366,7 @@ async def _auto_create_devin_terminal(
         export_path,
         prepare_bridge_dir,
         session_config_path,
+        write_agent_instructions_preamble,
         write_devin_agent_rule,
         write_devin_mcp_config,
         write_fork_preamble,
@@ -3390,8 +3391,14 @@ async def _auto_create_devin_terminal(
 
     # Deliver a custom agent's instructions as an always-on Windsurf rule (the
     # only channel Devin applies to every turn); a plain agent clears any stale
-    # rule a prior custom-agent launch left in this workspace.
-    write_devin_agent_rule(workspace_path, _native_startup_raw_instructions_from_spec(agent_spec))
+    # rule a prior custom-agent launch left in this workspace. Where that rule
+    # would not be session-scoped — a home-directory workspace Devin reads from
+    # every cwd, or one another agent's live rule already owns — the instructions
+    # ride the first message instead, which is weaker but stays in this session.
+    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
+    rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
+    if raw_instructions and not rule_is_live:
+        write_agent_instructions_preamble(bridge_dir, raw_instructions)
 
     # Register Omnigent's MCP relay before the TUI starts — Devin reads its MCP
     # servers at launch, from a project-local file (its user config carries none).
