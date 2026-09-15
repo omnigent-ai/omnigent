@@ -3231,6 +3231,61 @@ def test_databricks_token_auth_resolves_sdk_once(
     assert cfg.authenticate_calls == 4
 
 
+def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mint failure on the reused SDK auth re-resolves instead of latching.
+
+    The long-lived client holds one SDK auth, and the SDK bakes the resolved
+    Databricks CLI binary path into it. When that path vanishes (e.g. a
+    Homebrew upgrade removes the versioned Cellar directory), every request
+    would go out bare for the rest of the process; the auth must resolve a
+    fresh SDK auth — which finds the current binary — and keep minting.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.inner.databricks_executor as dbx
+
+    class _Cfg:
+        """Config double that can go stale like a deleted CLI binary."""
+
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.stale = False
+
+        def authenticate(self) -> dict[str, str]:
+            if self.stale:
+                raise FileNotFoundError("baked CLI binary path was deleted")
+            return {"Authorization": f"Bearer {self.token}"}
+
+    cfgs: list[_Cfg] = []
+
+    def _fake_resolve(
+        profile: str | None = None, *, host: str | None = None
+    ) -> tuple[object, str]:
+        cfgs.append(_Cfg(f"tok-{len(cfgs) + 1}"))
+        return dbx._DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.databricks.com"
+
+    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)  # skip static path
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)  # skip OIDC path
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+
+    auth = chat_module._DatabricksTokenAuth(server_url="https://ex.databricks.com")
+
+    assert _first_auth_header(auth, "https://ex.databricks.com/v1/x") == "Bearer tok-1"
+
+    # The upgrade deletes the binary path the first Config baked in.
+    cfgs[0].stale = True
+
+    assert _first_auth_header(auth, "https://ex.databricks.com/v1/x") == "Bearer tok-2", (
+        "the client kept the stale SDK auth instead of re-resolving, so every "
+        "request after a CLI upgrade goes out unauthenticated"
+    )
+    assert len(cfgs) == 2
+
+
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every SDK-client request carries the workspace-routing header.
 
