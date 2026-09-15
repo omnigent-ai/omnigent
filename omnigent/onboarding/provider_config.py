@@ -46,8 +46,9 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Any, Literal
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -555,6 +556,26 @@ def resolve_secret(ref: str) -> str:
     expanded = expand_envvars_with_omnigent_prefix(ref)
     check_unresolved_env_vars(ref, expanded)
     return expanded
+
+
+def credential_for_block(block: Mapping[str, Any]) -> str | None:
+    """Resolve the key material a family block configures, for outbound use.
+
+    Shared by the runtime turn path and the host config control-plane probe
+    so both honor identical ``api_key_ref`` / inline ``api_key`` semantics.
+
+    :param block: One family block (the ``openai:`` / ``anthropic:`` /
+        ``gemini:`` mapping of a provider entry).
+    :returns: The resolved credential, or ``None`` when the block carries
+        no key material (an ``auth_command`` or keyless local endpoint).
+    """
+    ref = block.get("api_key_ref")
+    if isinstance(ref, str):
+        return resolve_secret(ref)
+    inline = block.get("api_key")
+    if isinstance(inline, str):
+        return resolve_secret(inline)
+    return None
 
 
 def _config_path() -> str:

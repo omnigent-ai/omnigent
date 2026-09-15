@@ -43,6 +43,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostModelOptionsResultFrame,
+    HostProviderOpResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -774,6 +775,20 @@ async def _receive_loop(
                         "status": frame.status,
                         "models": frame.models,
                         "routable_models": frame.routable_models,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostProviderOpResultFrame):
+            op_future = conn.pending_provider_ops.pop(frame.request_id, None)
+            if op_future is not None and not op_future.done():
+                op_future.set_result(
+                    {
+                        "status": frame.status,
+                        "payload": frame.payload,
+                        "error_status": frame.error_status,
+                        "error_code": frame.error_code,
                         "error": frame.error,
                     }
                 )

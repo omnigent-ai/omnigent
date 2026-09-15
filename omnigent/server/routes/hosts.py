@@ -55,6 +55,7 @@ from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
+from omnigent.server.routes._host_provider_op import request_host_provider_op
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
@@ -78,6 +79,10 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+# Provider ops touch config.yaml / agent specs on disk and the test op
+# probes a remote endpoint; give the round trip more headroom than a
+# model-options lookup but still fail the HTTP request deterministically.
+_PROVIDER_OP_TIMEOUT_S = 45.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -447,6 +452,23 @@ class StoreHarnessCredentialRequest(BaseModel):
     default_model: str | None = None
     wire_api: str | None = None
     env_var: str | None = None
+
+
+class ProviderUpsertRequest(BaseModel):
+    """Body for ``PUT /hosts/{host_id}/providers/{name}`` — the full entry."""
+
+    entry: dict[str, Any]
+
+
+class AgentPinRequest(BaseModel):
+    """Body for ``PUT /hosts/{host_id}/agents/{name}/pin``.
+
+    At least one field must be set; ``None`` leaves that selection
+    unchanged.
+    """
+
+    provider: str | None = None
+    model: str | None = None
 
 
 class HostModelOptionsResponse(BaseModel):
@@ -1609,5 +1631,153 @@ def create_hosts_router(
             raise HTTPException(status_code=400, detail=exc.message) from exc
 
         return {"object": "list", "data": worktrees}
+
+
+    # ── Config control plane: host providers + per-agent pins (#7134) ──
+
+    async def _run_provider_op(
+        request: Request,
+        host_id: str,
+        op: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Authorize, resolve the live host, and run one provider op.
+
+        Shared by every control-plane route below: the auth/ownership
+        checks and the wrong-replica-vs-offline classification match the
+        other ``/hosts/{id}/*`` proxies, and the frame-level failure
+        fields (``error_status``/``error_code``/``error``) map onto HTTP
+        errors so the panel renders the host's own validation message.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+
+        try:
+            result = await request_host_provider_op(
+                host_registry=host_registry,
+                host_conn=conn,
+                op=op,
+                params=params,
+                timeout_s=_PROVIDER_OP_TIMEOUT_S,
+            )
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_id}' connection lost",
+            ) from exc
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_id}' did not complete provider op {op!r} within "
+                    f"{_PROVIDER_OP_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+        if result.get("status") != "ok":
+            detail = str(result.get("error") or f"provider op {op!r} failed")
+            status = result.get("error_status")
+            raise HTTPException(
+                status_code=status if isinstance(status, int) else 502,
+                detail=detail,
+            )
+        return result.get("payload") or {}
+
+    @router.get("/hosts/{host_id}/providers")
+    async def list_host_providers(request: Request, host_id: str) -> dict[str, Any]:
+        """List a host's providers (secrets redacted to source descriptors)."""
+        return await _run_provider_op(request, host_id, "providers_list", {})
+
+    @router.put("/hosts/{host_id}/providers/{name}")
+    async def upsert_host_provider(
+        request: Request,
+        host_id: str,
+        name: str,
+        body: ProviderUpsertRequest,
+    ) -> dict[str, Any]:
+        """Create or replace one provider entry on the host.
+
+        The entry is validated by the host with the same parser every
+        turn runs, so a shape the runtime would reject never lands in
+        ``config.yaml``.
+        """
+        return await _run_provider_op(
+            request, host_id, "provider_upsert", {"name": name, "entry": body.entry}
+        )
+
+    @router.delete("/hosts/{host_id}/providers/{name}")
+    async def delete_host_provider(
+        request: Request,
+        host_id: str,
+        name: str,
+    ) -> dict[str, Any]:
+        """Delete one provider entry from the host's config."""
+        return await _run_provider_op(request, host_id, "provider_delete", {"name": name})
+
+    @router.post("/hosts/{host_id}/providers/{name}/test")
+    async def test_host_provider(
+        request: Request,
+        host_id: str,
+        name: str,
+    ) -> dict[str, Any]:
+        """Probe a provider's endpoint from the host with its own credential.
+
+        The credential is resolved host-side and sent only to the
+        provider's own ``base_url``; the response carries status,
+        latency, and a bounded model-id sample — never the secret.
+        """
+        return await _run_provider_op(request, host_id, "provider_test", {"name": name})
+
+    @router.get("/hosts/{host_id}/agent-specs")
+    async def list_host_agent_specs(request: Request, host_id: str) -> dict[str, Any]:
+        """List the host-local agent specs with their current pins.
+
+        These are the specs under the host's ``~/.omnigent/agents/`` —
+        the ones ``omnigent run <agent>`` resolves there — as opposed to
+        the server-side registered-agent store the sessions API serves.
+        """
+        return await _run_provider_op(request, host_id, "agents_list", {})
+
+    @router.put("/hosts/{host_id}/agent-specs/{agent_name}/pin")
+    async def pin_host_agent(
+        request: Request,
+        host_id: str,
+        agent_name: str,
+        body: AgentPinRequest,
+    ) -> dict[str, Any]:
+        """Pin an agent spec's provider and/or model on the host.
+
+        Writes ``executor.auth: {type: provider, name: ...}`` and/or
+        ``executor.model`` — the runtime's strongest per-agent selector;
+        resolution then prefers the pin over every ambient default.
+        """
+        if body.provider is None and body.model is None:
+            raise HTTPException(
+                status_code=400,
+                detail="pin requires a provider and/or model",
+            )
+        return await _run_provider_op(
+            request,
+            host_id,
+            "agent_pin_set",
+            {"agent": agent_name, "provider": body.provider, "model": body.model},
+        )
+
+    @router.delete("/hosts/{host_id}/agent-specs/{agent_name}/pin")
+    async def clear_host_agent_pin(
+        request: Request,
+        host_id: str,
+        agent_name: str,
+    ) -> dict[str, Any]:
+        """Remove an agent spec's provider and model pins."""
+        return await _run_provider_op(
+            request, host_id, "agent_pin_clear", {"agent": agent_name}
+        )
 
     return router
