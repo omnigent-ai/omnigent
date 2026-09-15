@@ -39,9 +39,26 @@ _DEVIN_AGENT_ID = "ag_devin_e2e"
 # Devin model *families* (claude-opus-5, swe-2, …), the shape
 # ``list_devin_cli_model_options`` returns. Effort is a separate axis, so no
 # variant suffixes appear here.
+# Effort rungs are PER MODEL, mirroring what `list_devin_cli_model_options`
+# reports: swe-2 exposes only medium/high/max (`swe-2-low` is a different Fusion
+# model), while claude-opus-5 carries the full ladder.
 _DEVIN_MODELS = [
-    {"id": "claude-opus-5", "displayName": "Claude Opus 5", "isDefault": False},
-    {"id": "swe-2", "displayName": "SWE-2", "isDefault": True},
+    {
+        "id": "claude-opus-5",
+        "displayName": "Claude Opus 5",
+        "isDefault": False,
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": rung} for rung in ("low", "medium", "high", "xhigh", "max")
+        ],
+    },
+    {
+        "id": "swe-2",
+        "displayName": "SWE-2",
+        "isDefault": True,
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": rung} for rung in ("medium", "high", "max")
+        ],
+    },
 ]
 
 
@@ -138,18 +155,29 @@ async def _drive(base_url: str, session_id: str) -> None:
                     page.get_by_test_id(f"new-chat-landing-agent-model-{model['id']}")
                 ).to_be_visible()
 
-            # The Effort ladder renders. Devin has no --effort flag, so this is
-            # the only way to express effort when starting a chat; the runner
-            # composes it onto the model id at launch.
+            # The Effort ladder renders, carrying only the DEFAULT model's rungs.
+            # Devin has no --effort flag, so this is the only way to express effort
+            # when starting a chat; the runner composes it onto the model id at
+            # launch — and offering a rung the model lacks would compose an id
+            # Devin resolves back to the bare family, so the pick would look inert.
             await expect(page.get_by_test_id("new-chat-landing-agent-efforts")).to_be_visible()
-            for rung in ("low", "medium", "high", "xhigh", "max"):
+            for rung in ("medium", "high", "max"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-agent-effort-{rung}")
                 ).to_be_visible()
+            for rung in ("low", "xhigh"):
+                await expect(
+                    page.get_by_test_id(f"new-chat-landing-agent-effort-{rung}")
+                ).to_have_count(0)
 
             # A model + effort pick sticks, which is what the create call sends as
-            # model_override + reasoning_effort.
+            # model_override + reasoning_effort. Switching to a model with the full
+            # ladder widens the rungs, which is the per-model derivation working.
             await page.get_by_test_id("new-chat-landing-agent-model-claude-opus-5").click()
+            for rung in ("low", "xhigh"):
+                await expect(
+                    page.get_by_test_id(f"new-chat-landing-agent-effort-{rung}")
+                ).to_be_visible()
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-model-claude-opus-5")
             ).to_have_attribute("data-state", "checked")
