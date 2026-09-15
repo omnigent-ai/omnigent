@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json as _json
+import logging
 import sqlite3 as _sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -156,6 +157,7 @@ def test_send_cursor_pane_keys_invokes_tmux_send_keys(
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
+    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: True)
     monkeypatch.setattr(cnb, "_run_tmux", lambda sp, *a: calls.append((sp, a)))
 
     cnb.send_cursor_pane_keys(tmp_path, "y")
@@ -172,6 +174,54 @@ def test_send_cursor_pane_keys_raises_without_target(
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: None)
     with pytest.raises(RuntimeError):
         cnb.send_cursor_pane_keys(tmp_path, "y")
+
+
+def test_send_cursor_pane_keys_dead_pane_raises_pane_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A torn-down pane is reported as gone, not as a tmux delivery failure."""
+    monkeypatch.setattr(
+        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: False)
+    with pytest.raises(cnb.CursorPaneGoneError):
+        cnb.send_cursor_pane_keys(tmp_path, "Escape")
+
+
+def test_send_cursor_pane_keys_teardown_race_raises_pane_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A send-keys failure on a pane that died mid-send is reported as gone."""
+    alive = iter([True, False])  # pre-check passes; the post-failure recheck sees the death
+
+    def _connect_error(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): error connecting to sock")
+
+    monkeypatch.setattr(
+        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: next(alive))
+    monkeypatch.setattr(cnb, "_run_tmux", _connect_error)
+    with pytest.raises(cnb.CursorPaneGoneError):
+        cnb.send_cursor_pane_keys(tmp_path, "Escape")
+
+
+def test_send_cursor_pane_keys_live_pane_failure_stays_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A send-keys failure while the pane is alive is a genuine delivery error."""
+
+    def _tmux_error(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): unknown key")
+
+    monkeypatch.setattr(
+        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: True)
+    monkeypatch.setattr(cnb, "_run_tmux", _tmux_error)
+    with pytest.raises(RuntimeError) as excinfo:
+        cnb.send_cursor_pane_keys(tmp_path, "Escape")
+    assert not isinstance(excinfo.value, cnb.CursorPaneGoneError)
 
 
 # ── Transcript-based detector ────────────────────────────────────────────────
@@ -814,7 +864,9 @@ def test_pane_shows_accept_prompt(pane: str, expected: bool) -> None:
 
 
 async def test_send_cursor_keys_reports_undelivered_keystroke(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A tmux send that raises reports failure rather than a silent success."""
 
@@ -822,10 +874,35 @@ async def test_send_cursor_keys_reports_undelivered_keystroke(
         raise RuntimeError("cursor-native tmux target not advertised")
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
-    assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "y") is False
+    with caplog.at_level(logging.ERROR, logger=cnp.__name__):
+        assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "y") is False
+    # A genuine delivery failure keeps the ERROR-level signature.
+    assert any(
+        "failed to send cursor keystroke" in record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+    )
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
     assert await cnp._send_cursor_keys(tmp_path, "conv_live", "y") is True
+
+
+async def test_send_cursor_keys_dead_pane_drops_verdict_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A verdict to a torn-down pane reports failure with no ERROR record."""
+
+    def _gone(_bridge: Path, _key: str) -> None:
+        raise cnb.CursorPaneGoneError("cursor pane no longer exists (TUI exited)")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _gone)
+    with caplog.at_level(logging.INFO, logger=cnp.__name__):
+        assert await cnp._send_cursor_keys(tmp_path, "conv_gone", "Escape", "Enter") is False
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    # The drop is still observable, just as an expected teardown consequence.
+    assert any("cursor pane gone" in record.getMessage() for record in caplog.records)
 
 
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────

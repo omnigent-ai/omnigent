@@ -644,6 +644,15 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+class CursorPaneGoneError(RuntimeError):
+    """The advertised Cursor pane no longer exists (TUI exited / torn down).
+
+    Distinguishes an expected teardown consequence from a genuine tmux delivery
+    failure, so callers can drop a verdict quietly instead of surfacing an
+    error for a pane that is simply gone.
+    """
+
+
 def _session_alive(socket_path: str, tmux_target: str) -> bool:
     """Return whether the tmux session/pane still exists (the TUI is running)."""
     try:
@@ -692,13 +701,25 @@ def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :param keys: tmux key arguments, e.g. ``"y"`` or ``"Escape"``.
+    :raises CursorPaneGoneError: If the advertised pane no longer exists (the
+        TUI exited or its tmux server was torn down).
     :raises RuntimeError: If the tmux target is not advertised or the
-        ``send-keys`` invocation fails.
+        ``send-keys`` invocation fails on a live pane.
     """
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("cursor-native tmux target not advertised")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise CursorPaneGoneError("cursor pane no longer exists (TUI exited)")
+    try:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+    except RuntimeError as exc:
+        # send-keys can race the pane's teardown: recheck so a pane that died
+        # mid-send is reported as gone, not as a delivery failure.
+        if not _session_alive(socket_path, tmux_target):
+            raise CursorPaneGoneError("cursor pane no longer exists (TUI exited)") from exc
+        raise
 
 
 def _submit_needle(content: str) -> str:
