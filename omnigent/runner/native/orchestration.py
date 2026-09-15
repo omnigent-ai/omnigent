@@ -307,6 +307,31 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     task.add_done_callback(_evict)
 
 
+def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None:
+    """
+    Move a session's forwarder registration onto its rotated-to session.
+
+    A native ``/clear`` rotation re-homes the pane onto a fresh conversation
+    while the SAME forwarder task keeps mirroring it. The registry is keyed by
+    the session that launched the task, so without this a teardown addressed at
+    the superseded conversation (``_cancel_auto_forwarder_task`` on terminal
+    re-create, or a stop request) would cancel the live forwarder.
+
+    Re-registering (rather than assigning) attaches an eviction callback for the
+    new key; the old key's callback is left in place and no-ops.
+
+    :param old_session_id: Session the task was registered under.
+    :param new_session_id: Rotated-to session that now owns the pane.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        return
+    task = _AUTO_FORWARDER_TASKS.pop(old_session_id, None)
+    if task is None:
+        return
+    _register_auto_forwarder_task(new_session_id, task)
+
+
 # Background tasks that re-pop a still-pending cost-budget approval on a
 # terminal client that attaches after the ASK fired. Kept referenced so
 # they aren't garbage-collected before they run.
@@ -2589,7 +2614,8 @@ async def _auto_create_cursor_terminal(
     await _cancel_auto_forwarder_task(session_id)
     from omnigent.harnesses.cursor_native.bridge import (
         approve_mcp_server_for_workspace,
-        bridge_dir_for_session_id,
+        bridge_dir_for_bridge_id,
+        write_active_session_id,
         write_fork_preamble,
         write_hooks_config,
         write_mcp_config,
@@ -2602,7 +2628,15 @@ async def _auto_create_cursor_terminal(
     from omnigent.harnesses.cursor_native.status import clear_cursor_status_state
     from omnigent.harnesses.cursor_native.usage import clear_cursor_usage_state
 
-    bridge_dir = bridge_dir_for_session_id(session_id)
+    # A rotated conversation keeps the bridge dir of the conversation that
+    # launched the pane, named by the bridge-id label.
+    bridge_id = session_id
+    if server_client is not None:
+        bridge_id = await _cursor_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
 
     # Shared native-terminal snapshot reader (workspace + terminal_launch_args
     # + model_override), also used by the pi-native launch.
@@ -2687,6 +2721,9 @@ async def _auto_create_cursor_terminal(
                 extra={"session_id": session_id},
             )
     write_mcp_config(Path(workspace), bridge_dir)
+    # Claim the pane for this conversation. The shared MCP bridge reads the same
+    # key, so pane-originated tool calls attribute to whoever owns it now.
+    write_active_session_id(bridge_dir, session_id)
     # Register the cursor ``stop`` hook that captures per-turn token usage into
     # the bridge dir for the usage forwarder below (see cursor_native_usage).
     write_hooks_config(Path(workspace), bridge_dir)
@@ -2802,6 +2839,10 @@ async def _auto_create_cursor_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
+                # A ``/clear`` rotation re-homes this same task onto the new
+                # conversation; re-key it so a teardown aimed at the superseded
+                # one can't cancel the live mirror.
+                on_session_rotated=_rekey_auto_forwarder_task,
             ),
             supervise_cursor_transcript_elicitations(
                 base_url=server_url,
@@ -7773,7 +7814,7 @@ async def _delete_native_bridge_dirs(
     (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
     the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
     cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
-    Antigravity/claude/codex/opencode bridge ids can be rotated via a session
+    Antigravity/claude/codex/cursor/opencode bridge ids can be rotated via a session
     label, so resolve those too (falling back to *session_id*, the un-rotated key);
     the remaining families key purely on *session_id*.
 
@@ -7800,7 +7841,10 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_bridge_id as codex_bridge_dir,
     )
     from omnigent.harnesses.cursor_native.bridge import (
-        bridge_dir_for_session_id as cursor_bridge_dir,
+        CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.harnesses.cursor_native.bridge import (
+        bridge_dir_for_bridge_id as cursor_bridge_dir,
     )
     from omnigent.harnesses.goose_native.bridge import (
         bridge_dir_for_session_id as goose_bridge_dir,
@@ -7841,6 +7885,7 @@ async def _delete_native_bridge_dirs(
         claude_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
+        cursor_bridge_dir(labels.get(CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         cursor_bridge_dir(session_id),
         goose_bridge_dir(session_id),
         hermes_bridge_dir(session_id),
@@ -7894,6 +7939,43 @@ async def _claude_native_bridge_id_for_session(
         )
     )
     bridge_id = labels.get(BRIDGE_ID_LABEL_KEY)
+    if isinstance(bridge_id, str) and bridge_id:
+        return bridge_id
+    return session_id
+
+
+async def _cursor_native_bridge_id_for_session(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    session_labels: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the bridge id label for a cursor-native session.
+
+    The cursor mirror of :func:`_claude_native_bridge_id_for_session`: a
+    ``/clear`` rotation binds a fresh conversation to the pane the original
+    conversation launched, and the label names that original conversation.
+
+    :param server_client: Omnigent server client used to fetch the session
+        snapshot.
+    :param session_id: Omnigent session/conversation id, e.g.
+        ``"conv_abc123"``.
+    :param session_labels: Labels already in hand, or ``None`` to fetch them.
+    :returns: Opaque bridge id from
+        ``omnigent.cursor_native.bridge_id`` when present, otherwise
+        *session_id* for a conversation that owns its own pane.
+    """
+    from omnigent.harnesses.cursor_native.bridge import CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY
+
+    labels = (
+        session_labels
+        if session_labels is not None
+        else await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    )
+    bridge_id = labels.get(CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY)
     if isinstance(bridge_id, str) and bridge_id:
         return bridge_id
     return session_id
@@ -8618,6 +8700,62 @@ async def _codex_native_terminal_arrives_via_transfer(
     if state is None or state.session_id == session_id:
         return False
     return terminal_registry.get(state.session_id, "codex", "main") is not None
+
+
+async def _cursor_native_terminal_arrives_via_transfer(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    session_labels: Mapping[str, str] | None = None,
+) -> bool:
+    """
+    Return whether a live cursor terminal will be transferred into a session.
+
+    The cursor mirror of
+    :func:`_codex_native_terminal_arrives_via_transfer`. A TUI ``/clear``
+    starts a fresh cursor chat in the SAME pane, and the forwarder rotates
+    ownership onto a fresh session before transferring that terminal onto
+    it. Binding the runner to the new session triggers auto-create, and a
+    second ``cursor:main`` makes the rotation's transfer 409 — so the
+    forwarder retries and the rotation loops. The bridge config still names
+    the terminal-owning session at bind time (rotation rewrites it only
+    AFTER the transfer), detected here so the caller skips auto-create and
+    lets the transfer deliver the terminal.
+
+    :param server_client: Omnigent client to resolve the bridge id label;
+        ``None`` can't confirm a rotation, so returns ``False``.
+    :param session_id: Newly-bound session id, e.g. ``"conv_new"``.
+    :param resource_registry: Registry probed for the original session's
+        live ``cursor:main`` terminal.
+    :param session_labels: Labels already in hand (the server-supplied init
+        envelope), or ``None`` to look them up. Passing them avoids a lookup
+        whose failure would fall back to *session_id* and report ``False``
+        for a rotation that is in fact inbound.
+    :returns: ``True`` when a different session on the same bridge owns a
+        live ``cursor:main`` terminal (transfer inbound), else ``False``.
+    """
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is None or server_client is None:
+        return False
+    # Lazy import keeps cursor-native out of the generic runner import graph.
+    from omnigent.harnesses.cursor_native.bridge import (
+        bridge_dir_for_bridge_id as cursor_bridge_dir_for_bridge_id,
+    )
+    from omnigent.harnesses.cursor_native.bridge import (
+        read_active_session_id as read_cursor_active_session_id,
+    )
+
+    bridge_id = await _cursor_native_bridge_id_for_session(
+        server_client=server_client,
+        session_id=session_id,
+        session_labels=session_labels,
+    )
+    active_session_id = read_cursor_active_session_id(cursor_bridge_dir_for_bridge_id(bridge_id))
+    # Fresh bridge, or the new session is already active — nothing transfers in.
+    if active_session_id is None or active_session_id == session_id:
+        return False
+    return terminal_registry.get(active_session_id, "cursor", "main") is not None
 
 
 _SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS = 1.0

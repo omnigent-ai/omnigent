@@ -42,14 +42,23 @@ import os
 import re
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 import httpx
 
+from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.cursor_native import status as cursor_native_status
-from omnigent.harnesses.cursor_native.bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
+from omnigent.harnesses.cursor_native.bridge import (
+    CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY,
+    FORK_HISTORY_CLOSE_TAG,
+    FORK_HISTORY_OPEN_TAG,
+    read_active_session_id,
+    write_active_session_id,
+)
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native._native_post_delivery import post_may_have_been_delivered
 
@@ -102,6 +111,11 @@ _STATE_FILE = "cursor_forwarder.json"
 # claim is treated as a dead session and may be taken over. Generous relative to
 # the ~0.7s poll so a brief supervisor backoff/restart never drops a live claim.
 _CLAIM_FRESH_MS = 30_000
+
+# Handshake failures allowed per candidate chat before the forwarder gives up and
+# keeps mirroring the bound one. Unbounded, a persistently failing handshake
+# would retry every poll forever; bounded, the new chat just stays unmirrored.
+_MAX_ROTATION_ATTEMPTS = 5
 
 # cursor wraps the real prompt the user typed in ``<user_query>…</user_query>``
 # and prepends a large ``<user_info>…`` context dump as a separate user blob.
@@ -432,6 +446,42 @@ def _scan_hash_dir(
         if created >= floor_ms and created > best_created:
             best, best_created = store, created
     return best, best_created
+
+
+def _detect_rotated_chat(*, bound_store: Path, launch_epoch_ms: int) -> Path | None:
+    """Return the chat the pane rotated into via ``/clear``, or ``None``.
+
+    cursor's ``/clear`` (aliases ``/new``, ``/new-chat``, ``/newchat``) starts a
+    brand-new chat in a *sibling* directory and leaves the old ``store.db`` in
+    place, so the forwarder's bound store never disappears and never re-discovers
+    on its own. Detect the successor instead: the newest chat that is a sibling of
+    the bound one and strictly newer than it.
+
+    The search is anchored on the bound store's OWN hash dir rather than a
+    recomputed ``md5(workspace)``. Those differ whenever the first bind came from
+    :func:`_discover_store`'s path-hash fallback, and recomputing would leave
+    exactly those sessions unable to ever see their successor. Staying inside the
+    bound store's directory also keeps the no-cross-workspace guarantee that
+    fallback deliberately gives up.
+
+    :param bound_store: The ``store.db`` currently being mirrored.
+    :param launch_epoch_ms: Wall-clock ms when this terminal launched. Anchoring
+        the floor here keeps a cold resume from mistaking an older chat (which
+        ``preseed_resume_state`` legitimately bound) for a rotation.
+    :returns: The successor ``store.db``, or ``None`` when the pane has not
+        rotated (or the new chat has no rows yet).
+    """
+    hash_dir = bound_store.parent.parent
+    floor_ms = max(_chat_created_ms(bound_store.parent) + 1, launch_epoch_ms - _DISCOVERY_SKEW_MS)
+    best, _best_created = _scan_hash_dir(hash_dir, floor_ms, None, 0)
+    if best is None or best.parent == bound_store.parent:
+        return None
+    # The TUI creates the chat dir on the first message, but ``meta.json`` and
+    # the first blob can land in either order; an empty store means the rotation
+    # is still mid-flight, so wait for content rather than rotate onto nothing.
+    if _get_current_rowid(best) <= 0:
+        return None
+    return best
 
 
 def _content_text(content: object) -> str:
@@ -870,6 +920,255 @@ async def _persist_native_compaction_item(
     resp.raise_for_status()
 
 
+async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) -> dict[str, object]:
+    """
+    Fetch an Omnigent session snapshot for cursor session rotation.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :returns: Decoded JSON session snapshot.
+    :raises httpx.HTTPStatusError: If Omnigent rejects the request.
+    :raises RuntimeError: If the response is not a JSON object.
+    """
+    resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("cursor session snapshot response was not an object")
+    return payload
+
+
+def _inherited_launch_fields(snapshot: dict[str, object]) -> dict[str, object]:
+    """Return the launch settings a rotated cursor session must inherit.
+
+    ``_pi_native_launch_config`` (shared by pi- and cursor-native) reads these
+    off the session snapshot when the runner cold-resumes a pane, so a
+    replacement session that omits them silently loses the workspace, the
+    pass-through CLI args (``--force`` and friends), and the model/effort hints.
+    """
+    inherited: dict[str, object] = {}
+    workspace = snapshot.get("workspace")
+    if isinstance(workspace, str) and workspace:
+        inherited["workspace"] = workspace
+    launch_args = snapshot.get("terminal_launch_args")
+    if isinstance(launch_args, list) and all(isinstance(arg, str) for arg in launch_args):
+        inherited["terminal_launch_args"] = launch_args
+    for key in ("model_override", "reasoning_effort"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value:
+            inherited[key] = value
+    return inherited
+
+
+async def _create_clear_replacement_session(
+    *,
+    client: httpx.AsyncClient,
+    old_session_id: str,
+    bridge_dir: Path,
+    new_chat_id: str,
+) -> str:
+    """
+    Create the fresh Omnigent session for a cursor ``/clear`` rotation.
+
+    Mirrors :func:`omnigent.harnesses.claude_native.forwarder._create_clear_replacement_session`,
+    with the extra ``external_session_id`` PATCH codex needs (cursor resumes by
+    chat id) and the launch settings a cursor cold resume reads back.
+
+    ``external_session_id`` is write-once at the store layer, so the rotation
+    cannot re-point the existing conversation at the new chat — a new
+    conversation is the only option.
+
+    The old session is released as TWO PATCHes, bridge label before runner
+    clear: the server applies one PATCH's fields in separate store calls, and a
+    half-applied combined body must not leave the old session unbound while it
+    still names the live bridge. Failing between them leaves it pointed at its
+    own fresh bridge dir, the direction that cannot produce two pane owners.
+
+    :param client: Omnigent HTTP client.
+    :param old_session_id: Session being rotated away from, e.g. ``"conv_old"``.
+    :param bridge_dir: Native cursor bridge directory.
+    :param new_chat_id: cursor chat id the pane rotated into.
+    :returns: New Omnigent session id, e.g. ``"conv_new"``.
+    :raises httpx.HTTPError: If Omnigent rejects session creation, new-session
+        binding, or terminal transfer. Clearing the old runner binding is
+        best-effort after the bridge has rotated.
+    :raises RuntimeError: If the old session snapshot is malformed.
+    """
+    old = await _fetch_session_snapshot(client, old_session_id)
+    agent_id = old.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id:
+        raise RuntimeError(f"session {old_session_id!r} has no agent_id")
+    runner_id = old.get("runner_id")
+    raw_labels = old.get("labels")
+    labels = (
+        {str(key): str(value) for key, value in raw_labels.items()}
+        if isinstance(raw_labels, dict)
+        else {}
+    )
+    labels.setdefault(
+        CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY,
+        read_active_session_id(bridge_dir) or old_session_id,
+    )
+
+    create_body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
+    create_body.update(_inherited_launch_fields(old))
+    create_resp = await client.post("/v1/sessions", json=create_body)
+    create_resp.raise_for_status()
+    created = create_resp.json()
+    new_session_id = created.get("id") if isinstance(created, dict) else None
+    if not isinstance(new_session_id, str) or not new_session_id:
+        raise RuntimeError("clear replacement session response did not include id")
+
+    if isinstance(runner_id, str) and runner_id:
+        bind_resp = await client.patch(
+            f"/v1/sessions/{url_component(new_session_id)}",
+            json={"runner_id": runner_id},
+        )
+        bind_resp.raise_for_status()
+
+    chat_resp = await client.patch(
+        f"/v1/sessions/{url_component(new_session_id)}",
+        json={"external_session_id": new_chat_id},
+    )
+    chat_resp.raise_for_status()
+
+    terminal_id = terminal_resource_id("cursor", "main")
+    transfer_resp = await client.post(
+        (
+            f"/v1/sessions/{url_component(old_session_id)}"
+            f"/resources/terminals/{url_component(terminal_id)}/transfer"
+        ),
+        json={"target_session_id": new_session_id},
+    )
+    transfer_resp.raise_for_status()
+
+    # After the transfer, so the runner's transfer-inbound guard still sees the
+    # old owner while the terminal is in flight.
+    write_active_session_id(bridge_dir, new_session_id)
+    # Re-key the superseded session onto a DISTINCT "-cleared" bridge id so
+    # resuming it lands in its own bridge dir rather than stomping the live
+    # ``active_session_id`` the replacement now owns.
+    for field, payload in (
+        (
+            "bridge label",
+            {"labels": {CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"}},
+        ),
+        ("runner binding", {"runner_id": ""}),
+    ):
+        clear_resp = await client.patch(
+            f"/v1/sessions/{url_component(old_session_id)}", json=payload
+        )
+        if clear_resp.status_code >= 400:
+            _logger.warning(
+                "Failed to release the old cursor-native %s after /clear; "
+                "old_session=%s new_session=%s status=%s body=%s",
+                field,
+                old_session_id,
+                new_session_id,
+                clear_resp.status_code,
+                clear_resp.text,
+                extra={"session_id": old_session_id},
+            )
+            break
+    return new_session_id
+
+
+async def _post_clear_supersession(
+    client: httpx.AsyncClient,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    agent_name: str,
+) -> None:
+    """
+    Notify the superseded session that a ``/clear`` rotated it away.
+
+    Mirrors :func:`omnigent.harnesses.claude_native.forwarder._post_clear_supersession`.
+    Posts three best-effort events to the OLD conversation, in order:
+
+    1. An ``external_session_status: idle`` so the old conversation's "Working…"
+       spinner stops — its terminal moved to the new session, so it will never
+       receive the turn-end edge that would normally clear it.
+    2. A persisted assistant ``message`` item linking to the new conversation,
+       so a later reload explains what happened. This is the durable record.
+    3. A transient ``external_session_superseded`` event the server republishes
+       as ``session.superseded``, so a client *actively* viewing the old
+       conversation auto-redirects to the new one.
+
+    Each failure is logged and swallowed: the rotation has already completed and
+    reset forwarder state, so a notification error must not disrupt the poll loop.
+
+    :param client: Omnigent HTTP client (``base_url`` = AP server).
+    :param old_session_id: Superseded conversation id, e.g. ``"conv_old"``.
+    :param new_session_id: Rotated-to conversation id, e.g. ``"conv_new"``.
+    :param agent_name: Agent name to stamp on the notice message.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        # Defensive: never address the notice/redirect at the live session.
+        return
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        status_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+            extra={"session_id": old_session_id},
+        )
+    notice = (
+        "This conversation was ended by `/clear`. "
+        f"Continue in [the new chat](/c/{new_session_id}). "
+        "You can also send a message here to resume this conversation."
+    )
+    try:
+        item_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": agent_name,
+                        "content": [{"type": "output_text", "text": notice}],
+                    },
+                },
+            },
+        )
+        item_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession notice; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+            extra={"session_id": old_session_id},
+        )
+    try:
+        event_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": new_session_id},
+            },
+        )
+        event_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+            extra={"session_id": old_session_id},
+        )
+
+
 async def forward_cursor_store_to_session(
     *,
     base_url: str,
@@ -881,6 +1180,7 @@ async def forward_cursor_store_to_session(
     launch_epoch_ms: int,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
+    on_session_rotated: Callable[[str, str], None] | None = None,
 ) -> None:
     """Tail the cursor chat store and mirror new messages into the AP session.
 
@@ -909,6 +1209,9 @@ async def forward_cursor_store_to_session(
     :param launch_epoch_ms: Wall-clock ms when this terminal launched.
     :param poll_interval_s: Seconds between store polls.
     :param auth: Optional refresh-capable httpx Auth for remote deployments.
+    :param on_session_rotated: Called with ``(old_session_id, new_session_id)``
+        after a ``/clear`` rotation, so the caller can move any per-session
+        bookkeeping onto the new conversation.
     :returns: Never normally returns; cancel the task to stop it.
     """
     persisted = _read_state(bridge_dir)
@@ -923,12 +1226,21 @@ async def forward_cursor_store_to_session(
     # so the cold-resume path can pass ``--resume <chatId>`` to cursor-agent.
     chat_id_patched = False
     model_state = _ModelMirrorState()
+    # Bounded-retry guard for the rotation handshake, keyed on the candidate chat
+    # id so a new ``/clear`` always gets a fresh budget. In-memory: a supervisor
+    # restart hands the same ``/clear`` a second budget.
+    rotation_candidate: str | None = None
+    rotation_attempts = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
+        # Re-read every poll so a rotation performed below (or by an earlier
+        # incarnation of this forwarder) redirects every subsequent POST.
+        current_session_id = session_id
         while True:
             try:
+                current_session_id = read_active_session_id(bridge_dir) or session_id
                 # Snapshot completion before reading its transcript. A turn
                 # finishing during this poll must wait for the next read.
                 total_turn_ends = await asyncio.to_thread(
@@ -957,7 +1269,7 @@ async def forward_cursor_store_to_session(
                         if not chat_id_patched:
                             chat_id_val = store_path.parent.name
                             await _patch_external_session_id(
-                                client, session_id=session_id, chat_id=chat_id_val
+                                client, session_id=current_session_id, chat_id=chat_id_val
                             )
                             chat_id_patched = True
                     else:
@@ -992,7 +1304,7 @@ async def forward_cursor_store_to_session(
                             if not chat_id_patched:
                                 chat_id_val = store_path.parent.name
                                 await _patch_external_session_id(
-                                    client, session_id=session_id, chat_id=chat_id_val
+                                    client, session_id=current_session_id, chat_id=chat_id_val
                                 )
                                 chat_id_patched = True
                 if store_path is not None and store_path.exists():
@@ -1008,7 +1320,7 @@ async def forward_cursor_store_to_session(
                             "cursor chat %s already mirrored by another session; "
                             "pausing mirror for session=%s",
                             store_path,
-                            session_id,
+                            current_session_id,
                         )
                         store_path = None
                     else:
@@ -1033,28 +1345,28 @@ async def forward_cursor_store_to_session(
                                 # never desyncs the mirror, so it is acceptable.
                                 try:
                                     await _post_external_compaction_status(
-                                        client, session_id=session_id, status="completed"
+                                        client, session_id=current_session_id, status="completed"
                                     )
                                 except httpx.HTTPError:
                                     _logger.warning(
                                         "cursor forwarder could not post "
                                         "compaction-completed; the web UI spinner "
                                         "may linger; session=%s rowid=%s",
-                                        session_id,
+                                        current_session_id,
                                         item.rowid,
                                         exc_info=True,
                                     )
                                 try:
                                     await _persist_native_compaction_item(
                                         client,
-                                        session_id=session_id,
+                                        session_id=current_session_id,
                                         store_path=store_path,
                                     )
                                 except Exception:  # noqa: BLE001
                                     _logger.warning(
                                         "cursor forwarder could not persist "
                                         "compaction item; session=%s",
-                                        session_id,
+                                        current_session_id,
                                         exc_info=True,
                                     )
                                 failed_rowid = failed_attempts = 0
@@ -1071,7 +1383,7 @@ async def forward_cursor_store_to_session(
                             if item.item_type:
                                 try:
                                     await _post_conversation_item(
-                                        client, session_id=session_id, item=item
+                                        client, session_id=current_session_id, item=item
                                     )
                                 except httpx.HTTPError as exc:
                                     if post_may_have_been_delivered(exc):
@@ -1084,7 +1396,7 @@ async def forward_cursor_store_to_session(
                                             "cursor forwarder skipping item after an "
                                             "ambiguous POST failure (may already be "
                                             "committed); session=%s rowid=%s",
-                                            session_id,
+                                            current_session_id,
                                             item.rowid,
                                             exc_info=True,
                                         )
@@ -1104,7 +1416,7 @@ async def forward_cursor_store_to_session(
                                                 "%s); retrying; session=%s rowid=%s "
                                                 "attempt=%s",
                                                 exc.response.status_code,
-                                                session_id,
+                                                current_session_id,
                                                 item.rowid,
                                                 failed_attempts,
                                             )
@@ -1116,7 +1428,7 @@ async def forward_cursor_store_to_session(
                                             "otherwise wedge; session=%s rowid=%s",
                                             failed_attempts,
                                             exc.response.status_code,
-                                            session_id,
+                                            current_session_id,
                                             item.rowid,
                                         )
                                     else:
@@ -1128,7 +1440,7 @@ async def forward_cursor_store_to_session(
                                         _logger.warning(
                                             "cursor forwarder POST could not reach the "
                                             "server; retrying; session=%s rowid=%s",
-                                            session_id,
+                                            current_session_id,
                                             item.rowid,
                                             exc_info=True,
                                         )
@@ -1164,10 +1476,102 @@ async def forward_cursor_store_to_session(
                         observed_model = await asyncio.to_thread(_read_last_used_model, store_path)
                         await _post_model_change_if_new(
                             client,
-                            session_id=session_id,
+                            session_id=current_session_id,
                             state=model_state,
                             model=observed_model,
                         )
+                        # ``/clear`` starts a sibling chat and leaves this store
+                        # behind, so nothing above re-discovers. Rotate after the
+                        # drain, never mid-retry, so the old chat's last turn lands.
+                        candidate = (
+                            None
+                            if retrying_items
+                            else await asyncio.to_thread(
+                                _detect_rotated_chat,
+                                bound_store=store_path,
+                                launch_epoch_ms=launch_epoch_ms,
+                            )
+                        )
+                        # Keyed on the chat id, never reset on a ``None`` gap:
+                        # detection drops out mid-retry, and resetting there would
+                        # let one ``/clear`` spend its budget over and over.
+                        if candidate is not None and candidate.parent.name != rotation_candidate:
+                            rotation_candidate, rotation_attempts = candidate.parent.name, 0
+                        if (
+                            candidate is not None
+                            and rotation_attempts < _MAX_ROTATION_ATTEMPTS
+                            # Re-checked against the candidate immediately before
+                            # rotating: a same-cwd sibling session may own it.
+                            and not await asyncio.to_thread(
+                                _chat_claimed_by_other, bridge_dir, candidate, launch_epoch_ms
+                            )
+                        ):
+                            rotation_attempts += 1
+                            # Give the old chat's unposted turn end to the session
+                            # that produced it: the ``continue`` below skips the idle
+                            # block, waking the REPLACEMENT's parent instead.
+                            if total_turn_ends > await asyncio.to_thread(
+                                cursor_native_status.read_posted_count, bridge_dir
+                            ):
+                                await _post_external_session_status(
+                                    client, session_id=current_session_id, status="idle"
+                                )
+                                await asyncio.to_thread(
+                                    cursor_native_status.write_posted_count,
+                                    bridge_dir,
+                                    total_turn_ends,
+                                )
+                            try:
+                                new_session_id = await _create_clear_replacement_session(
+                                    client=client,
+                                    old_session_id=current_session_id,
+                                    bridge_dir=bridge_dir,
+                                    new_chat_id=candidate.parent.name,
+                                )
+                            except (httpx.HTTPError, RuntimeError, OSError):
+                                _logger.warning(
+                                    "cursor /clear rotation failed; still mirroring the "
+                                    "old chat; session=%s chat=%s attempt=%s",
+                                    current_session_id,
+                                    candidate.parent.name,
+                                    rotation_attempts,
+                                    exc_info=True,
+                                )
+                            else:
+                                await _post_clear_supersession(
+                                    client,
+                                    old_session_id=current_session_id,
+                                    new_session_id=new_session_id,
+                                    agent_name=agent_name,
+                                )
+                                if on_session_rotated is not None:
+                                    on_session_rotated(current_session_id, new_session_id)
+                                store_path = candidate
+                                # Mirror the new chat from its first row; the
+                                # replacement session's timeline is empty.
+                                last_rowid = 0
+                                failed_rowid = failed_attempts = 0
+                                # Step 5 of the handshake already pointed the new
+                                # session at this chat id.
+                                chat_id_patched = True
+                                model_state = _ModelMirrorState()
+                                rotation_candidate, rotation_attempts = None, 0
+                                _write_state(
+                                    bridge_dir,
+                                    _ForwardState(
+                                        store_path=str(store_path),
+                                        last_rowid=last_rowid,
+                                        launch_epoch_ms=launch_epoch_ms,
+                                    ),
+                                )
+                                _logger.info(
+                                    "cursor /clear rotated the session; old=%s new=%s chat=%s",
+                                    current_session_id,
+                                    new_session_id,
+                                    store_path.parent.name,
+                                    extra={"session_id": new_session_id},
+                                )
+                                continue
                 # Turn over the cursor ``stop`` hook's turn-completion markers to
                 # an ``external_session_status: idle`` edge — the signal that wakes
                 # a parent orchestrator (the PTY watcher's spinner status never
@@ -1183,7 +1587,7 @@ async def forward_cursor_store_to_session(
                     cursor_native_status.read_posted_count, bridge_dir
                 ):
                     await _post_external_session_status(
-                        client, session_id=session_id, status="idle"
+                        client, session_id=current_session_id, status="idle"
                     )
                     await asyncio.to_thread(
                         cursor_native_status.write_posted_count, bridge_dir, total_turn_ends
@@ -1193,7 +1597,7 @@ async def forward_cursor_store_to_session(
             except Exception:
                 _logger.exception(
                     "cursor forwarder poll failed; session=%s store=%s",
-                    session_id,
+                    current_session_id,
                     store_path,
                 )
             await asyncio.sleep(poll_interval_s)
@@ -1220,6 +1624,7 @@ async def supervise_cursor_forwarder(
     launch_epoch_ms: int,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
+    on_session_rotated: Callable[[str, str], None] | None = None,
 ) -> None:
     """Run :func:`forward_cursor_store_to_session` under a restart supervisor.
 
@@ -1239,6 +1644,10 @@ async def supervise_cursor_forwarder(
     :param launch_epoch_ms: Wall-clock ms when this terminal launched.
     :param poll_interval_s: Seconds between store polls.
     :param auth: Optional refresh-capable httpx Auth.
+    :param on_session_rotated: Forwarded to
+        :func:`forward_cursor_store_to_session`. ``session_id`` stays the launch
+        id across restarts; the live conversation is re-read from the bridge
+        config each poll, so a restart after a rotation keeps the new session.
     :returns: Never normally returns; cancel the task to stop it.
     """
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
@@ -1256,6 +1665,7 @@ async def supervise_cursor_forwarder(
                 launch_epoch_ms=launch_epoch_ms,
                 poll_interval_s=poll_interval_s,
                 auth=auth,
+                on_session_rotated=on_session_rotated,
             )
             _logger.warning(
                 "cursor forwarder returned unexpectedly; restarting; session=%s bridge_dir=%s",
