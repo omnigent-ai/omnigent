@@ -23,22 +23,10 @@ from omnigent.server.routes.sessions import (
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
-async def _drain_runner_skills(session_id: str) -> None:
-    """Pump the loop until the snapshot's background skills fetch lands.
-
-    Skills are now eventual-consistent (``[]`` on the first poll,
-    populated on a later one), so tests must wait for the fetch.
-    """
-    for _ in range(100):
-        if session_id in _sessions_mod._runner_skills_cache:
-            return
-        await asyncio.sleep(0)
-
-
 async def _drain_model_options(session_id: str) -> None:
     """Pump the loop until the background native model-options fetch lands.
 
-    Runner model options are eventual-consistent like skills: the first
+    Runner model options are eventually consistent: the first
     snapshot returns ``[]`` and starts the runner query; a later snapshot
     serves the cache.
     """
@@ -692,10 +680,8 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
     # Still "running" from the cached value.
     assert snapshot2.status == "running"
     # Status is server-cached, so only the FIRST snapshot queries the
-    # runner for status; the second hits the cache. (Skills are
-    # runner-owned and fetched every snapshot via ``/skills`` — the
-    # runner caches them per session — so filter those out here.)
-    status_calls = [u for u in fake_client.get_calls if not u.endswith("/skills")]
+    # runner for status; the second hits the cache.
+    status_calls = fake_client.get_calls
     assert len(status_calls) == 1, (
         f"Expected 1 runner status GET (cache hit on second call), "
         f"got {len(status_calls)}. If 2, the cache "
@@ -718,14 +704,6 @@ async def test_session_snapshot_uses_persisted_status_after_server_restart(
 
     session_id = "bef42153ba7a4f2cb35350dc23b27c93"
     _mod._session_status_cache.pop(session_id, None)
-    _mod._runner_skills_cache.pop(session_id, None)
-
-    class _SkillsResponse:
-        status_code = 200
-
-        @staticmethod
-        def json() -> dict[str, list[Any]]:
-            return {"skills": []}
 
     class _IdleRunnerClient:
         def __init__(self) -> None:
@@ -733,8 +711,6 @@ async def test_session_snapshot_uses_persisted_status_after_server_restart(
 
         async def get(self, url: str, timeout: float = 5.0) -> Any:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _SkillsResponse()
             raise AssertionError("persisted running status must avoid the idle runner probe")
 
     runner_client = _IdleRunnerClient()
@@ -754,13 +730,11 @@ async def test_session_snapshot_uses_persisted_status_after_server_restart(
             _ConversationStore([], conversations={session_id: conv}),  # type: ignore[arg-type]
             session_id,
         )
-        await _drain_runner_skills(session_id)
     finally:
         _mod._session_status_cache.pop(session_id, None)
-        _mod._runner_skills_cache.pop(session_id, None)
 
     assert snapshot.status == "running"
-    status_calls = [url for url in runner_client.get_calls if not url.endswith("/skills")]
+    status_calls = runner_client.get_calls
     assert status_calls == []
 
 
@@ -809,8 +783,6 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
 
     class _FakeResponse:
         status_code = 200
@@ -862,75 +834,9 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         "instead of synthesizing a default status"
     )
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("3ce755917a74a49f0c8feaf50f058ed9")
     assert fake_client.get_calls == [
         "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9",
-        "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9/skills",
     ]
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_includes_skills_from_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Skills are runner-owned: the snapshot's ``skills`` field is
-    populated from the bound runner's ``GET /v1/sessions/{id}/skills``
-    (discovered against the runner's filesystem), so the web composer
-    can list them in its slash-command menu.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: dict[str, object]) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-    class _FakeRunnerClient:
-        def __init__(self) -> None:
-            self.get_calls: list[str] = []
-
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse(
-                    {
-                        "skills": [
-                            {"name": "triage-issues", "description": "Triage issues."},
-                            {"name": "mlflow-bug", "description": "File an MLflow bug."},
-                        ]
-                    }
-                )
-            return _FakeResponse({"status": "idle"})
-
-    fake_client = _FakeRunnerClient()
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-    # First poll returns [] and kicks the background fetch; a later poll serves them.
-    first = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6dc1e933ea5626723a7c79af592a4dc8",
-    )
-    assert first.skills == []
-    await _drain_runner_skills("6dc1e933ea5626723a7c79af592a4dc8")
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6dc1e933ea5626723a7c79af592a4dc8",
-    )
-
-    assert "/v1/sessions/6dc1e933ea5626723a7c79af592a4dc8/skills" in fake_client.get_calls
-    assert [s.name for s in snapshot.skills] == ["triage-issues", "mlflow-bug"]
-    assert snapshot.skills[0].description == "Triage issues."
 
 
 @pytest.mark.asyncio
@@ -958,8 +864,6 @@ async def test_session_snapshot_includes_model_options_from_runner(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -977,8 +881,6 @@ async def test_session_snapshot_includes_model_options_from_runner(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1057,8 +959,6 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     """
     from omnigent.server.routes import sessions as _mod
 
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -1077,8 +977,6 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             del timeout
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse({"detail": "Not Found"}, status_code=404)
             if url.endswith("/kiro-model-options"):
@@ -1143,8 +1041,6 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -1163,8 +1059,6 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1234,8 +1128,6 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._pushed_model_options_cache.clear()
@@ -1254,8 +1146,6 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             return _FakeResponse({"status": "idle"})
 
     fake_client = _FakeRunnerClient()
@@ -1323,8 +1213,6 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -1342,8 +1230,6 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1412,8 +1298,6 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_cache["3626053dfa9668a8604cc06e0b590ae0"] = [
@@ -1441,8 +1325,6 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1514,8 +1396,6 @@ async def test_session_snapshot_serves_cached_model_options_while_runner_offline
 
     session_id = "conv_offline_catalog"
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_stale.discard(session_id)
@@ -1530,8 +1410,6 @@ async def test_session_snapshot_serves_cached_model_options_while_runner_offline
 
     class _FakeRunnerClient:
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": "gpt-5.5", "displayName": "GPT-5.5"}]})
             return _FakeResponse({"status": "idle"})
@@ -1593,8 +1471,6 @@ async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
 
     session_id = "conv_stale_catalog"
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_stale.discard(session_id)
@@ -1612,8 +1488,6 @@ async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
             self.model_id = "old-model"
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": self.model_id}]})
             return _FakeResponse({"status": "idle"})
@@ -1685,8 +1559,6 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
 
     session_id = "conv_host_catalog"
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_stale.discard(session_id)
@@ -1748,8 +1620,6 @@ async def test_session_snapshot_retries_empty_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -1786,8 +1656,6 @@ async def test_session_snapshot_retries_empty_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(self._codex_payloads.pop(0))
             return _FakeResponse({"status": "idle"})
@@ -1847,8 +1715,6 @@ async def test_session_snapshot_retries_503_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -1898,8 +1764,6 @@ async def test_session_snapshot_retries_503_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return self._codex_responses.pop(0)
             return _FakeResponse({"status": "idle"})
@@ -1945,91 +1809,12 @@ async def test_session_snapshot_retries_503_model_options(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "skills", [[], [{"name": "triage-issues", "description": "Triage issues."}]]
-)
-async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
-    monkeypatch: pytest.MonkeyPatch,
-    skills: list[dict[str, str]],
-) -> None:
-    """
-    The background runner-skills fetch publishes ``session.skills`` once
-    it populates the cache, so a connected client is nudged to re-read
-    the now-warm snapshot. Without this push the slash-command menu stays
-    empty until the next bind (the bug that motivated this event): the
-    first snapshot poll serves ``[]`` and the web query does not poll.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: dict[str, object]) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-    class _FakeRunnerClient:
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": skills})
-            return _FakeResponse({"status": "idle"})
-
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-
-    # Capture session-stream publishes by rebinding the module's
-    # ``session_stream`` reference to a recorder. Rebinding the name in
-    # the sessions module's namespace (not patching ``publish`` through
-    # the shared module singleton) keeps the mock from leaking into other
-    # tests — see omnigent-testing rule 14.
-    published: list[dict[str, object]] = []
-
-    class _RecordingStream:
-        @staticmethod
-        def publish(conversation_id: str, event: dict[str, object]) -> None:
-            published.append({"conversation_id": conversation_id, **event})
-
-    monkeypatch.setattr(_mod, "session_stream", _RecordingStream)
-
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-    # First poll serves [] and kicks the background fetch.
-    first = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
-    assert first.skills == []
-    assert first.skills_status == "loading"
-    await _drain_runner_skills("38aed2dc1dc1b08dbbaa1cf9592d7ae5")
-
-    # Exactly one session.skills event for this session was published when
-    # the fetch resolved. A missing event means the push regressed and the
-    # menu would stay empty; a duplicate means it fired more than once per
-    # resolve.
-    skills_events = [
-        e
-        for e in published
-        if e.get("type") == "session.skills"
-        and e.get("conversation_id") == "38aed2dc1dc1b08dbbaa1cf9592d7ae5"
-    ]
-    assert len(skills_events) == 1, (
-        f"Expected exactly 1 session.skills publish on fetch resolve, "
-        f"got {len(skills_events)}: {published}"
-    )
-    ready = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
-    assert ready.skills_status == "ready"
-    assert [s.model_dump() for s in ready.skills] == skills
-
-
-@pytest.mark.asyncio
 async def test_session_snapshot_skills_empty_without_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     With no runner bound (neither router nor singleton resolves a
-    client), skills come back ``[]`` rather than crashing — discovery
-    is runner-owned and there is nothing to query.
+    client), the deprecated skills fields retain their defaults.
     """
     from omnigent.server.routes import sessions as _mod
 
@@ -2054,46 +1839,6 @@ async def test_session_snapshot_skills_empty_without_runner(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_skills_empty_on_malformed_runner_payload(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A malformed ``/skills`` payload (items missing ``name``/``description``,
-    or a non-JSON body) must not break the snapshot — skills fall back to
-    ``[]`` (the documented best-effort contract).
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: object) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> object:
-            return self._payload
-
-    class _FakeRunnerClient:
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                # Items missing the required name/description keys.
-                return _FakeResponse({"skills": [{"oops": "no name"}]})
-            return _FakeResponse({"status": "idle"})
-
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "21ad0587558979245a26b40ebe2638ef",
-    )
-
-    assert snapshot.skills == []
-
-
-@pytest.mark.asyncio
 async def test_session_snapshot_prefers_router_over_singleton(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2105,8 +1850,6 @@ async def test_session_snapshot_prefers_router_over_singleton(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
 
     class _Response:
         def __init__(self, status: str) -> None:
@@ -2148,11 +1891,8 @@ async def test_session_snapshot_prefers_router_over_singleton(
     )
 
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("1cef6d7d1ef0c577c6ccfc690e5bc8ed")
     assert router_client.get_calls == [
         "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed",
-        "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed/skills",
     ]
     assert singleton_client.get_calls == [], (
         "singleton should not have been queried when the router resolved a client"
@@ -2679,3 +2419,41 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
         "code": "runner_error",
         "message": "turn setup failed",
     }
+
+
+async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as mod
+
+    mod._session_status_cache.clear()
+    calls: list[str] = []
+    published: list[dict[str, object]] = []
+
+    class Runner:
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            calls.append(url)
+            assert not url.endswith("/skills")
+
+            class Response:
+                status_code = 200
+
+                def json(self) -> dict[str, str]:
+                    return {"status": "idle"}
+
+            return Response()
+
+    class Stream:
+        @staticmethod
+        def publish(session_id: str, event: dict[str, object]) -> None:
+            published.append(event)
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: Runner())
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    monkeypatch.setattr(mod, "session_stream", Stream)
+    snapshot = await _get_session_snapshot(_ConversationStore([]), "session-menu-independent")  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    assert snapshot.skills == []
+    assert snapshot.skills_status == "unavailable"
+    assert all(not url.endswith("/skills") for url in calls)
+    assert all(event.get("type") != "session.skills" for event in published)

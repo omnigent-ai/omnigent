@@ -198,10 +198,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _recent_mirrored_tool_calls,
     _RelayHandle,
     _runner_relay_tasks,
-    _runner_skills_cache,
-    _runner_skills_failed,
-    _runner_skills_inflight,
-    _runner_skills_stale,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -258,7 +254,6 @@ from omnigent.server.routes._sessions.helpers import (
     _load_agent_spec_for_session,
     _load_model_options,
     _load_model_options_from_host,
-    _load_runner_skills,
     _mcp_error_response,
     _mcp_input_required_response,
     _mcp_ok_response,
@@ -345,7 +340,6 @@ from omnigent.server.schemas import (
     SessionResponse,
     SessionStatusEvent,
     SessionUsageEvent,
-    SkillSummary,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -1029,8 +1023,6 @@ def _build_session_response(
     last_total_tokens: int | None = None,
     last_task_error: dict[str, str] | None = None,
     agent_name: str | None = None,
-    skills: list[SkillSummary] | None = None,
-    skills_status: Literal["loading", "ready", "error", "unavailable"] = "unavailable",
     runner_online: bool | None = None,
     host_online: bool | None = None,
     host_resumable: bool = False,
@@ -1083,10 +1075,6 @@ def _build_session_response(
     :param agent_name: Human-readable agent name, e.g.
         ``"research-agent"``. ``None`` when the agent row is not
         available at snapshot-build time.
-    :param skills: Merged skill summaries (bundled + host) for
-        the bound agent. ``None`` is treated as the empty list,
-        e.g. when the agent spec cannot be loaded.
-    :param skills_status: Discovery state, including a successful empty catalog.
     :param runner_online: Strict runner reachability — ``True`` iff a
         runner tunnel is currently registered for this session (see
         :class:`SessionLiveness`). ``None`` when the caller has no
@@ -1203,8 +1191,6 @@ def _build_session_response(
         archived=conv.archived,
         # Replay the last native Plan after a Server restart.
         todos=conv.session_todos,
-        skills=skills or [],
-        skills_status=skills_status,
         model_options=[
             NativeModelOption.model_validate(option) for option in (model_options or [])
         ],
@@ -9885,73 +9871,6 @@ async def _handle_mcp_tools_call(
     )
 
 
-def _runner_skills_status(
-    runner_client: httpx.AsyncClient | None,
-    session_id: str,
-) -> Literal["loading", "ready", "error", "unavailable"]:
-    """Describe discovery independently of whether the catalog has entries."""
-    if runner_client is None:
-        return "unavailable"
-    if session_id in _runner_skills_failed:
-        return "error"
-    if session_id in _runner_skills_cache and session_id not in _runner_skills_stale:
-        return "ready"
-    return "loading"
-
-
-async def _fetch_runner_skills(
-    runner_client: httpx.AsyncClient | None,
-    session_id: str,
-) -> list[SkillSummary]:
-    """
-    Fetch a session's merged skills from its bound runner.
-
-    Skills are runner-owned: the runner discovers them against its own
-    filesystem (the spec's bundled skills plus host skills under the
-    session's workspace and the runner's ``~/.claude/skills/``). The
-    server only overlays the result onto the session snapshot (the web
-    composer's slash-command menu).
-    Best-effort: a missing/unreachable runner, a non-200, or any
-    transport error yields an empty list rather than failing the
-    snapshot.
-
-    :param runner_client: HTTP client pointed at the bound runner, or
-        ``None`` when no runner is bound.
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :returns: Skill summaries (name + one-line description) for the
-        session, or ``[]`` when unavailable.
-    """
-    if runner_client is None:
-        return []
-    cached = _runner_skills_cache.get(session_id)
-    if cached is not None and session_id not in _runner_skills_stale:
-        return cached
-    # Don't await the runner here: this snapshot is polled continuously
-    # (incl. mid-turn), and a per-poll runner round-trip pins the runner's
-    # event loop and wedges the turn. Kick one background fetch (single-
-    # flight); a later poll serves the fresh result.
-    if session_id not in _runner_skills_inflight:
-        task = asyncio.create_task(_load_runner_skills(runner_client, session_id))
-        _runner_skills_inflight[session_id] = task
-
-        def _clear_skills_inflight(_task: asyncio.Task[None]) -> None:
-            _runner_skills_inflight.pop(session_id, None)
-
-        task.add_done_callback(_clear_skills_inflight)
-    # Stale skills serve while that runs, so a browser reload — which asks for
-    # the refresh — still gets a populated slash-command menu on the response
-    # to its own request. Success publishes ``session.skills`` and open clients
-    # re-read the snapshot.
-    #
-    # A runner that keeps failing the fetch leaves the entry stale, so each poll
-    # starts one more single-flight. That is the same ceiling a cold cache has
-    # always had — one in-flight fetch per session, bounded by the poll rate —
-    # and the alternative, clearing the mark on failure, would serve the old
-    # list until something else invalidated it.
-    return cached or []
-
-
 async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
@@ -9963,7 +9882,7 @@ async def _fetch_model_options(
     Three shapes:
 
     * **codex-native / cursor-native / kiro-native** — a *live* catalog only
-      the bound runner can read from the installed CLI. Like skills, this stays
+      the bound runner can read from the installed CLI. This stays
       off the snapshot hot path: the first snapshot kicks a background fetch
       and returns ``[]``; subsequent snapshots serve the cache. The cache
       outlives the runner: with no runner bound (asleep session) it keeps
@@ -10119,7 +10038,7 @@ async def _get_session_snapshot(
         )
         items = list(reversed(items_page.data))
     # Resolve the bound runner client once — used for live status (on a
-    # status-cache miss) and for runner-owned skill discovery below.
+    # status-cache miss) and for native model options below.
     #
     # Prefer the router (multi-runner deployments wire only
     # ``set_runner_router``; the legacy ``get_runner_client`` singleton
@@ -10267,17 +10186,9 @@ async def _get_session_snapshot(
     # from this).
     if reported_model := concrete_reported_model(conv.reported_model):
         llm_model = reported_model
-    # Skills are runner-owned: the bound runner discovers them against its
-    # own filesystem (bundled skills + host skills under the session's
-    # workspace and ``~/.claude/skills/``) — the host where the harness
-    # actually executes and may read a skill's local resource files. The
-    # server only overlays the result; best-effort, empty when no runner
-    # is bound or it can't be reached.
-    skills = await _fetch_runner_skills(runner_client, session_id)
-    skills_status = _runner_skills_status(runner_client, session_id)
     # Codex model options are also runner-owned: they come from the
     # session's live Codex app-server ``model/list`` response. Best-effort
-    # and cache-backed like skills so a snapshot poll cannot wedge the
+    # and cache-backed so a snapshot poll cannot wedge the
     # runner while a turn is active.
     model_options = await _fetch_model_options(runner_client, session_id, conv)
     # Dynamic override from the forwarder (real Claude Code window).
@@ -10336,8 +10247,6 @@ async def _get_session_snapshot(
         last_total_tokens=last_total_tokens,
         last_task_error=last_task_error,
         agent_name=agent_name,
-        skills=skills,
-        skills_status=skills_status,
         model_options=model_options,
         runner_online=runner_online,
         host_online=host_online,
@@ -10376,7 +10285,6 @@ __all__ = [
     "_evaluate_input_policy",
     "_evaluate_tool_call_policy",
     "_fetch_model_options",
-    "_fetch_runner_skills",
     "_forward_event_to_runner",
     "_forward_native_subagent_terminal_failure",
     "_forward_native_terminal_message",

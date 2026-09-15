@@ -2648,6 +2648,23 @@
         "title": "HostModelOptionsResponse",
         "type": "object"
       },
+      "HostSkillsResponse": {
+        "description": "User-invocable skill metadata discovered on a host.",
+        "properties": {
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills"
+        ],
+        "title": "HostSkillsResponse",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -6783,7 +6800,8 @@
             "type": "boolean"
           },
           "skills": {
-            "description": "Skills the bound agent has access to \u2014 the merged result of the agent spec's bundled `skills` and the host-scope skills discovered along the agent workdir / `~/.claude/skills/` (subject to the spec's `skills_filter`). Mirrors what the TUI passes to the runner at startup. Empty list when the agent spec cannot be loaded, or when bundled + host discovery yields nothing.",
+            "deprecated": true,
+            "description": "Deprecated; use GET /sessions/{id}/skills. Removed in 0.15.0.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -6792,7 +6810,8 @@
           },
           "skills_status": {
             "default": "unavailable",
-            "description": "Skill discovery state. A ready catalog may be empty; errors and disconnected runners must not leave clients loading.",
+            "deprecated": true,
+            "description": "Deprecated; removed in 0.15.0 with snapshot skills.",
             "enum": [
               "loading",
               "ready",
@@ -7005,10 +7024,9 @@
         "type": "object"
       },
       "SessionSkillsEvent": {
-        "description": "Signal that a session's runner-owned skill discovery has settled.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache or first fails, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` and `skills_status` fields stay the source of truth.",
+        "description": "Deprecated discovery nudge; no longer emitted. Removed in 0.15.0.",
         "properties": {
           "conversation_id": {
-            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed the menu from the session snapshot's `skills` field, which is populated by the runner-skills cache at snapshot build time.",
             "title": "Conversation Id",
             "type": "string"
           },
@@ -7027,7 +7045,6 @@
           },
           "type": {
             "const": "session.skills",
-            "description": "Always `\"session.skills\"`.",
             "title": "Type",
             "type": "string"
           }
@@ -9816,6 +9833,70 @@
           }
         },
         "summary": "Get Host Model Options",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/skills": {
+      "get": {
+        "description": "Discover workspace, user, and plugin skill metadata before a session exists.\n\nUses the host's ambient harness configuration. Sessions may add bundled\nagent skills and apply agent filters, so this is a pre-launch catalog.\nRequires a connected host running a version that supports skill discovery.",
+        "operationId": "get_host_skills_v1_hosts__host_id__harnesses__harness__skills_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Absolute or tilde-prefixed discovery directory on the selected host.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Absolute or tilde-prefixed discovery directory on the selected host.",
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSkillsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Skills",
         "tags": [
           "hosts"
         ]
@@ -14684,6 +14765,49 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/skills": {
+      "get": {
+        "description": "Discover the effective session catalog on its host, without a runner.",
+        "operationId": "get_session_skills_v1_sessions__session_id__skills_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSkillsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Skills",
+        "tags": [
+          "sessions"
         ]
       }
     },

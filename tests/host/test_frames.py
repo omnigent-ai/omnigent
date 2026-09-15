@@ -42,6 +42,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -127,6 +129,50 @@ def test_import_local_frames_round_trip() -> None:
     )
     assert isinstance(done_failed, HostImportLocalDoneFrame)
     assert done_failed.failed == 2
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostSkillsFrame(request_id="req_skills", harness="claude-native", path="~/my project"),
+        HostSkillsResultFrame(
+            request_id="req_skills",
+            status="ok",
+            skills=[{"name": "toolkit:review", "description": "Review changes"}],
+        ),
+        HostSkillsFrame(
+            request_id="session",
+            harness="session",
+            path="/workspace",
+            session_id="conv",
+            agent_id="agent",
+            agent_version="2",
+            sub_agent_name="child",
+        ),
+        HostSkillsResultFrame(request_id="session", status="ok", session_id="conv"),
+        HostSkillsResultFrame(request_id="req_skills", status="ok"),
+        HostSkillsResultFrame(
+            request_id="req_skills",
+            status="failed",
+            error_code="invalid_path",
+            error="path must be absolute",
+        ),
+    ],
+)
+def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "skills", [{}, ["review"], [{"name": "review"}], [{"name": 1, "description": "x"}]]
+)
+def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            json.dumps(
+                {"kind": "host.skills_result", "request_id": "r", "status": "ok", "skills": skills}
+            )
+        )
 
 
 def test_model_options_frames_round_trip() -> None:

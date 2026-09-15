@@ -230,7 +230,13 @@ import {
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
 } from "@/lib/nativeHarnessModes";
-import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  fetchHosts,
+  useHostModelOptions,
+  useHostSkills,
+  useHosts,
+  type Host,
+} from "@/hooks/useHosts";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -258,7 +264,7 @@ import { useHostWorktrees, type HostWorktree } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import type { NativeModelOption } from "@/lib/types";
+import type { NativeModelOption, SkillsStatus } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -1157,22 +1163,19 @@ function SandboxRepoBranchSelect({
 }
 
 /**
- * Match a first message against an agent's bundled skills.
+ * Match a first message against the available bundled and host skills.
  *
  * Uses the in-session composer's shared command-shape guard
  * (:func:`isSlashCommandText`): the first token must read as ``/name``
  * (file paths like ``/etc/hosts`` never match), while the args after it
  * may carry anything — including paths and URLs, e.g.
  * ``"/review-pr https://github.com/..."``. The command name must
- * exactly match a bundled skill. Anything else — including
- * host-discovered skills the server can't know before a runner boots —
- * is sent as plain text, the same fall-through the in-session composer
- * uses for unknown commands.
+ * exactly match an available skill. Unknown commands are sent as plain text.
  *
  * @param text The sanitized first message, e.g. ``"/review-pr 123"``.
- * @param skills The chosen agent's bundled skills from GET /v1/agents.
+ * @param skills The chosen agent's bundled skills and the selected host's catalog.
  * @returns The skill name and argument string, or ``null`` when the
- *   text is not an invocation of a bundled skill.
+ *   text is not an invocation of an available skill.
  */
 export function matchSkillInvocation(
   text: string,
@@ -3883,9 +3886,7 @@ export function NewChatLandingScreen() {
     if (pickedHarness !== AUTO_NATIVE_HARNESS_ID) return;
     setPermissionMode(CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE);
   }, [pickedHarness]);
-  // Native-terminal agents interpret slash commands inside their own CLI
-  // (the runner injects the text verbatim), so the landing composer must
-  // not intercept them — no skills menu, no slash_command routing.
+  // Native harnesses receive skill invocations as plain text for their CLI to interpret.
   const isNativeTerminalAgent = isNativeCodingAgent(selectedAgent);
   const selectedAgentUnconfigured = harnessUnconfiguredOnHost(
     selectedAgent?.harness,
@@ -4227,22 +4228,53 @@ export function NewChatLandingScreen() {
   const sandboxRepoValid =
     sandboxRepoSelections.every((r) => isValidSandboxRepoUrl(r.url)) && !sandboxRepoOverCap;
 
-  // Sandbox creates need no host or path workspace — the server
-  // provisions both; only the message, agent, and (optional) repo
-  // inputs gate the submit.
-  // Slash-command suggestions for the chosen agent's bundled skills.
-  // Mirrors the in-session composer's menu mechanics (open while the
-  // command name is still being typed: leading "/", no second "/", no
-  // space yet), but lists skills only — built-ins like /model need a
-  // live session. Hidden for native-terminal agents (their CLI owns
-  // slash commands) and for agents without bundled skills.
+  const skillsHarness = autoRoutingSelected
+    ? null
+    : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
+  const skillsUnavailableMessage = sandboxSelected
+    ? "Host skills will be available after the sandbox starts."
+    : !selectedHostId
+      ? "Choose a host to discover skills."
+      : selectedHost?.status !== "online"
+        ? "Skills unavailable while the host is offline."
+        : !workspaceValid
+          ? "Choose a working directory to discover skills."
+          : !skillsHarness
+            ? "Choose a harness to discover host skills."
+            : undefined;
+  const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
+  const hostSkills = useHostSkills(
+    selectedHostId,
+    skillsHarness,
+    workspaceTrimmed,
+    canDiscoverHostSkills,
+  );
+  const skillsStatus: SkillsStatus = canDiscoverHostSkills
+    ? hostSkills.isPending
+      ? "loading"
+      : hostSkills.isError
+        ? "error"
+        : "ready"
+    : !sandboxSelected && (hostsLoading || agentsLoading)
+      ? "loading"
+      : "unavailable";
+  const availableSkills = useMemo(() => {
+    // Bundled skills take precedence, as they do in the runner's session catalog.
+    const skills = new Map((selectedAgent?.skills ?? []).map((skill) => [skill.name, skill]));
+    if (canDiscoverHostSkills) {
+      for (const skill of hostSkills.data ?? []) {
+        if (!skills.has(skill.name)) skills.set(skill.name, skill);
+      }
+    }
+    return [...skills.values()];
+  }, [selectedAgent?.skills, canDiscoverHostSkills, hostSkills.data]);
+
+  // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
-  const skillCommands = useMemo(() => {
-    if (isNativeTerminalAgent) return {};
-    const m: Record<string, string> = {};
-    for (const s of selectedAgent?.skills ?? []) m[`/${s.name}`] = s.description;
-    return m;
-  }, [selectedAgent, isNativeTerminalAgent]);
+  const skillCommands = useMemo(
+    () => Object.fromEntries(availableSkills.map((skill) => [`/${skill.name}`, skill.description])),
+    [availableSkills],
+  );
   const trimmedMessage = message.trimStart();
   const slashMenuOpen =
     trimmedMessage.startsWith("/") &&
@@ -4254,16 +4286,24 @@ export function NewChatLandingScreen() {
   const slashMenuMatches = slashMenuOpen
     ? rankedSlashCommandNames(skillCommands, slashMenuQuery)
     : [];
-  // Pre-select the first match whenever the filtered list changes, so
-  // Tab/Enter complete the top item without arrowing down first (same
-  // reset pattern as the in-session composer).
-  const prevSlashMatchesRef = useRef<string[]>([]);
+  // New queries select the first match; async arrivals retain the selected name.
+  // Track the previous render in state so discarded renders cannot consume an update.
+  const [previousSlashMatches, setPreviousSlashMatches] = useState<{
+    query: string;
+    names: string[];
+  }>({ query: "", names: [] });
   if (
-    slashMenuMatches.length !== prevSlashMatchesRef.current.length ||
-    slashMenuMatches.some((m, i) => m !== prevSlashMatchesRef.current[i])
+    slashMenuQuery !== previousSlashMatches.query ||
+    slashMenuMatches.length !== previousSlashMatches.names.length ||
+    slashMenuMatches.some((m, i) => m !== previousSlashMatches.names[i])
   ) {
-    prevSlashMatchesRef.current = slashMenuMatches;
-    setSlashMenuIndex(slashMenuMatches.length > 0 ? 0 : -1);
+    const previousName = previousSlashMatches.names[slashMenuIndex];
+    const retainedIndex =
+      previousSlashMatches.query === slashMenuQuery && previousName
+        ? slashMenuMatches.indexOf(previousName)
+        : -1;
+    setPreviousSlashMatches({ query: slashMenuQuery, names: slashMenuMatches });
+    setSlashMenuIndex(retainedIndex >= 0 ? retainedIndex : slashMenuMatches.length > 0 ? 0 : -1);
   }
 
   // Selecting a skill fills "/name " and leaves the caret ready for the
@@ -5244,13 +5284,10 @@ export function NewChatLandingScreen() {
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
-      // A first message matching one of the agent's bundled skills is sent as a
-      // structured `slash_command` (server resolves the skill) rather than the
-      // literal "/name". Native terminal agents keep plain text — their CLI owns
-      // slash commands.
+      // SDK invocations resolve on the runner after create; native CLIs receive plain text.
       const skill = isNativeTerminalAgent
         ? null
-        : matchSkillInvocation(initialPrompt, agent?.skills ?? []);
+        : matchSkillInvocation(initialPrompt, availableSkills);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
       // the freshly-opened chat. Sanitized text so recall reproduces what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
@@ -5709,6 +5746,24 @@ export function NewChatLandingScreen() {
                   // and takes priority over submission.
                   if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
+                  if (slashMenuOpen && e.key === "Escape") {
+                    e.preventDefault();
+                    setMessage("");
+                    setSlashMenuIndex(-1);
+                    return;
+                  }
+                  // Keep a partial skill name in the composer until there is a completion.
+                  if (
+                    slashMenuOpen &&
+                    skillsStatus === "loading" &&
+                    slashMenuMatches.length === 0 &&
+                    !shouldPreferSendOverCompletion &&
+                    (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobileViewport))
+                  ) {
+                    e.preventDefault();
+                    return;
+                  }
+
                   // While the skills menu is open, ArrowUp/Down navigate it and
                   // Enter/Tab complete the highlighted item — these take
                   // priority over submission (same UX as the in-session
@@ -5731,14 +5786,6 @@ export function NewChatLandingScreen() {
                     ) {
                       e.preventDefault();
                       applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                      return;
-                    }
-                    if (e.key === "Escape") {
-                      e.preventDefault();
-                      // Dismiss the menu by clearing the draft so the user can
-                      // start fresh.
-                      setMessage("");
-                      setSlashMenuIndex(-1);
                       return;
                     }
                   }
@@ -5778,6 +5825,9 @@ export function NewChatLandingScreen() {
                         activeIndex={slashMenuIndex}
                         onSelect={applySlashSelection}
                         commands={skillCommands}
+                        skillsStatus={skillsStatus}
+                        skillsUnavailableMessage={skillsUnavailableMessage}
+                        onRetrySkills={() => void hostSkills.refetch()}
                       />
                     )}
                     {/* "@"-file-mention browser — native terminal agents with a workspace */}

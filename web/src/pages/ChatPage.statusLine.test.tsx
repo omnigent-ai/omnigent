@@ -1,3 +1,6 @@
+vi.mock("@/hooks/useSessionSkills", () => ({
+  useSessionSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -171,7 +174,6 @@ describe("Composer status line (branch + context ring)", () => {
     openGithubTabMock.mockReset();
     useChatStore.setState({
       conversationId: "conv_test",
-      skills: [],
       contextWindow: null,
       tokensUsed: null,
       sessionCostUsd: null,
