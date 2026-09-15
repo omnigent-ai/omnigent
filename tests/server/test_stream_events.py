@@ -284,16 +284,7 @@ def test_session_status_waiting_round_trips_through_union() -> None:
 
 
 def test_session_skills_event_round_trips_through_union() -> None:
-    """``session.skills`` is a bare nudge that routes via the discriminator.
-
-    ``_load_runner_skills`` publishes this dict (via ``model_dump``) the
-    moment the background runner-skills fetch lands. If the variant were
-    missing from the union, the SSE serializer's boundary validation
-    (``_stream_live_events``) would reject the emit and the web UI would
-    never be told to re-read the snapshot — leaving the slash-command
-    menu empty. This pins the wire shape (just ``conversation_id``, no
-    payload) and the discriminator routing.
-    """
+    """The deprecated skill event remains parseable until removal in 0.15.0."""
     event = SessionSkillsEvent(
         type="session.skills",
         conversation_id="conv_abc",

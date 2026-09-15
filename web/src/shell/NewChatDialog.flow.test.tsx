@@ -89,6 +89,7 @@ vi.mock("@/lib/identity", () => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostSkills: vi.fn(() => ({ data: [], isPending: false, isError: false, refetch: vi.fn() })),
   useHostModelOptions: vi.fn(() => ({
     data: [
       { id: "opus", displayName: "Opus" },

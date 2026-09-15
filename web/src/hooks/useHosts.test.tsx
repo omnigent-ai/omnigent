@@ -1,11 +1,12 @@
 import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useDetectedCredentials,
   useHostModelOptions,
+  useHostSkills,
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
@@ -23,12 +24,15 @@ function mockResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
-function wrapper({ children }: { children: ReactNode }) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
+const wrapper = function QueryWrapper({ children }: { children: ReactNode }) {
+  const [client] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      }),
+  );
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
-}
+};
 
 beforeEach(() => {
   fetchMock.mockReset();
@@ -38,6 +42,104 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+});
+
+describe("useHostSkills", () => {
+  it("loads the selected host, harness and directory with an abortable request", async () => {
+    const skills = [{ name: "toolkit:review", description: "Review changes" }];
+    fetchMock.mockResolvedValueOnce(mockResponse({ skills }));
+    const { result } = renderHook(
+      () => useHostSkills("host_1", "claude-native", "/Users/me/my project"),
+      { wrapper },
+    );
+    expect(result.current.isPending).toBe(true);
+    await waitFor(() => expect(result.current.data).toEqual(skills));
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(new URL(url, "http://test").pathname).toBe(
+      "/v1/hosts/host_1/harnesses/claude-native/skills",
+    );
+    expect(new URL(url, "http://test").searchParams.get("path")).toBe("/Users/me/my project");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it.each([
+    [null, "claude-native", "/repo", true],
+    ["host_1", null, "/repo", true],
+    ["host_1", "claude-native", "", true],
+    ["host_1", "claude-native", "/repo", false],
+  ] as const)(
+    "does not discover with incomplete or disabled input (%s, %s, %s, %s)",
+    async (host, harness, path, enabled) => {
+      const { result } = renderHook(() => useHostSkills(host, harness, path, enabled), { wrapper });
+      await act(async () => {});
+      expect(result.current.fetchStatus).toBe("idle");
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { host: "host_2", harness: "claude-native", path: "/repo" },
+    { host: "host_1", harness: "codex-native", path: "/repo" },
+    { host: "host_1", harness: "claude-native", path: "/other" },
+  ])("ignores a late response after switching to $host / $harness / $path", async (next) => {
+    let resolveOld!: (response: Response) => void;
+    let resolveNew!: (response: Response) => void;
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveOld = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveNew = resolve;
+          }),
+      );
+    const { result, rerender } = renderHook(
+      ({ host, harness, path }) => useHostSkills(host, harness, path),
+      { wrapper, initialProps: { host: "host_1", harness: "claude-native", path: "/repo" } },
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const signal = fetchMock.mock.calls[0]![1].signal as AbortSignal;
+    rerender(next);
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isPending).toBe(true);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(signal.aborted).toBe(true);
+    const skills = [{ name: "current-skill", description: "Current target" }];
+    await act(async () => resolveNew(mockResponse({ skills })));
+    await waitFor(() => expect(result.current.data).toEqual(skills));
+    await act(async () =>
+      resolveOld(mockResponse({ skills: [{ name: "old-skill", description: "Old target" }] })),
+    );
+    expect(result.current.data).toEqual(skills);
+  });
+
+  it("exposes discovery failures and retries to a successful empty catalog", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: "discovery failed" }, 502));
+    const { result } = renderHook(() => useHostSkills("host_1", "claude-native", "/repo"), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockResolvedValueOnce(mockResponse({ skills: [] }));
+    await act(async () => {
+      await result.current.refetch();
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([]);
+  });
+
+  it("does not treat a malformed catalog as a successful empty result", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    const { result } = renderHook(() => useHostSkills("host_1", "claude-native", "/repo"), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+  });
 });
 
 describe("useHosts", () => {

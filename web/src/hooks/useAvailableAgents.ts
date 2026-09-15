@@ -20,9 +20,8 @@ export interface AvailableAgent {
   // by kind rather than by name slug.
   harness: string | null;
   // Skills bundled in the agent spec (name + one-line description).
-  // Feeds the landing composer's "/" menu before a session exists;
-  // host-discovered skills only resolve once a runner is bound, so
-  // they're absent here. Empty on older servers without the field.
+  // The landing composer merges these with the selected host's skill catalog.
+  // Empty on older servers without the field.
   skills: { name: string; description: string }[];
   // Server-seeded built-in (deterministic, name-derived id) vs a
   // user-registered template. Only set on catalog rows from GET /v1/agents;

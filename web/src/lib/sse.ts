@@ -948,8 +948,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
   if (eventType === "session.skills") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
-    // Bare nudge — the runner's skills resolved. The store handler
-    // refetches the (now-warm) snapshot and applies its `skills`.
+    // Deprecated server event; retained for wire compatibility until 0.15.0.
     return {
       type: "session_skills",
       conversationId,

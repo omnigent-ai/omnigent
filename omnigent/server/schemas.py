@@ -2103,16 +2103,8 @@ class SessionResponse(BaseModel):
     :param todos: Current native Plan items reported by a harness. Each has
         ``content``, ``status``, and ``activeForm``. Persisted in conversation
         metadata; empty before the first report or after an explicit clear.
-    :param skills: Skills the bound agent has access to — the
-        merged result of the agent spec's bundled ``skills``
-        and the host-scope skills discovered along the agent
-        workdir / ``~/.claude/skills/`` (subject to the spec's
-        ``skills_filter``). Mirrors what the TUI passes to the
-        runner at startup. Empty list when the agent spec
-        cannot be loaded, or when bundled + host discovery
-        yields nothing.
-    :param skills_status: Skill discovery state. A ready catalog may be empty;
-        errors and disconnected runners must not leave clients loading.
+    :param skills: Deprecated; use GET /sessions/{id}/skills. Removed in 0.15.0.
+    :param skills_status: Deprecated; removed in 0.15.0 with snapshot skills.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
         each model's supported reasoning efforts. Empty while unavailable.
@@ -2198,8 +2190,12 @@ class SessionResponse(BaseModel):
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
-    skills: list[SkillSummary] = Field(default_factory=list)
-    skills_status: Literal["loading", "ready", "error", "unavailable"] = "unavailable"
+    skills: list[SkillSummary] = Field(
+        default_factory=list, deprecated="Use GET /sessions/{id}/skills; removed in 0.15.0."
+    )
+    skills_status: Literal["loading", "ready", "error", "unavailable"] = Field(
+        default="unavailable", deprecated="Use GET /sessions/{id}/skills; removed in 0.15.0."
+    )
     model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
@@ -3468,32 +3464,7 @@ class SessionMcpStartupEvent(_SSEEventBase):
 
 
 class SessionSkillsEvent(_SSEEventBase):
-    """
-    Signal that a session's runner-owned skill discovery has settled.
-
-    Skills are discovered against the bound runner's filesystem and
-    fetched off the session-snapshot hot path: the snapshot kicks a
-    single background fetch (``_load_runner_skills`` in
-    ``omnigent/server/routes/sessions.py``) and serves ``[]`` until
-    it lands. This event fires the moment that background fetch
-    populates the per-session skills cache or first fails, so a connected web client
-    can re-read the snapshot and fill its slash-command menu instead
-    of waiting for the next bind.
-
-    Carries no payload beyond the conversation id — it is a "skills
-    are ready, re-read the snapshot" nudge, mirroring the
-    invalidate-then-refetch shape used by
-    :class:`SessionChangedFilesInvalidatedEvent`. The snapshot's
-    ``skills`` and ``skills_status`` fields stay the source of truth.
-
-    :param type: Always ``"session.skills"``.
-    :param conversation_id: Session identifier,
-        e.g. ``"conv_abc123"``.
-
-    Category: **transient** (SSE-only). On reconnect, clients seed
-    the menu from the session snapshot's ``skills`` field, which is
-    populated by the runner-skills cache at snapshot build time.
-    """
+    """Deprecated discovery nudge; no longer emitted. Removed in 0.15.0."""
 
     type: Literal["session.skills"]
     conversation_id: str
