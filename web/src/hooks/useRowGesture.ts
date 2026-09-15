@@ -34,6 +34,8 @@ export const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 // resolving over it would stack an action dialog on the open menu.
 const ROW_INTERACTIVE_CONTROL_SELECTOR =
   'button, input, select, textarea, [contenteditable]:not([contenteditable="false"])';
+const ROW_KEYBOARD_INTERACTIVE_CONTROL_SELECTOR =
+  'a[href], button, input, select, textarea, [role="button"], [role="link"], [contenteditable]:not([contenteditable="false"])';
 
 // How long a resolved gesture's trailing-click suppression stays armed. The
 // browser's synthesized click lands within the same task chain as the release
@@ -648,6 +650,14 @@ export function useRowGesture({
       onLostPointerCapture,
       onKeyDown: (event: ReactKeyboardEvent) => {
         clearClickSuppression();
+        const target = event.target;
+        const control =
+          target instanceof Element
+            ? target.closest(ROW_KEYBOARD_INTERACTIVE_CONTROL_SELECTOR)
+            : null;
+        if (control && control !== event.currentTarget && event.currentTarget.contains(control)) {
+          return;
+        }
         callDndListener(dragListeners, "onKeyDown", event);
       },
       onTouchStart: (event: ReactTouchEvent) => {
