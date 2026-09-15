@@ -37,6 +37,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+from omnigent.native.owner_claim import current_boot_id, current_pid_namespace
 
 
 def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
@@ -671,7 +672,9 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
 
     bridge_dir = prepare_bridge_dir("bridge_owner")
 
-    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").splitlines()[0] == str(
+        os.getpid()
+    )
 
 
 def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
@@ -689,7 +692,10 @@ def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
     owner_marker = dead_dir / "owner.pid"
-    owner_marker.write_text("999999", encoding="utf-8")
+    owner_marker.write_text(
+        f"999999\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
     rollout = (
         dead_dir
         / "codex-home"
@@ -717,7 +723,10 @@ def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
     monkeypatch.setattr(codex_native_bridge.os, "walk", _unexpected_walk)
 
     assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
-    assert owner_marker.read_text(encoding="utf-8") == "999999"
+    assert (
+        owner_marker.read_text(encoding="utf-8")
+        == f"999999\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n"
+    )
     assert rollout.read_text(encoding="utf-8") == '{"type":"session_meta"}\n'
     assert bridge_config.read_text(encoding="utf-8") == "secret"
     assert policy_config.read_text(encoding="utf-8") == "secret"
@@ -751,7 +760,10 @@ def test_prune_orphaned_bridge_dirs_removes_expired_bridge(
     unrelated_jsonl = rollout.parent / "metadata.jsonl"
     unrelated_jsonl.write_text('{"recent":true}\n', encoding="utf-8")
     owner_marker = dead_dir / "owner.pid"
-    owner_marker.write_text("999999", encoding="utf-8")
+    owner_marker.write_text(
+        f"999999\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
     (dead_dir / "bridge.json").write_text("secret", encoding="utf-8")
     expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS
     for activity_path in (owner_marker, rollout):
@@ -787,7 +799,10 @@ def test_prune_orphaned_bridge_dirs_uses_latest_rollout_activity(
     rollout.parent.mkdir(parents=True)
     rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
     owner_marker = dead_dir / "owner.pid"
-    owner_marker.write_text("999999", encoding="utf-8")
+    owner_marker.write_text(
+        f"999999\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
     expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
     os.utime(owner_marker, (expired_at, expired_at))
     os.utime(rollout, (now - 60, now - 60))
@@ -813,7 +828,10 @@ def test_prune_orphaned_bridge_dirs_retains_bridge_when_rollout_scan_fails(
     sessions_dir = dead_dir / "codex-home" / "sessions"
     sessions_dir.mkdir(parents=True)
     owner_marker = dead_dir / "owner.pid"
-    owner_marker.write_text("999999", encoding="utf-8")
+    owner_marker.write_text(
+        f"999999\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
     expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
     os.utime(owner_marker, (expired_at, expired_at))
 
@@ -848,13 +866,19 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
     dead_marker = dead_dir / "owner.pid"
-    dead_marker.write_text("999999", encoding="utf-8")
+    dead_marker.write_text(
+        f"999999\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
     os.utime(dead_marker, (expired_at, expired_at))
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
     live_marker = live_dir / "owner.pid"
-    live_marker.write_text(str(os.getpid()), encoding="utf-8")
+    live_marker.write_text(
+        f"{os.getpid()}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
     os.utime(live_marker, (expired_at, expired_at))
 
     unmarked_dir = root / "unmarked"

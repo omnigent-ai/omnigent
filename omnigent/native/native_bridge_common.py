@@ -25,14 +25,15 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
-import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
 
+from omnigent.native import owner_claim
+
 _logger = logging.getLogger(__name__)
 
-OWNER_PID_FILENAME = "owner.pid"
+OWNER_PID_FILENAME = owner_claim.OWNER_PID_FILENAME
 
 
 def write_owner_pid_marker(bridge_dir: Path) -> None:
@@ -48,7 +49,7 @@ def write_owner_pid_marker(bridge_dir: Path) -> None:
     :param bridge_dir: Per-session bridge directory to mark.
     """
     with contextlib.suppress(OSError):
-        (bridge_dir / OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
+        owner_claim.write_owner_claim(bridge_dir)
 
 
 def prune_orphaned_dirs(
@@ -63,13 +64,9 @@ def prune_orphaned_dirs(
     *bridge_root* and removes each immediate child dir whose ``owner.pid``
     marker names a process that no longer exists. A harness may provide an
     additional eligibility predicate, such as a minimum inactivity period.
-    Conservative in the dangerous direction — a reused/foreign pid reads as
-    alive and is left.
-    The check-then-rmtree race (a pid reused between the liveness read and
-    the removal) is accepted: it is benign because a live session refreshes
-    its marker every turn, so only genuinely orphaned dirs reach removal.
-    Dirs with no marker (or an unparseable one) are left untouched: they are
-    either from an older version or not ours.
+    The PID must belong to the current namespace before a local liveness
+    probe can establish owner death. Unknown, foreign and legacy ownership
+    is left untouched.
 
     Reuses ``inner/terminal.py:_process_alive`` as the liveness predicate.
 
@@ -88,12 +85,8 @@ def prune_orphaned_dirs(
     for entry in bridge_root.iterdir():
         if not entry.is_dir():
             continue
-        marker = entry / OWNER_PID_FILENAME
-        try:
-            pid = int(marker.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            continue
-        if _process_alive(pid):
+        claim = owner_claim.read_owner_claim(entry)
+        if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_process_alive):
             continue
         if should_prune is not None:
             try:

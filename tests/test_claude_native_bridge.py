@@ -69,6 +69,7 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
 )
 from omnigent.native import native_cost_popup
+from omnigent.native.owner_claim import current_boot_id, current_pid_namespace
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
@@ -10400,7 +10401,9 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
 
     bridge_dir = prepare_bridge_dir("conv_owner", workspace=tmp_path)
 
-    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").splitlines()[0] == str(
+        os.getpid()
+    )
 
 
 def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
@@ -10418,11 +10421,17 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     dead.wait()
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
-    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    (dead_dir / "owner.pid").write_text(
+        f"{dead.pid}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
-    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    (live_dir / "owner.pid").write_text(
+        f"{os.getpid()}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
 
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()

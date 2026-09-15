@@ -33,6 +33,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_mcp_config,
     write_tmux_target,
 )
+from omnigent.native.owner_claim import current_boot_id, current_pid_namespace
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2274,7 +2275,9 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
 
     bridge_dir = _mod.prepare_bridge_dir("bridge_owner")
 
-    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").splitlines()[0] == str(
+        os.getpid()
+    )
 
 
 def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
@@ -2294,11 +2297,17 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     dead.wait()
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
-    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    (dead_dir / "owner.pid").write_text(
+        f"{dead.pid}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
-    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    (live_dir / "owner.pid").write_text(
+        f"{os.getpid()}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
 
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()
