@@ -17,6 +17,7 @@ import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.harnesses.cursor_native.bridge import CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
@@ -26,7 +27,11 @@ from omnigent.runner.app import (
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
 )
-from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_env
+from omnigent.runner.native import (
+    NativeLaunchContext,
+    _cursor_native_bridge_id_for_session,
+    _resolve_native_spawn_env,
+)
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
@@ -187,6 +192,92 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     assert env == {"CODEX_BRIDGE": "bridge_xyz"}
     assert captured == {"session_id": "conv_codex", "bridge_id": "bridge_xyz"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_native_spawn_env_cursor_reads_bridge_id() -> None:
+    """cursor is label-shaped too: a rotated conversation keeps the launcher's dir."""
+    captured: dict[str, Any] = {}
+
+    def _fake_build(conversation_id: str, *, bridge_id: str | None = None) -> dict[str, str]:
+        captured["session_id"] = conversation_id
+        captured["bridge_id"] = bridge_id
+        return {"CURSOR_BRIDGE": bridge_id or conversation_id}
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"labels": {CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: "conv_launcher"}}
+        )
+
+    transport = httpx.MockTransport(_labels_handler)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "omnigent.harnesses.cursor_native.bridge.build_cursor_native_spawn_env", _fake_build
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+            env = await _resolve_native_spawn_env(
+                "cursor-native",
+                "conv_rotated",
+                server_client=client,
+                optional_labels=None,
+            )
+
+    assert env == {"CURSOR_BRIDGE": "conv_launcher"}
+    assert captured == {"session_id": "conv_rotated", "bridge_id": "conv_launcher"}
+
+
+@pytest.mark.asyncio
+async def test_cursor_native_bridge_id_prefers_label_over_session_id() -> None:
+    """The runner-side resolver mirrors the spawn-env label read."""
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"labels": {CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: "conv_launcher"}}
+        )
+
+    transport = httpx.MockTransport(_labels_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        bridge_id = await _cursor_native_bridge_id_for_session(
+            server_client=client,
+            session_id="conv_rotated",
+        )
+
+    assert bridge_id == "conv_launcher"
+
+
+@pytest.mark.asyncio
+async def test_cursor_native_bridge_id_falls_back_to_session_id() -> None:
+    """No label (unrotated, or a failed lookup) means the pane is the session's own."""
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    transport = httpx.MockTransport(_labels_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        bridge_id = await _cursor_native_bridge_id_for_session(
+            server_client=client,
+            session_id="conv_own",
+        )
+
+    assert bridge_id == "conv_own"
+
+
+@pytest.mark.asyncio
+async def test_cursor_native_bridge_id_uses_supplied_labels_without_a_lookup() -> None:
+    """Callers that already hold the labels skip the round trip."""
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("labels were already supplied")
+
+    transport = httpx.MockTransport(_labels_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        bridge_id = await _cursor_native_bridge_id_for_session(
+            server_client=client,
+            session_id="conv_rotated",
+            session_labels={CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: "conv_launcher"},
+        )
+
+    assert bridge_id == "conv_launcher"
 
 
 @pytest.mark.asyncio
