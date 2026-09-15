@@ -396,6 +396,43 @@ def test_configure_process_logging_forwards_custom_debug_log_send(
             handler.close()
 
 
+def test_configure_process_logging_is_non_blocking_when_log_dir_is_unwritable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A read-only log directory must not crash the process.
+
+    If the filesystem or the log directory is unwritable, logging setup falls
+    through to stderr-only and returns ``None`` instead of raising.
+    """
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
+    read_only = tmp_path / "ro"
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(read_only))
+
+    logger_name = "omnigent.test_configure_noblocking"
+    result = configure_process_logging(
+        "runner",
+        logger_names=(logger_name,),
+        root=False,
+    )
+    try:
+        assert result is None
+        assert current_process_log_path() is None
+        captured = capsys.readouterr()
+        assert "warning" in captured.err
+        assert "runner" in captured.err
+    finally:
+        read_only.chmod(0o755)
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
     """The exit sweep removes an empty log, keeps a written one, tolerates absence."""
     empty = tmp_path / "empty.log"
