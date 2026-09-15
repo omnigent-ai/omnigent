@@ -1,0 +1,40 @@
+# Dockerized Unity Catalog OSS server for the skillpack POC.
+#
+# Stands up the open-source Unity Catalog server (the Apache-licensed
+# unitycatalog/unitycatalog project) and exposes its REST API on
+# localhost:8080. Blob + manifest bytes live under ./data on the host,
+# bind-mounted into the container so the skillpack CLI (running on the host)
+# can read/write the same files the EXTERNAL volume points at.
+#
+# POC / not for production.
+name: uc-oss-skillpack
+
+services:
+  uc:
+    # Pinned to a specific published tag for reproducibility. If this image
+    # cannot be pulled, build from source instead (see README "Fallback").
+    image: unitycatalog/unitycatalog:v0.5.0
+    container_name: uc-oss-skillpack
+    ports:
+      - "8080:8080"
+    volumes:
+      # Host ./data  ↔  container /home/unitycatalog/etc/data
+      # (etc/ is the writable tree in the UC image). The EXTERNAL volume +
+      # metadata table are created with storage_location
+      # file:///home/unitycatalog/etc/data/... (see bootstrap.sh), so the host
+      # sees the same bytes under ./data.
+      - type: bind
+        source: ./data
+        target: /home/unitycatalog/etc/data
+    healthcheck:
+      # The runtime image is bare alpine (no curl); busybox wget is present.
+      # The list-catalogs endpoint returns 200 once the server is ready.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O /dev/null
+          http://localhost:8080/api/2.1/unity-catalog/catalogs
+          || exit 1
+      interval: 3s
+      timeout: 5s
+      retries: 20
