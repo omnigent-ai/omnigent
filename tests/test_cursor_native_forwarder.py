@@ -335,6 +335,46 @@ class TestDiscoverStore:
         assert fwd._discover_store("/queried/workspace", launch_epoch_ms=4_000) is None
 
 
+class TestDiscoverRotatedStore:
+    """``_discover_rotated_store`` finds the chat a TUI ``/clear`` started."""
+
+    def _seed_chat(self, root: Path, workspace: str, chat_id: str, created_ms: int) -> Path:
+        chat = root / hashlib.md5(workspace.encode()).hexdigest() / chat_id
+        chat.mkdir(parents=True)
+        (chat / "store.db").write_bytes(b"")
+        (chat / "meta.json").write_text(json.dumps({"createdAtMs": created_ms}))
+        return chat / "store.db"
+
+    def test_finds_newer_sibling_chat(self, tmp_path: Path) -> None:
+        ws = "/home/u/proj"
+        bound = self._seed_chat(tmp_path, ws, _CHAT_ID, 5_000)
+        newer = self._seed_chat(tmp_path, ws, _CHAT_ID_2, 6_000)
+        assert fwd._discover_rotated_store(bound, launch_epoch_ms=4_000) == newer
+
+    def test_no_newer_chat_returns_none(self, tmp_path: Path) -> None:
+        ws = "/home/u/proj"
+        bound = self._seed_chat(tmp_path, ws, _CHAT_ID, 5_000)
+        assert fwd._discover_rotated_store(bound, launch_epoch_ms=4_000) is None
+
+    def test_picks_newest_after_consecutive_clears(self, tmp_path: Path) -> None:
+        # Two /clear in quick succession: the TUI is on the NEWEST chat; the
+        # intermediate (empty) one is skipped.
+        ws = "/home/u/proj"
+        bound = self._seed_chat(tmp_path, ws, _CHAT_ID, 5_000)
+        self._seed_chat(tmp_path, ws, _CHAT_ID_2, 6_000)
+        newest = self._seed_chat(tmp_path, ws, "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e", 7_000)
+        assert fwd._discover_rotated_store(bound, launch_epoch_ms=4_000) == newest
+
+    def test_cold_resume_ignores_prelaunch_chats(self, tmp_path: Path) -> None:
+        # A resumed chat often predates OTHER old chats in the same workspace.
+        # Merely post-dating the bound chat must not count as a rotation: only
+        # a chat created at/after THIS launch (the TUI's /clear) qualifies.
+        ws = "/home/u/proj"
+        bound = self._seed_chat(tmp_path, ws, _CHAT_ID, 1_000)
+        self._seed_chat(tmp_path, ws, _CHAT_ID_2, 5_000)
+        assert fwd._discover_rotated_store(bound, launch_epoch_ms=1_000_000) is None
+
+
 class TestStateRoundTrip:
     def test_write_then_read(self, tmp_path: Path) -> None:
         assert fwd._write_state(
@@ -419,6 +459,43 @@ class TestChatClaim:
             encoding="utf-8",
         )
         assert fwd._chat_claimed_by_other(live, Path(store), my_launch_ms=2_000) is False
+
+
+class TestChatClaimedByAny:
+    """``_chat_claimed_by_any`` blocks a rotation onto any live sibling's chat."""
+
+    def test_blocks_even_when_sibling_launched_later(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        established = root / "sessA"
+        sibling = root / "sessB"
+        established.mkdir(parents=True)
+        sibling.mkdir(parents=True)
+        store = "/cursor/chats/h/c-new/store.db"
+        # A LATER-launched sibling claims the chat (fresh heartbeat on write).
+        fwd._write_state(
+            sibling, fwd._ForwardState(store_path=store, last_rowid=0, launch_epoch_ms=9_000)
+        )
+        # The discovery tie-break would let the earlier session take it over…
+        assert fwd._chat_claimed_by_other(established, Path(store), my_launch_ms=1_000) is False
+        # …but a rotation must never steal a live sibling's chat.
+        assert fwd._chat_claimed_by_any(established, Path(store)) is True
+
+    def test_stale_claim_does_not_block(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        dead = root / "sessDead"
+        live = root / "sessLive"
+        dead.mkdir(parents=True)
+        live.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        # Write the file directly so _write_state does not refresh the
+        # heartbeat to "now" — an ancient heartbeat marks a dead session.
+        (dead / fwd._STATE_FILE).write_text(
+            json.dumps(
+                {"store_path": store, "last_rowid": 9, "launch_epoch_ms": 1_000, "heartbeat_ms": 1}
+            ),
+            encoding="utf-8",
+        )
+        assert fwd._chat_claimed_by_any(live, Path(store)) is False
 
 
 class _RecordingClient:
@@ -862,6 +939,60 @@ async def test_patch_external_session_id_http_error_logs_but_does_not_raise(
     assert caplog.records
 
 
+class TestPostExternalSessionRotated:
+    """``_post_external_session_rotated`` re-points cold resume after /clear."""
+
+    @pytest.mark.asyncio
+    async def test_request_shape_and_ack(self) -> None:
+        client = _RecordingClient()
+        settled = await fwd._post_external_session_rotated(
+            client,  # type: ignore[arg-type]
+            session_id="conv_abc",
+            chat_id=_CHAT_ID_2,
+        )
+        assert settled is True
+        url, body = client.posts[0]
+        assert url == "/v1/sessions/conv_abc/events"
+        assert body == {
+            "type": "external_session_rotated",
+            "data": {"external_session_id": _CHAT_ID_2},
+        }
+
+    @pytest.mark.asyncio
+    async def test_rejection_is_settled_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A deterministic rejection (e.g. an older server without this event)
+        # is settled — retrying cannot change it — but must be logged loudly.
+        class _RejectingClient:
+            async def post(self, url: str, *, json: dict) -> httpx.Response:
+                return httpx.Response(400, request=httpx.Request("POST", url))
+
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            settled = await fwd._post_external_session_rotated(
+                _RejectingClient(),  # type: ignore[arg-type]
+                session_id="conv_x",
+                chat_id="cid",
+            )
+        assert settled is True
+        assert any("400" in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_transport_failure_asks_for_retry(self) -> None:
+        class _ErrorClient:
+            async def post(self, url: str, *, json: dict) -> httpx.Response:
+                raise httpx.ConnectError("refused", request=httpx.Request("POST", url))
+
+        settled = await fwd._post_external_session_rotated(
+            _ErrorClient(),  # type: ignore[arg-type]
+            session_id="conv_x",
+            chat_id="cid",
+        )
+        assert settled is False
+
+
 class TestPreseedResumeState:
     """``preseed_resume_state`` pre-seeds bridge state for cold resume."""
 
@@ -1265,3 +1396,197 @@ async def test_persist_native_compaction_item_no_store_skips_messages() -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"] == "item_abc"
     assert "compacted_messages" not in body["data"]
+
+
+# ---------------------------------------------------------------------------
+# /clear rotation: a TUI-side new chat must not strand the web session
+# ---------------------------------------------------------------------------
+
+
+class TestForwardLoopClearRotation:
+    """A TUI ``/clear`` mid-session rotates the mirror onto the new chat.
+
+    Regression coverage for the stranded-web-session bug: ``/clear`` creates a
+    new chat store while the old one stays on disk, so the loop's
+    disappearance-based re-discovery never fired — the mirror stayed pinned to
+    the cleared-away chat (no post-``/clear`` reply ever reached the web UI)
+    and ``external_session_id`` kept cold-resuming the old chat.
+    """
+
+    _WS = "/ws"
+
+    @staticmethod
+    def _seed_chat(
+        chats_root: Path,
+        workspace: str,
+        chat_id: str,
+        created_ms: int,
+        blobs: list[tuple[str, dict]],
+    ) -> Path:
+        chat = chats_root / hashlib.md5(workspace.encode()).hexdigest() / chat_id
+        chat.mkdir(parents=True)
+        (chat / "meta.json").write_text(json.dumps({"createdAtMs": created_ms}))
+        writer = _make_store(chat / "store.db", blobs)
+        writer.close()
+        return chat / "store.db"
+
+    @staticmethod
+    async def _wait_for(predicate, *, message: str, ticks: int = 4000) -> None:
+        for _ in range(ticks):
+            if predicate():
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError(message)
+
+    async def _run_loop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        poster: _FakePoster,
+        patches: list[str],
+        body,
+    ) -> None:
+        """Run the real poll loop with real discovery/claims; *body* drives it.
+
+        Only the HTTP edges are stubbed (item POSTs through *poster*; the
+        first-bind ``external_session_id`` PATCH and the rotation event both
+        record into *patches*); discovery, rotation, and claim checks run for
+        real against the ``chats`` tree under *tmp_path*.
+        """
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+
+        async def _record_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append(chat_id)
+
+        async def _record_rotated(client: object, *, session_id: str, chat_id: str) -> bool:
+            patches.append(chat_id)
+            return True
+
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _record_patch)
+        monkeypatch.setattr(fwd, "_post_external_session_rotated", _record_rotated)
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace=self._WS,
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            await body(bridge_dir)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_new_chat_rotates_mirror_and_resume_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        first = self._seed_chat(
+            chats_root,
+            self._WS,
+            _CHAT_ID,
+            5_000,
+            [("a1", _user("<user_query>\nfirst\n</user_query>"))],
+        )
+        poster = _FakePoster(lambda _: None)
+        patches: list[str] = []
+
+        async def body(bridge_dir: Path) -> None:
+            await self._wait_for(
+                lambda: fwd._read_state(bridge_dir).store_path == str(first)
+                and len(poster.delivered) >= 1,
+                message="forwarder never bound and mirrored the first chat",
+            )
+            # The TUI /clear: a NEW chat store appears; the old one stays on disk.
+            second = self._seed_chat(
+                chats_root,
+                self._WS,
+                _CHAT_ID_2,
+                6_000,
+                [
+                    ("b1", _user("<user_query>\nafter clear\n</user_query>")),
+                    ("b2", _assistant([{"type": "text", "text": "post-clear reply"}])),
+                ],
+            )
+            await self._wait_for(
+                lambda: fwd._read_state(bridge_dir).store_path == str(second),
+                message="mirror never rotated onto the post-/clear chat (web session stranded)",
+            )
+            await self._wait_for(
+                lambda: len(poster.delivered) >= 3,
+                message="post-/clear messages never mirrored",
+            )
+
+        await self._run_loop(monkeypatch, tmp_path, poster, patches, body)
+        # The new chat mirrored from its start — nothing from it was dropped.
+        texts = [it.item_data["content"][0]["text"] for it in poster.delivered]
+        assert texts == ["first", "after clear", "post-clear reply"]
+        # The cold-resume target was re-pointed at the new chat.
+        assert patches == [_CHAT_ID, _CHAT_ID_2]
+
+    @pytest.mark.asyncio
+    async def test_rotation_yields_to_a_live_sibling_claim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A newer chat that belongs to a concurrent same-cwd session (live
+        # claim) is NOT a /clear rotation: the established session stays on its
+        # own chat instead of stealing the sibling's conversation.
+        chats_root = tmp_path / "chats"
+        first = self._seed_chat(
+            chats_root,
+            self._WS,
+            _CHAT_ID,
+            5_000,
+            [("a1", _user("<user_query>\nfirst\n</user_query>"))],
+        )
+        poster = _FakePoster(lambda _: None)
+        patches: list[str] = []
+
+        async def body(bridge_dir: Path) -> None:
+            await self._wait_for(
+                lambda: fwd._read_state(bridge_dir).store_path == str(first)
+                and len(poster.delivered) >= 1,
+                message="forwarder never bound and mirrored the first chat",
+            )
+            # Claim the sibling's chat BEFORE its store appears so the loop can
+            # never observe it unclaimed.
+            sibling = bridge_dir.parent / "sibling"
+            sibling.mkdir()
+            second_store = (
+                chats_root
+                / hashlib.md5(self._WS.encode()).hexdigest()
+                / _CHAT_ID_2
+                / "store.db"
+            )
+            fwd._write_state(
+                sibling,
+                fwd._ForwardState(
+                    store_path=str(second_store), last_rowid=0, launch_epoch_ms=9_000
+                ),
+            )
+            self._seed_chat(
+                chats_root,
+                self._WS,
+                _CHAT_ID_2,
+                6_000,
+                [("b1", _user("<user_query>\nsibling turn\n</user_query>"))],
+            )
+            # Give the loop ample polls to (wrongly) rotate, then confirm it
+            # stayed put and mirrored nothing from the sibling's chat.
+            for _ in range(100):
+                await asyncio.sleep(0.001)
+            assert fwd._read_state(bridge_dir).store_path == str(first)
+
+        await self._run_loop(monkeypatch, tmp_path, poster, patches, body)
+        texts = [it.item_data["content"][0]["text"] for it in poster.delivered]
+        assert texts == ["first"]
+        assert patches == [_CHAT_ID]
