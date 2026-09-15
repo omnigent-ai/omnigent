@@ -143,12 +143,14 @@ the executor declares `supports_live_message_queue()`.
   runs. Delegates launched with the *same* task text are told apart by the final
   report that notification quotes (`chain_index_for_report`), since a delegate's
   own chain carries no `agent_id`.
-* **Permission mode is launch-time only.** The New Chat dialog offers Devin's own
-  rungs (auto / accept-edits / smart / dangerous) as `terminal_launch_args`,
-  because the `permission_mode` *field* is still hard-gated to `claude-native`
-  (`_PERMISSION_MODE_HARNESS` in `server/routes/_session_create_validation.py`)
-  and validated against Claude's vocabulary. Consequence: the mode is fixed at
-  launch — there is no mid-session switch as there is for model and effort.
+* **Permission mode has two channels.** The New Chat dialog pins Devin's own
+  rungs (normal / accept-edits / smart / dangerous) as `terminal_launch_args`,
+  because the create-time `permission_mode` *field* is still hard-gated to
+  `claude-native` (`_PERMISSION_MODE_HARNESS` in
+  `server/routes/_session_create_validation.py`). Mid-session, the composer
+  control cycles the mode in the TUI (`inject_permission_mode` presses Shift+Tab
+  and re-reads the composer marker), so the stored mode is always the one the
+  pane confirmed.
 * **Token-level streaming.** The forwarder mirrors whole hook events, so it posts
   no `external_output_text_delta`; `capabilities.streaming` is `False` by
   construction. The embedded terminal still shows Devin's own live output.
