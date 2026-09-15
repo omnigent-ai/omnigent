@@ -1,5 +1,7 @@
 "use strict";
 
+const { workspaceIdentityKey } = require("./url");
+
 /** Public macOS Managed Preferences key in the ai.omnigent.desktop domain. */
 const SERVER_URLS_KEY = "serverUrls";
 
@@ -49,13 +51,13 @@ function parseManagedServerUrls(value) {
   if (!Array.isArray(value) || value.length > MAX_SERVER_URLS) return [];
 
   const urls = [];
-  const origins = new Set();
+  const identities = new Set();
   try {
     for (const entry of value) {
       const normalized = normalizeManagedServerUrl(entry);
-      const origin = new URL(normalized).origin;
-      if (origins.has(origin)) continue;
-      origins.add(origin);
+      const identity = workspaceIdentityKey(normalized);
+      if (!identity || identities.has(identity)) continue;
+      identities.add(identity);
       urls.push(normalized);
     }
   } catch {
@@ -109,7 +111,8 @@ function getDatabricksInternalFeaturesEnabled({
 }
 
 /**
- * Remove user recents whose origin is already supplied by the organization.
+ * Remove user recents whose workspace identity is already supplied by the
+ * organization.
  *
  * @param {unknown} candidates
  * @param {string[]} managedServers
@@ -117,14 +120,11 @@ function getDatabricksInternalFeaturesEnabled({
  */
 function excludingManagedServers(candidates, managedServers) {
   if (!Array.isArray(candidates)) return [];
-  const managedOrigins = new Set(managedServers.map((url) => new URL(url).origin));
+  const managedIdentities = new Set(managedServers.map(workspaceIdentityKey).filter(Boolean));
   return candidates.filter((candidate) => {
     if (typeof candidate !== "string") return false;
-    try {
-      return !managedOrigins.has(new URL(candidate).origin);
-    } catch {
-      return true;
-    }
+    const identity = workspaceIdentityKey(candidate);
+    return identity === null || !managedIdentities.has(identity);
   });
 }
 

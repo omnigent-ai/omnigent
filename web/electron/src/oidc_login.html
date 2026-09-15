@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Continue sign-in</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --background: #fff;
+        --foreground: #11171c;
+        --muted: #6f6f6f;
+        --border: #e8ecf0;
+        --primary: #11171c;
+        --primary-foreground: #fff;
+        --destructive: #c8324c;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --background: #1e1927;
+          --foreground: #f2f4f5;
+          --muted: #92a4b3;
+          --border: #393342;
+          --primary: #e8ecf0;
+          --primary-foreground: #11171c;
+          --destructive: #e65b77;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 32px;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: var(--background);
+        color: var(--foreground);
+        text-align: center;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      main {
+        width: min(100%, 340px);
+      }
+      .spinner {
+        width: 38px;
+        height: 38px;
+        margin: 0 auto 20px;
+        border: 3px solid var(--border);
+        border-top-color: var(--foreground);
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      body.error .spinner {
+        display: none;
+      }
+      .error-mark {
+        display: none;
+        width: 42px;
+        height: 42px;
+        margin: 0 auto 18px;
+        border: 2px solid var(--destructive);
+        border-radius: 50%;
+        color: var(--destructive);
+        font-size: 28px;
+        line-height: 36px;
+      }
+      body.error .error-mark {
+        display: block;
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 20px;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      #host {
+        margin-top: 10px;
+        color: var(--foreground);
+        font-weight: 600;
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 26px;
+      }
+      button {
+        flex: 1;
+        padding: 9px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--foreground);
+        font: inherit;
+        cursor: pointer;
+      }
+      #retry {
+        display: none;
+        border: none;
+        background: var(--primary);
+        color: var(--primary-foreground);
+        font-weight: 600;
+      }
+      body.error #retry {
+        display: block;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="error-mark" aria-hidden="true">!</div>
+      <h1 id="title">Continue sign-in in your browser</h1>
+      <p id="message">Complete sign-in in the browser window that just opened.</p>
+      <p id="host"></p>
+      <div class="actions">
+        <button id="cancel" type="button">Cancel</button>
+        <button id="retry" type="button">Retry</button>
+      </div>
+    </main>
+    <script>
+      const bridge = window.omnigentOidcLogin;
+      const title = document.getElementById("title");
+      const message = document.getElementById("message");
+      const host = document.getElementById("host");
+      const cancel = document.getElementById("cancel");
+      const retry = document.getElementById("retry");
+
+      bridge.onState((state) => {
+        const isError = state && state.phase === "error";
+        document.body.classList.toggle("error", isError);
+        title.textContent = isError ? "Sign-in did not finish" : "Continue sign-in in your browser";
+        message.textContent = state && state.message ? state.message : "Waiting for sign-in…";
+        host.textContent = state && state.host ? state.host : "";
+      });
+      cancel.addEventListener("click", () => bridge.cancel());
+      retry.addEventListener("click", () => bridge.retry());
+    </script>
+  </body>
+</html>

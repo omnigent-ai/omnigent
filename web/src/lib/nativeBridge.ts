@@ -168,6 +168,10 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
+  /** Format a server using the shell's workspace-aware display rule. */
+  serverDisplayLabel?: (url: string) => string;
+  /** Compute the shell's workspace identity, including Databricks `o`. */
+  workspaceIdentityKey?: (url: string) => string | null;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -333,6 +337,8 @@ export interface ElectronUpdateBridge {
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /** Full mounted server URL. Optional on older desktop shells. */
+  currentServerUrl?: string;
   /**
    * Server URLs supplied through macOS Managed Preferences. Optional because a
    * newer server-served SPA can run inside a desktop shell that predates MDM.
@@ -739,6 +745,26 @@ export async function getServerPicker(): Promise<ServerPickerInfo | null> {
   } catch (err) {
     console.warn("[nativeBridge] native getServerPicker failed:", err);
     return null;
+  }
+}
+
+/** Workspace identity using the Electron shell's canonical rule when present. */
+export function workspaceIdentityKey(url: string): string | null {
+  const electron = electronApi();
+  try {
+    return electron?.workspaceIdentityKey?.(url) ?? new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Compact workspace-aware server label, with an origin-only fallback. */
+export function serverDisplayLabel(url: string): string {
+  const electron = electronApi();
+  try {
+    return electron?.serverDisplayLabel?.(url) ?? new URL(url).host;
+  } catch {
+    return url;
   }
 }
 
