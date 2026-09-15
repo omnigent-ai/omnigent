@@ -193,6 +193,23 @@ def family_effort_variants(family: Mapping[str, object]) -> dict[str, str]:
     return found
 
 
+def _strip_effort_suffix(model: str) -> str:
+    """Drop a trailing effort rung from *model*, if it carries one.
+
+    ``claude-opus-5-xhigh`` -> ``claude-opus-5``; a bare family slug is returned
+    unchanged. Only used on the offline (no-catalog) path, where the family's
+    real variant ids are unavailable to consult. No family slug ends in a rung,
+    so this never mistakes part of a name for a suffix.
+
+    :param model: A family slug or composed variant id.
+    :returns: The id with a trailing ``-<rung>`` removed, if present.
+    """
+    for rung in DEVIN_EFFORTS:
+        if model.endswith(f"-{rung}"):
+            return model[: -len(rung) - 1]
+    return model
+
+
 def _find_devin_family(
     model: str, families: Sequence[Mapping[str, object]]
 ) -> Mapping[str, object] | None:
@@ -297,6 +314,11 @@ def compose_devin_model(
     the bare slug, which Devin resolves to that family's default variant, so a
     mismatched pair still launches the model the user asked for.
 
+    ``model`` may itself be an already-composed variant (e.g. a stored override
+    of ``claude-opus-5-xhigh``): the requested rung is always resolved from the
+    family, never from the existing suffix, so a mid-session effort switch is not
+    a no-op when the pinned model already carries a rung.
+
     :param model: Family slug, alias, or an already-composed variant id.
     :param effort: One of :data:`DEVIN_EFFORTS`, or ``None``.
     :param families: ``devin models list`` family rows; ``None`` skips the lookup
@@ -307,15 +329,21 @@ def compose_devin_model(
         return None
     if not effort:
         return model
-    # An id that already ends in an effort rung is a full variant — leave it.
-    if any(model.endswith(f"-{rung}") for rung in DEVIN_EFFORTS):
-        return model
     if families is None:
-        return f"{model}-{effort}"
+        # Offline: strip any rung already on the id before applying the new one,
+        # so recomposing an existing variant doesn't double-suffix it.
+        return f"{_strip_effort_suffix(model)}-{effort}"
     family = _find_devin_family(model, families)
     if family is None:
         return model
-    return family_effort_variants(family).get(effort, model)
+    rung_variants = family_effort_variants(family)
+    if effort in rung_variants:
+        return rung_variants[effort]
+    # The family lacks the requested rung. Return the bare slug so a
+    # previously-composed id does not keep a stale rung; Devin resolves a family
+    # to its default variant.
+    slug = family.get("slug")
+    return slug if isinstance(slug, str) and slug else model
 
 
 def devin_model_families(
