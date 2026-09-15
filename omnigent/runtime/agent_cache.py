@@ -214,6 +214,7 @@ class AgentCache:
         tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
+        complete = False
         try:
             tmp_path.write_bytes(bundle_bytes)
             spec = load_spec(
@@ -222,8 +223,12 @@ class AgentCache:
                 expand_env=expand_env,
                 prune_invalid_sub_agents=True,
             )
+            complete = True
         finally:
             tmp_path.unlink()
+            # A failed extraction must not become a disk-cache hit on retry.
+            if not complete and workdir.is_dir():
+                shutil.rmtree(workdir)
 
         self._specs[agent_id] = spec
         return LoadedAgent(spec=spec, workdir=workdir)
