@@ -229,6 +229,28 @@ async def test_an_unterminated_fork_block_still_strips(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_policy_blocked_prompt_is_not_mirrored(tmp_path: Path) -> None:
+    # Devin never runs a blocked prompt, so no Stop arrives. Mirroring it would
+    # show a turn that never happened and leave the session "running" until the
+    # next prompt closed it.
+    client = _FakeClient()
+    blocked = dict(_USER_PROMPT, omnigent_policy_blocked=True)
+    await _drive(client, [blocked], tmp_path)
+    assert client.items("message") == []
+    assert client.events("external_session_status") == []
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_prompt_still_closes_a_previous_turn(tmp_path: Path) -> None:
+    # The prompt was submitted, so any turn still open really is over.
+    client = _FakeClient()
+    blocked = dict(_USER_PROMPT, prompt_id="second", omnigent_policy_blocked=True)
+    await _drive(client, [_USER_PROMPT, _PRE_TOOL, blocked], tmp_path)
+    statuses = [event["status"] for event in client.events("external_session_status")]
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
 async def test_turn_opens_running_and_closes_idle(tmp_path: Path) -> None:
     # Devin's executor returns right after injecting, so the Omnigent turn is over
     # immediately and the web sees no streaming state. These hook-driven edges are

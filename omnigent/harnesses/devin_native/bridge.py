@@ -50,6 +50,10 @@ _BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "d
 
 _TMUX_FILE = "tmux.json"
 _HOOKS_FILE = "hooks.jsonl"
+#: Stamped on a recorded ``UserPromptSubmit`` whose policy verdict blocked it.
+#: Devin never runs a blocked prompt, so no ``Stop`` follows — the forwarder
+#: reads this to avoid mirroring a turn that never happened.
+DEVIN_POLICY_BLOCKED_KEY = "omnigent_policy_blocked"
 _FORWARDER_READY_FILE = "devin_forwarder_ready.json"
 #: Session-scoped ``--config`` file (user config + Omnigent hooks).
 _SESSION_CONFIG_FILE = "devin_config.json"

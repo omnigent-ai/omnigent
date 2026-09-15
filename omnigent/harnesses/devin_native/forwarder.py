@@ -43,6 +43,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.devin_native.bridge import (
+    DEVIN_POLICY_BLOCKED_KEY,
     FORK_HISTORY_CLOSE_TAG,
     FORK_HISTORY_OPEN_TAG,
     export_path,
@@ -552,6 +553,11 @@ async def _handle_event(
         # A new prompt authoritatively closes any turn still open.
         if turn.prompt_id is not None and turn.prompt_id != prompt_id:
             await _close_turn(client, session_id=session_id, turn=turn)
+        if payload.get(DEVIN_POLICY_BLOCKED_KEY):
+            # Policy blocked this prompt, so Devin never ran it and no Stop will
+            # arrive. Mirroring it would show a turn that never happened and leave
+            # the session "running" until the next prompt closed it.
+            return
         prompt = payload.get("prompt")
         turn.prompt_id = prompt_id
         await _open_turn(client, session_id=session_id, turn=turn)

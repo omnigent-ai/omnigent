@@ -231,6 +231,18 @@ def _mirror_permission_request(
     return None
 
 
+def _record_event(bridge_dir: Path | None, payload: _JsonObject) -> None:
+    """Append *payload* to the hook log, tolerating an unwritable bridge dir."""
+    if bridge_dir is None:
+        return
+    try:
+        from omnigent.harnesses.devin_native.bridge import record_hook_event
+
+        record_hook_event(bridge_dir, payload)
+    except OSError as exc:
+        print(f"omnigent devin hook: could not record event: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the Devin hook: record the event, then apply policy / elicitation.
 
@@ -250,18 +262,32 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(hook_event, str):
         return 0
 
-    # 1. Record first: the transcript must survive a policy/network failure.
-    if bridge_dir is not None:
-        try:
-            from omnigent.harnesses.devin_native.bridge import record_hook_event
-
-            record_hook_event(bridge_dir, payload)
-        except OSError as exc:
-            print(f"omnigent devin hook: could not record event: {exc}", file=sys.stderr)
-
     server_url = os.environ.get(_SERVER_URL_ENV, "").strip()
     session_id = os.environ.get(_SESSION_ID_ENV, "").strip()
-    if not server_url or not session_id:
+    governed = bool(server_url and session_id)
+
+    # UserPromptSubmit is the one event whose verdict must reach the transcript
+    # with it: the forwarder mirrors the prompt and opens the turn from this
+    # record, and a blocked prompt never reaches the model — so no Stop follows
+    # and the turn would stay open forever. Every failure mode here blocks too
+    # (`fail_closed_hook_output` fails CLOSED on PHASE_REQUEST), so recording
+    # verdict-blind is wrong even when the server is merely unreachable.
+    if governed and hook_event == _USER_PROMPT_SUBMIT:
+        verdict = _evaluate_policy(
+            hook_event, payload, server_url=server_url, session_id=session_id
+        )
+        if isinstance(verdict, dict) and verdict.get("decision") == "block":
+            from omnigent.harnesses.devin_native.bridge import DEVIN_POLICY_BLOCKED_KEY
+
+            _record_event(bridge_dir, {**payload, DEVIN_POLICY_BLOCKED_KEY: True})
+        else:
+            _record_event(bridge_dir, payload)
+        return _emit(_devin_output_for_policy_verdict(hook_event, verdict))
+
+    # Everything else records first: the transcript must survive a policy or
+    # network failure, and these events describe work that already happened.
+    _record_event(bridge_dir, payload)
+    if not governed:
         # Not a governed session (e.g. the user ran `devin` outside Omnigent with
         # a stale config). Record-only; never block.
         return 0

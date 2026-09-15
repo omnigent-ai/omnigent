@@ -714,3 +714,49 @@ class TestUserConfigJsonc:
 
     def test_truly_malformed_config_still_degrades_to_empty(self, tmp_path: Path) -> None:
         assert _read_user_config(self._write(tmp_path, "{not json at all")) == {}
+
+
+class TestBlockedPromptRecord:
+    """A policy-blocked prompt must carry its verdict into the hook log."""
+
+    def _run_hook(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        verdict: dict[str, object] | None,
+    ) -> list[dict[str, object]]:
+        import io
+
+        from omnigent.harnesses.devin_native import hook as devin_hook
+
+        monkeypatch.setattr(devin_hook, "_evaluate_policy", lambda *a, **k: verdict)
+        monkeypatch.setenv(devin_hook._SERVER_URL_ENV, "http://127.0.0.1:1")
+        monkeypatch.setenv(devin_hook._SESSION_ID_ENV, "conv_abc")
+        payload = {"hook_event_name": "UserPromptSubmit", "prompt": "do it", "prompt_id": "p1"}
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+        devin_hook.main([str(tmp_path)])
+        return [payload for _offset, payload in iter_hook_events(tmp_path)]
+
+    def test_a_blocked_prompt_is_stamped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        events = self._run_hook(tmp_path, monkeypatch, {"decision": "block", "reason": "nope"})
+        assert events and events[0]["omnigent_policy_blocked"] is True
+
+    def test_an_allowed_prompt_is_not_stamped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        events = self._run_hook(tmp_path, monkeypatch, None)
+        assert events and "omnigent_policy_blocked" not in events[0]
+        # Still recorded: an allowed prompt must reach the transcript as usual.
+        assert events[0]["prompt"] == "do it"
+
+    def test_a_server_failure_blocks_and_is_stamped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # UserPromptSubmit fails CLOSED, so an unreachable server also blocks the
+        # prompt — recording it verdict-blind would open a turn nothing can close.
+        events = self._run_hook(
+            tmp_path, monkeypatch, {"decision": "block", "reason": "server unreachable"}
+        )
+        assert events[0]["omnigent_policy_blocked"] is True
