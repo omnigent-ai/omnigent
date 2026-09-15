@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { effortLevelsForConv, shouldShowEffortPicker, shouldShowModelPicker } from "./ChatPage";
+import {
+  effortLevelsForConv,
+  modelPickerKindForConv,
+  shouldShowEffortPicker,
+  shouldShowModelPicker,
+} from "./ChatPage";
 
 // These pin the composer capability gates (effort levels, model picker, effort
-// picker). Wrapper labels are authoritative; the resolved harness is the
-// fallback for chat-first custom Codex agents that intentionally have no
-// presentation label. Unrelated label-less sessions still fail closed.
+// picker). Wrapper labels are authoritative; the resolved harness is the fallback
+// for any session with no presentation label — chat-first custom Codex agents,
+// and sessions created before their harness was renamed (the ACP-era Devin rows).
+// Label-less sessions on a NON-native harness still fail closed, and so does a
+// label-less sub-agent child.
 
 const NATIVE = "claude-code-native-ui";
 
@@ -141,5 +148,57 @@ describe("shouldShowEffortPicker", () => {
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(
       false,
     );
+  });
+});
+
+describe("label-less native sessions (e.g. created before a harness rename)", () => {
+  // The ACP-era Devin rows are the live case: no `omnigent.wrapper` label, while
+  // the snapshot reports the canonical harness and the runner already resolves
+  // them to native and gives them a pane. Without the harness fallback every
+  // label-driven surface reads them as non-native.
+  const oldDevin = { labels: {}, harness: "devin-native" };
+
+  it("resolves a label-less devin session to Devin's picker", () => {
+    expect(modelPickerKindForConv(oldDevin)).toBe("devin");
+  });
+
+  it("gives it Devin's per-model rungs rather than the base ladder", () => {
+    const catalog = [
+      {
+        id: "swe-2",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "max" }],
+      },
+    ];
+    expect(effortLevelsForConv(oldDevin, catalog, "swe-2")).toEqual(["high", "max"]);
+  });
+
+  it("still covers label-less codex, which this replaced a special case for", () => {
+    expect(modelPickerKindForConv({ labels: {}, harness: "codex-native" })).toBe("codex");
+  });
+
+  it("does NOT resolve a label-less sub-agent child", () => {
+    // A child owns no PTY and takes no input, so a native harness alone must not
+    // earn it a picker — the ACP-era children carry no wrapper label either.
+    expect(
+      modelPickerKindForConv({
+        labels: {},
+        harness: "devin-native",
+        parentSessionId: "conv_parent",
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps an explicit label authoritative over the harness", () => {
+    expect(
+      modelPickerKindForConv({
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        harness: "devin-native",
+      }),
+    ).toBe("claude");
+  });
+
+  it("still fails closed for a label-less non-native harness", () => {
+    expect(modelPickerKindForConv({ labels: {}, harness: "openai-agents" })).toBeNull();
+    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
   });
 });

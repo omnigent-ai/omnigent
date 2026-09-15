@@ -1023,7 +1023,11 @@ export function ChatPage() {
   // stable identity across the switch's re-render burst.
   const capabilitySource = useMemo(() => {
     if (activeSession)
-      return { labels: activeSession.labels ?? {}, harness: activeSession.harness };
+      return {
+        labels: activeSession.labels ?? {},
+        harness: activeSession.harness,
+        parentSessionId: activeSession.parentSessionId ?? null,
+      };
     // Keep the seeded native identity through the temp-to-real ID handoff,
     // until the session snapshot can supply its wrapper label and harness.
     if (
@@ -1031,12 +1035,16 @@ export function ChatPage() {
       (composerSessionModelSeeded && activeConversationId === urlConvId)
     ) {
       const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
+      const seededLabels: Record<string, string | null> = nativeAgent
+        ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel }
+        : {};
       return {
-        labels: nativeAgent ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel } : {},
+        labels: seededLabels,
         harness: composerSessionHarness,
+        parentSessionId: null,
       };
     }
-    return { labels: activeConv?.labels ?? {}, harness: null };
+    return { labels: activeConv?.labels ?? {}, harness: null, parentSessionId: null };
   }, [
     activeSession,
     activeConv,
@@ -4093,20 +4101,49 @@ export function readOnlyReasonForSessionLabels(
  * mid-session overrides — keeps the label authoritative and skips the
  * fallback.
  */
-function isLabelLessCodexNative(
+/**
+ * The wrapper label a session behaves as: its own, else the one its harness
+ * implies.
+ *
+ * A session created before its harness was renamed carries no
+ * ``omnigent.wrapper`` label — the ACP-era Devin rows are the live example — so
+ * every label-driven surface below (model picker, effort ladder, permission mode)
+ * would read it as non-native even though the runner resolves it to a native
+ * harness and gives it a pane. Deriving from the harness fixes that for any
+ * rename, and subsumes the codex-only special case this replaces.
+ *
+ * A sub-agent child is excluded: it owns no PTY and takes no input, so it must
+ * not gain a picker just because its harness is native.
+ */
+function effectiveWrapperLabel(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
-): boolean {
-  return conv?.labels?.["omnigent.wrapper"] == null && conv?.harness === "codex-native";
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
+): string | undefined {
+  const label = conv?.labels?.["omnigent.wrapper"];
+  if (label != null) return label;
+  if (conv?.parentSessionId != null) return undefined;
+  return nativeCodingAgentForHarness(conv?.harness)?.wrapperLabel;
 }
 
 export function effortLevelsForConv(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
-  switch (conv?.labels?.["omnigent.wrapper"]) {
+  switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "devin-native-ui":
@@ -4120,9 +4157,7 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return isLabelLessCodexNative(conv)
-        ? codexEffortLevelsForModel(codexModelOptions, currentModel)
-        : EFFORT_LEVELS;
+      return EFFORT_LEVELS;
   }
 }
 
@@ -4135,9 +4170,15 @@ export function effortLevelsForConv(
  */
 export function modelPickerKindForConv(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
 ): NativeModelPickerKind | null {
-  switch (conv?.labels?.["omnigent.wrapper"]) {
+  switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
@@ -4165,7 +4206,7 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
-      return isLabelLessCodexNative(conv) ? "codex" : null;
+      return null;
   }
 }
 
