@@ -1,0 +1,2770 @@
+"""OmpExecutor: run agents through the oh-my-pi coding agent's RPC mode.
+
+Spawns omp (``omp --mode rpc``) as a subprocess and communicates via a JSONL
+protocol over stdin/stdout.  omp manages its own agent loop, tool execution,
+context window, and compaction internally.  This executor translates the omp
+event stream into Omnigent ExecutorEvents.
+
+Omnigent tools are bridged into omp via a generated JavaScript extension
+that registers each tool with ``pi.registerTool()`` (omp keeps upstream pi's
+extension surface, including the ``pi`` host object name).  Tool execution is
+proxied over a local TCP socket to the Omnigent Python process, so
+policies, history recording, sub-agents, runtime, and all other Omnigent
+features work exactly as they do with the Claude SDK and Codex harnesses.
+
+When ``os_env`` is set, the omp subprocess is wrapped in the same
+sandbox used for other harnesses.
+
+Databricks support: a temporary ``models.yml`` is generated with three
+providers (OpenAI Responses for GPT, Anthropic Messages for Claude, and
+OpenAI Completions for others) and ``PI_CODING_AGENT_DIR`` is set so omp
+picks it up (omp kept the ``PI_CODING_AGENT_DIR`` name; it relocates the
+``~/.omp/agent`` base).
+
+Requirements:
+    The ``omp`` CLI must be installed and on PATH.
+
+Environment (Databricks):
+    DATABRICKS_CONFIG_PROFILE — optional Databricks profile selector
+    ~/.databrickscfg          — host + token profile for workspace access
+    (or ~/.databrickscfg with a profile containing host + token)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import hmac
+import json
+import logging
+import os
+import pathlib
+import re
+import secrets
+import shutil
+import subprocess
+import tempfile
+from asyncio import Queue, Task
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any, NotRequired, TypeAlias, TypedDict, cast
+from urllib.parse import urlparse as _urlparse
+
+import yaml
+
+from omnigent.harnesses.pi_native.credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
+from omnigent.inner.agent_env import clean_agent_env
+from omnigent.inner.native_attachments import parse_data_uri
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.models import model_catalog
+from omnigent.models.model_metadata import ModelWireAPI
+from omnigent.models.pi_model_compatibility import (
+    SYSTEM_AI_RESPONSES_KEYWORDS,
+    databricks_model_aliases,
+    enrich_databricks_model_catalog,
+    pi_model_is_reasoning,
+    pi_model_json_entry,
+    unsupported_in_pi,
+)
+from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonValue
+from omnigent.util.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    PI_EFFORTS,
+    nearest_pi_thinking_level,
+    to_pi_thinking_level,
+    validate_effort,
+)
+
+from ._subprocess_lifecycle import close_subprocess_transport
+from .async_utils import run_sync_on_thread
+from .databricks_executor import _read_databrickscfg
+from .datamodel import OSEnvSandboxSpec, OSEnvSpec
+from .executor import (
+    Executor,
+    ExecutorConfig,
+    ExecutorError,
+    ExecutorEvent,
+    Message,
+    ReasoningChunk,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
+    ToolSpec,
+    TurnComplete,
+)
+
+logger = logging.getLogger(__name__)
+
+# Each line of omp's JSONL output; the event schema is owned by the omp CLI
+# not us, and varies across subcommands (response ack, message_update,
+# tool_execution_start/end, agent_end, message_end, etc.).
+OmpEvent: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+
+def _fetch_shell_command_token(command: str) -> str | None:
+    """Run an auth helper command and return its stdout token.
+
+    :param command: Shell command that prints a bearer token.
+    :returns: The stripped token, or ``None`` when the command fails or
+        prints no token.
+    """
+    result = subprocess.run(
+        ["sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    token = result.stdout.strip()
+    if result.returncode != 0 or not token:
+        logger.debug("omp Databricks auth command failed: %s", result.stderr.strip())
+        return None
+    return token
+
+
+# Tool-server callback provided by ``Session._wire_sdk_executor``. Invoked
+# with a tool name and argument dict; may return the result dict directly
+# or a coroutine/future yielding one.
+ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
+    [str, dict[str, Any]],
+    Awaitable[dict[str, Any]] | dict[str, Any],
+]
+
+# Native-tool policy gate wired by :class:`OmpExecutor`. Invoked with a native
+# (non-bridged) tool name + argument dict; returns ``{"block": bool, "reason":
+# str}``. omp's native tools (e.g. ``read``, enabled for skill loading) execute
+# inside the omp process and never traverse the bridged ``/mcp`` path, so the
+# ``tool_call`` extension hook routes them here for a TOOL_CALL policy verdict.
+NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
+    [str, dict[str, Any]],
+    Awaitable[dict[str, Any]] | dict[str, Any],
+]
+
+
+class _OmpProviderConfig(TypedDict):
+    baseUrl: str
+    apiKey: str
+    api: str
+    models: list[_JsonObject]
+    authHeader: NotRequired[bool]
+    compat: NotRequired[_JsonObject]
+
+
+class _OmpModelsConfig(TypedDict):
+    providers: dict[str, _OmpProviderConfig]
+
+
+class _OmpMessageUsage(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cache_read_input_tokens: int
+    cache_creation_input_tokens: int
+    model: str | None
+
+
+class _OmpTurnUsage(_OmpMessageUsage):
+    context_tokens: int
+
+
+# ---------------------------------------------------------------------------
+# TCP tool server — serves Omnigent tools to the omp extension
+# ---------------------------------------------------------------------------
+
+
+def _safe_dumps(response: dict[str, Any], req_id: str | None) -> str:  # type: ignore[explicit-any]
+    """Serialize a tool-server response, never raising on bad payloads.
+
+    Tool callbacks may return values ``json.dumps`` can't encode (a
+    ``datetime``, ``set``, ``bytes``, custom object, ...). Encoding happens
+    on the response path *outside* :meth:`_ToolServer._execute`'s try, so an
+    unguarded ``json.dumps`` would propagate and the connection would close
+    with zero bytes written — leaving the JS ``callTool`` promise pending and
+    hanging the entire omp turn. Mirrors codex's ``_result_text`` guard: on a
+    serialization failure, fall back to an ``{"error": ...}`` envelope so the
+    client always receives a valid frame.
+
+    :param response: The response dict to serialize.
+    :param req_id: The originating request id, echoed back on the error
+        envelope so the client correlates the failure with its call.
+    :returns: A compact JSON string (no trailing newline).
+    """
+    try:
+        return json.dumps(response, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        # Stringify ``req_id`` so the fallback envelope itself can never raise
+        # on a non-serializable id (the caller passes a ``str`` today, but the
+        # guard must hold for any future caller). ``None`` stays ``None`` so the
+        # client still sees a null id rather than the literal "None".
+        safe_id: str | None = req_id if req_id is None or isinstance(req_id, str) else str(req_id)
+        return json.dumps(
+            {"id": safe_id, "error": f"unserializable tool result: {exc}"},
+            separators=(",", ":"),
+        )
+
+
+class _ToolServer:
+    """Async TCP server that handles tool-call requests from the omp extension.
+
+    Protocol (JSONL over TCP):
+        Request:  {"id":"...","token":"...","tool":"tool_name","args":{...}}
+        Response: {"id":"...","result":{...}} or {"id":"...","error":"..."}
+
+    The loopback socket is reachable by any co-located process, so every
+    request must carry :attr:`token` (a per-server secret embedded only in
+    the generated omp extension); frames with a missing or wrong token are
+    rejected before dispatch.
+    """
+
+    def __init__(self) -> None:
+        self._server: asyncio.Server | None = None
+        self.port: int = 0
+        self._tool_executor: ToolExecutor | None = None
+        # Policy gate for native (non-bridged) omp tool calls, set by
+        # :meth:`OmpExecutor._ensure_tool_server`. ``None`` (single-process
+        # / test paths) means native tool calls are not gated.
+        self._policy_gate: NativePolicyGate | None = None
+        # Per-server bearer token required on every request. Minted at
+        # construction (never None) so auth is always enforced.
+        self.token: str = secrets.token_urlsafe(32)
+
+    async def start(self) -> int:
+        """Start listening on a random port. Returns the port number."""
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            "127.0.0.1",
+            0,
+        )
+        addr = self._server.sockets[0].getsockname()
+        self.port = addr[1]
+        logger.debug("OmpExecutor tool server listening on port %d", self.port)
+        return self.port
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            while True:
+                raw = await reader.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    request = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Authenticate before any dispatch; close the connection on
+                # failure (unlike the malformed-frame ``continue`` below).
+                if not self._token_ok(request.get("token")):
+                    writer.write(
+                        json.dumps(
+                            {"id": request.get("id"), "error": "unauthorized"},
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+                    await writer.drain()
+                    break
+                raw_req_id = request.get("id")
+                raw_tool_name = request.get("tool")
+                # The omp extension always supplies ``id`` and ``tool``
+                # on a tool request. Drop malformed frames rather than
+                # executing under an empty-string tool name.
+                if not isinstance(raw_req_id, str) or not isinstance(raw_tool_name, str):
+                    continue
+                tool_args = request.get("args", {})
+                if request.get("kind") == "policy_eval":
+                    # The ``tool_call`` extension hook asks for a TOOL_CALL
+                    # verdict on a native (non-bridged) tool — evaluate only,
+                    # never execute (omp runs the tool itself on ALLOW).
+                    verdict = await self._evaluate_policy(raw_tool_name, tool_args)
+                    response = {"id": raw_req_id, "verdict": verdict}
+                else:
+                    response = await self._execute(raw_tool_name, tool_args)
+                    response["id"] = raw_req_id
+                # Serialize defensively: a tool result may carry a value
+                # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
+                # If it raises here — outside ``_execute``'s try — the frame
+                # is never written and the JS ``callTool`` promise hangs the
+                # whole turn (no ``data``/``error`` event). Always emit a JSON
+                # frame: a serializable error envelope when the response can't
+                # be encoded, mirroring codex's ``_result_text`` guard.
+                out = _safe_dumps(response, raw_req_id) + "\n"
+                writer.write(out.encode("utf-8"))
+                await writer.drain()
+        except (asyncio.CancelledError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    def _token_ok(self, presented: JsonValue) -> bool:
+        """
+        Validate a request's ``token`` against this server's secret.
+
+        :param presented: The ``token`` field from the request JSON — a
+            ``str`` when authenticated, any JSON type (or ``None``) on a
+            malformed/forged frame, hence the ``isinstance`` guard.
+        :returns: ``True`` only when *presented* is a string equal to
+            :attr:`token`, compared in constant time.
+        """
+        return isinstance(presented, str) and hmac.compare_digest(presented, self.token)
+
+    async def _execute(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._tool_executor is None:
+            return {"error": f"No tool executor for '{name}'"}
+        try:
+            raw = self._tool_executor(name, args)
+            resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
+            if not isinstance(resolved, dict):
+                resolved = {"result": resolved}
+            return {"result": resolved}
+        except Exception as exc:  # noqa: BLE001 — tool errors are surfaced via the JSON response envelope
+            return {"error": str(exc)}
+
+    async def _evaluate_policy(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Evaluate a native (non-bridged) tool call against TOOL_CALL policy.
+
+        Routes through the :attr:`_policy_gate` wired by
+        :meth:`OmpExecutor._ensure_tool_server`. Returns ``{"block": bool,
+        "reason": str}``.
+
+        Fail-open (allow) when no gate is wired or the gate raises: this
+        mirrors the runner/scaffold policy-evaluation contract, which also
+        defaults to ALLOW on a stalled or failed verdict so a transient
+        Omnigent outage can't wedge the agent mid-turn.
+        """
+        if self._policy_gate is None:
+            return {"block": False, "reason": ""}
+        try:
+            raw = self._policy_gate(name, args)
+            resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
+            if isinstance(resolved, dict):
+                return {
+                    "block": bool(resolved.get("block")),
+                    "reason": str(resolved.get("reason") or ""),
+                }
+            return {"block": False, "reason": ""}
+        except Exception as exc:  # noqa: BLE001 — fail-open; the verdict path must never wedge omp
+            logger.warning("omp native-tool policy eval failed for %r: %s", name, exc)
+            return {"block": False, "reason": ""}
+
+
+# ---------------------------------------------------------------------------
+# omp extension generator — bridges Omnigent tools into omp
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_schema(schema: ToolSpec) -> ToolSpec:
+    """Strip JSON Schema features unsupported by the OpenAI Responses/Completions APIs.
+
+    Removes ``anyOf``, ``oneOf``, ``allOf``, ``examples``, ``default``,
+    ``additionalProperties``, and ``$ref``.  Union keywords are collapsed
+    to the first ``object`` branch when one exists (it carries the
+    structured properties the model needs), else the first typed branch.
+    This ensures the schema is accepted by Databricks serving endpoints.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    result: ToolSpec = {}
+    for key, value in schema.items():
+        if key in ("examples", "default", "$ref", "additionalProperties"):
+            continue
+        if key in ("anyOf", "oneOf", "allOf"):
+            # Prefer the object branch: collapsing to a primitive drops the properties.
+            if isinstance(value, list) and value:
+                typed = [c for c in value if isinstance(c, dict) and "type" in c]
+                for candidate in typed:
+                    if candidate["type"] == "object":
+                        return _sanitize_schema(candidate)
+                if typed:
+                    return _sanitize_schema(typed[0])
+            continue
+        if key == "properties" and isinstance(value, dict):
+            result[key] = {k: _sanitize_schema(v) for k, v in value.items()}
+        elif key == "items" and isinstance(value, dict):
+            result[key] = _sanitize_schema(value)
+        else:
+            result[key] = value
+    return result
+
+
+def _generate_extension_js(port: int, tool_schemas: list[ToolSpec], token: str) -> str:
+    """Generate a JavaScript omp extension that registers Omnigent tools.
+
+    Each tool is forwarded to the TCP tool server at ``127.0.0.1:<port>``.
+
+    :param port: TCP port the Omnigent tool server is listening on, e.g.
+        ``54321``.
+    :param tool_schemas: Omnigent tool schemas to register with omp.
+    :param token: The tool server's bearer token
+        (:attr:`_ToolServer.token`), embedded in the extension and sent
+        on every request so the server can authenticate this omp process.
+    """
+    # Build tool descriptors for the JS code. ``ToolSpec`` is the
+    # same JSON-shaped ``dict[str, Any]`` we consume.
+    descriptors: list[ToolSpec] = []
+    for s in tool_schemas:
+        raw_name = s.get("name")
+        # omp requires a concrete name on each registered tool; skip
+        # malformed entries rather than registering an unnamed tool.
+        if not isinstance(raw_name, str) or not raw_name:
+            continue
+        raw_desc = s.get("description")
+        # Description is optional; omp's JS bridge expects ``str`` on
+        # both ``description`` and ``promptSnippet``.
+        desc: str = raw_desc if isinstance(raw_desc, str) else ""
+        descriptors.append(
+            {
+                "name": raw_name,
+                "description": desc,
+                "promptSnippet": desc[:120],
+                "parameters": _sanitize_schema(
+                    s.get("parameters", {"type": "object", "properties": {}})
+                ),
+            }
+        )
+    tools_json = json.dumps(descriptors, indent=2)
+    # json.dumps so the secret is correctly JS-string-escaped.
+    token_json = json.dumps(token)
+
+    return f"""\
+// Auto-generated Omnigent tool bridge extension for omp.
+// Connects to the Omnigent TCP tool server on port {port}.
+import net from "node:net";
+
+const TOOLS = {tools_json};
+const BRIDGED = new Set(TOOLS.map((t) => t.name));
+const PORT = {port};
+const TOKEN = {token_json};
+
+/** Send a tool call request over TCP and return the result. */
+function callTool(toolName, args) {{
+  return new Promise((resolve) => {{
+    // Idempotent settle: a tool call must resolve exactly once. Route every
+    // resolve through finish() so a late "close" after a real "data" response
+    // can't clobber the result, and a bare close with no data still resolves
+    // (rather than hanging omp's agent loop forever).
+    let settled = false;
+    const finish = (v) => {{ if (!settled) {{ settled = true; resolve(v); }} }};
+    const errorResult = (text) => ({{
+      content: [{{ type: "text", text: JSON.stringify({{ error: text }}) }}],
+      isError: true
+    }});
+    const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
+      const id = Math.random().toString(36).slice(2);
+      const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
+      let buf = "";
+      client.on("data", (chunk) => {{
+        buf += chunk.toString();
+        const nl = buf.indexOf("\\n");
+        if (nl !== -1) {{
+          try {{
+            const resp = JSON.parse(buf.slice(0, nl));
+            client.end();
+            if (resp.error) {{
+              finish(errorResult(resp.error));
+            }} else {{
+              const text = typeof resp.result === "string"
+                ? resp.result
+                : JSON.stringify(resp.result);
+              const isError = resp.result && (resp.result.error || resp.result.blocked);
+              finish({{ content: [{{ type: "text", text }}], isError: !!isError }});
+            }}
+          }} catch (e) {{
+            client.end();
+            finish(errorResult(e.message));
+          }}
+        }}
+      }});
+      client.on("error", (err) => {{
+        finish(errorResult(err.message));
+      }});
+      // A clean FIN with no bytes (e.g. the server failed to serialize the
+      // result and closed) emits neither "data" nor "error"; without this
+      // the promise would hang forever. finish() is a no-op if already settled.
+      client.on("close", () => {{
+        finish(errorResult("tool server closed connection without a response"));
+      }});
+      client.write(req);
+    }});
+    client.on("error", (err) => {{
+      finish(errorResult(err.message));
+    }});
+  }});
+}}
+
+/**
+ * Ask the Omnigent tool server for a TOOL_CALL policy verdict on a native
+ * (non-bridged) omp tool. Resolves to the verdict object {{ block, reason }}
+ * or null. Fail-open (null) on any transport error: a wedged native tool
+ * would break omp worse than a missed gate, and bridged tools stay gated
+ * server-side regardless.
+ */
+function evalNativePolicy(toolName, args) {{
+  return new Promise((resolve) => {{
+    const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
+      const id = Math.random().toString(36).slice(2);
+      const frame = {{ id, token: TOKEN, kind: "policy_eval", tool: toolName, args }};
+      const req = JSON.stringify(frame) + "\\n";
+      let buf = "";
+      client.on("data", (chunk) => {{
+        buf += chunk.toString();
+        const nl = buf.indexOf("\\n");
+        if (nl !== -1) {{
+          client.end();
+          try {{
+            const resp = JSON.parse(buf.slice(0, nl));
+            resolve(resp && resp.verdict ? resp.verdict : null);
+          }} catch (e) {{
+            resolve(null);
+          }}
+        }}
+      }});
+      client.on("error", () => resolve(null));
+      client.write(req);
+    }});
+    client.on("error", () => resolve(null));
+  }});
+}}
+
+export default function(pi) {{
+  // Gate native (non-bridged) tool calls through Omnigent policy. omp's
+  // native tools (e.g. ``read``, enabled for skill loading) run in-process
+  // and never traverse the bridged /mcp path, so without this hook they
+  // escape all guardrails. Bridged tools ARE evaluated server-side at /mcp,
+  // so skip them here to avoid double-evaluation (and double ASK prompts).
+  pi.on("tool_call", async (event) => {{
+    if (!event || typeof event.toolName !== "string") return;
+    if (BRIDGED.has(event.toolName)) return;
+    const verdict = await evalNativePolicy(event.toolName, event.input || {{}});
+    if (verdict && verdict.block) {{
+      return {{ block: true, reason: verdict.reason || "blocked by Omnigent policy" }};
+    }}
+  }});
+
+  for (const tool of TOOLS) {{
+    // omp passes tool.parameters directly to the LLM as JSON Schema, so we
+    // can use the Omnigent schema as-is without TypeBox conversion.
+    pi.registerTool({{
+      name: tool.name,
+      label: tool.name,
+      description: tool.description,
+      promptSnippet: tool.promptSnippet || tool.description,
+      parameters: tool.parameters || {{ type: "object", properties: {{}} }},
+      async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {{
+        return callTool(tool.name, _params);
+      }},
+    }});
+  }}
+}};
+"""
+
+
+# ---------------------------------------------------------------------------
+# Credential helpers (shared pattern with codex_executor / claude_sdk_executor)
+# ---------------------------------------------------------------------------
+
+
+def _find_omp_cli() -> str | None:
+    """Find the ``omp`` CLI on PATH."""
+    return shutil.which("omp")
+
+
+def _omp_supports_auto_approve(executable: str) -> bool:
+    """Return ``True`` when the omp CLI at *executable* lists ``--auto-approve``.
+
+    omp errors hard on unknown flags, so the trust pre-accept must be
+    feature-detected, not assumed. Fails open — returns ``False`` on any
+    probe error so an older omp keeps working without the flag.
+
+    :param executable: Resolved path to the omp CLI.
+    :returns: ``True`` iff ``omp --help`` advertises ``--auto-approve``.
+    """
+    try:
+        proc = subprocess.run(
+            [executable, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Token-boundary match: a bare substring also fires on prose (e.g. the
+    # ``--plan-yolo`` help line mentions "auto-approve the plan" without the
+    # flag existing) or on a longer/negated flag name. A false positive is a
+    # hard spawn error (omp rejects unknown flags), so require the exact
+    # token.
+    help_text = proc.stdout or ""
+    return proc.returncode == 0 and re.search(r"--auto-approve(?![\w-])", help_text) is not None
+
+
+# ---------------------------------------------------------------------------
+# Databricks models.yml generation
+# ---------------------------------------------------------------------------
+
+# Databricks exposes API styles at different URL paths. Live Unity Catalog
+# model services populate each provider; MLflow metadata adds token limits.
+
+# Prefix-matched env var names allowed into the omp subprocess. Only
+# known-safe categories pass: omp's own config knobs, proxy settings,
+# TLS trust overrides, Node.js runtime knobs (omp is a Node CLI), and
+# locale. Credential families (``DATABRICKS_*``, ``AWS_*``, LLM
+# provider API keys, ...) deliberately do NOT match.
+_OMP_ENV_ALLOW_PREFIXES: tuple[str, ...] = (
+    "PI_",
+    "HTTP_",
+    "HTTPS_",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_",
+    "NODE_",
+    "XDG_",
+    "LANG",
+    "LC_",
+)
+
+# Exact-matched env var names allowed into the omp subprocess: the
+# minimal set a POSIX CLI reasonably expects.
+_OMP_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "TERM",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TZ",
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
+    }
+)
+_STREAM_READ_CHUNK_SIZE = 65536
+# How long _OmpRpcSession.close() waits for the omp subprocess to exit on its own
+# after SIGTERM before falling back to SIGKILL. The interrupt-slice budget in
+# _executor_adapter must be >= this value so the slice never fires first and
+# inject a CancelledError that bypasses the SIGKILL path.
+_RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
+
+# Idle budget for one stdout read during a turn. Expiry alone never ends
+# the turn (a long tool call may stay silent past it); only a real stdout
+# EOF does. Module-level so tests can patch it.
+_TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
+
+# Post-error drain budget: after an errored message the only line left to
+# consume is the already-emitted ``agent_end``. Module-level so tests can
+# patch it.
+_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
+
+# CLI flags whose values are sensitive (e.g. the full system prompt) and must
+# not be written to logs verbatim. The value following these flags is replaced
+# with a length-only placeholder.
+_REDACTED_ARGV_FLAGS = frozenset({"--append-system-prompt", "--system-prompt"})
+
+
+def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
+    """
+    Return a copy of ``args`` with sensitive flag values redacted for logging.
+
+    The system prompt value (e.g. passed via ``--append-system-prompt``) is
+    replaced with a ``[system prompt N chars]`` placeholder so it never leaks
+    into debug logs. Two argv forms are handled:
+
+    * the two-token form ``--append-system-prompt <value>`` (what the current
+      spawn code emits), and
+    * the equals-joined form ``--append-system-prompt=<value>`` (not emitted
+      today, but redacted defensively in case a future refactor switches to it).
+
+    All other tokens are preserved so the command remains useful for debugging.
+    """
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append(f"[system prompt {len(arg)} chars]")
+            redact_next = False
+            continue
+        if arg in _REDACTED_ARGV_FLAGS:
+            # Two-token form: redact the following value token.
+            redacted.append(arg)
+            redact_next = True
+            continue
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _REDACTED_ARGV_FLAGS:
+            # Equals-joined form: redact the inline value, keep the flag name.
+            redacted.append(f"{flag}=[system prompt {len(value)} chars]")
+            continue
+        redacted.append(arg)
+    return redacted
+
+
+def _build_models_yml(
+    host: str,
+    token: str,
+    base_urls: dict[str, str] | None = None,
+    model: str | None = None,
+    catalog_models: Sequence[model_catalog.ModelEntry] = (),
+    model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
+    openai_wire_api: str | None = None,
+) -> _OmpModelsConfig:
+    # omp's models.yml mixes str/int/bool/list/dict across provider configs;
+    """Build an omp ``models.yml`` with protocol-specific gateway providers.
+
+    Each provider targets a different API gateway path and wire format so
+    the correct protocol is used for each model family. Live catalog models
+    populate omp's picker; *model* additionally registers the resolved run
+    model so an offline catalog or generic gateway still launches. omp only
+    accepts ``provider/<model>`` selectors whose id is registered there.
+
+    :param host: Databricks workspace URL used for legacy profile-only
+        defaults.
+    :param token: Bearer token to write into omp's provider entries.
+    :param base_urls: Optional provider base URLs keyed by model family,
+        e.g. ``{"claude": "...", "openai": "..."}`` — from ucode state or
+        a generic (OpenRouter/LiteLLM) provider entry.
+    :param model: The resolved model id this run will select, e.g.
+        ``"moonshotai/kimi-k2.6"``; registered (bare ``{"id": ...}``, the
+        same shape ucode writes) under the provider
+        :func:`_omp_provider_for_model` routes it to when absent from the
+        catalog. ``None`` skips registration (omp picks its default).
+    :param catalog_models: Live Databricks model-service entries, optionally
+        enriched with MLflow limits. Empty leaves only *model* registered.
+    :param model_wire_apis: Databricks model ids mapped to catalog-reported
+        wire surfaces. Missing GPT metadata defaults to Responses.
+    :param openai_wire_api: Configured wire for a generic OpenAI-compatible
+        provider. ``None`` defaults generic providers to Chat Completions.
+    :returns: omp ``models.yml`` contents.
+    """
+    h = host.rstrip("/")
+    serving_endpoints_url = f"{h}/serving-endpoints"
+    codex_gateway_url = f"{h}/ai-gateway/codex/v1"
+    mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
+    raw_openai_base_url = (base_urls or {}).get("openai")
+    is_databricks_openai_gateway = bool(
+        raw_openai_base_url
+        and (
+            "/ai-gateway/" in raw_openai_base_url
+            or _is_databricks_ai_gateway_url(raw_openai_base_url)
+        )
+    )
+    # Databricks Codex URLs only accept Responses; Chat uses the workspace.
+    if raw_openai_base_url and is_databricks_openai_gateway:
+        openai_base_url = serving_endpoints_url
+    else:
+        openai_base_url = raw_openai_base_url or serving_endpoints_url
+    # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
+    # /ai-gateway/* paths don't exist — use the generic base URL for all paths.
+    is_generic_provider = bool(raw_openai_base_url and not is_databricks_openai_gateway)
+    generic_openai_wire_api = openai_wire_api or CHAT_WIRE_API if is_generic_provider else None
+    wire_catalog = model_wire_apis or {}
+    if is_databricks_openai_gateway:
+        assert raw_openai_base_url is not None
+        codex_gateway_url = raw_openai_base_url
+    elif is_generic_provider:
+        codex_gateway_url = openai_base_url
+        mlflow_gateway_url = openai_base_url
+    claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
+    _openai_responses_compat: _JsonObject = {
+        "supportsDeveloperRole": False,
+        "supportsStore": False,
+        "supportsStrictMode": False,
+        "supportsReasoningEffort": False,
+    }
+    provider_models: dict[str, list[_JsonObject]] = {
+        "databricks-openai": [],
+        "databricks": [],
+        "databricks-anthropic": [],
+        "databricks-mlflow": [],
+        "databricks-completions": [],
+    }
+    for catalog_model in catalog_models:
+        model_id = catalog_model.id
+        if unsupported_in_pi(model_id.lower()):
+            continue
+        wire_apis = wire_catalog.get(model_id.lower(), catalog_model.metadata.wire_apis)
+        provider_name = _omp_provider_for_model(model_id, wire_apis)
+        registered_model = catalog_model
+        if model is not None and model.lower() in databricks_model_aliases(model_id):
+            registered_model = replace(catalog_model, id=model)
+        # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
+        # not assignable to it (dict value types are invariant), so copy.
+        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        provider_models[provider_name].append(entry)
+    config: _OmpModelsConfig = {
+        "providers": {
+            # Models advertising Responses support use the AI Gateway's Codex
+            # surface, including tool-result chaining on subsequent turns.
+            "databricks-openai": {
+                "baseUrl": codex_gateway_url,
+                "apiKey": token,
+                "api": "openai-responses",
+                "authHeader": True,
+                "compat": _openai_responses_compat,
+                "models": provider_models["databricks-openai"],
+            },
+            # Older GPT models → OpenAI Chat Completions at serving-endpoints.
+            "databricks": {
+                "baseUrl": openai_base_url,
+                "apiKey": token,
+                "api": "openai-completions",
+                # Generic (non-Databricks) OpenAI-compatible gateways expect
+                # ``Authorization: Bearer <token>``; the Databricks workspace
+                # endpoint uses a different auth scheme so authHeader is omitted
+                # on the native path.
+                **({"authHeader": True} if is_generic_provider else {}),
+                "compat": _openai_responses_compat,
+                "models": provider_models["databricks"],
+            },
+            # Claude models → Anthropic Messages API.
+            # ``authHeader`` sends ``Authorization: Bearer <token>`` instead
+            # of the default Anthropic ``x-api-key`` header.
+            "databricks-anthropic": {
+                "baseUrl": claude_base_url,
+                "apiKey": token,
+                "api": "anthropic-messages",
+                "authHeader": True,
+                "models": provider_models["databricks-anthropic"],
+            },
+            # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
+            "databricks-mlflow": {
+                "baseUrl": mlflow_gateway_url,
+                "apiKey": token,
+                "api": "openai-completions",
+                "authHeader": True,
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsStore": False,
+                    "supportsStrictMode": False,
+                    "supportsReasoningEffort": False,
+                    "supportsUsageInStreaming": False,
+                },
+                "models": provider_models["databricks-mlflow"],
+            },
+            # Everything else (Llama, etc.) → same endpoint, same API
+            "databricks-completions": {
+                "baseUrl": openai_base_url,
+                "apiKey": token,
+                "api": "openai-completions",
+                # Same rationale as the "databricks" entry above.
+                **({"authHeader": True} if is_generic_provider else {}),
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsStore": False,
+                    "supportsStrictMode": False,
+                    "supportsReasoningEffort": False,
+                    # Gemini/Qwen/Llama/inkling models reject stream_options
+                    # (which carries include_usage) with 400 "unknown field".
+                    "supportsUsageInStreaming": False,
+                },
+                "models": provider_models["databricks-completions"],
+            },
+        },
+    }
+    if model is not None:
+        # Explicit selections must launch even when picker compatibility
+        # filtering hides the equivalent discovered entry.
+        provider = config["providers"][
+            _omp_provider_for_model(
+                model,
+                wire_catalog.get(model.lower()),
+                generic_openai_wire_api=generic_openai_wire_api,
+            )
+        ]
+        if not any(entry.get("id") == model for entry in provider["models"]):
+            # Declare image input: omp's transformMessages drops every image
+            # block ("model does not support images") unless the model entry
+            # advertises it, so a dynamically-registered vision model would
+            # silently lose its images (#515). We assert capability for ALL
+            # dynamically-routed ids (no per-model vision metadata here): for a
+            # genuinely text-only model this turns a silent image drop into a
+            # provider-side 400 on image turns — a deliberate trade (loud error
+            # over silent loss), since most current gateway models are
+            # multimodal and text-only turns are unaffected.
+            entry: _JsonObject = {"id": model, "input": ["text", "image"]}
+            if pi_model_is_reasoning(model):
+                entry["reasoning"] = True
+            provider["models"] = [*provider["models"], entry]
+    return config
+
+
+# Model-id fragments of completions-gateway models that stream their output on
+# the ``reasoning_content`` channel (DeepSeek-R1, ...). omp's openai-completions
+# parser only consumes that channel when the model entry declares
+# ``reasoning: true``; without it the stream carries no ``content`` and the
+# turn dies with "Stream ended without finish_reason".
+# Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
+# so they no longer need this flag.
+def _omp_needs_responses_api(
+    model: str,
+    wire_apis: frozenset[ModelWireAPI] | None = None,
+) -> bool:
+    """Return whether omp should use the Databricks Responses surface.
+
+    Catalog metadata is authoritative when available. The system-model family
+    fallback remains for endpoints whose documented chat surface omits the
+    finish reason omp requires. Unknown GPT metadata fails toward Responses,
+    which is the forward-compatible tool-capable surface.
+    """
+    lower = model.lower()
+    if lower.startswith("system.ai.") and any(
+        keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
+    ):
+        return True
+    if wire_apis is not None:
+        return ModelWireAPI.OPENAI_RESPONSES in wire_apis
+    return "gpt" in lower
+
+
+def _omp_provider_for_model(
+    model: str,
+    wire_apis: frozenset[ModelWireAPI] | None = None,
+    *,
+    generic_openai_wire_api: str | None = None,
+) -> str:
+    """Return the omp provider name to use for a given Databricks model."""
+    lower = model.lower()
+    if "claude" in lower:
+        return "databricks-anthropic"
+    if generic_openai_wire_api is not None:
+        if generic_openai_wire_api == RESPONSES_WIRE_API:
+            return "databricks-openai"
+        return "databricks-completions"
+    if lower.startswith("system.ai."):
+        return (
+            "databricks-openai"
+            if _omp_needs_responses_api(model, wire_apis)
+            else "databricks-mlflow"
+        )
+    if "gpt" in lower:
+        return "databricks-openai" if _omp_needs_responses_api(model, wire_apis) else "databricks"
+    return "databricks-completions"
+
+
+def _databricks_model_wire_catalog(
+    models: Sequence[model_catalog.ModelEntry],
+) -> dict[str, frozenset[ModelWireAPI]]:
+    """Index UC wire metadata by both system and serving-endpoint aliases."""
+    catalog: dict[str, frozenset[ModelWireAPI]] = {}
+    for model in models:
+        for alias in databricks_model_aliases(model.id):
+            catalog[alias] = model.metadata.wire_apis
+    return catalog
+
+
+async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # type: ignore[explicit-any]
+    """
+    Indirection point for ``asyncio.create_subprocess_exec``.
+
+    Exists so tests can stub subprocess creation without patching
+    ``asyncio.create_subprocess_exec`` globally (patching
+    ``omnigent.inner.omp_executor.asyncio.create_subprocess_exec``
+    walks the dotted path into the real ``asyncio`` module singleton
+    and leaks the mock into every other test in the process).
+
+    :param args: Positional argv components forwarded to
+        ``asyncio.create_subprocess_exec``.
+    :param kwargs: Keyword args (``stdin``, ``stdout``, ``stderr``,
+        ``env``, ``cwd``, ...) forwarded as-is.
+    :returns: The spawned subprocess handle.
+    """
+    return await asyncio.create_subprocess_exec(*args, **kwargs)
+
+
+def _clean_omp_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
+    """
+    Build a filtered copy of ``os.environ`` for the omp subprocess.
+
+    Thin wrapper over :func:`omnigent.inner.agent_env.clean_agent_env`. The
+    previous additive ``{**os.environ, **env}`` merge leaked every host secret
+    — cloud tokens, API keys — into the omp process, sandboxed or not.
+    Credential families are deliberately not allowlisted: gateway runs
+    authenticate through the generated ``models.yml``, and a spec that
+    legitimately needs a variable inside the omp process opts in via
+    ``os_env.sandbox.env_passthrough``.
+
+    :param extra_allowed: Extra exact names to pass through, e.g. the spec's
+        ``os_env.sandbox.env_passthrough`` entries. ``None`` means no extras.
+    :returns: Filtered environment dict, ready to extend with the executor's
+        own variables (``PI_CODING_AGENT_DIR``, ...).
+    """
+    return clean_agent_env(
+        allow_prefixes=_OMP_ENV_ALLOW_PREFIXES,
+        allow_exact=_OMP_ENV_ALLOW_EXACT,
+        extra_allowed=extra_allowed or (),
+    )
+
+
+# ---------------------------------------------------------------------------
+# omp RPC subprocess wrapper
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _OmpRpcSession:
+    """Manages a single omp subprocess in RPC mode."""
+
+    process: asyncio.subprocess.Process | None = None
+    _read_task: Task[None] | None = None
+    _stderr_task: Task[None] | None = None
+    # Non-optional: initialized eagerly so the reader/writer paths don't
+    # need to None-narrow on every access. ``None`` sentinel values are
+    # pushed onto the queue to signal EOF to ``read_line``.
+    _line_queue: Queue[str | None] = field(default_factory=Queue)
+    _stderr_lines: list[str] = field(default_factory=list)
+    _tmp_dir: str | None = None
+
+    async def start(
+        self,
+        omp_path: str,
+        *,
+        env: dict[str, str],
+        cwd: str | None = None,
+        model: str | None = None,
+        system_prompt: str | None = None,
+        thinking: str | None = None,
+        extra_args: list[str] | None = None,
+    ) -> None:
+        """
+        Spawn the omp subprocess in RPC mode and start the I/O readers.
+
+        :param omp_path: Path to spawn — the ``omp`` binary or the
+            sandbox launcher script wrapping it.
+        :param env: The COMPLETE subprocess environment. Deliberately
+            not merged with ``os.environ`` — the caller builds it from
+            the :func:`_clean_omp_env` allowlist so host/server secrets
+            (e.g. ``DATABRICKS_TOKEN``) never leak into the (possibly
+            sandboxed) omp process.
+        :param cwd: Working directory for the subprocess, or ``None``
+            to inherit the parent's.
+        :param model: omp model selector, e.g.
+            ``"databricks-anthropic/gateway-model-id"``.
+            ``None`` lets omp pick its default.
+        :param system_prompt: Text appended to omp's default system
+            prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param thinking: omp thinking level in omp's own vocabulary
+            (``off``/``minimal``/.../``max``), passed as ``--thinking``.
+            ``None`` omits the flag so omp's model default applies.
+        :param extra_args: Extra CLI tokens (``--extension``,
+            ``--tools``, ...). ``None`` appends nothing.
+        """
+        args = [omp_path, "--mode", "rpc", "--no-session"]
+        if model:
+            omp_coding_agent_dir = env.get("PI_CODING_AGENT_DIR")
+            args.extend(
+                [
+                    "--model",
+                    f"databricks/{model}"
+                    if omp_coding_agent_dir is not None and "databricks" in omp_coding_agent_dir
+                    else model,
+                ]
+            )
+        if thinking:
+            args.extend(["--thinking", thinking])
+        if system_prompt:
+            # Use --append-system-prompt instead of --system-prompt so omp
+            # keeps its default prompt (which includes tool descriptions from
+            # promptSnippet and guidelines).  Using --system-prompt would
+            # replace the default prompt entirely, stripping tool awareness.
+            args.extend(["--append-system-prompt", system_prompt])
+        if extra_args:
+            args.extend(extra_args)
+
+        logger.debug("OmpExecutor: spawning %s", " ".join(_redact_argv_for_log(args)))
+        self.process = await _create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+        )
+        self._read_task = asyncio.create_task(self._reader())
+        self._stderr_task = asyncio.create_task(self._stderr_reader())
+
+    async def _reader(self) -> None:
+        """Background task: read lines from omp stdout and enqueue them."""
+        assert self.process is not None and self.process.stdout is not None
+        try:
+            async for raw_line in self._iter_stream_lines(self.process.stdout):
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                if line:
+                    self._line_queue.put_nowait(line)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error
+            logger.debug("OmpExecutor reader error: %s", exc)
+        finally:
+            self._line_queue.put_nowait(None)
+
+    async def _stderr_reader(self) -> None:
+        """Drain stderr in the background."""
+        if self.process is None or self.process.stderr is None:
+            return
+        try:
+            async for raw_line in self._iter_stream_lines(self.process.stderr):
+                text = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                if text:
+                    logger.debug("omp stderr: %s", text)
+                    if len(self._stderr_lines) < 50:
+                        self._stderr_lines.append(text)
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001 — stderr drainer is best-effort; never crashes
+            pass
+
+    @staticmethod
+    async def _iter_stream_chunks(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+        while True:
+            chunk = await stream.read(_STREAM_READ_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+
+    @staticmethod
+    async def _iter_stream_lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+        buffer = bytearray()
+        async for chunk in _OmpRpcSession._iter_stream_chunks(stream):
+            buffer.extend(chunk)
+            while True:
+                newline_index = buffer.find(b"\n")
+                if newline_index < 0:
+                    break
+                line = bytes(buffer[: newline_index + 1])
+                del buffer[: newline_index + 1]
+                yield line
+        if buffer:
+            yield bytes(buffer)
+
+    async def send_command(self, command: OmpEvent) -> None:
+        """Send a JSONL command to omp's stdin."""
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("omp process not running")
+        line = json.dumps(command, separators=(",", ":")) + "\n"
+        self.process.stdin.write(line.encode("utf-8"))
+        await self.process.stdin.drain()
+
+    async def request(
+        self,
+        command: OmpEvent,
+        expected: str,
+        *,
+        timeout: float = 15.0,
+    ) -> OmpEvent | None:
+        """Send *command* and return its ``response`` line's payload.
+
+        Only safe between turns: lines that arrive before the response are
+        re-queued in order, but a caller reading them concurrently would race.
+
+        :param command: The RPC command to send; must carry an ``id``.
+        :param expected: The ``command`` value the response must name.
+        :returns: The response event, or ``None`` on EOF/timeout/failure.
+        """
+        await self.send_command(command)
+        deferred: list[str] = []
+        result: OmpEvent | None = None
+        try:
+            while True:
+                line = await self.read_line(timeout=timeout)
+                if line is None:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "response"
+                    and event.get("command") == expected
+                ):
+                    result = event if event.get("success", True) else None
+                    break
+                deferred.append(line)
+        finally:
+            for line in deferred:
+                self._line_queue.put_nowait(line)
+        return result
+
+    async def read_line(self, timeout: float = _TURN_STDOUT_IDLE_TIMEOUT_S) -> str | None:
+        """Read the next JSONL line from omp's stdout.
+
+        Returns ``None`` on EOF **or** timeout; callers that must tell
+        the two apart check :meth:`stdout_at_eof`.
+        """
+        try:
+            return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    def stdout_at_eof(self) -> bool:
+        """Whether omp's stdout is exhausted (process exited / pipe closed).
+
+        The background reader runs until EOF and pushes the ``None``
+        sentinel from its ``finally``, so a finished (or never-started)
+        reader means no further stdout lines can arrive, while a live
+        reader means a ``read_line`` ``None`` was only an idle timeout.
+        Also requires an empty queue so already-buffered lines are
+        drained before the stream is declared exhausted.
+        """
+        return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
+
+    async def close(self) -> None:
+        for task in (self._read_task, self._stderr_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        self._read_task = None
+        self._stderr_task = None
+        if self.process is not None:
+            with contextlib.suppress(ProcessLookupError):
+                self.process.terminate()
+            try:
+                await asyncio.wait_for(
+                    self.process.wait(), timeout=_RPC_SESSION_CLOSE_REAP_TIMEOUT_S
+                )
+            except (asyncio.TimeoutError, ProcessLookupError, RuntimeError):
+                # RuntimeError can happen when the subprocess was created on a
+                # different event loop (e.g. test fixtures that call close() in
+                # a fresh loop).  Fall back to synchronous kill.
+                with contextlib.suppress(ProcessLookupError):
+                    self.process.kill()
+            close_subprocess_transport(self.process)
+            self.process = None
+        if self._tmp_dir is not None:
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            self._tmp_dir = None
+
+
+# ---------------------------------------------------------------------------
+# OmpExecutor
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _OmpSessionState:
+    rpc: _OmpRpcSession | None = None
+    system_prompt: str | None = None
+    model: str | None = None
+    # Thinking level (omp vocabulary) this process is known to be running at,
+    # so an unchanged effort costs no RPC and a changed one is applied live.
+    applied_thinking: str | None = None
+    _has_sent_prompt: bool = False
+
+
+@dataclass(frozen=True)
+class BlockedCheck:
+    """Result of inspecting an omp tool result for a policy-blocked payload.
+
+    :param blocked: ``True`` when the result is (or wraps) a
+        ``{"blocked": true, "reason": "..."}`` dict.
+    :param reason: The human-readable block reason when ``blocked`` is
+        ``True``; an empty string otherwise.
+    """
+
+    blocked: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class OmpSubprocessConfig:
+    """Materialized environment + CLI args for an omp subprocess.
+
+    :param env: The complete environment for the omp process — the
+        :func:`_clean_omp_env` allowlist base, plus
+        ``PI_CODING_AGENT_DIR`` when Databricks model routing is in use.
+    :param tmp_dir: Temp directory that owns any ``models.yml`` /
+        ``omnigent_tools.mjs`` files generated for this subprocess.  The
+        caller is responsible for cleaning it up on shutdown.
+    :param extra_args: Extra CLI arguments to append to the omp invocation,
+        e.g. ``["--extension", ".../omnigent_tools.mjs"]``.
+    """
+
+    env: dict[str, str]
+    tmp_dir: str
+    extra_args: list[str]
+
+
+def _extract_text(msg: Message) -> str:
+    """
+    Extract text content from a message dict.
+
+    :param msg: A conversation message dict.
+    :returns: Plain text content of the message.
+    """
+    content = msg.get("content")
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return " ".join(parts)
+    return str(content)
+
+
+def _extract_latest_user_content(
+    messages: list[Message],
+) -> str | list[_JsonObject]:
+    """
+    Extract the latest user message content.
+
+    Returns a plain string for text-only messages. When the
+    message carries multimodal content blocks, returns the
+    block list so the caller can pass structured input to omp.
+
+    :param messages: Conversation history.
+    :returns: A string prompt or a list of content block dicts.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            if content is None:
+                return ""
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return cast(list[_JsonObject], content)
+            return str(content)
+    return ""
+
+
+def _split_omp_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str]]]:
+    """Split content blocks into omp's prompt ``message`` text and ``images``.
+
+    omp's RPC ``prompt`` command carries text in ``message`` and images in a
+    native ``images`` field (``ImageContent = {type, data, mimeType}``), which
+    the ``openai-completions`` provider converts to ``image_url`` blocks.
+    JSON-encoding the blocks into ``message`` instead (the previous behavior)
+    makes omp forward the image data URI as literal text, so the model never
+    sees the image (#515).
+
+    :param blocks: Responses-API content block dicts. ``input_text`` →
+        message text; ``input_image`` → omp ``images``; ``input_file`` (a
+        resolved attachment data URI) → its text payload is decoded into the
+        message for text-like MIME types and skipped (with a warning) for
+        binary ones, mirroring the Codex harness — omp has no native file
+        channel, but a text file's content is still useful inline, and the
+        old ``json.dumps(prompt)`` path surfaced it as text, so neither a
+        silent drop nor a hard failure is the right default here. A genuinely
+        unknown block type raises ``ValueError`` (→ ``ExecutorError`` in
+        ``run_turn``) so a new shape fails loudly rather than vanishing.
+    :returns: ``(message, images)`` — joined text and a list of omp
+        ``ImageContent`` dicts.
+    :raises ValueError: On a malformed ``input_image`` or an unhandled
+        block type.
+    """
+    text_parts: list[str] = []
+    images: list[dict[str, str]] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type in ("input_text", "output_text", "text"):
+            text_parts.append(str(block.get("text") or ""))
+        elif block_type == "input_image":
+            image_url = block.get("image_url")
+            if not isinstance(image_url, str) or not image_url.startswith("data:"):
+                raise ValueError(
+                    "input_image 'image_url' must be an inline data URI "
+                    "('data:<mime>;base64,...'); omp forwards images inline and "
+                    "cannot fetch external URLs or resolve file references "
+                    f"(got {str(image_url)[:48]!r})."
+                )
+            parsed = parse_data_uri(image_url)
+            images.append(
+                {"type": "image", "data": parsed.base64_payload, "mimeType": parsed.mime_type}
+            )
+        elif block_type == "input_file":
+            # omp has no file channel, so inline text-like files into the
+            # message (the model can still reason about them) and skip binary
+            # ones. Matches codex_executor's input_file fallback.
+            file_data = block.get("file_data") or ""
+            if isinstance(file_data, str) and file_data.startswith("data:"):
+                parsed = parse_data_uri(file_data)
+                if not parsed.mime_type.startswith("text/"):
+                    logger.warning(
+                        "omp harness: skipping non-text input_file (%s) — omp "
+                        "cannot consume binary attachments inline.",
+                        parsed.mime_type,
+                    )
+                    continue
+                try:
+                    decoded = base64.b64decode(parsed.base64_payload).decode("utf-8", "replace")
+                except ValueError as exc:  # binascii.Error subclasses ValueError
+                    raise ValueError(
+                        f"input_file has an undecodable base64 payload: {exc}"
+                    ) from exc
+                text_parts.append(decoded)
+            elif isinstance(file_data, str) and file_data:
+                # Already-inline text (no data: wrapper).
+                text_parts.append(file_data)
+        else:
+            raise ValueError(
+                f"Unsupported content block type {block_type!r} for the omp "
+                "harness: only 'input_text', 'input_image', and 'input_file' "
+                "blocks can be forwarded. Dropping it silently would lose the "
+                "attachment, so the turn fails loudly instead."
+            )
+    return "\n".join(text_parts), images
+
+
+def _build_omp_prompt(messages: list[Message], *, is_first_turn: bool) -> str | list[_JsonObject]:
+    """
+    Build the prompt to send to omp.
+
+    On the first turn with prior history (e.g. sub-agent with
+    ``pass_history=True``), serializes the full conversation so
+    the omp process has context. Otherwise returns just the
+    latest user message content (may be multimodal).
+
+    :param messages: Omnigent conversation history for the
+        turn.
+    :param is_first_turn: ``True`` when this is the first turn
+        against a freshly-started omp subprocess, so the full
+        history needs to be serialized into the prompt.
+    :returns: A string prompt or a list of content block dicts.
+    """
+    user_messages = [m for m in messages if m.get("role") == "user"]
+
+    if is_first_turn and len(messages) > 1 and len(user_messages) > 1:
+        lines = ["Conversation so far:"]
+        for msg in messages:
+            role = str(msg.get("role") or "user").replace("_", " ")
+            text = _extract_text(msg)
+            lines.append(f"{role}: {text}")
+        lines.append("")
+        lines.append(
+            "Respond to the latest user message, using the conversation above as context."
+        )
+        return "\n".join(lines)
+
+    return _extract_latest_user_content(messages)
+
+
+@dataclass(frozen=True)
+class SandboxedOmpCli:
+    """Result of wrapping the omp CLI in a sandbox.
+
+    :param launch_path: The path the executor should actually spawn.  Either
+        the original ``omp_path`` (sandbox skipped) or a generated wrapper
+        script that applies the sandbox before exec-ing omp.
+    :param sandboxed: ``True`` when the wrapper script is active.
+    """
+
+    launch_path: str
+    sandboxed: bool
+
+
+def _try_sandbox_omp(
+    omp_path: str,
+    os_env: OSEnvSpec | None,
+    cwd: str | None,
+    spawn_env_names: Sequence[str] | None = None,
+) -> SandboxedOmpCli:
+    """Wrap the omp CLI in a sandbox if ``os_env`` requests it.
+
+    :param omp_path: Path to the resolved ``omp`` binary.
+    :param os_env: The agent's ``os_env`` spec.  ``None`` or a ``"none"``
+        sandbox skips wrapping.
+    :param cwd: Working directory the sandbox should consider the root.
+    :param spawn_env_names: Env-var names the executor deliberately
+        passes in the omp subprocess env (the :func:`_clean_omp_env`
+        keys plus per-spawn extras like ``PI_CODING_AGENT_DIR``).
+        Baked into the launcher policy so :func:`run_launcher` prunes
+        anything else its environment picks up — defense in depth
+        against host-env leakage into the sandbox. ``None`` skips the
+        prune.
+    """
+    if os_env is None:
+        return SandboxedOmpCli(launch_path=omp_path, sandboxed=False)
+    sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+    if sandbox_spec.type == "none":
+        return SandboxedOmpCli(launch_path=omp_path, sandboxed=False)
+    try:
+        import pathlib
+
+        from .sandbox import (
+            create_exec_launcher,
+            resolve_sandbox,
+            with_additional_read_roots,
+            with_additional_write_roots,
+            with_spawn_env_allowlist,
+        )
+
+        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+        sandbox = resolve_sandbox(os_env, resolved_cwd)
+        if not sandbox.active:
+            return SandboxedOmpCli(launch_path=omp_path, sandboxed=False)
+        # omp needs to read its own installation + node_modules.
+        omp_dir = pathlib.Path(omp_path).resolve().parent.parent
+        sandbox = with_additional_read_roots(sandbox, [omp_dir])
+        # omp writes to ~/.omp, /tmp, and $TMPDIR (on macOS $TMPDIR is a
+        # per-user dir under /var/folders/, not /tmp — grant both so
+        # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
+        home_omp = pathlib.Path(os.path.expanduser("~/.omp"))
+        sys_tmpdir = pathlib.Path(tempfile.gettempdir())
+        sandbox = with_additional_write_roots(
+            sandbox, [home_omp, pathlib.Path("/tmp"), sys_tmpdir]
+        )
+        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+        launcher = create_exec_launcher(omp_path, sandbox)
+        return SandboxedOmpCli(launch_path=launcher, sandboxed=True)
+    except (OSError, ImportError, NotImplementedError) as exc:
+        logger.warning("Could not apply sandbox for omp: %s", exc)
+        return SandboxedOmpCli(launch_path=omp_path, sandboxed=False)
+
+
+def _resolve_omp_skill_args(
+    skills_filter: str | list[str],
+    _bundle_dir: pathlib.Path | None,
+) -> list[str]:
+    """
+    Translate ``skills_filter`` into omp CLI args.
+
+    omp exposes two skill knobs at the CLI: ``--no-skills`` (suppress
+    auto-discovery + loading) and ``--skills=a,b`` (comma-separated
+    name allowlist over the discovered set, via the
+    ``skills.includeSkills`` session override). Unlike pi there is no
+    ``--skill <path>`` explicit-load flag, so this helper composes
+    the two knobs based on the spec's ``skills_filter``:
+
+    - ``"all"`` → no flags. omp auto-discovery runs; bundle skills
+      surface only when they are on omp's discovery path.
+    - ``"none"`` → ``["--no-skills"]``. Discovery AND loading are
+      suppressed.
+    - ``list[str]`` → ``["--skills=a,b"]`` (allowlist over
+      discovered skills). Names omp never discovers resolve to
+      nothing — matches the SDK convention where a missing skill
+      is no-op, not an error.
+
+    :param skills_filter: ``"all"`` / ``"none"`` / list of skill
+        names from the spec.
+    :param _bundle_dir: The agent bundle's extracted on-disk path.
+        Currently unused — omp has no explicit-load flag that could
+        point at it. Kept for signature parity with the ``pi`` wrap.
+    :returns: A list of CLI tokens to extend ``self._extra_args``
+        with. Empty for ``"all"`` and unknown shapes (omp defaults:
+        auto-discovery on).
+    """
+    if skills_filter == "all":
+        return []
+    if skills_filter == "none":
+        return ["--no-skills"]
+    if isinstance(skills_filter, list):
+        return [f"--skills={','.join(name for name in skills_filter if isinstance(name, str))}"]
+    # Unknown shape — fall back to omp's defaults (auto-discovery on).
+    # The harness wrap's resolver should have validated upstream, so
+    # this branch is belt-and-suspenders.
+    return []
+
+
+def _extract_omp_turn_usage(
+    message: object,
+    fallback_model: str | None,
+) -> _OmpMessageUsage | None:
+    """Map an omp assistant message's ``usage`` object onto the wire shape
+    that :class:`TurnComplete` consumes, so omp sub-agent cost is priced
+    the same way as ``claude-sdk`` and ``codex`` turns.
+
+    omp (``@oh-my-pi/pi-coding-agent``) forwards assistant messages
+    whose ``usage`` dict carries ``input`` / ``output`` / ``cacheRead`` /
+    ``cacheWrite`` / ``totalTokens`` token counts, and the message itself
+    carries the resolved ``model``. This translates those into omnigent's
+    usage schema (see :class:`omnigent.inner.executor.TurnComplete`).
+
+    :param message: An omp message dict (e.g. ``event["message"]`` from a
+        ``message_end`` event, or an entry from ``event["messages"]`` on
+        ``agent_end``). Defensive against non-dict shapes.
+    :param fallback_model: The executor's configured model, used for
+        cost pricing when the assistant message omits ``model``.
+    :returns: The mapped usage dict, or ``None`` when ``message`` is not
+        an assistant message carrying a ``usage`` dict — callers leave
+        ``TurnComplete.usage`` as ``None`` in that case.
+    """
+    if not isinstance(message, dict):
+        return None
+    if message.get("role") != "assistant":
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    raw_model = message.get("model")
+    model = raw_model if isinstance(raw_model, str) and raw_model else fallback_model
+    return {
+        "input_tokens": int(usage.get("input") or 0),
+        "output_tokens": int(usage.get("output") or 0),
+        "total_tokens": int(usage.get("totalTokens") or 0),
+        "cache_read_input_tokens": int(usage.get("cacheRead") or 0),
+        "cache_creation_input_tokens": int(usage.get("cacheWrite") or 0),
+        "model": model,
+    }
+
+
+def _aggregate_omp_turn_usage(
+    message_usages: list[_OmpMessageUsage],
+    fallback_model: str | None,
+) -> _OmpTurnUsage | None:
+    """Aggregate per-message omp usage into one turn-level usage dict.
+
+    A single Omnigent turn drives omp's full agent loop, which may make
+    several LLM calls (one assistant message per iteration of a tool-use
+    loop), each forwarded as its own ``message_end``. Mirrors the
+    openai-agents executor's billing/context split (see
+    ``openai_agents_sdk_executor``): token counts are SUMMED across those
+    calls because each call is billed for the full input it sends, while
+    ``context_tokens`` reflects only the LAST call's total — the proxy for
+    how full the context window is going into the next request (summing
+    inputs would double-count the re-sent history).
+
+    :param message_usages: Per-message usage dicts from
+        :func:`_extract_omp_turn_usage`, in arrival order. Empty when omp
+        reported no usage for the turn.
+    :param fallback_model: The executor's configured model id, used only
+        when no captured message carried a ``model``,
+        e.g. ``"gateway-model-id"``.
+    :returns: A turn-level usage dict for ``TurnComplete.usage`` carrying
+        summed ``input_tokens`` / ``output_tokens`` / ``total_tokens`` /
+        ``cache_read_input_tokens`` / ``cache_creation_input_tokens``, a
+        last-call ``context_tokens``, and the pricing ``model``; or
+        ``None`` when no usable usage was captured.
+    """
+    if not message_usages:
+        return None
+    input_tokens = sum(u["input_tokens"] for u in message_usages)
+    output_tokens = sum(u["output_tokens"] for u in message_usages)
+    total_tokens = sum(u["total_tokens"] for u in message_usages)
+    cache_read = sum(u["cache_read_input_tokens"] for u in message_usages)
+    cache_write = sum(u["cache_creation_input_tokens"] for u in message_usages)
+    # No countable tokens means omp reported empty usage objects — treat as
+    # "no usage" so the server leaves the session unpriced rather than
+    # recording a $0.00 turn.
+    if not (input_tokens or output_tokens):
+        return None
+    last = message_usages[-1]
+    # context_tokens = the LAST call's total context (the proxy for
+    # next-request context fill); recompute from components when the
+    # provider omitted ``totalTokens``.
+    context_tokens = last["total_tokens"] or (
+        last["input_tokens"]
+        + last["output_tokens"]
+        + last["cache_read_input_tokens"]
+        + last["cache_creation_input_tokens"]
+    )
+    # _extract_omp_turn_usage already applied the per-message
+    # message-model-else-fallback precedence, so the last entry's model is
+    # the authoritative one to price the turn with.
+    model = last["model"] if last["model"] else fallback_model
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens or (input_tokens + output_tokens),
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+        "context_tokens": context_tokens,
+        "model": model,
+    }
+
+
+def _omp_thinking_from_config(config: ExecutorConfig | None) -> str | None:
+    """Resolve the per-turn ``--thinking``/RPC level from a turn's config.
+
+    Canonical omnigent efforts (:data:`PI_EFFORTS`) are translated to omp's
+    vocabulary; a clear value (``default``/``off``/``reset``) resolves to
+    ``None``, which leaves a live session at its current level and omits
+    ``--thinking`` on the next spawn so omp's model default applies.
+
+    :param config: The turn's executor config, or ``None``.
+    :returns: An omp thinking level, or ``None`` when no effort is requested.
+    :raises ValueError: If the requested effort is not one omp supports.
+    """
+    cfg = config or ExecutorConfig()
+    raw = cfg.extra.get("reasoning_effort")
+    if isinstance(raw, str) and raw in EFFORT_CLEAR_VALUES:
+        return None
+    effort = validate_effort(raw, "omp", PI_EFFORTS)
+    return to_pi_thinking_level(effort) if effort is not None else None
+
+
+class OmpExecutor(Executor):
+    """Execute agent turns via the omp coding agent (``omp --mode rpc``)."""
+
+    def __init__(
+        self,
+        *,
+        cwd: str | None = None,
+        os_env: OSEnvSpec | None = None,
+        model: str | None = None,
+        omp_path: str | None = None,
+        gateway: bool = False,
+        databricks_profile: str | None = None,
+        gateway_host: str | None = None,
+        base_url_override: str | None = None,
+        base_urls_override: dict[str, str] | None = None,
+        openai_wire_api: str | None = None,
+        gateway_auth_command: str | None = None,
+        retry_policy: RetryPolicy | None = None,
+        bundle_dir: pathlib.Path | None = None,
+        agent_name: str | None = None,
+        skills_filter: str | list[str] = "all",
+    ) -> None:
+        """Create a OmpExecutor.
+
+        :param cwd: Working directory for the omp subprocess.
+        :param os_env: Optional OS environment / sandbox spec.  When set, the
+            omp subprocess is wrapped in the same sandbox other
+            harnesses use.
+        :param model: Override the model name, e.g. ``"gateway-model-id"``.
+        :param omp_path: Absolute path to an ``omp`` CLI binary.  When ``None``
+            the executor searches ``PATH``.
+        :param gateway: When ``True``, write a ``models.yml`` pointing omp
+            at a vendor-neutral gateway. The Databricks AI gateway is one
+            producer of this transport; generic providers are another.
+        :param databricks_profile: Databricks-specific config profile from
+            ``~/.databrickscfg``, e.g. ``"<your-profile>"``.  Only used on the
+            Databricks producer path. ``None`` falls back to
+            ``DATABRICKS_CONFIG_PROFILE`` then the first valid profile.
+        :param gateway_host: Gateway workspace host origin, e.g.
+            ``"https://example.databricks.com"``.  Set from
+            ``HARNESS_OMP_GATEWAY_HOST`` (written by the Omnigent workflow layer).
+            When set, skips profile host lookup.
+        :param base_url_override: Override the workspace host used when
+            building omp's ``models.yml``.  Expected to be the Anthropic
+            gateway URL from ucode state.json (``base_urls.claude``), e.g.
+            ``"https://example.databricks.com/ai-gateway/anthropic"``.
+            The host portion is extracted and used as the base for all
+            omp provider URLs.  ``None`` falls back to deriving the host from
+            the Databricks profile credentials.
+        :param base_urls_override: ucode-provided omp gateway URLs keyed by
+            model family, e.g. ``{"claude": "...", "openai": "..."}``.
+        :param openai_wire_api: Configured generic-provider OpenAI wire,
+            ``"responses"`` or ``"chat"``. Databricks ignores this and uses
+            live Unity Catalog metadata.
+        :param gateway_auth_command: Shell command that prints a bearer token,
+            e.g.
+            ``"databricks auth token --host https://example.databricks.com ..."``
+            or ``"printf %s sk-..."``. Set from
+            ``HARNESS_OMP_GATEWAY_AUTH_COMMAND``.
+        :param retry_policy: The spec's ``llm.retry`` budget. Threads
+            ``policy.pi.settings()`` into omp's ``.omp/settings.json``
+            before subprocess spawn — omp natively does exponential
+            backoff and Retry-After honoring; this just sets the
+            budget. ``None`` resolves to ``RetryPolicy()`` defaults.
+            See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
+        :param bundle_dir: The agent bundle's extracted on-disk path.
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files
+            are currently unused by omp (it discovers skills itself).
+            ``None`` disables nothing.
+        :param agent_name: Optional agent display name. Reserved for
+            future use; currently unused by omp.
+        :param skills_filter: Host-skill filter (``"all"`` / ``"none"``
+            / ``list[str]``). ``"all"`` (default) passes no skill flags
+            so omp's auto-discovery runs; ``"none"`` adds ``--no-skills``;
+            a list adds ``--skills=a,b`` (allowlist over discovered
+            skills).
+        """
+        resolved_omp = omp_path or _find_omp_cli()
+        if not resolved_omp:
+            raise ImportError(
+                "OmpExecutor requires the 'omp' CLI on PATH. "
+                "Install it with: npm install -g @oh-my-pi/pi-coding-agent"
+            )
+        self._omp_path = resolved_omp
+        self._cwd = cwd
+        self._os_env_spec = os_env
+        self._model_override = model
+        self._gateway = gateway
+        self._databricks_profile = databricks_profile
+        self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
+        self._base_url_override = base_url_override
+        self._base_urls_override = base_urls_override
+        if openai_wire_api not in (None, RESPONSES_WIRE_API, CHAT_WIRE_API):
+            raise ValueError(f"unsupported omp OpenAI wire API: {openai_wire_api!r}")
+        self._openai_wire_api = openai_wire_api
+        self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
+        self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
+        self._gateway_auth_command = gateway_auth_command
+        # Retry policy → omp's .omp/settings.json before subprocess spawn.
+        # See ``RetryPolicy.pi.settings()`` for the schema (omp kept pi's
+        # settings shape). omp natively does exponential backoff +
+        # Retry-After honoring; we just set the budget.
+        self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        # Allowlisted base env for the omp subprocess — never the full
+        # host environ. The spec's os_env.sandbox.env_passthrough is the
+        # opt-in for anything beyond the base set (e.g. a provider API
+        # key on a direct, non-gateway run).
+        self._env: dict[str, str] = _clean_omp_env(
+            os_env.sandbox.env_passthrough if os_env is not None and os_env.sandbox else None
+        )
+        # ``--no-tools`` disables built-ins AND extension tools by
+        # default; we re-enable just the bridged tool names per turn via
+        # ``--tools <comma-list>`` in :meth:`_build_env_and_dir`. The
+        # combined effect is: omp's native read/bash/edit/write stay off
+        # (they don't route through Omnigent policies / history and can
+        # 400 against the Databricks Responses API), and the bridge
+        # extension's tools are explicitly allowlisted.
+        self._extra_args: list[str] = ["--no-tools"]
+        if _omp_supports_auto_approve(self._omp_path):
+            # Pre-accept the project-folder trust dialog. omp shows a
+            # blocking TUI prompt on first launch in a directory with
+            # .omp/ resources. In a runner-driven session there is nobody
+            # at the terminal to answer it, so we approve when the flag
+            # is supported.
+            self._extra_args.append("--auto-approve")
+        self._bundle_dir = bundle_dir
+        self._agent_name = agent_name
+        self._skills_filter = skills_filter
+        # Resolve once at construction (the bundle layout doesn't
+        # change across turns within a session). Each turn's
+        # ``_build_env_and_dir`` copies ``self._extra_args`` so this
+        # extension is read-only after init.
+        self._extra_args.extend(_resolve_omp_skill_args(skills_filter, bundle_dir))
+        # Set by Session._wire_sdk_executor().
+        self._tool_executor: ToolExecutor | None = None
+
+        if gateway:
+            creds = None
+            if self._gateway_host_override is None:
+                creds = _read_databrickscfg(databricks_profile)
+                if creds is None:
+                    raise OSError(
+                        "OmpExecutor(gateway=True) requires gateway credentials via "
+                        "the gateway base URL / auth command or a valid "
+                        "~/.databrickscfg profile."
+                    )
+            if self._gateway_host_override is not None:
+                self._databricks_host = self._gateway_host_override
+                if gateway_auth_command is None:
+                    raise OSError(
+                        "OmpExecutor(gateway=True) with a gateway workspace host "
+                        "requires a gateway auth command."
+                    )
+                token = _fetch_shell_command_token(gateway_auth_command)
+                if token is None:
+                    raise OSError(
+                        "OmpExecutor(gateway=True) could not fetch a gateway token "
+                        "for the workspace host."
+                    )
+                self._databricks_token = token
+            elif base_url_override:
+                # Derive the workspace host from the Anthropic gateway URL
+                # ucode wrote to state.json.
+                _parsed = _urlparse(base_url_override)
+                self._databricks_host = f"{_parsed.scheme}://{_parsed.netloc}"
+                assert creds is not None
+                self._databricks_token = creds.token
+            else:
+                assert creds is not None
+                self._databricks_host = creds.host
+                self._databricks_token = creds.token
+
+        # True when the gateway transport was derived from a ~/.databrickscfg
+        # profile (no gateway host or base URL supplied directly). Gates the
+        # Databricks default model in :meth:`_resolve_model`; on the ucode /
+        # generic-provider paths the producer resolves a concrete model.
+        self._gateway_uses_databricks_profile = bool(
+            gateway and self._gateway_host_override is None and base_url_override is None
+        )
+        self._gateway_workspace_url = (
+            self._gateway_model_service_workspace_url() if gateway else None
+        )
+
+        # Apply sandbox.
+        # ``PI_CODING_AGENT_DIR`` is added per-spawn by
+        # ``_build_env_and_dir`` on the gateway path, so it must be in
+        # the launcher's prune allowlist even though it's not in
+        # ``self._env`` yet.
+        sandboxed = _try_sandbox_omp(
+            self._omp_path,
+            os_env,
+            cwd,
+            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
+        )
+        self._omp_launch_path = sandboxed.launch_path
+        self._sandboxed = sandboxed.sandboxed
+
+        self._session_states: dict[str, _OmpSessionState] = {}
+        self._tool_server: _ToolServer | None = None
+
+    def supports_streaming(self) -> bool:
+        return True
+
+    def supports_tool_calling(self) -> bool:
+        return True
+
+    def handles_tools_internally(self) -> bool:
+        return True
+
+    def supports_live_message_queue(self) -> bool:
+        return True
+
+    async def enqueue_session_message(  # type: ignore[explicit-any]
+        self,
+        session_key: str,
+        content: str | dict[str, Any],
+    ) -> bool:
+        """Send a steering message to omp mid-turn.
+
+        omp's RPC ``steer`` command injects a user message between tool calls
+        within the current agent turn, so the model sees it before its next
+        response.
+        """
+        state = self._session_states.get(session_key)
+        if state is None or state.rpc is None:
+            return False
+        text = content if isinstance(content, str) else str(content)
+        try:
+            await state.rpc.send_command(
+                {
+                    "type": "steer",
+                    "message": text,
+                }
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — steer is best-effort; any failure surfaces as False
+            logger.debug("OmpExecutor: failed to enqueue steer message: %s", exc)
+            return False
+
+    async def close_session(self, session_key: str) -> None:
+        state = self._session_states.pop(session_key, None)
+        if state is not None and state.rpc is not None:
+            await state.rpc.close()
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        state = self._session_states.get(session_key)
+        if state is None or state.rpc is None:
+            return False
+        # Best-effort abort to halt the in-flight turn.
+        try:
+            await state.rpc.send_command({"type": "abort", "id": "abort"})
+        except Exception as exc:  # noqa: BLE001 — abort is best-effort
+            logger.debug("OmpExecutor: interrupt abort failed: %s", exc)
+        # Always drop the session so the next turn starts fresh and replays
+        # full history. A resumed subprocess sends only the latest user
+        # message, which would bypass the runner's "[System: interrupted]"
+        # marker and silently continue the abandoned request. See
+        # claude_sdk_executor.interrupt_session for the rationale.
+        try:
+            await self.close_session(session_key)
+            return True
+        except Exception as exc:  # noqa: BLE001 — close failures surface as False
+            logger.debug("OmpExecutor: session close after interrupt failed: %s", exc)
+            return False
+
+    async def close(self) -> None:
+        keys = list(self._session_states.keys())
+        for key in keys:
+            await self.close_session(key)
+        if self._tool_server is not None:
+            await self._tool_server.stop()
+            self._tool_server = None
+
+    def _session_key(self, messages: list[Message]) -> str:
+        if messages:
+            last = messages[-1]
+            if last.get("session_id"):
+                return str(last["session_id"])
+            meta = last.get("metadata", {})
+            if meta.get("session_id"):
+                return str(meta["session_id"])
+        return "__default__"
+
+    async def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
+        """
+        Determine the model name to pass to omp.
+
+        ``cfg.model`` (per-request /model override) wins over the spec
+        default (``HARNESS_OMP_MODEL`` → ``self._model_override``). On the
+        Databricks-profile gateway path a missing model resolves from the
+        Databricks Claude catalog — omp's own default may be a direct-provider
+        id the gateway rejects. Elsewhere ``None`` lets omp pick its own default.
+
+        :param config: Optional :class:`ExecutorConfig` whose ``model``
+            takes precedence when set.
+        :returns: The resolved model string, or ``None`` when both
+            sources are unset off the Databricks-profile gateway path.
+        """
+        cfg = config or ExecutorConfig()
+        model = cfg.model or self._model_override
+        if model is None and self._gateway_uses_databricks_profile:
+            # DATABRICKS-PATCH(omp-live-model-discovery): resolve from the
+            # workspace, not the bundled catalog whose legacy `databricks-` ids
+            # the gateway answers with `501 … Use Unity Catalog model services`.
+            from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+            model_id = await run_sync_on_thread(
+                _resolve_databricks_claude_model, self._databricks_profile
+            )
+            if not isinstance(model_id, str):
+                raise TypeError("Databricks model resolution returned a non-string model id")
+            return model_id
+        # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
+        # by the direct Anthropic API but not by the Databricks AI Gateway.
+        if model and self._gateway:
+            model = re.sub(r"\[.*?\]$", "", model)
+        return model
+
+    def _generic_openai_wire_api(self) -> str | None:
+        """Return the configured wire only for a non-Databricks gateway."""
+        openai_base_url = (self._base_urls_override or {}).get("openai")
+        if openai_base_url:
+            is_databricks_gateway = (
+                "/ai-gateway/" in openai_base_url or _is_databricks_ai_gateway_url(openai_base_url)
+            )
+            if not is_databricks_gateway:
+                return self._openai_wire_api or CHAT_WIRE_API
+        return None
+
+    def _gateway_model_service_workspace_url(self) -> str | None:
+        """Return the workspace API origin for Databricks catalog discovery."""
+        if self._gateway_uses_databricks_profile:
+            return self._databricks_host
+        candidates = [
+            *(self._base_urls_override or {}).values(),
+            self._base_url_override,
+            self._gateway_host_override,
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            workspace_url = _databricks_workspace_url_for_gateway(
+                candidate,
+                profile=self._databricks_profile,
+            )
+            if workspace_url is not None:
+                return workspace_url
+        return None
+
+    async def _load_gateway_model_wire_apis(self) -> dict[str, frozenset[ModelWireAPI]]:
+        """Fetch and cache the live Databricks model catalog."""
+        if self._gateway_model_wire_apis is not None:
+            return self._gateway_model_wire_apis
+        workspace_url = self._gateway_workspace_url if self._gateway else None
+        if workspace_url is None:
+            self._gateway_model_entries = ()
+            self._gateway_model_wire_apis = {}
+            return self._gateway_model_wire_apis
+        try:
+            models = await run_sync_on_thread(
+                model_catalog.fetch_databricks_model_service_entries,
+                workspace_url,
+                self._databricks_token,
+            )
+        except Exception:  # noqa: BLE001 — metadata is best-effort; fall back to the yml catalog
+            logger.warning(
+                "omp could not fetch Databricks model metadata; "
+                "the picker will show only the selected model",
+                exc_info=True,
+            )
+            self._gateway_model_entries = ()
+            self._gateway_model_wire_apis = {}
+            return self._gateway_model_wire_apis
+        try:
+            metadata_models = await run_sync_on_thread(
+                model_catalog.catalog_model_entries,
+                "databricks",
+            )
+        except Exception:  # noqa: BLE001 — enrichment is best-effort; the live list survives without it
+            logger.info(
+                "omp could not enrich the live Databricks model list with MLflow metadata",
+                exc_info=True,
+            )
+        else:
+            models = enrich_databricks_model_catalog(models, metadata_models)
+        self._gateway_model_entries = tuple(models)
+        self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
+        return self._gateway_model_wire_apis
+
+    async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
+        """Start the TCP tool server if there are Omnigent tools to bridge."""
+        if not tools:
+            return None
+        if self._tool_server is None:
+            self._tool_server = _ToolServer()
+            await self._tool_server.start()
+        self._tool_server._tool_executor = self._tool_executor
+        self._tool_server._policy_gate = self._gate_native_tool
+        return self._tool_server.port
+
+    async def _gate_native_tool(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Evaluate a native omp tool call against Omnigent TOOL_CALL policy.
+
+        Bridges the tool server's :attr:`_ToolServer._policy_gate` to the
+        ``_policy_evaluator`` the harness scaffold installs on this executor
+        (the same round-trip the Claude SDK executor uses for LLM_REQUEST /
+        LLM_RESPONSE policies). Mirrors the claude-native / codex-native
+        PreToolUse hooks: the verdict is computed by the Omnigent server
+        against the session's full policy set (inherited parent session
+        policies + the agent spec's guardrails).
+
+        :param name: Native tool name, e.g. ``"read"`` or ``"bash"``.
+        :param args: The tool's argument dict.
+        :returns: ``{"block": bool, "reason": str}`` — block on DENY.
+            Allow when no evaluator is wired (single-process / test paths).
+            TOOL_CALL ASK is collapsed to ALLOW/DENY server-side before the
+            verdict returns, so only DENY blocks here.
+        """
+        # ``_policy_evaluator`` is installed best-effort by the harness
+        # scaffold's executor adapter; absent on single-process / pre-turn
+        # paths. Same fetch pattern as the Claude SDK executor.
+        evaluator = getattr(self, "_policy_evaluator", None)
+        if evaluator is None:
+            return {"block": False, "reason": ""}
+        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
+        if verdict.action == "POLICY_ACTION_DENY":
+            return {"block": True, "reason": verdict.reason or "blocked by policy"}
+        return {"block": False, "reason": ""}
+
+    def _build_env_and_dir(
+        self,
+        tools: list[ToolSpec],
+        tool_server_port: int | None,
+        tool_server_token: str | None,
+        model: str | None,
+    ) -> OmpSubprocessConfig:
+        """Build env dict, temp dir, and extra CLI args for an omp subprocess.
+
+        :param tools: Omnigent tool schemas to bridge into omp.
+        :param tool_server_port: TCP port the Omnigent tool server is
+            listening on, or ``None`` if no tools need bridging.
+        :param tool_server_token: The tool server's bearer token
+            (:attr:`_ToolServer.token`), embedded in the generated
+            extension so requests authenticate. Non-``None`` whenever
+            *tool_server_port* is.
+        :param model: The resolved model id this subprocess will run, e.g.
+            ``"moonshotai/kimi-k2.6"``; registered in the generated
+            ``models.yml`` on the gateway path so the
+            ``provider/<model>`` selector resolves. ``None`` when no model
+            is pinned (omp picks its own default).
+        """
+        env = dict(self._env)
+        tmp_dir = tempfile.mkdtemp(prefix="omnigent_omp_")
+        extra_args: list[str] = list(self._extra_args)
+
+        if self._gateway:
+            effective_model = model
+            models_yml = _build_models_yml(
+                self._gateway_workspace_url or self._databricks_host,
+                self._databricks_token,
+                self._base_urls_override,
+                model=effective_model,
+                catalog_models=self._gateway_model_entries or (),
+                model_wire_apis=self._gateway_model_wire_apis,
+                openai_wire_api=self._openai_wire_api,
+            )
+            models_path = os.path.join(tmp_dir, "models.yml")
+            with open(models_path, "w") as f:
+                yaml.safe_dump(models_yml, f, sort_keys=True)
+            env["PI_CODING_AGENT_DIR"] = tmp_dir
+            # Gateway mode relocates omp's agent root — copy the user's global
+            # settings (extensions, packages, …) and symlink install trees so
+            # ``omp install`` packages still resolve. See #1423.
+            from omnigent.inner.pi_settings import prepare_managed_omp_agent_dir
+
+            prepare_managed_omp_agent_dir(
+                pathlib.Path(tmp_dir),
+                overlay=self._retry_policy.pi.settings(),
+            )
+
+        # omp natively supports retry config via ``.omp/settings.json``
+        # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
+        # path, merge the retry block into ``<cwd>/.omp/settings.json``.
+        # Gateway runs apply retry via :func:`prepare_managed_omp_agent_dir`
+        # into the managed agent dir instead.
+        if not self._gateway:
+            retry_settings = self._retry_policy.pi.settings()
+            settings_dir_root = self._cwd or tmp_dir
+            settings_path = os.path.join(settings_dir_root, ".omp", "settings.json")
+            try:
+                if os.path.exists(settings_path):
+                    with open(settings_path) as f:
+                        existing_settings = json.load(f)
+                    if not isinstance(existing_settings, dict):
+                        existing_settings = {}
+                else:
+                    existing_settings = {}
+                existing_settings.update(retry_settings)
+                os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+                with open(settings_path, "w") as f:
+                    json.dump(existing_settings, f, indent=2)
+            except OSError:
+                fallback_path = os.path.join(tmp_dir, ".omp", "settings.json")
+                os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+                with open(fallback_path, "w") as f:
+                    json.dump(retry_settings, f, indent=2)
+
+        # Generate the Omnigent tool bridge extension if tools are available.
+        if tools and tool_server_port is not None:
+            if tool_server_token is None:
+                # A port without a token would spawn the bridge
+                # unauthenticated; fail loud instead.
+                raise ValueError("tool_server_token is required when tool_server_port is set")
+            ext_path = os.path.join(tmp_dir, "omnigent_tools.mjs")
+            with open(ext_path, "w") as f:
+                f.write(_generate_extension_js(tool_server_port, tools, tool_server_token))
+            extra_args.extend(["--extension", ext_path])
+            # Allowlist the bridged tool names. ``--no-tools`` (set in
+            # __init__) disables every tool by default in pi 0.68+;
+            # ``--tools`` adds specific names back. Without this pass
+            # the bridge extension's tools register but pi never
+            # exposes them to the LLM — symptom: model replies "I
+            # don't have a calculate tool available."
+            tool_names = [
+                name for name in (s.get("name") for s in tools) if isinstance(name, str) and name
+            ]
+            # omp's system prompt (system-prompt.ts) gates skill-index
+            # injection on ``selectedTools`` including ``"read"``. omp's
+            # native ``read`` is a local filesystem read that runs
+            # in-process and never traverses the bridged /mcp path — so
+            # enabling it lets the model see (and load) skills from omp's
+            # own discovery. As a native tool it would
+            # otherwise escape all guardrails, so the generated extension's
+            # ``tool_call`` hook routes it (and any other native tool) through
+            # an Omnigent TOOL_CALL policy verdict; see
+            # :func:`_generate_extension_js` and
+            # :meth:`OmpExecutor._gate_native_tool`.
+            if self._skills_filter != "none":
+                tool_names.append("read")
+            if tool_names:
+                extra_args.extend(["--tools", ",".join(tool_names)])
+
+        return OmpSubprocessConfig(env=env, tmp_dir=tmp_dir, extra_args=extra_args)
+
+    async def _available_thinking_levels(self, rpc: _OmpRpcSession) -> list[str] | None:
+        """Ask omp which thinking levels the current model offers.
+
+        omp has no ``get_available_thinking_levels`` command (it answers
+        ``Unknown command``), so the probe fast-fails to ``None`` and the
+        caller applies the requested level unclamped via
+        ``set_thinking_level``. If omp ever gains the command, this starts
+        clamping with no further change.
+
+        :returns: The reported levels, or ``None`` when omp did not answer —
+            the caller then skips clamping.
+        """
+        try:
+            response = await rpc.request(
+                {"type": "get_available_thinking_levels", "id": "thinking_levels"},
+                "get_available_thinking_levels",
+            )
+        except Exception:  # noqa: BLE001 — probe is best-effort; a failed probe just skips clamping
+            logger.debug("OmpExecutor: get_available_thinking_levels failed", exc_info=True)
+            return None
+        data = response.get("data") if response else None
+        levels = data.get("levels") if isinstance(data, dict) else None
+        if not isinstance(levels, list):
+            return None
+        return [level for level in levels if isinstance(level, str)]
+
+    async def _apply_thinking_level(
+        self,
+        state: _OmpSessionState,
+        rpc: _OmpRpcSession,
+        thinking: str | None,
+        *,
+        spawned: bool,
+    ) -> None:
+        """Make the live omp session run at *thinking*, clamping if unsupported.
+
+        A fresh spawn already carries the level on its argv, so it only needs
+        an RPC when the model doesn't offer that rung; a live session gets
+        ``set_thinking_level`` whenever the requested level changed.
+
+        :param state: Session state whose ``applied_thinking`` is updated.
+        :param rpc: The live omp RPC session.
+        :param thinking: Requested level in omp vocabulary, or ``None`` to leave
+            the session alone (clear-to-default is a no-op mid-session).
+        :param spawned: ``True`` when *rpc* was just spawned with ``--thinking``.
+        """
+        if thinking is None:
+            return
+        if not spawned and thinking == state.applied_thinking:
+            return
+        supported = await self._available_thinking_levels(rpc)
+        level = nearest_pi_thinking_level(thinking, supported) if supported else None
+        if level is None:
+            level = thinking
+        if level != thinking:
+            logger.warning(
+                "OmpExecutor: model %s does not support thinking level %r; using %r",
+                state.model,
+                thinking,
+                level,
+            )
+        elif spawned:
+            return
+        await rpc.send_command(
+            {"type": "set_thinking_level", "level": level, "id": f"thinking_{level}"}
+        )
+        state.applied_thinking = thinking
+
+    async def _ensure_rpc(
+        self,
+        session_key: str,
+        system_prompt: str,
+        model: str | None,
+        tools: list[ToolSpec],
+        thinking: str | None = None,
+    ) -> _OmpRpcSession:
+        """Get or create an omp RPC subprocess for the given session.
+
+        :param thinking: omp thinking level for a fresh spawn (``--thinking``).
+            A change on a live process is applied over RPC instead — see
+            :meth:`_apply_thinking_level` — so it is not part of the reuse
+            signature. A model change respawns, which re-asserts the level.
+        """
+        state = self._session_states.setdefault(session_key, _OmpSessionState())
+
+        effective_model = model
+
+        if (
+            state.rpc is not None
+            and state.rpc.process is not None
+            and state.rpc.process.returncode is None
+            and state.system_prompt == system_prompt
+            and state.model == effective_model
+        ):
+            return state.rpc
+
+        wire_catalog = await self._load_gateway_model_wire_apis()
+
+        if state.rpc is not None:
+            await state.rpc.close()
+
+        tool_server_port = await self._ensure_tool_server(tools)
+        tool_server_token = self._tool_server.token if self._tool_server is not None else None
+        subprocess_config = self._build_env_and_dir(
+            tools, tool_server_port, tool_server_token, effective_model
+        )
+        env = subprocess_config.env
+        tmp_dir = subprocess_config.tmp_dir
+        extra_args = subprocess_config.extra_args
+        # For Databricks models, prefix with the provider name so omp resolves
+        # the model from our custom provider in models.yml.
+        omp_model: str | None
+        if self._gateway and effective_model:
+            provider = _omp_provider_for_model(
+                effective_model,
+                wire_catalog.get(effective_model.lower()),
+                generic_openai_wire_api=self._generic_openai_wire_api(),
+            )
+            head, sep, _ = effective_model.partition("/")
+            # An already-qualified selector for the provider this model routes
+            # to passes through untouched — re-prefixing would stack to
+            # ``provider/provider/model``, which omp cannot resolve.
+            omp_model = (
+                effective_model if sep and head == provider else f"{provider}/{effective_model}"
+            )
+        else:
+            omp_model = effective_model
+        rpc = _OmpRpcSession()
+        rpc._tmp_dir = tmp_dir
+
+        await rpc.start(
+            self._omp_launch_path,
+            env=env,
+            cwd=self._cwd,
+            model=omp_model or None,
+            system_prompt=system_prompt or None,
+            thinking=thinking,
+            extra_args=extra_args or None,
+        )
+        state.rpc = rpc
+        state.system_prompt = system_prompt
+        state.model = effective_model
+        state.applied_thinking = thinking
+        state._has_sent_prompt = False
+        return rpc
+
+    async def run_turn(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[ExecutorEvent]:
+        if self._gateway:
+            if self._gateway_host_override is None:
+                creds = _read_databrickscfg(self._databricks_profile)
+                if creds is not None:
+                    self._databricks_token = creds.token
+            else:
+                assert self._gateway_auth_command is not None
+                token = _fetch_shell_command_token(self._gateway_auth_command)
+                if token:
+                    self._databricks_token = token
+        session_key = self._session_key(messages)
+        model = await self._resolve_model(config)
+        try:
+            thinking = _omp_thinking_from_config(config)
+        except ValueError as exc:
+            yield ExecutorError(message=str(exc), retryable=False)
+            return
+
+        prior_rpc = (self._session_states.get(session_key) or _OmpSessionState()).rpc
+        try:
+            rpc = await self._ensure_rpc(session_key, system_prompt, model, tools, thinking)
+        except Exception as exc:  # noqa: BLE001 — executor boundary surfaces startup errors as ExecutorError
+            yield ExecutorError(message=f"Failed to start omp: {exc}")
+            return
+
+        turn_state = self._session_states.get(session_key)
+        if turn_state is not None:
+            try:
+                await self._apply_thinking_level(
+                    turn_state, rpc, thinking, spawned=rpc is not prior_rpc
+                )
+            except Exception as exc:  # noqa: BLE001 — executor boundary: an effort failure must not sink the turn
+                logger.warning("OmpExecutor: could not apply thinking level: %s", exc)
+
+        # Build the prompt to send to omp.  On the first turn of a new omp
+        # process, if there are prior messages (e.g. parent history passed
+        # to a sub-agent), we serialize the full conversation so omp has
+        # context.  On subsequent turns the omp process already has context,
+        # so we only send the latest user message.
+        state = self._session_states.get(session_key)
+        is_first_turn = state is not None and not state._has_sent_prompt
+
+        prompt = _build_omp_prompt(messages, is_first_turn=is_first_turn)
+
+        if not prompt:
+            # No prompt built (e.g. empty message list on a resumed session) —
+            # end the turn with no assistant text rather than fabricating one.
+            yield TurnComplete(response=None)
+            return
+
+        if state is not None:
+            state._has_sent_prompt = True
+
+        # Send prompt command. omp's JSONL protocol carries text in ``message``
+        # and images in a native ``images`` field. Split multimodal blocks into
+        # both (rather than JSON-encoding them into the text) so the model
+        # actually receives attached images instead of a base64 text blob (#515).
+        message: str
+        images: list[dict[str, str]] = []
+        if isinstance(prompt, list):
+            try:
+                message, images = _split_omp_prompt(prompt)
+            except Exception as exc:  # noqa: BLE001 — prompt-prep boundary: any failure (malformed/unsupported block, bad data URI) surfaces as ExecutorError, never an uncaught crash, matching the send_command path below
+                yield ExecutorError(message=f"Failed to prepare prompt for omp: {exc}")
+                return
+        else:
+            message = prompt
+        cmd_id = f"turn_{id(messages)}"
+        # streamingBehavior='followUp' lets omp queue the prompt when its isStreaming
+        # flag is still set after a race with a not-yet-confirmed-dead subprocess,
+        # rather than surfacing the raw 'Agent is already processing' protocol error.
+        command: OmpEvent = {
+            "type": "prompt",
+            "message": message,
+            "id": cmd_id,
+            "streamingBehavior": "followUp",
+        }
+        if images:
+            command["images"] = images
+        try:
+            await rpc.send_command(command)
+        except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
+            yield ExecutorError(message=f"Failed to send prompt to omp: {exc}")
+            return
+
+        # Read events until agent_end.
+        response_text = ""
+        streamed_any = False
+        # Per-LLM-call token usage captured from each assistant message omp
+        # forwards (``message_end`` is the capture site; ``agent_end`` is a
+        # fallback). Summed into a turn-level usage dict at completion so a
+        # multi-step (tool-loop) turn bills for every call, not just the
+        # last. Empty when omp reports no usage — cost tracking is skipped.
+        message_usages: list[_OmpMessageUsage] = []
+        # Error reported by a ``message_end`` (stopReason=error); surfaced at
+        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        pending_error: str | None = None
+
+        while True:
+            # After an errored message the only thing left to drain is the
+            # already-emitted agent_end, so don't wait the full idle budget.
+            line = await rpc.read_line(
+                timeout=_TURN_STDOUT_IDLE_TIMEOUT_S
+                if pending_error is None
+                else _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
+            )
+            if line is None:
+                if pending_error is None and not rpc.stdout_at_eof():
+                    # Idle timeout, not process death: omp's stdout reader is
+                    # still running — e.g. a long tool call silent past the
+                    # idle budget. Keep waiting; a dead omp process delivers
+                    # a real EOF (reader finishes) instead. True hangs are
+                    # bounded by the harness-level idle watchdog.
+                    logger.debug("OmpExecutor: stdout idle past budget; omp running, waiting")
+                    continue
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                elif not streamed_any and not response_text:
+                    stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
+                    stderr_suffix = f" Stderr: {stderr}" if stderr else ""
+                    yield ExecutorError(
+                        message=f"omp process ended without response.{stderr_suffix}"
+                    )
+                else:
+                    turn_usage = _aggregate_omp_turn_usage(message_usages, model)
+                    _notify_usage_from_dict(model=model, usage=turn_usage)
+                    yield TurnComplete(
+                        response=response_text,
+                        usage=dict(turn_usage) if turn_usage is not None else None,
+                    )
+                return
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug("OmpExecutor: non-JSON line: %s", line[:200])
+                continue
+
+            raw_event_type = event.get("type")
+            event_type: str | None = raw_event_type if isinstance(raw_event_type, str) else None
+
+            # Skip the command-ack response — except a local-only prompt
+            # completion, which arrives here instead of as ``agent_end``.
+            if event_type == "response":
+                if not event.get("success", True):
+                    yield ExecutorError(message=event.get("error", "omp command failed"))
+                    return
+                ack_data = event.get("data")
+                if (
+                    event.get("command") == "prompt"
+                    and isinstance(ack_data, dict)
+                    and ack_data.get("agentInvoked") is False
+                ):
+                    yield TurnComplete(response=None)
+                    return
+                continue
+
+            # omp startup / protocol frames that carry no turn content: the
+            # ``ready`` frame emitted before the first command processes,
+            # and any ``rpc_chunk`` continuation (unreachable while we stay
+            # on protocol v1 — we never send ``negotiate_protocol`` — but
+            # skipped defensively so a future CLI can't wedge the loop).
+            if event_type in ("ready", "rpc_chunk"):
+                continue
+
+            # Late local-only prompt completion (see the ``response`` ack
+            # above): the prompt resolved without an agent turn, so no
+            # ``agent_end`` follows. Anything else here is not a
+            # completion signal — keep draining.
+            if event_type == "prompt_result":
+                result_data = event.get("data")
+                if event.get("agentInvoked") is False or (
+                    isinstance(result_data, dict) and result_data.get("agentInvoked") is False
+                ):
+                    yield TurnComplete(response=None)
+                    return
+                continue
+
+            # Streaming text and thinking deltas.
+            if event_type == "message_update":
+                ame = event.get("assistantMessageEvent", {})
+                ame_type = ame.get("type")
+                if ame_type == "text_delta":
+                    raw_delta = ame.get("delta")
+                    if isinstance(raw_delta, str) and raw_delta:
+                        yield TextChunk(text=raw_delta)
+                        response_text += raw_delta
+                        streamed_any = True
+                elif ame_type == "thinking_start":
+                    # Anchors the "Thinking…" indicator before the first delta.
+                    yield ReasoningChunk(delta="", event_type="reasoning_started")
+                elif ame_type == "thinking_delta":
+                    raw_delta = ame.get("delta")
+                    if isinstance(raw_delta, str) and raw_delta:
+                        # Reasoning stays out of response_text — it is not assistant text.
+                        yield ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
+                continue
+
+            # Tool execution events.
+            if event_type == "tool_execution_start":
+                tool_name = event.get("toolName", "unknown")
+                args = event.get("args", {})
+                yield ToolCallRequest(
+                    name=tool_name,
+                    args=args if isinstance(args, dict) else {},
+                )
+                continue
+
+            if event_type == "tool_execution_end":
+                tool_name = event.get("toolName", "unknown")
+                is_error = event.get("isError", False)
+                result = event.get("result")
+                # omp may report isError at the top level OR only inside
+                # the result dict (result.isError).  Check both.
+                if isinstance(result, dict) and result.get("isError"):
+                    is_error = True
+                # Detect policy-blocked results coming back from the tool
+                # server.  The _execute_tool callback returns
+                # {"blocked": True, "reason": "..."} when a policy blocks
+                # the call.  By the time it reaches us, the result may be:
+                #   - a dict with "blocked" key (direct)
+                #   - a dict with "content" list containing JSON text (from omp extension)
+                #   - a string containing JSON with "blocked" key
+                result_str = str(result) if result is not None else ""
+                is_blocked = False
+
+                def _check_blocked(obj: JsonValue) -> BlockedCheck:
+                    """Check if obj represents a blocked tool result."""
+                    if isinstance(obj, dict):
+                        if obj.get("blocked"):
+                            return BlockedCheck(blocked=True, reason=str(obj.get("reason", obj)))
+                        # omp extension wraps in {content: [{type:"text", text:"..."}]}
+                        content = obj.get("content")
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and item.get("type") == "text":
+                                    text = item.get("text")
+                                    if not isinstance(text, str):
+                                        continue
+                                    try:
+                                        parsed = json.loads(text)
+                                        if isinstance(parsed, dict) and parsed.get("blocked"):
+                                            return BlockedCheck(
+                                                blocked=True,
+                                                reason=str(parsed.get("reason", text)),
+                                            )
+                                    except (json.JSONDecodeError, TypeError):
+                                        pass
+                    elif isinstance(obj, str):
+                        try:
+                            parsed = json.loads(obj)
+                            if isinstance(parsed, dict) and parsed.get("blocked"):
+                                return BlockedCheck(
+                                    blocked=True,
+                                    reason=str(parsed.get("reason", obj)),
+                                )
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    return BlockedCheck(blocked=False, reason="")
+
+                if is_error:
+                    check = _check_blocked(result)
+                    is_blocked = check.blocked
+                    if is_blocked:
+                        result_str = check.reason
+
+                if is_blocked:
+                    status = ToolCallStatus.BLOCKED
+                elif is_error:
+                    status = ToolCallStatus.ERROR
+                else:
+                    status = ToolCallStatus.SUCCESS
+
+                yield ToolCallComplete(
+                    name=tool_name,
+                    status=status,
+                    result=result,
+                    error=result_str if (is_error or is_blocked) else "",
+                )
+                continue
+
+            # Agent ended — the turn is complete, unless omp says more work
+            # is scheduled (``isTerminal: false`` covers maintenance/async
+            # delivery that resumes the session before its true final
+            # settle). Absent means terminal (older runtimes). A
+            # non-terminal end is not a completion — keep draining.
+            if event_type == "agent_end" and event.get("isTerminal") is False:
+                continue
+            if event_type == "agent_end":
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
+                end_messages = event.get("messages", [])
+                if not response_text:
+                    for m in reversed(end_messages):
+                        if m.get("role") == "assistant":
+                            content = m.get("content", [])
+                            if isinstance(content, str):
+                                response_text = content
+                            elif isinstance(content, list):
+                                text_parts: list[str] = []
+                                for part in content:
+                                    if not (isinstance(part, dict) and part.get("type") == "text"):
+                                        continue
+                                    part_text = part.get("text")
+                                    if isinstance(part_text, str):
+                                        text_parts.append(part_text)
+                                response_text = "".join(text_parts)
+                            break
+                # Fallback usage capture: if no ``message_end`` carried
+                # usage, pull it from the last assistant message in
+                # ``messages`` (only the last — ``messages`` may hold the
+                # whole conversation, so summing it would overcount).
+                if not message_usages and isinstance(end_messages, list):
+                    for m in reversed(end_messages):
+                        captured = _extract_omp_turn_usage(m, model)
+                        if captured is not None:
+                            message_usages.append(captured)
+                            break
+                turn_usage = _aggregate_omp_turn_usage(message_usages, model)
+                _notify_usage_from_dict(model=model, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text,
+                    usage=dict(turn_usage) if turn_usage is not None else None,
+                )
+                return
+
+            # message_end carries one completed assistant message, whose
+            # ``usage`` object holds that LLM call's token counts — collect
+            # each for the turn-level sum before handling error stop reasons.
+            if event_type == "message_end":
+                msg = event.get("message", {})
+                if isinstance(msg, dict):
+                    captured = _extract_omp_turn_usage(msg, model)
+                    if captured is not None:
+                        message_usages.append(captured)
+                    raw_stop = msg.get("stopReason")
+                    stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                    if stop == "aborted":
+                        err = msg.get("errorMessage", stop)
+                        yield ExecutorError(message=str(err))
+                        return
+                    if stop == "error":
+                        # omp emits the turn-terminal ``agent_end`` after an
+                        # errored LLM call; returning here would leave it
+                        # queued, so the next turn on this RPC session reads
+                        # the stale event as its own end. Record the error
+                        # and keep draining until ``agent_end``.
+                        pending_error = str(msg.get("errorMessage", stop))
+                continue
+
+            logger.debug("OmpExecutor: ignoring event type=%s", event_type)

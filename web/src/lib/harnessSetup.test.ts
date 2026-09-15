@@ -184,7 +184,9 @@ describe("harnessCredentialFamily", () => {
     expect(harnessCredentialFamily("codex-native")).toBe("openai");
     // Pi resolves to its preferred anthropic fallback family.
     expect(harnessCredentialFamily("pi")).toBe("anthropic");
-    expect(harnessCredentialFamily("pi-native")).toBe("anthropic");
+    // Omp resolves like Pi (preferred anthropic fallback family).
+    expect(harnessCredentialFamily("omp")).toBe("anthropic");
+    expect(harnessCredentialFamily("oh-my-pi")).toBe("anthropic");
   });
 
   it("returns null for harnesses the UI can't authenticate", () => {
@@ -205,7 +207,8 @@ describe("harnessCredentialAdoptFamilies", () => {
 
   it("returns BOTH families for Pi (it consumes anthropic + openai)", () => {
     expect(harnessCredentialAdoptFamilies("pi")).toEqual(["anthropic", "openai"]);
-    expect(harnessCredentialAdoptFamilies("pi-native")).toEqual(["anthropic", "openai"]);
+    expect(harnessCredentialAdoptFamilies("omp")).toEqual(["anthropic", "openai"]);
+    expect(harnessCredentialAdoptFamilies("oh-my-pi")).toEqual(["anthropic", "openai"]);
   });
 
   it("returns an empty list for harnesses the UI can't authenticate", () => {
@@ -221,6 +224,7 @@ describe("harnessAuthableOnHost", () => {
   it("true for Claude/Codex/Pi families when feature on and host online", () => {
     expect(harnessAuthableOnHost(info(), "codex-native", online)).toBe(true);
     expect(harnessAuthableOnHost(info(), "claude-native", online)).toBe(true);
+    expect(harnessAuthableOnHost(info(), "omp", online)).toBe(true);
     expect(harnessAuthableOnHost(info(), "pi", online)).toBe(true);
   });
 

@@ -5091,6 +5091,7 @@ def _build_model_readout_lines(
         kind_glyph,
     )
     from omnigent.onboarding.provider_config import (
+        OMP_SURFACE,
         PI_SURFACE,
         describe_active_credential,
         harness_family,
@@ -5151,12 +5152,12 @@ def _build_model_readout_lines(
 
     # List the OTHER configured providers that serve THIS harness's family,
     # so the user only sees relevant alternatives (a Codex run shouldn't list
-    # Claude-only providers). A both-family harness (pi) maps to no single
-    # family — filter its alternates on the pi surface instead, which every
-    # kind but subscription serves (a CLI login can't drive pi).
+    # Claude-only providers). A both-family harness (pi/omp) maps to no single
+    # family — filter its alternates on its own surface instead, which every
+    # kind but subscription serves (a CLI login can't drive pi/omp).
     providers = load_providers(config)
     fam = harness_family(harness)
-    surface = fam if fam is not None else PI_SURFACE
+    surface = fam if fam is not None else (OMP_SURFACE if harness == "omp" else PI_SURFACE)
     others = [
         (name, entry)
         for name, entry in providers.items()

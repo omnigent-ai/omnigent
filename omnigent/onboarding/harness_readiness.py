@@ -46,6 +46,7 @@ from omnigent.onboarding.harness_install import (
     HERMES_KEY,
     KIMI_KEY,
     KIRO_KEY,
+    OMP_KEY,
     OPENCODE_KEY,
     PI_KEY,
     QWEN_KEY,
@@ -59,6 +60,7 @@ from omnigent.onboarding.provider_config import (
     _HARNESS_FAMILY,
     ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
+    OMP_SURFACE,
     OPENAI_FAMILY,
     PI_SURFACE,
     SUBSCRIPTION_KIND,
@@ -104,6 +106,11 @@ _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
 # ``_HARNESS_FAMILY`` entry — pi uses the ``PI_SURFACE`` sentinel — so they must
 # be gated explicitly or they fail open like an unknown harness.
 _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
+
+# CLI-wrapping omp harness (``omp --mode rpc``). Like pi it has no
+# ``_HARNESS_FAMILY`` entry — omp uses the ``OMP_SURFACE`` sentinel — so it
+# must be gated explicitly or it fails open like an unknown harness.
+_OMP_HARNESSES: frozenset[str] = frozenset({"omp"})
 
 # Surface name for Kimi Code in the readiness map. Mirrors :data:`PI_SURFACE`
 # — kimi is a CLI-backed harness with its own backend (Moonshot AI's), not a
@@ -495,14 +502,28 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         except Exception:
             pass
         return "needs-auth"
+    if canonical in _OMP_HARNESSES:
+        # omp has no CLI login — its only credential is either an
+        # omnigent-managed provider (an API key / gateway) or its own
+        # ~/.omp/agent auth (``omp auth-broker login`` / in-TUI ``/login``).
+        # Two-step signal mirrors pi: installed-but-no-provider is the
+        # yellow "needs-auth" state the setup dialog acts on. Unlike pi
+        # there is no subscription carve-out — omp cannot consume Pi's
+        # native auth.
+        binary_state = _binary_availability_reason(OMP_KEY)
+        if binary_state is not True:
+            return binary_state
+        if _family_provider_configured(OMP_SURFACE):
+            return True
+        return "needs-auth"
     return _harness_availability_core(canonical)
 
 
 def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
-    Only CLI-wrapping harnesses are assessed (native Claude/Codex/Kiro and
-    ``pi`` / ``pi-native``): they cannot run without their binary on
+    Only CLI-wrapping harnesses are assessed (native Claude/Codex/Kiro,
+    ``pi`` / ``pi-native``, and ``omp``): they cannot run without their binary on
     ``PATH``, and that is the one thing the daemon can check reliably and
     locally. SDK harnesses and unknown harnesses always return ``True`` —
     their readiness depends on runtime/ambient credentials the daemon
@@ -550,6 +571,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
+    spellings.update(_OMP_HARNESSES)
     spellings.update(_OPENCODE_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_KIRO_NATIVE_HARNESSES)
