@@ -31,6 +31,11 @@ Covered facets (each is a claim from the bug report):
 - ``test_create_directory_accepts_drive_letter_path`` — creating a
   folder under a Windows path must work (bug: the route only accepts
   paths starting with ``/`` or ``~``).
+- ``test_windows_workspace_enables_send`` — a folder committed from
+  the picker must enable Send (bug: the composer's workspace validator
+  accepted only paths starting with ``/``, so the chip showed the chosen
+  Windows folder while Send stayed disabled, its tooltip asking for the
+  working directory that had already been chosen).
 
 The async-in-a-fresh-thread shape is inherited from
 ``test_start_session.py`` (pytest-asyncio can't start a loop on the main
@@ -42,13 +47,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import threading
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any
 
 import httpx
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import Route, async_playwright, expect
 
 from omnigent.host.frames import (
     HostCreateDirFrame,
@@ -74,7 +80,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from tests.e2e_ui.start_session.helpers import open_landing_workspace_picker
+from tests.e2e_ui.start_session.helpers import (
+    commit_landing_workspace_picker,
+    open_landing_workspace_picker,
+)
 
 _HOST_NAME = "win11-e2e"
 _WIN_HOME = "C:\\Users\\alice"
@@ -520,3 +529,63 @@ async def _drive_create_directory(base_url: str) -> None:
         )
         created = resp.json()["path"]
         assert created.endswith("new-app"), created
+
+
+def test_windows_workspace_enables_send(live_server: str) -> None:
+    """A folder committed from the picker on a Windows host enables Send.
+
+    The landing composer's submit predicate ANDs ``isValidWorkspace``,
+    which accepted only paths starting with ``/``. A Windows host's picker
+    commits native drive-letter paths (``C:\\Users\\alice\\work``), so
+    on the buggy build the working-directory chip displayed the chosen
+    folder while Send stayed disabled — its tooltip asking for "a host and
+    working directory", the one thing already done. Starting a session
+    from the web UI on a Windows host was impossible.
+    """
+    _run_in_fresh_loop(_drive_windows_workspace_enables_send(live_server))
+
+
+async def _drive_windows_workspace_enables_send(base_url: str) -> None:
+    async with _windows_host(base_url) as host_id, async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        # Explicit context so a recorded video is finalized on context.close()
+        # even when the drive fails mid-way.
+        context = await browser.new_context(**_video_kwargs())
+        page = await context.new_page()
+        try:
+            # Hide agents left by other tests so the default harness stays
+            # selected and Send's only remaining gate is the workspace. This
+            # is the one stub in the file; hosts and the filesystem still go
+            # through the real tunnel.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body='{"data": []}'
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await _open_picker_at_windows_home(page, base_url, host_id)
+
+            # Browse into a home child so the committed path is a real
+            # drive-letter path the host produced, not a typed one.
+            await page.get_by_test_id("workspace-picker-entry-work").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-entry-omnigent-app")).to_be_visible(
+                timeout=10_000
+            )
+            await commit_landing_workspace_picker(page)
+
+            # The chip reflects the Windows folder (separator spelling is the
+            # SPA's business; the drive-letter shape is what matters) …
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_attribute(
+                "aria-label", re.compile(r"^Working directory: C:[\\/]Users[\\/]alice[\\/]work$")
+            )
+
+            # … and with a message typed, Send enables. (Buggy build: the
+            # chip shows the same folder and Send stays disabled.)
+            await page.get_by_test_id("new-chat-landing-input").fill("Work on this repository")
+            await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled(
+                timeout=10_000
+            )
+        finally:
+            await context.close()
+            await browser.close()

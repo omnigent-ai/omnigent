@@ -491,18 +491,25 @@ export function ConnectHostInstructions({
  * Return true when ``workspace`` is acceptable to send to the backend.
  *
  * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
- * relative paths are rejected because the server never expands ``~``
- * — that's the host's job, and the workspace request body must be
- * an unambiguous absolute path. Empty / whitespace-only input is
- * also rejected so the submit button is disabled until the user
- * has typed something usable.
+ * paths are accepted. Tilde-prefixed and relative paths are rejected
+ * because the server never expands ``~`` — that's the host's job, and
+ * the workspace request body must be an unambiguous absolute path.
+ * Empty / whitespace-only input is also rejected so the submit button
+ * is disabled until the user has typed something usable.
+ *
+ * "Absolute" is host-shaped, not POSIX-only: a Windows host's paths are
+ * drive-letter (``C:\dir`` / ``C:/dir``) or UNC (``\\server\share``),
+ * and neither starts with ``/``. Accepting only ``/`` rejected every
+ * real path on a Windows host, so the composer's submit button could
+ * never enable there however valid the directory the picker returned.
  *
  * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * @returns true when ``workspace.trim()`` is an absolute POSIX,
+ *   Windows drive-letter, or UNC path.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  const trimmed = workspace.trim();
+  return trimmed.startsWith("/") || /^[A-Za-z]:[\\/]/.test(trimmed) || trimmed.startsWith("\\\\");
 }
 
 /**

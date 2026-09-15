@@ -1521,6 +1521,151 @@ async def test_model_override_trusts_echoed_value_over_request() -> None:
     assert calls == ["gemini-3-1-pro-low"]
 
 
+# ---------------------------------------------------------------------------
+# warm model switch (session/set_model) — agents that advertise a catalog
+# ---------------------------------------------------------------------------
+
+
+def _models_result(current: str | None = None, *available: str) -> dict:
+    """A ``session/new`` result carrying a model catalog (Cline's shape)."""
+    models: dict = {"availableModels": [{"modelId": m, "name": m} for m in available]}
+    if current is not None:
+        models["currentModelId"] = current
+    return models
+
+
+def test_session_models_records_catalog_and_current_model() -> None:
+    """
+    A ``models`` object from ``session/new`` is recorded.
+
+    Agents like Cline advertise selectable models here instead of via
+    ``config_option_update``, and report the live one as ``currentModelId``.
+
+    **What breaks if this fails**: the catalog stays empty, so the switch falls
+    through to ``session/set_config_option`` — which these agents don't expose —
+    and the agent silently keeps its own default model.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("a/one", "a/one", "b/two"))
+
+    assert ex._session_model_ids == {"a/one", "b/two"}
+    assert ex._active_model == "a/one"
+
+
+def test_session_models_ignores_non_catalog_payloads() -> None:
+    """A missing or malformed ``models`` value leaves the catalog untouched."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(None)
+    ex._note_session_models("nope")
+    ex._note_session_models({"availableModels": ["bare-string", {"noModelId": 1}]})
+
+    assert ex._session_model_ids == set()
+    assert ex._active_model is None
+
+
+@pytest.mark.asyncio
+async def test_model_override_uses_set_model_when_catalog_advertised() -> None:
+    """
+    With a catalog present the switch goes through ``session/set_model``.
+
+    ``session/set_config_option`` must not be attempted: these agents never
+    advertise a ``model`` option, so that path bails out and leaves the agent on
+    its default — which is also what it bills.
+
+    **What breaks if this fails**: a configured or picked model is silently
+    dropped for every catalog-style ACP agent (Cline).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("vendor/default", "vendor/default"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "sub/cheap-flash")
+
+    assert calls == [("session/set_model", {"sessionId": "s1", "modelId": "sub/cheap-flash"})]
+    assert ex._active_model == "sub/cheap-flash"
+
+
+@pytest.mark.asyncio
+async def test_set_model_accepts_id_outside_the_advertised_catalog() -> None:
+    """
+    An id the agent did not enumerate is still sent.
+
+    ``availableModels`` is what the agent offers interactively; Cline also accepts
+    subscription-scoped ``cline-pass/*`` ids it never lists. Filtering on the
+    catalog would reject exactly the ids that avoid metered billing.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("anthropic/pricey", "anthropic/pricey"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "cline-pass/deepseek-v4.1-flash")
+
+    assert calls[0][1]["modelId"] == "cline-pass/deepseek-v4.1-flash"
+    assert ex._active_model == "cline-pass/deepseek-v4.1-flash"
+
+
+@pytest.mark.asyncio
+async def test_configured_model_applies_when_the_turn_names_none() -> None:
+    """
+    The agent's configured ``model:`` is used when a turn carries no pick.
+
+    A turn only names a model when the user picked one, so without this fallback
+    the ``model:`` in an agent's config entry never reaches the agent at all.
+
+    **What breaks if this fails**: a configured model is inert and the agent runs
+    (and bills) on whatever it defaults to.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", model="sub/configured"))
+    ex._note_session_models(_models_result("vendor/default", "vendor/default"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", None)
+
+    assert calls == [("session/set_model", {"sessionId": "s1", "modelId": "sub/configured"})]
+
+
+@pytest.mark.asyncio
+async def test_set_model_rejection_latches_off_and_does_not_raise() -> None:
+    """
+    A rejected ``session/set_model`` never fails the turn, and is not retried.
+
+    **What breaks if this fails**: an agent that cannot switch models loses the
+    turn entirely instead of answering on the model it already has.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("vendor/default", "vendor/default"))
+    calls: list[str] = []
+
+    async def failing_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        return {"error": {"message": "unknown model"}}
+
+    ex._rpc = failing_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "bogus/model")
+
+    assert ex._model_switch_supported is False
+    assert ex._active_model == "vendor/default"
+
+    # Latched off: a later turn does not retry.
+    await ex._apply_model_override("s1", "another/model")
+    assert calls == ["session/set_model"]
+
+
 @pytest.mark.asyncio
 async def test_model_override_falls_back_to_request_when_no_option_echoed() -> None:
     """

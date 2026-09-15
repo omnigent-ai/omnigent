@@ -550,8 +550,10 @@ def mock_llm_server_url(
             resp = httpx.get(f"{base_url}/stats", timeout=1.0)
             if resp.status_code == 200:
                 break
-        except httpx.ConnectError:
-            # Expected while the mock server is still booting.
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # Expected while the mock server is still booting. Windows
+            # loopback can time out rather than refuse before the listener
+            # is up, so tolerate both.
             pass
         time.sleep(0.1)
     else:

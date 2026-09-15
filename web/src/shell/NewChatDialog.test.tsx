@@ -484,6 +484,34 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("./myapp")).toBe(false);
     expect(isValidWorkspace("../myapp")).toBe(false);
   });
+
+  it("accepts Windows drive-letter paths", () => {
+    // A Windows host's absolute paths never start with "/". Rejecting them
+    // left the composer's submit button permanently disabled on Windows, no
+    // matter what the directory picker returned.
+    expect(isValidWorkspace("C:\\Users\\me\\projects")).toBe(true);
+    expect(isValidWorkspace("C:/Users/me/projects")).toBe(true);
+    expect(isValidWorkspace("d:\\repo")).toBe(true);
+    expect(isValidWorkspace("  C:\\Users\\me  ")).toBe(true);
+  });
+
+  it("accepts UNC paths", () => {
+    expect(isValidWorkspace("\\\\server\\share")).toBe(true);
+    expect(isValidWorkspace("\\\\server\\share\\dir")).toBe(true);
+  });
+
+  it("rejects a bare drive letter with no separator", () => {
+    // "C:" alone is drive-relative on Windows, not absolute — it resolves
+    // against that drive's current directory, so it is exactly the kind of
+    // ambiguous path the server refuses.
+    expect(isValidWorkspace("C:")).toBe(false);
+    expect(isValidWorkspace("C:repo")).toBe(false);
+  });
+
+  it("rejects a single backslash prefix", () => {
+    // One backslash is drive-relative, not UNC; only "\\\\" is absolute.
+    expect(isValidWorkspace("\\repo")).toBe(false);
+  });
 });
 
 // Path normalization underpins the directory-conflict match: a freshly
