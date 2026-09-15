@@ -907,6 +907,26 @@ def read_bridge_startup_error(bridge_dir: Path) -> str | None:
     return message if isinstance(message, str) and message else None
 
 
+def bridge_torn_down(bridge_dir: Path) -> bool:
+    """
+    Return whether *bridge_dir* has none of its runner-written bridge files.
+
+    A launch seeds ``bridge.json`` (with the bridge dir itself) before the TUI
+    boots, and the discovery supervisor later adds ``state.json`` or
+    ``startup_error.json``; only a session teardown removes them all. All
+    three missing therefore means the bridge was torn out from under whatever
+    pane is still running. Bare dir absence is NOT the signal: the running
+    CLI can resurrect ``codex-home`` content inside the dir after a teardown.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` when no runner-written bridge file exists.
+    """
+    return not any(
+        (bridge_dir / name).is_file()
+        for name in (_STATE_FILE, _STARTUP_ERROR_FILE, _MCP_CONFIG_FILE)
+    )
+
+
 def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
     """
     Read the recorded per-MCP-server startup state.
