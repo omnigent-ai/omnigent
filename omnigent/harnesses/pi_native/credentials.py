@@ -250,6 +250,11 @@ class PiProviderConfig:
     # Keys are provider ids; values are complete Pi provider config dicts.
     additional_providers: dict[str, _PiProviderPayload] = field(default_factory=dict, hash=False)
     databricks_surfaces: dict[DatabricksPiSurface, str] = field(default_factory=dict, hash=False)
+    # True when the rendered model list is an operator-curated set: a family
+    # ``models:`` tier map (the authored curation contract) rather than a live
+    # discovered catalog. Lets the launch path scope Pi's picker even when a
+    # curated map collapses to a single rendered model id.
+    curated_models: bool = False
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -820,7 +825,7 @@ def _fetch_pi_model_lists(
     """
     try:
         models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
-    except Exception:  # noqa: BLE001 — HTTP/network failure → empty
+    except Exception:
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
             "Pi will show only the selected model",
@@ -842,7 +847,7 @@ def _fetch_pi_model_lists(
         models = enrich_databricks_model_catalog(
             models, model_catalog.catalog_model_entries("databricks")
         )
-    except Exception:  # noqa: BLE001 — live availability remains authoritative
+    except Exception:
         _LOGGER.info(
             "pi-native: could not enrich the live Databricks model list with MLflow metadata",
             exc_info=True,
@@ -1071,7 +1076,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
                 claude_models, gpt_models, completions_models, gemini_models = (
                     _fetch_pi_model_lists(real_workspace_url, token)
                 )
-            except Exception:  # noqa: BLE001 — network failure must not break launch
+            except Exception:
                 _LOGGER.info(
                     "pi-native: could not fetch workspace model list; showing default model only",
                     exc_info=True,
@@ -1312,7 +1317,14 @@ def _inline_family_pi_provider(
             auth_header = True
         else:
             continue
-        resolved_model = model or entry.family_default_model(family_name)
+        if model is not None:
+            resolved_model = model
+        else:
+            # A ``default:`` tier may name another tier (an alias such as
+            # ``deepseek-pro: deepseek-v4-pro``); launch with the id the
+            # endpoint actually serves, not the alias.
+            default_tier = entry.family_default_model(family_name)
+            resolved_model = family.resolve_model_tier(default_tier) if default_tier else None
         if not resolved_model:
             continue
         # A session override can arrive as a Databricks-gateway id, which only
@@ -1324,13 +1336,40 @@ def _inline_family_pi_provider(
         if model is not None:
             resolved_model = normalize_model_for_provider(resolved_model, entry.kind)
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
-        # Anthropic API but rejected by the Databricks AI Gateway.
+        # Anthropic API but rejected by the Databricks AI Gateway, and in a Pi
+        # ``enabledModels`` ref the "[" would route the pattern through Pi's
+        # glob matcher instead of its exact reference match.
         resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
         model_entry = _gateway_pi_model_entry(
             resolved_model,
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
         )
+        # Register the family's curated ``models:`` shortlist (its tier map)
+        # alongside the selected model, so Pi's /model picker offers exactly
+        # the deployment's verified set instead of just the launch model.
+        # Duplicate ids collapse to their first occurrence; the selected
+        # model's entry is already in the list, so skip a second copy. Tier
+        # ids get the same bracket-suffix strip as the selected model, so
+        # ``[1m]``-style operator ids don't render a gateway-rejected entry.
+        # A tier value may itself name another tier; resolve it first so an
+        # alias never renders as a picker row.
+        shortlist: list[_PiModelEntry] = [model_entry]
+        seen_ids: set[str] = {resolved_model}
+        for tier_model in family.models.values():
+            if not isinstance(tier_model, str) or not tier_model:
+                continue
+            tier_id = re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
+            if tier_id in seen_ids:
+                continue
+            seen_ids.add(tier_id)
+            shortlist.append(
+                _gateway_pi_model_entry(
+                    tier_id,
+                    configured_context_window=family.context_window,
+                    configured_max_output_tokens=family.max_output_tokens,
+                )
+            )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,
@@ -1341,7 +1380,8 @@ def _inline_family_pi_provider(
             # Advisory when the model landed on the other family's wire; a raw
             # passthrough endpoint rejects it, and silence reads as a hang.
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
-            extra_models=[model_entry],
+            extra_models=shortlist,
+            curated_models=bool(family.models),
         )
     return None
 
@@ -1475,7 +1515,7 @@ def resolve_pi_native_provider(
                 ),
             )
         return resolved
-    except Exception:  # noqa: BLE001 — any resolution failure must not break launch
+    except Exception:
         # Any failure (malformed config, duplicate per-family default, or an
         # unresolved ``api_key: $VAR``) falls back to Pi's own login rather than
         # failing the terminal launch.
@@ -1511,6 +1551,29 @@ def write_pi_models_config(
         json.dump(rendered, handle, indent=2, sort_keys=True)
         handle.write("\n")
     return models_path
+
+
+def _enabled_model_refs(rendered: _PiModelsConfig) -> list[str]:
+    """Build provider-qualified ``enabledModels`` refs for a rendered config.
+
+    Every model of every rendered provider is included, so the picker's
+    scoped view lists exactly the managed catalog. (A soft preference, not an
+    enforcement boundary: the picker can toggle back to all models. The
+    ``OMNIGENT_PI_ENV_UNSET`` denylist is the fail-closed net.)
+
+    :param rendered: The rendered ``models.json`` mapping.
+    :returns: ``["provider/model", ...]`` refs in rendered order (deterministic,
+        matching the picker's listing order).
+    """
+    refs: list[str] = []
+    providers = rendered.get("providers", {})
+    for provider_id, payload in providers.items():
+        if not isinstance(payload, dict):
+            continue
+        for model in payload.get("models", []):
+            if isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]:
+                refs.append(f"{provider_id}/{model['id']}")
+    return refs
 
 
 class PiNativeLaunch(NamedTuple):
@@ -1581,9 +1644,34 @@ def pi_native_provider_launch(
     # applies the session-level thinking before the compat check fires).
     # Passing None in the overlay makes _deep_merge_settings write null for the
     # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    #
+    # ``enabledModels`` is the settings key Pi actually reads (verified against
+    # @earendil-works/pi-coding-agent 0.85): SettingsManager.getEnabledModels()
+    # returns ``settings.enabledModels``, which Pi resolves at startup and in
+    # the /model dialog into its session-scoped model list (internally
+    # ``scopedModels``); the /model dialog's scoped view and Ctrl+P cycling
+    # both then honour that resolved scope. It is a preference, not an
+    # enforcement boundary (the dialog can toggle back to all models, and a
+    # project ``.pi/settings.json`` overrides the managed file); the
+    # ``OMNIGENT_PI_ENV_UNSET`` denylist is the fail-closed net. Refs are
+    # provider-qualified so they resolve via Pi's findExactModelReferenceMatch
+    # (case-insensitive) even when a built-in provider carries the same model
+    # id. Older Pi ignores the unknown settings key harmlessly. Written only
+    # for a curated or multi-model render (see below).
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
-    prepare_managed_pi_agent_dir(agent_dir, overlay={"defaultThinkingLevel": None})
+    overlay: dict[str, object] = {"defaultThinkingLevel": None}
+    # Scope when the deployment curated a set (a family ``models:`` map,
+    # which stays curated even if its tiers collapse to one rendered id) or
+    # when the render carries several managed models (live discovered
+    # catalogs). A single, non-curated render stays unscoped: the managed
+    # model is the only one our models.json adds, and scoping would hide
+    # working built-in entries from users whose real provider credentials
+    # legitimately activate them (local/hosted runners).
+    enabled_refs = _enabled_model_refs(rendered)
+    if enabled_refs and (provider.curated_models or len(enabled_refs) > 1):
+        overlay["enabledModels"] = enabled_refs
+    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding
