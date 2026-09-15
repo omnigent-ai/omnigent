@@ -80,6 +80,7 @@ from omnigent.server.routes._sessions.helpers import (
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
+    _raise_if_runner_session_agent_missing,
     _read_upload_capped,
     _stored_file_to_resource,
 )
@@ -425,22 +426,9 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
-            # Re-derive the typed session-lifecycle error instead of
-            # flattening it to a generic 502 gateway failure: the session's
-            # bound agent was deleted or rebound, so a retry cannot succeed
-            # and the client must recreate the agent or start a new session.
-            # ``OmnigentError.http_status`` re-derives the 410 from the code,
-            # mirroring how ``create_session_terminal`` handles runner errors.
-            if isinstance(response_payload, dict):
-                error = response_payload.get("error")
-                if (
-                    isinstance(error, dict)
-                    and error.get("code") == ErrorCode.SESSION_AGENT_MISSING
-                ):
-                    raise OmnigentError(
-                        str(error.get("message") or "session agent missing"),
-                        code=ErrorCode.SESSION_AGENT_MISSING,
-                    )
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"

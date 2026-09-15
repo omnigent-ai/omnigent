@@ -670,7 +670,14 @@ async def test_list_session_resources_missing_session_agent_returns_typed_410(
     resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
 
     assert resp.status_code == 410
-    assert resp.json()["error"]["code"] == "session_agent_missing"
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
 
 
 @pytest.mark.asyncio
@@ -1295,7 +1302,14 @@ async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
     resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone")
 
     assert resp.status_code == 410
-    assert resp.json()["error"]["code"] == "session_agent_missing"
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
 
 
 @pytest.mark.asyncio

@@ -5838,6 +5838,43 @@ async def _get_runner_client_for_resource_access_impl(
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
+# Client-safe message for a session whose bound agent no longer resolves.
+# Mirrors the native-terminal payload's wording: never forward the runner's
+# internal resolver text, which names the resolver and the raw agent id.
+_SESSION_AGENT_MISSING_CLIENT_MESSAGE = (
+    "This session's agent is no longer available; it was deleted or "
+    "replaced. Recreate the agent or start a new session, then retry."
+)
+
+
+def _raise_if_runner_session_agent_missing(resp: httpx.Response) -> None:
+    """Re-raise a runner ``session_agent_missing`` error as a typed 410.
+
+    Inspects a non-200 runner response body for the typed
+    ``session_agent_missing`` code and re-derives the ``OmnigentError``
+    (``http_status`` 410, matching ``create_session_terminal``'s code
+    passthrough) so server proxies surface the session-lifecycle condition
+    instead of flattening it into a generic 5xx gateway failure. Uses a
+    fixed client-safe message — never the runner's internal resolver text.
+    No-op for any other body, code, or a non-JSON payload.
+
+    :param resp: Runner HTTP response with a non-2xx status.
+    :raises OmnigentError: Typed ``session_agent_missing`` (HTTP 410).
+    """
+    try:
+        payload: object = resp.json()
+    except ValueError:
+        return
+    if not isinstance(payload, dict):
+        return
+    error = payload.get("error")
+    if isinstance(error, dict) and error.get("code") == ErrorCode.SESSION_AGENT_MISSING:
+        raise OmnigentError(
+            _SESSION_AGENT_MISSING_CLIENT_MESSAGE,
+            code=ErrorCode.SESSION_AGENT_MISSING,
+        )
+
+
 async def _proxy_get_session_resources_to_runner(
     runner_client: httpx.AsyncClient,
     session_id: str,
@@ -5864,26 +5901,9 @@ async def _proxy_get_session_resources_to_runner(
             timeout=10.0,
         )
         if resp.status_code != 200:
-            # Re-derive the typed session-lifecycle error instead of
-            # flattening it to a generic 502 gateway failure: the session's
-            # bound agent was deleted or rebound, so a retry cannot succeed
-            # and the client must recreate the agent or start a new session.
-            # ``OmnigentError.http_status`` re-derives the 410 from the code,
-            # matching ``_proxy_get_to_runner`` and ``create_session_terminal``.
-            try:
-                error_body: object = resp.json()
-            except ValueError:
-                error_body = None
-            if isinstance(error_body, dict):
-                error = error_body.get("error")
-                if (
-                    isinstance(error, dict)
-                    and error.get("code") == ErrorCode.SESSION_AGENT_MISSING
-                ):
-                    raise OmnigentError(
-                        str(error.get("message") or "session agent missing"),
-                        code=ErrorCode.SESSION_AGENT_MISSING,
-                    )
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             _logger.warning(
                 "session resources: runner returned %d for session=%s",
                 resp.status_code,
@@ -6821,6 +6841,10 @@ async def _resolve_skill_meta_text_via_runner(
             code=ErrorCode.INTERNAL_ERROR,
         ) from exc
     if resp.status_code not in (200, 404):
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) instead of flattening it into an INTERNAL_ERROR 500 —
+        # the exact server-fault mis-attribution this code path must avoid.
+        _raise_if_runner_session_agent_missing(resp)
         raise OmnigentError(
             f"Runner failed to resolve skill {skill_name!r}: HTTP {resp.status_code}",
             code=ErrorCode.INTERNAL_ERROR,

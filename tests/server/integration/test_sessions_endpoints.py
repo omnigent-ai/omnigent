@@ -2118,6 +2118,76 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert "malformed skill resolution" in resp.json()["error"]["message"]
 
 
+async def test_skill_slash_command_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner ``session_agent_missing`` on ``/skills/resolve`` surfaces as a
+    typed 410, not a 500.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session, not a server fault. The proxy re-derives the typed 410 from the
+    runner body's error code with a client-safe message that never leaks the
+    internal resolver text or the raw agent id.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Return a typed 410 for resolve; 202 otherwise."""
+        if request.url.path.endswith("/skills/resolve"):
+            return httpx.Response(
+                410,
+                json={
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(session_id: str, runner_router: object) -> httpx.AsyncClient:
+        """Resolve every session to the fake runner."""
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(
+            client,
+            name="skill-agent-gone",
+            skills=[{"name": "grill-me", "description": "Stress-test a plan.", "content": "Ask."}],
+        )
+        session = await _create_session(client, agent["id"])
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "slash_command",
+                "data": {"kind": "skill", "name": "grill-me", "arguments": ""},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert resp.status_code == 410, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
+
+
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
