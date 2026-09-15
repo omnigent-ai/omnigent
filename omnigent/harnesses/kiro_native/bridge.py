@@ -57,6 +57,8 @@ _SUBMIT_VERIFY_TIMEOUT_S = 5.0
 _SUBMIT_RETRY_INTERVAL_S = 0.5
 _PERMISSION_KEY_INTERVAL_S = 0.3
 _PERMISSION_ENTER_SETTLE_S = 0.5
+_PERMISSION_VERDICT_VERIFY_TIMEOUT_S = 5.0
+_PERMISSION_VERDICT_RETRY_INTERVAL_S = 0.5
 _KIRO_SEPARATOR = "────"
 _KIRO_INPUT_READY_MARKERS = (
     "ask a question or describe a task",
@@ -368,11 +370,20 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
     return proc.returncode == 0
 
 
-def _capture_pane(socket_path: str, tmux_target: str) -> str:
+def _capture_pane(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    join_wrapped: bool = False,
+) -> str:
     """Capture visible pane contents; return empty string on failure."""
+    args = ["tmux", "-S", socket_path, "capture-pane", "-p"]
+    if join_wrapped:
+        args.append("-J")
+    args.extend(("-t", tmux_target))
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-p", "-t", tmux_target],
+            args,
             check=False,
             capture_output=True,
             text=True,
@@ -469,11 +480,32 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
             approval_index = index
     if approval_index < 0:
         return ""
-    for line in reversed(lines[:approval_index]):
-        stripped = line.strip()
-        if not stripped or _KIRO_SEPARATOR in stripped:
-            continue
-        return stripped.lstrip("↓●○✓✗ ").strip()
+    tool_index = -1
+    # Kiro separates the tool block from the approval picker with a horizontal
+    # rule, and may render metadata (for example ``working_dir``) after the
+    # command. Search only the nearby block instead of treating the line
+    # immediately above ``requires approval`` as the command.
+    for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
+        stripped = lines[index].strip()
+        if stripped.startswith(("↓ ", "● ", "○ ", "✓ ", "✗ ")):
+            tool_index = index
+            break
+    if tool_index >= 0:
+        command_lines: list[str] = []
+        for line in lines[tool_index:approval_index]:
+            stripped = line.strip()
+            if not stripped or _KIRO_SEPARATOR in stripped or stripped.startswith(("╰ ", "↳ ")):
+                continue
+            command_lines.append(stripped.lstrip("↓●○✓✗ ").strip())
+        return " ".join(command_lines)
+    # The supported Kiro E2E shim renders the ACP request title directly,
+    # without a leading tool-status glyph. Keep that explicit title shape as a
+    # narrow fallback; do not fall back to arbitrary command fragments or
+    # metadata, which caused false correlations in the native TUI.
+    for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
+        stripped = lines[index].strip()
+        if stripped.startswith("Running:"):
+            return stripped
     return ""
 
 
@@ -505,7 +537,7 @@ def _wait_for_kiro_permission_prompt(
     """Wait until Kiro has rendered an approval prompt before typing a verdict."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
         if (
             _kiro_permission_prompt_active(pane)
             and _kiro_permission_focus_on_one_time_allow(pane)
@@ -516,6 +548,42 @@ def _wait_for_kiro_permission_prompt(
     raise RuntimeError(
         "kiro-native permission prompt was not safely focused before verdict delivery"
     )
+
+
+def _wait_for_kiro_permission_verdict_applied(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    action: str,
+    expected_title: str | None,
+    timeout_s: float,
+) -> None:
+    """Verify Kiro consumed a verdict, retrying only on the same safe prompt."""
+    deadline = time.monotonic() + min(timeout_s, _PERMISSION_VERDICT_VERIFY_TIMEOUT_S)
+    last_enter = time.monotonic()
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
+        if not _kiro_permission_prompt_active(pane):
+            return
+        if not _kiro_permission_prompt_matches_title(pane, expected_title):
+            raise RuntimeError(
+                "kiro-native permission prompt changed before verdict delivery completed"
+            )
+        focus_is_safe = (
+            _kiro_permission_focus_on_one_time_allow(pane)
+            if action == "accept"
+            else _kiro_permission_focus_on_reject(pane)
+        )
+        if not focus_is_safe:
+            raise RuntimeError(
+                "kiro-native permission focus changed before verdict delivery completed"
+            )
+        now = time.monotonic()
+        if now - last_enter >= _PERMISSION_VERDICT_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = now
+        time.sleep(_POLL_INTERVAL_S)
+    raise RuntimeError("kiro-native permission prompt did not resolve after verdict delivery")
 
 
 def _wait_for_kiro_input_ready(
@@ -724,7 +792,7 @@ def send_kiro_permission_verdict(
     )
     if action == "accept":
         time.sleep(_PERMISSION_ENTER_SETTLE_S)
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
         if not (
             _kiro_permission_prompt_active(pane)
             and _kiro_permission_focus_on_one_time_allow(pane)
@@ -733,11 +801,18 @@ def send_kiro_permission_verdict(
             raise RuntimeError("kiro-native allow option was not safely focused before delivery")
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
+        _wait_for_kiro_permission_verdict_applied(
+            socket_path,
+            tmux_target,
+            action=action,
+            expected_title=expected_title,
+            timeout_s=timeout_s,
+        )
         return
     for key in ("Down", "Down"):
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
-    pane = _capture_pane(socket_path, tmux_target)
+    pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
     if not (
         _kiro_permission_prompt_active(pane)
         and _kiro_permission_focus_on_reject(pane)
@@ -747,6 +822,13 @@ def send_kiro_permission_verdict(
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    _wait_for_kiro_permission_verdict_applied(
+        socket_path,
+        tmux_target,
+        action=action,
+        expected_title=expected_title,
+        timeout_s=timeout_s,
+    )
 
 
 # kiro prints "Model changed to <id> (saved as default)" after a successful

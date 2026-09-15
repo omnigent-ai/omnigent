@@ -58,7 +58,9 @@ Kiro's public docs describe `KIRO_ACP_RECORD_PATH` as a traffic recorder, not as
 
 The render gaps are required. A live probe showed that sending `Down Down Enter` as one burst could still select the default approval because the TUI had not processed the intermediate selection movement.
 
-Immediately before pressing `Enter`, the bridge re-verifies that Kiro's approval prompt is visible, focused on the intended row, and associated with the parsed request title — the one-time allow row for `accept` (re-checked after the pre-`Enter` settle delay), or the one-time reject row for `decline` / `cancel` after moving down one row at a time. If those checks fail, the bridge raises instead of typing, so no verdict is delivered and the Terminal remains usable.
+Immediately before pressing `Enter`, the bridge re-verifies that Kiro's approval prompt is visible, focused on the intended row, and associated with the parsed request title — the one-time allow row for `accept` (re-checked after the pre-`Enter` settle delay), or the one-time reject row for `decline` / `cancel` after moving down one row at a time. Permission captures join tmux soft-wrapped lines so long command titles remain comparable at narrow pane widths. If those checks fail, the bridge raises instead of typing, so no verdict is delivered and the Terminal remains usable.
+
+After pressing `Enter`, the bridge also verifies that the matching approval prompt disappears. If Kiro does not consume the first keypress, the bridge retries only while the same prompt title and intended option remain focused. A changed focus or a prompt that survives the bounded verification window fails closed instead of reporting a successful delivery.
 
 ## Race Handling
 
