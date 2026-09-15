@@ -45,7 +45,7 @@ from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import FrameType
-from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, TypeAlias, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -856,32 +856,6 @@ def claude_native_model_options(
     return []
 
 
-def _parse_claude_model_aliases(stdout: str) -> list[str]:
-    """
-    Extract the alias list from ``claude -p "/model"``'s printed usage line.
-
-    The harness prints e.g. ``Usage: /model <name>. Available: sonnet, opus,
-    haiku, fable, best, sonnet[1m], opusplan, default, or a full model ID.``
-    — its own enumeration of every settable alias. Parsing keeps zero model
-    knowledge here: entries are taken verbatim, and only the trailing prose
-    fragment (anything with whitespace) is dropped.
-
-    :param stdout: The probe run's stdout.
-    :returns: Alias tokens in the harness's order; empty when no line parses.
-    """
-    for line in stdout.splitlines():
-        _, marker, tail = line.partition("Available:")
-        if not marker:
-            continue
-        aliases: list[str] = []
-        for entry in tail.split(","):
-            token = entry.strip().rstrip(".")
-            if token and " " not in token:
-                aliases.append(token)
-        return aliases
-    return []
-
-
 def _parse_claude_current_model(stdout: str) -> dict[str, str]:
     """
     Extract the resolved model from a stream-json ``/model`` probe run.
@@ -927,6 +901,8 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
 def _claude_model_probe_invocation(
     claude_config: ClaudeNativeUcodeConfig | None,
     extra_args: Sequence[str] = (),
+    *,
+    stream_input: bool = False,
 ) -> tuple[str, list[str], dict[str, str]]:
     """
     Assemble one headless ``/model`` probe invocation.
@@ -937,13 +913,14 @@ def _claude_model_probe_invocation(
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param extra_args: Appended CLI args (e.g. ``--model <alias>``).
+    :param stream_input: Send control requests and /model over stdin.
     :returns: ``(command, launch_args, env)`` ready to exec.
     """
     from omnigent.claude_launcher import resolve_claude_launch
 
     args = [
         "-p",
-        "/model",
+        *(["--input-format", "stream-json"] if stream_input else ["/model"]),
         # The probe asks one client-side question; the MCP fleet, session
         # persistence, and background chatter are irrelevant startup weight.
         "--strict-mcp-config",
@@ -1094,44 +1071,46 @@ def _claude_alias_row(alias: str, resolution: dict[str, str]) -> dict[str, objec
 class ClaudeModelProbe:
     """One harness enumeration: picker rows plus the bare-launch default.
 
-    :param alias_rows: The printed aliases as deduplicated picker rows.
+    :param alias_rows: Enabled CLI picker options, deduplicated by model.
     :param default_model: The model the enumeration run itself launched on
         (its init event's ``model``) — what a no-pick launch of this config
         actually runs — or ``None`` when unreadable.
     :param default_label: The harness's own label for *default_model*, or
         ``None``.
+    :param disabled_models: Disabled picker values and their resolved model ids.
     """
 
     alias_rows: list[dict[str, object]]
     default_model: str | None = None
     default_label: str | None = None
+    disabled_models: frozenset[str] = frozenset()
 
 
-def _parse_claude_enumeration_aliases(stdout: str) -> list[str]:
-    """Extract the alias list from a stream-json enumeration run.
-
-    The ``Available:`` line lives inside the ``result`` event's text on a
-    stream-json run; falls back to scanning the raw output so a plain-text
-    run still parses.
-
-    :param stdout: The enumeration run's decoded stdout.
-    :returns: Alias names, e.g. ``["sonnet", "opus", ...]``.
-    """
+def _parse_claude_picker_models(stdout: str) -> list[dict[str, Any]] | None:
+    """Read the CLI's actual picker, including availability, from initialize."""
     for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("type") == "result":
-            result_text = event.get("result")
-            if isinstance(result_text, str):
-                aliases = _parse_claude_model_aliases(result_text)
-                if aliases:
-                    return aliases
-    return _parse_claude_model_aliases(stdout)
+        if not isinstance(event, dict) or event.get("type") != "control_response":
+            continue
+        response = event.get("response")
+        if not isinstance(response, dict) or response.get("subtype") != "success":
+            continue
+        if response.get("request_id") != "model-catalog":
+            continue
+        payload = response.get("response")
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if isinstance(models, list):
+            return [
+                model
+                for model in models
+                if isinstance(model, dict)
+                and isinstance(model.get("value"), str)
+                and model["value"]
+            ]
+    return None
 
 
 async def probe_claude_model_options(
@@ -1140,29 +1119,38 @@ async def probe_claude_model_options(
     """
     Ask Claude Code itself which models it would offer, and its default.
 
-    The harness is the source of truth: a short ``claude -p "/model"`` run
-    (stream-json, so its init event also names the model a bare launch of
-    this config actually runs — the truthful "Default") makes Claude Code
-    print its own alias list. Each printed alias is then resolved to its
-    concrete model by a per-alias harness run. All outputs are read
-    verbatim; no selection semantics are replicated here. Runs for every
-    config shape, including the bare subscription launch (``None`` config).
+    The control-protocol initialize response uses the interactive picker's
+    options and availability rules. The /model usage text lists syntax aliases
+    even when they are hidden or disabled, so it cannot enumerate the catalog.
+    A client-side /model request in the same run reports the actual default.
 
-    :param claude_config: The resolved native launch config
-        (:func:`resolve_native_claude_config`), or ``None``.
-    :returns: The probe result, or ``None`` when the probe failed (callers
-        fall back to the configured/static rows).
+    :param claude_config: The resolved native launch config, or ``None``.
+    :returns: The probe result, or ``None`` when availability cannot be read.
     """
     command, launch_args, env = _claude_model_probe_invocation(
-        claude_config, ("--output-format", "stream-json", "--verbose")
+        claude_config, ("--output-format", "stream-json", "--verbose"), stream_input=True
     )
+    requests = [
+        {
+            "type": "control_request",
+            "request_id": "model-catalog",
+            "request": {"subtype": "initialize"},
+        },
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "/model"},
+            "parent_tool_use_id": None,
+            "session_id": "default",
+        },
+    ]
+    probe_input = "".join(json.dumps(request) + "\n" for request in requests).encode()
     try:
         process = await asyncio.create_subprocess_exec(
             command,
             *launch_args,
             cwd=str(Path.home()),
             env=env,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1171,13 +1159,15 @@ async def probe_claude_model_options(
         return None
     try:
         async with asyncio.timeout(_CLAUDE_MODEL_PROBE_TIMEOUT_S):
-            stdout, stderr = await process.communicate()
-    except (TimeoutError, asyncio.CancelledError):
+            stdout, stderr = await process.communicate(probe_input)
+    except (TimeoutError, asyncio.CancelledError) as exc:
         if process.returncode is None:
             process.kill()
         with contextlib.suppress(Exception):
             await process.wait()
-        _logger.warning("Claude model probe timed out; keeping configured rows only")
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        _logger.warning("Claude model probe timed out")
         return None
     if process.returncode != 0:
         _logger.warning(
@@ -1187,23 +1177,39 @@ async def probe_claude_model_options(
         )
         return None
     text = stdout.decode(errors="replace")
-    aliases = _parse_claude_enumeration_aliases(text)
-    # The enumeration run's own init event names what a bare launch runs —
-    # the harness's truthful Default.
+    models = _parse_claude_picker_models(text)
+    if models is None:
+        _logger.warning("Claude model probe returned no structured picker options")
+        return None
     default_resolution = _parse_claude_current_model(text)
-    # The picker renders its own top-level Default choice (launch with no
-    # model), which is exactly what the harness's ``default`` alias does —
-    # listing it again would duplicate that row.
-    aliases = [alias for alias in aliases if alias != "default"]
-    resolutions = await _resolve_claude_model_aliases(claude_config, aliases)
+    disabled_models = frozenset(
+        value
+        for model in models
+        if model.get("disabled") is True
+        for value in (model["value"], model.get("resolvedModel"))
+        if isinstance(value, str) and value
+    )
+    enabled = [
+        model
+        for model in models
+        if model["value"] != "default" and model.get("disabled") is not True
+    ]
+    # Older CLIs omit resolvedModel; resolve only their enabled picker values.
+    unresolved = [model["value"] for model in enabled if not model.get("resolvedModel")]
+    resolutions = await _resolve_claude_model_aliases(claude_config, unresolved)
     alias_rows: list[dict[str, object]] = []
     seen_models: set[object] = set()
-    for alias in aliases:
-        row = _claude_alias_row(alias, resolutions.get(alias, {}))
-        # Distinct aliases can resolve to a model an earlier row already
-        # covers (``best``, ``fable[1m]``, and ``opusplan`` all do today);
-        # repeating the model is picker noise.
-        if row["model"] in seen_models:
+    for model in enabled:
+        alias = model["value"]
+        resolution = dict(resolutions.get(alias, {}))
+        resolved = model.get("resolvedModel")
+        if isinstance(resolved, str) and resolved:
+            resolution["model"] = resolved
+        label = model.get("displayName")
+        if isinstance(label, str) and label:
+            resolution["label"] = label
+        row = _claude_alias_row(alias, resolution)
+        if row["model"] in disabled_models or row["model"] in seen_models:
             continue
         seen_models.add(row["model"])
         alias_rows.append(row)
@@ -1211,6 +1217,7 @@ async def probe_claude_model_options(
         alias_rows=alias_rows,
         default_model=default_resolution.get("model"),
         default_label=default_resolution.get("label"),
+        disabled_models=disabled_models,
     )
 
 
@@ -1236,6 +1243,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
+        "control-picker-v1",  # Invalidate catalogs built from unfiltered help aliases.
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1264,16 +1272,10 @@ async def claude_model_catalog(
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when the probe failed.
     """
-    from omnigent.onboarding.ambient import claude_managed_model_picker
-
-    managed_picker = claude_managed_model_picker() if claude_config is None else ()
-    managed_rows: list[dict[str, object]] = [
-        {"id": model, "model": model, "displayName": label} for model, label in managed_picker
-    ]
     probe = await probe_claude_model_options(claude_config)
     if probe is None:
-        return managed_rows or None
-    rows = managed_rows or list(probe.alias_rows)
+        return None
+    rows = list(probe.alias_rows)
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
     ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
@@ -1295,7 +1297,7 @@ async def claude_model_catalog(
             out.append({**row, "isDefault": True})
         else:
             out.append({key: value for key, value in row.items() if key != "isDefault"})
-    if default_model and not marked:
+    if default_model and not marked and default_model not in probe.disabled_models:
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
