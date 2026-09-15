@@ -60,13 +60,19 @@ def _wait_for(check: Callable[[], Any], description: str, timeout: float = 60.0)
 def _app_server_pid(listen_url: str) -> int:
     # The unique loopback listener identifies only this test's app-server.
     output = subprocess.run(
-        ["ps", "-eo", "pid=,args="], capture_output=True, text=True, check=True, timeout=10
+        ["ps", "-ww", "-eo", "pid=,ppid=,args="],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
     ).stdout
-    matches = [
-        int(line.strip().split(maxsplit=1)[0])
-        for line in output.splitlines()
-        if listen_url in line and "app-server" in line
-    ]
+    processes = {
+        int(pid): int(ppid)
+        for pid, ppid, args in (line.split(maxsplit=2) for line in output.splitlines())
+        if listen_url in args and "app-server" in args
+    }
+    # npm's Node launcher passes the same arguments to the native child.
+    matches = [pid for pid in processes if pid not in processes.values()]
     assert len(matches) == 1, f"Expected one app-server, found PIDs {matches}"
     return matches[0]
 
