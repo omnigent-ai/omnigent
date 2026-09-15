@@ -499,18 +499,18 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repos:
-        # Prefer the owner's per-user credential for the clone: when they've
-        # connected GitHub, wire the broker as the sole github.com helper so a
-        # private clone authenticates as *them*. Wired ONCE (it configures the
-        # global github.com helper for every clone below). When they haven't
-        # connected this is a no-op that leaves the image's shared ``$GIT_TOKEN``
-        # helper in place; ``|| true`` keeps a broker hiccup from failing the
-        # clone (it then falls back to ``$GIT_TOKEN``). Needs OMNIGENT_HOST_TOKEN.
+        # Prefer the owner's per-user credential for the clone. Skip the
+        # broker when GIT_TOKEN is already in env: it 404s before the host
+        # registers and clearing the image helper makes clone fail Username.
         wire = (
             "from omnigent.git_credential_github import configure_clone_credentials; "
             f"configure_clone_credentials({server_url!r}, {host_id!r})"
         )
-        script += f"python3 -c {shlex.quote(wire)} || true\n"
+        script += (
+            f'if [ -z "${{GIT_TOKEN:-}}" ]; then\n'
+            f"  python3 -c {shlex.quote(wire)} || true\n"
+            f"fi\n"
+        )
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
         # the launch loudly, not boot the host on it. ``set -e`` stays on, but a
