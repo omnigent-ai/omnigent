@@ -336,7 +336,10 @@ class _TmuxCommandError(RuntimeError):
     ) -> None:
         self.returncode = returncode
         self.detail = stderr.decode(errors="replace").strip() or "<no stderr>"
-        super().__init__(f"tmux command failed (rc={returncode}): {' '.join(cmd)}: {self.detail}")
+        super().__init__(
+            f"tmux command failed (rc={returncode}): "
+            + json.dumps({"cmd": cmd, "detail": self.detail})
+        )
 
 
 class _TmuxProcessStartError(RuntimeError):
