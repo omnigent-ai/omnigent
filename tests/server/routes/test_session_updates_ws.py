@@ -863,6 +863,62 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.75)
 
 
+def test_priced_turn_marks_owner_usage_summary_stale(app: FastAPI, stores) -> None:
+    """Recording priced spend invalidates the owner's cached usage breakdowns.
+
+    The usage page serves harness/model breakdowns from the ``user_usage_summary``
+    cache, so a priced turn that isn't followed by an invalidation would leave
+    the page showing pre-turn numbers forever. The staleness marking rides the
+    daily-rollup write path (``_record_daily_cost``), which already resolved
+    the owner — this guards that the cache flip survives that placement.
+    """
+    conversation_store = stores[0]
+    sid = _seed_session(stores, owner=ALICE, title="cache invalidation session")
+    conversation_store.set_usage_summary(ALICE, {"claude-sdk": 1.0}, {"model-a": 1.0}, 1)
+    assert conversation_store.get_usage_summary(ALICE) is not None
+
+    resp = TestClient(app).post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.5}},
+        headers={"X-Forwarded-Email": ALICE},
+    )
+    assert resp.status_code == 202, resp.text
+
+    # Stale now — the next usage-page read rebuilds with the new spend.
+    assert conversation_store.get_usage_summary(ALICE) is None
+
+
+def test_sub_agent_turn_marks_root_owner_usage_summary_stale(app: FastAPI, stores) -> None:
+    """Sub-agent spend invalidates the ROOT owner's cached breakdowns.
+
+    Sub-agent conversations carry no owner grant, so a direct
+    ``get_session_owner(child.id)`` misses. Invalidation must use the same
+    root-fallback attribution as the daily rollup; scoping it to the direct
+    owner only would leave the parent owner's breakdown cache stale even
+    though their rolled-up session costs changed.
+    """
+    conversation_store, _agent_store, _permission_store = stores
+
+    parent_id = _seed_session(stores, owner=ALICE, title="parent session")
+    child = conversation_store.create_conversation(
+        title="sub-agent",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        parent_conversation_id=parent_id,
+    )
+    assert conversation_store.get_session_owner(child.id) is None
+
+    conversation_store.set_usage_summary(ALICE, {"claude-sdk": 1.0}, {"model-a": 1.0}, 1)
+
+    # Internal runner path — no auth header, spend lands on the child.
+    resp = TestClient(app).post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.75}},
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert conversation_store.get_usage_summary(ALICE) is None
+
+
 def test_projects_changed_event_forwards_to_client(
     app: FastAPI, stores, fast_rescan: None
 ) -> None:

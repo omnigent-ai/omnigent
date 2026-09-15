@@ -5766,6 +5766,35 @@ def test_set_session_usage_overwrites(
     assert fetched.session_usage == {"input_tokens": 200, "output_tokens": 50}
 
 
+def test_usage_summary_cache_round_trip(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The usage-summary cache serves only fresh rows; stale rows read as a miss."""
+    # No row yet reads as a miss, and marking stale must not create a hit.
+    assert conversation_store.get_usage_summary("alice@example.com") is None
+    conversation_store.mark_usage_summary_stale("alice@example.com")
+    assert conversation_store.get_usage_summary("alice@example.com") is None
+
+    conversation_store.set_usage_summary(
+        "alice@example.com", {"claude-sdk": 2.0}, {"model-a": 2.0}, 3
+    )
+    assert conversation_store.get_usage_summary("alice@example.com") == (
+        {"claude-sdk": 2.0},
+        {"model-a": 2.0},
+    )
+
+    # Stale rows read as a miss until the next rebuild overwrites them.
+    conversation_store.mark_usage_summary_stale("alice@example.com")
+    assert conversation_store.get_usage_summary("alice@example.com") is None
+    conversation_store.set_usage_summary(
+        "alice@example.com", {"claude-sdk": 2.5}, {"model-a": 2.5}, 4
+    )
+    assert conversation_store.get_usage_summary("alice@example.com") == (
+        {"claude-sdk": 2.5},
+        {"model-a": 2.5},
+    )
+
+
 # ── next_position counter (write-path MAX(position) scan removal) ──────
 
 

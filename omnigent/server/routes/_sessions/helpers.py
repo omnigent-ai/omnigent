@@ -2059,8 +2059,12 @@ def _record_daily_cost(
     """
     Add a turn's LLM cost to the session owner's daily rollup.
 
-    A no-op when *delta_usd* is not positive or the session has no
-    resolvable owner. Attributes the cost to the session creator
+    Also marks the owner's cached usage summary stale, reusing the owner
+    resolved here so the hot path issues no extra lookup; the usage-page
+    breakdowns are rebuilt lazily on the next ``GET /v1/usage``. A no-op
+    when *delta_usd* is not positive (a zero-cost turn cannot change the
+    cost breakdowns) or the session has no resolvable owner. Attributes the
+    cost to the session creator
     (:meth:`ConversationStore.get_session_owner`) and buckets it by the
     current UTC day, so a session spanning midnight splits its spend
     across both days. Recorded for every priced turn regardless of
@@ -2100,6 +2104,7 @@ def _record_daily_cost(
     from omnigent.db.utils import now_epoch
 
     conversation_store.add_daily_cost(owner, _utc_day(now_epoch()), delta_usd)
+    conversation_store.mark_usage_summary_stale(owner)
 
 
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:

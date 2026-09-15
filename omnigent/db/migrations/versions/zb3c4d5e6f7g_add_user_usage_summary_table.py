@@ -1,13 +1,14 @@
 """Add user_usage_summary table for pre-computed breakdowns.
 
 Revision ID: zb3c4d5e6f7g
-Revises: ga1b2c3d4e5f
+Revises: gg1b2c3d4e5f
 Create Date: 2026-08-30 00:00:00.000000
 
 Adds a new ``user_usage_summary`` table to store pre-aggregated usage breakdowns
-per user (harness and model cost distributions). This table is maintained
-incrementally as session usage is recorded, enabling O(1) breakdown queries
-instead of O(N) full-session scans on every ``GET /v1/usage`` request.
+per user (harness and model cost distributions). Rows are marked stale as
+session costs are recorded and rebuilt lazily on the next usage read, enabling
+O(1) breakdown queries instead of O(N) full-session scans on every
+``GET /v1/usage`` request.
 
 Schema:
 - ``user_id``: The user/owner identifier (TEXT primary key)

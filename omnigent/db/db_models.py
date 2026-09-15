@@ -1452,13 +1452,13 @@ class SqlUserUsageSummary(OmnigentBase):
 
     Pre-computed per-user aggregation of harness and model cost breakdowns,
     enabling O(1) breakdown queries on ``GET /v1/usage`` instead of scanning
-    all sessions on every request. Updated incrementally as session usage
-    changes, tracking each session's contribution so we can subtract the old
-    value and add the new value when a session's usage is updated.
+    all sessions on every request. Stale-and-rebuild, not incremental: a
+    priced turn flips ``needs_rebuild`` via
+    :meth:`ConversationStore.mark_usage_summary_stale`, and the next
+    first-page usage read rebuilds the row from all sessions via
+    :meth:`ConversationStore.set_usage_summary`.
 
-    One row per ``user_id``. Maintained by
-    :meth:`ConversationStore.update_usage_summary_for_session` called after
-    :meth:`ConversationStore.increment_session_usage`.
+    One row per ``user_id``.
 
     Breakdowns are all-time aggregates (not date-filtered). Date-range filters
     on ``/v1/usage`` apply to the daily cost timeline and session list, but

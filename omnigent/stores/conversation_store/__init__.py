@@ -1269,9 +1269,10 @@ class ConversationStore(ABC):
         Mark the user's usage summary as needing rebuild.
 
         Sets ``needs_rebuild=True`` in the ``user_usage_summary`` table
-        for this user. Called after :meth:`increment_session_usage` to
-        invalidate the cached breakdown. On the next ``GET /v1/usage``
-        request, the summary will be rebuilt from all sessions.
+        for this user. Called whenever a session's recorded cost changes
+        (alongside the daily-cost rollup write) to invalidate the cached
+        breakdown. On the next first-page ``GET /v1/usage`` request, the
+        summary is rebuilt from all sessions and re-cached.
 
         :param user_id: The user whose summary should be marked stale.
         """
