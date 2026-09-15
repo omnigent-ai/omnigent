@@ -507,6 +507,9 @@ _AGENT_RULE_RELPATH = (".windsurf", "rules", "omnigent-agent-instructions.md")
 #: Frontmatter key naming the session a rule belongs to, so a launch never
 #: deletes or overwrites instructions another session is running under.
 _AGENT_RULE_STAMP_KEY = "omnigent_session"
+#: Where the launch path records the workspace, so the SessionEnd hook can find
+#: and remove this session's agent rule (which lives in the workspace, not here).
+_WORKSPACE_HINT_FILE = "workspace.txt"
 
 #: A custom agent's instructions, staged for the first injected message when the
 #: rule channel is not safe to use for this workspace.
@@ -702,6 +705,51 @@ def _stamped_session_is_running(session_id: str) -> bool:
         return bridge_dir_for_session_id(session_id).is_dir()
     except OSError:
         return True
+
+
+def write_devin_workspace_hint(bridge_dir: Path, workspace: Path) -> None:
+    """Record the session's workspace so teardown can find its agent rule.
+
+    The rule lives in the workspace, not the bridge dir, and the SessionEnd hook
+    that removes it does not otherwise know where the workspace is. Best-effort.
+
+    :param bridge_dir: Per-session bridge directory.
+    :param workspace: The session's workspace directory.
+    """
+    with contextlib.suppress(OSError):
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (bridge_dir / _WORKSPACE_HINT_FILE).write_text(str(workspace), encoding="utf-8")
+
+
+def read_devin_workspace_hint(bridge_dir: Path) -> Path | None:
+    """Return the workspace recorded by :func:`write_devin_workspace_hint`."""
+    try:
+        text = (bridge_dir / _WORKSPACE_HINT_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return Path(text) if text else None
+
+
+def remove_devin_agent_rule_if_owned(workspace: Path, session_id: str) -> bool:
+    """Remove the always-on agent rule at session teardown, if this session owns it.
+
+    The rule is loaded into every turn's system prompt and, without teardown,
+    outlives the session: a later plain ``devin`` run in the same checkout —
+    Omnigent's or not — would pick up the finished custom agent's instructions.
+    Removal is gated on the frontmatter ownership stamp, so a rule another session
+    is actively running under (shared workspace) is left in place.
+
+    :param workspace: The session's workspace directory.
+    :param session_id: The conversation id stamped on this session's rule.
+    :returns: ``True`` when a rule owned by *session_id* was removed.
+    """
+    rule_path = workspace.joinpath(*_AGENT_RULE_RELPATH)
+    owner, existing = _read_agent_rule(rule_path)
+    if not existing or owner != session_id:
+        return False
+    with contextlib.suppress(OSError):
+        rule_path.unlink(missing_ok=True)
+    return True
 
 
 def write_agent_instructions_preamble(bridge_dir: Path, instructions: str) -> None:
@@ -1495,6 +1543,33 @@ def _reject_reserved_passthrough(passthrough: Sequence[str]) -> None:
         )
 
 
+def _drop_passthrough_flag(passthrough: Sequence[str], flag: str) -> list[str]:
+    """Return *passthrough* with every ``flag`` (and its value) removed.
+
+    Handles both ``--flag value`` (two tokens) and ``--flag=value`` (one). Used
+    to collapse a flag Omnigent also emits first-class: ``devin`` rejects a
+    repeated option ("cannot be used multiple times") rather than taking the
+    last, so the same ``--model`` in both channels would fail startup.
+
+    :param passthrough: User/CLI-supplied args.
+    :param flag: The long flag to strip, e.g. ``"--model"``.
+    :returns: A new list without the flag or its argument.
+    """
+    out: list[str] = []
+    skip_value = False
+    for arg in passthrough:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg == flag:
+            skip_value = True  # drop the following value token too
+            continue
+        if arg.startswith(f"{flag}="):
+            continue
+        out.append(arg)
+    return out
+
+
 def build_devin_launch_args(
     passthrough: Sequence[str],
     *,
@@ -1527,6 +1602,13 @@ def build_devin_launch_args(
     if resume_id:
         args.extend(["--resume", resume_id])
     if model:
+        # The CLI daemon path persists the resolved model into terminal_launch_args
+        # too (it predates the structured model_override channel). Emitting it here
+        # AND in passthrough would repeat --model, which devin rejects; the
+        # first-class value is authoritative, so strip any passthrough copy. When
+        # no first-class model is set, a passthrough --model is left as the sole
+        # source rather than dropped.
+        passthrough = _drop_passthrough_flag(passthrough, "--model")
         args.extend(["--model", model])
     if permission_mode:
         args.extend(["--permission-mode", permission_mode])

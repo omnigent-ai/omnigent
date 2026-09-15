@@ -30,8 +30,10 @@ from omnigent.harnesses.devin_native.bridge import (
     iter_hook_events,
     prepare_bridge_dir,
     read_agent_instructions_preamble,
+    read_devin_workspace_hint,
     read_fork_preamble,
     record_hook_event,
+    remove_devin_agent_rule_if_owned,
     session_config_path,
     wrap_agent_instructions,
     wrap_fork_preamble,
@@ -39,6 +41,7 @@ from omnigent.harnesses.devin_native.bridge import (
     write_devin_agent_rule,
     write_devin_mcp_config,
     write_devin_session_config,
+    write_devin_workspace_hint,
     write_fork_preamble,
 )
 from omnigent.harnesses.devin_native.hook import _normalize_tool_result
@@ -129,9 +132,26 @@ class TestComposeModel:
     def test_no_model_is_none(self) -> None:
         assert compose_devin_model(None, "high") is None
 
-    def test_already_composed_variant_is_left_alone(self) -> None:
-        # A full variant id must not gain a second rung suffix.
-        assert compose_devin_model("claude-opus-5-xhigh", "max") == "claude-opus-5-xhigh"
+    def test_a_composed_variant_recomposes_to_the_requested_rung(self) -> None:
+        # A stored override can already carry a rung (e.g. after a launch persists
+        # the composed id). A later effort switch must resolve the NEW rung from
+        # the family, not keep the old suffix — that no-op was the mid-session
+        # effort bug. It also never double-suffixes.
+        assert (
+            compose_devin_model("claude-opus-5-xhigh", "max", families=[_FAMILY_OPUS])
+            == "claude-opus-5-max"
+        )
+        assert (
+            compose_devin_model("claude-opus-5-xhigh", "low", families=[_FAMILY_OPUS])
+            == "claude-opus-5-low"
+        )
+
+    def test_offline_recompose_does_not_double_suffix(self) -> None:
+        # With no catalog, the existing rung is stripped before the new one is
+        # applied, so we never emit `…-xhigh-low`.
+        assert compose_devin_model("claude-opus-5-xhigh", "low", families=None) == (
+            "claude-opus-5-low"
+        )
 
     def test_a_rung_the_family_lacks_falls_back_to_it(self) -> None:
         # swe-2 has only medium/high/max, and no `swe-2-low` exists anywhere in
@@ -368,6 +388,33 @@ class TestAgentRule:
         prepare_bridge_dir("live-sess")
         assert write_devin_agent_rule(tmp_path, "shared instructions", session_id="live-sess")
 
+    def test_teardown_removes_this_sessions_rule(self, tmp_path: Path) -> None:
+        rule = tmp_path / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+        write_devin_agent_rule(tmp_path, "agent instructions", session_id="sess-a")
+        assert rule.exists()
+        # At session end the rule must go, or it loads into a later Devin run.
+        assert remove_devin_agent_rule_if_owned(tmp_path, "sess-a") is True
+        assert not rule.exists()
+
+    def test_teardown_leaves_another_sessions_rule(self, tmp_path: Path) -> None:
+        rule = tmp_path / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+        write_devin_agent_rule(tmp_path, "agent A instructions", session_id="sess-a")
+        # A different session ending must not delete the rule sess-a owns.
+        assert remove_devin_agent_rule_if_owned(tmp_path, "sess-b") is False
+        assert "agent A instructions" in rule.read_text(encoding="utf-8")
+
+    def test_teardown_is_a_noop_without_a_rule(self, tmp_path: Path) -> None:
+        assert remove_devin_agent_rule_if_owned(tmp_path, "sess-a") is False
+
+    def test_workspace_hint_round_trips(self, tmp_path: Path) -> None:
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        write_devin_workspace_hint(bridge, tmp_path / "ws")
+        assert read_devin_workspace_hint(bridge) == tmp_path / "ws"
+
+    def test_absent_workspace_hint_is_none(self, tmp_path: Path) -> None:
+        assert read_devin_workspace_hint(tmp_path) is None
+
 
 class TestAgentInstructionsPreamble:
     """The fallback channel when the rule would not be session-scoped."""
@@ -482,6 +529,28 @@ class TestLaunchArgs:
     def test_passthrough_args_come_last(self) -> None:
         args = self._args(passthrough=["--foo", "bar"], model="swe-2")
         assert args[-2:] == ["--foo", "bar"]
+
+    def test_a_first_class_model_dedupes_a_passthrough_model(self) -> None:
+        # The CLI daemon path persists `--model` into terminal_launch_args AND the
+        # runner emits it first-class from model_override; devin rejects a repeated
+        # --model, so exactly one must survive, the first-class value.
+        args = self._args(passthrough=["--model", "swe-2", "--foo"], model="swe-2-high")
+        assert args.count("--model") == 1
+        assert args[args.index("--model") + 1] == "swe-2-high"
+        assert "--foo" in args
+        assert "swe-2" not in args  # the passthrough value is gone with its flag
+
+    def test_dedupes_the_equals_form_too(self) -> None:
+        args = self._args(passthrough=["--model=swe-2"], model="swe-2-high")
+        assert args.count("--model") == 1
+        assert "--model=swe-2" not in args
+
+    def test_a_passthrough_model_survives_when_no_first_class_model(self) -> None:
+        # No model_override to emit first-class: the passthrough copy is the only
+        # source and must not be dropped.
+        args = self._args(passthrough=["--model", "swe-2"])
+        assert args.count("--model") == 1
+        assert args[args.index("--model") + 1] == "swe-2"
 
 
 class TestHookEventLog:
@@ -1030,3 +1099,50 @@ class TestBlockedPromptRecord:
             tmp_path, monkeypatch, {"decision": "block", "reason": "server unreachable"}
         )
         assert events[0]["omnigent_policy_blocked"] is True
+
+
+class TestSessionEndRuleTeardown:
+    """SessionEnd removes this session's agent rule so it doesn't outlive it."""
+
+    def _run_session_end(
+        self, bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, session_id: str
+    ) -> None:
+        import io
+
+        from omnigent.harnesses.devin_native import hook as devin_hook
+
+        monkeypatch.setenv(devin_hook._SERVER_URL_ENV, "http://127.0.0.1:1")
+        monkeypatch.setenv(devin_hook._SESSION_ID_ENV, session_id)
+        payload = {"hook_event_name": "SessionEnd", "session_id": "devin-xyz"}
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+        devin_hook.main([str(bridge_dir)])
+
+    def test_owned_rule_is_removed_on_session_end(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        write_devin_agent_rule(workspace, "custom brief", session_id="conv_abc")
+        write_devin_workspace_hint(bridge, workspace)
+        rule = workspace / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+        assert rule.exists()
+
+        self._run_session_end(bridge, monkeypatch, "conv_abc")
+        assert not rule.exists(), "the finished session's rule must be gone"
+
+    def test_session_end_leaves_a_rule_owned_by_another_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        write_devin_agent_rule(workspace, "other brief", session_id="conv_other")
+        write_devin_workspace_hint(bridge, workspace)
+        rule = workspace / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+
+        # This session (conv_abc) ending must not delete conv_other's live rule.
+        self._run_session_end(bridge, monkeypatch, "conv_abc")
+        assert "other brief" in rule.read_text(encoding="utf-8")
