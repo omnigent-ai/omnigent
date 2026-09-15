@@ -1581,7 +1581,8 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
     await server.close()
 
     app_server_argv = _build_native_codex_app_server_argv(
-        tagged_argv0="codex session-tag",
+        codex_argv0="codex",
+        session_tag="session-tag",
         listen_url="ws://127.0.0.1:9876",
         config_overrides=server.config_overrides,
     )
@@ -1610,6 +1611,37 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
     assert provider["wire_api"] == "responses"
     assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_app_server_argv_carries_session_tag_as_config_override() -> None:
+    """The crash-reap tag travels as a -c argument, not argv[0].
+
+    Shebang wrappers rewrite argv[0], so it stays the bare name.
+    """
+    from omnigent.harnesses.codex_native import process_registry as codex_process_registry
+
+    tag = "session-tag-123"
+    argv = _build_native_codex_app_server_argv(
+        codex_argv0="codex",
+        session_tag=tag,
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=('model="probe-model"',),
+    )
+    needle = codex_process_registry.codex_native_session_tag_cmdline_arg(tag)
+    assert argv[0] == "codex"
+    assert "omnigent_crash_teardown_tag" not in argv[0]
+    tag_index = argv.index("-c")
+    assert argv[tag_index + 1] == needle
+    assert argv == [
+        "codex",
+        "app-server",
+        "-c",
+        needle,
+        "--listen",
+        "ws://127.0.0.1:9876",
+        "-c",
+        'model="probe-model"',
+    ]
 
 
 def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
@@ -3309,6 +3341,14 @@ async def test_discovery_process_captures_stderr_in_memory(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    # Registry side effects are covered by the dedicated tests below; this
+    # stderr-shape test stays hermetic.
+    monkeypatch.setattr(
+        codex_native_app_server, "reconcile_codex_native_process_registry", lambda: None
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "acquire_codex_native_process_owner_lock", lambda: None
+    )
 
     discovery = await codex_native_app_server._start_codex_model_discovery_process(
         codex_path="/test/codex",
@@ -3337,3 +3377,291 @@ async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:
     )
     with pytest.raises(RuntimeError, match=r"^Codex model discovery exited early \(1\)$"):
         await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)
+
+
+def _isolated_discovery_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object]]:
+    """Redirect probe registry IO to *tmp_path* and record reconcile/register calls."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import process_registry as codex_process_registry
+
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    registry_path = tmp_path / "registry.json"
+    real_reconcile = codex_process_registry.reconcile_codex_native_process_registry
+    real_register = codex_process_registry.register_codex_native_process
+    real_unregister = codex_process_registry.unregister_codex_native_process
+    calls: dict[str, object] = {"reconciled": 0}
+
+    def _reconcile() -> None:
+        calls["reconciled"] = int(calls["reconciled"]) + 1
+        real_reconcile(registry_path=registry_path)
+
+    def _register(
+        *,
+        pid: int,
+        pgid: int,
+        session_tag: str,
+        owner_lock_path: object,
+        **kwargs: object,
+    ) -> None:
+        del kwargs
+        calls["pid"] = pid
+        calls["pgid"] = pgid
+        calls["session_tag"] = session_tag
+        real_register(
+            pid=pid,
+            pgid=pgid,
+            session_tag=session_tag,
+            owner_lock_path=owner_lock_path,  # type: ignore[arg-type]
+            registry_path=registry_path,
+        )
+
+    def _unregister(session_tag: str, **kwargs: object) -> None:
+        del kwargs
+        real_unregister(session_tag, registry_path=registry_path)
+
+    monkeypatch.setattr(
+        codex_native_app_server, "reconcile_codex_native_process_registry", _reconcile
+    )
+    monkeypatch.setattr(codex_native_app_server, "register_codex_native_process", _register)
+    monkeypatch.setattr(codex_native_app_server, "unregister_codex_native_process", _unregister)
+    return registry_path, calls
+
+
+def _read_discovery_registry_entries(registry_path: Path) -> list[dict[str, object]]:
+    try:
+        raw = registry_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    payload = json.loads(raw)
+    assert isinstance(payload, list)
+    return [item for item in payload if isinstance(item, dict)]
+
+
+@pytest.mark.posix_only
+async def test_model_discovery_spawn_registers_crash_safe_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The probe spawn registers a tagged entry whose tag is in the argv list."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import process_registry as codex_process_registry
+
+    registry_path, calls = _isolated_discovery_registry(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> object:
+        captured["args"] = list(args)
+        captured["kwargs"] = dict(kwargs)
+        stderr = asyncio.StreamReader()
+        stderr.feed_eof()
+
+        class _FakeProcess:
+            pid = 1234567
+            returncode: int | None = None
+
+            def terminate(self) -> None:
+                self.returncode = 0
+
+            def kill(self) -> None:
+                self.returncode = -1
+
+            async def wait(self) -> int:
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        process = _FakeProcess()
+        process.stderr = stderr  # type: ignore[attr-defined]
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    listen_url = "ws://127.0.0.1:12345"
+
+    discovery = await codex_native_app_server._start_codex_model_discovery_process(
+        codex_path="/test/codex",
+        listen_url=listen_url,
+        env={},
+        cwd=tmp_path,
+        config_overrides=('model="probe-model"',),
+    )
+    try:
+        assert calls["reconciled"] == 1
+        assert isinstance(captured["args"], list)
+        assert isinstance(captured["kwargs"], dict)
+        args = [str(arg) for arg in captured["args"]]
+        kwargs = captured["kwargs"]
+        assert kwargs["executable"] == "/test/codex"
+        tag = discovery.session_tag
+        assert tag is not None and tag.startswith("codex-model-probe-")
+        needle = codex_process_registry.codex_native_session_tag_cmdline_arg(tag)
+        assert args[0] == "codex"
+        assert "omnigent_crash_teardown_tag" not in args[0]
+        assert args[1:] == [
+            "app-server",
+            "-c",
+            needle,
+            "--listen",
+            listen_url,
+            "-c",
+            'model="probe-model"',
+        ]
+        assert discovery.owner_lock is not None
+        entries = _read_discovery_registry_entries(registry_path)
+        assert len(entries) == 1
+        assert entries[0]["session_tag"] == tag == calls["session_tag"]
+        assert entries[0]["pid"] == 1234567 == calls["pid"]
+        assert entries[0]["pgid"] == calls["pgid"]
+        assert entries[0]["owner_lock_path"] == str(discovery.owner_lock.path)
+    finally:
+        await codex_native_app_server._stop_codex_model_discovery_process(discovery)
+
+
+@pytest.mark.posix_only
+async def test_model_discovery_stop_removes_entry_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Stopping the probe removes its registry entry and releases the lock."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    registry_path, _calls = _isolated_discovery_registry(monkeypatch, tmp_path)
+
+    async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        stderr = asyncio.StreamReader()
+        stderr.feed_eof()
+
+        class _FakeProcess:
+            pid = 1234568
+            returncode: int | None = None
+
+            def terminate(self) -> None:
+                self.returncode = 0
+
+            def kill(self) -> None:
+                self.returncode = -1
+
+            async def wait(self) -> int:
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        process = _FakeProcess()
+        process.stderr = stderr  # type: ignore[attr-defined]
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    discovery = await codex_native_app_server._start_codex_model_discovery_process(
+        codex_path="/test/codex",
+        listen_url="ws://127.0.0.1:12346",
+        env={},
+        cwd=tmp_path,
+    )
+    assert discovery.session_tag is not None
+    assert discovery.owner_lock is not None
+    lock_path = Path(discovery.owner_lock.path)
+    assert lock_path.exists()
+    assert len(_read_discovery_registry_entries(registry_path)) == 1
+
+    await codex_native_app_server._stop_codex_model_discovery_process(discovery)
+
+    assert _read_discovery_registry_entries(registry_path) == []
+    assert not lock_path.exists()
+
+
+@pytest.mark.posix_only
+async def test_model_discovery_stop_keeps_entry_when_terminate_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed teardown keeps the entry for reconcile but still releases the lock."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import process_registry as codex_process_registry
+
+    registry_path, _calls = _isolated_discovery_registry(monkeypatch, tmp_path)
+    owner_lock = codex_native_app_server.acquire_codex_native_process_owner_lock()
+    assert owner_lock is not None
+    session_tag = "codex-model-probe-failing-teardown"
+    codex_process_registry.register_codex_native_process(
+        pid=1234569,
+        pgid=1234569,
+        session_tag=session_tag,
+        owner_lock_path=owner_lock.path,
+        registry_path=registry_path,
+    )
+
+    class _FailingProcess:
+        pid = 1234569
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            return 0
+
+    async def _empty_stderr() -> str:
+        return ""
+
+    def _boom(process: object) -> None:
+        del process
+        raise RuntimeError("terminate boom")
+
+    monkeypatch.setattr(codex_native_app_server._proc, "terminate_tree", _boom)
+    discovery = codex_native_app_server._CodexModelDiscoveryProcess(
+        process=_FailingProcess(),  # type: ignore[arg-type]
+        stderr_tail=asyncio.create_task(_empty_stderr()),
+        session_tag=session_tag,
+        owner_lock=owner_lock,
+    )
+
+    with pytest.raises(RuntimeError, match="terminate boom"):
+        await codex_native_app_server._stop_codex_model_discovery_process(discovery)
+
+    entries = _read_discovery_registry_entries(registry_path)
+    assert len(entries) == 1
+    assert entries[0]["session_tag"] == session_tag
+    assert not Path(owner_lock.path).exists()
+
+
+@pytest.mark.posix_only
+async def test_model_discovery_spawn_failure_releases_owner_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed probe spawn releases the owner lock instead of leaking it."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import process_registry as codex_process_registry
+
+    registry_path, calls = _isolated_discovery_registry(monkeypatch, tmp_path)
+    real_acquire = codex_process_registry.acquire_codex_native_process_owner_lock
+    acquired: list[Path] = []
+
+    def _acquire() -> object:
+        lock = real_acquire()
+        if lock is not None:
+            acquired.append(Path(lock.path))
+        return lock
+
+    async def _failing_spawn(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError("exec failed")
+
+    monkeypatch.setattr(
+        codex_native_app_server, "acquire_codex_native_process_owner_lock", _acquire
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _failing_spawn)
+
+    with pytest.raises(OSError, match="exec failed"):
+        await codex_native_app_server._start_codex_model_discovery_process(
+            codex_path="/test/codex",
+            listen_url="ws://127.0.0.1:12347",
+            env={},
+            cwd=tmp_path,
+        )
+
+    assert len(acquired) == 1
+    assert not acquired[0].exists()
+    assert _read_discovery_registry_entries(registry_path) == []
+    assert calls["reconciled"] == 1
