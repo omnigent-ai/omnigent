@@ -3667,7 +3667,7 @@ async function refreshSessionBinding(id: string): Promise<void> {
   } catch {
     return;
   }
-  void queryClient?.invalidateQueries({ queryKey: ["session-skills", id] });
+  void queryClient?.invalidateQueries({ queryKey: ["skills", id] });
   // Apply to the conversation this refresh was for, not whichever is on screen:
   // an agent switch in a backgrounded conversation must still re-derive its
   // binding (most importantly `isNativeTerminalSession`, which gates the

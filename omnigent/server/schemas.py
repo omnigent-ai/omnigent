@@ -261,10 +261,9 @@ class AgentObject(BaseModel):
     :param skills: Skills bundled in the agent spec
         (``skills/<dir>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
-        session (and its runner) exists. Host-discovered skills
-        are runner-owned, so they are NOT listed here — the
-        session snapshot's ``skills`` field carries the merged
-        set once a runner is bound. Empty list when the spec
+        session exists. ``GET /skills`` discovers host skills and,
+        when given ``session_id``, merges the session's bundled skills.
+        Empty list when the spec
         bundles no skills or when the bundle cannot be loaded.
     :param terminals: Terminal names declared in the spec's
         ``terminals:`` block, in declaration order, e.g.
@@ -2103,7 +2102,7 @@ class SessionResponse(BaseModel):
     :param todos: Current native Plan items reported by a harness. Each has
         ``content``, ``status``, and ``activeForm``. Persisted in conversation
         metadata; empty before the first report or after an explicit clear.
-    :param skills: Deprecated; use GET /sessions/{id}/skills. Removed in 0.15.0.
+    :param skills: Deprecated; use GET /skills?session_id={id}. Removed in 0.15.0.
     :param skills_status: Deprecated; removed in 0.15.0 with snapshot skills.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
@@ -2191,10 +2190,10 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(
-        default_factory=list, deprecated="Use GET /sessions/{id}/skills; removed in 0.15.0."
+        default_factory=list, deprecated="Use GET /skills?session_id={id}; removed in 0.15.0."
     )
     skills_status: Literal["loading", "ready", "error", "unavailable"] = Field(
-        default="unavailable", deprecated="Use GET /sessions/{id}/skills; removed in 0.15.0."
+        default="unavailable", deprecated="Use GET /skills?session_id={id}; removed in 0.15.0."
     )
     model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False

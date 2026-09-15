@@ -1,3 +1,6 @@
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 // The landing screen's mobile chrome. One rule, about arriving at "/" on a
 // phone: the composer is not focused, so landing here — including on the way
 // back out of Settings — never throws up the keyboard unasked. (The iOS
@@ -32,7 +35,6 @@ vi.mock("@/lib/identity", () => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
-  useHostSkills: vi.fn(() => ({ data: [], isPending: false, isError: false, refetch: vi.fn() })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));

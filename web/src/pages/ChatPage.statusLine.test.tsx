@@ -1,5 +1,5 @@
-vi.mock("@/hooks/useSessionSkills", () => ({
-  useSessionSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
 }));
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";

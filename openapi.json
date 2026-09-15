@@ -126,7 +126,7 @@
             "type": "array"
           },
           "skills": {
-            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
+            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session exists. `GET /skills` discovers host skills and, when given `session_id`, merges the session's bundled skills. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -2646,23 +2646,6 @@
           "routable_models"
         ],
         "title": "HostModelOptionsResponse",
-        "type": "object"
-      },
-      "HostSkillsResponse": {
-        "description": "User-invocable skill metadata discovered on a host.",
-        "properties": {
-          "skills": {
-            "items": {
-              "$ref": "#/components/schemas/SkillSummary"
-            },
-            "title": "Skills",
-            "type": "array"
-          }
-        },
-        "required": [
-          "skills"
-        ],
-        "title": "HostSkillsResponse",
         "type": "object"
       },
       "ImportItemInput": {
@@ -6862,7 +6845,7 @@
           },
           "skills": {
             "deprecated": true,
-            "description": "Deprecated; use GET /sessions/{id}/skills. Removed in 0.15.0.",
+            "description": "Deprecated; use GET /skills?session_id={id}. Removed in 0.15.0.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -7758,6 +7741,23 @@
           "description"
         ],
         "title": "SkillSummary",
+        "type": "object"
+      },
+      "SkillsResponse": {
+        "description": "User-invocable skill metadata discovered on a host.",
+        "properties": {
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills"
+        ],
+        "title": "SkillsResponse",
         "type": "object"
       },
       "SlashCommandData": {
@@ -9894,70 +9894,6 @@
           }
         },
         "summary": "Get Host Model Options",
-        "tags": [
-          "hosts"
-        ]
-      }
-    },
-    "/v1/hosts/{host_id}/harnesses/{harness}/skills": {
-      "get": {
-        "description": "Discover workspace, user, and plugin skill metadata before a session exists.\n\nUses the host's ambient harness configuration. Sessions may add bundled\nagent skills and apply agent filters, so this is a pre-launch catalog.\nRequires a connected host running a version that supports skill discovery.",
-        "operationId": "get_host_skills_v1_hosts__host_id__harnesses__harness__skills_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "host_id",
-            "required": true,
-            "schema": {
-              "title": "Host Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "harness",
-            "required": true,
-            "schema": {
-              "title": "Harness",
-              "type": "string"
-            }
-          },
-          {
-            "description": "Absolute or tilde-prefixed discovery directory on the selected host.",
-            "in": "query",
-            "name": "path",
-            "required": true,
-            "schema": {
-              "description": "Absolute or tilde-prefixed discovery directory on the selected host.",
-              "minLength": 1,
-              "title": "Path",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HostSkillsResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Get Host Skills",
         "tags": [
           "hosts"
         ]
@@ -14891,49 +14827,6 @@
         ]
       }
     },
-    "/v1/sessions/{session_id}/skills": {
-      "get": {
-        "description": "Discover the effective session catalog on its host, without a runner.",
-        "operationId": "get_session_skills_v1_sessions__session_id__skills_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HostSkillsResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Get Session Skills",
-        "tags": [
-          "sessions"
-        ]
-      }
-    },
     "/v1/sessions/{session_id}/stream": {
       "get": {
         "description": "Subscribe to the session's live SSE event stream.\n\nDoes NOT replay history; clients reconcile via the snapshot\nendpoint. The generator emits `[DONE]` on normal completion\nand uses `finally` only for presence cleanup \u2014 see\n`_stream_live_events`.\n\nHolding this stream open registers the caller as a session\n*viewer* (presence): co-viewers' streams receive\n`session.presence` events on join/leave/idle edges, and\nthis stream's snapshot-on-connect includes the current\nviewer list. Presence is scoped to the session tree's root\nconversation, so viewers of different agents/sub-agents in\none session see each other. See\n`omnigent/server/presence.py`.\n\n**Returns:** An SSE `StreamingResponse`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -15163,6 +15056,108 @@
         "summary": "Set Sharing",
         "tags": [
           "sharing"
+        ]
+      }
+    },
+    "/v1/skills": {
+      "get": {
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. The two forms cannot be combined.",
+        "operationId": "get_skills_v1_skills_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Skills",
+        "tags": [
+          "skills"
         ]
       }
     },

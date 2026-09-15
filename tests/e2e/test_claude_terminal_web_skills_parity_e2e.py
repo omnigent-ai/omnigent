@@ -2,7 +2,7 @@
 terminal's loaded skills.
 
 For a claude-family session the web composer's slash-command menu is fed by
-``GET /v1/sessions/{id}/skills`` (``_resolve_session_skills`` →
+``GET /v1/skills?session_id={id}`` (``resolve_session_skills`` →
 ``resolve_harness_skills``), while the embedded terminal's menu is whatever
 the real Claude Code CLI discovers itself. Live-verified against Claude Code
 v2.1.212, the two disagree in both directions:

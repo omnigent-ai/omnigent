@@ -26,6 +26,7 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -888,6 +889,16 @@ def multi_user_app(
         ),
         prefix="/v1",
     )
+    app.include_router(
+        create_skills_router(
+            registry,
+            host_store,
+            conv_store,
+            auth_provider=auth,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+    )
     return app, registry, host_store, conv_store
 
 
@@ -980,8 +991,8 @@ async def test_host_skills_requires_owner(
     assert conn is not None
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(
-            f"/v1/hosts/{host_id}/harnesses/claude-native/skills",
-            params={"path": "~"},
+            "/v1/skills",
+            params={"host_id": host_id, "harness": "claude-native", "path": "~"},
             headers={"x-test-user": user} if user else {},
         )
     assert response.status_code == status, response.text

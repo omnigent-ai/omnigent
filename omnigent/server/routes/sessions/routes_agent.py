@@ -49,8 +49,6 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
-from omnigent.server.routes._host_launch import host_absent_error
-from omnigent.server.routes._host_skills import request_host_skills
 from omnigent.server.routes._sessions.common import (
     _TURN_ACTOR_LABEL,
     _logger,
@@ -67,7 +65,6 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     _handle_mcp_tools_call,
 )
-from omnigent.server.routes.hosts import HostSkillsResponse
 from omnigent.server.routes.sessions.routes_permissions import (
     _policy_description,
     _policy_type,
@@ -248,55 +245,6 @@ def register_agent_routes(
                 "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
             },
         )
-
-    @router.get("/sessions/{session_id}/skills")
-    async def get_session_skills(request: Request, session_id: str) -> HostSkillsResponse:
-        """Discover the effective session catalog on its host, without a runner."""
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        conv = access.conversation
-        if conv is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None:
-            raise HTTPException(status_code=404, detail="session not found")
-        if conv.host_id is None or not conv.workspace:
-            raise HTTPException(status_code=409, detail="session host is not ready")
-        conn = host_registry.get(conv.host_id) if host_registry is not None else None
-        if conn is None:
-            host_store = getattr(request.app.state, "host_store", None)
-            host = (
-                await asyncio.to_thread(host_store.get_host, conv.host_id)
-                if host_store is not None
-                else None
-            )
-            if host is not None:
-                raise host_absent_error(host)
-            raise HTTPException(status_code=503, detail="session host is offline")
-        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
-        if agent is None:
-            raise HTTPException(status_code=404, detail="session agent not found")
-        assert host_registry is not None
-        result = await request_host_skills(
-            host_registry=host_registry,
-            host_conn=conn,
-            harness="session",
-            path=conv.workspace,
-            session_id=conv.id,
-            agent_id=agent.id,
-            agent_version=str(agent.version),
-            sub_agent_name=conv.sub_agent_name,
-        )
-        if result.status != "ok":
-            raise HTTPException(
-                status_code=502, detail=result.error or "host skill discovery failed"
-            )
-        if result.session_id != conv.id:
-            raise HTTPException(
-                status_code=502, detail="update the host to discover session skills"
-            )
-        return HostSkillsResponse(skills=[SkillSummary.model_validate(s) for s in result.skills])
 
     @router.put(
         "/sessions/{session_id}/agent",

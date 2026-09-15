@@ -1,4 +1,4 @@
-import { useSessionSkills } from "@/hooks/useSessionSkills";
+import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
   HarnessPickerConfigRow,
@@ -2691,7 +2691,16 @@ function ComposerImpl(
     skills,
     skillsStatus,
     refetch: refreshSkills,
-  } = useSessionSkills(composerSession, hostOnline, runnerStarting || terminalPending);
+  } = useSkills({
+    sessionId: composerSession?.id,
+    hostId: composerSession?.hostId,
+    harness: composerSession?.harness,
+    path: composerSession?.workspace,
+    agentId: composerSession?.agentId,
+    subAgentName: composerSession?.subAgentName,
+    enabled: !isReadOnly && hostOnline !== false,
+    starting: !isReadOnly && (runnerStarting || terminalPending),
+  });
   // ``/model`` writes ``conv.model_override`` (the same column the REPL's
   // ``/model`` and native pickers write). In-process harnesses re-resolve
   // it each turn; native wrappers expose it only when they have a picker

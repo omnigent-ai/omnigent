@@ -39,6 +39,7 @@ from omnigent.host.frames import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -115,6 +116,8 @@ def fs_app(
         create_hosts_router(registry, host_store, conv_store),
         prefix="/v1",
     )
+
+    app.include_router(create_skills_router(registry, host_store, conv_store), prefix="/v1")
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -327,8 +330,8 @@ async def test_host_skills_round_trip_without_session(
     replies["skills:claude-sdk:~/project with spaces"] = reply
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(
-            f"/v1/hosts/{_HOST_ID}/harnesses/claude/skills",
-            params={"path": "~/project with spaces"},
+            "/v1/skills",
+            params={"host_id": _HOST_ID, "harness": "claude", "path": "~/project with spaces"},
         )
     assert response.status_code == status, response.text
     assert response.json() == expected
@@ -345,8 +348,8 @@ async def test_host_skills_requires_directory(
     app, _registry, _host_store, _conv_store = fs_app
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(
-            f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/skills",
-            params=params,
+            "/v1/skills",
+            params={"host_id": _HOST_ID, "harness": "claude-native", **params},
         )
     assert response.status_code == 422
 
@@ -368,8 +371,8 @@ async def test_host_skills_requires_connected_host(
             host_store.set_offline(_HOST_ID)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(
-            f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/skills",
-            params={"path": "~"},
+            "/v1/skills",
+            params={"host_id": _HOST_ID, "harness": "claude-native", "path": "~"},
         )
     assert response.status_code == status, response.text
     assert registry.get(_HOST_ID) is None

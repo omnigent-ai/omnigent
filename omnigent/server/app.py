@@ -3234,6 +3234,7 @@ def create_app(
     if host_store is not None:
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
+        from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
@@ -3265,6 +3266,18 @@ def create_app(
             ),
             prefix="/v1",
             tags=["hosts"],
+        )
+        app.include_router(
+            create_skills_router(
+                host_registry,
+                host_store,
+                conversation_store,
+                agent_store=agent_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["skills"],
         )
         # Host-facing credential vending: a sandbox fetches its owner's
         # per-provider credential over the launch-token-authenticated channel
