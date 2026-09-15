@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
+
+import tomllib
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
@@ -417,9 +420,107 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return walk(ctx) + _claude_plugin_skills(ctx)
 
 
+def _codex_home_dir(ctx: SkillSourceContext) -> Path:
+    """
+    Codex's host home (its ``skills/``, ``plugins/`` and ``config.toml`` root).
+
+    A native session honors the ``$CODEX_HOME``-resolved home
+    (``ctx.codex_home``) to stay in step with the terminal; the in-process
+    SDK harness keeps ``~/.codex`` (mirrors :func:`codex_host_skills`).
+    """
+    if ctx.is_native and ctx.codex_home is not None:
+        return ctx.codex_home
+    return ctx.home / ".codex"
+
+
+def _enabled_codex_plugin_keys(codex_home: Path) -> list[str]:
+    """
+    ``<plugin>@<marketplace>`` keys enabled in ``<codex_home>/config.toml``.
+
+    ``codex plugin add`` records each install as a
+    ``[plugins."<plugin>@<marketplace>"]`` table whose ``enabled`` boolean
+    carries the disable toggle (verified against codex-cli 0.139.0). Only a
+    real TOML ``true`` counts. Best-effort: a missing or unparseable config
+    yields no keys.
+    """
+    try:
+        with (codex_home / "config.toml").open("rb") as fh:
+            config = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        return []
+    return [
+        key
+        for key, table in plugins.items()
+        if isinstance(table, dict) and table.get("enabled") is True
+    ]
+
+
+def _codex_plugin_version_key(version: str) -> tuple[tuple[int, int | str], ...]:
+    """Numeric-aware ordering for plugin cache version dir names (not full semver)."""
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part) for part in re.split(r"[.+-]", version)
+    )
+
+
+def _codex_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """
+    Enabled Codex plugin skills, namespaced ``<plugin>:<skill>``.
+
+    Codex installs a plugin into
+    ``<codex_home>/plugins/cache/<marketplace>/<plugin>/<version>/`` and
+    registers each of its ``skills/<dir>/SKILL.md`` under
+    ``<plugin>:<frontmatter-name>``, honoring the ``[plugins]`` enabled state
+    in ``config.toml`` and exposing only the newest cached version (all
+    verified against codex-cli 0.139.0's own ``skills/list``). This mirrors
+    that resolution so the menu matches the CLI's picker. These are not
+    symlinked into ``$CODEX_HOME/skills``: the private session home already
+    bridges ``plugins/cache`` and ``config.toml``, so the CLI loads plugin
+    skills natively and a symlink would double-register them.
+
+    Plugin skills are host skills, so they obey ``skills_filter`` exactly as
+    :func:`_claude_plugin_skills` does: ``"none"`` suppresses them entirely
+    and a list selects by the skill's bare (frontmatter) name.
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names: set[str] | None = (
+        set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    )
+    codex_home = _codex_home_dir(ctx)
+    out: list[SkillSpec] = []
+    for key in _enabled_codex_plugin_keys(codex_home):
+        plugin, _, marketplace = key.partition("@")
+        if not plugin or not marketplace:
+            continue
+        cache_dir = codex_home / "plugins" / "cache" / marketplace / plugin
+        try:
+            versions = [child for child in cache_dir.iterdir() if child.is_dir()]
+        except OSError:  # not installed (or unreadable) despite the config entry
+            continue
+        if not versions:
+            continue
+        # Codex exposes only the newest cached version of an installed
+        # plugin; stale versions left in the cache stay hidden.
+        active = max(versions, key=lambda child: _codex_plugin_version_key(child.name))
+        skipped: list[str] = []
+        for spec in _discover_skills(active / "skills", skipped=skipped):
+            if filter_names is not None and spec.name not in filter_names:
+                continue
+            out.append(replace(spec, name=f"{plugin}:{spec.name}"))
+        # Surface dropped skills with the plugin key so a missing command is
+        # diagnosable rather than silently absent.
+        for detail in skipped:
+            _log.warning("Codex plugin %r: skipped skill: %s", key, detail)
+    return out
+
+
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Codex skills: ``<bundle>/skills`` + the host codex skills dir under the filter.
+    Codex skills: ``<bundle>/skills`` + the host codex skills dir under the filter,
+    plus enabled plugins' skills.
 
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
@@ -439,13 +540,14 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     frontmatter ``name``. Codex registers a skill's slash command under its
     directory, and the executor symlinks under that dir name — so when the
     two differ, the menu label must match the directory (mirrors the Cursor
-    provider). The lazy import keeps the Codex-specific dependency out of
-    ``omnigent.spec``'s module-load path.
+    provider). Enabled plugins' skills are appended by
+    :func:`_codex_plugin_skills`, which mirrors Codex's own plugin resolution
+    (``<plugin>:<frontmatter-name>``). The lazy import keeps the
+    Codex-specific dependency out of ``omnigent.spec``'s module-load path.
     """
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
 
-    host_override = ctx.codex_home if ctx.is_native else None
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
+    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=_codex_home_dir(ctx))
     out: list[SkillSpec] = []
     for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
         try:
@@ -453,7 +555,7 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         except (OmnigentError, OSError):  # best-effort discovery
             continue
         out.append(replace(spec, name=name))
-    return out
+    return out + _codex_plugin_skills(ctx)
 
 
 def cursor_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:

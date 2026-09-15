@@ -504,6 +504,154 @@ def test_codex_provider_respects_none_filter(tmp_path: Path) -> None:
     assert resolve_harness_skills(ctx, "codex") == []
 
 
+def _codex_home_with_plugin(
+    codex_home: Path,
+    *,
+    plugin: str,
+    skill: str,
+    enabled: bool,
+    marketplace: str = "local-market",
+    version: str = "1.0.0",
+) -> None:
+    """Seed a Codex home with one installed plugin (codex-cli 0.139.0 layout).
+
+    Mirrors what ``codex plugin add`` produces: the payload cached at
+    ``plugins/cache/<marketplace>/<plugin>/<version>/skills`` and a
+    ``[plugins."<plugin>@<marketplace>"]`` table in ``config.toml`` carrying
+    the ``enabled`` boolean. Appends the config table only once per key so a
+    plugin can be seeded with several cached versions.
+    """
+    install = codex_home / "plugins" / "cache" / marketplace / plugin / version
+    _write_skill(install / "skills", skill)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    config = codex_home / "config.toml"
+    key = f'[plugins."{plugin}@{marketplace}"]'
+    existing = config.read_text() if config.is_file() else ""
+    if key not in existing:
+        config.write_text(f"{existing}{key}\nenabled = {'true' if enabled else 'false'}\n")
+
+
+def test_codex_provider_surfaces_enabled_plugin_skill_namespaced(tmp_path: Path) -> None:
+    """An enabled plugin's skill joins the inventory as ``<plugin>:<skill>``,
+    alongside the standalone ``skills/`` tier."""
+    home = tmp_path / "home"
+    _write_skill(home / ".codex" / "skills", "standalone-skill")
+    _codex_home_with_plugin(
+        home / ".codex", plugin="demo-plugin", skill="plugin-demo-skill", enabled=True
+    )
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")]
+    assert "demo-plugin:plugin-demo-skill" in names
+    assert "standalone-skill" in names
+
+
+def test_codex_provider_excludes_disabled_plugin(tmp_path: Path) -> None:
+    """A cached plugin whose config entry is ``enabled = false`` stays hidden."""
+    home = tmp_path / "home"
+    _codex_home_with_plugin(
+        home / ".codex", plugin="off-plugin", skill="disabled-plugin-skill", enabled=False
+    )
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")
+    assert out == []
+
+
+def test_codex_plugin_skills_native_honor_codex_home_sdk_keeps_home_codex(
+    tmp_path: Path,
+) -> None:
+    """Plugin discovery follows the same home resolution as standalone skills:
+    native reads the ``$CODEX_HOME``-resolved home, SDK keeps ``~/.codex``."""
+    home = tmp_path / "home"
+    custom = tmp_path / "custom-codex-home"
+    _codex_home_with_plugin(custom, plugin="demo-plugin", skill="plugin-demo-skill", enabled=True)
+    ctx = _ctx(tmp_path / "ws", home, codex_home=custom)
+    native = [s.name for s in resolve_harness_skills(ctx, "codex-native")]
+    sdk = [s.name for s in resolve_harness_skills(ctx, "codex")]
+    assert native == ["demo-plugin:plugin-demo-skill"]
+    assert sdk == []
+
+
+def test_codex_plugin_skill_name_collision_stays_namespaced(tmp_path: Path) -> None:
+    """Two enabled plugins with same-named skills both surface (distinct namespaces)."""
+    home = tmp_path / "home"
+    _codex_home_with_plugin(
+        home / ".codex", plugin="demo-plugin", skill="plugin-demo-skill", enabled=True
+    )
+    _codex_home_with_plugin(
+        home / ".codex", plugin="clash-plugin", skill="plugin-demo-skill", enabled=True
+    )
+    names = {s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")}
+    assert names == {"demo-plugin:plugin-demo-skill", "clash-plugin:plugin-demo-skill"}
+
+
+def test_codex_plugin_stale_cached_version_not_exposed(tmp_path: Path) -> None:
+    """Only the newest cached version's skills surface, with numeric ordering
+    (``10.0.0`` beats ``9.0.0``), matching Codex's own resolution."""
+    home = tmp_path / "home"
+    _codex_home_with_plugin(
+        home / ".codex", plugin="demo-plugin", skill="old-skill", enabled=True, version="9.0.0"
+    )
+    _codex_home_with_plugin(
+        home / ".codex", plugin="demo-plugin", skill="new-skill", enabled=True, version="10.0.0"
+    )
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")]
+    assert names == ["demo-plugin:new-skill"]
+
+
+def test_codex_plugin_skill_surfaces_frontmatter_name(tmp_path: Path) -> None:
+    """The namespace suffix is the skill's frontmatter ``name``, not its dir
+    (matches codex-cli 0.139.0's ``skills/list``)."""
+    home = tmp_path / "home"
+    _codex_home_with_plugin(
+        home / ".codex", plugin="demo-plugin", skill="plugin-demo-skill", enabled=True
+    )
+    skill_dir = (
+        (home / ".codex" / "plugins" / "cache" / "local-market" / "demo-plugin" / "1.0.0")
+        / "skills"
+        / "dir-name-skill"
+    )
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: frontmatter-name-skill\ndescription: probe.\n---\nbody\n"
+    )
+    names = {s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")}
+    assert "demo-plugin:frontmatter-name-skill" in names
+
+
+def test_codex_plugin_skills_respect_filters(tmp_path: Path) -> None:
+    """``skills_filter`` gates plugin skills: ``"none"`` hides them, a list
+    selects by the bare (pre-namespace) name."""
+    home = tmp_path / "home"
+    _codex_home_with_plugin(
+        home / ".codex", plugin="demo-plugin", skill="plugin-demo-skill", enabled=True
+    )
+    ws = tmp_path / "ws"
+    assert resolve_harness_skills(_ctx(ws, home, skills_filter="none"), "codex-native") == []
+    selected = resolve_harness_skills(
+        _ctx(ws, home, skills_filter=["plugin-demo-skill"]), "codex-native"
+    )
+    assert [s.name for s in selected] == ["demo-plugin:plugin-demo-skill"]
+    assert resolve_harness_skills(_ctx(ws, home, skills_filter=["other"]), "codex-native") == []
+
+
+def test_codex_provider_tolerates_malformed_plugin_config(tmp_path: Path) -> None:
+    """A broken ``config.toml`` (or a non-bool ``enabled``) drops plugin skills
+    without touching standalone discovery."""
+    home = tmp_path / "home"
+    _write_skill(home / ".codex" / "skills", "standalone-skill")
+    _codex_home_with_plugin(
+        home / ".codex", plugin="demo-plugin", skill="plugin-demo-skill", enabled=True
+    )
+    config = home / ".codex" / "config.toml"
+
+    config.write_text("not [ valid toml")
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")]
+    assert names == ["standalone-skill"]
+
+    # A string "true" is not an enablement — only a real TOML boolean counts.
+    config.write_text('[plugins."demo-plugin@local-market"]\nenabled = "true"\n')
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")]
+    assert names == ["standalone-skill"]
+
+
 def test_cursor_provider_surfaces_skills_by_dir_name(tmp_path: Path) -> None:
     """
     Cursor names a skill by its ``plugin--skill`` directory (collision-safe
