@@ -781,6 +781,23 @@ async def test_task_name_is_capped_at_parse_time() -> None:
     assert len(req.task_name) == 200
 
 
+def test_task_description_is_parsed_and_capped() -> None:
+    """The spawn's human label is agent-authored, so it is bounded like ``task_name``."""
+    parsed = SubagentRouteRequest.from_payload(
+        {"harness": "claude-native", "task_description": "Research auth flows"}
+    )
+    assert parsed.task_description == "Research auth flows"
+    capped = SubagentRouteRequest.from_payload(
+        {"harness": "claude-native", "task_description": "x" * 5000}
+    )
+    assert capped.task_description is not None
+    assert len(capped.task_description) == 200
+    # A blank or absent label is no label at all, not an empty one.
+    blank = SubagentRouteRequest.from_payload({"harness": "codex", "task_description": ""})
+    assert blank.task_description is None
+    assert SubagentRouteRequest.from_payload({"harness": "codex"}).task_description is None
+
+
 # ── Decision persistence ────────────────────────────────────────────
 
 
@@ -1443,3 +1460,15 @@ def test_decision_record_copies_the_router_source() -> None:
     # A fail-open allow routed nothing, so it names no source.
     unrouted = SubagentRouteDecision(action="allow", rationale="Routing unavailable")
     assert decision_record(req, unrouted).router_source is None
+
+
+def test_decision_record_names_the_task_it_governed() -> None:
+    """The persisted item carries the spawn's label, so a fan-out's chips
+    can each be tied to the sub-agent/task their decision governed."""
+    decision = SubagentRouteDecision(
+        action="rewrite", rationale="deep reasoning", model=CLAUDE_MODEL
+    )
+    record = decision_record(_request(task_description="Implement token refresh"), decision)
+    assert record.task_description == "Implement token refresh"
+    # A spawn that carried no label records none.
+    assert decision_record(_request(), decision).task_description is None
