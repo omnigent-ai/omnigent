@@ -3170,6 +3170,19 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
+    def _publish_native_turn_end_after_cancel(session_id: str, outcome: Response) -> None:
+        """Publish the turn's end after a cancel the harness cannot report itself.
+
+        A stop kills the TUI outright and an interrupt just presses its cancel
+        keys, so neither is guaranteed to produce a lifecycle event — a killed
+        harness fires no ``Stop`` hook at all. Without an edge here the web keeps
+        showing "Working…" for a session that has visibly stopped. Only published
+        on a successful cancel, and a harness that *does* report a ``failed`` edge
+        still wins: the server keeps ``failed`` sticky against a trailing ``idle``.
+        """
+        if 200 <= outcome.status_code < 300:
+            _publish_session_status(session_id, "idle")
+
     def _publish_session_status(
         session_id: str,
         status: str,
@@ -9205,6 +9218,7 @@ def create_runner_app(
             _harness = _session_harness_name(conversation_id)
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
+                _publish_native_turn_end_after_cancel(conversation_id, _interrupt_resp)
                 return _interrupt_resp
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
@@ -9263,6 +9277,7 @@ def create_runner_app(
             _harness = _session_harness_name(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
+                _publish_native_turn_end_after_cancel(conversation_id, _stop_resp)
                 return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
