@@ -313,14 +313,12 @@ export function isSubagentRoutingEligible(
 }
 
 // Leading whitespace + the command token, so the composer overlay can tint
-// just the `/skill` and leave any args in the default color.
-const SLASH_COMMAND_SPLIT_RE = /^(\s*)(\/[A-Za-z0-9][\w:-]*)/;
+// just the `/command` or `$skill` and leave args in the default color.
+const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
 
 /**
- * Split a slash-command draft into the command token and the rest, for the
- * composer highlight overlay. Returns null when the text isn't a command
- * (callers gate on `isSlashCommandText`, so a returned token is the full
- * command — never a `/etc/hosts`-style path prefix).
+ * Split a command or skill draft for the composer highlight overlay.
+ * Returns null for prose and file paths such as `/etc/hosts`.
  */
 export function splitSlashCommand(
   value: string,
@@ -2007,7 +2005,7 @@ interface ComposerProps {
 /**
  * Build the full slash-command map for the composer: built-ins
  * first (so they top the menu), then one entry per session skill
- * keyed by ``/${skill.name}``. Insertion order matters — the
+ * keyed by the session's skill prefix and name. Insertion order matters — the
  * menu iterates ``Object.entries`` and the user sees built-ins
  * before skills.
  *
@@ -2025,6 +2023,7 @@ export function buildSlashCommandMap(
   showModel: boolean,
   showCompact = true,
   showBtw = false,
+  skillPrefix: "/" | "$" = "/",
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2036,7 +2035,7 @@ export function buildSlashCommandMap(
     m[name] = description;
   }
   for (const skill of skills) {
-    m[`/${skill.name}`] = skill.description;
+    m[`${skillPrefix}${skill.name}`] = skill.description;
   }
   return m;
 }
@@ -2054,20 +2053,21 @@ export function buildSlashCommandMap(
  * :param showEffort: Whether ``/effort`` should be selectable.
  * :param showModel: Whether ``/model`` should be selectable (same gate
  *     as :func:`buildSlashCommandMap`'s ``showModel``).
- * :returns: A ``Set`` of slash-prefixed names.
+ * :returns: A ``Set`` of prefixed command and skill names.
  */
 export function buildSlashCommandWithArgsSet(
   skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
   showBtw = false,
+  skillPrefix: "/" | "$" = "/",
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
   // Selecting /btw fills "/btw " so the user types the side question after it.
   if (showBtw) s.add("/btw");
-  for (const skill of skills) s.add(`/${skill.name}`);
+  for (const skill of skills) s.add(`${skillPrefix}${skill.name}`);
   return s;
 }
 
@@ -2583,8 +2583,7 @@ function ComposerImpl(
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
   // Session skills (bundled + host-discovered) come from the snapshot
-  // on bind and populate the suggestions menu as ``/skill-name``
-  // entries alongside the built-ins.
+  // on bind. Codex-native invokes skills with `$`; other harnesses use `/`.
   const skills = useChatStore((s) => s.skills);
   const reportedSkillsStatus = useChatStore((s) => s.skillsStatus);
   const terminalPending = useChatStore((s) => s.terminalPending);
@@ -2608,35 +2607,36 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
+  const skillPrefix = sessionHarness === "codex-native" ? "$" : "/";
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw),
-    [skills, showEffort, showModel, showCompact, showBtw],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw, skillPrefix),
+    [skills, showEffort, showModel, showCompact, showBtw, skillPrefix],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
-    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw),
-    [skills, showEffort, showModel, showBtw],
+    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw, skillPrefix),
+    [skills, showEffort, showModel, showBtw, skillPrefix],
   );
 
-  // Suggestions menu is open while the user is still typing the command
-  // name — i.e. the value starts with "/" with no spaces yet (once a
-  // space appears the command name is done and args follow) and no second
-  // "/" (guards against file-path-like strings).
+  // Suggest names until a space starts the arguments; exclude file paths.
   const trimmedValue = value.trimStart();
+  const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
   const menuOpen =
     draft.quotes.length === 0 &&
-    trimmedValue.startsWith("/") &&
+    hasCommandPrefix &&
     !trimmedValue.slice(1).includes("/") &&
     !trimmedValue.includes(" ") &&
     files.length === 0;
-  // Query = what the user typed after the leading "/".
+  // Query = what the user typed after the command or skill prefix.
   const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
-  // Tint the `/skill` token blue while the draft reads as a slash command, so
-  // the command shape is signalled as the user types it.
+  // Tint only the command or skill token, leaving arguments in the default color.
   const composerIsCommand =
-    draft.quotes.length === 0 && files.length === 0 && isSlashCommandText(value);
+    draft.quotes.length === 0 &&
+    files.length === 0 &&
+    hasCommandPrefix &&
+    splitSlashCommand(value) !== null;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3568,7 +3568,7 @@ function ComposerImpl(
                 </div>
               )}
               {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the `/skill` token we hide the textarea's own glyphs
+            to tint just the command or skill token we hide the textarea's own glyphs
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
