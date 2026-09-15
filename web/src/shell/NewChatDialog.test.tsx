@@ -6342,6 +6342,37 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
   });
 
+  it("uses arrows to browse and Enter to attach a folder", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    fireEvent.keyDown(input(), { key: "ArrowRight" });
+    expect(input()).toHaveValue("@omnigent/");
+    fireEvent.keyDown(input(), { key: "ArrowLeft" });
+    expect(input()).toHaveValue("@");
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(screen.getByText("@omnigent/")).toBeInTheDocument();
+    expect(input()).toHaveValue("");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "leaves Tab (shift=%s) available for focus navigation",
+    async (shiftKey) => {
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
+      fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+      expect(fireEvent.keyDown(input(), { key: "Tab", shiftKey })).toBe(true);
+      expect(input()).toHaveValue("@");
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+      expect(screen.queryByText("@omnigent/")).not.toBeInTheDocument();
+    },
+  );
+
   it("does not accept the highlighted mention when Enter is pressed on mobile", async () => {
     const restoreViewport = forceMobileViewport();
     try {

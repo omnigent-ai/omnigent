@@ -338,10 +338,6 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
   });
 
-  // ── Keyboard navigation (H4) ────────────────────────────────────────────
-  // The slash menu has keyboard tests; the mention menu's Arrow/Enter/Tab/Esc
-  // branches were entirely uncovered, so a regression would pass silently.
-
   it("ArrowDown moves to the next row and Enter acts on the highlighted one", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
@@ -361,25 +357,108 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByText("@readme.md")).toBeInTheDocument();
   });
 
-  it("Enter on a directory row drills in rather than attaching", () => {
+  it("ArrowRight opens a directory and Enter attaches its highlighted file", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    // Row 0 is the "src" folder: Enter must open it (reveal nested files), and
-    // must NOT produce a chip — drilling is navigation, not attachment. (The
-    // token becomes "@src/" in the textarea; a chip would instead surface a
-    // "Remove src" button, which must be absent.)
-    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.keyDown(textarea(), { key: "ArrowRight" });
+    expect(textarea()).toHaveValue("@src/");
     expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
     expect(screen.queryByLabelText("Remove src")).not.toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.getByText("@src/client.ts")).toBeInTheDocument();
   });
 
-  it("Tab attaches the highlighted folder as a whole-directory unit", () => {
-    renderWithTooltips(<Composer {...composerProps()} />);
+  it("Enter attaches the highlighted folder without sending the draft", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
     type("@");
-    // Tab on the "src" folder attaches it as a unit (trailing-slash chip),
-    // distinct from Enter's drill-in.
-    fireEvent.keyDown(textarea(), { key: "Tab" });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "Tab (shift=%s) keeps browser focus navigation and adds no reference",
+    (shiftKey) => {
+      renderWithTooltips(<Composer {...composerProps()} />);
+      type("@");
+      expect(fireEvent.keyDown(textarea(), { key: "Tab", shiftKey })).toBe(true);
+      expect(textarea()).toHaveValue("@");
+      expect(screen.queryByText("@src/")).not.toBeInTheDocument();
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["ArrowLeft", "Backspace"])(
+    "%s returns to the parent and then the workspace root",
+    (key) => {
+      renderWithTooltips(<Composer {...composerProps()} />);
+      type("look @src/nested/");
+      fireEvent.keyDown(textarea(), { key });
+      expect(textarea()).toHaveValue("look @src/");
+      fireEvent.keyDown(textarea(), { key });
+      expect(textarea()).toHaveValue("look @");
+      expect(screen.getByTitle("Open src")).toBeInTheDocument();
+    },
+  );
+
+  it("parent navigation preserves surrounding text and restores the caret", async () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), {
+      target: { value: "look @src/ later", selectionStart: 10, selectionEnd: 10 },
+    });
+    fireEvent.keyDown(textarea(), { key: "ArrowLeft" });
+    expect(textarea()).toHaveValue("look @ later");
+    await Promise.resolve();
+    expect(textarea().selectionStart).toBe(6);
+    expect(textarea().selectionEnd).toBe(6);
+  });
+
+  it.each(["ArrowLeft", "Backspace"])("%s can leave a loading directory", (key) => {
+    ws.srcEntries = [];
+    ws.dirLoading = true;
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src/");
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key });
+    expect(textarea()).toHaveValue("@");
+    expect(screen.getByTitle("Open src")).toBeInTheDocument();
+  });
+
+  it("ArrowLeft leaves a directory with an unmatched filter", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src/missing");
+    fireEvent.keyDown(textarea(), { key: "ArrowLeft" });
+    expect(textarea()).toHaveValue("@");
+  });
+
+  it.each(["@src/cl", "@"])('Backspace edits "%s" normally', (value) => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type(value);
+    expect(fireEvent.keyDown(textarea(), { key: "Backspace" })).toBe(true);
+    expect(textarea()).toHaveValue(value);
+  });
+
+  it.each([
+    { key: "ArrowLeft", shiftKey: true },
+    { key: "ArrowLeft", ctrlKey: true },
+    { key: "ArrowRight", altKey: true },
+    { key: "Backspace", metaKey: true },
+  ])("preserves modified text editing: %j", (event) => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src/");
+    expect(fireEvent.keyDown(textarea(), event)).toBe(true);
+    expect(textarea()).toHaveValue("@src/");
+  });
+
+  it("Backspace deletes selected text normally", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src/");
+    textarea().setSelectionRange(1, 5);
+    expect(fireEvent.keyDown(textarea(), { key: "Backspace" })).toBe(true);
+    expect(textarea()).toHaveValue("@src/");
   });
 
   it("Escape closes the mention menu", () => {
