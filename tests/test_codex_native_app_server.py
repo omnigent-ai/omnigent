@@ -2852,11 +2852,13 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
 
 @pytest.mark.parametrize("reader", ["probe", "catalog", "reprobe"])
 @pytest.mark.parametrize("supplied", [False, True], ids=["ambient", "supplied-provider"])
+@pytest.mark.parametrize("config_model", [None, "gpt-5.5"])
 async def test_probe_codex_model_options_probes_every_launch_shape(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     reader: str,
     supplied: bool,
+    config_model: str | None,
 ) -> None:
     """A non-Databricks launch still probes, with its own overrides verbatim.
 
@@ -2938,7 +2940,9 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
             return None
 
         async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
-            del method, params
+            if method == "config/read":
+                return {"result": {"config": {"model": config_model}}}
+            assert method == "model/list" and params == {"includeHidden": False}
             return {
                 "result": {
                     "data": [{"id": "gpt-5.6-sol", "isDefault": True}, {"id": "gpt-5.5"}],
@@ -2959,7 +2963,9 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     }[reader]
     rows = await read(codex_path="/test/codex", launch=spec_launch if supplied else None)
 
-    assert rows == [{"id": "gpt-5.6-sol", "isDefault": True}, {"id": "gpt-5.5"}]
+    expected_rows = [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.5"}]
+    expected_rows[0 if config_model is None else 1]["isDefault"] = True
+    assert rows == expected_rows
     expected_launch = spec_launch if supplied else ambient
     assert captured["config_overrides"] == expected_launch.config_overrides
     assert resolutions == ([] if supplied else [None])
@@ -3337,3 +3343,55 @@ async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:
     )
     with pytest.raises(RuntimeError, match=r"^Codex model discovery exited early \(1\)$"):
         await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)
+
+
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+def test_codex_probe_home_preserves_configured_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: bool
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    source = tmp_path / "source"
+    source.mkdir()
+    catalog = source / "models.json"
+    catalog.write_text('{"models": []}')
+    catalog_setting = catalog.name if relative else str(catalog)
+    (source / "config.toml").write_text(
+        f'model = "gateway-model"\nmodel_catalog_json = {json.dumps(catalog_setting)}\n'
+        'model_provider = "gateway"\n'
+        '[model_providers.gateway]\nname = "Gateway"\n'
+        '[mcp_servers.unrelated]\ncommand = "must-not-start"\n'
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+
+    home = app_server._probe_codex_home([])
+    config = tomllib.loads((home / "config.toml").read_text())
+    assert config["model_catalog_json"] == str(catalog)
+    assert config["model"] == "gateway-model"
+    assert config["model_provider"] == "gateway"
+    assert "mcp_servers" not in config
+
+
+@pytest.mark.parametrize("change", ["catalog-content", "catalog-path", "default-model"])
+def test_codex_catalog_fingerprint_tracks_configured_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    catalog = tmp_path / "models.json"
+    catalog.write_text('{"models": []}')
+    config = tmp_path / "config.toml"
+    config.write_text('model = "first"\nmodel_catalog_json = "models.json"\n')
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: tmp_path)
+    launch = NativeCodexLaunch([], None, None)
+    before = app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable)
+
+    if change == "catalog-content":
+        catalog.write_text('{"models": [{"slug": "newly-available"}]}')
+    elif change == "catalog-path":
+        config.write_text('model = "first"\nmodel_catalog_json = "another.json"\n')
+    else:
+        config.write_text('model = "second"\nmodel_catalog_json = "models.json"\n')
+
+    assert app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable) != before

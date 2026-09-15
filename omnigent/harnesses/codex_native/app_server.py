@@ -1012,6 +1012,25 @@ async def _wait_for_discovery_listener(
     raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
+def _codex_picker_config(source_home: Path) -> dict[str, str]:
+    """Read the CLI settings needed to reproduce its model picker."""
+    try:
+        config = tomlkit.parse((source_home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    picker = {
+        key: str(value)
+        for key in ("model", "model_catalog_json")
+        if isinstance(value := config.get(key), str) and value
+    }
+    if catalog := picker.get("model_catalog_json"):
+        path = Path(catalog).expanduser()
+        picker["model_catalog_json"] = str(
+            path if path.is_absolute() else (source_home / path).resolve()
+        )
+    return picker
+
+
 def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     """
     Persistent probe ``CODEX_HOME`` for one provider configuration.
@@ -1039,7 +1058,17 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     # (not symlinked), so drop the copy to re-read an edited source config.
     with contextlib.suppress(OSError):
         (home / "config.toml").unlink(missing_ok=True)
-    _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
+    source_home = _codex_home_config_source_from_env()
+    _populate_codex_home_config(home, source_home, minimal_config=True)
+    # A custom catalog replaces Codex's built-in choices, including visibility.
+    picker_config = _codex_picker_config(source_home)
+    if picker_config:
+        config_path = home / "config.toml"
+        document = (
+            tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
+        )
+        document.update(picker_config)
+        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
     return home
 
 
@@ -1145,6 +1174,13 @@ async def probe_codex_model_options(
         )
         await client.connect()
         rows = await list_codex_model_options(client)
+        if pinned_model is None:
+            response = await client.request("config/read", {"includeLayers": False})
+            result = response.get("result")
+            config = result.get("config") if isinstance(result, dict) else None
+            model = config.get("model") if isinstance(config, dict) else None
+            if isinstance(model, str) and model:
+                pinned_model = model
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -1175,8 +1211,12 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
 
     profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
+    picker_config = _codex_picker_config(_codex_home_config_source_from_env())
     return fingerprint_of(
         "codex-native",
+        "configured-picker-v1",
+        tuple(sorted(picker_config.items())),
+        binary_identity(picker_config.get("model_catalog_json")),
         (launch.profile, (profile_host or "").rstrip("/")) if launch.profile is not None else None,
         launch.model,
         tuple(launch.config_overrides),
