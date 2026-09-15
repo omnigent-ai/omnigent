@@ -45,6 +45,7 @@ from omnigent.harnesses.devin_native.hook import _normalize_tool_result
 from omnigent.harnesses.devin_native.main import (
     DEVIN_EFFORTS,
     compose_devin_model,
+    family_effort_variants,
     list_devin_cli_model_options,
     resolve_devin_launch_model,
 )
@@ -85,9 +86,42 @@ class TestComposeModel:
 
     def test_composes_family_and_effort(self) -> None:
         assert (
-            compose_devin_model("claude-opus-5", "xhigh", known_variants=["claude-opus-5-xhigh"])
+            compose_devin_model("claude-opus-5", "xhigh", families=[_FAMILY_OPUS])
             == "claude-opus-5-xhigh"
         )
+
+    def test_a_dotted_slug_reaches_its_real_variant(self) -> None:
+        """A slug is not the prefix of its variant ids.
+
+        ``gpt-5.6-sol`` spells its rungs ``gpt-5-6-sol-high``, so composing from
+        the slug produced an id the catalog never had and effort was dropped for
+        every dotted family — half the catalog.
+        """
+        assert compose_devin_model("gpt-5.6-sol", "high", families=[_FAMILY_SOL]) == (
+            "gpt-5-6-sol-high"
+        )
+
+    def test_a_reordered_variant_name_still_resolves(self) -> None:
+        # `claude-fable-5` spells its variants `claude-5-fable-*`, which no slug
+        # rewriting would find; the rung is read off the ids instead.
+        assert compose_devin_model("claude-fable-5", "low", families=[_FAMILY_FABLE]) == (
+            "claude-5-fable-low"
+        )
+
+    def test_an_alias_resolves_to_its_family(self) -> None:
+        assert compose_devin_model("opus", "xhigh", families=[_FAMILY_OPUS]) == (
+            "claude-opus-5-xhigh"
+        )
+
+    def test_a_fast_variant_never_stands_in_for_a_rung(self) -> None:
+        # `claude-opus-5-high-fast` also carries `high`, but the plain variant is
+        # what the rung means.
+        assert compose_devin_model("claude-opus-5", "high", families=[_FAMILY_OPUS]) == (
+            "claude-opus-5-high"
+        )
+
+    def test_an_unknown_model_falls_back_to_itself(self) -> None:
+        assert compose_devin_model("not-a-model", "high", families=[_FAMILY_OPUS]) == "not-a-model"
 
     def test_no_effort_keeps_family(self) -> None:
         assert compose_devin_model("claude-opus-5", None) == "claude-opus-5"
@@ -99,44 +133,93 @@ class TestComposeModel:
         # A full variant id must not gain a second rung suffix.
         assert compose_devin_model("claude-opus-5-xhigh", "max") == "claude-opus-5-xhigh"
 
-    def test_unknown_variant_falls_back_to_family(self) -> None:
-        # gemini tops out at `high`, so `max` has no variant: fall back to the
-        # family rather than passing Devin an id it would reject.
-        assert (
-            compose_devin_model(
-                "gemini-3.8-flash", "max", known_variants=["gemini-3-8-flash-high"]
-            )
-            == "gemini-3.8-flash"
-        )
+    def test_a_rung_the_family_lacks_falls_back_to_it(self) -> None:
+        # swe-2 has only medium/high/max, and no `swe-2-low` exists anywhere in
+        # the catalog: fall back to the family rather than invent an id, which
+        # Devin would resolve to some other model entirely.
+        assert compose_devin_model("swe-2", "low", families=[_FAMILY_SWE2]) == "swe-2"
 
     def test_unvalidated_composition_when_catalog_unknown(self) -> None:
-        assert compose_devin_model("swe-2", "high", known_variants=None) == "swe-2-high"
+        assert compose_devin_model("swe-2", "high", families=None) == "swe-2-high"
 
-    def test_every_declared_effort_composes(self) -> None:
+    def test_every_declared_effort_resolves(self) -> None:
         for effort in DEVIN_EFFORTS:
-            variant = f"claude-opus-5-{effort}"
-            assert (
-                compose_devin_model("claude-opus-5", effort, known_variants=[variant]) == variant
+            assert compose_devin_model("claude-opus-5", effort, families=[_FAMILY_OPUS]) == (
+                f"claude-opus-5-{effort}"
             )
+
+
+class TestFamilyEffortVariants:
+    """The rung ladder the web picker offers for one model."""
+
+    def test_lists_only_the_rungs_the_family_has(self) -> None:
+        assert family_effort_variants(_FAMILY_SWE2) == {
+            "medium": "swe-2-medium",
+            "high": "swe-2-high",
+            "max": "swe-2-max",
+        }
+
+    def test_ignores_suffixed_variants(self) -> None:
+        # `-fast` / `-priority` / `-1m` rows are not rungs of their own.
+        assert family_effort_variants(_FAMILY_OPUS)["max"] == "claude-opus-5-max"
+
+    def test_a_family_without_rungs_offers_none(self) -> None:
+        assert (
+            family_effort_variants({"slug": "adaptive", "variants": [{"model_uid": "adaptive"}]})
+            == {}
+        )
+
+
+#: Family rows in the shape `devin models list --format json` returns, trimmed to
+#: the keys the resolver reads. The spellings are the point: dots in slugs, dashes
+#: in variant ids, and `claude-fable-5` reordering its own name.
+_FAMILY_OPUS: dict[str, object] = {
+    "slug": "claude-opus-5",
+    "aliases": ["opus"],
+    "variants": [
+        {"model_uid": f"claude-opus-5-{rung}"}
+        for rung in ("medium", "low", "high", "xhigh", "max")
+    ]
+    + [
+        {"model_uid": f"claude-opus-5-{rung}-fast"}
+        for rung in ("low", "medium", "high", "xhigh", "max")
+    ],
+}
+_FAMILY_SOL: dict[str, object] = {
+    "slug": "gpt-5.6-sol",
+    "aliases": [],
+    "variants": [{"model_uid": f"gpt-5-6-sol-{rung}"} for rung in ("medium", "low", "high")]
+    + [{"model_uid": "gpt-5-6-sol-high-priority"}],
+}
+_FAMILY_FABLE: dict[str, object] = {
+    "slug": "claude-fable-5",
+    "aliases": [],
+    "variants": [{"model_uid": f"claude-5-fable-{rung}"} for rung in ("low", "medium", "high")],
+}
+_FAMILY_SWE2: dict[str, object] = {
+    "slug": "swe-2",
+    "aliases": ["swe"],
+    "variants": [{"model_uid": f"swe-2-{rung}"} for rung in ("high", "medium", "max")],
+}
 
 
 class TestResolveLaunchModel:
     """The shared CLI + runner resolver degrades safely."""
 
     def test_unreachable_catalog_keeps_the_family(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def _boom() -> list[str]:
+        def _boom() -> list[object]:
             raise OSError("devin not on PATH")
 
-        monkeypatch.setattr("omnigent.harnesses.devin_native.main.devin_model_variants", _boom)
+        monkeypatch.setattr("omnigent.harnesses.devin_native.main.devin_model_families", _boom)
         # Guessing `claude-opus-5-xhigh` blind could 400 the launch; the family
         # always resolves, so a probe failure costs effort, not the session.
         assert resolve_devin_launch_model("claude-opus-5", "xhigh") == "claude-opus-5"
 
     def test_no_effort_skips_the_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def _fail() -> list[str]:  # pragma: no cover - must not be called
+        def _fail() -> list[object]:  # pragma: no cover - must not be called
             raise AssertionError("catalog probed with no effort to compose")
 
-        monkeypatch.setattr("omnigent.harnesses.devin_native.main.devin_model_variants", _fail)
+        monkeypatch.setattr("omnigent.harnesses.devin_native.main.devin_model_families", _fail)
         assert resolve_devin_launch_model("swe-2", None) == "swe-2"
 
 

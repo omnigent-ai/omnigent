@@ -172,6 +172,42 @@ def _variant_ids(family: Mapping[str, object]) -> list[str]:
     return ids
 
 
+def family_effort_variants(family: Mapping[str, object]) -> dict[str, str]:
+    """Map each effort rung a family offers to the variant id that carries it.
+
+    A family's slug is not the prefix of its variant ids: ``gpt-5.6-sol`` spells
+    its variants ``gpt-5-6-sol-high``, and ``claude-fable-5`` reorders to
+    ``claude-5-fable-low``. So rungs are read off the ids themselves rather than
+    composed from the slug. Suffixed variants (``-fast``, ``-priority``, ``-1m``)
+    end in something other than a rung and are skipped, which leaves the plain
+    variant for each rung.
+
+    :param family: One ``devin models list`` family row.
+    :returns: ``{rung: variant id}`` for the rungs this family actually has.
+    """
+    found: dict[str, str] = {}
+    for uid in _variant_ids(family):
+        for rung in DEVIN_EFFORTS:
+            if uid.endswith(f"-{rung}") and len(uid) < len(found.get(rung, uid + "x")):
+                found[rung] = uid
+    return found
+
+
+def _find_devin_family(
+    model: str, families: Sequence[Mapping[str, object]]
+) -> Mapping[str, object] | None:
+    """Return the family row *model* names, by slug, alias, or variant id."""
+    for family in families:
+        aliases = family.get("aliases")
+        alias_list = aliases if isinstance(aliases, list) else []
+        if model == family.get("slug") or model in alias_list:
+            return family
+    for family in families:
+        if model in _variant_ids(family):
+            return family
+    return None
+
+
 def list_devin_cli_model_options(
     *,
     env: Mapping[str, str] | None = None,
@@ -207,18 +243,18 @@ def list_devin_cli_model_options(
             continue
         label = family.get("family_label")
         display_name = label.strip() if isinstance(label, str) and label.strip() else slug
-        variants = _variant_ids(family)
         option: _JsonObject = {
             "id": slug,
             "displayName": display_name,
             "isDefault": slug == default_id,
         }
-        efforts = [effort for effort in DEVIN_EFFORTS if f"{slug}-{effort}" in variants]
+        rung_variants = family_effort_variants(family)
+        efforts = [effort for effort in DEVIN_EFFORTS if effort in rung_variants]
         if efforts:
             option["efforts"] = efforts
             # Also emit the shared native-catalog shape (`supportedReasoningEfforts`)
             # so the web effort picker shows only THIS model's rungs — swe-2 has
-            # only medium/high/max, and `swe-2-low` is a different (Fusion) model.
+            # only medium/high/max, and no `swe-2-low` exists in the catalog.
             option["supportedReasoningEfforts"] = [
                 {"reasoningEffort": effort} for effort in efforts
             ]
@@ -248,21 +284,23 @@ def compose_devin_model(
     model: str | None,
     effort: str | None,
     *,
-    known_variants: Sequence[str] | None = None,
+    families: Sequence[Mapping[str, object]] | None = None,
 ) -> str | None:
     """Combine a Devin family slug and an effort rung into a ``--model`` value.
 
     Devin has no separate effort flag — effort is a suffix on the model id — so
-    an Omnigent (model, effort) pair composes into one variant id. When the
-    composed variant is not in *known_variants* the bare family slug is returned
-    instead, which Devin resolves to that family's default variant. That keeps a
-    mismatched pair (e.g. ``gemini-3.8-flash`` with ``max``) working rather than
-    passing Devin an id it would reject.
+    an Omnigent (model, effort) pair has to resolve to one variant id. The rung is
+    looked up among the requested family's own variants, because a slug is not
+    the prefix of its variant ids (``gpt-5.6-sol`` -> ``gpt-5-6-sol-high``); it
+    was that mismatch, not a missing rung, that dropped effort for every family
+    whose slug carries a dot. A family that genuinely lacks the rung falls back to
+    the bare slug, which Devin resolves to that family's default variant, so a
+    mismatched pair still launches the model the user asked for.
 
     :param model: Family slug, alias, or an already-composed variant id.
     :param effort: One of :data:`DEVIN_EFFORTS`, or ``None``.
-    :param known_variants: Valid variant ids; ``None`` skips validation and
-        trusts the composition.
+    :param families: ``devin models list`` family rows; ``None`` skips the lookup
+        and trusts a slug-plus-rung composition.
     :returns: The ``--model`` value, or ``None`` when no model was requested.
     """
     if not model:
@@ -272,27 +310,25 @@ def compose_devin_model(
     # An id that already ends in an effort rung is a full variant — leave it.
     if any(model.endswith(f"-{rung}") for rung in DEVIN_EFFORTS):
         return model
-    composed = f"{model}-{effort}"
-    if known_variants is None or composed in known_variants:
-        return composed
-    return model
+    if families is None:
+        return f"{model}-{effort}"
+    family = _find_devin_family(model, families)
+    if family is None:
+        return model
+    return family_effort_variants(family).get(effort, model)
 
 
-def devin_model_variants(
+def devin_model_families(
     *,
     env: Mapping[str, str] | None = None,
     timeout_s: float = _MODEL_LIST_TIMEOUT_S,
-) -> list[str]:
-    """Return every valid Devin variant id, for :func:`compose_devin_model`."""
+) -> list[Mapping[str, object]]:
+    """Return Devin's family rows, for :func:`compose_devin_model`."""
     payload = _run_devin_models_list(env=env, timeout_s=timeout_s)
     families = payload.get("families")
     if not isinstance(families, list):
         return []
-    variants: list[str] = []
-    for family in families:
-        if isinstance(family, dict):
-            variants.extend(_variant_ids(family))
-    return variants
+    return [family for family in families if isinstance(family, dict)]
 
 
 # ---------------------------------------------------------------------------
@@ -395,12 +431,12 @@ def resolve_devin_launch_model(model: str | None, effort: str | None) -> str | N
     if not effort:
         return model
     try:
-        variants: Sequence[str] | None = devin_model_variants()
+        families: Sequence[Mapping[str, object]] | None = devin_model_families()
     except (subprocess.SubprocessError, OSError, ValueError, click.ClickException):
-        variants = None
-    if variants is None:
+        families = None
+    if not families:
         return model
-    return compose_devin_model(model, effort, known_variants=variants)
+    return compose_devin_model(model, effort, families=families)
 
 
 def _materialize_devin_agent_spec(tmpdir: Path, *, model: str | None = None) -> Path:
