@@ -14,6 +14,58 @@ import {
 
 const STORAGE_KEY = "omnigent:ui-theme-palette";
 
+type Rgb = [number, number, number];
+
+/** Parses the `#rrggbb` and `rgba(r, g, b, a)` forms the palettes use. */
+function parseColor(value: string): { rgb: Rgb; alpha: number } {
+  const hex = /^#([0-9a-f]{6})$/i.exec(value);
+  if (hex) {
+    const rgb = [0, 2, 4].map((offset) => Number.parseInt(hex[1].slice(offset, offset + 2), 16));
+    return { rgb: rgb as Rgb, alpha: 1 };
+  }
+  const rgba = /^rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)$/.exec(value);
+  if (!rgba) throw new Error(`unsupported color: ${value}`);
+  return {
+    rgb: [Number(rgba[1]), Number(rgba[2]), Number(rgba[3])],
+    alpha: rgba[4] === undefined ? 1 : Number(rgba[4]),
+  };
+}
+
+/** The colour actually painted when `top` is drawn over an opaque `under`. */
+function composite(top: { rgb: Rgb; alpha: number }, under: Rgb): Rgb {
+  return under.map((channel, i) => channel + (top.rgb[i] - channel) * top.alpha) as Rgb;
+}
+
+const linear = (channel: number) => {
+  const value = channel / 255;
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+};
+
+function luminance([r, g, b]: Rgb): number {
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+}
+
+function contrast(first: Rgb, second: Rgb): number {
+  const [high, low] = [luminance(first), luminance(second)].sort((a, b) => b - a);
+  return (high + 0.05) / (low + 0.05);
+}
+
+function lab([r, g, b]: Rgb): [number, number, number] {
+  const [lr, lg, lb] = [r, g, b].map(linear);
+  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const x = f((lr * 0.4124 + lg * 0.3576 + lb * 0.1805) / 0.95047);
+  const y = f(lr * 0.2126 + lg * 0.7152 + lb * 0.0722);
+  const z = f((lr * 0.0193 + lg * 0.1192 + lb * 0.9505) / 1.08883);
+  return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+}
+
+/** CIE76 colour difference: ~2 is just noticeable, 8+ is clearly distinct. */
+function deltaE(first: Rgb, second: Rgb): number {
+  const [l1, a1, b1] = lab(first);
+  const [l2, a2, b2] = lab(second);
+  return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
+}
+
 afterEach(() => {
   localStorage.clear();
   setEmbedScopeRoot(null);
@@ -128,24 +180,28 @@ describe("themePalette", () => {
     expect(solarized?.tokens.dark.shellBackground).toBe("#002b36");
   });
 
-  it.each(PALETTES)("keeps $label selected text opaque and readable in both modes", (palette) => {
-    const luminance = (hex: string) => {
-      const channels = [1, 3, 5].map((offset) => {
-        const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
-        return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
-      });
-      return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
-    };
+  it("keeps Omnigent's text selection on the brand tint, not the neutral primary", () => {
+    const omni = PALETTES.find((palette) => palette.id === "omni")!;
+    expect(omni.tokens.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
+    expect(omni.tokens.light.selectionForeground).toBe("#651249");
+    expect(omni.tokens.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.15)");
+    expect(omni.tokens.dark.selectionForeground).toBe("#f9a8d4");
+  });
 
+  it.each(PALETTES)("keeps $label selected text readable and its highlight visible", (palette) => {
     for (const mode of ["light", "dark"] as const) {
-      const { selectionBackground, selectionForeground } = palette.tokens[mode];
-      expect(selectionBackground).toMatch(/^#[0-9a-f]{6}$/i);
-      expect(selectionForeground).toMatch(/^#[0-9a-f]{6}$/i);
-      const background = luminance(selectionBackground);
-      const foreground = luminance(selectionForeground);
-      const contrast =
-        (Math.max(background, foreground) + 0.05) / (Math.min(background, foreground) + 0.05);
-      expect(contrast, `${palette.label} ${mode}`).toBeGreaterThanOrEqual(4.5);
+      const { background, selectionBackground, selectionForeground } = palette.tokens[mode];
+      const label = `${palette.label} ${mode}`;
+      const page = parseColor(background).rgb;
+      expect(parseColor(selectionBackground).alpha, label).toBeLessThan(1);
+      // Measure the highlight as painted (a tint composited over the page),
+      // whether the palette uses an opaque pair or a translucent wash.
+      const highlight = composite(parseColor(selectionBackground), page);
+      expect(
+        contrast(parseColor(selectionForeground).rgb, highlight),
+        label,
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(deltaE(highlight, page), label).toBeGreaterThanOrEqual(8);
     }
   });
 });

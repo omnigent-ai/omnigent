@@ -693,7 +693,10 @@ async def _evaluate_policy_via_omnigent(
         verdict_body["data"] = verdict_data
 
     # Retry once on dead-channel / timeout / non-2xx; any unacknowledged verdict
-    # eventually calls on_delivery_failure to cancel the wedged turn.
+    # eventually calls on_delivery_failure to cancel the wedged turn. Track the
+    # failure mode so the wrap-up log attributes the cause instead of lumping
+    # every mode into one unattributed record.
+    failure_reason = "unexpected"
     for _attempt in range(2):
         try:
             resp = await harness_client.post(
@@ -702,6 +705,7 @@ async def _evaluate_policy_via_omnigent(
                 timeout=30.0,
             )
         except _DEAD_HARNESS_CHANNEL_ERRORS as exc:
+            failure_reason = "dead_channel"
             _logger.warning(
                 "Policy verdict %s delivery hit a dead harness channel (attempt %d/2): %s",
                 evaluation_id,
@@ -711,6 +715,7 @@ async def _evaluate_policy_via_omnigent(
             )
             continue
         except Exception:  # noqa: BLE001 — non-transport: no retry, but still signal
+            failure_reason = "unexpected"
             _logger.warning(
                 "Failed to deliver policy verdict %s to harness (unexpected error)",
                 evaluation_id,
@@ -720,6 +725,7 @@ async def _evaluate_policy_via_omnigent(
             break
         if 200 <= resp.status_code < 300:
             return
+        failure_reason = f"http_{resp.status_code}"
         _logger.warning(
             "Policy verdict %s delivery got HTTP %d — harness did not accept it (attempt %d/2)",
             evaluation_id,
@@ -728,13 +734,34 @@ async def _evaluate_policy_via_omnigent(
             extra={"session_id": conversation_id},
         )
 
-    _logger.error(
-        "Policy verdict %s delivery unacknowledged (dead channel / timeout / "
-        "non-2xx / unexpected) after retry; signaling desync for %s",
-        evaluation_id,
-        conversation_id,
-        extra={"session_id": conversation_id},
-    )
+    if failure_reason == "dead_channel":
+        # The harness channel died before the verdict could land — an upstream
+        # disconnect/teardown consequence whose primary failure (the harness
+        # death) is surfaced by stream teardown, not an Omnigent defect. Log at
+        # WARNING with a structured reason; the desync recovery still runs.
+        _logger.warning(
+            "Policy verdict %s undeliverable after retry: harness channel is dead "
+            "(upstream disconnect/teardown); signaling desync for %s",
+            evaluation_id,
+            conversation_id,
+            extra={
+                "session_id": conversation_id,
+                "delivery_failure_reason": "verdict_delivery_channel_dead",
+            },
+        )
+    else:
+        # A live harness refused the verdict (non-2xx) or delivery failed in an
+        # unforeseen way — potentially a real protocol defect, kept at ERROR.
+        _logger.error(
+            "Policy verdict %s delivery unacknowledged (%s) after retry; signaling desync for %s",
+            evaluation_id,
+            failure_reason,
+            conversation_id,
+            extra={
+                "session_id": conversation_id,
+                "delivery_failure_reason": failure_reason,
+            },
+        )
     if on_delivery_failure is not None:
         await on_delivery_failure(conversation_id)
 
@@ -2896,6 +2923,15 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
+    # Conversations whose claude-sdk `/compact` published an up-front
+    # `response.compaction.in_progress`. Used to (a) swallow the executor's own
+    # later `in_progress` so the web shows a single spinner, and (b) publish a
+    # `failed` if the turn produced no compaction, so the spinner is never
+    # stranded. Discarded on `response.compaction.completed` (real compaction),
+    # else cleared by `_on_proxy_stream_end` — the single turn-end convergence
+    # point reached on every exit path (clean end, setup error, cancel).
+    _sdk_compact_inprogress: set[str] = set()
+    app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     # Detached watchers answering a /model confirm dialog that pops after
@@ -6395,6 +6431,115 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    def _is_sdk_compact_body(body: dict[str, Any]) -> bool:
+        """Return whether a buffered body is the synthesized claude-sdk ``/compact``.
+
+        The compact control is dispatched as a resumed turn whose sole content is
+        the literal ``/compact`` slash command. The continuation drain uses this
+        to dispatch a buffered ``/compact`` as its OWN turn (never coalesced
+        behind a later message), so the SDK still sees it as the turn prompt and
+        runs native compaction.
+        """
+        content = body.get("content")
+        if not isinstance(content, list) or len(content) != 1:
+            return False
+        part = content[0]
+        return (
+            isinstance(part, dict)
+            and part.get("type") == "input_text"
+            and part.get("text") == "/compact"
+        )
+
+    async def _handle_claude_sdk_compact(conv_id: str) -> Response:
+        """Compact a claude-sdk session by sending it the ``/compact`` command.
+
+        The Claude SDK owns its own context window in the harness subprocess,
+        so Omnigent-side transcript compaction is ineffective for it. The
+        effective path is to send the literal ``/compact`` slash command to
+        the live client, which runs native compaction — the same PreCompact
+        path auto-compaction uses, whose ``response.compaction.completed`` the
+        executor already emits. We do that by dispatching a resumed
+        ``/compact`` turn: buffered behind an in-flight turn (the harness has a
+        single client), started immediately otherwise. Returns 200 so the
+        Omnigent server treats the control as handled and skips its own
+        (transcript-only) compaction.
+        """
+        compact_body: _JsonObject = {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "/compact"}],
+            "conversation_id": conv_id,
+        }
+        # Serialize the active-turn check + slot bind through the same ingest
+        # gate the message path uses. Without it, the idle branch's check and
+        # its `_active_turns` bind straddle an `await` (history load), so a
+        # message arriving in that window also sees the session idle and binds
+        # the slot — the two turns then clobber each other's `_active_turns`
+        # entry and race the single live SDK client. Under the gate one reaches
+        # its bind before the other's check, so the loser buffers instead.
+        _seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = _seq + 1
+        _cond = _ingest_cond.get(conv_id)
+        if _cond is None:
+            _cond = asyncio.Condition()
+            _ingest_cond[conv_id] = _cond
+        async with _cond:
+            while _ingest_now_serving.get(conv_id, 0) != _seq:
+                await _cond.wait()
+        try:
+            # A turn is already running: buffer so /compact runs as the next turn
+            # rather than racing the live one; the buffer drains via
+            # _check_and_start_next_turn once the active turn ends. The buffered
+            # compact's own in_progress comes from the executor when it later runs
+            # — publishing an up-front spinner here would show "Compacting…" while
+            # the prior turn is still working, so only the idle path does that.
+            if conv_id in _active_turns:
+                _session_message_buffers.setdefault(conv_id, []).append(compact_body)
+                return Response(status_code=200)
+
+            # Publish the compaction spinner up front so the UI shows "Compacting
+            # conversation…" immediately, like the native handlers — the executor's
+            # own in_progress fires only once the SDK PreCompact hook hits (mid-turn),
+            # by which point the generic running status has shown "Working…". The
+            # relay swallows the executor's later duplicate; `completed` (or the
+            # turn-end `failed` fallback in _on_proxy_stream_end) clears the spinner.
+            _publish_event(
+                conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id}
+            )
+            _sdk_compact_inprogress.add(conv_id)
+            try:
+                new_item: _JsonObject = {
+                    "type": "message",
+                    "role": "user",
+                    "content": compact_body["content"],
+                }
+                if conv_id in _session_histories:
+                    _session_histories[conv_id].append(new_item)
+                else:
+                    loaded = await _load_history_as_input(conv_id)
+                    loaded.append(new_item)
+                    _session_histories[conv_id] = loaded
+
+                _begin_turn_slot(conv_id)
+                _publish_turn_status(conv_id, "running")
+                _turn_task = asyncio.create_task(
+                    _run_turn_bg(compact_body, conv_id),
+                    name=f"compact-{conv_id}",
+                )
+                _active_turns[conv_id] = _turn_task
+                _turn_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_turn_task)
+            except Exception:
+                # Never strand the spinner if the turn fails to start.
+                _sdk_compact_inprogress.discard(conv_id)
+                _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+                raise
+            return Response(status_code=200)
+        finally:
+            async with _cond:
+                _ingest_now_serving[conv_id] = _seq + 1
+                _cond.notify_all()
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -6666,6 +6811,17 @@ def create_runner_app(
 
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
+        # A claude-sdk `/compact` turn that ended without emitting
+        # `response.compaction.completed` produced no compaction (nothing to
+        # compact, or the turn failed before/without streaming). Clear the
+        # up-front spinner with `failed` here — the single turn-end convergence
+        # point, reached on every exit path (clean end, setup error, cancel) — so
+        # no path strands the spinner or leaks the flag into a later turn's
+        # compaction signalling. A successful compaction already discarded the
+        # flag on `response.compaction.completed`, making this a no-op then.
+        if conv_id in _sdk_compact_inprogress:
+            _sdk_compact_inprogress.discard(conv_id)
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
@@ -6924,6 +7080,19 @@ def create_runner_app(
                 except RuntimeError:
                     pass
 
+    def _recover_failed_tool_dispatch(
+        dispatch_task: asyncio.Task[object], *, conv_id: str, response_id: str
+    ) -> None:
+        if dispatch_task.cancelled() or dispatch_task.exception() is None:
+            return
+        # Recovery can cancel a turn awaiting this dispatch task. Run it
+        # independently so teardown cannot await or cancel itself.
+        task = asyncio.create_task(
+            _resync_turn_state(conv_id, "tool_dispatch_failed", owner_response_id=response_id)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
     async def _resync_turn_state_on_delivery_failure(
         conv_id: str, response_id: str | None
     ) -> None:
@@ -7009,7 +7178,14 @@ def create_runner_app(
                 _rewake_parent_if_inbox_stranded(session_id)
                 return
 
-            if _is_native_harness(session_id):
+            # A buffered claude-sdk /compact must dispatch as its OWN turn: the
+            # SDK runs native compaction only when /compact is the turn prompt,
+            # but the default non-native drain coalesces the whole buffer and
+            # dispatches only the last body — burying a /compact behind a later
+            # message and silently no-opping it (the runner already returned 200,
+            # so the server won't fall back). Drain one at a time (like native)
+            # whenever a /compact is buffered, so each lands as its own turn.
+            if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
                 next_body = buf.pop(0)
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
@@ -7035,6 +7211,20 @@ def create_runner_app(
                     )
                 next_body = all_bodies[-1]
 
+            if _is_sdk_compact_body(next_body):
+                # This buffered /compact now dispatches as its own turn. Mirror the
+                # idle path: publish the spinner up front AND set the flag, so
+                # (a) the relay swallows the executor's own duplicate in_progress
+                # (single spinner), and (b) _on_proxy_stream_end publishes `failed`
+                # if the turn ends without a `response.compaction.completed` (a real
+                # executor path — the compaction-complete event can be None) rather
+                # than stranding the spinner. The prior turn has ended, so showing
+                # "Compacting…" now is accurate.
+                _publish_event(
+                    session_id,
+                    {"type": "response.compaction.in_progress", "task_id": session_id},
+                )
+                _sdk_compact_inprogress.add(session_id)
             _begin_turn_slot(session_id)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
@@ -7050,6 +7240,8 @@ def create_runner_app(
             async with _cond:
                 _ingest_now_serving[session_id] = _seq + 1
                 _cond.notify_all()
+
+    app.state.check_and_start_next_turn = _check_and_start_next_turn
 
     async def _post_subagent_wake_notice(
         parent_id: str,
@@ -8295,6 +8487,14 @@ def create_runner_app(
                                     raise _ContextWindowOverflow(*_overflow)
 
                                 _evt_type = event.get("type")
+                                if (
+                                    _evt_type == "response.compaction.in_progress"
+                                    and conv_id in _sdk_compact_inprogress
+                                ):
+                                    # _handle_claude_sdk_compact already published an
+                                    # up-front spinner; drop the executor's own duplicate
+                                    # so the web renders a single compaction spinner.
+                                    continue
                                 if _evt_type == "injection.consumed":
                                     _inj_id = event.get("injection_id")
                                     _buf = _session_message_buffers.get(conv_id)
@@ -8368,6 +8568,10 @@ def create_runner_app(
                                 elif _evt_type == "response.compaction.completed" and event.get(
                                     "summary"
                                 ):
+                                    # A real compaction landed; the completed event clears
+                                    # the up-front spinner, so drop the pending flag and
+                                    # skip the stream-end `failed` fallback.
+                                    _sdk_compact_inprogress.discard(conv_id)
                                     await _handle_harness_compaction(conv_id, event)
 
                                 if is_action_required(event):
@@ -8479,6 +8683,13 @@ def create_runner_app(
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
                                                 )
+                                            )
+                                        )
+                                        _dispatch_tasks[-1].add_done_callback(
+                                            functools.partial(
+                                                _recover_failed_tool_dispatch,
+                                                conv_id=conv_id,
+                                                response_id=_response_id,
                                             )
                                         )
 
@@ -8600,6 +8811,9 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
+                    # _on_proxy_stream_end clears any claude-sdk `/compact`
+                    # spinner (publishing `failed` when no compaction landed);
+                    # it is the single convergence point for every turn-end path.
                     _on_proxy_stream_end(
                         conv_id, error=_stream_failed_error, owner_response_id=_response_id
                     )
@@ -8628,7 +8842,14 @@ def create_runner_app(
                     "proxy stream connection error for %s: %s",
                     conv_id,
                     exc,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "harness_stream_failed",
+                        "attributes": {
+                            "harness": harness_name,
+                            "response_id": _response_id,
+                        },
+                    },
                 )
                 _error = {
                     "code": "connection_error",
@@ -9073,6 +9294,8 @@ def create_runner_app(
                 return await _handle_hermes_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "qwen-native":
                 return await _handle_qwen_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "claude-sdk":
+                return await _handle_claude_sdk_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "clear":

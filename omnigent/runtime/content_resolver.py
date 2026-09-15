@@ -97,13 +97,93 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 # bounded well under the model's context budget and the provider's API
 # limits — Anthropic accepts images up to ~5 MB, PDFs up to ~32 MB / 100
 # pages, and ~32 MB per request total. The per-type caps below keep a
-# single attachment usable across a multi-turn conversation; the global
-# ceiling backstops the total request size after base64 inflation (~1.33x).
+# single attachment usable across a multi-turn conversation.
+#
+# Images are the exception: we accept a much larger upload (screenshots,
+# retina captures) and shrink it under the provider's per-image limit at
+# upload time via :func:`compress_image_attachment`, so the stored blob —
+# and the base64 re-sent every turn — always fits. The compressed result is
+# what lands in the file store (see the ``files`` upload route).
 # Mirrored client-side in web/src/lib/attachments.ts — keep in sync.
-MAX_IMAGE_UPLOAD_BYTES: int = 5 * 1024 * 1024
+MAX_IMAGE_UPLOAD_BYTES: int = 50 * 1024 * 1024
 MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
 MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
-MAX_ATTACHMENT_UPLOAD_BYTES: int = 25 * 1024 * 1024
+# Per-attachment read cap, not an aggregate one. It is applied as
+# ``min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)``: only compressible images
+# reach 50 MB (then shrink to <= IMAGE_MODEL_BUDGET_BYTES before storage);
+# PDF/text keep their smaller per-type caps. So this is no longer a sub-32 MB
+# request backstop — nothing oversized is stored because images are compressed.
+MAX_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
+
+# The larger image cap only applies to raster formats we can actually shrink
+# (see _COMPRESSIBLE_IMAGE_MIMES). Other image types (SVG, and raster formats we
+# don't re-encode like BMP/TIFF) keep this smaller cap and skip compression, so
+# raising the image cap can't let an oversized uncompressed one through. Note a
+# file near this cap still inflates to ~6.6 MB base64 — over the provider's
+# per-image ceiling — but these formats generally aren't valid model image
+# inputs anyway; this is the pre-existing behavior for uncompressed images.
+IMAGE_UNCOMPRESSED_UPLOAD_BYTES: int = 5 * 1024 * 1024
+
+# Raster image MIMEs compress_image_attachment can decode and re-encode. Only
+# these get MAX_IMAGE_UPLOAD_BYTES; everything else image/* is capped at
+# IMAGE_UNCOMPRESSED_UPLOAD_BYTES and passed through untouched.
+_COMPRESSIBLE_IMAGE_MIMES: frozenset[str] = frozenset(
+    {"image/png", "image/jpeg", "image/webp", "image/gif"}
+)
+
+# Pillow format names that legitimately back each compressible MIME. Used to
+# reject a spoofed extension (e.g. a TIFF/BMP labeled image/png) before we hand
+# 50 MB of untrusted bytes to an unintended decoder. MPO (multi-picture JPEG,
+# common from phone/stereo cameras) is admitted for image/jpeg and flattened to
+# its primary frame — see the animation gate in compress_image_attachment.
+_ALLOWED_PIL_FORMATS: dict[str, frozenset[str]] = {
+    "image/png": frozenset({"PNG"}),
+    "image/jpeg": frozenset({"JPEG", "MPO"}),
+    "image/webp": frozenset({"WEBP"}),
+    "image/gif": frozenset({"GIF"}),
+}
+
+# Budget for an image's RAW stored bytes after compression. The stored blob is
+# re-encoded as a base64 data URI on every turn (see _resolve_file_id_block),
+# which inflates it ~4/3, and providers apply the ~5 MB per-image ceiling to
+# that encoded payload. So the raw budget is 5 MB / (4/3) with headroom for the
+# data-URI wrapper: 3.5 MB raw → ~4.7 MB encoded, safely under 5 MB. A decodable
+# still image always ends up at or below the raw budget.
+IMAGE_MODEL_BUDGET_BYTES: int = 3_500_000
+
+# Longest-edge cap. An oversized image is downscaled to this immediately after
+# decode — before the convert/encode work — which both bounds peak memory (a
+# full-resolution re-encode of a 40 MP image can spike to >1 GiB) and drops
+# wasted bytes: providers downsample vision inputs to ~1568 px (Anthropic) /
+# ~2048 px (OpenAI) anyway, so a larger edge is never seen by the model. 2048
+# keeps full model-visible detail with margin across providers.
+IMAGE_MAX_EDGE_PX: int = 2048
+
+# Decompression-bomb / memory guard on a format we must decode at full size
+# (PNG/WebP/GIF have no scale-decode). A decoded RGBA frame is 4 bytes/px, so
+# this caps that raw allocation (32 MP ≈ 128 MB). 32 MP still covers 8K
+# screenshots and ~24 MP camera photos.
+IMAGE_MAX_DECODED_PIXELS: int = 32 * 1024 * 1024
+
+# JPEG/MPO decode at a reduced DCT scale via Image.draft(), so a large source
+# never fully materializes — a higher source ceiling is safe (and welcome: phone
+# photos are large JPEGs). The actual decode is bounded by the post-draft check
+# against IMAGE_MAX_DECODED_PIXELS; this is a sanity limit on the declared
+# header. Kept under Pillow's own MAX_IMAGE_PIXELS (~89.5 MP) so opening a valid
+# large photo doesn't emit its "decompression bomb" warning into server logs.
+IMAGE_MAX_SOURCE_PIXELS: int = 80 * 1024 * 1024
+
+# Pillow formats whose decoder honours draft() scale-down (so the source cap,
+# not the decoded cap, applies). MPO is multi-picture JPEG.
+_DRAFTABLE_IMAGE_FORMATS: frozenset[str] = frozenset({"JPEG", "MPO"})
+
+# How many image uploads may hold their raw bytes in memory and
+# decode/re-encode concurrently. The heavy step is bounded per-op (read up to
+# MAX_IMAGE_UPLOAD_BYTES + a ~IMAGE_MAX_DECODED_PIXELS bitmap and copies), so the
+# server's peak upload memory ≈ this × that per-op cost. Default sized for the
+# ~1 GiB deployments; raise it on larger instances via the
+# ``image_compression_concurrency`` server-config key.
+MAX_IMAGE_COMPRESSION_CONCURRENCY: int = 2
 
 # Copy-at-spawn limits (see the ``files:copy`` endpoint). A parent forwarding
 # files to a subagent copies them through the server, which reads each source
@@ -145,6 +225,12 @@ def attachment_upload_limit(content_type: str) -> int | None:
     them only produces garbled UTF-8 or — for large files — an oversized,
     context-blowing request. Callers reject ``None`` with HTTP 415.
 
+    Compressible raster images (PNG, JPEG, WebP, GIF) get the large
+    :data:`MAX_IMAGE_UPLOAD_BYTES` cap because an oversized one is shrunk
+    under the model budget at upload; other image types (SVG, …) keep the
+    smaller :data:`IMAGE_UNCOMPRESSED_UPLOAD_BYTES` cap since we can't shrink
+    them.
+
     :param content_type: The resolved MIME type, e.g. ``"image/png"``.
         Use :func:`_resolve_content_type` to derive it from the upload's
         declared type + filename first.
@@ -153,12 +239,264 @@ def attachment_upload_limit(content_type: str) -> int | None:
         not an allowed attachment.
     """
     if content_type.startswith("image/"):
-        return MAX_IMAGE_UPLOAD_BYTES
+        if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+            return MAX_IMAGE_UPLOAD_BYTES
+        return IMAGE_UNCOMPRESSED_UPLOAD_BYTES
     if content_type == "application/pdf":
         return MAX_PDF_UPLOAD_BYTES
     if content_type.startswith("text/") or content_type in _TEXT_LIKE_APPLICATION_MIMES:
         return MAX_TEXT_UPLOAD_BYTES
     return None
+
+
+class ImageCompressionError(ValueError):
+    """An image attachment could not be shrunk under the model size budget.
+
+    Raised when the bytes don't decode as an image, or when even the smallest
+    downscale/quality still exceeds :data:`IMAGE_MODEL_BUDGET_BYTES`. Callers
+    reject it with HTTP 413.
+    """
+
+
+# Filename extension for each image type we emit from compression, so a
+# re-encoded attachment's name matches its bytes.
+_IMAGE_CONTENT_TYPE_EXTENSIONS: dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def image_filename_for_content_type(filename: str, content_type: str) -> str:
+    """Return *filename* with an extension matching *content_type*.
+
+    :func:`compress_image_attachment` may re-encode an image (e.g. PNG →
+    JPEG), leaving the original name's extension inconsistent with the stored
+    bytes. Swapping it keeps name, bytes, and MIME aligned. An unknown image
+    type, or a name already carrying the right extension, is returned
+    unchanged.
+
+    :param filename: The original upload filename, e.g. ``"shot.png"``.
+    :param content_type: The re-encoded image MIME, e.g. ``"image/jpeg"``.
+    :returns: The filename with the matching extension, e.g. ``"shot.jpg"``.
+    """
+    from pathlib import PurePosixPath
+
+    target = _IMAGE_CONTENT_TYPE_EXTENSIONS.get(content_type)
+    if target is None:
+        return filename
+    path = PurePosixPath(filename)
+    if path.suffix.lower() == target:
+        return filename
+    try:
+        return str(path.with_suffix(target))
+    except ValueError:
+        # Names like "." / ".." have no stem for with_suffix; keep as-is.
+        return filename
+
+
+def image_needs_compression(size: int, content_type: str) -> bool:
+    """Whether an image upload would actually be re-encoded by compression.
+
+    Lets the upload route skip the worker-thread decode hop for an already
+    small image (``<=`` :data:`IMAGE_MODEL_BUDGET_BYTES`) that a compressible
+    type would pass through untouched. (A compressible type still enters the
+    admission gate before its size is known, since the size needs the read; the
+    gate is only skipped entirely for non-compressible types like SVG.) Mirrors
+    the fast-path short-circuit in :func:`compress_image_attachment`.
+
+    :param size: The image's byte length.
+    :param content_type: The resolved image MIME.
+    :returns: ``True`` only if compression would decode/re-encode the image.
+    """
+    return size > IMAGE_MODEL_BUDGET_BYTES and content_type in _COMPRESSIBLE_IMAGE_MIMES
+
+
+def _encode_image(image: Any, image_format: str, **params: Any) -> bytes:
+    """Encode *image* to *image_format*, returning the bytes."""
+    from io import BytesIO
+
+    buffer = BytesIO()
+    image.save(buffer, format=image_format, **params)
+    return buffer.getvalue()
+
+
+def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes, str]:
+    """Shrink a raster image so its bytes fit :data:`IMAGE_MODEL_BUDGET_BYTES`.
+
+    Compressible raster images upload at the larger
+    :data:`MAX_IMAGE_UPLOAD_BYTES`, but every attachment is inlined as base64
+    into each turn's request, so a big image would blow past the provider's
+    per-image limit. This downscales and/or re-encodes the image to fit the
+    model budget, keeping it a valid in-place attachment (the compressed bytes
+    are what get stored).
+
+    Already-small images (``<=`` budget) and non-raster types we don't compress
+    (SVG, …) are returned unchanged. For still images we search largest-first:
+    alpha images try lossy then lossless WebP then PNG; opaque images try WebP
+    (crisper on text than JPEG) then fall back to JPEG, downscaling the canvas
+    when quality alone isn't enough. A multi-picture JPEG (MPO) is flattened to
+    its primary frame. A truly **animated** image over the budget is rejected:
+    we can't re-encode animation, and storing it uncompressed would just fail at
+    the provider at turn time.
+
+    :param content: Raw uploaded image bytes.
+    :param content_type: The resolved image MIME (``image/*``).
+    :returns: ``(bytes, content_type)`` — the (possibly re-encoded) image and
+        its MIME, with the bytes ``<=`` the budget; the content_type may change
+        (e.g. ``image/png`` → ``image/jpeg``). A high-entropy image that can't
+        reach the budget even at the smallest scale/quality raises instead.
+    :raises ImageCompressionError: If the bytes don't decode as an image, are
+        an oversized animation, or can't be brought under the budget. The
+        message is safe to surface to the client (no raw decoder text).
+    """
+    # Small enough already, or a type we don't compress (SVG etc.): leave as-is.
+    if not image_needs_compression(len(content), content_type):
+        return content, content_type
+
+    import struct
+    from io import BytesIO
+
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    # Restrict Pillow to the plugins that legitimately back the declared MIME, so
+    # a spoofed TIFF/BMP-as-png can't invoke an unintended decoder's parser at all
+    # (formats= is applied before any plugin runs). An empty list would let Pillow
+    # try every plugin, so fall back to rejecting an unrecognised type outright.
+    allowed_formats = sorted(_ALLOWED_PIL_FORMATS.get(content_type, frozenset()))
+    if not allowed_formats:
+        raise ImageCompressionError(
+            "this image format can't be resized; upload a PNG, JPEG, WebP, or GIF"
+        )
+
+    try:
+        with Image.open(BytesIO(content), formats=allowed_formats) as probe:
+            # Cheap header dimensions first — bail before walking frames
+            # (n_frames enumerates every GIF frame) or decoding. Draftable
+            # formats (JPEG) decode scaled-down so they get the higher source
+            # ceiling; others decode at full size, so cap the raw allocation.
+            probe_format = probe.format
+            max_source_px = (
+                IMAGE_MAX_SOURCE_PIXELS
+                if probe_format in _DRAFTABLE_IMAGE_FORMATS
+                else IMAGE_MAX_DECODED_PIXELS
+            )
+            if probe.width * probe.height > max_source_px:
+                raise ImageCompressionError("the image's dimensions are too large to process")
+            n_frames = int(getattr(probe, "n_frames", 1))
+        # True animation can't be re-encoded here and would be rejected by the
+        # provider at turn time — reject cleanly now. MPO is multi-frame but not
+        # animation (its extra frames are alternate stills), so we keep its
+        # primary frame (Image.open positions at frame 0) and compress that.
+        if n_frames != 1 and probe_format != "MPO":
+            raise ImageCompressionError(
+                "this animated image is too large to attach; upload a smaller "
+                "or static image instead"
+            )
+        with Image.open(BytesIO(content), formats=allowed_formats) as opened:
+            # draft() lets the JPEG decoder emit a DCT-downscaled frame (½/¼/⅛)
+            # directly, so a large photo never fully decodes into memory. No-op
+            # for formats that don't support it (PNG/WebP/GIF). The target must
+            # preserve aspect ratio: a square (E, E) box won't reduce an extreme
+            # ratio (e.g. 60000×1600, whose short side is already < E), leaving
+            # it to decode at full size, so scale the box to the image's ratio.
+            w0, h0 = opened.size
+            if w0 >= h0:
+                draft_target = (IMAGE_MAX_EDGE_PX, max(1, round(IMAGE_MAX_EDGE_PX * h0 / w0)))
+            else:
+                draft_target = (max(1, round(IMAGE_MAX_EDGE_PX * w0 / h0)), IMAGE_MAX_EDGE_PX)
+            opened.draft(None, draft_target)
+            # Hard-cap the decode on the POST-draft size, before load(), so the
+            # actual pixel allocation is bounded for every format and aspect
+            # ratio — draft() is a no-op for some inputs and can't always reach
+            # the edge cap, so the source-header check alone isn't sufficient.
+            if opened.width * opened.height > IMAGE_MAX_DECODED_PIXELS:
+                raise ImageCompressionError("the image's dimensions are too large to process")
+            # Apply EXIF orientation in place: the copying form allocates a full
+            # extra frame even when there's no orientation to apply (the common
+            # case), which on a large image is a needless ~100 MB.
+            ImageOps.exif_transpose(opened, in_place=True)
+            opened.load()
+            # Decide the final encode mode now, before resizing: detect alpha
+            # broadly (RGBA/LA, or a palette/RGB tRNS chunk Pillow exposes via
+            # info["transparency"]) so transparency isn't lost in the resize, and
+            # convert only when the mode differs (no needless full-frame copy).
+            has_alpha = opened.mode in ("RGBA", "LA") or "transparency" in opened.info
+            target_mode = "RGBA" if has_alpha else "RGB"
+            converted = opened if opened.mode == target_mode else opened.convert(target_mode)
+            # Downscale to the edge cap before the encode work — a full-resolution
+            # re-encode is what spikes peak memory. Produce a small detached frame
+            # so the large decoded frame frees when the block closes `opened`.
+            longest = max(converted.width, converted.height)
+            if longest > IMAGE_MAX_EDGE_PX:
+                factor = IMAGE_MAX_EDGE_PX / longest
+                base = converted.resize(
+                    (
+                        max(1, round(converted.width * factor)),
+                        max(1, round(converted.height * factor)),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+            elif converted is opened:
+                base = converted.copy()
+            else:
+                base = converted
+    except ImageCompressionError:
+        raise
+    except (
+        Image.DecompressionBombError,
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+        # Truncated/malformed frames: enumerating n_frames or load() on corrupt
+        # bytes can raise these instead of OSError — still a clean 413, not a 500.
+        IndexError,
+        EOFError,
+        struct.error,
+    ) as exc:
+        raise ImageCompressionError("the file is not a readable image") from exc
+
+    if has_alpha:
+        # Alpha-preserving encoders, best-compression first. Tried lazily so the
+        # search stops at the first candidate that fits.
+        _encodings: tuple[tuple[str, str, dict[str, Any]], ...] = (
+            ("WEBP", "image/webp", {"quality": 80, "method": 4}),
+            ("WEBP", "image/webp", {"quality": 60, "method": 4}),
+            ("PNG", "image/png", {"optimize": True}),
+        )
+    else:
+        # WebP first: at a comparable budget it keeps fine text/UI detail crisper
+        # than JPEG (which rings on screenshots), and providers accept WebP. JPEG
+        # is the final fallback.
+        _encodings = (
+            ("WEBP", "image/webp", {"quality": 82, "method": 4}),
+            ("WEBP", "image/webp", {"quality": 68, "method": 4}),
+            ("JPEG", "image/jpeg", {"quality": 75, "optimize": True, "progressive": True}),
+        )
+
+    # Largest-first over a small scale/quality grid (≤ 3 scales × 3 encodings),
+    # encoding one candidate at a time and returning at the first that fits, so a
+    # worst-case (incompressible) upload can't fan out into many eager encodes. A
+    # Pillow encode error becomes a clean 413, never a 500.
+    try:
+        for scale in (1.0, 0.5, 0.25):
+            if scale == 1.0:
+                frame = base
+            else:
+                frame = base.resize(
+                    (max(1, round(base.width * scale)), max(1, round(base.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            for image_format, mime, params in _encodings:
+                data = _encode_image(frame, image_format, **params)
+                if len(data) <= IMAGE_MODEL_BUDGET_BYTES:
+                    return data, mime
+    except (OSError, ValueError) as exc:
+        raise ImageCompressionError("the image couldn't be re-encoded") from exc
+
+    raise ImageCompressionError("the image couldn't be compressed to a supported size")
 
 
 # Extensions accepted as text/code attachments even when the upload's

@@ -4243,6 +4243,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 prepared_item_rows.append(
                     {
                         "id": new_item_id,
+                        # Complete primary keys let MySQL batch ORM inserts without RETURNING.
+                        "workspace_id": src_item.workspace_id,
                         "conversation_id": new_conv_id,
                         "response_id": src_item.response_id,
                         "created_at": src_item.created_at,

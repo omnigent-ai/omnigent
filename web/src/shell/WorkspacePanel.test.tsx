@@ -8,6 +8,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
+import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -173,6 +174,45 @@ describe("WorkspacePanel surface presentation", () => {
     expect(filesTab).not.toHaveAttribute("title");
     expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it.each([
+    ["files", ["Files", "Changes", "GitHub", "Agents 1", "Browser"]],
+    ["changes", ["Changes", "Files", "GitHub", "Agents 1", "Browser"]],
+    ["github", ["GitHub", "Files", "Changes", "Agents 1", "Browser"]],
+    ["subagents", ["Agents 1", "Files", "Changes", "GitHub", "Browser"]],
+  ] as const)("places the %s default first without reordering the remaining tabs", (tab, order) => {
+    writeDefaultWorkspaceTab(tab);
+    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "files" });
+
+    expect(screen.getAllByRole("tab").map((item) => item.getAttribute("aria-label"))).toEqual(
+      order,
+    );
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("moves keyboard focus through the displayed order", async () => {
+    writeDefaultWorkspaceTab("changes");
+    const { onRightRailTabChange } = renderWorkspace({
+      showGithubTab: true,
+      rightRailTab: "changes",
+    });
+
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Changes" }), { key: "ArrowRight" });
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
+    expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("keeps the remaining order when the default tab is unavailable", () => {
+    writeDefaultWorkspaceTab("github");
+    renderWorkspace({ showGithubTab: false });
+
+    expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual([
+      "Files",
+      "Changes",
+      "Agents 1",
+    ]);
   });
 
   it("shows inert workspace chrome while a temporary session is pending", () => {

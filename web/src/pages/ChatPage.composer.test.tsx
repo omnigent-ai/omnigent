@@ -4,6 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
@@ -16,6 +17,12 @@ import {
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import * as host from "@/lib/host";
+import * as identity from "@/lib/identity";
+import {
+  getSessionModelLabelCacheKey,
+  readSessionModelLabelCache,
+} from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
@@ -37,12 +44,47 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
 }));
+// The workspace bar's git-status hook uses TanStack Query; stub it so the
+// composer renders in isolation (no QueryClient) with a neutral empty status.
+// The hoisted spy records the args so a test can assert the page passes the
+// real session id / host / workspace / creation branch (not fixtures).
+const { composerGitStatusArgsSpy } = vi.hoisted(() => ({ composerGitStatusArgsSpy: vi.fn() }));
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: (args: unknown) => {
+    composerGitStatusArgsSpy(args);
+    return {
+      branch: null,
+      branchState: "unknown",
+      isWorktree: null,
+      worktreePath: null,
+      creationBranch: null,
+      repoNameWithOwner: null,
+      prCount: 0,
+      prNumber: null,
+      refresh: () => {},
+      refreshing: false,
+    };
+  },
+}));
+// SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
+// so the indicator self-hides (no active children) in isolated composer renders.
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
+}));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
+const { composerSnapshotHost } = vi.hoisted(() => ({
+  composerSnapshotHost: { id: null as string | null },
+}));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
-  useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
+  useSession: () => ({
+    session: { hostId: composerSnapshotHost.id },
+    isLoading: false,
+    error: null,
+  }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
@@ -70,8 +112,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
-import type { Session } from "@/lib/types";
+import { Composer, shouldQueueSend } from "./ChatPage";
 import type { QueuedMessage } from "@/store/chatStore";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -99,6 +140,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     selectedAgentId: null,
     permissionLevel: null,
     readOnlyReason: null,
+    sendDisabledReason: null,
     effortLevels: ["low", "medium", "high"] as const,
     showEffort: true,
     showModels: false,
@@ -117,8 +159,6 @@ async function openSessionModels() {
 
 function openSessionConfig() {
   fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
-  const advanced = screen.queryByTestId("composer-advanced-settings");
-  if (advanced) fireEvent.click(advanced);
 }
 
 const CLAUDE_MODEL_OPTIONS = [
@@ -261,6 +301,20 @@ describe("Composer session drafts", () => {
 
     fireEvent.submit(textarea().closest("form")!);
     await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(false));
+  });
+
+  it("preserves an unfinished draft when a temporary session receives its real id", async () => {
+    useChatStore.setState({ conversationId: "temp:draft" });
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.change(textarea(), { target: { value: "draft during startup" } });
+    await waitFor(() => expect(getSessionDraft("temp:draft")?.text).toBe("draft during startup"));
+
+    act(() => useChatStore.setState({ conversationId: "conv_real" }));
+
+    await waitFor(() => expect(textarea()).toHaveValue("draft during startup"));
+    expect(getSessionDraft("temp:draft")).toBeUndefined();
+    expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
   });
 });
 
@@ -1185,6 +1239,132 @@ describe("Composer slash-command submit routing", () => {
   });
 });
 
+describe("Composer cached model labels", () => {
+  const model = "provider/model-a";
+  const catalog = [{ id: "alias-a", model, displayName: "Team model" }];
+  const scope = {
+    sessionId: "conv_cached_label",
+    hostId: "host-a",
+    agentId: "agent-a",
+    harness: "claude-native",
+  };
+  const props = () =>
+    composerProps({
+      modelPickerKind: "claude",
+      showModels: true,
+      showEffort: false,
+      codexModelOptions: catalog,
+      modelLabelOptions: [],
+    });
+  beforeEach(() => {
+    localStorage.clear();
+    composerSnapshotHost.id = scope.hostId;
+    vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
+    useChatStore.setState({
+      conversationId: scope.sessionId,
+      sessionHostId: scope.hostId,
+      boundAgentId: scope.agentId,
+      sessionHarness: scope.harness,
+      llmModel: model,
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+      pendingModelChange: null,
+      nativeVendorOwnsModel: false,
+      costControlModeOverride: "off",
+      skills: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    composerSnapshotHost.id = null;
+    vi.restoreAllMocks();
+    localStorage.clear();
+    useChatStore.setState({ sessionModelSeeded: false, sessionHostId: null, boundAgentId: null });
+  });
+
+  it("waits for session labels while leaving host-probe menu choices usable", async () => {
+    const view = renderWithTooltips(<Composer {...props()} />);
+    const trigger = screen.getByTestId("composer-config-gear");
+    expect(screen.getByRole("status", { name: "Loading model" })).toBeInTheDocument();
+    expect(trigger).toBeEnabled();
+    expect(trigger).not.toHaveTextContent(model);
+    expect(trigger).not.toHaveTextContent("Team model");
+    expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBeNull();
+    fireEvent.focus(trigger);
+    const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tooltip).toHaveTextContent("Loading model…");
+    expect(tooltip).not.toHaveTextContent(model);
+    openSessionConfig();
+    expect(screen.getByTestId("composer-agent-model-summary")).toHaveTextContent("Loading model…");
+    fireEvent.click(screen.getByTestId("composer-agent-edit"));
+    expect(await screen.findByTestId("composer-agent-model-alias-a")).toBeEnabled();
+
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...props()} modelLabelOptions={catalog} />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+    expect(trigger).toHaveTextContent("Team model");
+  });
+
+  it("uses the cached session display name immediately on remount, not a newer host probe", async () => {
+    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBe(
+      "Team model",
+    );
+    first.unmount();
+    useChatStore.setState({ sessionHostId: null });
+    renderWithTooltips(
+      <Composer {...props()} codexModelOptions={[{ ...catalog[0], displayName: "Host name" }]} />,
+    );
+    const trigger = screen.getByTestId("composer-config-gear");
+    expect(trigger).toHaveTextContent("Team model");
+    expect(trigger).not.toHaveTextContent("Host name");
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+    await openSessionModels();
+    expect(screen.getByTestId("composer-agent-model-alias-a")).toBeEnabled();
+  });
+
+  it("uses a loading label for the synthetic current row without a catalog", async () => {
+    renderWithTooltips(<Composer {...props()} codexModelOptions={[]} />);
+    await openSessionModels();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Loading model… (current)" }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("composer-agent-config-menu")).not.toHaveTextContent(model);
+  });
+
+  it("does not reuse the creation host's cache after the snapshot host changes", () => {
+    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    composerSnapshotHost.id = "new-host";
+    first.rerender(
+      <TooltipProvider>
+        <Composer {...props()} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-model-loading")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-config-gear")).not.toHaveTextContent("Team model");
+  });
+
+  it("does not cache an optimistic creation seed until the runner confirms it", () => {
+    useChatStore.setState({ sessionModelSeeded: true, sessionModelOverride: model });
+    renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    const key = getSessionModelLabelCacheKey(scope, model);
+    expect(readSessionModelLabelCache(key)).toBeNull();
+    act(() => useChatStore.setState({ sessionModelSeeded: false }));
+    expect(readSessionModelLabelCache(key)).toBe("Team model");
+  });
+
+  it("keeps Smart Routing visible without a label-loading spinner", () => {
+    useChatStore.setState({ costControlModeOverride: "on" });
+    renderWithTooltips(<Composer {...props()} costRoutingEligible />);
+    expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Smart Routing");
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+  });
+});
+
 describe("Composer model/effort label", () => {
   beforeEach(() => {
     useChatStore.setState({
@@ -1211,6 +1391,33 @@ describe("Composer model/effort label", () => {
 
   const label = () => screen.getByTestId("composer-agent-config-value");
 
+  it("shows the catalog display name beside Edit in the shared harness row", () => {
+    useChatStore.setState({
+      llmModel: "system.ai.claude-opus-4-6",
+      sessionHarness: "claude-native",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: [
+            { id: "opus", model: "system.ai.claude-opus-4-6", displayName: "Opus" },
+          ],
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Opus");
+    fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+    const row = screen.getByTestId("composer-agent-edit");
+    expect(row).toHaveClass("composer-agent-row");
+    expect(row).toHaveAttribute("data-active", "true");
+    expect(within(row).getByText("Opus")).toHaveClass("text-right");
+    expect(within(row).getByText("Edit")).toHaveClass("composer-agent-edit");
+    fireEvent.keyDown(row, { key: "ArrowRight" });
+    expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
+  });
+
   it("shows the model in the foreground and effort muted", () => {
     // The chip renders the harness's reported model (`llmModel`), never the
     // sticky preference or the request.
@@ -1233,6 +1440,35 @@ describe("Composer model/effort label", () => {
     // Model black, effort grey.
     expect(within(label()).getByText("Opus")).toHaveClass("text-foreground");
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("shows no effort for a seeded null, never borrowing the cross-session sticky (#7039)", () => {
+    // Same sticky "high" as the test above, but the optimistic create seeded an
+    // intentional "no effort" (sessionEffortSeeded) — the authoritative seed
+    // must win, so the label shows the model with no effort, not "High".
+    useChatStore.setState({
+      llmModel: "opus",
+      selectedEffort: "high",
+      sessionReasoningEffort: null,
+      sessionEffortSeeded: true,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("High");
+    expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
+    // This suite shares one global store and only resets what each test sets;
+    // no other test touches the seeded flag, so restore the default here.
+    useChatStore.setState({ sessionEffortSeeded: false });
   });
 
   it("reads 'Smart Routing' with no model/effort when routing is on", async () => {
@@ -1293,7 +1529,7 @@ describe("Composer model/effort label", () => {
     // render as if it were the session's model.
     expect(label()).toHaveTextContent("Haiku");
     expect(label()).not.toHaveTextContent("Opus");
-    expect(label()).not.toHaveTextContent("Sonnet");
+    expect(label()).not.toHaveTextContent("Sonnet 4.6");
   });
 
   const CLAUDE_LIVE_OPTIONS = [
@@ -1301,7 +1537,7 @@ describe("Composer model/effort label", () => {
     { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5", isDefault: true },
   ];
 
-  it("maps a Claude concrete model to its friendly alias in the read-only label", () => {
+  it("uses the catalog display name for an exact Claude model ID in the read-only label", () => {
     useChatStore.setState({
       selectedModel: null,
       sessionModelOverride: null,
@@ -1320,7 +1556,6 @@ describe("Composer model/effort label", () => {
       />,
     );
 
-    // The read-only label maps the concrete bound model to its friendly alias.
     expect(label()).toHaveTextContent("Sonnet 5");
     expect(label()).not.toHaveTextContent("system.ai.claude-sonnet-5");
     // The modal's catalog-default fallback (isDefault row when no concrete
@@ -1541,7 +1776,7 @@ describe("Composer model/effort label", () => {
     expect(label()).toHaveTextContent("High");
   });
 
-  it("opens configuration from the shared model trigger and Advanced settings", async () => {
+  it("opens model configuration from Edit in the shared picker", async () => {
     // The pill-wide hover highlight advertises one clickable control, so the
     // label half must perform the same action as the gear beside it.
     useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
@@ -1559,7 +1794,8 @@ describe("Composer model/effort label", () => {
 
     openSessionConfig();
 
-    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("composer-agent-edit"));
+    expect(await screen.findByTestId("composer-agent-config-menu")).toBeTruthy();
   });
 
   it("keeps the label click inert when the session is read-only", () => {
@@ -1617,23 +1853,9 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
   });
 
-  it.each([
-    ["Session workspace", 0],
-    ["Session worktree", 1],
-  ])("wraps text inside the %s popover", (label, triggerIndex) => {
-    renderWithTooltips(<Composer {...composerProps()} />);
-
-    const controls = screen.getByTestId("composer-workspace-controls");
-    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
-      key: "ArrowDown",
-    });
-
-    const popover = screen.getByRole("menu");
-    expect(within(popover).getByText(label)).toBeVisible();
-    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
-    expect(popover).not.toHaveClass("whitespace-nowrap");
-    expect(popover.querySelector("p")).toHaveClass("break-all");
-  });
+  // The workspace/worktree popover markup moved into the shared
+  // ComposerWorkspaceStatus component (its own tests cover the popover text
+  // wrapping); the two page-local inline-dropdown popover cases retired with it.
 
   it("renders the same workspace, host, permission and model controls as landing", () => {
     useChatStore.setState({
@@ -1658,11 +1880,16 @@ describe("Composer shared visible controls", () => {
     const actions = screen.getByTestId("composer-action-row");
     expect(textarea().parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
-    expect(actions.children).toHaveLength(2);
+    const [widthProbe, leading, trailing] = Array.from(actions.children);
+    expect(widthProbe).toHaveClass("h-0");
+    expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
+    expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
+    expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    expect(within(workspace).getByTestId("composer-git-branch")).toHaveTextContent(
-      "feature/shared-composer",
-    );
+    // The branch text now flows through the shared ComposerWorkspaceStatus +
+    // useComposerGitStatus (covered by their own tests); here assert the shared
+    // branch control renders in the bar.
+    expect(within(workspace).getByTestId("composer-git-branch")).toBeInTheDocument();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");
@@ -1671,6 +1898,22 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
+    // The workspace bar is fed by the page adapter, not fixtures: assert the
+    // page threads the actual session identity through useComposerGitStatus.
+    composerGitStatusArgsSpy.mockClear();
+    useChatStore.setState({ conversationId: "conv_git_args", gitBranch: "feature/x" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "conv_git_args",
+        creationBranch: "feature/x",
+        hostId: null,
+        workspace: null,
+      }),
+    );
   });
 
   it("dispatches the shared permission picker to the session setter", async () => {
@@ -1708,6 +1951,25 @@ describe("Composer effort slash-command visibility", () => {
     // so verify /context is present instead.
     expect(screen.queryByTestId("slash-menu-item-effort")).toBeNull();
     expect(screen.getByTestId("slash-menu-item-context")).toBeInTheDocument();
+  });
+
+  it("shows /compact for a claude-sdk session", () => {
+    // claude-sdk is not a native wrapper, but its runner sends /compact to
+    // the live SDK client to trigger native compaction, so the command is
+    // offered even though isNativeWrapper is false.
+    useChatStore.setState({ sessionHarness: "claude-sdk" });
+    render(<Composer {...composerProps({ isNativeWrapper: false })} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
+  });
+
+  it("hides /compact for a non-native, non-claude-sdk session", () => {
+    // Other in-process SDK harnesses (openai-agents) have no /compact path
+    // yet, so the command stays hidden.
+    useChatStore.setState({ sessionHarness: "openai-agents" });
+    render(<Composer {...composerProps({ isNativeWrapper: false })} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.queryByTestId("slash-menu-item-compact")).toBeNull();
   });
 
   it("shows /model in suggestions for in-process and picker-backed native sessions", () => {
@@ -1824,107 +2086,6 @@ describe("Composer Codex Plan-mode control", () => {
   });
 });
 
-describe("Composer claude-native permission mode", () => {
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-    useChatStore.setState({ claudePermissionMode: "" });
-  });
-
-  it("shows the Permissions row inside the gear modal", async () => {
-    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
-
-    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
-    openSessionConfig();
-
-    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    const row = screen.getByTestId("composer-config-permission-mode");
-    // Trigger shows the label only — the description belongs to the open list.
-    expect(row).toHaveTextContent("Auto");
-    expect(row).not.toHaveTextContent("classifier");
-  });
-
-  it("omits the Permissions row when the mode could not be determined", async () => {
-    // Claude only renders its mode footer in some pane states (a todo list
-    // displaces it), so an unknown mode must not be shown as a guess.
-    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "" });
-
-    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
-    openSessionConfig();
-
-    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    expect(screen.queryByTestId("composer-config-permission-mode")).toBeNull();
-  });
-
-  it("keeps the gear reachable when the mode is the only config row", () => {
-    // A Claude session with no model/effort/routing knobs must still open the
-    // gear, since the permission mode lives behind it.
-    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
-
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showClaudePermissionMode: true,
-          showModels: false,
-          showEffort: false,
-          costRoutingEligible: false,
-        })}
-      />,
-    );
-
-    expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
-  });
-});
-
-describe("Composer codex-native approval mode", () => {
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-    useChatStore.setState({ codexApprovalMode: "" });
-  });
-
-  it("shows the Approvals row with the current mode inside the gear modal", async () => {
-    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
-
-    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
-    openSessionConfig();
-
-    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
-  });
-
-  it("follows a live store change while the modal is open and untouched", async () => {
-    // Repro: the mode changes externally (a TUI /permissions switch arrives as
-    // a session.codex_approval_mode SSE) while the gear modal is open. The open
-    // picker must update, not stay on the value it snapshotted on open.
-    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
-
-    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
-    openSessionConfig();
-    await screen.findByTestId("composer-config-modal");
-    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
-
-    act(() => {
-      useChatStore.setState({ codexApprovalMode: "full-access" });
-    });
-
-    await waitFor(() =>
-      expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Full Access"),
-    );
-  });
-
-  it("shows the placeholder until a mode is known", async () => {
-    // Label-only reader: an unset mode reads as the placeholder, never a guess.
-    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "" });
-
-    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
-    openSessionConfig();
-
-    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Set in Codex");
-  });
-});
-
 describe("slashCommandMatches", () => {
   it("matches the leaf segment after a namespace prefix", () => {
     expect(slashCommandMatches("/superpowers:using-superpowers", "using-superpowers")).toBe(true);
@@ -1983,6 +2144,140 @@ describe("rankedSlashCommandNames", () => {
     expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "")).toEqual(
       Object.keys(BUILTIN_SLASH_COMMANDS),
     );
+  });
+});
+
+describe("Composer asynchronous skills", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_loading_skills",
+      skills: [],
+      skillsStatus: "loading",
+      terminalPending: false,
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    useChatStore.setState({ skills: [], skillsStatus: null, terminalPending: false });
+    vi.useRealTimers();
+  });
+
+  it.each([
+    { runnerStarting: true, terminalPending: false },
+    { runnerStarting: false, terminalPending: true },
+  ])("waits for skills while the session starts: %j", ({ runnerStarting, terminalPending }) => {
+    useChatStore.setState({ skillsStatus: "unavailable", terminalPending });
+    const props = composerProps({ runnerStarting });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    expect(screen.queryByText("Skills unavailable while disconnected.")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    act(() =>
+      useChatStore.setState({
+        skills: [{ name: "code-review", description: "Review code" }],
+        skillsStatus: "ready",
+      }),
+    );
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/code-review ");
+  });
+
+  it("stops showing startup loading when the runner stays disconnected", () => {
+    useChatStore.setState({ skillsStatus: "unavailable" });
+    const props = composerProps({ runnerStarting: true });
+    const { rerender } = render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    rerender(<Composer {...props} runnerStarting={false} />);
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    expect(screen.getByText("Skills unavailable while disconnected.")).toBeVisible();
+  });
+
+  it("shows discovery errors even when the session is still starting", () => {
+    useChatStore.setState({ skillsStatus: "error" });
+    render(<Composer {...composerProps({ runnerStarting: true })} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    expect(screen.getByText("Couldn’t load skills.")).toBeVisible();
+  });
+
+  it("dismisses a loading-only menu before interrupting a running session", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+  });
+
+  it("recovers a missed notification once without polling while discovery stays loading", async () => {
+    vi.useFakeTimers();
+    const original = useChatStore.getState().refreshSkills;
+    const refreshSkills = vi.fn(async () => {
+      await Promise.resolve();
+      useChatStore.setState({ skills: [], skillsStatus: "loading" });
+    });
+    useChatStore.setState({ refreshSkills });
+    try {
+      render(<Composer {...composerProps()} />);
+      fireEvent.change(textarea(), { target: { value: "/review" } });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(refreshSkills).toHaveBeenCalledExactlyOnceWith(false);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(refreshSkills).toHaveBeenCalledOnce();
+      act(() => useChatStore.setState({ skillsStatus: "ready" }));
+      act(() => vi.advanceTimersByTime(5_000));
+      expect(refreshSkills).toHaveBeenCalledOnce();
+    } finally {
+      cleanup();
+      useChatStore.setState({ refreshSkills: original });
+    }
+  });
+
+  it("preserves the highlighted command when skills arrive", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    const selected = activeRow()?.textContent;
+    act(() =>
+      useChatStore.setState({
+        skills: [{ name: "review", description: "Review code" }],
+        skillsStatus: "ready",
+      }),
+    );
+    expect(screen.getByTestId("slash-menu-item-review")).toBeVisible();
+    expect(activeRow()?.textContent).toBe(selected);
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+  });
+
+  it("waits for completion instead of sending a partial skill name", () => {
+    const props = composerProps();
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    expect(screen.getByText("Loading skills…")).toBeVisible();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("/review");
+    act(() =>
+      useChatStore.setState({
+        skills: [{ name: "code-review", description: "Review code" }],
+        skillsStatus: "ready",
+      }),
+    );
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/code-review ");
+    expect(props.onSend).not.toHaveBeenCalled();
   });
 });
 
@@ -2113,6 +2408,27 @@ describe("Composer placeholder", () => {
   it("shows the normal placeholder when the runner is live", () => {
     render(<Composer {...composerProps({})} />);
     expect(textarea().placeholder).toMatch(/send a message/i);
+  });
+
+  it("keeps drafting enabled while session creation blocks submission", () => {
+    const props = composerProps({
+      disabled: true,
+      unreachable: true,
+      permissionLevel: 1,
+      sendDisabledReason: "Starting the session…",
+    });
+    render(<Composer {...props} />);
+
+    const input = textarea();
+    expect(input).toBeEnabled();
+    expect(input.placeholder).toMatch(/send a message/i);
+    fireEvent.change(input, { target: { value: "queue this next" } });
+    expect(input).toHaveValue("queue this next");
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(input).toHaveValue("queue this next");
   });
 
   it("a structural read-only reason wins over the normal placeholder", () => {
@@ -2914,6 +3230,51 @@ describe("Composer sub-agent tray", () => {
   });
 });
 
+// The trays peeking above the composer (queued strip, sub-agent tray) dock
+// onto the inset workspace bar: a tray's negative-margin tuck only hides its
+// bottom corners behind a surface at least as wide, so the trays must share
+// the bar's column wrapper and inset. Rendered as full-column siblings of the
+// wrapper instead, page background shows under their outer edges and the tray
+// floats detached above the composer (real geometry is covered by
+// tests/e2e_ui/chat/test_queued_strip_docks_on_composer.py).
+describe("Composer trays dock onto the workspace bar", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ queuedMessages: [] });
+  });
+
+  /** The column wrapper holding the workspace bar. */
+  function workspaceBarParent(): Element | null {
+    return (
+      document.querySelector('[data-testid="composer-workspace-controls"]')?.parentElement ?? null
+    );
+  }
+
+  it("renders the queued strip inside the workspace bar's column wrapper", () => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
+    });
+    // Tooltip provider for the strip's per-row steer/edit/delete buttons.
+    renderWithTooltips(<Composer {...composerProps()} />);
+    const strip = document.querySelector('[data-testid="composer-queued-strip"]');
+    expect(strip).not.toBeNull();
+    expect(workspaceBarParent()).not.toBeNull();
+    expect(strip!.parentElement).toBe(workspaceBarParent());
+  });
+
+  it("renders the sub-agent tray inside the workspace bar's column wrapper", () => {
+    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    render(<Composer {...composerProps({ subAgentLabel: "check-account-eligibility" })} />);
+    const tray = document.querySelector('[data-testid="composer-subagent-tray"]');
+    expect(tray).not.toBeNull();
+    expect(workspaceBarParent()).not.toBeNull();
+    expect(tray!.parentElement).toBe(workspaceBarParent());
+  });
+});
+
 describe("Composer — queued-message flush gating", () => {
   afterEach(() => {
     cleanup();
@@ -3019,7 +3380,7 @@ describe("Composer config gear", () => {
     renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "false");
     openSessionConfig();
-    expect(screen.queryByTestId("composer-config-modal")).not.toBeNull();
+    expect(screen.queryByTestId("composer-agent-menu")).not.toBeNull();
   });
 
   it("still shows the config tooltip on a disabled gear (soft-disable preserves hover)", async () => {
@@ -3060,7 +3421,7 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Model:");
     expect(tip.textContent).toContain("Effort:");
     // Effort is switchable in-session; permission mode is not, so it must be absent.
-    expect(tip.textContent).not.toContain("Permissions");
+    expect(tip.textContent).not.toContain("Permission mode");
   });
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
@@ -3098,16 +3459,17 @@ describe("Composer config gear", () => {
     expect(tip.textContent).not.toContain("Effort:");
   });
 
-  it("keeps Advanced settings free of duplicate model and effort controls", async () => {
+  it("omits Advanced settings and its trailing separator from the picker", () => {
     renderWithTooltips(
       <Composer
         {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
       />,
     );
     openSessionConfig();
-    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    expect(screen.queryByTestId("composer-config-model")).toBeNull();
-    expect(screen.queryByTestId("composer-config-effort")).toBeNull();
+    expect(screen.queryByTestId("composer-advanced-settings")).toBeNull();
+    expect(screen.queryByText("Advanced settings…")).toBeNull();
+    const menu = screen.getByTestId("composer-agent-menu");
+    expect(menu.lastElementChild).toBe(screen.getByTestId("composer-agent-edit"));
   });
 
   it("opens mobile model and effort settings in place with Back navigation", async () => {
@@ -3140,7 +3502,7 @@ describe("Composer config gear", () => {
     }
   });
 
-  it("offers inline effort choices and exactly one Advanced entry in the session picker", async () => {
+  it("offers inline effort choices without an Advanced entry in the session picker", async () => {
     useChatStore.setState({
       selectedEffort: "xhigh",
       sessionHarness: "claude-native",
@@ -3164,7 +3526,7 @@ describe("Composer config gear", () => {
       "true",
     );
     expect(screen.getByTestId("composer-agent-effort-xhigh")).toHaveTextContent("xHigh");
-    expect(screen.getAllByText("Advanced settings…")).toHaveLength(1);
+    expect(screen.queryByText("Advanced settings…")).toBeNull();
   });
 
   it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {
@@ -3262,26 +3624,6 @@ describe("Composer config gear", () => {
     // Give the nonce effect a tick; the modal must stay closed.
     await waitFor(() => expect(gear()).toHaveAttribute("aria-disabled", "true"));
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
-  });
-
-  it("gives a routable agent with no Model dropdown the subagent row, not a Smart Routing switch", async () => {
-    // An SDK/bundle agent (Polly) has no Model dropdown and no in-session Smart
-    // Routing switch: its own routing is a create-time choice, so Subagent
-    // routing is the only routing control the gear offers.
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showModels: false,
-          modelPickerKind: null,
-          costRoutingEligible: true,
-          subagentRoutingEligible: true,
-        })}
-      />,
-    );
-    openSessionConfig();
-    await screen.findByTestId("composer-config-modal");
-    expect(screen.getByTestId("composer-config-subagent-routing")).toBeTruthy();
-    expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
   });
 
   it("keeps Codex models in the primary picker alongside Smart Routing", async () => {
@@ -3433,30 +3775,9 @@ describe("Composer config gear", () => {
     // while Luna's own max stays.
     await waitFor(() => expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(null));
     act(() => useChatStore.setState({ llmModel: "gpt-5.6-luna", selectedEffort: null }));
-    expect(screen.getByTestId("composer-agent-effort-default")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    expect(screen.queryByTestId("composer-agent-effort-default")).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-ultra"]')).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-max"]')).not.toBeNull();
-  });
-
-  it("skips unchanged knobs on Save (no spurious slash-command injection)", async () => {
-    const setModel = vi.fn().mockResolvedValue(undefined);
-    const setEffort = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel, setEffort, selectedEffort: "medium" });
-    renderWithTooltips(
-      <Composer
-        {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
-      />,
-    );
-    openSessionConfig();
-    await screen.findByTestId("composer-config-modal");
-    // Save with nothing changed — no setter should fire.
-    fireEvent.click(screen.getByTestId("composer-config-save"));
-    await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
-    expect(setModel).not.toHaveBeenCalled();
-    expect(setEffort).not.toHaveBeenCalled();
   });
 
   it("re-pins the model when turning Smart Routing off, even if the shown model is unchanged", async () => {
@@ -3499,32 +3820,6 @@ describe("Composer config gear", () => {
       expect(setModel).toHaveBeenCalledWith("opus", { expectConfirmation: true }),
     );
     expect(setCostControlMode).toHaveBeenCalledWith("off");
-  });
-
-  it("does not change models or routing when Advanced is cancelled", async () => {
-    const setModel = vi.fn().mockResolvedValue(undefined);
-    const setCostControlMode = vi.fn().mockResolvedValue(undefined);
-    const options = [
-      { id: "opus", model: "opus", displayName: "Opus" },
-      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
-    ] as never;
-    useChatStore.setState({ setModel, setCostControlMode, codexModelOptions: options });
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          // Smart Routing lives in the Model dropdown, so draft it there.
-          showModels: true,
-          modelPickerKind: "claude",
-          costRoutingEligible: true,
-          codexModelOptions: options,
-        })}
-      />,
-    );
-    openSessionConfig();
-    await screen.findByTestId("composer-config-modal");
-    fireEvent.click(screen.getByTestId("composer-config-cancel"));
-    expect(setCostControlMode).not.toHaveBeenCalled();
-    expect(setModel).not.toHaveBeenCalled();
   });
 
   it("keeps Claude models in the primary picker alongside Smart Routing", async () => {
@@ -3581,7 +3876,7 @@ describe("Composer config gear", () => {
 
     it("names the model the session is on instead of rendering blank", async () => {
       await openModalOnRoutedSession();
-      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent(ROUTED);
+      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent("claude-opus-4-8");
     });
 
     it("pins nothing when opening and closing the model picker", async () => {
@@ -3596,396 +3891,6 @@ describe("Composer config gear", () => {
       await waitFor(() =>
         expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
       );
-    });
-  });
-});
-
-// The gear modal's "Subagent routing" row — the only in-session routing control,
-// for native Claude/Codex and SDK/bundle agents alike. Session-shape eligibility
-// is pinned in CostRoutingControl.test.tsx (`isSubagentRoutingSession`); these
-// tests pin the row's rendering, its effective-value display, and its PATCH on
-// Save.
-describe("Composer config gear — subagent routing", () => {
-  beforeEach(() => {
-    useChatStore.setState({
-      conversationId: "conv_test",
-      skills: [],
-      selectedModel: null,
-      sessionModelOverride: null,
-      llmModel: null,
-      nativeVendorOwnsModel: false,
-      selectedEffort: null,
-      costControlModeOverride: null,
-      subagentRoutingOverride: null,
-      // Opening the gear re-reads the switches from the server; stub it so
-      // these renders don't reach the network.
-      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
-    });
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-  });
-
-  const gear = () => document.querySelector('[data-testid="composer-config-gear"]');
-  const row = () => screen.queryByTestId("composer-config-subagent-routing");
-
-  /** Open the gear modal for a native Claude session (no in-session IR control). */
-  async function openNativeModal(overrides: Record<string, unknown> = {}) {
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showModels: true,
-          modelPickerKind: "claude",
-          // Native terminal sessions keep main-model IR hidden.
-          costRoutingEligible: false,
-          subagentRoutingEligible: true,
-          ...overrides,
-        })}
-      />,
-    );
-    openSessionConfig();
-    await screen.findByTestId("composer-config-modal");
-  }
-
-  it("renders the row when the session is subagent-routing eligible", async () => {
-    await openNativeModal();
-    expect(row()).not.toBeNull();
-  });
-
-  it("hides the row when the session is not eligible (routing disabled or wrong harness)", async () => {
-    await openNativeModal({ subagentRoutingEligible: false });
-    expect(row()).toBeNull();
-  });
-
-  // Only the smart-routing flag matters to `isSubagentRoutingEligible`.
-  const smartRoutingInfo = { smart_routing_enabled: true } as unknown as Parameters<
-    typeof isSubagentRoutingEligible
-  >[0];
-
-  it.each([
-    ["routed claude-native", "claude-native", "on", {}, true],
-    [
-      "auto-harness codex-native",
-      "codex-native",
-      null,
-      { "omnigent.routing.auto_harness": "1" },
-      true,
-    ],
-    ["pinned codex-native", "codex-native", "on", {}, true],
-    ["plain claude-native", "claude-native", null, {}, false],
-    ["plain codex-native", "codex-native", null, {}, false],
-  ] as const)(
-    "row visibility follows the session's routing class: %s",
-    async (_case, harness, costControlModeOverride, extraLabels, visible) => {
-      const session = {
-        agentName: "coder",
-        parentSessionId: null,
-        harness,
-        costControlModeOverride,
-        labels: { "omnigent.wrapper": "claude-code", ...extraLabels },
-      } as unknown as Session;
-      await openNativeModal({
-        subagentRoutingEligible: isSubagentRoutingEligible(smartRoutingInfo, session),
-      });
-      expect(row() === null).toBe(!visible);
-    },
-  );
-
-  it("renders the gear for a native session whose only knob is subagent routing", () => {
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showEffort: false,
-          showModels: false,
-          costRoutingEligible: false,
-          subagentRoutingEligible: true,
-        })}
-      />,
-    );
-    expect(gear()).not.toBeNull();
-  });
-
-  it("offers exactly the two states, with no inherit option", async () => {
-    await openNativeModal();
-    fireEvent.click(row()!);
-    expect(document.querySelectorAll("[data-subagent-routing]")).toHaveLength(2);
-    expect(document.querySelector('[data-subagent-routing="inherit"]')).toBeNull();
-    expect(document.querySelector('[data-subagent-routing="on"]')).not.toBeNull();
-    expect(document.querySelector('[data-subagent-routing="off"]')).not.toBeNull();
-  });
-
-  it("keeps subagent routing independent of changes to session routing", async () => {
-    useChatStore.setState({ costControlModeOverride: null, subagentRoutingOverride: null });
-    await openNativeModal({ costRoutingEligible: true });
-    expect(row()!.textContent).toContain("Default");
-    act(() => useChatStore.setState({ costControlModeOverride: "on" }));
-    expect(row()!.textContent).toContain("Default");
-  });
-
-  // Both directions must PATCH, and neither commits before Save.
-  it.each([
-    { stored: null, pick: "on" },
-    { stored: "on", pick: "off" },
-  ] as const)(
-    "PATCHes $pick on Save from stored $stored (drafted until then)",
-    async ({ stored, pick }) => {
-      const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: stored });
-      await openNativeModal();
-      // The description is unconditional now that the row has no third state.
-      expect(screen.getByText("Model routing for subagents this session spawns")).toBeTruthy();
-      fireEvent.click(row()!);
-      fireEvent.click(document.querySelector(`[data-subagent-routing="${pick}"]`) as Element);
-      // Drafted only — nothing commits until Save.
-      expect(setSubagentRouting).not.toHaveBeenCalled();
-      fireEvent.click(screen.getByTestId("composer-config-save"));
-      await waitFor(() => expect(setSubagentRouting).toHaveBeenCalledWith(pick));
-    },
-  );
-
-  it("does not PATCH when the row is left untouched", async () => {
-    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: "on" });
-    await openNativeModal();
-    fireEvent.click(screen.getByTestId("composer-config-save"));
-    await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
-    expect(setSubagentRouting).not.toHaveBeenCalled();
-  });
-
-  it("writes nothing when an unset session is drafted to Smart Routing and back", async () => {
-    // An unset store value already means Default, so returning to it is not a
-    // change — the row must not PATCH "off" onto a session that reads Default.
-    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: null });
-    await openNativeModal();
-    fireEvent.click(row()!);
-    fireEvent.click(document.querySelector('[data-subagent-routing="on"]') as Element);
-    expect(row()!.textContent).toContain("Smart Routing");
-    fireEvent.click(row()!);
-    fireEvent.click(document.querySelector('[data-subagent-routing="off"]') as Element);
-    fireEvent.click(screen.getByTestId("composer-config-save"));
-    await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
-    expect(setSubagentRouting).not.toHaveBeenCalled();
-  });
-
-  it("discards a drafted pick on Cancel", async () => {
-    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setSubagentRouting });
-    await openNativeModal();
-    fireEvent.click(row()!);
-    fireEvent.click(document.querySelector('[data-subagent-routing="on"]') as Element);
-    fireEvent.click(screen.getByTestId("composer-config-cancel"));
-    expect(setSubagentRouting).not.toHaveBeenCalled();
-  });
-
-  // Display side of the round-trip: `null` (a session stored before the switch
-  // became explicit) collapses onto Default, the same place "off" lands.
-  it.each([
-    { stored: null, shown: "Default" },
-    { stored: "on", shown: "Smart Routing" },
-    { stored: "off", shown: "Default" },
-  ] as const)("shows $shown for stored $stored", async ({ stored, shown }) => {
-    useChatStore.setState({ subagentRoutingOverride: stored });
-    await openNativeModal();
-    expect(row()!.textContent).toContain(shown);
-  });
-
-  // Write side of the same round-trip: every (stored, picked) pair. A pick that
-  // changes what the session reads persists exactly itself; re-picking the state
-  // it already reads writes nothing (`null` and "off" both read as Default).
-  it.each([
-    { stored: null, option: "on", written: "on" },
-    { stored: null, option: "off", written: null },
-    { stored: "on", option: "on", written: null },
-    { stored: "on", option: "off", written: "off" },
-    { stored: "off", option: "on", written: "on" },
-    { stored: "off", option: "off", written: null },
-  ] as const)(
-    "stored $stored + pick $option writes $written",
-    async ({ stored, option, written }) => {
-      const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: stored });
-      await openNativeModal();
-      fireEvent.click(row()!);
-      fireEvent.click(document.querySelector(`[data-subagent-routing="${option}"]`) as Element);
-      fireEvent.click(screen.getByTestId("composer-config-save"));
-      await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
-      if (written === null) expect(setSubagentRouting).not.toHaveBeenCalled();
-      else expect(setSubagentRouting).toHaveBeenCalledWith(written);
-    },
-  );
-
-  // The mismatch this pins: the row must not keep showing the value the session
-  // had when the modal opened. Nothing pushes a routing-switch change to the
-  // client, so the stored value can land (bind snapshot, another tab's PATCH)
-  // while the modal sits open — and a Save then wrote the stale value back.
-  it("follows the stored value when it changes under an open, untouched row", async () => {
-    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: null });
-    await openNativeModal();
-    expect(row()!.textContent).toContain("Default");
-
-    // The real stored value arrives (the snapshot the store was missing).
-    useChatStore.setState({ subagentRoutingOverride: "on" });
-    await waitFor(() => expect(row()!.textContent).toContain("Smart Routing"));
-
-    // Untouched → Save writes nothing; the session keeps what it has.
-    fireEvent.click(screen.getByTestId("composer-config-save"));
-    await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
-    expect(setSubagentRouting).not.toHaveBeenCalled();
-  });
-
-  it("keeps the user's pick when the stored value changes under it", async () => {
-    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: null });
-    await openNativeModal();
-    fireEvent.click(row()!);
-    fireEvent.click(document.querySelector('[data-subagent-routing="on"]') as Element);
-
-    // A late snapshot must not overwrite what the user just chose.
-    useChatStore.setState({ subagentRoutingOverride: "off" });
-    expect(row()!.textContent).toContain("Smart Routing");
-
-    fireEvent.click(screen.getByTestId("composer-config-save"));
-    await waitFor(() => expect(setSubagentRouting).toHaveBeenCalledWith("on"));
-  });
-
-  it("re-reads the stored switches when the modal opens", async () => {
-    const refreshSessionOverrides = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ refreshSessionOverrides });
-    await openNativeModal();
-    expect(refreshSessionOverrides).toHaveBeenCalled();
-  });
-
-  // An SDK/bundle agent (Polly, Debby) has no Model dropdown and no in-session
-  // Smart Routing switch — its own routing is chosen once at create. Subagent
-  // routing is its ONLY gear knob, and it must be the same row native sessions
-  // get: same copy, same options, same PATCH, and never a cost-control write.
-  describe("SDK/bundle sessions", () => {
-    /** Open the gear modal for a bundle agent whose only knob is subagent routing. */
-    async function openBundleModal(overrides: Record<string, unknown> = {}) {
-      renderWithTooltips(
-        <Composer
-          {...composerProps({
-            showEffort: false,
-            showModels: false,
-            modelPickerKind: null,
-            // Routing-eligible for its own turns, but the switch is create-time only.
-            costRoutingEligible: true,
-            subagentRoutingEligible: true,
-            ...overrides,
-          })}
-        />,
-      );
-      openSessionConfig();
-      await screen.findByTestId("composer-config-modal");
-    }
-
-    /** The modal's config rows (direct children of the rows container). */
-    function configRows(): Element[] {
-      const modal = screen.getByTestId("composer-config-modal");
-      return Array.from(modal.querySelectorAll(":scope > div.flex.flex-col.gap-5 > div"));
-    }
-
-    it("renders the gear when subagent routing is the only knob", () => {
-      renderWithTooltips(
-        <Composer
-          {...composerProps({
-            showEffort: false,
-            showModels: false,
-            costRoutingEligible: true,
-            subagentRoutingEligible: true,
-          })}
-        />,
-      );
-      expect(gear()).not.toBeNull();
-    });
-
-    it("renders exactly one row — the subagent row, with no switch/Model/Effort", async () => {
-      await openBundleModal();
-      expect(configRows()).toHaveLength(1);
-      expect(row()).not.toBeNull();
-      expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
-      expect(screen.queryByTestId("composer-config-model")).toBeNull();
-      expect(screen.queryByTestId("composer-config-effort")).toBeNull();
-    });
-
-    it("uses the same copy as a native session", async () => {
-      await openBundleModal();
-      expect(screen.getByText("Subagent routing")).toBeTruthy();
-      expect(screen.getByText("Model routing for subagents this session spawns")).toBeTruthy();
-    });
-
-    it("offers exactly the two states, same option values as native", async () => {
-      await openBundleModal();
-      fireEvent.click(row()!);
-      expect(document.querySelectorAll("[data-subagent-routing]")).toHaveLength(2);
-      expect(document.querySelector('[data-subagent-routing="on"]')).not.toBeNull();
-      expect(document.querySelector('[data-subagent-routing="off"]')).not.toBeNull();
-    });
-
-    it.each([
-      { stored: null, shown: "Default" },
-      { stored: "on", shown: "Smart Routing" },
-      { stored: "off", shown: "Default" },
-    ] as const)("shows $shown for stored $stored", async ({ stored, shown }) => {
-      useChatStore.setState({ subagentRoutingOverride: stored });
-      await openBundleModal();
-      expect(row()!.textContent).toContain(shown);
-    });
-
-    it("PATCHes subagent routing on Save and never touches cost control", async () => {
-      const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-      const setCostControlMode = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({
-        setSubagentRouting,
-        setCostControlMode,
-        subagentRoutingOverride: null,
-      });
-      await openBundleModal();
-      fireEvent.click(row()!);
-      fireEvent.click(document.querySelector('[data-subagent-routing="on"]') as Element);
-      expect(setSubagentRouting).not.toHaveBeenCalled();
-      fireEvent.click(screen.getByTestId("composer-config-save"));
-      await waitFor(() => expect(setSubagentRouting).toHaveBeenCalledWith("on"));
-      // The removed switch was the only thing that wrote cost control here.
-      expect(setCostControlMode).not.toHaveBeenCalled();
-    });
-
-    it("PATCHes off from stored on, and nothing else", async () => {
-      const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-      const setCostControlMode = vi.fn().mockResolvedValue(undefined);
-      const setModel = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({
-        setSubagentRouting,
-        setCostControlMode,
-        setModel,
-        subagentRoutingOverride: "on",
-      });
-      await openBundleModal();
-      fireEvent.click(row()!);
-      fireEvent.click(document.querySelector('[data-subagent-routing="off"]') as Element);
-      fireEvent.click(screen.getByTestId("composer-config-save"));
-      await waitFor(() => expect(setSubagentRouting).toHaveBeenCalledWith("off"));
-      expect(setCostControlMode).not.toHaveBeenCalled();
-      expect(setModel).not.toHaveBeenCalled();
-    });
-
-    it("writes nothing when Save is pressed untouched", async () => {
-      const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
-      const setCostControlMode = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({
-        setSubagentRouting,
-        setCostControlMode,
-        subagentRoutingOverride: "on",
-      });
-      await openBundleModal();
-      fireEvent.click(screen.getByTestId("composer-config-save"));
-      await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
-      expect(setSubagentRouting).not.toHaveBeenCalled();
-      expect(setCostControlMode).not.toHaveBeenCalled();
     });
   });
 });

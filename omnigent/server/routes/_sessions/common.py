@@ -237,6 +237,12 @@ _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mo
 _CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
     {"default", "acceptEdits", "plan", "auto"}
 )
+# Modes the forwarder can read off the pane footer. A session launched into
+# ``bypassPermissions`` reports it so the label and picker show the real mode;
+# it is still not a PATCH target.
+_CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES | {
+    "bypassPermissions"
+}
 
 
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
@@ -579,6 +585,9 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 
 
+_runner_skills_failed: set[str] = set()
+
+
 # Sessions whose cached skills need a re-fetch but should keep serving until it
 # lands. A browser reload asks for one, and dropping the entry outright would
 # empty the composer's slash-command menu for the reload that requested it.
@@ -690,6 +699,11 @@ _llm_response_denied_turns: dict[str, str] = {}
 
 
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+_policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 
@@ -915,6 +929,7 @@ __all__ = [
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_CLAUDE_NATIVE_PERMISSION_MODES",
     "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
+    "_CLAUDE_NATIVE_READABLE_PERMISSION_MODES",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
