@@ -15,6 +15,7 @@ from fastapi import (
     APIRouter,
     HTTPException,
     Request,
+    Response,
 )
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
@@ -71,6 +72,10 @@ from omnigent.server.background_session_titles import (
     schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.replica_forward import (
+    REPLICA_FORWARDED_HEADER,
+    forward_misrouted_request,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -451,6 +456,47 @@ def register_events_routes(
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
+    async def _forward_misrouted_session_request(
+        request: Request, session_id: str, *, stream: bool = False
+    ) -> Response | None:
+        """Proxy a mis-routed session request to the replica owning its tunnel.
+
+        Re-verifies the wrong-replica classification from scratch (the
+        session's host tunnel is absent HERE while the host row is live
+        elsewhere), then forwards to the owning replica's advertised URL
+        from ``hosts.replica_url``. Returns ``None`` whenever forwarding
+        is not possible — the request already crossed one replica hop, no
+        URL is advertised, the row points back at this replica, or the
+        proxy hop failed — so callers fall back to the pre-existing
+        ``WRONG_REPLICA`` raise and the client-side keyless re-address.
+
+        :param request: The mis-routed inbound request.
+        :param session_id: Session whose runner lives elsewhere.
+        :param stream: Relay the response incrementally (SSE) when set.
+        :returns: The relayed response, or ``None`` to fall back.
+        """
+        if request.headers.get(REPLICA_FORWARDED_HEADER):
+            return None
+        state = request.app.state
+        host_registry_state = getattr(state, "host_registry", None)
+        host_store_state = getattr(state, "host_store", None)
+        if host_registry_state is None or host_store_state is None:
+            return None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if (
+            conv is None
+            or conv.host_id is None
+            or host_registry_state.get(conv.host_id) is not None
+        ):
+            return None
+        host = await asyncio.to_thread(host_store_state.get_host, conv.host_id)
+        if host is None or not host_is_live(host):
+            return None
+        target = getattr(host, "replica_url", None)
+        if not target or target == getattr(state, "replica_advertise_url", None):
+            return None
+        return await forward_misrouted_request(request, target, stream=stream)
+
     def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token:
@@ -473,7 +519,7 @@ def register_events_routes(
         request: Request,
         session_id: str,
         body: SessionEventInput | list[SessionEventInput],
-    ) -> dict[str, bool | str] | list[dict[str, bool | str]]:
+    ) -> dict[str, bool | str] | list[dict[str, bool | str]] | Response:
         """
         Route entry for :func:`_post_event_impl`.
 
@@ -484,34 +530,52 @@ def register_events_routes(
         the error response does not include acknowledgements from earlier
         entries. Messages count as in flight for the whole request, including
         runner launch.
+
+        A ``WRONG_REPLICA`` failure (the session's runner tunnel lives on
+        another replica) is healed here by proxying the request to the
+        owning replica when its advertised URL is known — but only when
+        no entry has been applied yet, since every wrong-replica raise
+        precedes its entry's side effects and the forward replays the
+        whole request. Otherwise the error surfaces as before and the
+        client re-addresses.
         """
-        with contextlib.ExitStack() as in_flight:
-            if isinstance(body, list):
-                if not body:
-                    raise OmnigentError(
-                        "session event batch must not be empty",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                if len(body) > MAX_SESSION_EVENT_BATCH_EVENTS:
-                    raise OmnigentError(
-                        "session event batch exceeds the 100-event limit",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                return [
-                    await _post_event_impl(
-                        request,
-                        session_id,
-                        event,
-                        in_flight=in_flight if event.type == "message" else None,
-                    )
-                    for event in body
-                ]
-            return await _post_event_impl(
-                request,
-                session_id,
-                body,
-                in_flight=in_flight if body.type == "message" else None,
-            )
+        completed: list[dict[str, bool | str]] = []
+        try:
+            with contextlib.ExitStack() as in_flight:
+                if isinstance(body, list):
+                    if not body:
+                        raise OmnigentError(
+                            "session event batch must not be empty",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    if len(body) > MAX_SESSION_EVENT_BATCH_EVENTS:
+                        raise OmnigentError(
+                            "session event batch exceeds the 100-event limit",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    for event in body:
+                        completed.append(
+                            await _post_event_impl(
+                                request,
+                                session_id,
+                                event,
+                                in_flight=in_flight if event.type == "message" else None,
+                            )
+                        )
+                    return completed
+                return await _post_event_impl(
+                    request,
+                    session_id,
+                    body,
+                    in_flight=in_flight if body.type == "message" else None,
+                )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.WRONG_REPLICA or completed:
+                raise
+            forwarded = await _forward_misrouted_session_request(request, session_id)
+            if forwarded is None:
+                raise
+            return forwarded
 
     router.include_router(event_router)
 
@@ -2176,9 +2240,14 @@ def register_events_routes(
         request: Request,
         session_id: str,
         idle: bool = False,
-    ) -> StreamingResponse:
+    ) -> Response:
         """
         Subscribe to the session's live SSE event stream.
+
+        Normally a :class:`StreamingResponse`; a stream that mis-routed
+        to a replica without the session's runner tunnel is relayed from
+        the owning replica instead (see
+        :func:`_forward_misrouted_session_request`).
 
         Does NOT replay history; clients reconcile via the snapshot
         endpoint. The generator emits ``[DONE]`` on normal completion
@@ -2228,6 +2297,11 @@ def register_events_routes(
                 if host_registry_state.get(conv.host_id) is None:
                     host = await asyncio.to_thread(host_store_state.get_host, conv.host_id)
                     if host is not None and host_is_live(host):
+                        forwarded = await _forward_misrouted_session_request(
+                            request, session_id, stream=True
+                        )
+                        if forwarded is not None:
+                            return forwarded
                         raise OmnigentError(
                             "session stream is on another replica; retry",
                             code=ErrorCode.WRONG_REPLICA,

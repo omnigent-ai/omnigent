@@ -85,6 +85,7 @@ def create_host_tunnel_router(
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    replica_advertise_url: str | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -126,6 +127,11 @@ def create_host_tunnel_router(
     :param runner_exit_reports: Shared store for ``host.runner_exited``
         reports, read by the runner status endpoint. ``None`` (e.g.
         minimal test wiring) drops the reports.
+    :param replica_advertise_url: Base URL peer replicas can reach THIS
+        replica on, e.g. ``"http://10.68.3.7:8000"``. Stamped on the
+        host row (``hosts.replica_url``) at connect and every heartbeat
+        so other replicas can forward this host's mis-routed session
+        requests here. ``None`` disables forwarding to this replica.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -284,6 +290,7 @@ def create_host_tunnel_router(
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
                 managed_token=managed_token,
+                replica_url=replica_advertise_url,
             )
             host_persisted = True
 
@@ -318,7 +325,7 @@ def create_host_tunnel_router(
                 name=f"host-sender:{host_id}",
             )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
+                _ping_loop(ws, conn, host_id, host_store, replica_advertise_url),
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
@@ -819,6 +826,7 @@ async def _ping_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    replica_advertise_url: str | None = None,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
@@ -834,6 +842,9 @@ async def _ping_loop(
     :param conn: Host connection for timing checks.
     :param host_id: Host id for logging.
     :param host_store: Persistent host store the heartbeat is written to.
+    :param replica_advertise_url: This replica's advertised base URL,
+        re-stamped on the host row with each heartbeat (see
+        :meth:`HostStore.heartbeat`).
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
@@ -850,7 +861,7 @@ async def _ping_loop(
             return
         # The host is still within the liveness window — refresh its
         # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        await asyncio.to_thread(host_store.heartbeat, host_id, replica_url=replica_advertise_url)
         try:
             ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
             conn.outbound_queue.put_nowait(ping_text)

@@ -85,6 +85,12 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param replica_url: Base URL peer replicas can reach the server
+        replica holding this host's live tunnel on, e.g.
+        ``"http://10.68.3.7:8000"``. Stamped by the owning replica on
+        tunnel connect and heartbeat; a replica receiving a mis-routed
+        session request forwards it here. ``None`` when the owning
+        replica has no advertised address.
     """
 
     host_id: str
@@ -98,6 +104,7 @@ class Host:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
+    replica_url: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -172,6 +179,7 @@ def _row_to_host(row: SqlHost) -> Host:
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        replica_url=row.replica_url,
     )
 
 
@@ -233,6 +241,7 @@ class HostStore:
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
         managed_token: str | None = None,
+        replica_url: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -275,6 +284,11 @@ class HostStore:
         :param managed_token: Raw launch token for a managed host. When set,
             registration atomically revalidates the current credential instead
             of performing the external-host upsert path.
+        :param replica_url: The connecting replica's advertised base URL,
+            e.g. ``"http://10.68.3.7:8000"`` — where peer replicas forward
+            this host's mis-routed session requests. ``None`` (no advertised
+            address) is written as-is so a stale URL never outlives the
+            replica that stamped it.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
@@ -303,6 +317,7 @@ class HostStore:
                             status=encode_host_status("online"),
                             updated_at=now,
                             configured_harnesses=harnesses_json,
+                            replica_url=replica_url,
                         )
                     ),
                 )
@@ -334,6 +349,7 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.replica_url = replica_url
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -349,6 +365,7 @@ class HostStore:
                     user_id=user_id,
                     now=now,
                     configured_harnesses_json=harnesses_json,
+                    replica_url=replica_url,
                 )
                 if reowned is not None:
                     return reowned
@@ -372,6 +389,7 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    replica_url,
                 )
                 return _row_to_host(row)
 
@@ -384,6 +402,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                replica_url=replica_url,
             )
             session.add(row)
             return _row_to_host(row)
@@ -397,6 +416,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        replica_url: str | None = None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -417,6 +437,8 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param replica_url: The connecting replica's advertised base URL,
+            or None.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -472,6 +494,7 @@ class HostStore:
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
+            replica_url=replica_url,
         )
         session.add(new_row)
         session.flush()
@@ -498,6 +521,7 @@ class HostStore:
         user_id: str,
         now: int,
         configured_harnesses_json: str | None = None,
+        replica_url: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -522,6 +546,8 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param replica_url: The connecting replica's advertised base URL,
+            or None. Written like the normal connect paths.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -548,6 +574,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                replica_url=replica_url,
             )
         )
         return Host(
@@ -560,6 +587,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            replica_url=replica_url,
         )
 
     def set_offline(self, host_id: str) -> None:
@@ -617,7 +645,7 @@ class HostStore:
 
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
-    def heartbeat(self, host_id: str) -> None:
+    def heartbeat(self, host_id: str, *, replica_url: str | None = None) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
@@ -631,6 +659,11 @@ class HostStore:
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param replica_url: The tunnel-owning replica's advertised base
+            URL, re-stamped alongside the timestamp so the row heals
+            within one ping interval if it ever goes stale (e.g. a row
+            that predates the column). Only the owner's ping loop calls
+            this, so its value — including ``None`` — is canonical.
         """
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
@@ -645,7 +678,7 @@ class HostStore:
                     SqlHost.host_id == host_id,
                     SqlHost.deleted_at.is_(None),
                 )
-                .values(updated_at=updated_at)
+                .values(updated_at=updated_at, replica_url=replica_url)
             )
 
         run_write_transaction(self._session_immediate, "update_host_heartbeat", write)

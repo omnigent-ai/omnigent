@@ -4443,6 +4443,13 @@ def server(
         logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
     )
 
+    # Peer replicas of a multi-replica deployment forward mis-routed
+    # session requests to each other at this URL (see
+    # omnigent.server.replica_forward). None simply disables forwarding.
+    from omnigent.server.replica_forward import derive_replica_advertise_url
+
+    replica_advertise_url = derive_replica_advertise_url(host, port)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -4468,6 +4475,7 @@ def server(
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,
+        replica_advertise_url=replica_advertise_url,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")

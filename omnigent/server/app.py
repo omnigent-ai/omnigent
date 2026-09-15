@@ -187,7 +187,7 @@ def _resolve_extension_state(
     # Distribution metadata is an external installation boundary. Preserve the
     # rest of the server if global discovery itself fails before per-plugin
     # failure isolation can apply.
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
         return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
 
@@ -206,7 +206,7 @@ def _resolve_extension_assets(
                 ", ".join(sorted(overrides)),
             )
         return build_asset_index(state, overrides=overrides)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}
 
@@ -935,7 +935,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+    except Exception:
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -1113,6 +1113,7 @@ def create_app(
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
+    replica_advertise_url: str | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1218,6 +1219,12 @@ def create_app(
     :param extension_state: Optional pre-resolved installed-extension registry.
         When omitted, entry points are discovered once at application
         construction and the process-cached state is reused thereafter.
+    :param replica_advertise_url: Base URL peer replicas can reach THIS
+        server on, e.g. ``"http://10.68.3.7:8000"``. Stamped on host rows
+        when their tunnels connect here, and compared against a row's
+        ``replica_url`` before forwarding a mis-routed session request
+        (see :mod:`omnigent.server.replica_forward`). ``None`` disables
+        both sides of the forwarding.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -1587,6 +1594,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.replica_advertise_url = replica_advertise_url
     # GitHub App integration: enabled only when both the config and the
     # connection store are wired. The client is stateless (holds config),
     # built once and reused for the connect flow.
@@ -3248,6 +3256,7 @@ def create_app(
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
+                replica_advertise_url=replica_advertise_url,
             ),
             prefix="/v1",
             tags=["hosts"],

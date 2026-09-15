@@ -446,6 +446,39 @@ def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
     host_store.heartbeat("aababcc3941edb738172734a9ab7bb8c")
 
 
+def test_connect_and_heartbeat_stamp_replica_url(host_store: HostStore) -> None:
+    """
+    Verify the tunnel-owning replica's advertised URL round-trips.
+
+    Peer replicas read ``replica_url`` to forward a mis-routed session
+    request to the replica holding the tunnel. If connect or heartbeat
+    fails to write it (or a reconnect without an address fails to clear
+    it), mis-routed sessions either strand on ``wrong_replica`` or get
+    forwarded at a replica that no longer owns the tunnel.
+    """
+    host_id = "1f2e3d4c5b6a79880716253443526170"
+    host = host_store.upsert_on_connect(
+        host_id, "laptop", "alice@example.com", replica_url="http://10.0.0.5:8000"
+    )
+    assert host.replica_url == "http://10.0.0.5:8000"
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.replica_url == "http://10.0.0.5:8000"
+
+    # The owner's heartbeat re-stamps the URL, healing a stale value.
+    host_store.heartbeat(host_id, replica_url="http://10.0.0.7:8000")
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.replica_url == "http://10.0.0.7:8000"
+
+    # A reconnect from a replica with no advertised address clears the
+    # column — a stale URL must not outlive the replica that stamped it.
+    host_store.upsert_on_connect(host_id, "laptop", "alice@example.com")
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.replica_url is None
+
+
 def test_is_online_true_for_fresh_online_host(host_store: HostStore) -> None:
     """
     Verify is_online is True for an online host seen just now.

@@ -1340,6 +1340,13 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param replica_url: Base URL peer replicas can reach the server
+        replica holding this host's live tunnel on, e.g.
+        ``"http://10.68.3.7:8000"``. Stamped by the owning replica on
+        tunnel connect and heartbeat; a replica that receives a
+        mis-routed session request forwards it here. ``NULL`` when the
+        owning replica has no advertised address (forwarding disabled).
+        Server-internal — never surfaced through the hosts API.
     """
 
     __tablename__ = "hosts"
@@ -1371,6 +1378,7 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    replica_url: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
