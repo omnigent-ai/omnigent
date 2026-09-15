@@ -901,3 +901,134 @@ def test_documented_tool_response_takes_precedence() -> None:
     )
     assert result is not None
     assert result["event"]["data"]["result"] == "actual result"
+
+
+def test_post_evaluate_with_retry_retries_transient_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An explicit 429 throttle is retried instead of failing the gate closed.
+
+    The throttle is transient by definition, so the first 429 must not block
+    ``UserPromptSubmit`` / ``PreToolUse``; the retry re-sends the same
+    elicitation id and honours the bounded ``Retry-After`` hint.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    sleeps: list[float] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+    bodies: list[dict[str, object]] = []
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            bodies.append(json)
+            if len(bodies) == 1:
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "2"},
+                    request=httpx.Request("POST", url),
+                )
+            return ok
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is ok
+    assert error is None
+    assert len(bodies) == 2
+    assert len({body["_omnigent_elicitation_id"] for body in bodies}) == 1, (
+        "the retry must re-send the same elicitation id"
+    )
+    assert sleeps == [2.0], "a bounded Retry-After hint sets the wait"
+
+
+def test_post_evaluate_with_retry_persistent_429_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A server that keeps throttling exhausts the budget and fails closed.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    posts: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(url)
+            return httpx.Response(429, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None and "retry budget exhausted" in error
+    assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
+
+
+def test_post_evaluate_with_retry_other_4xx_stays_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Non-429 4xx responses are final: one POST, no retry.
+    """
+    posts: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(url)
+            return httpx.Response(422, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None and "422" in error
+    assert len(posts) == 1
