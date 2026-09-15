@@ -4978,7 +4978,10 @@ HarnessStreamEvent = (
 
 
 class ProjectOrderRequest(BaseModel):
-    """Complete manual order; null selects alphabetical mode without erasing it."""
+    """Rank owned project IDs; unranked projects append in discovery order.
+
+    Null selects alphabetical mode without erasing the remembered manual IDs.
+    """
 
     ordered_project_ids: (
         list[Annotated[str, Field(min_length=32, max_length=32, pattern="^[0-9a-f]{32}$")]] | None

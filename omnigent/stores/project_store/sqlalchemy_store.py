@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import builtins
 import json
-from typing import Any, cast
+import re
+from typing import Any
 
-from sqlalchemy import asc, select, update
+import zstandard
+from sqlalchemy import LargeBinary, asc, select, type_coerce, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
+from omnigent.db.compression import decode
 from omnigent.db.db_models import SqlProject, SqlUser, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -89,14 +92,39 @@ def _to_entity(row: SqlProject) -> Project:
     )
 
 
-def _decode_order(raw: str | None) -> ProjectOrderPreference:
+def _decode_order(raw: bytes | str | memoryview | None) -> ProjectOrderPreference:
+    """Keep invalid preferences from breaking project discovery."""
+    default: ProjectOrderPreference = {"sort_mode": "alphabetical", "ordered_project_ids": None}
     if raw is None:
-        return {"sort_mode": "alphabetical", "ordered_project_ids": None}
-    decoded = json.loads(raw)
-    # The original format stored only the manual ID array.
-    if isinstance(decoded, list):
-        return {"sort_mode": "manual", "ordered_project_ids": decoded}
-    return cast(ProjectOrderPreference, decoded)
+        return default
+    try:
+        # The 10,000-ID API limit serializes to under 400 KiB, including legacy spacing.
+        decoded = json.loads(decode(raw, max_decoded_bytes=512 * 1024) or "null")
+        # The original format stored only the manual ID array.
+        if isinstance(decoded, list):
+            decoded = {"sort_mode": "manual", "ordered_project_ids": decoded}
+        if not isinstance(decoded, dict) or decoded.get("sort_mode") not in (
+            "alphabetical",
+            "manual",
+        ):
+            return default
+        ids = decoded.get("ordered_project_ids")
+        if ids is None:
+            return default
+        if (
+            not isinstance(ids, list)
+            or len(ids) > 10000
+            or any(
+                not isinstance(id, str) or re.fullmatch("[0-9a-f]{32}", id) is None for id in ids
+            )
+        ):
+            return default
+        return {
+            "sort_mode": decoded["sort_mode"],
+            "ordered_project_ids": list(dict.fromkeys(ids)),
+        }
+    except (ValueError, RecursionError, zstandard.ZstdError):
+        return default
 
 
 class SqlAlchemyProjectStore(ProjectStore):
@@ -283,8 +311,9 @@ class SqlAlchemyProjectStore(ProjectStore):
         """Read the preference without loading authentication fields."""
         preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
         with self._session("read_project_order") as session:
+            # Decode raw bytes here so malformed values cannot fail in the ORM result processor.
             raw = session.scalar(
-                select(SqlUser.project_order).where(
+                select(type_coerce(SqlUser.project_order, LargeBinary)).where(
                     SqlUser.workspace_id == current_workspace_id(),
                     SqlUser.id == preference_user_id,
                 )
@@ -301,7 +330,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             workspace_id = current_workspace_id()
             if ids is None:
                 raw = session.scalar(
-                    select(SqlUser.project_order)
+                    select(type_coerce(SqlUser.project_order, LargeBinary))
                     .where(SqlUser.workspace_id == workspace_id, SqlUser.id == preference_user_id)
                     .with_for_update()
                 )

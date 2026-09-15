@@ -2416,7 +2416,11 @@ function ConversationList({
                       <ProjectFolder
                         key={group.name}
                         ordering={{
-                          disabled: saveOrder.isPending || selectionMode || editingIds.size > 0,
+                          disabled:
+                            !projectOrder.data ||
+                            saveOrder.isPending ||
+                            selectionMode ||
+                            editingIds.size > 0,
                           first: index === 0,
                           last: index === projects.length - 1,
                           move: (destination) => moveProject(group.name, destination),

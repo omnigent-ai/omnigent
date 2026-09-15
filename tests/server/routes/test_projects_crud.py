@@ -529,6 +529,36 @@ async def test_project_order_rejects_oversized_or_malformed_ids(
     assert response.status_code == 422
 
 
+async def test_corrupt_order_does_not_break_project_discovery(
+    project_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from sqlalchemy import text
+
+    from omnigent.db.utils import get_or_create_engine
+
+    for name in ("Z", "A"):
+        (await project_client.post("/v1/projects", json={"name": name})).raise_for_status()
+    (
+        await project_client.put("/v1/projects/order", json={"ordered_project_ids": []})
+    ).raise_for_status()
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            text("UPDATE users SET project_order=:raw WHERE workspace_id=0 AND id='local'"),
+            {"raw": b"\x00\x01broken compression"},
+        )
+    preference = await project_client.get("/v1/projects/order")
+    assert preference.status_code == 200
+    assert preference.json() == {"sort_mode": "alphabetical", "ordered_project_ids": None}
+    for path in ("/v1/projects", "/v1/sessions/projects"):
+        response = await project_client.get(path)
+        assert response.status_code == 200
+        body = response.json()
+        assert [p["name"] for p in (body if isinstance(body, list) else body["data"])] == [
+            "A",
+            "Z",
+        ]
+
+
 async def test_order_endpoints_enforce_owner_and_announce_changes(
     multi_user_client: httpx.AsyncClient,
 ) -> None:

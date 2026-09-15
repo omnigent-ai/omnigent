@@ -3753,7 +3753,7 @@
         "type": "object"
       },
       "ProjectOrderRequest": {
-        "description": "Complete manual order; null selects alphabetical mode without erasing it.",
+        "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.",
         "properties": {
           "ordered_project_ids": {
             "anyOf": [

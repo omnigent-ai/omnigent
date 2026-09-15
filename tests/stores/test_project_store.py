@@ -563,3 +563,68 @@ def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProject
             )
         )
     assert size is not None and size > 65535
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"not json",
+        b"null",
+        b"\xff",
+        b"\x00",
+        b"\x00\x01invalid",
+        b"\x00\x03{}",
+        b'{"sort_mode":"invalid","ordered_project_ids":[]}',
+        b'{"sort_mode":"manual","ordered_project_ids":[5]}',
+        b'{"sort_mode":"manual","ordered_project_ids":["invalid"]}',
+        b'{"sort_mode":"manual","ordered_project_ids":{}}',
+        b'{"sort_mode":"manual","ordered_project_ids":null}',
+    ],
+)
+def test_invalid_order_falls_back_and_can_be_replaced(
+    store: SqlAlchemyProjectStore, raw: bytes
+) -> None:
+    from sqlalchemy import LargeBinary, bindparam, text
+
+    store.save_order([], user_id=None)
+    with store._engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE users SET project_order=:raw WHERE workspace_id=0 AND id='local'"
+            ).bindparams(bindparam("raw", type_=LargeBinary)),
+            {"raw": raw},
+        )
+    default = {"sort_mode": "alphabetical", "ordered_project_ids": None}
+    assert store.get_order_preference(user_id=None) == default
+    assert store.get_order(user_id=None) is None
+    assert store.save_order(None, user_id=None) == default
+    assert store.get_order_preference(user_id=None) == default
+    store.save_order([], user_id=None)
+    assert store.get_order(user_id=None) == []
+
+
+def test_order_decoder_bounds_size_and_normalizes_duplicate_ids() -> None:
+    import json
+
+    from omnigent.db.compression import encode
+    from omnigent.stores.project_store.sqlalchemy_store import _decode_order
+
+    a, b = _uid("decode-a"), _uid("decode-b")
+    for preference in ([b, a, b], {"sort_mode": "manual", "ordered_project_ids": [b, a, b]}):
+        assert _decode_order(encode(json.dumps(preference))) == {
+            "sort_mode": "manual",
+            "ordered_project_ids": [b, a],
+        }
+    for preference in ([a] * 10001, ["x" * (512 * 1024)]):
+        assert _decode_order(encode(json.dumps(preference))) == {
+            "sort_mode": "alphabetical",
+            "ordered_project_ids": None,
+        }
+
+
+def test_apply_order_deduplicates_and_appends_unranked_projects() -> None:
+    from omnigent.stores.project_store import apply_project_order
+
+    assert apply_project_order(
+        ["b", "c", "a"], ["a", "deleted", "a"], project_id=str, project_name=str
+    ) == ["a", "b", "c"]
