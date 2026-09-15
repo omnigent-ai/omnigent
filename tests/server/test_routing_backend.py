@@ -399,3 +399,18 @@ async def test_route_with_fallback_uses_the_judge_off_the_gateway() -> None:
 
 async def test_route_with_fallback_reports_an_unconfigured_deployment() -> None:
     assert await route_with_fallback(RoutingBackends(), "hi", _MENU, gateway_backed=True) is None
+
+
+def test_routing_available_trusts_a_runners_remote_server() -> None:
+    """A runner has no backends of its own; the server's answer is the truth.
+
+    Without this, every runner reads routing as off — the backends are built in
+    the server process — and hides the advisor from sessions the server routes.
+    """
+    assert routing_available(SimpleNamespace(remote_routing_available=True)) is True
+
+
+def test_routing_available_stays_off_without_backends_or_a_remote_router() -> None:
+    assert routing_available(SimpleNamespace(remote_routing_available=False)) is False
+    assert routing_available(SimpleNamespace()) is False
+    assert routing_available(None) is False
