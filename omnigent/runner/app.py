@@ -166,7 +166,11 @@ from omnigent.runner.subagent_routing import (
     routing_class_from_snapshot,
     session_routing_class,
 )
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.harnesses.process_manager import (
+    HarnessProcessManager,
+    HarnessSpawnError,
+    NoLiveHarnessError,
+)
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
@@ -374,21 +378,27 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
 
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     """
-    Log *exc* in full and return a generic detail string safe for clients.
+    Log *exc* in full and return a detail string safe for clients.
 
     Raw exception text (``str(exc)``) can embed absolute paths, internal
     hostnames, PIDs, and other server-side state. The runner is reached via
     the AP server proxy and its error bodies are relayed to the caller, so
     the cause is logged here for operators while the HTTP response carries
-    only this fixed string. The structured ``error`` code that accompanies
+    a fixed string by default. The structured ``error`` code that accompanies
     the detail already names the failure category for the caller.
+
+    :class:`HarnessSpawnError` is the exception: its messages are curated to
+    be client-safe (they name the harness, exit code, or timeout — never
+    paths or hosts), so the cause is preserved in the detail. Telemetry and
+    the surfaced turn failure would otherwise carry no attributable reason
+    for a spawn failure at all.
 
     The runner's own log path is named so the reader can go read the cause
     instead of hunting for it; it is home-relative (``~/…``) so it points
     somewhere without leaking the account name.
 
-    :param exc: The caught exception, e.g. a ``RuntimeError`` from a harness
-        spawn or an ``InvalidPath`` from path validation.
+    :param exc: The caught exception, e.g. a ``HarnessSpawnError`` from a
+        harness spawn or an ``InvalidPath`` from path validation.
     :param context: Short operator-facing label for the failing operation,
         e.g. ``"harness spawn"``. Appears only in the server log.
     :returns: A non-sensitive string safe to return to clients, e.g.
@@ -403,6 +413,8 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         extra={"session_id": runner_primary_session_id()},
     )
     log_reference = process_log_reference("runner")
+    if isinstance(exc, HarnessSpawnError):
+        return f"{exc}; see the runner log for details: {log_reference}"
     return f"Request failed on the runner; see the runner log for details: {log_reference}"
 
 
