@@ -1029,6 +1029,19 @@ def _is_serialization_failure(exc: DBAPIError) -> bool:
     )
 
 
+def _is_transient_disconnect(exc: DBAPIError) -> bool:
+    """Return whether a statement died because its connection was lost.
+
+    ``connection_invalidated`` is set when the dialect recognized the error as
+    a disconnect (e.g. MySQL 2006 "server has gone away" / 2013 "lost
+    connection during query"), so the dead pooled connection is already
+    discarded and a replay runs on a fresh one. Errors raised outside a
+    statement (``statement is None``, e.g. a failed COMMIT) are excluded: a
+    disconnected commit may have landed, so replaying it could double-apply.
+    """
+    return exc.connection_invalidated and exc.statement is not None
+
+
 def run_write_transaction(
     session_maker: NamedManagedSessionMaker,
     operation_name: str,
@@ -1038,7 +1051,12 @@ def run_write_transaction(
     sleep: Callable[[float], None] = time.sleep,
     random_value: Callable[[], float] = random.random,
 ) -> _T:
-    """Run a named managed transaction, replaying CRDB serialization failures.
+    """Run a named managed transaction, replaying transient failures.
+
+    Two kinds of failure are replayed with bounded, jittered backoff:
+    CockroachDB serialization failures (SQLSTATE 40001) and statement-phase
+    connection losses on any dialect (the dialect invalidated the connection,
+    e.g. MySQL "server has gone away", so the replay runs on a fresh one).
 
     The callback must contain database work only. Callers must perform cache
     invalidation and external side effects after this function returns. The
@@ -1047,7 +1065,7 @@ def run_write_transaction(
     """
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
-    retryable = is_cockroachdb(session_maker.engine.dialect.name)
+    retryable_serialization = is_cockroachdb(session_maker.engine.dialect.name)
     qualified_name = f"{session_maker.query_name_prefix}.{operation_name}"
 
     for attempt in range(max_retries + 1):
@@ -1055,20 +1073,29 @@ def run_write_transaction(
             with session_maker(operation_name) as session:
                 return callback(session)
         except DBAPIError as exc:
-            if not retryable or not _is_serialization_failure(exc):
+            if _is_transient_disconnect(exc):
+                retry_reason = "connection loss"
+            elif retryable_serialization and _is_serialization_failure(exc):
+                retry_reason = "serialization failure"
+            else:
                 raise
             if attempt == max_retries:
                 record_transaction_retry(qualified_name, "exhausted")
                 _logger.error(
-                    "CockroachDB transaction retries exhausted",
-                    extra={"db_operation": qualified_name, "retry_count": attempt},
+                    "Write transaction retries exhausted",
+                    extra={
+                        "db_operation": qualified_name,
+                        "retry_count": attempt,
+                        "retry_reason": retry_reason,
+                    },
                 )
                 raise
             ceiling = min(0.025 * (2**attempt), 0.1)
             delay = ceiling * random_value()
             record_transaction_retry(qualified_name, "scheduled")
             _logger.warning(
-                "Retrying CockroachDB transaction after serialization failure",
+                "Retrying write transaction after %s",
+                retry_reason,
                 extra={
                     "db_operation": qualified_name,
                     "retry_count": attempt + 1,
