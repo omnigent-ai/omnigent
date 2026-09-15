@@ -306,13 +306,14 @@ async: true
 cancellable: true
 timers: true
 
-# polly runs unsandboxed: it only orchestrates (git, registry, gates) and
-# dispatches sub-agents. The coding sub-agents run in their own worktrees.
+# Polly can write the workspace and its orchestration metadata, while the
+# platform sandbox keeps the rest of the host filesystem hidden.
 os_env:
   type: caller_process
   cwd: .
   sandbox:
-    type: none
+    write_paths: [.]
+    cwd_allow_hidden: [.git, .github, .polly, .venv, .worktrees]
 
 # Generic shell terminals for long-running processes (dev servers, watchers, log
 # tails) and ad-hoc shell when sys_os_shell's blocking model doesn't fit. NOT
@@ -322,19 +323,11 @@ terminals:
   shell:
     command: bash
     allow_cwd_override: true
-    os_env:
-      type: caller_process
-      cwd: .
-      sandbox:
-        type: none
+    os_env: inherit
   zsh:
     command: zsh
     allow_cwd_override: true
-    os_env:
-      type: caller_process
-      cwd: .
-      sandbox:
-        type: none
+    os_env: inherit
 
 tools:
   # Coding sub-agents — see agents/<dir>/. claude_code, codex, opencode,
