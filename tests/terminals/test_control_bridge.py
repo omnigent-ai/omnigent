@@ -26,8 +26,11 @@ from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
     _hex_send_keys_commands,
+    _non_negative_int,
+    _query_pane_size,
     _read_tmux_buffer,
     bridge_tmux_control_to_websocket,
+    pane_size_message,
     unescape_control_output,
 )
 
@@ -779,13 +782,13 @@ async def test_control_bridge_forwards_recent_copy_buffer_as_text_frame() -> Non
 
     async def _clipboard_arrived() -> bool:
         for _ in range(50):
-            if ws.sent_text:
+            if _clipboard_frames(ws.sent_text):
                 return True
             await asyncio.sleep(0.05)
         return False
 
     assert await _clipboard_arrived(), "clipboard control frame was not sent"
-    message = json.loads(ws.sent_text[-1])
+    message = _clipboard_frames(ws.sent_text)[-1]
     assert message["type"] == "clipboard-write"
     assert message["encoding"] == "base64"
     assert base64.b64decode(message["data"]) == copied
@@ -815,7 +818,7 @@ async def test_control_bridge_ignores_copy_without_recent_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.3)
-    assert ws.sent_text == []
+    assert _clipboard_frames(ws.sent_text) == []
 
     await _kill_and_join(sock, task)
 
@@ -843,6 +846,164 @@ async def test_control_bridge_read_only_drops_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.2)
-    assert ws.sent_text == []
+    assert _clipboard_frames(ws.sent_text) == []
 
     await _kill_and_join(sock, task)
+
+
+def test_pane_size_message_is_compact_json() -> None:
+    """The announce frame carries the grid under a stable, compact schema."""
+    assert pane_size_message(120, 40) == '{"type":"pane-size","cols":120,"rows":40}'
+
+
+def test_non_negative_int_rejects_unusable_tmux_fields() -> None:
+    """A tmux build without a format expands it to "" — that must not raise."""
+    assert _non_negative_int("120") == 120
+    assert _non_negative_int("") == 0
+    assert _non_negative_int("-3") == 0
+    assert _non_negative_int("0") == 0
+    assert _non_negative_int("nope") == 0
+
+
+def _clipboard_frames(sent_text: list[str]) -> list[dict[str, object]]:
+    """Select only ``clipboard-write`` frames from the text channel.
+
+    The text channel also carries ``pane-size`` announcements, so a clipboard
+    assertion must filter by type rather than treat every text frame as a
+    clipboard write.
+    """
+    return [m for m in map(json.loads, sent_text) if m.get("type") == "clipboard-write"]
+
+
+def _pane_size_frames(sent_text: list[str]) -> list[tuple[int, int]]:
+    """Extract every ``pane-size`` announcement from recorded text frames."""
+    sizes = []
+    for raw in sent_text:
+        message = json.loads(raw)
+        if message.get("type") == "pane-size":
+            sizes.append((message["cols"], message["rows"]))
+    return sizes
+
+
+async def _attach_sizing_control_client(
+    sock: Path, target: str, cols: int, rows: int
+) -> asyncio.subprocess.Process:
+    """Attach a second control client that claims a different terminal size.
+
+    Stands in for the real-world second client — a phone or laptop running
+    ``tmux attach`` over ssh. Under tmux's default ``window-size latest`` it
+    wins the shared window size, which is precisely the event the browser is
+    never told about without the pane-size announce.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "-f",
+        os.devnull,
+        "-C",
+        "attach",
+        "-t",
+        target,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(f"refresh-client -C {cols}x{rows}\n".encode())
+    await proc.stdin.drain()
+    return proc
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_bridge_announces_initial_pane_size() -> None:
+    """The browser learns the real grid before the seed paints into it."""
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        await asyncio.sleep(0.6)
+        assert _pane_size_frames(ws.sent_text)[:1] == [(80, 24)]
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_bridge_announces_pane_size_when_another_client_resizes() -> None:
+    """A second client winning ``window-size latest`` is reported to the browser.
+
+    Regression test for the web terminal rendering a claude-native pane as
+    scrambled fragments while ``tmux attach`` over ssh rendered it perfectly:
+    the pane had been resized by the ssh client, the bridge discarded tmux's
+    ``%layout-change``, and xterm.js kept painting bytes laid out for the other
+    width into its stale grid.
+    """
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    other: asyncio.subprocess.Process | None = None
+    try:
+        await asyncio.sleep(0.6)
+        other = await _attach_sizing_control_client(sock, target, 132, 50)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            if (132, 50) in _pane_size_frames(ws.sent_text):
+                break
+            await asyncio.sleep(0.1)
+        # tmux is the authority on the resulting geometry; assert the bridge
+        # told the browser whatever tmux settled on, and that it is the new
+        # client's size rather than the stale one.
+        assert await _query_pane_size(shutil.which("tmux") or "tmux", str(sock), target) == (
+            132,
+            50,
+        )
+        assert (132, 50) in _pane_size_frames(ws.sent_text), (
+            "bridge never announced the resized pane geometry to the browser"
+        )
+    finally:
+        if other is not None:
+            with contextlib.suppress(ProcessLookupError):
+                other.kill()
+            with contextlib.suppress(Exception):
+                await other.wait()
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_bridge_does_not_repeat_an_unchanged_pane_size() -> None:
+    """Redundant tmux notifications must not spam the browser with resizes."""
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    other: asyncio.subprocess.Process | None = None
+    try:
+        await asyncio.sleep(0.6)
+        # Two clients that both ask for the pane's existing size: tmux may emit
+        # layout notifications, but the geometry never actually changes.
+        other = await _attach_sizing_control_client(sock, target, 80, 24)
+        await asyncio.sleep(1.0)
+        assert _pane_size_frames(ws.sent_text) == [(80, 24)]
+    finally:
+        if other is not None:
+            with contextlib.suppress(ProcessLookupError):
+                other.kill()
+            with contextlib.suppress(Exception):
+                await other.wait()
+        await _kill_and_join(sock, task)

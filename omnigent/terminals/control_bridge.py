@@ -26,6 +26,17 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
   the client exits; the hex channel is byte-exact for ESC sequences, control
   chars, and UTF-8 multibyte alike.
 
+tmux's window size is *shared* by every client attached to the session. A
+second client (a phone or laptop running ``tmux attach`` over ssh) resizes the
+window out from under the browser under tmux's default ``window-size latest``
+policy, and tmux announces that with ``%layout-change``. The browser's xterm.js
+grid is sized by its own fit addon, so unless it is told, it keeps painting a
+stale geometry: text laid out for a wider pane wraps in the narrower grid and
+overwrites the row below it, and absolutely-addressed cells land in the wrong
+place. The bridge therefore sends the authoritative pane size to the browser as
+a ``pane-size`` text frame — once after the seed and again on every size change
+— and the browser resizes its grid to match.
+
 The browser-facing stream uses binary frames for raw pane bytes, text JSON
 frames for resize controls, and binary frames for input. A typed text JSON
 frame carries tmux clipboard updates because outer-client OSC 52 is absent from
@@ -66,6 +77,7 @@ _logger = logging.getLogger(__name__)
 
 __all__ = [
     "bridge_tmux_control_to_websocket",
+    "pane_size_message",
     "unescape_control_output",
 ]
 
@@ -101,6 +113,16 @@ _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 # sentinel-terminated backlog before teardown cancels it. Bounds teardown so a
 # stuck-slow client can't hang the close; a normal drain completes well within.
 _FORWARD_DRAIN_TIMEOUT_S: Final[float] = 5.0
+
+# tmux notifications that mean "the window/pane geometry may have changed".
+# ``%layout-change`` covers a resize driven by any client (including another
+# client winning tmux's shared ``window-size latest`` race); the window-pane
+# notifications cover panes being added, removed, or re-targeted.
+_PANE_SIZE_NOTIFICATIONS: Final[tuple[bytes, ...]] = (
+    b"%layout-change",
+    b"%window-pane-changed",
+    b"%window-add",
+)
 
 # tmux emits this control notification after copy-mode stores a selection in a
 # paste buffer. Only default-style, shell-safe names are accepted; copy-mode's
@@ -472,6 +494,80 @@ async def _capture_pane_metadata(
         return None
 
 
+def _non_negative_int(value: str) -> int:
+    """Parse a tmux numeric format field, treating anything odd as ``0``.
+
+    A tmux build that does not know a format expands it to the empty string,
+    and the pane-size announce is best-effort: an unparseable field must cost
+    only the announce, never the rest of the seed.
+
+    :param value: The raw field text, e.g. ``"120"`` or ``""``.
+    :returns: The parsed value, or ``0`` when it is not a non-negative integer.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def pane_size_message(cols: int, rows: int) -> str:
+    """Build the ``pane-size`` control frame sent to the browser.
+
+    :param cols: Authoritative pane width in character cells.
+    :param rows: Authoritative pane height in character cells.
+    :returns: The compact JSON text frame body.
+    """
+    return json.dumps({"type": "pane-size", "cols": cols, "rows": rows}, separators=(",", ":"))
+
+
+async def _query_pane_size(
+    tmux: str, socket_path: str, tmux_target: str
+) -> tuple[int, int] | None:
+    """Ask tmux for the target pane's current grid size.
+
+    tmux owns the geometry: the browser proposes a size with
+    ``refresh-client -C``, but the window size every client shares is resolved
+    by tmux's ``window-size`` policy across all attached clients, so the
+    browser's proposal is not necessarily what it gets.
+
+    :param tmux: Absolute path to the tmux binary.
+    :param socket_path: tmux server socket path.
+    :param tmux_target: The ``-t`` target, e.g. ``"main"``.
+    :returns: ``(cols, rows)``, or ``None`` when tmux could not be queried or
+        reported a non-positive size.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            socket_path,
+            "display-message",
+            "-p",
+            "-t",
+            tmux_target,
+            "#{pane_width},#{pane_height}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+    except (OSError, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        raw = stdout.decode().strip().split(",")
+    except UnicodeDecodeError:
+        return None
+    if len(raw) < 2:
+        return None
+    cols = _non_negative_int(raw[0])
+    rows = _non_negative_int(raw[1])
+    if cols <= 0 or rows <= 0:
+        return None
+    return cols, rows
+
+
 def _cursor_restore_escape(meta: _PaneMetadata | None) -> bytes:
     """Build the escape that restores the pane cursor after a seed.
 
@@ -532,6 +628,14 @@ async def bridge_tmux_control_to_websocket(
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="tmux not found")
         return
 
+    # Announce the authoritative grid BEFORE the seed. The seed is a snapshot of
+    # a pane of exactly this size, so the browser must already be that size or
+    # it reflows the snapshot as it paints it.
+    announced_size: tuple[int, int] | None = await _query_pane_size(tmux, socket_path, tmux_target)
+    if announced_size is not None:
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+            await websocket.send_text(pane_size_message(*announced_size))
+
     # Seed the browser terminal with the current screen BEFORE attaching so no
     # pre-attach content is missing. Failure is non-fatal — a live pane redraw
     # will repaint it shortly.
@@ -571,6 +675,10 @@ async def bridge_tmux_control_to_websocket(
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
     output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    # Coalescing doorbell for "tmux says the geometry changed". Only the fact
+    # matters, never how many notifications arrived, so a depth of one is
+    # enough and a burst of resizes cannot build a backlog.
+    pane_size_events: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
     # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
     # A noisy pane cannot build an unbounded queue of names/subprocess reads.
     clipboard_buffers: asyncio.Queue[str | None] = asyncio.Queue(maxsize=2)
@@ -628,6 +736,14 @@ async def bridge_tmux_control_to_websocket(
             parts = line.split(b" ", 2)
             if len(parts) == 3:
                 output_chunks.put_nowait(unescape_control_output(parts[2]))
+            return True
+        if line.startswith(_PANE_SIZE_NOTIFICATIONS):
+            # tmux resized the shared window — possibly because *another*
+            # client (an ssh/tmux attach on a phone or laptop) became the
+            # latest under ``window-size latest``. The browser proposed a size
+            # but does not own one, so re-read the truth and tell it.
+            with contextlib.suppress(asyncio.QueueFull):
+                pane_size_events.put_nowait(None)
             return True
         buffer_name = _clipboard_buffer_name(line)
         if buffer_name is not None:
@@ -718,6 +834,29 @@ async def bridge_tmux_control_to_websocket(
             if eof_seen:
                 return
 
+    async def _announce_pane_size() -> None:
+        """Push the authoritative pane size to the browser whenever it changes.
+
+        tmux's window size is shared by every attached client and resolved by
+        the ``window-size`` option, so the size the browser asked for is not
+        necessarily the size it gets. Without this, a second tmux client
+        attached over ssh silently re-sizes the pane and the browser keeps
+        painting the old geometry: output laid out for the new width wraps in
+        the stale grid and overwrites the row beneath it.
+        """
+        nonlocal announced_size
+        while True:
+            await pane_size_events.get()
+            size = await _query_pane_size(tmux, socket_path, tmux_target)
+            if size is None or size == announced_size:
+                continue
+            announced_size = size
+            try:
+                async with ws_send_lock:
+                    await websocket.send_text(pane_size_message(*size))
+            except (RuntimeError, WebSocketDisconnect):
+                return
+
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
         nonlocal last_client_input_at
@@ -776,6 +915,7 @@ async def bridge_tmux_control_to_websocket(
     clipboard_task = asyncio.create_task(
         _forward_clipboard_updates(), name="tmux-control-clipboard"
     )
+    pane_size_task = asyncio.create_task(_announce_pane_size(), name="tmux-control-pane-size")
     if forward_done is not None:
         forward_task.add_done_callback(lambda _task: forward_done.set())
     ws_task = asyncio.create_task(_ws_to_control(), name="tmux-ws-to-control")
@@ -816,13 +956,13 @@ async def bridge_tmux_control_to_websocket(
                 await asyncio.wait_for(
                     asyncio.shield(clipboard_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
                 )
-        for task in {*pending, clipboard_task}:
+        for task in {*pending, clipboard_task, pane_size_task}:
             if task.done():
                 continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        for task in {read_task, forward_task, clipboard_task, ws_task}:
+        for task in {read_task, forward_task, clipboard_task, pane_size_task, ws_task}:
             if task.done() and not task.cancelled():
                 exc = task.exception()
                 if exc is not None:
@@ -830,7 +970,7 @@ async def bridge_tmux_control_to_websocket(
     finally:
         # Outer route cancellation can bypass the normal post-wait cleanup.
         # Always stop and join every child task before detaching the tmux client.
-        bridge_tasks = {read_task, forward_task, clipboard_task, ws_task}
+        bridge_tasks = {read_task, forward_task, clipboard_task, pane_size_task, ws_task}
         for task in bridge_tasks:
             if not task.done():
                 task.cancel()

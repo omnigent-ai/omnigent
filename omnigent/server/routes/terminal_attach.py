@@ -35,7 +35,13 @@ Wire protocol on the WebSocket
   frames. xterm.js's ``term.write()`` accepts ``Uint8Array`` directly and runs
   it through its ANSI parser, so colors, cursor motion, alternate screen, and
   mouse modes work transparently. A text ``clipboard-write`` JSON frame may
-  follow a tmux copy-mode selection.
+  follow a tmux copy-mode selection, and a text
+  ``{"type": "pane-size", "cols": N, "rows": M}`` frame carries the
+  authoritative tmux pane geometry (sent once before the seed and again
+  whenever tmux resizes the shared window — for example because another
+  client attached over ssh won tmux's ``window-size latest`` race). The
+  browser resizes its grid to the announced size; without that it keeps
+  painting a stale geometry and the screen garbles.
 - **Client → server**:
     - **Text frames** are JSON control messages such as
       ``{"type": "resize", "cols": N, "rows": M}``. Unknown shapes are
