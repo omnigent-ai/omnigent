@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -144,19 +145,11 @@ async def mkdir_setup(
     conn = registry.get(_HOST_ID)
     assert conn is not None
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
-        """Drain outbound WS frames and reply to create_dir frames.
-
-        :returns: None when ``stop_drain`` is set or no events arrive
-            within the per-iteration timeout.
-        """
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        """Reply to create-dir frames until fixture teardown cancels the drain."""
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -192,14 +185,38 @@ async def mkdir_setup(
     try:
         yield app, registry, comm, replies, drain_task
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
+
+
+async def test_create_directory_survives_idle_mock_host(
+    mkdir_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The mock host remains connected while no requests are in flight."""
+    app, registry, comm, _replies, _drain = mkdir_setup
+    await asyncio.sleep(0.75)
+    assert not comm.future.done()
+    assert registry.get(_HOST_ID) is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/directories", json={"path": "/projects/new-app"}
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["path"] == "/projects/new-app"
 
 
 async def test_create_directory_returns_created_path(
