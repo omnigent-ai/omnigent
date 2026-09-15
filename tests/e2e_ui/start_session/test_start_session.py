@@ -643,7 +643,7 @@ def test_start_session_navigates_while_create_is_pending(seeded_session: tuple[s
 
     The create response is held so the test can verify the navigate-first
     window: the landing composer is already gone, the URL uses a client-only
-    ``temp:`` id, and the optimistic prompt is visible in a read-only chat.
+    ``temp:`` id, and the optimistic prompt is visible in an editable chat.
     Releasing the response must replace that temporary URL with the real id.
     """
     base_url, session_id = seeded_session
@@ -741,8 +741,9 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             )
             await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(0)
             composer = page.get_by_role("textbox", name="Message the agent")
-            await expect(composer).to_be_disabled()
-            await expect(composer).to_have_attribute("placeholder", "Starting the session…")
+            await expect(composer).to_be_editable()
+            await expect(composer).to_have_attribute("placeholder", re.compile("Send a follow-up"))
+            await expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
             await expect(
                 page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
             ).to_be_visible()
@@ -763,9 +764,9 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
                 await expect(
                     header.get_by_role("button", name=action_name, exact=True)
                 ).to_be_disabled()
-            await expect(
-                header.get_by_role("button", name="Collapse right panel", exact=True)
-            ).to_be_enabled()
+            panel_toggle = header.get_by_role("button", name="Expand right panel", exact=True)
+            await expect(panel_toggle).to_be_enabled()
+            await panel_toggle.click()
             workspace = page.get_by_role("complementary", name="Workspace")
             await expect(workspace).to_be_visible()
             for tab_name in ("Files", "Changes", "GitHub", "Agents"):
@@ -1438,7 +1439,9 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 await page.get_by_test_id("new-chat-button").click()
             await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(chip).to_have_attribute("aria-label", re.compile("Choose host"))
+            await expect(chip).to_have_attribute(
+                "aria-label", re.compile("No host selected, Offline")
+            )
 
             # A later host refresh reports the continuously preferred VM again.
             # The empty slot lets that saved choice heal automatically.
