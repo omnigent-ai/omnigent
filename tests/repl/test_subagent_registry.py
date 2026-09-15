@@ -22,6 +22,7 @@ import inspect
 from typing import Any
 
 import pytest
+from omnigent_client import PaginatedList
 from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
@@ -147,9 +148,11 @@ class _FakeSessions:
         self._by_parent = by_parent
         self.calls: list[str] = []
 
-    async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+    async def child_sessions(
+        self, session_id: str, *, limit: int = 100, after: str | None = None
+    ) -> PaginatedList:
         self.calls.append(session_id)
-        return list(self._by_parent.get(session_id, []))
+        return PaginatedList(data=list(self._by_parent.get(session_id, [])), has_more=False)
 
     async def child_sessions_tree(
         self, session_id: str, *, max_depth: int = 3, limit: int = 100

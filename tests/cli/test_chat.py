@@ -11,7 +11,7 @@ import click
 import httpx
 import pytest
 from omnigent_client import OmnigentError as ClientOmnigentError
-from omnigent_client import QueryResult
+from omnigent_client import PaginatedList, QueryResult
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
@@ -3857,9 +3857,7 @@ class _FakeSessionsNamespace:
         """Pretend to bind a runner; echo back the session id."""
         return SimpleNamespace(id=session_id)
 
-    async def list_items(
-        self, session_id: str, *, limit: int, order: str
-    ) -> list[dict[str, object]]:
+    async def list_items(self, session_id: str, *, limit: int, order: str) -> PaginatedList:
         """
         Return the controlled transcript honoring ``order``.
 
@@ -3881,7 +3879,8 @@ class _FakeSessionsNamespace:
                 "list_items must NOT be read when the live turn returned "
                 "text — reconcile is a failure-only fallback."
             )
-        return list(reversed(self._items)) if order == "desc" else list(self._items)
+        data = list(reversed(self._items)) if order == "desc" else list(self._items)
+        return PaginatedList(data=data, has_more=False)
 
 
 class _FakeAPClient:
