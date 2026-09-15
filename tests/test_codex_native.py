@@ -8556,7 +8556,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         pytest.raises(click.ClickException) if ensure_status != 200 else contextlib.nullcontext()
     )
     with expected_error:
-        with startup.codex_startup_attempt():
+        with startup.native_startup_attempt(harness="codex-native"):
             prepared = await codex_native._prepare_codex_terminal_via_daemon(
                 base_url="https://example.com",
                 headers={},

@@ -1877,7 +1877,17 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
     :returns: None.
     """
     updates: list[str] = []
+    startup_events: list[tuple[str, str | None]] = []
     progress = RunnerStartupProgress(update=updates.append)
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     async def fake_create_session(
         client: object,
@@ -1996,6 +2006,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         )
 
     monkeypatch.setattr(claude_native, "_create_claude_session", fake_create_session)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     monkeypatch.setattr(claude_native, "wait_for_host_online", fake_wait_for_host_online)
     monkeypatch.setattr(
         claude_native,
@@ -2030,6 +2041,12 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         "Starting runner...",
         "Starting Claude terminal...",
         "Claude terminal ready.",
+    ]
+    assert startup_events == [
+        ("runner_requested", "conv_daemon_progress"),
+        ("session_runner_bound", None),
+        ("runner_connected", None),
+        ("terminal_available", "conv_daemon_progress"),
     ]
 
 
@@ -2416,6 +2433,16 @@ async def test_prepare_reattaches_existing_claude_terminal(
     terminal instead of attaching to the live one.
     """
     calls: list[str] = []
+    startup_events: list[tuple[str, str | None]] = []
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     async def fake_find(client: object, session_id: str) -> str | None:
         """
@@ -2473,6 +2500,7 @@ async def test_prepare_reattaches_existing_claude_terminal(
         return {"omnigent.claude_native.bridge_id": "bridge_abc"}
 
     monkeypatch.setattr(claude_native, "_find_running_claude_terminal", fake_find)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     monkeypatch.setattr(claude_native, "_bind_session_runner", fail_bind)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", fail_launch)
     monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", fake_fetch_labels)
@@ -2494,6 +2522,10 @@ async def test_prepare_reattaches_existing_claude_terminal(
         reattached=True,
     )
     assert calls == ["find:conv_abc"]
+    assert startup_events == [
+        ("session_resolved", "conv_abc"),
+        ("terminal_available", "conv_abc"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2728,6 +2760,59 @@ async def test_read_claude_terminal_tmux_unavailable(response: httpx.Response) -
 
     assert result.socket is None
     assert result.target is None
+
+
+@pytest.mark.asyncio
+async def test_direct_tmux_attach_records_start_and_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Direct tmux attachment records the foreground handoff lifecycle."""
+    from omnigent.terminals import ws_common
+
+    startup_events: list[tuple[str, int | None]] = []
+
+    class Process:
+        returncode = 0
+
+        async def wait(self) -> int:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        del args, kwargs
+        return Process()
+
+    async def pane_dead(socket_path: str, tmux_target: str) -> bool:
+        assert socket_path == str(tmp_path / "tmux.sock")
+        assert tmux_target == "claude:main"
+        return True
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del session_id
+        startup_events.append((event, exit_code))
+
+    monkeypatch.setattr(claude_native.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(ws_common, "_check_pane_dead_definitive", pane_dead)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
+
+    outcome = await claude_native._attach_direct_tmux(
+        tmp_path / "tmux.sock",
+        "claude:main",
+    )
+
+    assert outcome is claude_native._AttachOutcome.EXITED
+    assert startup_events == [
+        ("terminal_attach_started", None),
+        ("terminal_attach_exited", 0),
+    ]
 
 
 def test_can_attach_direct_tmux_true_when_socket_local_and_tmux_present(
@@ -3412,7 +3497,9 @@ async def test_ensure_local_claude_resume_transcript_survives_malformed_file_met
 
 
 @pytest.mark.asyncio
-async def test_create_claude_session_omits_title_for_generic_seed_path() -> None:
+async def test_create_claude_session_omits_title_for_generic_seed_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Session creation must not seed a title in create-time metadata.
 
@@ -3428,7 +3515,17 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
     sidebar fallback keys off the wrapper label.
     """
     captured_metadata: dict[str, object] = {}
+    startup_events: list[tuple[str, str | None]] = []
     session_id_returned = "conv_0123456789abcdef"
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -3453,6 +3550,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
         )
 
     transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
         session_id = await claude_native._create_claude_session(
             client,
@@ -3461,6 +3559,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
         )
 
     assert session_id == session_id_returned
+    assert startup_events == [("session_resolved", session_id_returned)]
     # No title in metadata: any title here would defeat the generic seed
     # path and resurrect the claude-specific carve-out we just removed.
     assert "title" not in captured_metadata, (
