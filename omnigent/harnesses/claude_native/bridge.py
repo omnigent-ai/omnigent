@@ -223,12 +223,18 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
-# TUI (e.g. CPU-starved at submit time): giving up after a short
-# fixed window failed the whole turn while the committed draft would
-# have delivered moments later.
-_SUBMIT_VERIFY_TIMEOUT_S = 60.0
-# How long the draft may verifiably sit unaccepted before a warning
-# is logged that the TUI is slow (delivery keeps retrying).
+# TUI (e.g. CPU-starved at submit time): giving up after the old short
+# window failed the whole turn while the committed draft would have
+# delivered moments later. This doubles the old 10s ceiling as a
+# conservative interim value — the true recovery-time tail was never
+# measurable while that ceiling censored it (a submit that would land
+# at 20s was recorded as a 10s failure). The slow-accept log below now
+# records real recovery times, so tune this from that distribution.
+_SUBMIT_VERIFY_TIMEOUT_S = 20.0
+# How long the draft may verifiably sit unaccepted before a warning is
+# logged that the TUI is slow (delivery keeps retrying). Also the point
+# past which a recovery is logged with its elapsed time — the signal
+# used to tune _SUBMIT_VERIFY_TIMEOUT_S once the tail is observed.
 _SUBMIT_SLOW_ACCEPT_WARN_S = 10.0
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit

@@ -59,14 +59,15 @@ pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="requires t
 # the bridge looks for in the input box to confirm the paste committed.
 _MESSAGE = "deliver me despite a slow tui"
 
-# How long the fake TUI stays unresponsive after the draft commits. Longer
-# than the legacy 10s fixed submit window (where delivery used to hard-fail),
-# comfortably shorter than the extended window a fix must wait out.
-_TUI_STALL_S = 15.0
+# How long the fake TUI stays unresponsive after the draft commits. Past the
+# legacy 10s fixed submit window (where delivery used to hard-fail), and clear
+# of the current submit ceiling so a healthy recovery lands inside it.
+_TUI_STALL_S = 13.0
 
-# Upper bound on how long a single delivery may take: the stall plus generous
-# slack for tmux/readiness overhead and queued-input replay.
-_DELIVERY_BOUND_S = _TUI_STALL_S + 25.0
+# Upper bound on how long a single delivery may take: the submit ceiling plus
+# slack for tmux/readiness overhead and queued-input replay. Tied to the
+# ceiling constant so this bound tracks it if the window is later tuned.
+_DELIVERY_BOUND_S = _SUBMIT_VERIFY_TIMEOUT_S + 5.0
 
 # The fake Claude TUI. It renders the framed composer Claude Code shows -- a
 # box rule, a prompt row, a closing rule -- so the bridge's readiness gate and
@@ -210,9 +211,8 @@ def test_inject_user_message_delivers_despite_stalled_submit(
     elapsed = time.monotonic() - start
 
     # The delivery must actually have out-waited the stall (a fixture whose
-    # TUI never stalled would trivially pass), inside the extended window.
+    # TUI never stalled would trivially pass) and still land within the ceiling.
     assert _TUI_STALL_S - 2.0 <= elapsed <= _DELIVERY_BOUND_S, elapsed
-    assert elapsed <= _SUBMIT_VERIFY_TIMEOUT_S + 10.0, elapsed
 
     # The message left the input box and landed in the transcript.
     pane = _capture_pane(socket_path, "claude")
