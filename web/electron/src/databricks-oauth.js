@@ -365,6 +365,60 @@ async function getValidStoredToken(workspaceOrigin) {
 
 // ── Interactive browser login (loopback redirect) ───────────────────────────
 
+// Bounded pre-flight so an unavailable OAuth client fails fast instead of
+// hanging the connect for AUTH_TIMEOUT_MS. Waited on before the browser opens.
+const PREFLIGHT_TIMEOUT_MS = 8_000;
+
+/**
+ * Whether the OAuth client is accepted at ``origin``'s authorize endpoint.
+ *
+ * Probed server-side (no cookies), so a REGISTERED client always answers with a
+ * 3xx redirect to a login/SSO challenge, while an unavailable/unregistered
+ * client answers 4xx (or a non-redirect error). Node's fetch in the main process
+ * can read that status directly (unlike a renderer's opaque redirects).
+ *
+ * This is the signal that lets us skip the browser and fall back to the
+ * workspace's own in-window login when the ``omnigent`` connector isn't
+ * available — instead of opening a browser that never redirects back and waiting
+ * out the full auth timeout. A transient error/timeout returns false (fall back
+ * this connect, retry next time) rather than risk the hang.
+ *
+ * @param {string} origin
+ * @returns {Promise<boolean>}
+ */
+async function probeOAuthClientAvailable(origin) {
+  const { scopes } = config();
+  const query = new URLSearchParams({
+    response_type: "code",
+    client_id: OAUTH_CLIENT_ID,
+    redirect_uri: DEFAULT_REDIRECT_BASE,
+    scope: scopes,
+    state: "preflight",
+    code_challenge: base64url(crypto.createHash("sha256").update("preflight").digest()),
+    code_challenge_method: "S256",
+  }).toString();
+  try {
+    const resp = await fetch(`${origin}/oidc/v1/authorize?${query}`, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(PREFLIGHT_TIMEOUT_MS),
+    });
+    // A redirect (Node reports 3xx here; some stacks surface a manual redirect
+    // as an opaqueredirect with status 0) is the login challenge → client OK.
+    const ok = (resp.status >= 300 && resp.status < 400) || resp.type === "opaqueredirect";
+    if (!ok) {
+      console.warn(
+        `[omnigent] databricks oauth: authorize preflight for client ${OAUTH_CLIENT_ID} ` +
+          `returned HTTP ${resp.status} (not a login challenge) — treating client as unavailable`,
+      );
+    }
+    return ok;
+  } catch (e) {
+    console.warn(`[omnigent] databricks oauth: authorize preflight failed: ${e.message}`);
+    return false;
+  }
+}
+
 async function runInteractiveLogin(origin) {
   const { redirectBase, scopes } = config();
   // The redirect (and thus the local listener) must be loopback-only — never a
@@ -374,6 +428,12 @@ async function runInteractiveLogin(origin) {
     throw new Error(
       `OMNIGENT_DATABRICKS_OAUTH_REDIRECT must be an http loopback URL, got: ${redirectBase}`,
     );
+  }
+  // Fail fast when the OAuth client isn't available, so the caller falls back to
+  // the in-window login immediately instead of opening a browser that never
+  // redirects back and hanging until AUTH_TIMEOUT_MS.
+  if (!(await probeOAuthClientAvailable(origin))) {
+    throw new Error(`OAuth client ${OAUTH_CLIENT_ID} not available at ${origin}`);
   }
   const { verifier, challenge } = makePkce();
   const state = base64url(crypto.randomBytes(24));
