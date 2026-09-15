@@ -55,6 +55,27 @@ _ITEMS_PAGE = {
     "has_more": False,
 }
 
+# The synthetic role=user marker a cancel persists (matched by its stable
+# "[System: interrupted]" first line, not the full wording).
+_CANCELLATION_MARKER_MESSAGE = {
+    "id": "msg_002",
+    "type": "message",
+    "role": "user",
+    "content": [
+        {
+            "type": "input_text",
+            "text": (
+                "[System: interrupted]\nThe user interrupted and abandoned their previous request."
+            ),
+        }
+    ],
+}
+_CANCELLED_ITEMS_PAGE = {
+    "object": "list",
+    "data": [_PENDING_USER_MESSAGE, _CANCELLATION_MARKER_MESSAGE],
+    "has_more": False,
+}
+
 
 class _HistoryServerClient:
     """Returns one pre-persisted user message from GET /items.
@@ -88,6 +109,22 @@ class _HistoryServerClient:
 
     async def patch(self, url: str, **kwargs: Any) -> _Resp:
         del url, kwargs
+        return self._Resp({})
+
+
+class _CancelledHistoryServerClient(_HistoryServerClient):
+    """Returns a transcript that ends with the cancellation marker.
+
+    Simulates the server state after a cancel: the original user prompt is
+    followed by the synthetic role=user interruption marker — the state a
+    relaunched runner loads when the web Retry button reconnects a session
+    whose turn was cancelled.
+    """
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if url.rstrip("/").endswith("/items"):
+            return self._Resp(_CANCELLED_ITEMS_PAGE)
         return self._Resp({})
 
 
@@ -281,6 +318,42 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
         assert len(harness.posted_bodies) == 2, (
             "Expected two harness calls total (recovery turn + forward-triggered turn); "
             f"got {len(harness.posted_bodies)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_trailing_cancellation_marker_does_not_start_recovery_turn() -> None:
+    """A cancelled turn's marker must not be mistaken for a pending prompt.
+
+    A cancel persists a synthetic role=user "[System: interrupted]" marker, so
+    the transcript's last item is a user message. A relaunched runner loading
+    that history (the web Retry reconnect path, which does NOT set
+    suppress_recovery_turn) must treat the turn as deliberately abandoned:
+    no recovery turn may start and the harness must not be called — otherwise
+    every cancel + retry re-runs the cancelled prompt in a loop.
+    """
+    app, _pm, harness = _build_sdk_app(_CancelledHistoryServerClient())
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        # Let any (buggy) recovery turn get scheduled and run.
+        await asyncio.sleep(0.1)
+
+        get_resp = await client.get(f"/v1/sessions/{SESSION_ID}")
+        assert get_resp.status_code == 200, get_resp.text
+        assert get_resp.json().get("status") == "idle", (
+            "Session must stay idle after session-init when the transcript ends "
+            "with the cancellation marker; a recovery turn was started instead."
+        )
+
+        assert len(harness.posted_bodies) == 0, (
+            "A relaunch after a cancel must not re-run the cancelled prompt; "
+            f"the harness was called {len(harness.posted_bodies)} time(s)."
         )
 
 
