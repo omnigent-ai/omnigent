@@ -13,13 +13,16 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_native_spawn_env,
     build_hook_config,
     build_devin_mcp_server,
+    canonical_devin_permission_mode,
     devin_input_ready,
+    devin_permission_mode,
     devin_queue_pending,
     hooks_size,
     iter_hook_events,
     record_hook_event,
     session_config_path,
     write_devin_agent_rule,
+    inject_permission_mode,
     write_devin_mcp_config,
     write_devin_session_config,
 )
@@ -525,3 +528,42 @@ class TestMcpConfig:
         # `devin mcp add` (3000.10.21) emits exactly these keys.
         entry = build_devin_mcp_server(tmp_path / "bridge", python_executable="/py")
         assert set(entry) == {"command", "args", "transport", "env"}
+
+
+# Devin marks a non-default permission mode on the composer's top rule; the
+# default shows none. Verbatim from cycling Shift+Tab on devin 3000.10.21.
+def _mode_pane(marker: str) -> str:
+    rule = "─" * 40
+    return (
+        f"{rule} {marker} ─\n"
+        "❭ Ask Devin to build features, fix bugs, or work on your code\n"
+        f"{rule}\nGLM-5.2 High\n"
+    )
+
+
+class TestPermissionMode:
+    """Mid-session switching cycles Shift+Tab, so the pane is the source of truth."""
+
+    def test_reads_each_marker(self) -> None:
+        assert devin_permission_mode(_mode_pane("(bypass permissions on)")) == "dangerous"
+        assert devin_permission_mode(_mode_pane("(accept edits on)")) == "accept-edits"
+        assert devin_permission_mode(_mode_pane("(smart mode on)")) == "smart"
+
+    def test_no_marker_is_the_default_mode(self) -> None:
+        # Devin marks only the non-default modes, so a bare rule means `normal`.
+        assert devin_permission_mode(_IDLE_PANE) == "normal"
+
+    def test_marker_survives_a_narrow_pane_wrap(self) -> None:
+        assert devin_permission_mode("──\n(accept edits\non) ─\n❭ Ask Devin\n") == "accept-edits"
+
+    def test_aliases_normalize_to_devins_canonical_names(self) -> None:
+        assert canonical_devin_permission_mode("auto") == "normal"
+        assert canonical_devin_permission_mode("bypass") == "dangerous"
+        assert canonical_devin_permission_mode("yolo") == "dangerous"
+        assert canonical_devin_permission_mode(" Accept-Edits ") == "accept-edits"
+
+    def test_an_unknown_mode_is_refused_before_touching_the_pane(self, tmp_path: Path) -> None:
+        # Guarding first matters: cycling blind could overshoot onto `dangerous`,
+        # which auto-approves every tool.
+        with pytest.raises(RuntimeError, match="does not expose permission mode"):
+            inject_permission_mode(tmp_path, mode="not-a-mode")

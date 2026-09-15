@@ -108,6 +108,25 @@ _DEVIN_BOOT_MARKERS = ("Starting", "Loading", "Connecting")
 #: Devin parks a message submitted mid-turn in its own queue and offers this
 #: hint; pressing Enter again is its "send now".
 _DEVIN_SEND_NOW_HINT = "send now"
+#: Devin marks a non-default permission mode on the composer's top rule, e.g.
+#: ``── (accept edits on) ──``; the default (``normal``) shows no marker. Captured
+#: from devin 3000.10.21 while cycling with Shift+Tab.
+_DEVIN_PERMISSION_MARKERS: tuple[tuple[str, str], ...] = (
+    ("(bypass permissions on)", "dangerous"),
+    ("(accept edits on)", "accept-edits"),
+    ("(smart mode on)", "smart"),
+)
+#: Devin's default permission mode — the one with no on-screen marker.
+DEVIN_DEFAULT_PERMISSION_MODE = "normal"
+#: Aliases Devin accepts for the canonical rungs (from its own validator).
+_DEVIN_PERMISSION_ALIASES = {
+    "auto": "normal",
+    "bypass": "dangerous",
+    "yolo": "dangerous",
+}
+#: Shift+Tab cycles the modes, so a switch is bounded by one full cycle plus slack.
+_PERMISSION_CYCLE_MAX_PRESSES = 8
+_PERMISSION_SETTLE_S = 0.25
 _QUEUE_FLUSH_TIMEOUT_S = 2.0
 _QUEUE_FLUSH_INTERVAL_S = 0.3
 
@@ -753,6 +772,73 @@ def devin_queue_pending(pane: str) -> bool:
     """
     normalized = " ".join(pane.split())
     return "queued" in normalized and _DEVIN_SEND_NOW_HINT in normalized
+
+
+def canonical_devin_permission_mode(mode: str) -> str:
+    """Return *mode* under Devin's canonical spelling.
+
+    Devin accepts aliases (``auto`` for ``normal``, ``bypass``/``yolo`` for
+    ``dangerous``), but only the canonical name is what the pane's marker resolves
+    to, so a switch has to compare like with like.
+    """
+    lowered = mode.strip().lower()
+    return _DEVIN_PERMISSION_ALIASES.get(lowered, lowered)
+
+
+def devin_permission_mode(pane: str) -> str:
+    """Return the permission mode Devin's composer is currently advertising.
+
+    :param pane: Captured pane text.
+    :returns: A canonical mode name; :data:`DEVIN_DEFAULT_PERMISSION_MODE` when no
+        marker is present (Devin marks only the non-default modes).
+    """
+    normalized = " ".join(pane.split())
+    for marker, mode in _DEVIN_PERMISSION_MARKERS:
+        if marker in normalized:
+            return mode
+    return DEVIN_DEFAULT_PERMISSION_MODE
+
+
+def inject_permission_mode(
+    bridge_dir: Path,
+    *,
+    mode: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> str:
+    """Switch the live Devin session onto *mode* by cycling Shift+Tab.
+
+    Devin has no command that sets a mode directly — its own hint is "Use
+    Shift+Tab to cycle permission modes" — so this presses Shift+Tab and re-reads
+    the composer's marker after each press, stopping the moment the target shows.
+    Verifying every step is what keeps a cycle from overshooting onto
+    ``dangerous`` (which auto-approves every tool).
+
+    :param bridge_dir: Per-session bridge directory.
+    :param mode: Target mode, canonical or alias.
+    :returns: The mode now showing in the pane.
+    :raises RuntimeError: If *mode* is unknown, or one full cycle never reached it
+        (an older Devin may not offer every rung).
+    """
+    target = canonical_devin_permission_mode(mode)
+    known = {DEVIN_DEFAULT_PERMISSION_MODE, *(m for _marker, m in _DEVIN_PERMISSION_MARKERS)}
+    if target not in known:
+        raise RuntimeError(f"devin-native does not expose permission mode {mode!r}")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    _wait_for_devin_input_ready(socket_path, tmux_target, timeout_s=timeout_s)
+    for _press in range(_PERMISSION_CYCLE_MAX_PRESSES):
+        if devin_permission_mode(_capture_pane(socket_path, tmux_target)) == target:
+            return target
+        # BTab is tmux's name for Shift+Tab.
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BTab")
+        time.sleep(_PERMISSION_SETTLE_S)
+    settled = devin_permission_mode(_capture_pane(socket_path, tmux_target))
+    if settled == target:
+        return target
+    raise RuntimeError(
+        f"devin-native could not reach permission mode {target!r}; the pane is on {settled!r}"
+    )
 
 
 def _flush_devin_queue(socket_path: str, tmux_target: str) -> None:

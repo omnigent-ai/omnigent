@@ -6146,6 +6146,37 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_devin_native_permission_mode_change(
+        conv_id: str,
+        mode: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_permission_mode,
+        )
+
+        if mode is None or not mode.strip():
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            settled = await asyncio.to_thread(
+                inject_permission_mode,
+                bridge_dir,
+                mode=mode.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_permission_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="devin-native permission mode change"
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"permission_mode": settled})
+
     async def _handle_devin_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -9329,7 +9360,7 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
-            if harness == "claude-native":
+            if harness in ("claude-native", "devin-native"):
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if mode is not None and not isinstance(mode, str):
                     return JSONResponse(
@@ -9338,6 +9369,11 @@ def create_runner_app(
                             "error": "invalid_input",
                             "detail": "Body 'permission_mode' must be a string or null",
                         },
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_permission_mode_change(
+                        conversation_id,
+                        mode,
                     )
                 return await _handle_claude_native_permission_mode_change(
                     conversation_id,
