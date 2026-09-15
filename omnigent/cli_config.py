@@ -1030,14 +1030,32 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         else:
             ucode_agents = sorted(_FAMILY_UCODE_AGENT.values())
         profile = login_databricks_workspace(workspace_url, console=console)
-        configure_ucode_for_workspace(workspace_url, agents=ucode_agents)
-        # Fail loud if ucode didn't actually record state for the workspace —
-        # otherwise routing would silently fall back and confuse the user.
-        if not ucode_workspace_exists(workspace_url):
-            raise click.ClickException(
-                f"`ucode configure` finished but recorded no state for {workspace_url}. "
-                "Re-run and check the ucode output above."
+        try:
+            configure_ucode_for_workspace(workspace_url, agents=ucode_agents)
+            # Fail loud if ucode didn't actually record state for the workspace —
+            # otherwise routing would silently fall back and confuse the user.
+            if not ucode_workspace_exists(workspace_url):
+                raise click.ClickException(
+                    f"`ucode configure` finished but recorded no state for {workspace_url}. "
+                    "Re-run and check the ucode output above."
+                )
+        except click.ClickException as exc:
+            from rich.markup import escape as _rich_escape
+
+            # A failed `ucode configure` (commonly: its Databricks CLI
+            # self-upgrade can't replace an existing /usr/local/bin binary)
+            # aborts only this add — never the whole setup TUI.
+            console.print(f"  [red]{_rich_escape(exc.format_message())}[/red]")
+            console.print(
+                "  [dim]If the output above says the Databricks CLI is too old, "
+                "upgrade it manually, then retry ‘+ Add a credential’:[/dim]"
             )
+            console.print("  [dim]  sudo rm /usr/local/bin/databricks[/dim]")
+            console.print(
+                "  [dim]  curl -fsSL https://raw.githubusercontent.com/databricks/"
+                "setup-cli/main/install.sh | sudo sh[/dim]"
+            )
+            return "✗ Databricks credential not added — `ucode configure` failed"
         # Wipe the verbose login + ucode output so the menu we return to (with a
         # "✓ Added databricks" status) renders on a clean screen.
         clear_screen()
