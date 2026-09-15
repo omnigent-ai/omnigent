@@ -1,6 +1,8 @@
 """FastAPI application — main entry point for the omnigent server."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -263,6 +265,106 @@ _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
 _WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+
+
+# RFC 3986 unreserved + path separator + percent (for encoded segments).
+_BASE_PATH_ALLOWED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/%"
+)
+
+
+def _normalize_base_path(value: str | None) -> str:
+    """Normalize ``OMNIGENT_WEB_BASE_PATH`` to a leading-slash, no-trailing-slash string.
+
+    ``None``, ``""`` and ``"/"`` all map to ``""`` (root deployment, today's
+    behavior). Mirrors the frontend's ``getBasePath`` (``web/src/lib/basePath.ts``)
+    so the two agree on the prefix.
+
+    :param value: Raw base path, e.g. ``"/proxy/6767/"`` or ``"proxy/6767"``.
+    :returns: Normalized path (``"/proxy/6767"``) or ``""``.
+    :raises ValueError: If the path contains characters outside
+        ``_BASE_PATH_ALLOWED`` — quotes, angle brackets, spaces, backslashes,
+        etc. — since it's spliced into ``index.html`` unescaped and a
+        misconfigured value must not be able to break out of that context.
+    """
+    if not value:
+        return ""
+    trimmed = value.strip()
+    if trimmed in ("", "/"):
+        return ""
+    if not trimmed.startswith("/"):
+        trimmed = f"/{trimmed}"
+    trimmed = trimmed.rstrip("/")
+    invalid = set(trimmed) - _BASE_PATH_ALLOWED
+    if invalid:
+        raise ValueError(
+            f"Invalid base path {value!r}: only URL path characters "
+            f"(letters, digits, '-._~/%') are allowed, got {sorted(invalid)!r}."
+        )
+    return trimmed
+
+
+def _rewrite_web_ui_index(html: str, base_path: str) -> str:
+    """Rebase the built ``index.html`` for the configured deployment base path.
+
+    The standalone build emits relative asset references (``./assets/...``,
+    ``./favicon.svg``) so dynamic code-split chunks resolve via
+    ``import.meta.url`` under any path prefix. Relative references break on a
+    deep-link refresh, so they are rewritten here to absolute
+    ``{base}/assets/...``. With an empty base this yields root-absolute
+    ``/assets/...`` — byte-identical in spirit to a non-prefixed deployment.
+
+    When a base path is configured, a small inline script publishes it as
+    ``window.__OMNIGENT_BASE_PATH__`` ahead of the entry module so the SPA can
+    prefix its own API/WebSocket/navigation URLs (see ``basePath.ts``).
+
+    :param html: Raw built ``index.html`` contents.
+    :param base_path: Normalized base path (``""`` or ``"/proxy/6767"``).
+    :returns: Rewritten HTML.
+    """
+    rewritten = html.replace('="./', f'="{base_path}/')
+    if base_path:
+        # JSON-encode and neutralize any ``</`` so a hostile base path can't
+        # break out of the inline script element.
+        literal = json.dumps(base_path).replace("</", "<\\/")
+        injection = f"<script>window.__OMNIGENT_BASE_PATH__ = {literal};</script>"
+        rewritten = rewritten.replace("<head>", f"<head>{injection}", 1)
+    return rewritten
+
+
+class BasePathMiddleware:
+    """Strip a configured public base path prefix from incoming request paths.
+
+    Lets one server work whether the reverse proxy forwards the prefix
+    (code-server ``/absproxy/<port>/``, a plain nginx/Traefik subpath) or
+    strips it (code-server ``/proxy/<port>/``): when the prefix is present it
+    is removed so routing matches the canonical ``/v1/...`` paths, and
+    ``root_path`` is set so server-generated URLs stay under the mount. A
+    no-op when no base path is configured, or for a request that does not
+    carry the prefix (the stripping-proxy case).
+
+    :param app: The wrapped ASGI application.
+    :param base_path: Normalized base path (``""`` disables the middleware).
+    """
+
+    def __init__(self, app: ASGIApp, base_path: str) -> None:
+        self.app = app
+        self.base_path = base_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.base_path and scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path == self.base_path or path.startswith(f"{self.base_path}/"):
+                scope = dict(scope)
+                scope["path"] = path[len(self.base_path) :] or "/"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, (bytes, bytearray)):
+                    prefix = self.base_path.encode()
+                    if raw_path.startswith(prefix):
+                        scope["raw_path"] = raw_path[len(prefix) :] or b"/"
+                scope["root_path"] = self.base_path
+        await self.app(scope, receive, send)
+
 
 # Envelope version of GET /.well-known/omnigent.json (see the route for the
 # full contract). Bump ONLY for a change a client cannot absorb by ignoring
@@ -1113,6 +1215,7 @@ def create_app(
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
+    base_path: str | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1233,12 +1336,23 @@ def create_app(
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
+    :param base_path: Public URL prefix the server is served under by a
+        reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
+        ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
+        root deployment.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    # Public base path for serving behind a subpath reverse proxy (issue
+    # #1031). Falls back to OMNIGENT_WEB_BASE_PATH so Docker/PaaS entrypoints
+    # pick it up without threading a kwarg. Empty → root deployment (default).
+    resolved_base_path = _normalize_base_path(
+        base_path if base_path is not None else os.environ.get("OMNIGENT_WEB_BASE_PATH")
+    )
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
@@ -1587,6 +1701,10 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
+    # a full-page redirect (not covered by BasePathMiddleware's inbound-only
+    # strip) can prefix it themselves. "" for a root deployment.
+    app.state.base_path = resolved_base_path
     # GitHub App integration: enabled only when both the config and the
     # connection store are wired. The client is stateless (holds config),
     # built once and reused for the connect flow.
@@ -3503,8 +3621,13 @@ def create_app(
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
-    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is
-    # registered AFTER all API routers so router routes win on overlap.
+    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount stays
+    # at the domain root regardless of `resolved_base_path` — a configured
+    # base path is instead handled by rebasing the served HTML/asset refs
+    # (see `_rewrite_web_ui_index`) and by `BasePathMiddleware` stripping the
+    # prefix from incoming requests, which is what lets one server work
+    # whether the fronting proxy forwards the prefix or strips it. The mount
+    # is registered AFTER all API routers so router routes win on overlap.
     # Skipping the mount when no build is present keeps API-only
     # deployments working (and ``/`` 404s cleanly instead of exploding at
     # startup).
@@ -3530,7 +3653,7 @@ def create_app(
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
-                _SPAStaticFiles(directory=web_ui_dist, html=True),
+                _SPAStaticFiles(directory=web_ui_dist, html=True, base_path=resolved_base_path),
                 minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE,
             ),
             name="web-ui",
@@ -3546,6 +3669,13 @@ def create_app(
         async def root() -> FileResponse:
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
+
+    if resolved_base_path:
+        # Added last → outermost ASGI layer, so the prefix is stripped before
+        # routing and every other middleware sees canonical `/v1/...` paths.
+        # Only wired when a base path is configured: a root deployment pays
+        # no per-request cost.
+        app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
     return app
 
@@ -3565,7 +3695,33 @@ class _SPAStaticFiles(StaticFiles):
     and a path with a file extension (``.js``, ``.css``, ``.png``,
     ``.woff2``, …) returns the static 404 verbatim. Other extensionless
     paths fall back to ``index.html``.
+
+    The HTML shell is rebased for the deployment ``base_path`` once at
+    startup (see :func:`_rewrite_web_ui_index`) and served from memory with
+    a content ``etag`` so ``If-None-Match`` revalidation still yields ``304``.
     """
+
+    def __init__(self, *args: Any, base_path: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._index_html: bytes | None = None
+        self._index_etag: str | None = None
+        index_file = Path(self.directory) / "index.html"  # type: ignore[arg-type]
+        if index_file.is_file():
+            html = _rewrite_web_ui_index(index_file.read_text(encoding="utf-8"), base_path)
+            self._index_html = html.encode("utf-8")
+            self._index_etag = f'"{hashlib.md5(self._index_html).hexdigest()}"'
+
+    def _shell_response(self, scope: Scope) -> Response:
+        """Serve the rebased HTML shell from memory, honoring ``If-None-Match``."""
+        assert self._index_html is not None
+        if_none_match = next(
+            (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"if-none-match"),
+            None,
+        )
+        if self._index_etag is not None and if_none_match == self._index_etag:
+            return Response(status_code=304, headers={"etag": self._index_etag})
+        headers = {"etag": self._index_etag} if self._index_etag else {}
+        return Response(self._index_html, media_type="text/html", headers=headers)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # The mount is at "/" so it catches *every* unmatched path —
@@ -3582,6 +3738,11 @@ class _SPAStaticFiles(StaticFiles):
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
+        # The HTML shell (root, directory, or SPA history fallback) is served
+        # from the rebased in-memory copy rather than the file on disk, so
+        # asset refs and the injected base-path global reflect `base_path`.
+        if self._index_html is not None and path in ("", ".", "index.html"):
+            return _apply_web_ui_cache_headers(self._shell_response(scope), "index.html")
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
@@ -3605,7 +3766,11 @@ class _SPAStaticFiles(StaticFiles):
                 )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
-                response = await super().get_response("index.html", scope)
+                response = (
+                    self._shell_response(scope)
+                    if self._index_html is not None
+                    else await super().get_response("index.html", scope)
+                )
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)

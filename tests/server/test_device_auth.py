@@ -254,7 +254,11 @@ def test_revoke_is_fail_closed(store: DeviceGrantStore) -> None:
 
 
 def _build_accounts_app(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, device_grant_enabled: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device_grant_enabled: bool = True,
+    base_path: str | None = None,
 ) -> Iterator[TestClient]:
     monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -319,6 +323,7 @@ def _build_accounts_app(
         host_store=host_store,
         auth_provider=auth_provider,
         account_store=account_store,
+        base_path=base_path,
     )
     with TestClient(app) as client:
         yield client
@@ -426,6 +431,28 @@ def test_consent_page_requires_login(app: TestClient) -> None:
     r = app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
     assert r.status_code == 302
     assert "/login" in r.headers["location"]
+
+
+def test_consent_page_login_bounce_carries_base_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under a configured base path, the login bounce and its return_to are prefixed.
+
+    Otherwise the browser is sent to the bare domain root's /login, which a
+    subpath reverse proxy (e.g. code-server's /proxy/<port>/) has no route
+    for — the device-authorization consent flow would break under exactly
+    the deployment OMNIGENT_WEB_BASE_PATH exists to support.
+    """
+    gen = _build_accounts_app(tmp_path, monkeypatch, base_path="/proxy/6767")
+    client = next(gen)
+    try:
+        r = client.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
+        assert r.status_code == 302
+        location = r.headers["location"]
+        assert location.startswith("/proxy/6767/login")
+        assert "return_to=/proxy/6767/oauth/device" in location
+    finally:
+        gen.close()
 
 
 def test_unsupported_grant_type(app: TestClient) -> None:

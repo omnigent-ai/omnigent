@@ -9,6 +9,7 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
+import { getBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
@@ -140,7 +141,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
           <ThemeProvider>
             <TooltipProvider>
               <ImageLightboxProvider>
-                <BrowserRouter>
+                <BrowserRouter basename={getBasePath() || undefined}>
                   <SessionUpdatesProvider>
                     <RunnerHealthProvider>
                       <QueueFlushProvider>

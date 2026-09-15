@@ -15,6 +15,7 @@
  * into a login redirect.
  */
 
+import { stripBasePath, withBasePath } from "./basePath";
 import { getCachedServerInfo } from "./capabilities";
 import { getOmnigentHostConfig, hostFetch, isDatabricksWorkspace } from "./host";
 import {
@@ -271,7 +272,7 @@ function redirectToLogin(loginUrl: string): boolean {
   if (loginRedirectPending) return false;
   loginRedirectPending = true;
   const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
-  window.location.href = `${loginUrl}?return_to=${returnTo}`;
+  window.location.href = `${withBasePath(loginUrl)}?return_to=${returnTo}`;
   return true;
 }
 
@@ -301,7 +302,10 @@ export function isLoginRedirectPending(): boolean {
  * every mode.
  */
 function isOnLoginPath(): boolean {
-  const path = window.location.pathname;
+  // Compare against base-relative paths so the guard still recognizes the
+  // login/register pages when served under a subpath proxy (e.g.
+  // `/proxy/6767/login`).
+  const path = stripBasePath(window.location.pathname);
   return path === "/login" || path === "/register" || path.startsWith("/auth/login");
 }
 

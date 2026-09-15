@@ -1,10 +1,19 @@
 <!doctype html>
 <html lang="en">
   <head>
+    <!--
+      Root-absolute fallback base URI so the build's relative asset refs
+      (./assets/...) resolve correctly on a deep-linked route (e.g. /c/<id>)
+      even when served by a server that predates the base-path rewrite in
+      omnigent/server/app.py (_rewrite_web_ui_index). That rewrite replaces
+      or ignores this tag: it turns relative refs into absolute ones, which
+      browsers resolve independently of any <base href>.
+    -->
+    <base href="/" />
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <meta name="theme-color" content="#0d1218" />
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Omnigent</title>
   </head>

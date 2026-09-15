@@ -748,15 +748,17 @@ def create_device_auth_router(
 
     # ── Browser consent page ──────────────────────────────────────
 
-    def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
+    def _bounce_to_login(request: Request, user_code: str, *, reauth: bool) -> RedirectResponse:
         """302 to the login page, returning to this consent URL afterward.
 
         ``reauth`` adds ``&reauth=1`` so the login page forces a fresh
         password submit instead of auto-bouncing an already-signed-in user
         (which would loop back here with the same stale session).
         """
-        login_url = auth_provider.login_url or "/login"
-        return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
+        base_path: str = getattr(request.app.state, "base_path", "")
+        login_url = base_path + (auth_provider.login_url or "/login")
+        return_to_path = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
+        return_to = base_path + return_to_path
         query = f"return_to={html.escape(return_to, quote=True)}"
         if reauth:
             query += "&reauth=1"
@@ -802,7 +804,7 @@ def create_device_auth_router(
         user_id = auth_provider.get_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
         if user_id is None:
-            return _bounce_to_login(user_code, reauth=False)
+            return _bounce_to_login(request, user_code, reauth=False)
 
         if not user_code:
             return HTMLResponse(_consent_html(prompt_for_code=True), status_code=200)
@@ -821,7 +823,7 @@ def create_device_auth_router(
         # rather than auto-returning the stale session (which would loop).
         session_iat = _session_iat(request)
         if session_iat is None or session_iat < grant.created_at:
-            return _bounce_to_login(user_code, reauth=True)
+            return _bounce_to_login(request, user_code, reauth=True)
 
         return HTMLResponse(
             _consent_html(

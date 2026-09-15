@@ -45,6 +45,7 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { withBasePath } from "@/lib/basePath";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
@@ -539,7 +540,10 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
 function getShareableLink(sessionId: string, rebasePath: (path: string) => string): string {
   const path = rebasePath(`/c/${sessionId}`);
   const transform = getOmnigentTransformShareLink();
-  return transform ? transform(path) : `${window.location.origin}${path}`;
+  // Standalone: `rebasePath` is identity, so apply the deployment base path
+  // (e.g. `/proxy/6767`) before prepending the origin. The embed supplies its
+  // own `transform`, which already includes the host mount path.
+  return transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
 }
 
 /**
