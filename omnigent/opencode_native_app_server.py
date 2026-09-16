@@ -505,9 +505,7 @@ class OpenCodeNativeServer:
         try:
             await self._wait_until_ready()
         except BaseException:
-            # The child is already running but no caller owns it yet: a
-            # cancelled startup (session deleted mid-boot) or a failed
-            # readiness probe would otherwise orphan ``opencode serve``.
+            # No caller owns the child until startup succeeds.
             await self.close()
             raise
 

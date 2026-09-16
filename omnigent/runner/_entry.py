@@ -1565,11 +1565,7 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
-        # Close host-spawned native app servers before the process exits. A
-        # host-initiated stop tears the runner down without a per-session
-        # DELETE, so without this they orphan as lingering ``codex`` /
-        # ``opencode`` processes (codex app-servers in particular spawn in
-        # their own session and survive the runner's death).
+        # Host shutdown skips per-session deletion, so close native servers here.
         from omnigent.runner.native import (
             teardown_all_codex_native_app_servers,
             teardown_all_opencode_native_servers,

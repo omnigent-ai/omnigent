@@ -207,12 +207,7 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
 async def test_start_closes_process_when_readiness_is_cancelled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Cancelling startup during the readiness probe reaps ``opencode serve``.
-
-    Session teardown can land while ``start()`` is still polling readiness;
-    the spawned child has no other owner yet, so ``start()`` itself must
-    close it instead of leaking one orphaned server per cancelled startup.
-    """
+    """Cancelling the readiness wait must reap the OpenCode server."""
     server = _server(monkeypatch, tmp_path)
 
     class _FakeProc:

@@ -276,14 +276,7 @@ async def test_spec_fill_parked_across_delete_discards(tmp_path: Path) -> None:
 
 
 async def test_delete_session_cancels_inflight_init() -> None:
-    """``DELETE`` must cancel a session init that is still running.
-
-    A delete landing during startup used to leave the init task running to
-    completion; it would then re-register the native resources the delete's
-    teardown had already swept (e.g. a freshly spawned ``opencode serve``),
-    orphaning one server per cancelled startup. The delete path must cancel
-    the registered init task and let it unwind before tearing down.
-    """
+    """Deleting a session cancels its pending initialization before resource teardown."""
     from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 
     session_id = f"conv_{uuid.uuid4().hex}"
@@ -332,16 +325,7 @@ async def test_delete_session_cancels_inflight_init() -> None:
 async def test_delete_session_survives_a_failing_inflight_init(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A cancelled init that fails while unwinding must not abort the teardown.
-
-    The cancel loop runs FIRST in ``delete_session``, ahead of the turn
-    cancel, the forwarder cancel and ``teardown_opencode_native_server``. So
-    an init that raises something other than ``CancelledError`` on its way out
-    (a cleanup path of its own blowing up) must be logged and stepped over,
-    never re-raised: propagating it would skip the very teardown that reaps
-    the freshly spawned ``opencode serve``, leaking the server this cancel
-    exists to prevent leaking.
-    """
+    """An init failure during cancellation is logged without aborting deletion."""
     from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 
     session_id = f"conv_{uuid.uuid4().hex}"
@@ -356,9 +340,7 @@ async def test_delete_session_survives_a_failing_inflight_init(
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            # Deliberately not one of the spec-resolver errors init handles
-            # itself (httpx.HTTPError / RuntimeError / ValueError), so the
-            # init task completes with this exception rather than a response.
+            # Use an error that initialization does not convert to an HTTP response.
             raise _InitUnwindError("init cleanup exploded") from None
         raise AssertionError("unreachable")
 
@@ -397,13 +379,7 @@ async def test_delete_session_bounds_the_wait_on_a_slow_init_unwind(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cancelled init that unwinds slowly must not wedge ``DELETE``.
-
-    Mirrors ``_cancel_auto_forwarder_task``: the wait on a cancelled task is
-    bounded and a timeout is logged, so an init stuck in its own cleanup (a
-    slow ``server.close()`` / ``process.wait()`` while unwinding) degrades to
-    a warning instead of blocking session deletion indefinitely.
-    """
+    """Deletion proceeds after the timeout if cancelled initialization is still unwinding."""
     from omnigent.runner import app as runner_app_mod
     from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 
@@ -412,8 +388,7 @@ async def test_delete_session_bounds_the_wait_on_a_slow_init_unwind(
     unwind_started = asyncio.Event()
     unwind_release = asyncio.Event()
 
-    # Short enough to keep the test fast; the init below cannot finish until the
-    # test releases it, so the bound is what has to end the wait.
+    # Initialization stays blocked until explicitly released below.
     monkeypatch.setattr(runner_app_mod, "_SESSION_INIT_CANCEL_TIMEOUT_S", 0.05)
 
     async def slow_unwind_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:

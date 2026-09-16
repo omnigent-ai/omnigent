@@ -519,15 +519,7 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
 
 @pytest.mark.asyncio
 async def test_teardown_all_opencode_native_servers_closes_every_session() -> None:
-    """
-    Runner shutdown closes every registered ``opencode serve`` child.
-
-    A host-initiated stop SIGTERMs the runner without a per-session
-    ``DELETE /v1/sessions``, so the shutdown sweep is the only thing that
-    closes the host-spawned opencode servers. Every registered session must
-    be torn down (forwarder cancelled, server closed) and the registry left
-    empty.
-    """
+    """Shutdown cancels all forwarders, closes their servers, and clears the registries."""
     session_ids = [
         "dddd3333dddd3333dddd3333dddd3333",
         "eeee4444eeee4444eeee4444eeee4444",
@@ -577,13 +569,7 @@ async def test_teardown_all_opencode_native_servers_closes_every_session() -> No
 
 @pytest.mark.asyncio
 async def test_teardown_all_opencode_native_servers_survives_a_failing_close() -> None:
-    """One server whose ``close()`` raises must not strand the rest of the sweep.
-
-    Runner shutdown is the last chance to reap these children, so the sweep has
-    to be all-or-nothing in the useful direction: a server that throws on close
-    is logged over, not allowed to abort the loop or leave its registry entry
-    behind for a later sweep to trip on.
-    """
+    """A failed close must not abort the sweep or leave stale registry entries."""
     failing_id = "ffff5555ffff5555ffff5555ffff5555"
     healthy_id = "aaaa6666aaaa6666aaaa6666aaaa6666"
     session_ids = [failing_id, healthy_id]

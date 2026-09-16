@@ -4283,10 +4283,7 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
-        # Cancel any in-flight session init first. Startup can still be
-        # materializing native resources (e.g. waiting on an ``opencode
-        # serve`` readiness probe); left running, it would re-register the
-        # very servers/forwarders the teardown below removes, orphaning them.
+        # Stop initialization before it can recreate resources during teardown.
         init_tasks = [
             task
             for key, task in list(_session_init_tasks.items())
@@ -4295,11 +4292,7 @@ def create_runner_app(
         for init_task in init_tasks:
             init_task.cancel()
         if init_tasks:
-            # asyncio.wait absorbs the CancelledErrors and bounds the wait on a
-            # hung cancellation, mirroring _cancel_auto_forwarder_task. A real
-            # init failure is logged rather than raised: the teardown below has
-            # to run either way, or the servers this cancel exists to reap leak
-            # anyway.
+            # Bound cleanup time; log init failures so resource teardown still runs.
             _finished, pending = await asyncio.wait(
                 set(init_tasks), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
             )
@@ -4344,9 +4337,7 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
-        # Belt-and-suspenders for opencode-native: close a registered
-        # ``opencode serve`` that no forwarder ever adopted (a create that
-        # finished right as this delete landed). No-op for other harnesses.
+        # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
 
         if process_manager is not None:

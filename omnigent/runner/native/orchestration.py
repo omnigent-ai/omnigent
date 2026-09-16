@@ -252,19 +252,7 @@ async def teardown_all_codex_native_app_servers() -> None:
 
 
 async def teardown_opencode_native_server(session_id: str) -> None:
-    """
-    Tear down a host-spawned opencode-native session's ``opencode serve``.
-
-    The opencode counterpart of :func:`teardown_codex_native_app_server`.
-    Cancelling the forwarder closes the server via
-    :func:`_supervise_opencode_forwarder`'s own ``finally``; the pop below
-    is the belt-and-suspenders close for the case where no forwarder ever
-    adopted the server. No-op for a session that has no registered opencode
-    server, so this is safe to call regardless of harness.
-
-    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    :returns: None.
-    """
+    """Cancel the forwarder and close any remaining server for this session."""
     if session_id not in _AUTO_OPENCODE_SERVERS:
         return
     await _cancel_auto_forwarder_task(session_id)
@@ -275,23 +263,7 @@ async def teardown_opencode_native_server(session_id: str) -> None:
 
 
 async def teardown_all_opencode_native_servers() -> None:
-    """
-    Tear down every host-spawned opencode-native server on this runner.
-
-    The opencode counterpart of
-    :func:`teardown_all_codex_native_app_servers`, called from the runner's
-    shutdown path (``_stop_pm``) so a graceful host or runner stop takes the
-    per-session ``opencode serve`` subprocesses down with it. Per-session
-    teardown normally runs on ``DELETE /v1/sessions``, but a host stop tears
-    the runner down without deleting each session first, so those never fire.
-
-    Iterates a snapshot of the registered session ids and delegates to
-    :func:`teardown_opencode_native_server` (which cancels the forwarder and
-    closes the server). Best-effort and idempotent: a session already torn
-    down is a no-op.
-
-    :returns: None.
-    """
+    """Close all registered OpenCode servers during runner shutdown, best effort."""
     for session_id in list(_AUTO_OPENCODE_SERVERS):
         with contextlib.suppress(Exception):
             await teardown_opencode_native_server(session_id)
@@ -1462,12 +1434,8 @@ async def _auto_create_opencode_terminal(
             ),
         )
     except BaseException:
-        # Includes CancelledError: session teardown can cancel this create
-        # while it is still materializing the OpenCode session, and nothing
-        # else owns the just-spawned server yet. Drop the registry entry
-        # before closing, and suppress the close, the way the forwarder
-        # supervisor's finally does: a close that raises must not strand a
-        # stale registry entry, nor replace the exception being propagated.
+        # Include cancellation; remove ownership before closing so a close failure
+        # cannot leave a stale entry or replace the startup error.
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):
             await server.close()
@@ -1538,9 +1506,7 @@ async def _auto_create_opencode_terminal(
             },
         )
     except BaseException:
-        # Includes CancelledError: a teardown that lands before the terminal
-        # registers must still reap the forwarder and its server. Pop before
-        # closing, and suppress the close, for the same reason as above.
+        # Terminal startup failure or cancellation must also release the server.
         await _cancel_auto_forwarder_task(session_id)
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):

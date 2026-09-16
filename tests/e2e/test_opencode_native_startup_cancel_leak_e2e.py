@@ -1,21 +1,6 @@
-"""E2E repro: cancelling opencode-native startup leaks ``opencode serve``.
+"""Deleting a session during startup must reap its real OpenCode server.
 
-Drives the reported journey end-to-end through the real product stack:
-connect a host daemon -> create an ``opencode-native-ui`` session (the runner
-spawns a real per-session ``opencode serve``) -> cancel the startup by
-deleting the session while the server's readiness probe is still pending ->
-verify the spawned ``opencode serve`` subprocess is reaped instead of
-outliving its session.
-
-On the buggy build the deletion lands in the startup window between
-``subprocess.Popen`` and the forwarder adopting the server, so the child
-``opencode serve`` is orphaned (observable via ``pgrep -af 'opencode
-serve'``) — exactly the reported symptom. A fixed build reaps the child
-within the grace window.
-
-Needs an ``opencode`` binary on PATH (any supported version); no LLM
-credentials are required because the session is cancelled before any turn.
-"""
+Requires Linux /proc and opencode on PATH; no LLM credentials are needed."""
 
 from __future__ import annotations
 
@@ -48,10 +33,7 @@ def _spawn_host_daemon(*, tmp_path: Path, live_server: str) -> subprocess.Popen[
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
-    # A pinned CI `opencode` wrapper synthesizes a provider config from these;
-    # a real binary ignores them. No turn runs, so no model is ever reached.
-    # The host->runner env filter drops unknown names, so list them in the
-    # passthrough var (itself forwarded) to reach the runner's `opencode`.
+    # Pass provider settings to the CI wrapper; this test never sends a prompt.
     env.setdefault("OPENCODE_MODEL", "claude-sonnet-4-5")
     env.setdefault("GATEWAY_BASE_URL", "http://127.0.0.1:9")
     passthrough = {"OPENCODE_MODEL", "GATEWAY_BASE_URL"}
@@ -82,12 +64,7 @@ def _online_host_id(client: httpx.Client, timeout: float = 30.0) -> str:
 
 
 def _opencode_serve_pids(workspace: Path) -> list[int]:
-    """Return pids of ``opencode serve`` processes running in ``workspace``.
-
-    The runner launches each per-session server with ``cwd=<session
-    workspace>``, so matching on the process cwd scopes the scan to this
-    test's disposable session even on a busy host.
-    """
+    """Find OpenCode servers by workspace so unrelated sessions are excluded."""
     resolved = workspace.resolve()
     pids: list[int] = []
     for entry in Path("/proc").iterdir():
@@ -109,12 +86,7 @@ def test_opencode_native_startup_cancel_reaps_serve(
     tmp_path: Path,
     live_server: str,
 ) -> None:
-    """Deleting an opencode-native session during startup must reap ``opencode serve``.
-
-    Journey: launch an opencode-native session; while the runner's
-    ``opencode serve`` readiness probe is still pending, cancel the startup by
-    deleting the session; the spawned server must not outlive the session.
-    """
+    """Delete during startup and verify the OpenCode server exits."""
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     agent_id = next(
@@ -137,10 +109,7 @@ def test_opencode_native_startup_cancel_reaps_serve(
         create.raise_for_status()
         session_id = create.json()["id"]
 
-        # Wait for the runner to spawn the per-session `opencode serve`, then
-        # cancel immediately: the readiness probe polls every 0.5s and the
-        # server takes seconds to answer, so first sighting of the process
-        # lands inside the pending-probe window the report describes.
+        # Delete as soon as the process appears to catch the readiness wait.
         deadline = time.monotonic() + _SERVE_APPEAR_TIMEOUT_S
         while time.monotonic() < deadline:
             if _opencode_serve_pids(workspace):
@@ -152,9 +121,7 @@ def test_opencode_native_startup_cancel_reaps_serve(
                 f"{_SERVE_APPEAR_TIMEOUT_S}s (workspace={workspace})"
             )
 
-        # The user-facing cancellation: delete the session while startup is
-        # in flight. Retried briefly in case the server has not finished
-        # materializing the session it is asked to delete.
+        # Retry deletion while the session is still being created.
         delete_deadline = time.monotonic() + 30.0
         while True:
             delete = http_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
