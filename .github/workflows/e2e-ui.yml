@@ -283,8 +283,13 @@ jobs:
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             MARKER="$MARKER and not nightly"
           fi
-          # Every shard uses the same committed duration snapshot; --group
-          # is 1-indexed. JSONL artifacts retain every phase and the assignment.
+          # --splits/--group partition the suite via a strided slice (see
+          # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
+          # evens out wall-clock better than pytest-shard's hash-bucketing.
+          # --group is 1-indexed, so map the 0-indexed shard_id with +1.
+          # --durations surfaces the slowest test phases (setup/call/teardown)
+          # at the end of each shard's log so we can see where the wall-clock
+          # goes and rebalance; the 1s floor keeps trivial phases out.
           # Retry every otherwise-unmarked failure once for transient CI races;
           # per-test @pytest.mark.flaky settings still take precedence.
           uv run pytest tests/e2e_ui \
@@ -292,7 +297,6 @@ jobs:
             --durations=25 --durations-min=1.0 \
             --reruns=1 --reruns-delay=5 \
             --ui-skip-build \
-            --ui-duration-file=tests/e2e_ui/durations.json \
             --ui-timing-output=artifacts/ui-timings.jsonl \
             --splits="$NUM_SHARDS" \
             --group="$((SHARD_ID + 1))" \
