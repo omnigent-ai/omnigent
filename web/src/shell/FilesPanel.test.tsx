@@ -207,6 +207,7 @@ function renderPanel({
           path="/c/:conversationId"
           element={
             <FilesPanel
+              conversationId={conversationId}
               sort="recent"
               onSortChange={vi.fn()}
               flatView={flatView}
@@ -233,6 +234,96 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("FilesPanel explicit session", () => {
+  beforeEach(() => {
+    useAllFilesMock.mockReturnValue(allFilesResult([]));
+    useChangedFilesMock.mockReturnValue(changedFilesResult());
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(
+      environmentResult("/home/user/project", { unconfined: true, roots: [] }),
+    );
+    useSearchMock.mockReturnValue(searchResult([]));
+  });
+
+  function panelFor(conversationId: string | undefined, drawer = false) {
+    const props = {
+      conversationId,
+      flatView: false,
+      showHidden: false,
+      onShowHiddenChange: vi.fn(),
+      sort: "recent" as const,
+      onSortChange: vi.fn(),
+      onFileSelect: vi.fn(),
+    };
+    return (
+      <MemoryRouter initialEntries={["/c/route-session"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              drawer ? (
+                <FilesPanelDrawer {...props} open onClose={vi.fn()} />
+              ) : (
+                <FilesPanel {...props} />
+              )
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+  }
+
+  it.each([false, true])(
+    "uses the explicit session instead of route params (drawer=%s)",
+    (drawer) => {
+      render(panelFor("selected-files-session", drawer));
+
+      expect(useSession).toHaveBeenLastCalledWith("selected-files-session");
+      expect(useEnvironmentMock).toHaveBeenLastCalledWith("selected-files-session", {
+        enabled: true,
+      });
+      expect(useChangedFilesMock).toHaveBeenLastCalledWith("selected-files-session", {
+        enabled: true,
+      });
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        "selected-files-session",
+        { enabled: true },
+        "",
+      );
+      expect(useSearchMock).toHaveBeenLastCalledWith(
+        "selected-files-session",
+        "",
+        "",
+        "",
+        { enabled: false },
+        "",
+      );
+    },
+  );
+
+  it("keeps browse locations scoped to the explicit selection during in-place switches", () => {
+    const { rerender } = render(panelFor("files-prop-a"));
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("files-prop-a", expect.anything(), "/etc");
+
+    rerender(panelFor("files-prop-b"));
+    expect(useSession).toHaveBeenLastCalledWith("files-prop-b");
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("files-prop-b", expect.anything(), "");
+
+    rerender(panelFor("files-prop-a"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("files-prop-a", expect.anything(), "/etc");
+  });
+
+  it("does not fall back to the route when the selection is explicitly empty", () => {
+    render(panelFor(undefined));
+
+    expect(useSession).toHaveBeenLastCalledWith(undefined);
+    expect(useEnvironmentMock).toHaveBeenLastCalledWith(undefined, { enabled: true });
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(undefined, { enabled: true }, "");
+  });
 });
 
 describe("FilesPanel working folder directory", () => {
@@ -306,6 +397,7 @@ describe("FilesPanel working folder header role", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_header_frameless"
                 sort="recent"
                 onSortChange={vi.fn()}
                 frameless
@@ -423,6 +515,7 @@ describe("FilesPanel changed files search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_search_visible"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={true}
@@ -484,6 +577,7 @@ describe("FilesPanel changed files search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_search_clear"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={false}
@@ -505,6 +599,7 @@ describe("FilesPanel changed files search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_search_clear"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={true}
@@ -576,6 +671,7 @@ describe("FilesPanel changed files search", () => {
               element={
                 <>
                   <FilesPanelDrawer
+                    conversationId="conv_drawer_preserves_tree"
                     sort="recent"
                     onSortChange={vi.fn()}
                     open={drawerOpen}
@@ -591,6 +687,7 @@ describe("FilesPanel changed files search", () => {
                         open drawer
                       </button>
                       <FilesPanel
+                        conversationId="conv_drawer_preserves_tree"
                         sort="recent"
                         onSortChange={vi.fn()}
                         flatView={false}
@@ -643,6 +740,7 @@ describe("FilesPanel changed files search", () => {
               element={
                 <>
                   <FilesPanelDrawer
+                    conversationId="conv_drawer_preserves_eye"
                     sort="recent"
                     onSortChange={vi.fn()}
                     open={drawerOpen}
@@ -658,6 +756,7 @@ describe("FilesPanel changed files search", () => {
                         open drawer
                       </button>
                       <FilesPanel
+                        conversationId="conv_drawer_preserves_eye"
                         sort="recent"
                         onSortChange={vi.fn()}
                         flatView={false}
@@ -706,6 +805,7 @@ describe("FilesPanel changed files search", () => {
               path="/c/:conversationId"
               element={
                 <FilesPanel
+                  conversationId="conv_search_hidden"
                   sort="recent"
                   onSortChange={vi.fn()}
                   flatView={true}
@@ -758,6 +858,7 @@ describe("FilesPanel tree (Explore) search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_tree_search_visible"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={true}
@@ -1014,6 +1115,7 @@ describe("FilesPanel tree (Explore) search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_tree_search_tab_clear"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={true}
@@ -1035,6 +1137,7 @@ describe("FilesPanel tree (Explore) search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_tree_search_tab_clear"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={false}
@@ -1242,6 +1345,7 @@ describe("FilesPanel tree (Explore) search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_tree_filters_tab_clear"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={true}
@@ -1264,6 +1368,7 @@ describe("FilesPanel tree (Explore) search", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_tree_filters_tab_clear"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={false}
@@ -1357,6 +1462,7 @@ describe("FilesPanel scroll position persistence", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId={conversationId}
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={false}
@@ -1611,6 +1717,7 @@ describe("FilesPanel browse location", () => {
             path="/c/:conversationId"
             element={
               <FilesPanel
+                conversationId="conv_refused"
                 sort="recent"
                 onSortChange={vi.fn()}
                 flatView={false}
