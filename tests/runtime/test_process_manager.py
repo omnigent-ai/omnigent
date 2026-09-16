@@ -11,6 +11,7 @@ without launching real runner subprocesses.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -179,3 +180,27 @@ def test_build_harness_spawn_env_strips_binding_token_without_overrides(
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in env
     assert "bug-binding-token-secret" not in env.values()  # not leaked under another key
     assert env["PATH_MARKER_FOR_TEST"] == "marker-value"
+
+
+@pytest.mark.parametrize("with_overrides", [False, True])
+def test_build_harness_spawn_env_keeps_desktop_session_in_runner(
+    monkeypatch: pytest.MonkeyPatch, with_overrides: bool
+) -> None:
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr(os, "environ", {**session_env, "XDG_CONFIG_HOME": "/home/test/.config"})
+    overrides = {**session_env, "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf %s test-key"}
+
+    env = _build_harness_spawn_env(overrides if with_overrides else None)
+
+    if with_overrides:
+        assert {name: env[name] for name in session_env} == session_env
+    else:
+        assert session_env.keys().isdisjoint(env)
+    assert env["XDG_CONFIG_HOME"] == "/home/test/.config"
+    assert {name: os.environ[name] for name in session_env} == session_env
+    assert {name: overrides[name] for name in session_env} == session_env
+    if with_overrides:
+        assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s test-key"

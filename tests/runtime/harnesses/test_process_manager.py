@@ -1132,6 +1132,37 @@ async def test_get_client_env_override_propagates_to_subprocess(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize("desktop_granted", [False, True])
+async def test_spawned_harness_requires_desktop_session_grant(
+    manager: HarnessProcessManager, monkeypatch: pytest.MonkeyPatch, desktop_granted: bool
+) -> None:
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    for name, value in session_env.items():
+        monkeypatch.setenv(name, value)
+    auth_command = "printf %s test-provider-key"
+    await manager.start()
+    try:
+        client = await manager.get_client(
+            "conv_keyring",
+            _TEST_HARNESS_NAME,
+            env={
+                **(session_env if desktop_granted else {}),
+                "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": auth_command,
+            },
+        )
+        for name, value in session_env.items():
+            response = await client.get(f"/env/{name}")
+            assert response.json() == {"value": value if desktop_granted else None}
+            assert os.environ[name] == value
+        response = await client.get("/env/HARNESS_CODEX_GATEWAY_AUTH_COMMAND")
+        assert response.json() == {"value": auth_command}
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_env_override_is_per_conversation(
     manager: HarnessProcessManager,
 ) -> None:

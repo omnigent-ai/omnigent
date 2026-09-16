@@ -409,6 +409,9 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
         big = _http.get(
             f"{base_url}/v1/sessions/{session_id}/items",
             params={"limit": 1000, "order": "asc"},
+            # Uvicorn closes this connection after logging the injected error.
+            # Keep the subsequent resume off a socket still being torn down.
+            headers={"Connection": "close"},
             timeout=60.0,
         )
         assert big.status_code == 500, "large-page failure signature must be live"

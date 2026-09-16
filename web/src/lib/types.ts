@@ -479,16 +479,6 @@ export interface Session {
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent has access to (bundled + host-discovered,
-   * subject to the spec's ``skills_filter``). Populated by the
-   * server from the agent cache; ``undefined`` on older snapshots.
-   * The web composer surfaces these in its slash-command menu so
-   * users can fire ``/skill-name``.
-   */
-  skills?: SkillSummary[];
-  /** Discovery state; absent on older servers. */
-  skillsStatus?: SkillsStatus;
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
   /**
@@ -550,13 +540,7 @@ export interface SandboxStatus {
   error?: string | null;
 }
 
-/**
- * One entry in ``Session.skills`` — mirrors
- * ``omnigent.server.schemas.SkillSummary``. Just the name +
- * one-line description so the composer's suggestion menu can list
- * them; the full skill body is loaded server-side at invocation
- * time.
- */
+/** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */
 export interface SkillSummary {
   /** Lowercase kebab-case identifier, e.g. ``"triage-issues"``. */
   name: string;

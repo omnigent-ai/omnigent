@@ -21,6 +21,7 @@ from omnigent.harnesses.codex_native.bridge import (
     pending_mcp_servers,
     prepare_bridge_dir,
     read_bridge_startup_error,
+    read_bridge_startup_timeout,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -32,6 +33,7 @@ from omnigent.harnesses.codex_native.bridge import (
     update_active_turn_id,
     update_mcp_server_startup,
     write_bridge_startup_error,
+    write_bridge_startup_timeout,
     write_bridge_state,
     write_codex_config_effort,
     write_codex_config_model,
@@ -548,6 +550,72 @@ def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> No
 
     clear_bridge_state(bridge_dir)
     assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_round_trips_and_is_cleared(bridge_dir: Path) -> None:
+    """The configured-command marker is bounded and cleared before a new launch."""
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+    write_bridge_startup_timeout(bridge_dir, 120.0)
+    assert read_bridge_startup_timeout(bridge_dir) == 120.0
+
+    clear_bridge_state(bridge_dir)
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, 120.1, float("inf"), float("nan")])
+def test_bridge_startup_timeout_rejects_unbounded_values(
+    bridge_dir: Path,
+    timeout: float,
+) -> None:
+    """Invalid marker values cannot weaken the executor's bounded wait."""
+    with pytest.raises(ValueError, match="finite, positive"):
+        write_bridge_startup_timeout(bridge_dir, timeout)
+
+
+@pytest.mark.parametrize("value", [True, "120", 120.1, 10**1000, None])
+def test_bridge_startup_timeout_ignores_malformed_file_values(
+    bridge_dir: Path,
+    value: object,
+) -> None:
+    """Executor-visible marker parsing fails closed to the legacy wait."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_text(
+        json.dumps({"timeout_seconds": value}),
+        encoding="utf-8",
+    )
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_ignores_invalid_utf8(bridge_dir: Path) -> None:
+    """A marker that is not UTF-8 fails closed to the legacy wait."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_bytes(b"\xff")
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_ignores_overlong_integer(bridge_dir: Path) -> None:
+    """A marker larger than the payload cap fails closed."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_text(
+        '{"timeout_seconds": ' + "1" * 5000 + "}",
+        encoding="utf-8",
+    )
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_ignores_deeply_nested_json(bridge_dir: Path) -> None:
+    """A recursively nested marker cannot escape the fail-closed boundary."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_text(
+        "[" * 10_000 + "0" + "]" * 10_000,
+        encoding="utf-8",
+    )
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
 
 
 def test_mcp_startup_updates_round_trip(bridge_dir: Path) -> None:

@@ -62,6 +62,7 @@ from tests.codex_parity.sidecar_harness import (
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
+from tests.e2e_ui import timings
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -302,6 +303,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    timings.pytest_addoption(parser)
     # Round-robin shard split for the e2e-ui CI matrix. We roll our own
     # (rather than pull in pytest-shard / pytest-split) so the partition
     # is a dependency-free strided slice -- see pytest_collection_modifyitems
@@ -325,6 +327,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
     :param config: Pytest config with repo and pytest-playwright options.
     """
+    timings.pytest_configure(config)
     base_url = config.getoption("--ui-base-url")
     if base_url:
         _validate_ui_base_url(base_url)

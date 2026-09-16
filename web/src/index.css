@@ -456,6 +456,25 @@
   background-color: rgba(255, 255, 255, 0.05);
 }
 
+/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
+.composer-workspace-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--muted) 70%, transparent),
+      color-mix(in oklch, var(--muted) 70%, transparent)
+    ),
+    var(--background);
+}
+
+.composer-subagent-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--brand-accent) 10%, transparent),
+      color-mix(in oklch, var(--brand-accent) 10%, transparent)
+    ),
+    var(--background);
+}
+
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
 .ui-icon {
   box-sizing: border-box;
