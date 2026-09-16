@@ -2488,10 +2488,7 @@ def _prepare_messages(
             content_cache,
             session_id=conversation_id,
         )
-    messages = history_to_input_items(
-        resolved,
-        preserve_framework_notices=spec.executor.harness_kind in {"claude-native", "codex-native"},
-    )
+    messages = history_to_input_items(resolved, preserve_framework_notices=True)
     sys_tokens = count_tokens(
         [{"role": "system", "content": sys_instructions}],
         compaction_state.model,

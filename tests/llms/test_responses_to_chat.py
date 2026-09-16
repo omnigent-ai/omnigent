@@ -50,8 +50,8 @@ def test_resize_notice_stays_system_context_across_providers(provider: str) -> N
     messages = responses_input_to_chat_messages(history_to_input_items([item]), "Be helpful.")
     assert messages == [
         {"role": "system", "content": "Be helpful."},
-        {"role": "user", "content": "inspect this"},
         {"role": "system", "content": notice},
+        {"role": "user", "content": "inspect this"},
     ]
     if provider == "anthropic":
         payload = _chat_to_anthropic(messages, "claude-test", None, {})

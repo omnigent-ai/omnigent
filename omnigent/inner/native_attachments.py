@@ -24,6 +24,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -281,6 +282,28 @@ def framework_notices(content: object) -> list[str]:
         if text:
             notices.append(text)
     return notices
+
+
+def expand_framework_notices(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Render structured notices as system context at a provider boundary."""
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            result.append(message)
+            continue
+        visible_content = [
+            block
+            for block in content
+            if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE
+        ]
+        result.extend(
+            {"role": "system", "content": [{"type": "input_text", "text": notice}]}
+            for notice in framework_notices(content)
+        )
+        if visible_content or not content:
+            result.append({**message, "content": visible_content})
+    return result
 
 
 def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:

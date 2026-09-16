@@ -80,11 +80,11 @@ def test_framework_notice_is_system_context_not_user_text() -> None:
     item.data.content.append(framework_notice_block(dimensions))
 
     assert history_to_input_items([item]) == [
-        {"role": "user", "content": [{"type": "input_text", "text": "inspect this"}]},
         {
             "role": "system",
             "content": [{"type": "input_text", "text": resize_notice(dimensions)}],
         },
+        {"role": "user", "content": [{"type": "input_text", "text": "inspect this"}]},
     ]
     assert history_to_input_items([item], preserve_framework_notices=True) == [
         {"role": "user", "content": item.data.content}

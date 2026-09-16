@@ -14,7 +14,7 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
-from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE, framework_notices
+from omnigent.inner.native_attachments import expand_framework_notices
 from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
 
@@ -359,22 +359,7 @@ def history_to_input_items(
             # the LLM. The text description survives and gives
             # the LLM context about files it previously produced.
             content = _strip_output_annotations(item.data.content)
-            if preserve_framework_notices:
-                result.append({"role": item.data.role, "content": content})
-                continue
-            notices = framework_notices(content)
-            visible_content = [
-                block for block in content if block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE
-            ]
-            if visible_content:
-                result.append({"role": item.data.role, "content": visible_content})
-            result.extend(
-                {
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": notice}],
-                }
-                for notice in notices
-            )
+            result.append({"role": item.data.role, "content": content})
 
         elif item.type == "function_call":
             assert isinstance(item.data, FunctionCallData)
@@ -419,4 +404,4 @@ def history_to_input_items(
             # before being prepended to history.
             pass
 
-    return result
+    return result if preserve_framework_notices else expand_framework_notices(result)
