@@ -2185,8 +2185,18 @@ async def test_list_conversations_delete_of_non_cursor_row_keeps_paging(
         if not page.has_more or page.last_id is None:
             break
         after = page.last_id
-    survivors = [cid for cid in created if cid != page1.first_id]
-    assert [cid for cid in enumerated if cid != page1.first_id] == survivors
+    # Compare against the store's own single-page order, not creation order:
+    # the ORDER BY tiebreaker is the row id outside SQLite, so rows sharing a
+    # ``created_at`` do not come back in the order they were created.
+    whole = conversation_store.list_conversations(limit=100, order="asc")
+    listed = [c.id for c in whole.data if c.id in set(created)]
+    walked = [cid for cid in enumerated if cid != page1.first_id]
+    assert walked == listed, (
+        f"the paged walk disagrees with a single-page read: {walked} vs {listed}"
+    )
+    assert set(listed) == set(created) - {page1.first_id}, (
+        "a non-cursor delete must remove exactly that row from the listing"
+    )
 
 
 def test_list_conversations_order_asc(
