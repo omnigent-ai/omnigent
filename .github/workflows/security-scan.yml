@@ -51,6 +51,7 @@ jobs:
         with:
           ref: main             # trusted; never the PR head
           sparse-checkout: |
+            .github/actions/setup-uv
             .github/scripts/security-scan
             .github/scripts/merge-ready
             .github/security
@@ -132,7 +133,7 @@ jobs:
 
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
 
       - name: OSV advisory scan (uv.lock)
         # Checks every package version pinned in the PR's uv.lock against the

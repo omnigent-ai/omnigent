@@ -1,0 +1,40 @@
+name: "Set up cached uv"
+description: "Restore or populate a cache of the pinned uv binary"
+
+inputs:
+  enable-cache:
+    description: "Cache uv's downloaded packages between jobs."
+    default: "true"
+    required: false
+  version:
+    description: "Exact uv version to install and use in the binary cache key."
+    default: "0.12.15"
+    required: false
+
+runs:
+  using: composite
+  steps:
+    # setup-uv stores installed binaries in RUNNER_TOOL_CACHE, but hosted
+    # runners do not share that directory. Persist it across jobs so most jobs
+    # avoid both the manifest request and binary download.
+    - name: Restore uv binary
+      id: restore-uv
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ runner.tool_cache }}/uv
+        key: uv-tool-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+
+    - name: Install uv
+      uses: ./.github/actions/setup-uv/install
+      with:
+        version: ${{ inputs.version }}
+        enable-cache: ${{ inputs.enable-cache }}
+
+    # Save before the caller runs workload code, so later steps cannot alter
+    # the files that populate this shared cache.
+    - name: Save uv binary
+      if: steps.restore-uv.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ runner.tool_cache }}/uv
+        key: uv-tool-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
