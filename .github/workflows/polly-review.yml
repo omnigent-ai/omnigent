@@ -238,7 +238,7 @@ jobs:
           # this dir's node_modules empty.
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
@@ -283,9 +283,11 @@ jobs:
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_ANTHROPIC_OPUS_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_OPUS_MODEL }}
           OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
           : "${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}"
+          : "${OMNIGENT_ANTHROPIC_OPUS_MODEL:?Set OMNIGENT_CI_ANTHROPIC_OPUS_MODEL}"
           : "${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}"
           mkdir -p "$HOME/.omnigent"
           # Use python to write the config safely — avoids interpolating
@@ -304,7 +306,11 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': os.environ['OMNIGENT_ANTHROPIC_MODEL']},
+                          # Fable's auto-permission classifier needs a routable Opus fallback.
+                          'models': {
+                              'default': os.environ['OMNIGENT_ANTHROPIC_MODEL'],
+                              'opus': os.environ['OMNIGENT_ANTHROPIC_OPUS_MODEL'],
+                          },
                       },
                       'openai': {
                           'base_url': host + '/ai-gateway/codex/v1',
@@ -464,7 +470,12 @@ jobs:
           {review_sections}
 
           Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
-          Be concise. Do not restate the diff. Focus on what matters.
+          Do not restate the diff. Focus on what matters.
+
+          **Writing style:**
+          - Keep sentences concise and to the point. Use plain words.
+          - Do not assume the reader has prior knowledge. Explain and provide context when needed.
+          - Format multiple sub-points as a list.
 
           Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
 

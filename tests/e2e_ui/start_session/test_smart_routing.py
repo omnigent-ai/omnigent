@@ -317,13 +317,13 @@ async def _drive_smart_routing_disabled(base_url: str, session_id: str) -> None:
             )
 
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            # The routing entry remains visible but cannot be selected.
+            # Unavailable routing is omitted; ordinary harness selection remains available.
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
             ).to_be_visible()
             await expect(
                 page.get_by_test_id("new-chat-landing-harness-smart-routing")
-            ).to_be_disabled()
+            ).to_have_count(0)
 
             await (
                 page.get_by_test_id("new-chat-landing-agent-config-ag_claude_e2e")

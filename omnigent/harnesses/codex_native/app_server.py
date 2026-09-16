@@ -123,6 +123,8 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # (including a version we could not parse) the flag is omitted and the
 # interactive trust prompt may appear instead.
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
+# Codex rejects permission flags on remote resume starting with this release.
+_MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
@@ -721,7 +723,9 @@ class CodexAppServerClient:
         response = await future
         error = response.get("error")
         if error:
-            raise CodexAppServerResponseError(error)
+            exc = CodexAppServerResponseError(error)
+            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            raise exc
         return response
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
@@ -3031,10 +3035,8 @@ def resolve_native_codex_launch(
        legacy ``executor.profile`` / ``executor.config.profile`` — resolved
        through :func:`~omnigent.runtime.workflow._resolve_provider_for_build`
        itself, the same resolver the in-process harness uses, so a spec that
-       routes in-process routes natively too (a spec ``ApiKeyAuth`` resolves
-       to ``None`` for every harness — the resolver leaves bare keys to the
-       claude-sdk / openai-agents builders — so codex-native falls through
-       exactly as in-process codex does);
+       routes in-process routes natively too. A spec ``ApiKeyAuth`` routes
+       through a synthesized key provider with its declared endpoint;
 
     1. an explicit per-family default provider →
        - ``key`` / ``gateway`` / ``local`` → provider ``-c`` overrides
@@ -3045,7 +3047,8 @@ def resolve_native_codex_launch(
          ``auth.json``) fall through to the first other configured provider
          that can route, so a real credential is not shadowed by a dead
          subscription default;
-    2. else a global Databricks ``auth:`` block → ucode;
+    2. else a global ``auth:`` block → ucode for Databricks, or provider
+       overrides for an inline API key;
     3. else an ambient-detected provider (first run without configure);
     4. else the codex CLI's own login.
 
@@ -3071,7 +3074,11 @@ def resolve_native_codex_launch(
         default_provider_for_harness,
         load_config,
     )
-    from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
+    from omnigent.runtime.workflow import (
+        _load_global_auth,
+        _resolve_provider_for_build,
+        _synthesize_codex_api_key_provider,
+    )
     from omnigent.spec.types import DatabricksAuth
 
     explicit = load_config()
@@ -3091,17 +3098,8 @@ def resolve_native_codex_launch(
         or spec.executor.profile
         or spec.executor.config.get("profile")
     ):
-        # Spec-level credential (issue #2744): resolve it through the same
-        # resolver the in-process codex harness uses, so switching a working
-        # spec from ``harness: codex`` to ``codex-native`` keeps its auth
-        # working. A named provider that is undeclared raises loud here
-        # instead of parking the TUI on the sign-in screen for a 30s timeout.
-        # A spec ``ApiKeyAuth`` resolves to ``None`` for every harness (the
-        # shared resolver leaves bare keys to the claude-sdk / openai-agents
-        # builders; the in-process codex builder has no ApiKeyAuth branch
-        # either), so codex-native falls through to the machine-level chain
-        # below exactly as in-process codex does — as does a spec credential
-        # that cannot route openai.
+        # Share credential resolution with the in-process harness so spec
+        # auth, including inline keys, takes precedence over machine defaults.
         spec_entry = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
         if spec_entry is not None:
             if spec_entry.kind == SUBSCRIPTION_KIND:
@@ -3160,14 +3158,9 @@ def resolve_native_codex_launch(
                 summary=f"Databricks ucode profile {global_auth.profile!r} (global auth block)",
             )
         if global_auth is not None:
-            return NativeCodexLaunch(
-                config_overrides=[],
-                model=model,
-                profile=None,
-                summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
-                login_required=not _codex_login_usable(),
-            )
-        entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
+            entry = _synthesize_codex_api_key_provider(global_auth)
+        else:
+            entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
     if (
         entry is None
@@ -3198,14 +3191,9 @@ def resolve_native_codex_launch(
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
 
     if entry is None and not api_key_auth_precludes_broker(spec):
-        # Managed connect host: no spec/global/ambient provider, but the owner
-        # linked Databricks via the connect flow (host-only [omnigent] profile +
-        # broker sidecar). Route Codex through the workspace gateway, minting the
-        # bearer via the broker — the Codex counterpart to
-        # _connect_broker_claude_config. ucode configure (host boot) populated
-        # ucode state, so the model resolves to a served id. An explicit spec
-        # ApiKeyAuth resolves to None above too, but Codex threads that key
-        # itself, so it must not be rerouted through the owner's gateway.
+        # Use the managed host's Databricks broker only when no provider or
+        # explicit API-key auth selected a route. Host boot populated ucode
+        # state so the model resolves to a served id.
         from omnigent.host.databricks_credential import (
             HOST_DATABRICKS_PROFILE,
             broker_token_command,
@@ -3428,13 +3416,16 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
     return params
 
 
+_CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {
+    "approval_policy": "approvalPolicy",
+    "approvals_reviewer": "approvalsReviewer",
+    "default_permissions": "permissions",
+    "sandbox_mode": "sandbox",
+}
+
+
 def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> None:
-    field = {
-        "approval_policy": "approvalPolicy",
-        "approvals_reviewer": "approvalsReviewer",
-        "default_permissions": "permissions",
-        "sandbox_mode": "sandbox",
-    }.get(key.strip())
+    field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key.strip())
     if field is None:
         return
     value = _codex_config_string(raw_value)
@@ -3447,7 +3438,8 @@ async def preload_codex_thread_for_resume(
     thread_id: str,
     *,
     terminal_launch_args: Sequence[str] | None = None,
-) -> None:
+    retain_client: bool = False,
+) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
 
@@ -3462,15 +3454,18 @@ async def preload_codex_thread_for_resume(
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
     :param terminal_launch_args: Persisted permission overrides for the resumed thread.
-    :returns: None.
+    :param retain_client: Keep the thread subscribed through terminal attachment.
+        The caller must pass the returned client to the forwarder and close it.
+    :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
     client = client_for_transport(
         transport,
         client_name="omnigent-codex-native-preload",
     )
-    await client.connect()
+    retained = False
     try:
+        await client.connect()
         await client.request(
             "thread/resume",
             {
@@ -3479,8 +3474,13 @@ async def preload_codex_thread_for_resume(
                 **_codex_resume_permission_params(terminal_launch_args),
             },
         )
+        if retain_client:
+            retained = True
+            return client
     finally:
-        await client.close()
+        if not retained:
+            await client.close()
+    return None
 
 
 async def apply_codex_thread_effort(
@@ -3524,13 +3524,16 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     """
     Build terminal env overrides for the native Codex TUI.
 
+    The terminal and app-server share resource attributes for telemetry attribution.
+
     :param app_server: Running app-server wrapper.
     :returns: Environment variables for the terminal process.
     """
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
-        if key in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
+        if key
+        in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 
@@ -3616,12 +3619,53 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     return cleaned
 
 
+def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str]:
+    """Omit permissions configured on the app-server at startup or thread/resume."""
+    args = _strip_approval_sandbox_flags(codex_args)
+    cleaned: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        width = 1
+        if arg in {"-c", "--config"} and index + 1 < len(args):
+            assignment = args[index + 1]
+            width = 2
+        elif arg.startswith(("-c=", "--config=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, separator, raw_value = assignment.partition("=")
+            # Leave unsupported settings for Codex to validate, rather than
+            # silently dropping a policy that preload does not apply.
+            if (
+                separator
+                and key.strip() in _CODEX_RESUME_PERMISSION_CONFIG_FIELDS
+                and _codex_config_string(raw_value)
+            ):
+                index += width
+                continue
+        cleaned.append(arg)
+        index += 1
+    return cleaned
+
+
+def codex_remote_resume_omits_permission_args(
+    codex_cli_version: tuple[int, int, int] | None,
+) -> bool:
+    """Whether remote resume needs a retained preload instead of permission flags."""
+    return (
+        codex_cli_version is None
+        or codex_cli_version >= _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION
+    )
+
+
 def build_codex_remote_args(
     *,
     codex_args: tuple[str, ...],
     thread_id: str | None,
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
+    codex_cli_version: tuple[int, int, int] | None = None,
     bypass_sandbox: bool = False,
     bypass_hook_trust: bool = False,
 ) -> list[str]:
@@ -3656,7 +3700,8 @@ def build_codex_remote_args(
         settings already cover everything.
     :param thread_id: Codex thread id to resume, e.g. ``"thread_abc123"``.
         ``None`` starts a fresh remote Codex TUI thread instead of
-        resuming an existing one.
+        resuming an existing one. On Codex 0.154+, omit terminal permission
+        args; app-server startup and preload still configure the thread.
     :param remote_url: App-server endpoint the TUI attaches to, e.g.
         ``"unix:///home/user/.omnigent/codex-native/x/app-server.sock"``
         or ``"ws://127.0.0.1:9876"``.
@@ -3665,14 +3710,19 @@ def build_codex_remote_args(
         ``('model="databricks-gpt-5-5"', 'model_provider="omnigent_databricks"')``.
         Each is emitted as a ``-c <value>`` global flag. Empty for a
         plain Codex-login launch that needs no provider routing.
-    :param bypass_sandbox: When ``True``, emit a single
+    :param codex_cli_version: Probed app-server CLI version. Before 0.154,
+        preserve permission flags because a remote TUI can reapply its own
+        defaults on attach. ``None`` uses the 0.154+ compatible arguments.
+    :param bypass_sandbox: When ``True`` for a fresh thread or a pre-0.154
+        resume, emit a single
         ``--dangerously-bypass-approvals-and-sandbox`` flag and strip any
         conflicting ``--sandbox`` / ``--ask-for-approval`` pairs from
         *codex_args* (codex aborts at startup if the bypass flag is
         combined with either). DANGEROUS: this disables both the approval
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
-        the granular flags untouched. See issue #657.
+        the granular flags untouched. On Codex 0.154+, resumed terminals
+        omit these flags and use the existing preload path. See issue #657.
     :param bypass_hook_trust: When ``True``, emit
         ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
         hooks without the interactive "Hooks need review" trust prompt.
@@ -3700,7 +3750,13 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
-    return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+    if not codex_remote_resume_omits_permission_args(codex_cli_version):
+        return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+    # Codex rejects explicit permission overrides on remote resume, even
+    # when they match the app-server policy. config_overrides went to server
+    # startup; codex_args went to preload's thread/resume call.
+    resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
+    return [*resume_args, "resume", "--remote", remote_url, thread_id]
 
 
 def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:

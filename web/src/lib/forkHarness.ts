@@ -75,6 +75,8 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
     harness === "native-codex" ||
     harness === "cursor-native" ||
     harness === "native-cursor" ||
+    harness === "devin-native" ||
+    harness === "native-devin" ||
     harness === "pi-native" ||
     harness === "native-pi" ||
     harness === "antigravity-native" ||
@@ -115,6 +117,11 @@ const NATIVE_REBUILD_HARNESSES: ReadonlySet<string> = new Set([
 const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
   "cursor-native",
   "native-cursor",
+  // devin's session store is read-only to Omnigent, so a fork replays its prior
+  // turns as text on the clone's first message rather than seeding a resumable
+  // local transcript. Mirrors Python `ForkHistory.PREAMBLE` for devin-native.
+  "devin-native",
+  "native-devin",
   "opencode-native",
   "native-opencode",
 ]);

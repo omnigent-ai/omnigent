@@ -80,6 +80,8 @@ from omnigent.server.routes._sessions.helpers import (
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
+    _raise_if_runner_session_agent_missing,
+    _raise_if_session_agent_missing_payload,
     _read_upload_capped,
     _stored_file_to_resource,
 )
@@ -120,6 +122,25 @@ class _RunnerStreamResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             await self._upstream.aclose()
+
+
+# Admission gate bounding how many image uploads hold their raw bytes in memory
+# and decode/re-encode at once. Created lazily on first use so it binds to the
+# running server loop (not import time) and picks up the configured size. The
+# raw upload is already spooled to disk by the multipart parser before the
+# handler runs, so waiting here serializes only the in-memory materialize +
+# decode — the memory-heavy work — never the network transfer.
+_image_compression_gate: asyncio.Semaphore | None = None
+
+
+def _get_image_compression_gate() -> asyncio.Semaphore:
+    """Return the process-wide image-compression admission semaphore."""
+    global _image_compression_gate
+    if _image_compression_gate is None:
+        from omnigent.server.server_config import image_compression_concurrency
+
+        _image_compression_gate = asyncio.Semaphore(image_compression_concurrency())
+    return _image_compression_gate
 
 
 def register_resources_routes(
@@ -353,6 +374,10 @@ def register_resources_routes(
             payload = None
         if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
             raise HTTPException(status_code=502, detail="runner download failed")
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) with its client-safe message instead of forwarding the
+        # runner's raw resolver text verbatim.
+        _raise_if_session_agent_missing_payload(payload)
         return JSONResponse(status_code=resp.status_code, content=payload)
 
     async def _proxy_get_to_runner(
@@ -369,7 +394,9 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
+        :raises OmnigentError: Typed ``not_found`` (404) or
+            ``session_agent_missing`` (410) re-derived from the runner body.
+        :raises HTTPException: 502 on any other runner failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -404,6 +431,9 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
@@ -1537,10 +1567,15 @@ def register_resources_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         from omnigent.runtime.content_resolver import (
+            _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
+            ImageCompressionError,
             _resolve_content_type,
             attachment_text_type_for_extension,
             attachment_upload_limit,
+            compress_image_attachment,
+            image_filename_for_content_type,
+            image_needs_compression,
         )
 
         # Resolve the type from the declared MIME + filename BEFORE reading
@@ -1571,13 +1606,38 @@ def register_resources_routes(
                     "PDF, and text/code files can be attached."
                 ),
             )
-        content = await _read_upload_capped(
-            file,
-            min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES),
-        )
+        read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+        filename = file.filename
+        if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+            # Compressible images carry the large cap and the decode, so they are
+            # the server's peak upload memory. The body is already spooled to
+            # disk by the multipart parser, so gate the in-memory read + the
+            # decode/re-encode behind the admission semaphore: a burst of
+            # concurrent uploads waits (each holding only a disk-backed temp
+            # file), instead of every one buffering the full image in RAM and
+            # decoding at once. This bounds peak memory to the gate size × the
+            # per-upload cost, without serializing the network transfer.
+            async with _get_image_compression_gate():
+                content = await _read_upload_capped(file, read_limit)
+                if image_needs_compression(len(content), content_type):
+                    try:
+                        compressed, resolved_type = await asyncio.to_thread(
+                            compress_image_attachment, content, content_type
+                        )
+                    except ImageCompressionError as exc:
+                        raise HTTPException(status_code=413, detail=str(exc)) from exc
+                    # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+                    # filename extension so name, bytes, and MIME stay consistent.
+                    if resolved_type != content_type:
+                        filename = image_filename_for_content_type(file.filename, resolved_type)
+                    content, content_type = compressed, resolved_type
+        else:
+            # PDF/text/SVG and other non-compressed types use their smaller
+            # per-type caps and aren't decoded, so they read outside the gate.
+            content = await _read_upload_capped(file, read_limit)
         stored = file_store.create(
             session_id=session_id,
-            filename=file.filename,
+            filename=filename,
             bytes=len(content),
             content_type=content_type,
         )
@@ -1984,6 +2044,10 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) with its client-safe message instead of forwarding
+            # the runner's raw resolver text verbatim.
+            _raise_if_session_agent_missing_payload(payload)
             error = payload.get("error", {})
             message = error.get("message", "filesystem operation failed")
             if status == 404:

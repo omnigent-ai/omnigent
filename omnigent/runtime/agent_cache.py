@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import shutil
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 from omnigent.entities import LoadedAgent
@@ -48,7 +51,7 @@ class AgentCache:
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
 
-    def _cache_path(self, agent_id: str, *, suffix: str = "") -> Path:
+    def _cache_path(self, agent_id: str) -> Path:
         """Return a direct child of the cache root for an agent id."""
         component = os.path.basename(agent_id)
         if (
@@ -60,7 +63,7 @@ class AgentCache:
         ):
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         cache_root = self._cache_dir.resolve(strict=False)
-        normalized_path = os.path.normpath(cache_root / f"{component}{suffix}")
+        normalized_path = os.path.normpath(cache_root / component)
         if not normalized_path.startswith(os.path.join(cache_root, "")):
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         path = Path(normalized_path)
@@ -115,9 +118,9 @@ class AgentCache:
             self._specs[agent_id] = spec
             return LoadedAgent(spec=spec, workdir=workdir)
 
-        # Cache miss — download bundle, write to temp file, extract
+        # Cache miss — validate privately before publishing the disk entry.
         bundle_bytes = self._artifact_store.get(bundle_location)
-        return self._extract_and_cache(agent_id, bundle_bytes, workdir, expand_env=expand_env)
+        return self._extract_and_cache(agent_id, bundle_bytes, expand_env=expand_env)
 
     def replace(
         self,
@@ -130,10 +133,10 @@ class AgentCache:
         """
         Warm-swap an agent's cached spec and disk directory.
 
-        Extracts the new bundle to a temp directory, swaps the
-        in-memory spec entry, renames into the cache location, and
-        cleans up the old directory. Concurrent readers see either
-        the old spec or the new spec, never an empty cache.
+        Validates the new bundle in a temporary directory before
+        replacing the disk directory and updating the in-memory spec.
+        Callers must coordinate replacement with concurrent use of
+        this agent; the disk swap and memory update are not atomic.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
@@ -151,31 +154,18 @@ class AgentCache:
             directory.
         """
         workdir = self._cache_path(agent_id)
-        staging_dir = self._cache_path(agent_id, suffix="_staging")
-
-        # Extract new bundle to staging directory
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
-        try:
-            tmp_path.write_bytes(bundle_bytes)
+        with self._staging_dir() as staging_dir:
             spec = load_spec(
-                tmp_path,
+                bundle_bytes,
                 dest=staging_dir,
                 expand_env=expand_env,
                 prune_invalid_sub_agents=True,
             )
-        finally:
-            tmp_path.unlink()
-
-        # Swap in-memory entry (atomic dict assignment)
+            workdir = self._cache_path(agent_id)
+            if workdir.is_dir():
+                shutil.rmtree(workdir)
+            staging_dir.rename(workdir)
         self._specs[agent_id] = spec
-
-        # Replace disk directory: remove old, rename staging into place
-        if workdir.is_dir():
-            shutil.rmtree(workdir)
-        staging_dir.rename(workdir)
-
         return LoadedAgent(spec=spec, workdir=workdir)
 
     def evict(self, agent_id: str) -> None:
@@ -191,11 +181,23 @@ class AgentCache:
         if workdir.is_dir():
             shutil.rmtree(workdir)
 
+    @contextlib.contextmanager
+    def _staging_dir(self) -> Iterator[Path]:
+        """Create scratch space outside the live agent-id namespace."""
+        cache_root = self._cache_dir.resolve(strict=False)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=f".{cache_root.name}-staging-", dir=cache_root.parent)
+        )
+        try:
+            yield staging_dir
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
     def _extract_and_cache(
         self,
         agent_id: str,
         bundle_bytes: bytes,
-        workdir: Path,
         *,
         expand_env: bool = False,
     ) -> LoadedAgent:
@@ -204,26 +206,33 @@ class AgentCache:
 
         :param agent_id: Unique agent identifier.
         :param bundle_bytes: Raw bytes of the ``.tar.gz`` bundle.
-        :param workdir: Target directory for extraction.
         :param expand_env: Whether to expand ``${VAR}`` references
             against the server process environment. Forwarded from
             :meth:`load`; defaults to ``False`` (fail-safe). See
             :meth:`load` for the rationale.
         :returns: A LoadedAgent with the parsed spec and workdir.
         """
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
-        try:
-            tmp_path.write_bytes(bundle_bytes)
+        with self._staging_dir() as staging_dir:
             spec = load_spec(
-                tmp_path,
-                dest=workdir,
+                bundle_bytes,
+                dest=staging_dir,
                 expand_env=expand_env,
                 prune_invalid_sub_agents=True,
             )
-        finally:
-            tmp_path.unlink()
-
+            workdir = self._cache_path(agent_id)
+            try:
+                staging_dir.rename(workdir)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                # Another cold loader published first; use its complete bundle.
+                workdir = self._cache_path(agent_id)
+                if not workdir.is_dir():
+                    raise
+                spec = load_spec(
+                    workdir,
+                    expand_env=expand_env,
+                    prune_invalid_sub_agents=True,
+                )
         self._specs[agent_id] = spec
         return LoadedAgent(spec=spec, workdir=workdir)

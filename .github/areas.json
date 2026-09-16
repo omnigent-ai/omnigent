@@ -9,6 +9,12 @@
     "and the CI runner has no PyYAML, so JSON is read natively by both the JS",
     "(JSON.parse) and Python (json.load) with zero dependencies.",
     "",
+    "assignment_paused - GitHub logins temporarily excluded by issue triage",
+    "  (legacy + v2), auto-assign-reviewer (including linked issues), and",
+    "  Waiting on Author review re-requests.",
+    "  Other workflows do not use this list. Remove a login to resume.",
+    "  Existing assignments and review requests are not removed by the pause.",
+    "",
     "Each area:",
     "  key        - stable identifier (not user-facing)",
     "  label      - the comp:* GitHub label applied to issues in this area. MUST be",
@@ -44,6 +50,11 @@
     "               every reader -- only `owners` is used for routing -- so this is",
     "               the 'commented out, not deleted' form: to re-activate someone,",
     "               move their login from owners_paused back into owners."
+  ],
+  "assignment_paused": [
+    "bbqiu",
+    "aravind-segu",
+    "Edwinhe03"
   ],
   "areas": [
     {

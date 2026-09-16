@@ -288,6 +288,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Whether the session is archived. Carried on the snapshot because it is
+   * the only carrier for a session opened directly by URL — the default
+   * sidebar list excludes archived rows. `false`/absent for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -464,24 +470,15 @@ export interface Session {
    */
   kind: "default" | "sub_agent";
   /**
-   * Current Claude Code todo list for `omnigent claude` sessions.
-   * Sourced from the server's `_session_todos_cache` at snapshot
-   * build time so the panel survives page refresh. Empty array for
-   * non-claude-native sessions or before the first turn creates todos.
+   * Current native Plan/TODO list reported by a harness. Restored from
+   * persisted session metadata at snapshot build time so the panel survives
+   * page refresh. Empty before the first Plan update.
    */
   todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent has access to (bundled + host-discovered,
-   * subject to the spec's ``skills_filter``). Populated by the
-   * server from the agent cache; ``undefined`` on older snapshots.
-   * The web composer surfaces these in its slash-command menu so
-   * users can fire ``/skill-name``.
-   */
-  skills?: SkillSummary[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
   /**
@@ -543,19 +540,15 @@ export interface SandboxStatus {
   error?: string | null;
 }
 
-/**
- * One entry in ``Session.skills`` — mirrors
- * ``omnigent.server.schemas.SkillSummary``. Just the name +
- * one-line description so the composer's suggestion menu can list
- * them; the full skill body is loaded server-side at invocation
- * time.
- */
+/** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */
 export interface SkillSummary {
   /** Lowercase kebab-case identifier, e.g. ``"triage-issues"``. */
   name: string;
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
 }
+
+export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";
 
 /** Reasoning-effort metadata advertised for a native model. */
 export interface NativeReasoningEffortOption {

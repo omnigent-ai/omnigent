@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
     "@emoji-mart/data": "^1.2.1",
     "@emoji-mart/react": "^1.1.1",
     "@fontsource-variable/geist-mono": "^5.2.7",
@@ -51,6 +52,7 @@
     "@tanstack/react-virtual": "^3.14.10",
     "@tiptap/core": "3.30.5",
     "@tiptap/extension-blockquote": "3.30.5",
+    "@tiptap/extension-code-block": "3.30.5",
     "@tiptap/extension-image": "3.30.5",
     "@tiptap/extension-link": "3.30.5",
     "@tiptap/extension-list": "3.30.5",
@@ -112,6 +114,7 @@
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.3",
     "@types/node": "^24.12.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

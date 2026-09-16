@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
@@ -24,6 +31,7 @@ from omnigent.inner.datamodel import (
     OSEnvSpec,
     TerminalEnvSpec,
 )
+from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -1333,7 +1341,8 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for a ``credential_proxy[*].source`` mapping.
 
     The secret origin is a structured single-key mapping —
-    ``{env: VAR}``, ``{file: path}``, or ``{command: cmd}`` — rather than
+    ``{env: VAR}``, ``{file: path}``, ``{command: cmd}``, or
+    ``{unix_socket: path}`` — rather than
     a prefix-encoded string. Exactly one key must be set. Pydantic
     validates the shape here; :meth:`to_spec` converts it to the internal
     :class:`CredentialSourceSpec` dataclass the runtime consumes.
@@ -1344,6 +1353,9 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         secret, e.g. ``"~/.config/tokens/github_pat.txt"``.
     :param command: Shell command whose stdout is the secret, e.g.
         ``"gh auth token"``.
+    :param unix_socket: Private HTTP broker socket serving a token at ``/token``.
+    :param refresh_interval_seconds: Optional positive cache lifetime for
+        file or Unix socket sources, in seconds.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1351,6 +1363,10 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     env: str | None = None
     file: str | None = None
     command: str | None = None
+    unix_socket: str | None = None
+    refresh_interval_seconds: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False, strict=True
+    )
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> _CredentialSourceModel:
@@ -1364,17 +1380,33 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         """
         set_keys = [
             name
-            for name, value in (("env", self.env), ("file", self.file), ("command", self.command))
+            for name, value in (
+                ("env", self.env),
+                ("file", self.file),
+                ("command", self.command),
+                ("unix_socket", self.unix_socket),
+            )
             if value is not None
         ]
         if len(set_keys) != 1:
-            raise ValueError("source must set exactly one of 'env', 'file', or 'command'")
+            raise ValueError(
+                "source must set exactly one of 'env', 'file', 'command', or 'unix_socket'"
+            )
         if self.env is not None and not _ENV_VAR_NAME_RE.match(self.env):
             raise ValueError("source 'env' must be a POSIX environment variable name")
         if self.file is not None and not self.file.strip():
             raise ValueError("source 'file' must be a non-empty path")
         if self.command is not None and not self.command.strip():
             raise ValueError("source 'command' must be a non-empty command")
+        if self.unix_socket is not None and not self.unix_socket.strip():
+            raise ValueError("source 'unix_socket' must be a non-empty path")
+        if self.refresh_interval_seconds is not None and (
+            self.env is not None or self.command is not None
+        ):
+            raise ValueError(
+                "refresh_interval_seconds requires a file or unix_socket source; "
+                "shell commands cannot refresh"
+            )
         return self
 
     def to_spec(self) -> CredentialSourceSpec:
@@ -1382,15 +1414,29 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         Convert this validated model into a :class:`CredentialSourceSpec`.
 
         :returns: The internal dataclass the runtime resolves the secret
-            from. Exactly one of ``env`` / ``file`` / ``command`` is set
+            from. Exactly one of ``env`` / ``file`` / ``command`` / ``unix_socket`` is set
             (guaranteed by :meth:`_exactly_one_source`).
         """
         if self.env is not None:
             return CredentialSourceSpec(kind="env", env=self.env)
+        if self.unix_socket is not None:
+            return CredentialSourceSpec(
+                kind="unix_socket",
+                path=self.unix_socket.strip(),
+                refresh_interval_seconds=self.refresh_interval_seconds,
+            )
         if self.file is not None:
-            return CredentialSourceSpec(kind="file", path=self.file.strip())
+            return CredentialSourceSpec(
+                kind="file",
+                path=self.file.strip(),
+                refresh_interval_seconds=self.refresh_interval_seconds,
+            )
         assert self.command is not None
-        return CredentialSourceSpec(kind="command", command=self.command.strip())
+        return CredentialSourceSpec(
+            kind="command",
+            command=self.command.strip(),
+            refresh_interval_seconds=self.refresh_interval_seconds,
+        )
 
 
 class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
@@ -2052,10 +2098,14 @@ def _read_contained_file(root: Path, value: str) -> str | None:
         ``"prompts/system.md"``.
     :returns: The file contents if *value* names a file contained within
         *root*, else ``None``.
+    :raises UnicodeDecodeError: If a contained instruction file cannot be decoded.
     """
     try:
-        root_prefix = os.path.join(os.path.realpath(root), "")
+        root_prefix = containment_prefix(os.path.realpath(root))
         resolved = os.path.realpath(root / value)
+    except (OSError, ValueError):
+        return None
+    try:
         if resolved.startswith(root_prefix):
             candidate = Path(resolved)
             if candidate.is_file():
