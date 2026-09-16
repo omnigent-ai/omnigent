@@ -535,18 +535,21 @@ class SubagentEntry:
         so a failed later item can leave the cursor behind without
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
-        observed in this sub-agent's transcript. Used by the idle
+        observed in this sub-agent's transcript. Used by the quiescence
         heuristic — when ``now - last_activity_ts >
         _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: idle`` event. ``None`` when no
-        items have been seen yet (so the heuristic doesn't fire
-        before there's anything to be quiescent about).
+        ``external_session_status: quiesced`` event (a badge-only
+        signal; the server never forwards it to the runner as a
+        terminal edge). ``None`` when no items have been seen yet (so
+        the heuristic doesn't fire before there's anything to be
+        quiescent about).
     :param last_status: Last status string POSTed for this
         sub-agent — used to dedupe so we don't spam ``running`` or
-        ``idle`` events on every tick when nothing changed. ``None``
+        ``quiesced`` events on every tick when nothing changed. ``None``
         means no status has been posted yet.
     :param delivery_error: Durable reason the mirrored transcript is
-        incomplete. Its quiescence edge is ``failed`` instead of ``idle``.
+        incomplete. Its quiescence edge is ``failed`` instead of
+        ``quiesced``.
     """
 
     subagent_id: str
@@ -2159,7 +2162,10 @@ async def _forward_one_subagent(
         and new_entry.last_activity_ts is not None
         and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
-        desired_status = "failed" if new_entry.delivery_error else "idle"
+        # A bare transcript lull is a badge-only "quiesced", never terminal
+        # "idle": the runner delivers idle/failed as authoritative completions,
+        # and a still-running sub-agent mid tool call must not complete.
+        desired_status = "failed" if new_entry.delivery_error else "quiesced"
     if desired_status is None or desired_status == new_entry.last_status:
         return
     retry_key = f"subagent_status:{entry.child_conversation_id}"

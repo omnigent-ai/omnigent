@@ -236,6 +236,23 @@ export function projectSessionPage(payload: unknown, limit: number): ExtensionSe
   return result;
 }
 
+/**
+ * SDK-visible code for a cursor whose session is gone. Must match
+ * `STALE_CURSOR_ERROR_CODE` in the web-extension SDK's `sessions.ts`.
+ */
+const STALE_CURSOR_ERROR_CODE = "StaleCursor";
+
+/** The server's `stale_cursor` 400 on a cursor-paginated list route. */
+async function isStaleCursorResponse(response: Response): Promise<boolean> {
+  if (response.status !== 400) return false;
+  try {
+    const body = (await response.clone().json()) as { error?: { code?: string } };
+    return body.error?.code === "stale_cursor";
+  } catch {
+    return false;
+  }
+}
+
 export async function listSessionPage(
   params: unknown,
   signal: AbortSignal,
@@ -259,6 +276,14 @@ export async function listSessionPage(
     }
     if (response.status >= 500) {
       throw new ExtensionHostServiceError("Unavailable", "Session list is unavailable");
+    }
+    if (await isStaleCursorResponse(response)) {
+      // Keep this distinguishable: `sessions.listAll` restarts its walk on
+      // it rather than failing the whole call.
+      throw new ExtensionHostServiceError(
+        STALE_CURSOR_ERROR_CODE,
+        "Session list cursor is no longer valid",
+      );
     }
     throw new ExtensionHostServiceError(
       "HostError",

@@ -173,6 +173,12 @@ describe("themePalette", () => {
     }
   });
 
+  it.each(PALETTES)("keeps $label canvas opaque for composited surfaces", (palette) => {
+    for (const mode of ["light", "dark"] as const) {
+      expect(parseColor(palette.tokens[mode].background).alpha, mode).toBe(1);
+    }
+  });
+
   it("uses the canonical Solarized backgrounds", () => {
     const solarized = PALETTES.find((palette) => palette.id === "solarized");
     expect(solarized?.tokens.light.background).toBe("#fdf6e3");

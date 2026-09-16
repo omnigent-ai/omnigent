@@ -1,17 +1,4 @@
-"""
-Runner-owned skill discovery + resolution endpoints.
-
-Skills are resolved on the runner, not the Omnigent server, because the
-runner is where the harness executes and may read a skill's local
-resource files. These tests exercise the two runner endpoints the AP
-server delegates to:
-
-* ``GET /v1/sessions/{id}/skills`` — the merged (bundled + host) skill
-  list for the web composer's slash-command menu.
-* ``POST /v1/sessions/{id}/skills/resolve`` — a skill invocation's
-  hidden ``<skill>`` meta text, with the ``<path>`` resolved against the
-  runner's filesystem.
-"""
+"""Runner invocation resolves skills and resource paths in the execution environment."""
 
 from __future__ import annotations
 
@@ -184,13 +171,8 @@ async def _client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
 
 
 @pytest.mark.asyncio
-async def test_get_session_skills_returns_bundled_skills(tmp_path: Path) -> None:
-    """
-    ``GET /skills`` returns the bundled skills (name + description).
-    ``skills_filter="none"`` suppresses host discovery so the result is
-    exactly the bundled set — hermetic, independent of the dev's real
-    ``~/.claude/skills/``.
-    """
+async def test_invocation_available_skills_returns_bundled_skills(tmp_path: Path) -> None:
+    """Unknown invocations list the visible bundled skills available to resolve."""
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     bundled = [
@@ -200,18 +182,14 @@ async def test_get_session_skills_returns_bundled_skills(tmp_path: Path) -> None
     app = _make_app(bundle, bundled, "none")
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_s/skills")
+        resp = await c.post("/v1/sessions/conv_s/skills/resolve", json={"name": "missing-skill"})
 
-    assert resp.status_code == 200, resp.text
-    skills = resp.json()["skills"]
-    assert skills == [
-        {"name": "grill-me", "description": "Stress-test a plan."},
-        {"name": "code-review", "description": "Review changes."},
-    ]
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["available"] == ["code-review", "grill-me"]
 
 
 @pytest.mark.asyncio
-async def test_get_session_skills_unions_workspace_and_bundle_host_skills(
+async def test_invocation_available_skills_unions_workspace_and_bundle_host_skills(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -247,16 +225,17 @@ async def test_get_session_skills_unions_workspace_and_bundle_host_skills(
     app = _make_app(bundle, bundled, "all", workspace=workspace)
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_host/skills")
+        resp = await c.post(
+            "/v1/sessions/conv_host/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert resp.status_code == 200, resp.text
-    names = [s["name"] for s in resp.json()["skills"]]
-    # Bundled first, then workspace root, then bundle workdir.
-    assert names == ["grill-me", "workspace-host", "bundle-host"]
+    assert resp.status_code == 404, resp.text
+    names = resp.json()["available"]
+    assert set(names) == {"grill-me", "workspace-host", "bundle-host"}
 
 
 @pytest.mark.asyncio
-async def test_get_session_skills_native_shape_finds_workspace_skill(
+async def test_invocation_available_skills_native_shape_finds_workspace_skill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -282,26 +261,29 @@ async def test_get_session_skills_native_shape_finds_workspace_skill(
     app = _make_app(bundle, [], "all", workspace=workspace)
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_native/skills")
+        resp = await c.post(
+            "/v1/sessions/conv_native/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert resp.status_code == 200, resp.text
-    assert [s["name"] for s in resp.json()["skills"]] == ["project-skill"]
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["available"] == ["project-skill"]
 
 
 @pytest.mark.asyncio
-async def test_get_session_skills_empty_without_spec_resolver(tmp_path: Path) -> None:
+async def test_invocation_available_skills_empty_without_spec_resolver(tmp_path: Path) -> None:
     """
-    With no spec resolver wired, ``GET /skills`` returns an empty list
-    (nothing to discover) rather than erroring.
+    With no spec resolver, an unknown invocation reports no available skills.
     """
     del tmp_path
     app = create_runner_app(server_client=_ServerClient())  # type: ignore[arg-type]
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_none/skills")
+        resp = await c.post(
+            "/v1/sessions/conv_none/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {"skills": []}
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["available"] == []
 
 
 @pytest.mark.asyncio
@@ -325,6 +307,7 @@ async def test_resolve_session_skill_returns_runner_side_meta_text(tmp_path: Pat
     app = _make_app(bundle, bundled, "none")
 
     async for c in _client(app):
+        assert (await c.get("/v1/sessions/conv_r/skills")).status_code == 404
         resp = await c.post(
             "/v1/sessions/conv_r/skills/resolve",
             json={"name": "grill-me", "arguments": "review this rollout"},
@@ -422,7 +405,7 @@ async def test_resolve_session_skill_non_string_arguments_returns_400(tmp_path: 
 @pytest.mark.asyncio
 async def test_session_skills_cached_per_session(tmp_path: Path) -> None:
     """
-    The merged skills are cached per session: a second ``GET /skills``
+    The merged skills are cached per session: a second ``POST /skills/resolve``
     reuses the cache and does not re-run spec resolution / the host-skill
     filesystem walk.
     """
@@ -433,8 +416,8 @@ async def test_session_skills_cached_per_session(tmp_path: Path) -> None:
     app = _make_app(bundle, bundled, "none", resolver_calls=resolver_calls)
 
     async for c in _client(app):
-        first = await c.get("/v1/sessions/conv_cache/skills")
-        second = await c.get("/v1/sessions/conv_cache/skills")
+        first = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
+        second = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -476,18 +459,22 @@ async def test_session_skills_cache_ttl_expiry_rediscovers(
     app = _make_app(bundle, [], "all", workspace=workspace)
 
     async for c in _client(app):
-        first = await c.get("/v1/sessions/conv_ttl/skills")
+        first = await c.post(
+            "/v1/sessions/conv_ttl/skills/resolve", json={"name": "missing-skill"}
+        )
         # Install a second host skill only AFTER the first response is served.
         second_skill = workspace / ".claude" / "skills" / "second"
         second_skill.mkdir(parents=True)
         (second_skill / "SKILL.md").write_text(_skill_md("second", "Installed mid-session."))
-        second = await c.get("/v1/sessions/conv_ttl/skills")
+        second = await c.post(
+            "/v1/sessions/conv_ttl/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert {s["name"] for s in first.json()["skills"]} == {"first"}
+    assert first.status_code == 404
+    assert second.status_code == 404
+    assert set(first.json()["available"]) == {"first"}
     # TTL=0 ⇒ the second request re-walked and discovered the new skill.
-    assert {s["name"] for s in second.json()["skills"]} == {"first", "second"}
+    assert set(second.json()["available"]) == {"first", "second"}
 
 
 def _seed_claude_plugin(home: Path) -> None:
@@ -513,7 +500,7 @@ def _seed_claude_plugin(home: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_session_skills_includes_enabled_claude_plugin(
+async def test_invocation_available_skills_includes_enabled_claude_plugin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -529,10 +516,10 @@ async def test_get_session_skills_includes_enabled_claude_plugin(
     app = _make_app(bundle, [], "all", workspace=workspace, harness="claude-native")
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_cc/skills")
+        resp = await c.post("/v1/sessions/conv_cc/skills/resolve", json={"name": "missing-skill"})
 
-    assert resp.status_code == 200, resp.text
-    assert "superpowers:using-superpowers" in [s["name"] for s in resp.json()["skills"]]
+    assert resp.status_code == 404, resp.text
+    assert "superpowers:using-superpowers" in resp.json()["available"]
 
 
 @pytest.mark.asyncio
@@ -552,10 +539,12 @@ async def test_codex_session_does_not_list_claude_plugin_skills(
     app = _make_app(bundle, [], "all", workspace=workspace, harness="codex-native")
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_codex/skills")
+        resp = await c.post(
+            "/v1/sessions/conv_codex/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert resp.status_code == 200, resp.text
-    assert "superpowers:using-superpowers" not in [s["name"] for s in resp.json()["skills"]]
+    assert resp.status_code == 404, resp.text
+    assert "superpowers:using-superpowers" not in resp.json()["available"]
 
 
 @pytest.mark.asyncio
@@ -563,7 +552,7 @@ async def test_resolve_finds_a_surfaced_plugin_skill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Anything ``/skills`` lists, ``/skills/resolve`` resolves by name."""
+    """Plugin skills resolve by the names exposed in the host menu."""
     home = tmp_path / "home"
     _seed_claude_plugin(home)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
@@ -585,7 +574,7 @@ async def test_resolve_finds_a_surfaced_plugin_skill(
 
 
 @pytest.mark.asyncio
-async def test_get_session_skills_excludes_user_invocable_false_bundled(
+async def test_invocation_available_skills_excludes_user_invocable_false_bundled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -602,10 +591,10 @@ async def test_get_session_skills_excludes_user_invocable_false_bundled(
     app = _make_app(bundle, bundled, "all", workspace=workspace, harness="claude-native")
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_ui/skills")
+        resp = await c.post("/v1/sessions/conv_ui/skills/resolve", json={"name": "missing-skill"})
 
-    assert resp.status_code == 200, resp.text
-    names = [s["name"] for s in resp.json()["skills"]]
+    assert resp.status_code == 404, resp.text
+    names = resp.json()["available"]
     assert "visible" in names
     assert "internal" not in names
 
@@ -636,11 +625,13 @@ async def test_non_invocable_bundled_skill_does_not_unshadow_host_skill(
     app = _make_app(bundle, bundled, "all", workspace=workspace, harness="claude-native")
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_shadow/skills")
+        resp = await c.post(
+            "/v1/sessions/conv_shadow/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 404, resp.text
     # Neither the hidden bundled skill nor the host skill of the same name shows.
-    assert "shared" not in [s["name"] for s in resp.json()["skills"]]
+    assert "shared" not in resp.json()["available"]
 
 
 @pytest.mark.asyncio
@@ -673,9 +664,9 @@ async def test_codex_bundle_skill_not_duplicated_when_dir_differs_from_name(
     app = _make_app(bundle, bundled, "all", workspace=workspace, harness="codex-native")
 
     async for c in _client(app):
-        resp = await c.get("/v1/sessions/conv_dup/skills")
+        resp = await c.post("/v1/sessions/conv_dup/skills/resolve", json={"name": "missing-skill"})
 
-    assert resp.status_code == 200, resp.text
-    names = [s["name"] for s in resp.json()["skills"]]
+    assert resp.status_code == 404, resp.text
+    names = resp.json()["available"]
     # Exactly one entry for the skill (no phantom dir-named duplicate).
     assert names.count("triage") + names.count("sra--triage") == 1
