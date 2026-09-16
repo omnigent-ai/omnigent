@@ -214,7 +214,7 @@ def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
     return not (isinstance(data_uri, str) and data_uri.startswith("data:"))
 
 
-def resize_notice(source_metadata: Mapping[str, object] | None) -> str | None:
+def resize_notice(source_metadata: object) -> str | None:
     """
     Model-facing note that an uploaded image was downscaled, or ``None``.
 
@@ -253,14 +253,14 @@ def resize_dimensions(source_metadata: object) -> dict[str, int] | None:
 
 def reject_authored_framework_notices(content: object) -> object:
     """Reject reserved context blocks in authored message content."""
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict):
-                if block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE:
-                    raise ValueError(
-                        "Framework notice blocks are reserved for attachment resolution"
-                    )
-                reject_authored_framework_notices(block.get("content"))
+    if isinstance(content, dict):
+        if content.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE:
+            raise ValueError("Framework notice blocks are reserved for attachment resolution")
+        for value in content.values():
+            reject_authored_framework_notices(value)
+    elif isinstance(content, list):
+        for value in content:
+            reject_authored_framework_notices(value)
     return content
 
 
@@ -277,14 +277,14 @@ def framework_notices(content: object) -> list[str]:
     for block in content:
         if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE:
             continue
-        text = resize_notice(resize_dimensions(block.get("source_metadata")))
+        text = resize_notice(block.get("source_metadata"))
         if text:
             notices.append(text)
     return notices
 
 
 def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:
-    """Encode resize metadata in Codex's model-visible image path."""
+    """Encode resize metadata in a persistent attachment-cache alias."""
     dimensions = resize_dimensions(source_metadata)
     if dimensions is None:
         return path
@@ -296,7 +296,12 @@ def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:
             f"-request-crop-for-fine-detail{path.suffix}"
         )
         if not alias.exists():
-            shutil.copyfile(path, alias)
+            temporary = alias.with_name(f".{uuid.uuid4().hex}.tmp")
+            try:
+                shutil.copyfile(path, temporary)
+                temporary.replace(alias)
+            finally:
+                temporary.unlink(missing_ok=True)
     except OSError:
         _logger.warning("Failed to add resize metadata to Codex image path", exc_info=True)
         return path

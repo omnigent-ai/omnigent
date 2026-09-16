@@ -53,24 +53,6 @@ def test_multiple_system_messages_joined() -> None:
     assert payload["system"] == "Be helpful.\nBe concise."
 
 
-def test_resize_notice_survives_responses_to_anthropic_conversion() -> None:
-    from omnigent.entities import ConversationItem, MessageData
-    from omnigent.inner.native_attachments import framework_notice_block
-    from omnigent.llms._responses_to_chat import responses_input_to_chat_messages
-    from omnigent.runtime.prompt import history_to_input_items
-
-    data = MessageData(role="user", content=[{"type": "input_text", "text": "inspect this"}])
-    data.content.append(framework_notice_block({"width": 6000, "height": 4000}))
-    item = ConversationItem(
-        id="item", type="message", status="completed", response_id="r", created_at=0, data=data
-    )
-    messages = responses_input_to_chat_messages(history_to_input_items([item]), None)
-    payload = _chat_to_anthropic(messages, "claude-test", None, {})
-    assert "downscaled from 6000×4000" in payload["system"]
-    assert "crop of the original" in payload["system"]
-    assert len(payload["messages"]) == 1
-
-
 def test_assistant_tool_calls_converted() -> None:
     messages = [
         {"role": "user", "content": "Weather?"},

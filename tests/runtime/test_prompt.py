@@ -59,8 +59,8 @@ def _output_item(output: str) -> ConversationItem:
     )
 
 
-def test_framework_notice_is_developer_context_not_user_text() -> None:
-    """Transient image metadata becomes a separate developer message."""
+def test_framework_notice_is_system_context_not_user_text() -> None:
+    """Transient image metadata becomes a separate system message."""
     from omnigent.inner.native_attachments import framework_notice_block, resize_notice
 
     dimensions = {"width": 6000, "height": 4000}
@@ -82,7 +82,7 @@ def test_framework_notice_is_developer_context_not_user_text() -> None:
     assert history_to_input_items([item]) == [
         {"role": "user", "content": [{"type": "input_text", "text": "inspect this"}]},
         {
-            "role": "developer",
+            "role": "system",
             "content": [{"type": "input_text", "text": resize_notice(dimensions)}],
         },
     ]
@@ -113,6 +113,26 @@ def test_authored_notice_cannot_be_loaded_as_message_data() -> None:
         ],
     )
     assert data.content[0]["text"] == "_omnigent_framework_notice is literal user text"
+
+
+def test_authored_notice_cannot_be_loaded_in_compaction() -> None:
+    from pydantic import ValidationError
+
+    from omnigent.entities import CompactionData
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    with pytest.raises(ValidationError, match="reserved"):
+        CompactionData(
+            summary="summary",
+            last_item_id="message",
+            token_count=1,
+            compacted_messages=[
+                {
+                    "role": "user",
+                    "content": [framework_notice_block({"width": 6000, "height": 4000})],
+                }
+            ],
+        )
 
 
 def test_history_replay_strips_inline_base64_image() -> None:

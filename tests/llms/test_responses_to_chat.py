@@ -30,6 +30,48 @@ def test_instructions_become_system_message() -> None:
     assert messages == [{"role": "system", "content": "Be helpful."}]
 
 
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock", "gemini", "databricks"])
+def test_resize_notice_stays_system_context_across_providers(provider: str) -> None:
+    from omnigent.entities import ConversationItem, MessageData
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+    from omnigent.llms.adapters.anthropic import _chat_to_anthropic
+    from omnigent.llms.adapters.bedrock import _messages_to_converse
+    from omnigent.llms.adapters.databricks import DatabricksAdapter
+    from omnigent.llms.adapters.gemini import _chat_to_gemini
+    from omnigent.runtime.prompt import history_to_input_items
+
+    dimensions = {"width": 6000, "height": 4000}
+    notice = resize_notice(dimensions)
+    data = MessageData(role="user", content=[{"type": "input_text", "text": "inspect this"}])
+    data.content.append(framework_notice_block(dimensions))
+    item = ConversationItem(
+        id="item", type="message", status="completed", response_id="r", created_at=0, data=data
+    )
+    messages = responses_input_to_chat_messages(history_to_input_items([item]), "Be helpful.")
+    assert messages == [
+        {"role": "system", "content": "Be helpful."},
+        {"role": "user", "content": "inspect this"},
+        {"role": "system", "content": notice},
+    ]
+    if provider == "anthropic":
+        payload = _chat_to_anthropic(messages, "claude-test", None, {})
+        assert payload["system"] == f"Be helpful.\n{notice}"
+        assert payload["messages"] == [{"role": "user", "content": "inspect this"}]
+    elif provider == "bedrock":
+        conversation, system = _messages_to_converse(messages)
+        assert system == [{"text": "Be helpful."}, {"text": notice}]
+        assert conversation == [{"role": "user", "content": [{"text": "inspect this"}]}]
+    elif provider == "gemini":
+        payload = _chat_to_gemini(messages, None, {})
+        assert payload["system_instruction"] == {
+            "parts": [{"text": "Be helpful."}, {"text": notice}]
+        }
+        assert payload["contents"] == [{"role": "user", "parts": [{"text": "inspect this"}]}]
+    else:
+        payload = DatabricksAdapter()._build_payload(messages, "test-model", None, False, {})
+        assert payload["messages"] == messages
+
+
 def test_no_instructions_no_system_message() -> None:
     items = [{"role": "user", "content": "Hi"}]
     messages = responses_input_to_chat_messages(items, None)

@@ -370,7 +370,7 @@ def history_to_input_items(
                 result.append({"role": item.data.role, "content": visible_content})
             result.extend(
                 {
-                    "role": "developer",
+                    "role": "system",
                     "content": [{"type": "input_text", "text": notice}],
                 }
                 for notice in notices

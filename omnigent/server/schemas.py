@@ -1281,7 +1281,7 @@ class SessionEventInput(BaseModel):
     @field_validator("data")
     @classmethod
     def reject_framework_blocks(cls, data: dict[str, Any]) -> dict[str, Any]:
-        reject_authored_framework_notices(data.get("content"))
+        reject_authored_framework_notices(data)
         return data
 
 

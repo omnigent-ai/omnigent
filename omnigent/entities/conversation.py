@@ -534,6 +534,7 @@ class CompactionData(BaseModel):
         :returns: The list with binary payloads replaced by a marker,
             or ``None`` unchanged.
         """
+        reject_authored_framework_notices(value)
         return redact_binary_payloads(value, _binary_payload_omitted)
 
 

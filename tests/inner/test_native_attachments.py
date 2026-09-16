@@ -15,6 +15,7 @@ from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
     attachment_reference_line,
+    codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
     resize_notice,
@@ -27,6 +28,27 @@ _PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
 )
 _PNG_DATA_URI = f"data:image/png;base64,{_PNG_B64}"
+
+
+def test_resize_alias_copy_failure_leaves_no_partial_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "photo.png"
+    path.write_bytes(base64.b64decode(_PNG_B64))
+    dimensions = {"width": 6000, "height": 4000}
+
+    def fail_copy(source: Path, destination: Path) -> None:
+        destination.write_bytes(source.read_bytes()[:8])
+        raise OSError("disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.inner.native_attachments.shutil.copyfile", fail_copy)
+        assert codex_resize_metadata_path(path, dimensions) == path
+    assert list(tmp_path.iterdir()) == [path]
+    alias = codex_resize_metadata_path(path, dimensions)
+    assert alias != path
+    assert alias.read_bytes() == path.read_bytes()
+    assert codex_resize_metadata_path(path, dimensions) == alias
 
 
 def test_parse_data_uri_splits_mime_and_payload() -> None:
