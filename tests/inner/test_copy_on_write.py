@@ -350,6 +350,17 @@ def test_keeper_checks_tmpfs_xattrs_before_reporting_ready(
     assert capsys.readouterr().out == ""
 
 
+def test_keeper_rejects_missing_xattr_support(tmp_path, monkeypatch, capsys):
+    import os
+
+    from omnigent.sandbox.copy_on_write import _run_keeper
+
+    monkeypatch.delattr(os, "setxattr", raising=False)
+    with pytest.raises(OSError, match="requires Linux extended attribute support"):
+        _run_keeper(str(tmp_path))
+    assert capsys.readouterr().out == ""
+
+
 def test_keeper_entrypoint_reports_ready_and_exits_on_owner_eof(tmp_path):
     import os
     import subprocess

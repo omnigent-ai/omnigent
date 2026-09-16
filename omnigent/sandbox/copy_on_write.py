@@ -209,6 +209,8 @@ def wrap_shared_namespace(argv: list[str], policy: SandboxPolicy) -> list[str]:
 
 def _run_keeper(probe_dir: str) -> None:
     """Publish readiness only after tmpfs xattrs work, then wait for owner EOF."""
+    if not hasattr(os, "setxattr"):
+        raise OSError("copy_on_write keeper requires Linux extended attribute support")
     with tempfile.TemporaryFile(dir=probe_dir) as probe:
         os.setxattr(probe.fileno(), "user.omnigent_cow_probe", b"1")
     print(os.getpid(), flush=True)
