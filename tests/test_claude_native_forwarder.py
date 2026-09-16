@@ -9534,6 +9534,80 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
     assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
 
 
+@pytest.mark.parametrize("http_status", [None, 503])
+async def test_degraded_sync_log_belongs_to_the_destination_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    http_status: int | None,
+) -> None:
+    from omnigent.debug_logging import current_session_id_scope, record_to_row
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent-session")
+    monkeypatch.setattr(forwarder, "_forward_health", forwarder._ForwardHealth())
+    transcript_path = tmp_path / "transcript.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "source-1",
+                "message": {
+                    "id": "message-1",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Synthetic reply"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        current_response_id=None,
+        seen_source_ids=(),
+    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/child-session/events"
+        if http_status is None:
+            raise httpx.ConnectError("private transport detail", request=request)
+        return httpx.Response(http_status, json={"error": "private response detail"})
+
+    with current_session_id_scope("unrelated-request-session"):
+        async with httpx.AsyncClient(
+            base_url="http://example.test", transport=httpx.MockTransport(reject)
+        ) as client:
+            for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+                state = await forwarder._forward_available_items(
+                    client=client,
+                    session_id="child-session",
+                    bridge_dir=tmp_path,
+                    agent_name="test-agent",
+                    state=state,
+                    retry_tracker=tracker,
+                    dedupe=dedupe,
+                )
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "claude_forward_sync_degraded"
+        ]
+        assert len(records) == 1
+        row = record_to_row(records[0], source="runner")
+
+    assert row["session_id"] == "child-session"
+    assert row["attributes"]["exception_type"] == (
+        "ConnectError" if http_status is None else "HTTPStatusError"
+    )
+    assert row["attributes"].get("http_status") == (
+        str(http_status) if http_status is not None else None
+    )
+    assert "private" not in json.dumps(row["attributes"])
+
+
 @pytest.mark.parametrize("http_status", [None, 403, 503])
 def test_forward_failures_escalate_to_degraded_once(
     http_status: int | None, caplog: pytest.LogCaptureFixture
@@ -9559,16 +9633,16 @@ def test_forward_failures_escalate_to_degraded_once(
     )
 
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
-        tracker.record_failure("item:source-1", exc)
+        tracker.record_failure("item:source-1", exc, session_id="conv_health")
     # Below threshold: not yet degraded.
     assert forwarder._forward_health.degraded_logged is False
 
-    tracker.record_failure("item:source-1", exc)  # crosses threshold
+    tracker.record_failure("item:source-1", exc, session_id="conv_health")  # crosses threshold
     assert forwarder._forward_health.degraded_logged is True
     assert forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD
 
     # The latch holds — further failures keep counting but don't re-escalate.
-    tracker.record_failure("item:source-1", exc)
+    tracker.record_failure("item:source-1", exc, session_id="conv_health")
     assert forwarder._forward_health.degraded_logged is True
     assert (
         forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD + 1
@@ -9579,6 +9653,7 @@ def test_forward_failures_escalate_to_degraded_once(
         if getattr(record, "event_name", None) == "claude_forward_sync_degraded"
     ]
     assert len(records) == 1
+    assert records[0].session_id == "conv_health"
     assert records[0].attributes == {
         "exception_type": type(exc).__name__,
         "http_status": http_status,
@@ -9595,7 +9670,9 @@ def test_forward_success_resets_degraded_state() -> None:
     """
     forwarder._reset_forward_health()
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
-        forwarder._note_forward_failure("status:idle", httpx.ConnectError("unreachable"))
+        forwarder._note_forward_failure(
+            "status:idle", httpx.ConnectError("unreachable"), session_id="conv_health"
+        )
     assert forwarder._forward_health.degraded_logged is True
 
     forwarder._note_forward_success()
@@ -9620,7 +9697,7 @@ def test_retry_tracker_transient_failures_escalate_degraded() -> None:
     transient = httpx.ConnectError("connect timeout")
 
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
-        decision = tracker.record_failure("item:source-1", transient)
+        decision = tracker.record_failure("item:source-1", transient, session_id="conv_health")
         # Transient failures are retried, never dropped.
         assert decision.exhausted is False
         assert decision.permanent is False
@@ -10241,17 +10318,17 @@ def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
         503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_work_entry"}
     )
     # Attempts 1 and 2 keep retrying...
-    assert tracker.record_failure("k", exc).exhausted is False
-    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
+    assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
     # ...attempt 3 hits the not-confirmed budget and gives up.
-    assert tracker.record_failure("k", exc).exhausted is True
+    assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is True
 
 
 def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
     tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
     exc = _http_status_error(503, {"error": "internal_error"})
     for _ in range(10):
-        assert tracker.record_failure("k", exc).exhausted is False
+        assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
 
 
 def test_unbounded_transient_retries_keep_delay_capped_without_overflow() -> None:
@@ -10263,7 +10340,7 @@ def test_unbounded_transient_retries_keep_delay_capped_without_overflow() -> Non
     tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
     exc = httpx.RequestError("Databricks token refresh returned no token")
     for _ in range(2000):
-        decision = tracker.record_failure("k", exc)
+        decision = tracker.record_failure("k", exc, session_id="conv_retry")
         assert decision.exhausted is False
         assert decision.delay_s <= 30.0
     # The schedule still saturates at the cap instead of decaying.
@@ -10273,16 +10350,16 @@ def test_unbounded_transient_retries_keep_delay_capped_without_overflow() -> Non
 def test_backoff_schedule_unchanged_below_the_cap() -> None:
     tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
     exc = httpx.RequestError("boom")
-    delays = [tracker.record_failure("k", exc).delay_s for _ in range(6)]
+    delays = [tracker.record_failure("k", exc, session_id="conv_retry").delay_s for _ in range(6)]
     assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
 
 
 def test_permanent_4xx_still_exhausts_at_three() -> None:
     tracker = forwarder._PostRetryTracker(max_permanent_attempts=3)
     exc = _http_status_error(400, {"error": "bad_request"})
-    assert tracker.record_failure("k", exc).exhausted is False
-    assert tracker.record_failure("k", exc).exhausted is False
-    assert tracker.record_failure("k", exc).exhausted is True
+    assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
+    assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
+    assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is True
 
 
 def test_is_subagent_delivery_not_confirmed_classifier() -> None:
