@@ -1870,8 +1870,13 @@ class TerminalInstance:
                 if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
                     return
                 continue
+            # A stopped watcher can outlive its join timeout inside a tmux probe.
+            if stop_event.is_set() or not self.running:
+                return
             if snapshot is None:
                 session_exists = self._tmux_session_exists_sync()
+                if stop_event.is_set() or not self.running:
+                    return
                 if session_exists is not False:
                     consecutive_capture_failures = 0
                     self._probe_failures.clear()
@@ -1892,6 +1897,8 @@ class TerminalInstance:
             self._probe_failures.clear()
             self._remember_pane_snapshot(snapshot)
             pane_dead = self._pane_is_dead()
+            if stop_event.is_set() or not self.running:
+                return
             if pane_dead is None:
                 if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
                     return
@@ -2079,9 +2086,8 @@ class TerminalInstance:
         variant. Bounded by :data:`_IDLE_WATCHER_JOIN_TIMEOUT_S` so
         a wedged ``subprocess.run`` (rare — the only one in the loop
         body) doesn't block the close path indefinitely. After the
-        timeout the thread keeps running, but it's a daemon — it
-        will exit when the process does, and the next iteration's
-        ``self.running`` check will short-circuit it anyway.
+        timeout an in-flight probe may still be running. The stopped
+        watcher discards its result when it returns.
         """
         thread = self._idle_thread
         stop_event = self._idle_stop_event
