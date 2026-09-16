@@ -1,12 +1,13 @@
-"""Live browser journey through the server, runner, tmux, and real Antigravity.
+"""Browser journey through the server, runner, tmux, and real Antigravity.
 
-Run with ``GEMINI_API_KEY`` or an existing ``agy`` login::
+Run without credentials using a local mock Gemini server::
 
-    OMNIGENT_E2E_ANTIGRAVITY=1 uv run --no-sync pytest \
+    OMNIGENT_E2E_ANTIGRAVITY=mock uv run --no-sync pytest \
         tests/e2e_ui/shells/test_antigravity_tmux_recovery.py -v \
         --video=on --output=/tmp/antigravity-e2e
 
-Only tmux probe failures are injected. Antigravity and its model are real.
+Use ``OMNIGENT_E2E_ANTIGRAVITY=1`` for a live model with ``GEMINI_API_KEY`` or
+an existing ``agy`` login. Both modes inject tmux probe failures.
 """
 
 from __future__ import annotations
@@ -15,16 +16,19 @@ import contextlib
 import io
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -47,13 +51,83 @@ from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIAL
 
 pytestmark = [
     pytest.mark.skipif(
-        os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "1",
-        reason="opt in with OMNIGENT_E2E_ANTIGRAVITY=1; requires a Gemini key or agy login",
+        os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") not in {"1", "mock"},
+        reason="set OMNIGENT_E2E_ANTIGRAVITY=mock (no credentials) or 1 (live model)",
     ),
     pytest.mark.timeout(600),
 ]
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture
+def antigravity_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[list[str] | None]:
+    if os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "mock":
+        assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
+        yield None
+        return
+
+    replies: list[str] = []
+
+    class GeminiHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            streaming = ":streamGenerateContent" in self.path
+            if not streaming and ":generateContent" not in self.path:
+                self.send_error(404)
+                return
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            reply = "Ready."
+            for content in reversed(request.get("contents", [])):
+                if content.get("role") != "user":
+                    continue
+                text = "\n".join(part.get("text", "") for part in content.get("parts", []))
+                matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})\.", text)
+                if matches:
+                    reply = matches[-1]
+                    replies.append(reply)
+                    break
+            response = {
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": reply}]},
+                        "finishReason": "STOP",
+                        "index": 0,
+                    }
+                ],
+                "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+            }
+            payload = json.dumps(response)
+            body = (f"data: {payload}\n\n" if streaming else payload).encode()
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "text/event-stream" if streaming else "application/json"
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    home = tmp_path / "model-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT",
+        home / ".omnigent" / "antigravity-native",
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "mock-gemini-key")
+    with ThreadingHTTPServer(("127.0.0.1", 0), GeminiHandler) as server:
+        monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", f"http://127.0.0.1:{server.server_port}/")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield replies
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 def _wait_until(check: Callable[[], bool], message: str, timeout: float = 60) -> None:
@@ -258,18 +332,17 @@ def _antigravity_stack(directory: Path) -> Iterator[AntigravitySession]:
 
 @pytest.fixture
 def antigravity_session(
-    request: pytest.FixtureRequest, tmp_path: Path
+    request: pytest.FixtureRequest, tmp_path: Path, antigravity_model: list[str] | None
 ) -> Iterator[AntigravitySession]:
     assert not request.config.getoption("--ui-base-url"), "this test requires its own server"
     assert shutil.which("agy"), "install agy before running this test"
-    assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
     request.getfixturevalue("built_spa")
     with _antigravity_stack(tmp_path) as session:
         yield session
 
 
 def test_antigravity_survives_probe_outage_then_detects_exit(
-    page: Page, antigravity_session: AntigravitySession
+    page: Page, antigravity_session: AntigravitySession, antigravity_model: list[str] | None
 ) -> None:
     session = antigravity_session
     page.add_init_script(_BLOCK_LOOPBACK_DIALS)
@@ -286,6 +359,8 @@ def test_antigravity_survives_probe_outage_then_detects_exit(
         page.get_by_role("button", name="Send", exact=True).click()
         reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
         expect(reply.filter(has_text=token)).to_have_count(1, timeout=180_000)
+        if antigravity_model is not None:
+            assert token in antigravity_model, "agy did not request this reply from the mock model"
         expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
         page.get_by_test_id("view-mode-terminal").click()
         expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
