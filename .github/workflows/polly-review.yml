@@ -283,9 +283,11 @@ jobs:
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_ANTHROPIC_OPUS_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_OPUS_MODEL }}
           OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
           : "${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}"
+          : "${OMNIGENT_ANTHROPIC_OPUS_MODEL:?Set OMNIGENT_CI_ANTHROPIC_OPUS_MODEL}"
           : "${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}"
           mkdir -p "$HOME/.omnigent"
           # Use python to write the config safely — avoids interpolating
@@ -304,7 +306,11 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': os.environ['OMNIGENT_ANTHROPIC_MODEL']},
+                          # Fable's auto-permission classifier needs a routable Opus fallback.
+                          'models': {
+                              'default': os.environ['OMNIGENT_ANTHROPIC_MODEL'],
+                              'opus': os.environ['OMNIGENT_ANTHROPIC_OPUS_MODEL'],
+                          },
                       },
                       'openai': {
                           'base_url': host + '/ai-gateway/codex/v1',
