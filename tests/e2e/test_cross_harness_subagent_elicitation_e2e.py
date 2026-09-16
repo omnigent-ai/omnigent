@@ -5,6 +5,7 @@ its real permission hook, and the parent snapshot exposes the child's card.
 The answer must reach Claude's next Messages API request as a tool result.
 
 The model APIs are mocked; the server, runner, native CLIs, and hooks are real.
+The flow runs with clean and conflicting dummy provider environments.
 No credentials, global config changes, or live model calls are required::
 
     uv run --no-sync pytest -o addopts='' \
@@ -23,6 +24,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -47,7 +49,63 @@ _CHILD_DONE = "CLAUDE_CHILD_RESUMED"
 
 
 @pytest.fixture
+def cross_harness_deadline() -> float:
+    """Reserve two minutes of the outer timeout for diagnostics and teardown."""
+    return time.monotonic() + 240
+
+
+@pytest.fixture(params=["clean", "bedrock", "vertex", "foundry"])
+def ambient_provider_env(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exercise real startup with conflicting, loopback-only provider settings."""
+    if request.param == "clean":
+        return
+    provider_env = {
+        "bedrock": {
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "ANTHROPIC_BEDROCK_BASE_URL": "http://127.0.0.1:1/bedrock",
+            "AWS_ENDPOINT_URL": "http://127.0.0.1:1/aws",
+            "AWS_ACCESS_KEY_ID": "dummy-access-key",
+            "AWS_SECRET_ACCESS_KEY": "dummy-secret-key",
+            "AWS_SESSION_TOKEN": "dummy-session-token",
+            "AWS_BEARER_TOKEN_BEDROCK": "dummy-bedrock-token",
+            "AWS_REGION": "us-east-1",
+            "AWS_EC2_METADATA_DISABLED": "true",
+        },
+        "vertex": {
+            "CLAUDE_CODE_USE_VERTEX": "1",
+            "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:1/vertex",
+            "ANTHROPIC_VERTEX_PROJECT_ID": "dummy-project",
+            "CLOUD_ML_REGION": "us-east5",
+            "GOOGLE_APPLICATION_CREDENTIALS": str(tmp_path / "no-google-credentials.json"),
+        },
+        "foundry": {
+            "CLAUDE_CODE_USE_FOUNDRY": "1",
+            "ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:1/foundry",
+            "ANTHROPIC_FOUNDRY_API_KEY": "dummy-foundry-key",
+            "AZURE_CLIENT_ID": "dummy-client-id",
+            "AZURE_CLIENT_SECRET": "dummy-client-secret",
+            "AZURE_TENANT_ID": "dummy-tenant-id",
+        },
+    }[request.param]
+    for key, value in {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:1/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "dummy-anthropic-token",
+        "ANTHROPIC_API_KEY": "dummy-anthropic-key",
+        "OPENAI_BASE_URL": "http://127.0.0.1:1/openai",
+        "OPENAI_API_KEY": "dummy-openai-key",
+        **provider_env,
+    }.items():
+        monkeypatch.setenv(key, value)
+
+
+@pytest.fixture
 def cross_harness_rig(
+    cross_harness_deadline: float,
+    ambient_provider_env: None,
     isolated_mock_llm_server_url: str,
     tmp_path: Path,
 ) -> Iterator[tuple[httpx.Client, Path, str, str]]:
@@ -96,7 +154,25 @@ def cross_harness_rig(
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     env = {
-        **os.environ,
+        **{
+            key: value
+            for key, value in os.environ.items()
+            if key
+            in {
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "SYSTEMROOT",
+                "WINDIR",
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "REQUESTS_CA_BUNDLE",
+                "NODE_EXTRA_CA_CERTS",
+            }
+        },
         "HOME": str(native_home),
         "CODEX_HOME": str(codex_home),
         "OMNIGENT_CONFIG_HOME": str(config_dir),
@@ -109,18 +185,6 @@ def cross_harness_rig(
         "OMNIGENT_CLAUDE_PATH": str(shutil.which("claude")),
         "PYTHONPATH": str(_REPO),
     }
-    for key in (
-        "CLAUDECODE",
-        "CLAUDE_CONFIG_DIR",
-        "CLAUDE_CODE",
-        "CODEX",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "DATABRICKS_TOKEN",
-        "DATABRICKS_CONFIG_PROFILE",
-    ):
-        env.pop(key, None)
     for key in ("NO_PROXY", "no_proxy"):
         env[key] = "127.0.0.1,localhost"
     processes: list[subprocess.Popen[bytes]] = []
@@ -172,7 +236,7 @@ def cross_harness_rig(
                     stderr=subprocess.STDOUT,
                 )
             )
-            deadline = time.monotonic() + 60
+            deadline = min(cross_harness_deadline, time.monotonic() + 60)
             while time.monotonic() < deadline:
                 assert all(proc.poll() is None for proc in processes), "server/runner exited"
                 with contextlib.suppress(httpx.HTTPError):
@@ -195,14 +259,14 @@ def cross_harness_rig(
 
 
 def _snapshot(client: httpx.Client, session_id: str) -> dict[str, Any]:
-    response = client.get(f"/v1/sessions/{session_id}")
+    response = client.get(f"/v1/sessions/{session_id}", timeout=5)
     response.raise_for_status()
     return response.json()
 
 
 def _items(client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
     response = client.get(
-        f"/v1/sessions/{session_id}/items", params={"order": "asc", "limit": 1000}
+        f"/v1/sessions/{session_id}/items", params={"order": "asc", "limit": 1000}, timeout=5
     )
     response.raise_for_status()
     return [
@@ -217,23 +281,82 @@ def _wait_for(
     description: str,
     client: httpx.Client,
     session_ids: list[str],
-    timeout: float = 180,
+    deadline: float,
+    timeout: float | None = None,
 ) -> Any:
     """Poll real processes and retain session diagnostics on timeout."""
-    deadline = time.monotonic() + timeout
+    if timeout is not None:
+        deadline = min(deadline, time.monotonic() + timeout)
     while time.monotonic() < deadline:
         result = probe()
         if result:
             return result
-        time.sleep(1)
-    diagnostics = {
-        sid: {"snapshot": _snapshot(client, sid), "items": _items(client, sid)}
-        for sid in session_ids
-    }
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    diagnostics = {}
+    for session_id in session_ids:
+        try:
+            diagnostics[session_id] = {
+                "snapshot": _snapshot(client, session_id),
+                "items": _items(client, session_id),
+            }
+        except httpx.HTTPError as exc:
+            diagnostics[session_id] = {"error": str(exc)}
     pytest.fail(f"Timed out waiting for {description}: {json.dumps(diagnostics, default=str)}")
 
 
+@pytest.mark.parametrize("diagnostics_unavailable", [False, True])
+def test_waits_share_deadline_and_collect_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostics_unavailable: bool,
+) -> None:
+    """A late stall reports session diagnostics before the outer timeout."""
+    clock = SimpleNamespace(now=0.0)
+
+    def advance(seconds: float) -> None:
+        clock.now += seconds
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "time",
+        SimpleNamespace(monotonic=lambda: clock.now, sleep=advance),
+    )
+
+    def response(request: httpx.Request) -> httpx.Response:
+        if diagnostics_unavailable:
+            return httpx.Response(503)
+        if request.url.path.endswith("/items"):
+            return httpx.Response(200, json={"data": [{"content": "last child message"}]})
+        return httpx.Response(200, json={"pending_elicitations": ["pending-question"]})
+
+    with httpx.Client(base_url="http://test", transport=httpx.MockTransport(response)) as client:
+        deadline = 5.0
+        assert _wait_for(
+            lambda: clock.now >= 3,
+            description="an earlier step",
+            client=client,
+            session_ids=["child"],
+            deadline=deadline,
+        )
+        with pytest.raises(
+            pytest.fail.Exception, match="Timed out waiting for a late stall"
+        ) as failure:
+            _wait_for(
+                lambda: False,
+                description="a late stall",
+                client=client,
+                session_ids=["child"],
+                deadline=deadline,
+            )
+    assert clock.now == deadline
+    if diagnostics_unavailable:
+        assert "503" in str(failure.value)
+    else:
+        assert "pending-question" in str(failure.value)
+        assert "last child message" in str(failure.value)
+
+
 def test_codex_parent_answers_real_claude_child_elicitation(
+    cross_harness_deadline: float,
     cross_harness_rig: tuple[httpx.Client, Path, str, str],
     tmp_path: Path,
 ) -> None:
@@ -373,6 +496,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
         child_row = _wait_for(
             find_child,
             description="Codex to dispatch the Claude child",
+            deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
         )
@@ -398,6 +522,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
         event = _wait_for(
             mirrored_question,
             description="the real Claude question in the Codex parent snapshot",
+            deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
         )
@@ -431,6 +556,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
                 if isinstance(block, dict)
             ),
             description="Claude to send the actual answer back to the model as a tool result",
+            deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
         )
@@ -442,6 +568,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
                 for item in _items(client, child_id)
             ),
             description="Claude to finish its turn after the question",
+            deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
         )
@@ -454,6 +581,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
                 for sid in session_ids
             ),
             description="the resolved card to clear from both parent and child",
+            deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
             timeout=30,
@@ -461,5 +589,5 @@ def test_codex_parent_answers_real_claude_child_elicitation(
     finally:
         for sid in reversed(session_ids):
             with contextlib.suppress(httpx.HTTPError):
-                client.post(f"/v1/sessions/{sid}/events", json={"type": "stop_session"})
-                client.delete(f"/v1/sessions/{sid}")
+                client.post(f"/v1/sessions/{sid}/events", json={"type": "stop_session"}, timeout=2)
+                client.delete(f"/v1/sessions/{sid}", timeout=2)
