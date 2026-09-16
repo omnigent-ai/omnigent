@@ -46,7 +46,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import phase_scope, runner_primary_session_id
+from omnigent.debug_logging import (
+    SESSION_ID_ENV_VAR,
+    phase_scope,
+    runner_primary_session_id,
+)
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -12817,7 +12821,8 @@ def _build_spawn_env_from_spec(
     :param cwd: Runtime working directory for harnesses that need it.
     :param workdir: Bundle workdir, threaded to the builders.
     :param session_id: Session/conversation id, used to hand the harness
-        this session's subagent-routing endpoint. ``None`` omits it.
+        this session's subagent-routing endpoint and its conversation-id
+        env export. ``None`` omits both.
     :param model_override: The per-session ``/model`` override, e.g.
         ``"claude-sonnet-4-6"``, or ``None``. When set, it overrides the
         ``HARNESS_<H>_MODEL`` the builder baked in (spec model / provider
@@ -12921,6 +12926,12 @@ def _build_spawn_env_from_spec(
         from omnigent.runner.subagent_routing import session_router_env
 
         env.update(session_router_env(session_id, harness))
+        # Hand child processes the conversation id under a stable name so
+        # anything downstream of the harness (its own subprocesses, stdio
+        # MCP servers it hosts) can attribute work to the conversation the
+        # Web UI resolves at /c/<id>. setdefault: a spec that sets the var
+        # itself wins.
+        env.setdefault(SESSION_ID_ENV_VAR, session_id)
         if harness in CODEX_CANONICAL_HARNESSES:
             # A Smart Routing turn or spawn can land on a gateway arm codex's
             # bundled catalog has no entry for, so the session replaces that

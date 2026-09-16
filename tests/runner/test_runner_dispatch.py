@@ -1912,6 +1912,49 @@ def test_build_spawn_env_applies_model_override(
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
 
 
+def test_build_spawn_env_exports_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spawn env hands harness children the conversation id.
+
+    ``OMNIGENT_SESSION_ID`` is the stable name child processes (and the
+    stdio MCP servers they host) read to attribute their work to the
+    conversation the Web UI resolves at ``/c/<id>``. It rides the same
+    ``session_id`` the subagent-router env uses; no session id, no var.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.delenv("OMNIGENT_SESSION_ID", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    with_id = _build_spawn_env_from_spec(spec, "claude-sdk", session_id="conv_spawn_env_test")
+    assert with_id is not None
+    assert with_id["OMNIGENT_SESSION_ID"] == "conv_spawn_env_test"
+
+    without_id = _build_spawn_env_from_spec(spec, "claude-sdk")
+    assert without_id is not None
+    assert "OMNIGENT_SESSION_ID" not in without_id
+
+
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The dispatch chain routes ``hermes`` to its builder.
 

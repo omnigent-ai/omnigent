@@ -29,11 +29,13 @@ from typing import Any
 import pytest
 from mcp.types import Tool as McpToolDef
 
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, SESSION_ID_ENV_VAR
 from omnigent.runner import mcp_manager as _mcp_manager_module
 from omnigent.runner.mcp_manager import (
     _POOL_SPEC_CAPACITY,
     McpSchemasResult,
     RunnerMcpManager,
+    _stamp_primary_session_env,
     compute_server_hash,
     compute_spec_hash,
 )
@@ -868,3 +870,131 @@ def test_strip_mcp_tool_prefix_preserves_bare_double_underscore() -> None:
     assert _strip_mcp_tool_prefix("bare_name") == "bare_name"
     # Looks-like-prefix but only two parts: preserved.
     assert _strip_mcp_tool_prefix("mcp__missing_third") == "mcp__missing_third"
+
+
+# ── Primary-session env stamping ───────────────────────────────────────────
+
+
+def test_stamp_primary_session_env_no_primary_returns_configs_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a primary session id the configs pass through untouched.
+
+    A runner that hosts no conversation-attributable work (e.g. a tooling
+    entrypoint) must not mutate MCP configs — the hashes stay identical to
+    the unstamped ones, so pool entries stay shared exactly as before.
+    """
+    monkeypatch.delenv(PRIMARY_SESSION_ID_ENV_VAR, raising=False)
+    cfg = MCPServerConfig(name="jira", transport="stdio", command="python", args=["-m", "jira"])
+    result = _stamp_primary_session_env([cfg])
+    assert result == [cfg]
+    assert result[0] is cfg  # no copy, no env overlay
+
+
+def test_stamp_primary_session_env_stamps_stdio_and_skips_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A primary session id lands in every stdio config's env overlay only.
+
+    HTTP servers run elsewhere; their env dict never carries a conversation
+    id (and their configs stay byte-identical, same object).
+    """
+    monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, "conv_stamp_1")
+    stdio = MCPServerConfig(name="jira", transport="stdio", command="python", args=["-m", "jira"])
+    http = _make_config("github")
+    result = _stamp_primary_session_env([stdio, http])
+    assert result[0].env is not None
+    assert result[0].env[SESSION_ID_ENV_VAR] == "conv_stamp_1"
+    assert result[1] is http
+
+
+def test_stamp_primary_session_env_author_value_wins_and_keeps_declared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config that already declares the var (or other env) keeps them.
+
+    ``setdefault`` semantics: the spec author can pin the attribution id
+    (tests, dev setups) and their declared secrets stay untouched.
+    """
+    monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, "conv_runner_primary")
+    cfg = MCPServerConfig(
+        name="jira",
+        transport="stdio",
+        command="python",
+        args=["-m", "jira"],
+        env={SESSION_ID_ENV_VAR: "conv_author_pinned", "GITHUB_TOKEN": "ghp_xyz"},
+    )
+    (stamped,) = _stamp_primary_session_env([cfg])
+    assert stamped.env is not None
+    assert stamped.env[SESSION_ID_ENV_VAR] == "conv_author_pinned"
+    assert stamped.env["GITHUB_TOKEN"] == "ghp_xyz"
+    # The original config object is never mutated in place.
+    assert cfg.env == {SESSION_ID_ENV_VAR: "conv_author_pinned", "GITHUB_TOKEN": "ghp_xyz"}
+
+
+def test_stamp_primary_session_env_diverges_hashes_per_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stamped env feeds the pool hashes, so each conversation owns a server.
+
+    This is the load-bearing side effect of stamping the *config* rather
+    than the spawn env: ``compute_spec_hash``/``compute_server_hash``
+    digest ``env``, so two primaries with identical specs do not share one
+    stdio server process (which would conflate their attribution). Stamping
+    is idempotent per primary.
+    """
+    configs = [
+        MCPServerConfig(name="jira", transport="stdio", command="python", args=["-m", "jira"])
+    ]
+    monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, "conv_a")
+    stamped_a = _stamp_primary_session_env(list(configs))
+    stamped_a_again = _stamp_primary_session_env(list(configs))
+    monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, "conv_b")
+    stamped_b = _stamp_primary_session_env(list(configs))
+
+    assert compute_spec_hash(stamped_a) == compute_spec_hash(stamped_a_again)
+    assert compute_spec_hash(stamped_a) != compute_spec_hash(stamped_b)
+    assert compute_server_hash(stamped_a[0]) != compute_server_hash(stamped_b[0])
+    assert compute_spec_hash(stamped_a) != compute_spec_hash(configs)
+
+
+@pytest.mark.asyncio
+async def test_pool_separates_identical_specs_across_primaries(
+    patch_connection: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical specs under different primary ids get separate pool entries.
+
+    Without the stamp, two conversations with the same MCP declarations
+    would share one spec entry (and one stdio server process); the stamped
+    env keeps their identities — and their server processes — apart.
+    """
+    patch_connection["__tools_for__"]["jira"] = [_make_tool_def("jira_search")]
+
+    def _spec() -> AgentSpec:
+        return AgentSpec(
+            spec_version=1,
+            name="agent",
+            mcp_servers=[
+                MCPServerConfig(
+                    name="jira",
+                    transport="stdio",
+                    command="python",
+                    args=["-m", "jira"],
+                )
+            ],
+        )
+
+    manager = RunnerMcpManager()
+    try:
+        monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, "conv_a")
+        await manager.schemas_for(_spec())
+        monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, "conv_b")
+        await manager.schemas_for(_spec())
+        snapshot = manager.status_snapshot()
+    finally:
+        await manager.shutdown()
+
+    assert len(snapshot["specs"]) == 2, (
+        f"expected one pool entry per primary session, got {len(snapshot['specs'])}"
+    )

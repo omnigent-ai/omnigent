@@ -36,7 +36,7 @@ from anyio.streams.memory import (
 from cachetools import TTLCache
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.exceptions import McpError
 from mcp.shared.message import SessionMessage
@@ -53,6 +53,7 @@ from mcp.types import (
 )
 from mcp.types import Tool as McpToolDef
 
+from omnigent.debug_logging import SESSION_ID_ENV_VAR
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 
@@ -1315,18 +1316,35 @@ class McpServerConnection:
                 f"MCP server {self.config.name!r} transport='stdio' but command is "
                 "None — validator should have caught this"
             )
+        # ``env=None`` inherits the SDK's ``get_default_environment``
+        # allowlist (no runner-auth secret). The ``config.env`` branch
+        # overlays author-declared vars (e.g. ``GITHUB_TOKEN``) on the
+        # full parent env, so strip the runner tunnel binding token
+        # first: an MCP server command is spec-author code. The runner
+        # stamps the conversation id into ``config.env``
+        # (SESSION_ID_ENV_VAR — see runner/mcp_manager.py); a config whose
+        # only env entry is that stamp keeps the allowlist posture below:
+        # gaining the parent's whole environment merely because the
+        # conversation id was disclosed would leak everything else too.
+        declared_env = {
+            key: value
+            for key, value in (self.config.env or {}).items()
+            if key != SESSION_ID_ENV_VAR
+        }
+        session_stamp = (self.config.env or {}).get(SESSION_ID_ENV_VAR)
+        if declared_env:
+            spawn_env: dict[str, str] | None = strip_runner_auth_secrets(os.environ) | dict(
+                self.config.env or {}
+            )
+        elif session_stamp:
+            spawn_env = {**get_default_environment(), SESSION_ID_ENV_VAR: session_stamp}
+        else:
+            spawn_env = None
         params = StdioServerParameters(
             command=self.config.command,
             args=list(self.config.args),
             cwd=self.cwd,
-            # ``env=None`` inherits the SDK's ``get_default_environment``
-            # allowlist (no runner-auth secret). The ``config.env`` branch
-            # overlays author-declared vars (e.g. ``GITHUB_TOKEN``) on the
-            # full parent env, so strip the runner tunnel binding token
-            # first: an MCP server command is spec-author code.
-            env=(strip_runner_auth_secrets(os.environ) | self.config.env)
-            if self.config.env
-            else None,
+            env=spawn_env,
         )
         read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
         return read_stream, write_stream
