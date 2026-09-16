@@ -111,11 +111,17 @@ def test_finds_completed_scan_beyond_first_unfiltered_page(
         assert _scan(conclusion)["html_url"] in result.stdout
 
 
-def test_waits_for_newer_scan_instead_of_accepting_old_success(tmp_path: Path) -> None:
+@pytest.mark.parametrize("newest_first", [False, True])
+def test_waits_for_newer_scan_instead_of_accepting_old_success(
+    tmp_path: Path, newest_first: bool
+) -> None:
     old = _scan("success")
     pending = _scan(None, "2026-09-16T01:00:00Z")
     finished = _scan("success", "2026-09-16T01:00:00Z")
-    result, sleeps = _run_gate(tmp_path, [[old, pending], [old, finished]])
+    polls = [[old, pending], [old, finished]]
+    if newest_first:
+        polls = [list(reversed(scans)) for scans in polls]
+    result, sleeps = _run_gate(tmp_path, polls)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Security Scan concluded: success" in result.stdout
     assert sleeps == ["30"]
