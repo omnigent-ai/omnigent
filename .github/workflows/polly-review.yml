@@ -336,21 +336,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch the full diff to a file — no size cap needed since the diff
-          # is read from disk by Polly via sys_os_shell, not embedded in the
-          # CLI argument (which would hit ARG_MAX for large PRs).
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+          # Freeze both revisions so the file and review marker describe the same diff.
+          gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles \
+            > /tmp/pr_meta.json
+          base_sha="$(jq -r .baseRefOid /tmp/pr_meta.json)"
+          head_sha="$(jq -r .headRefOid /tmp/pr_meta.json)"
+          gh api "repos/${REPO}/compare/${base_sha}...${head_sha}" \
             -H "Accept: application/vnd.github.v3.diff" \
-            > /tmp/pr_diff.txt || true
+            > /tmp/pr_diff.txt
+          chmod 444 /tmp/pr_diff.txt
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
 
           # Extract lockfile pin changes from the diff.
           grep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \
             | head -500 > /tmp/lockfile_pins.txt || true
-
-          # Fetch PR metadata.
-          gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json title,body,baseRefName,headRefName,additions,deletions,changedFiles \
-            > /tmp/pr_meta.json
 
           # author_association isn't exposed by `gh pr view --json`, so read it
           # from the REST API. Used to scope the "missing visual demonstration"
@@ -359,12 +359,12 @@ jobs:
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             --jq '.author_association // "NONE"' > /tmp/pr_author_assoc.txt || echo "NONE" > /tmp/pr_author_assoc.txt
 
-          # Build the review prompt — the diff is NOT embedded in the prompt.
-          # Polly reads it from /tmp/pr_diff.txt via sys_os_shell at review time.
+          # Reviewers read the shared snapshot; Polly passes only its path and identity.
           python3 -u <<'PYEOF'
-          import json, pathlib, re
+          import hashlib, json, pathlib, re
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          diff_sha256 = hashlib.sha256(pathlib.Path("/tmp/pr_diff.txt").read_bytes()).hexdigest()
           lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
 
           # The "missing visual demonstration" nudge targets external contributors
@@ -448,6 +448,7 @@ jobs:
           ## PR Metadata
           - **Title:** {meta['title']}
           - **Branch:** {meta['headRefName']} → {meta['baseRefName']}
+          - **Diff revisions:** {meta['baseRefOid']}...{meta['headRefOid']}
           - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)
 
           ## PR Description
@@ -456,8 +457,13 @@ jobs:
           {lockfile_section}
           ## Instructions
 
-          **Step 1 — read the diff.** The full PR diff has been pre-fetched to
-          `/tmp/pr_diff.txt`. Read it with `sys_os_shell("cat /tmp/pr_diff.txt")`.
+          **Step 1 — use the saved diff.** The full PR diff is at `/tmp/pr_diff.txt`
+          on this runner's filesystem, shared with the reviewers.
+          Its SHA-256 is `{diff_sha256}`.
+          Pass that absolute path, checksum, base/head SHAs, and the review contract
+          in each reviewer task. Reviewers must read the file themselves with their
+          own tools. Do not paste or regenerate the diff in task messages, and do
+          not modify the snapshot. If a reviewer cannot read it, report the failure.
           The codebase is checked out at `main` — read source files freely for
           additional context when needed.
 
@@ -577,7 +583,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
-          HEAD_SHA: ${{ steps.dupe.outputs.head_sha }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
