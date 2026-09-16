@@ -113,8 +113,14 @@ _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 
 # ACP protocol constants (JSON-RPC 2.0 method names).
 _AGENT_METHOD_INITIALIZE = "initialize"
+_AGENT_METHOD_AUTHENTICATE = "authenticate"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+# Browser/device-login method ids that cannot complete on a headless sandbox.
+_ACP_INTERACTIVE_AUTH_METHODS = frozenset({"grok.com"})
+# ACP error code an agent returns when a request requires ``authenticate``
+# first (Grok Build's ``session/new`` uses it for "Authentication required").
+_ACP_AUTH_REQUIRED_CODE = -32000
 
 # Notification sent *from* the agent to the client (streaming progress).
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -297,6 +303,49 @@ def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     return mime, payload
 
 
+def _is_auth_required_error(error: object) -> bool:
+    """True when a JSON-RPC error object says authentication is required.
+
+    Matches the ACP auth-required error code and, as a fallback for agents
+    that use a generic code, an "authentication required" message.
+    """
+    if not isinstance(error, dict):
+        return False
+    if error.get("code") == _ACP_AUTH_REQUIRED_CODE:
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and "authentication required" in message.lower()
+
+
+def _unattended_auth_method_id(initialize_result: _AcpJsonObject) -> str | None:
+    """Pick a non-browser ACP auth method, or ``None`` if none is advertised.
+
+    Prefers ``_meta.defaultAuthMethodId`` (Grok sets this to ``cached_token``
+    when ``auth.json`` loaded) and otherwise the first method that is not a
+    known interactive login id. Entries without a string ``id`` are skipped.
+    """
+    methods = initialize_result.get("authMethods")
+    if not isinstance(methods, list) or not methods:
+        return None
+    ids = [
+        method.get("id")
+        for method in methods
+        if isinstance(method, dict) and isinstance(method.get("id"), str)
+    ]
+    meta = initialize_result.get("_meta")
+    default = meta.get("defaultAuthMethodId") if isinstance(meta, dict) else None
+    if (
+        isinstance(default, str)
+        and default in ids
+        and default not in _ACP_INTERACTIVE_AUTH_METHODS
+    ):
+        return default
+    for method_id in ids:
+        if method_id not in _ACP_INTERACTIVE_AUTH_METHODS:
+            return method_id
+    return None
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -318,7 +367,7 @@ class AcpExecutor(Executor):
             sandbox (bwrap/seatbelt) at spawn — see :meth:`_sandbox_launch_path`.
         :param extension: Vendor behavior for the agent being driven, injected by
             that vendor's harness wrap (e.g.
-            :mod:`omnigent.inner.devin.harness`). The default is protocol-only,
+            a vendor wrap). The default is protocol-only,
             so the generic ``acp`` harness reads no vendor field.
         """
         self._config = config
@@ -365,6 +414,13 @@ class AcpExecutor(Executor):
         self._session_id: str | None = None
         self._initialized: bool = False
         self._image_supported: bool = False
+        # One-way latch per subprocess: set after a successful ACP
+        # ``authenticate``; reset on restart so a fresh process re-auths.
+        self._authenticated: bool = False
+        # ``initialize.result`` snapshot advertising auth (``authMethods`` +
+        # ``_meta.defaultAuthMethodId``); consumed only when ``session/new``
+        # actually reports that authentication is required.
+        self._auth_advertisement: _AcpJsonObject = {}
         self._system_prompt_sent: bool = False
 
         # ACP toolCallId → tool name / rawInput from the originating tool_call, so
@@ -411,6 +467,8 @@ class AcpExecutor(Executor):
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
         self._image_supported = False
+        self._authenticated = False
+        self._auth_advertisement = {}
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
@@ -681,11 +739,66 @@ class AcpExecutor(Executor):
             message = resp["error"].get("message", resp["error"])
             self._warn_initialize_failed(str(message))
             raise RuntimeError(f"ACP initialize failed: {message}")
+        result = resp.get("result") or {}
         prompt_caps = (
-            (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
+            result.get("agentCapabilities", {}).get("promptCapabilities", {})
+            if isinstance(result, dict)
+            else {}
         )
         self._image_supported = bool(prompt_caps.get("image"))
+        # Stash the advertised auth methods but do NOT authenticate here:
+        # sending an unsolicited ``authenticate`` would change the handshake
+        # for every agent that advertises methods informationally (or is
+        # already authenticated via env/disk). ``_ensure_session`` reacts
+        # only when ``session/new`` actually demands authentication.
+        self._auth_advertisement = result if isinstance(result, dict) else {}
         self._initialized = True
+
+    async def _authenticate(self, method_id: str) -> None:
+        """Send ACP ``authenticate`` with *method_id* and latch success.
+
+        Called reactively from :meth:`_ensure_session` after ``session/new``
+        reports that authentication is required — never proactively, so agents
+        whose ``session/new`` already succeeds keep their handshake untouched.
+        """
+        auth_resp = await self._rpc(
+            _AGENT_METHOD_AUTHENTICATE,
+            {"methodId": method_id},
+            timeout=_INIT_TIMEOUT_SECONDS,
+        )
+        if "error" in auth_resp:
+            error = auth_resp["error"]
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise RuntimeError(f"ACP authenticate failed: {message}")
+        self._authenticated = True
+
+    async def _authenticate_and_retry_session_new(
+        self, resp: _AcpJsonObject, params: _AcpJsonObject
+    ) -> _AcpJsonObject:
+        """Authenticate with an advertised headless method and retry once.
+
+        Grok Build (``grok agent stdio``) rejects ``session/new`` with
+        ``Authentication required`` until the client sends ``authenticate``;
+        its ``_meta.defaultAuthMethodId`` (``cached_token`` when
+        ``~/.grok/auth.json`` holds a token) completes headlessly. If the
+        agent advertises only interactive/browser methods — or a malformed
+        list with no usable id — raise a clear diagnosis instead of attempting
+        a login that cannot succeed on a headless host. With no advertised
+        methods at all, return the original error untouched.
+        """
+        method_id = _unattended_auth_method_id(self._auth_advertisement)
+        if method_id is None:
+            if self._auth_advertisement.get("authMethods"):
+                error = resp["error"]
+                message = error.get("message", error) if isinstance(error, dict) else error
+                raise RuntimeError(
+                    "ACP session/new requires authentication, but the agent "
+                    "advertises no headless auth method (browser-only or "
+                    f"malformed authMethods): {message}"
+                )
+            return resp
+        await self._authenticate(method_id)
+        return await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning the session id.
@@ -712,6 +825,8 @@ class AcpExecutor(Executor):
             params["model"] = self._config.model
 
         resp = await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        if "error" in resp and not self._authenticated and _is_auth_required_error(resp["error"]):
+            resp = await self._authenticate_and_retry_session_new(resp, params)
         if "error" in resp:
             raise RuntimeError(
                 f"ACP session/new failed: {resp['error'].get('message', resp['error'])}"

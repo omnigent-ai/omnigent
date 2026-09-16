@@ -116,6 +116,21 @@ describe("buildReconnectCommand", () => {
     expect(cmd).toContain("--server 'https://example.com/api?profile=dev&glob=*'");
   });
 
+  it("emits `omnigent devin --resume` for a devin-native local_stranded session", () => {
+    // Every native wrapper resumes through its own verb; `omnigent run` cannot
+    // resume one at all, which is what this used to suggest.
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_devin1",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: "devin-native-ui",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent devin");
+    expect(cmd).toContain("--resume conv_devin1");
+    expect(cmd).not.toContain("omnigent run");
+    expect(cmd).not.toContain("path/to/agent.yaml");
+  });
+
   it("emits `omnigent claude --resume` for a claude-native local_stranded session", () => {
     const cmd = buildReconnectCommand({
       conversationId: "conv_claude1",

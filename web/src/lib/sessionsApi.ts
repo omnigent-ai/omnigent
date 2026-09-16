@@ -28,6 +28,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  SkillsStatus,
   SkillSummary,
 } from "./types";
 
@@ -245,6 +246,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
+  skills_status?: SkillsStatus;
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
   /**
@@ -358,6 +360,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    skillsStatus: wire.skills_status,
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
@@ -685,8 +688,7 @@ async function importLocalSessionsBuffered(
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
  *   A `project_id` files the session into that project atomically at create
  *   and lets the server default-fill absent fields from the project config.
- * @returns The created session's id, plus any non-fatal project-consistency
- *   `warnings` the server attached to a `project_id` create.
+ * @returns The created session's id.
  */
 export async function createBundledSession(
   bundle: File,
@@ -699,7 +701,7 @@ export async function createBundledSession(
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
   } = {},
-): Promise<{ id: string; warnings?: { code?: string; message?: string }[] }> {
+): Promise<{ id: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
@@ -720,9 +722,8 @@ export async function createBundledSession(
   // so callers don't need to care which path was taken.
   const body = (await res.json()) as {
     session_id: string;
-    warnings?: { code?: string; message?: string }[];
   };
-  return { id: body.session_id, warnings: body.warnings };
+  return { id: body.session_id };
 }
 
 /**

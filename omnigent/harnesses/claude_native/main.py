@@ -65,6 +65,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSo
 from websockets.frames import Close
 
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
+from omnigent._startup_events import record_startup_event
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import (
     PICKER_ACCENT as _PICKER_ACCENT,
@@ -3692,6 +3693,7 @@ async def _attach_direct_tmux(
         tmux_target,
         env=env,
     )
+    record_startup_event("terminal_attach_started")
     startup_profiler.mark("tmux attach subprocess started")
 
     # Poll for a dead pane in the background. With ``remain-on-exit on``,
@@ -3721,6 +3723,7 @@ async def _attach_direct_tmux(
             await watcher
 
     startup_profiler.mark("tmux attach subprocess exited")
+    record_startup_event("terminal_attach_exited", exit_code=process.returncode)
     # Use the tri-state probe so a dead pane (session alive, pane_dead=1) is
     # treated as EXITED rather than DETACHED. With remain-on-exit the session
     # outlives the inner CLI, so _tmux_session_alive alone would wrongly signal
@@ -4320,6 +4323,15 @@ async def _wait_for_claude_terminal_ready(
     )
 
 
+async def _wait_for_runner_online_with_startup_event(
+    client: httpx.AsyncClient,
+    runner_id: str,
+) -> None:
+    """Wait for the runner tunnel and record its actual completion time."""
+    await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
+    record_startup_event("runner_connected")
+
+
 async def _ensure_claude_terminal_on_runner(
     client: httpx.AsyncClient,
     session_id: str,
@@ -4416,6 +4428,8 @@ async def _prepare_claude_terminal_via_daemon(
         # exit; a fresh launch owns teardown.
         reattached = session_id is not None
         fresh_session = session_id is None
+        if session_id is not None:
+            record_startup_event("session_resolved", session_id=session_id)
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Claude session requires a session bundle.")
@@ -4492,6 +4506,7 @@ async def _prepare_claude_terminal_via_daemon(
             startup_progress=startup_progress,
             progress_message="Starting runner...",
         )
+        record_startup_event("runner_requested", session_id=session_id)
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
@@ -4499,6 +4514,7 @@ async def _prepare_claude_terminal_via_daemon(
             workspace=workspace,
             fresh=fresh_session,
         )
+        record_startup_event("session_runner_bound")
         _mark_startup_step(
             startup_profiler,
             "daemon runner launch requested",
@@ -4514,9 +4530,7 @@ async def _prepare_claude_terminal_via_daemon(
                 startup_progress=startup_progress,
                 progress_message="Waiting for runner...",
             )
-            await wait_for_runner_online(
-                client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
-            )
+            await _wait_for_runner_online_with_startup_event(client, runner_id)
             _mark_startup_step(
                 startup_profiler,
                 "daemon runner online",
@@ -4565,13 +4579,12 @@ async def _prepare_claude_terminal_via_daemon(
                 progress_message="Starting Claude terminal...",
             )
             _, terminal_id = await asyncio.gather(
-                wait_for_runner_online(
-                    client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
-                ),
+                _wait_for_runner_online_with_startup_event(client, runner_id),
                 _wait_for_claude_terminal_ready(
                     client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
                 ),
             )
+        record_startup_event("terminal_available", session_id=session_id)
         _mark_startup_step(
             startup_profiler,
             "claude terminal ready",
@@ -4870,6 +4883,8 @@ async def _prepare_claude_terminal(
         # single ``cold_resumed`` flag covers both.
         cold_resumed = False
         bridge_id: str | None = None
+        if session_id is not None:
+            record_startup_event("session_resolved", session_id=session_id)
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Claude session requires a session bundle.")
@@ -4911,6 +4926,7 @@ async def _prepare_claude_terminal(
             )
             existing_terminal_id = await _find_running_claude_terminal(client, session_id)
             if existing_terminal_id is not None:
+                record_startup_event("terminal_available", session_id=session_id)
                 _mark_startup_step(
                     startup_profiler,
                     "existing terminal found",
@@ -4952,6 +4968,7 @@ async def _prepare_claude_terminal(
                 startup_progress=startup_progress,
             )
             await _bind_session_runner(client, session_id, runner_id)
+            record_startup_event("session_runner_bound")
             _mark_startup_step(
                 startup_profiler,
                 "session runner bound",
@@ -4991,6 +5008,7 @@ async def _prepare_claude_terminal(
             claude_config=claude_config,
             append_system_prompt=append_system_prompt,
         )
+        record_startup_event("terminal_available", session_id=session_id)
         _mark_startup_step(
             startup_profiler,
             "claude terminal launched",
@@ -6066,6 +6084,7 @@ async def _create_claude_session(
     session_id = body.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise click.ClickException("Claude session creation response did not include session_id.")
+    record_startup_event("session_resolved", session_id=session_id)
     return session_id
 
 

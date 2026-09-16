@@ -16,17 +16,19 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.entities.conversation import Conversation
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.server.routes import sessions as sessions_mod
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import (
     _handle_mcp_tools_call,
     _pending_policy_ask_writes,
     _PendingPolicyAskWrites,
 )
-from omnigent.spec.types import PolicyAction
+from omnigent.spec.types import Phase, PolicyAction
 
 # ---------------------------------------------------------------------------
 # Stubs — real types, no MagicMock
@@ -728,3 +730,133 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     assert captured[0].actor == {"run_as": "alice@example.com"}, (
         f"expected actor from runner body, got: {captured[0].actor!r}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_action", "reviewed_transform", "retry_transform", "changed_arguments", "approval"),
+    [
+        (PolicyAction.ASK, {"value": "reviewed"}, {"value": "later"}, False, "accept"),
+        (PolicyAction.ASK, None, {"value": "later"}, False, "accept"),
+        (PolicyAction.ASK, {}, {"value": "later"}, False, "accept"),
+        (PolicyAction.ASK, {"value": "reviewed"}, None, True, "accept"),
+        (PolicyAction.ASK, {"value": "reviewed"}, None, False, "decline"),
+        (PolicyAction.DENY, {"value": "reviewed"}, None, False, "accept"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, {"value": "current"}, False, "accept"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, None, False, "accept"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, {}, False, "accept"),
+    ],
+)
+async def test_retry_dispatches_policy_owned_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_action: PolicyAction,
+    reviewed_transform: dict[str, str] | None,
+    retry_transform: dict[str, str] | None,
+    changed_arguments: bool,
+    approval: str,
+) -> None:
+    """Approval preserves the reviewed call; ALLOW uses the current policy result."""
+    eid = "elicit_reviewed_call"
+    original_arguments = {"value": "original"}
+    dispatched: list[dict[str, Any]] = []
+    label_writes: list[dict[str, str]] = []
+    evaluations: list[EvaluationContext] = []
+
+    class Engine(_FixedPolicyEngine):
+        def apply_label_writes(self, set_labels: dict[str, str]) -> None:
+            label_writes.append(set_labels)
+
+    engine = Engine(PolicyResult(action=PolicyAction.ALLOW))
+    call_results = iter(
+        [
+            PolicyResult(
+                action=PolicyAction.ASK,
+                data=reviewed_transform,
+                set_labels={"review": "accepted"},
+                deciding_policies=["review"],
+            ),
+            PolicyResult(action=retry_action, data=retry_transform),
+        ]
+    )
+
+    async def evaluate(session_id, spec, store, conv, ctx):
+        evaluations.append(ctx)
+        result = (
+            next(call_results)
+            if ctx.phase == Phase.TOOL_CALL
+            else PolicyResult(action=PolicyAction.ALLOW)
+        )
+        return engine, result
+
+    async def register(*args, **kwargs):
+        return eid
+
+    def execute(request: httpx.Request) -> httpx.Response:
+        dispatched.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": {"output": "ok"}})
+
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "spec")
+    monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", evaluate)
+    monkeypatch.setattr(orchestration, "_register_policy_elicitation", register)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(execute), base_url="http://runner.test"
+    ) as runner:
+
+        async def get_runner(*args):
+            return runner
+
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
+
+        async def call(params):
+            response = await _handle_mcp_tools_call(
+                rpc_id=1,
+                session_id=_SESSION_ID,
+                params=params,
+                conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+                agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+                runner_router=None,
+            )
+            return json.loads(bytes(response.body))
+
+        try:
+            initial = await call({"name": "example__lookup", "arguments": original_arguments})
+            assert not dispatched
+            assert not label_writes
+            state = json.loads(initial["result"]["requestState"])
+            state["transformed_arguments"] = {"value": "client"}
+            result = await call(
+                {
+                    "name": "example__lookup",
+                    "arguments": {"value": "changed"} if changed_arguments else original_arguments,
+                    "requestState": json.dumps(state),
+                    "inputResponses": {eid: {"action": approval}},
+                }
+            )
+            rejected = retry_action == PolicyAction.DENY or (
+                retry_action == PolicyAction.ASK and (changed_arguments or approval != "accept")
+            )
+            if rejected:
+                assert "error" in result
+                assert not dispatched
+                assert not label_writes
+                if changed_arguments:
+                    assert "do not match" in result["error"]["message"]
+            else:
+                assert "error" not in result
+                transform = (
+                    reviewed_transform if retry_action == PolicyAction.ASK else retry_transform
+                )
+                expected = transform if transform is not None else original_arguments
+                assert len(dispatched) == 1
+                assert dispatched[0]["params"]["arguments"] == expected
+                assert evaluations[-1].request_data == {
+                    "name": "example__lookup",
+                    "arguments": expected,
+                }
+                if retry_action == PolicyAction.ASK:
+                    assert label_writes == [{"review": "accepted"}]
+                    assert eid not in _pending_policy_ask_writes
+            assert "transformed_arguments" not in json.loads(initial["result"]["requestState"])
+        finally:
+            _pending_policy_ask_writes.pop(eid, None)

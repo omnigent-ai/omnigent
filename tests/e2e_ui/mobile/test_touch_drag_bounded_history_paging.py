@@ -36,9 +36,12 @@ _OLD_TURNS = 30
 # reported lengthy Otto session whose recent history is one huge tool chain.
 _CALLS_PER_BIG_TURN = 250
 
-# Regression bound: one gesture may reasonably load a page or two of history,
-# never a runaway chain. The buggy build fans out to ~47 pages from one drag.
-_MAX_PAGES_PER_GESTURE = 3
+# One drag keeps paging while every page folds into the giant turn already on
+# screen and stops at the first page that shows something new — bounded by the
+# loader's per-gesture budget (a first page plus 30 chained) so it can never
+# run through the whole transcript. The buggy build chained ~47 pages from one
+# drag and kept going after a new row had appeared.
+_MAX_PAGES_PER_GESTURE = 31
 
 # Paging is considered settled once no new /items request lands for this long.
 _SETTLE_SECONDS = 3.0
@@ -169,12 +172,14 @@ def test_one_touch_drag_loads_bounded_history(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A single small touch drag must not chain dozens of history pages.
+    """A single small touch drag pages until something new shows, then stops.
 
-    Failure mode this catches: on a tool-heavy transcript the first small
-    downward drag arms history paging, and folded (height-neutral) pages keep
-    the pane under the load threshold, so the pager chains the entire history
-    — ~47 "Loading earlier messages…" pages from one 60px gesture.
+    Failure modes this catches: on a tool-heavy transcript the first small
+    downward drag arms history paging and folded (height-neutral) pages keep
+    the pane under the load threshold, so an unbounded pager chained the entire
+    history — ~47 "Loading earlier messages…" pages from one 60px gesture; and
+    a fixed two-page budget stopped inside the fold, so a phone reader had to
+    drag over and over before any earlier text appeared.
 
     :param browser: Playwright browser to open a touch phone context on.
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -232,9 +237,13 @@ def test_one_touch_drag_loads_bounded_history(
         assert pages_loaded >= 1, "the touch drag loaded no history at all; paging never armed"
         assert pages_loaded <= _MAX_PAGES_PER_GESTURE, (
             f"one 60px touch drag chained {pages_loaded} history-page requests "
-            f"(expected at most {_MAX_PAGES_PER_GESTURE}); the reader asked to "
-            f"peek up once, not to page in the whole transcript"
+            f"(expected at most {_MAX_PAGES_PER_GESTURE}); the seek must stop at the "
+            f"first page that shows something new or at its budget"
         )
+        # And it paged far enough to show the reader something new: the newest
+        # giant turn alone is ~20 pages of folded tool calls above the opening
+        # window, and the drag must carry through them to the turn before it.
+        expect(page.get_by_text("FINAL SUMMARY 0", exact=False)).to_be_attached()
         # And the loading row must not still be churning after the settle.
         expect(page.get_by_text("Loading earlier messages", exact=False)).to_have_count(0)
     finally:

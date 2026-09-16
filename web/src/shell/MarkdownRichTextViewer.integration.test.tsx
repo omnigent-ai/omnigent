@@ -12,22 +12,33 @@ import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // --- Thin fake TipTap editor: an event emitter over a mutable markdown string ---
+// Mirrors TipTap's "update" event carrying a transaction, so tests can emit a
+// no-op (docChanged:false) or flagged transaction.
+interface FakeTr {
+  docChanged: boolean;
+  getMeta: (key: string) => unknown;
+}
+interface UpdatePayload {
+  transaction?: FakeTr;
+}
+type UpdateHandler = (payload?: UpdatePayload) => void;
+
 interface FakeEditor {
   isDestroyed: boolean;
   getMarkdown: () => string;
-  on: (evt: string, h: () => void) => void;
-  off: (evt: string, h: () => void) => void;
+  on: (evt: string, h: UpdateHandler) => void;
+  off: (evt: string, h: UpdateHandler) => void;
   commands: { setContent: (c: string) => void };
   setEditable: () => void;
   state: { selection: { empty: boolean; from: number; to: number } };
-  emit: (evt: string) => void;
+  emit: (evt: string, payload?: UpdatePayload) => void;
   setMarkdown: (m: string) => void;
   isFocused: boolean;
   wired: boolean;
 }
 
 function makeFakeEditor(initial: string): FakeEditor {
-  const handlers: Record<string, Set<() => void>> = {};
+  const handlers: Record<string, Set<UpdateHandler>> = {};
   let markdown = initial;
   return {
     isDestroyed: false,
@@ -45,8 +56,8 @@ function makeFakeEditor(initial: string): FakeEditor {
     },
     setEditable: () => {},
     state: { selection: { empty: true, from: 0, to: 0 } },
-    emit: (evt) => {
-      handlers[evt]?.forEach((h) => h());
+    emit: (evt, payload) => {
+      handlers[evt]?.forEach((h) => h(payload));
     },
     setMarkdown: (m) => {
       markdown = m;
@@ -63,15 +74,17 @@ let fakeEditor: FakeEditor | null = null;
 vi.mock("@tiptap/react", () => ({
   useEditor: (config: {
     onCreate?: (p: { editor: FakeEditor }) => void;
-    onUpdate?: (p: { editor: FakeEditor }) => void;
+    onUpdate?: (p: { editor: FakeEditor; transaction?: FakeTr }) => void;
   }) => {
     const f = fakeEditor;
     if (f && !f.wired) {
       f.wired = true;
       // onCreate sets the editor's baseline; real TipTap also registers the
-      // onUpdate option as an "update" listener, so mirror that.
+      // onUpdate option as an "update" listener carrying the transaction.
       config.onCreate?.({ editor: f });
-      if (config.onUpdate) f.on("update", () => config.onUpdate!({ editor: f }));
+      if (config.onUpdate) {
+        f.on("update", (p) => config.onUpdate!({ editor: f, transaction: p?.transaction }));
+      }
     }
     return f;
   },
@@ -115,6 +128,7 @@ vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }))
 vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
 
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
 
@@ -230,6 +244,32 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
       unmount();
     });
     expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("keeps a blurred language change when a no-op update (setEditable) fires mid-debounce", async () => {
+    // The picker dispatches a flagged, doc-changing update while blurred (the
+    // <select> holds focus). If canEdit then flips within the debounce window,
+    // editor.setEditable emits an empty (docChanged:false) update — which must
+    // NOT re-baseline over the pending change, or the queued save no-ops and the
+    // language change is silently lost on reload.
+    render(makeViewer());
+    fakeEditor!.isFocused = false;
+    fakeEditor!.setMarkdown(EDITED);
+    await act(async () => {
+      fakeEditor!.emit("update", {
+        transaction: { docChanged: true, getMeta: (k) => k === CODE_BLOCK_LANGUAGE_EDIT_META },
+      });
+    });
+    // Synthetic no-op update from setEditable — the bug re-baselined here.
+    await act(async () => {
+      fakeEditor!.emit("update", {
+        transaction: { docChanged: false, getMeta: () => undefined },
+      });
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
   });
 
   it("marks the editor clean after a save even if getMarkdown() drifts (no stuck 'Unsaved')", async () => {

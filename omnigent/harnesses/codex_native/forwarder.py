@@ -2058,11 +2058,6 @@ async def supervise_forwarder(
         timeout=httpx.Timeout(30.0),
         transport=ap_transport,
     ) as ap_client:
-        # Recover proven-undelivered dead-lettered forwards now that the
-        # server may be reachable again (host/server returned after an
-        # outage or restart). Runs before live forwarding begins, so no
-        # other writer races the dead-letter files (#1579).
-        await _replay_dead_letters_on_startup(ap_client, bridge_dir)
         # Synthesize the thread's MCP startup round (see the comment on
         # _CODEX_MCP_STARTUP_STATUS_METHOD): the fresh-launch forwarder
         # starts right at thread creation, which is when codex boots its
@@ -6553,7 +6548,7 @@ async def _post_external_session_todos(
     """
     Post one ``external_session_todos`` event to the Sessions API.
 
-    Drives the web ``TodoPanel`` from a Codex plan update. The server caches
+    Drives the web ``TodoPanel`` from a Codex plan update. The server persists
     the list and broadcasts a ``session.todos`` SSE event, so the panel
     replaces its contents with the full current plan.
 
@@ -7067,12 +7062,14 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(event_type: str) -> None:
+def _note_forward_failure(event_type: str, result: _PostResult, session_id: str) -> None:
     """
     Record a permanent forward failure; escalate once when sync degrades.
 
     :param event_type: Session event type that failed to post, e.g.
         ``"external_conversation_item"``.
+    :param result: Classified outcome of the latest failed post.
+    :param session_id: Session whose event failed to post.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -7086,23 +7083,36 @@ def _note_forward_failure(event_type: str) -> None:
             "(latest type=%s)",
             _forward_health.consecutive_failures,
             event_type,
+            extra={
+                "session_id": session_id,
+                "event_name": "codex_forward_sync_degraded",
+                "attributes": {
+                    "http_status": result.response.status_code
+                    if result.response is not None
+                    else None,
+                    "transport_error": result.transport_error,
+                    "delivered_ambiguous": result.delivered_ambiguous,
+                },
+            },
         )
         _forward_health.degraded_logged = True
 
 
-async def _replay_dead_letters_on_startup(
+async def _replay_dead_letters_before_resume(
     ap_client: httpx.AsyncClient,
     bridge_dir: Path,
 ) -> None:
     """
-    Re-POST proven-undelivered dead-lettered forwards on forwarder startup (#1579).
+    Re-POST proven-undelivered dead letters before rebuilding a resume rollout.
 
-    Best-effort recovery for the realistic case — the host/server returned after
-    an outage or a restart. Delegates to the shared
+    Best-effort recovery for the realistic case where the host/server returned
+    after an outage or restart. Running before the authoritative server-history
+    fetch ensures successfully replayed items are included in the rebuilt local
+    rollout. Delegates to the shared
     :func:`replay_dead_letters` drain, supplying a re-POST that routes each
     record to its recorded session via :func:`_post_session_event_inner` (the
     inner so a re-failure does not double dead-letter through the wrapper).
-    Never raises: a replay failure must not block live forwarding.
+    Never raises: a replay failure must not block resume.
 
     :param ap_client: HTTP client for Omnigent event posts.
     :param bridge_dir: Native Codex bridge directory holding the dead-letter files.
@@ -7147,8 +7157,8 @@ async def _replay_dead_letters_on_startup(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:  # noqa: BLE001 - replay must never block forwarder startup.
-        _logger.warning("Codex forwarder dead-letter replay failed", exc_info=True)
+    except Exception:  # noqa: BLE001 - replay must never block resume.
+        _logger.warning("Codex dead-letter replay before resume failed", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -7218,7 +7228,7 @@ async def _post_session_event(
     if response is not None and response.status_code < 400:
         _note_forward_success()
     else:
-        _note_forward_failure(event_type)
+        _note_forward_failure(event_type, result, session_id)
         dl_dir = _dead_letter_dir.get()
         if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
             http_status = response.status_code if response is not None else None
@@ -7262,11 +7272,11 @@ async def _post_session_event_inner(
     :param max_attempts: Maximum POST attempts before giving up, e.g. ``3``;
         ``None`` retries transient failures indefinitely and requires an
         idempotent event payload.
-        Startup dead-letter replay passes ``1`` — its natural retry cadence is
-        the next startup, so an in-call retry loop only adds latency (#1579).
+        Cold-resume dead-letter replay passes ``1`` — its natural retry cadence
+        is the next resume, so an in-call retry loop only adds latency (#1579).
     :param timeout: Optional per-request timeout in seconds overriding the
         client default, e.g. ``5.0``. Replay passes a short value so a hung
-        server fails fast instead of stalling startup on the 30s client default.
+        server fails fast instead of stalling resume on the 30s client default.
     :returns: A :class:`_PostResult` carrying the final response, or — for a
         legacy conversation item without ``source_id`` — whether the POST was
         abandoned after an ambiguous transport failure versus a proven-

@@ -1163,7 +1163,7 @@ def test_backoff_delay_capped_at_max() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_call_tool_reconnects_on_connection_error() -> None:
+async def test_call_tool_reconnects_on_connection_error(caplog: pytest.LogCaptureFixture) -> None:
     """
     When a tool call fails with a connection error, the
     connection reconnects with backoff and retries.
@@ -1190,10 +1190,21 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
         # Patch the _sleep indirection so retry backoff is instant.
         with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
             with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
-                result = await conn.call_tool("test_tool", {"query": "hi"})
+                result = await conn.call_tool(
+                    "test_tool", {"query": "private arguments"}, session_id="conv_retry"
+                )
 
         assert result == "recovered"
         mock_reconnect.assert_awaited_once()
+        records = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "mcp_tool_reconnect"
+        ]
+        assert len(records) == 1
+        record = records[0]
+        assert record.session_id == "conv_retry"
+        assert record.exc_info is not None and isinstance(record.exc_info[1], EOFError)
+        assert record.attributes == {"transport_error_type": None}
+        assert "private arguments" not in record.getMessage()
 
     await conn.close()
 
@@ -1280,7 +1291,9 @@ async def test_call_tool_reconnects_on_dead_session_timeout() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_call_tool_reconnects_on_swallowed_transport_error_timeout() -> None:
+async def test_call_tool_reconnects_on_swallowed_transport_error_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     The locked MCP SDK can swallow a mid-response network failure
     entirely (streamable-HTTP SSE/JSON response paths), leaving the
@@ -1326,6 +1339,13 @@ async def test_call_tool_reconnects_on_swallowed_transport_error_timeout() -> No
         # error must not linger past the successful retry to
         # misclassify a future genuine tool timeout.
         assert conn._transport_error is None
+        records = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "mcp_tool_reconnect"
+        ]
+        assert len(records) == 1
+        record = records[0]
+        assert record.exc_info is not None and isinstance(record.exc_info[1], McpError)
+        assert record.attributes == {"transport_error_type": "ReadError"}
 
     await conn.close()
 

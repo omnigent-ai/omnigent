@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1973,6 +1974,48 @@ def test_setup_creates_first_admin_and_signs_in(
     # Setup is no longer pending once the first admin exists.
     info_after = client.get("/v1/info").json()
     assert info_after["needs_setup"] is False
+
+
+def test_setup_after_saving_no_auth_project_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preference-only local user must not prevent first-admin setup."""
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlUser
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    project_store = SqlAlchemyProjectStore(db_url)
+    # Migrations seed a local admin; exercise lazy preference-owner creation instead.
+    with Session(get_or_create_engine(db_url)) as session:
+        local = session.get(SqlUser, (0, "local"))
+        if local is not None:
+            session.delete(local)
+            session.commit()
+    project = project_store.create("a" * 32, "Local project", None)
+    project_store.save_order([project.id], user_id=None)
+    with Session(get_or_create_engine(db_url)) as session:
+        local = session.get(SqlUser, (0, "local"))
+        assert local is not None
+        assert local.is_admin is False
+        assert local.password_hash is None
+
+    with contextmanager(_build_accounts_app)(
+        tmp_path, monkeypatch, init_admin_password=None
+    ) as client:
+        assert client.get("/v1/info").json()["needs_setup"] is True
+        response = client.post(
+            "/auth/setup", json={"username": "alice", "password": "alice-pw-12345"}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["is_admin"] is True
+        me = client.get("/auth/me")
+        assert me.status_code == 200, me.text
+        assert me.json()["id"] == "alice"
+        assert client.get("/v1/info").json()["needs_setup"] is False
+        assert project_store.get_order(user_id=None) == [project.id]
 
 
 def test_setup_writes_loopback_cli_token(
