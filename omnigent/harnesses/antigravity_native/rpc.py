@@ -296,6 +296,8 @@ def _csrf_token_from_process(port: int, process: psutil.Process) -> str | None:
 
 def _remember_rpc_port_owner(port: int, process: psutil.Process) -> None:
     with _RPC_PORT_OWNERS_LOCK:
+        if port in _RPC_PORT_OWNERS:
+            return
         _RPC_PORT_OWNERS[port] = process
         _RPC_PORT_OWNERS.move_to_end(port)
         if len(_RPC_PORT_OWNERS) > _MAX_RPC_PORT_OWNERS:

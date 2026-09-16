@@ -189,10 +189,12 @@ def test_repeated_rpcs_only_revalidate_their_owner(
     assert lookups.call_count == len(ports_to_read)
 
 
-def test_cache_hit_does_not_replace_a_newer_owner(
-    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock]
+@pytest.mark.parametrize("cached_owner", [False, True])
+def test_delayed_validation_does_not_replace_a_newer_owner(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock], cached_owner: bool
 ) -> None:
-    assert rpc._csrf_token_for_port(52548) == "first"
+    if cached_owner:
+        assert rpc._csrf_token_for_port(52548) == "first"
     validated = threading.Barrier(2, timeout=5)
     resume = threading.Event()
     read_token = rpc._csrf_token_from_process
