@@ -94,6 +94,8 @@ _READY_DELAY_S = 45
 # The turn must reach a terminal outcome within: gate wait + slow boot + a
 # mock LLM turn + terminal attach.
 _TURN_OUTCOME_TIMEOUT_S = 200.0
+# How long the persisted transcript may lag the rendered assistant bubble.
+_TRANSCRIPT_SETTLE_S = 60.0
 # claude-native auto-launch of the (slow) terminal + WS attach.
 _TERMINAL_READY_TIMEOUT_MS = 120_000
 
@@ -129,6 +131,46 @@ _client = httpx.Client(trust_env=False)
 # proxy at import time.
 for _var in ("NO_PROXY", "no_proxy"):
     os.environ[_var] = ",".join(filter(None, [os.environ.get(_var, ""), "127.0.0.1,localhost"]))
+
+
+def _await_transcript_outcome(
+    base_url: str, session_id: str, *, timeout_s: float = _TRANSCRIPT_SETTLE_S
+) -> tuple[list[str], list[str]]:
+    """Poll the transcript tail until the turn's outcome is persisted.
+
+    The assistant bubble can render from the live stream a beat before the
+    item's text lands in the store, so read newest-first and keep re-reading
+    until the echo token (or an error item) shows up.
+
+    :param base_url: Base URL of the rig's server, e.g. ``"http://127.0.0.1:8000"``.
+    :param session_id: Session/conversation identifier.
+    :param timeout_s: How long to keep polling before returning what is there.
+    :returns: ``(error_messages, assistant_texts)`` from the newest page.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        items = _client.get(
+            f"{base_url}/v1/sessions/{session_id}/items",
+            params={"limit": 100, "order": "desc"},
+            timeout=10.0,
+        )
+        items.raise_for_status()
+        data = items.json()["data"]
+
+        error_messages = [
+            str(item.get("message", "")) for item in data if item.get("type") == "error"
+        ]
+        assistant_texts = [
+            block.get("text", "")
+            for item in data
+            if item.get("role") == "assistant" and isinstance(item.get("content"), list)
+            for block in item["content"]
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        settled = error_messages or any(_ECHO_TOKEN in text for text in assistant_texts)
+        if settled or time.monotonic() >= deadline:
+            return error_messages, assistant_texts
+        time.sleep(0.5)
 
 
 def _no_proxy_env() -> dict[str, str]:
@@ -483,18 +525,7 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
     # Durable assertion against the canonical transcript: the first prompt
     # must have been delivered and answered (an assistant item echoing the
     # token), and the turn must not have failed with an error item.
-    items = _client.get(f"{base_url}/v1/sessions/{session_id}/items?limit=50", timeout=10.0)
-    items.raise_for_status()
-    data = items.json()["data"]
-
-    error_messages = [str(item.get("message", "")) for item in data if item.get("type") == "error"]
-    assistant_texts = [
-        block.get("text", "")
-        for item in data
-        if item.get("role") == "assistant" and isinstance(item.get("content"), list)
-        for block in item["content"]
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    ]
+    error_messages, assistant_texts = _await_transcript_outcome(base_url, session_id)
     delivered = any(_ECHO_TOKEN in text for text in assistant_texts)
 
     assert delivered, (
