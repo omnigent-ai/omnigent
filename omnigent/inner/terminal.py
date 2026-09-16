@@ -1917,8 +1917,13 @@ class TerminalInstance:
                 if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
                     return
                 continue
+            # Stop/replacement can finish while an old probe is still in flight.
+            if stop_event.is_set() or not self.running:
+                return
             if snapshot is None:
                 session_exists = self._tmux_session_exists_sync()
+                if stop_event.is_set() or not self.running:
+                    return
                 if session_exists is not False:
                     consecutive_capture_failures = 0
                     self._probe_failures.clear()
@@ -1939,6 +1944,8 @@ class TerminalInstance:
             self._probe_failures.clear()
             self._remember_pane_snapshot(snapshot)
             pane_dead = self._pane_is_dead()
+            if stop_event.is_set() or not self.running:
+                return
             if pane_dead is None:
                 if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
                     return
@@ -1954,6 +1961,8 @@ class TerminalInstance:
                 if self.keep_alive_after_exit:
                     with contextlib.suppress(Exception):
                         self._tmux_output_sync("detach-client", "-s", self.tmux_target)
+                if stop_event.is_set() or not self.running:
+                    return
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
@@ -1963,6 +1972,8 @@ class TerminalInstance:
             # it never runs for a dead pane, and before the pane diff so an
             # authoritative file status can preempt the PTY-derived edge.
             if on_tick is not None and not self._fire_watch_callback(on_tick, "tick"):
+                return
+            if stop_event.is_set() or not self.running:
                 return
             # A pane change that lands within the recent-interaction window
             # is a client-driven repaint (attach/detach reflow, focus,
@@ -1980,6 +1991,8 @@ class TerminalInstance:
                 and detector.changed_this_tick
                 and not self._fire_watch_callback(on_activity, "activity")
             ):
+                return
+            if stop_event.is_set() or not self.running:
                 return
             if (
                 idle_fired
@@ -2133,13 +2146,9 @@ class TerminalInstance:
         """
         Signal the threaded watcher to stop and join with a timeout.
 
-        Symmetrical to :meth:`_stop_idle_watcher` for the asyncio
-        variant. Bounded by :data:`_IDLE_WATCHER_JOIN_TIMEOUT_S` so
-        a wedged ``subprocess.run`` (rare — the only one in the loop
-        body) doesn't block the close path indefinitely. After the
-        timeout the thread keeps running, but it's a daemon — it
-        will exit when the process does, and the next iteration's
-        ``self.running`` check will short-circuit it anyway.
+        Bounded by :data:`_IDLE_WATCHER_JOIN_TIMEOUT_S` so an in-flight probe
+        cannot block close or replacement indefinitely. The old thread checks
+        its stop event after each probe and callback before continuing.
         """
         thread = self._idle_thread
         stop_event = self._idle_stop_event
@@ -2149,7 +2158,7 @@ class TerminalInstance:
         self._idle_stop_event = None
         if stop_event is not None:
             stop_event.set()
-        if thread.is_alive():
+        if thread is not threading.current_thread() and thread.is_alive():
             thread.join(timeout=_IDLE_WATCHER_JOIN_TIMEOUT_S)
 
     async def is_alive(self) -> bool:
