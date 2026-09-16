@@ -90,6 +90,9 @@ from omnigent.server.routes._errors import session_not_found as _session_not_fou
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
+    _CLAUDE_NATIVE_HARNESS,
+    _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _COMPACT_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
@@ -154,6 +157,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _is_devin_native_subagent,
     _launch_runner_on_host,
+    _native_coding_agent_for_session,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -1444,10 +1448,20 @@ def register_events_routes(
                 if data.get("reauth_required") is True:
                     error_code = "codex_reauth_required"
                 else:
-                    # Store-enriched failures are harness-neutral; wire output
-                    # retains the Codex fallback unless a rate limit is known.
+                    # Claude supplies hook-derived output too; other senders
+                    # keep the legacy Codex default. Resolved by wrapper label
+                    # OR harness — a custom claude-native agent has no label.
+                    native_agent = _native_coding_agent_for_session(conv)
+                    is_claude = (
+                        native_agent is not None and native_agent.harness == _CLAUDE_NATIVE_HARNESS
+                    ) or (
+                        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                        == _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
+                    )
                     error_code = (
-                        "codex_turn_error" if body.data.get("output") else "native_turn_error"
+                        "codex_turn_error"
+                        if body.data.get("output") and not is_claude
+                        else "native_turn_error"
                     )
                 status_error = ErrorDetail(
                     code=classify_native_turn_error(error_code, output),
