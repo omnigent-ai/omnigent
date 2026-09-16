@@ -270,6 +270,67 @@ class WaitingOnAuthorTest(unittest.TestCase):
 
 
 class WaitingForReviewTest(unittest.TestCase):
+    def test_invalid_pause_config_leaves_handoff_state_unchanged(self) -> None:
+        invalid_configs = [
+            "{",
+            '{"assignment_paused":null}',
+            '{"assignment_paused":"paused"}',
+            '{"assignment_paused":{"paused":true}}',
+            '{"assignment_paused":[42]}',
+            '{"assignment_paused":[""]}',
+        ]
+        for scheduled in [False, True]:
+            for config in [*invalid_configs, FileNotFoundError("areas.json")]:
+                with self.subTest(scheduled=scheduled, config=config):
+                    api = FakeAPI(
+                        pull=pr(author="alice", assignees=["maintainer1"]),
+                        issues=[issue(12)],
+                        timeline_by_issue={12: [labeled_at("2026-07-01T00:00:00Z")]},
+                        issue_comments={
+                            12: [
+                                {
+                                    "user": {"login": "alice"},
+                                    "created_at": "2026-07-20T00:00:00Z",
+                                }
+                            ]
+                        },
+                    )
+                    read_result = (
+                        {"side_effect": config}
+                        if isinstance(config, Exception)
+                        else {"return_value": config}
+                    )
+                    with patch.object(waiting_on_author.Path, "read_text", **read_result):
+                        if scheduled:
+                            waiting_on_author.close_stale_waiting_prs(
+                                api, now=datetime(2026, 7, 24, tzinfo=UTC)
+                            )
+                        else:
+                            with self.assertRaises((ValueError, FileNotFoundError)):
+                                waiting_on_author.clear_on_author_activity(
+                                    "issue_comment",
+                                    {
+                                        "issue": {"number": 12, "pull_request": {}},
+                                        "comment": {"user": {"login": "alice"}},
+                                    },
+                                    api,
+                                )
+                    self.assertEqual(api.removed, [])
+                    self.assertEqual(api.added, [])
+                    self.assertEqual(api.review_requests, [])
+                    self.assertEqual(api.closed, [])
+                    self.assertEqual(api.comments, [])
+
+    def test_handoff_skips_when_waiting_label_already_removed(self) -> None:
+        api = FakeAPI()
+        with patch.object(api, "remove_label", return_value=False):
+            changed = waiting_on_author.hand_off_to_reviewer(
+                api, pr(assignees=["maintainer1"]), "author replied"
+            )
+        self.assertFalse(changed)
+        self.assertEqual(api.added, [])
+        self.assertEqual(api.review_requests, [])
+
     def test_handoff_excludes_paused_assignees_and_reviewers(self) -> None:
         api = FakeAPI()
         pull = pr(assignees=["paused", "active"], requested_reviewers=["PAUSED"])
