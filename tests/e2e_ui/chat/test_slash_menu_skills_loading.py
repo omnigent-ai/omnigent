@@ -217,6 +217,15 @@ def test_new_session_menu_uses_the_selected_agents_effective_catalog(
     """The host request includes the agent, and its result replaces cached suggestions."""
     base_url, session_id = seeded_session
     pending: list[Route] = []
+
+    def session_agents(route: Route) -> None:
+        # Session-scoped agents must not replace the fixture's selected agent.
+        if parse_qs(urlparse(route.request.url).query).get("kind") == ["any"]:
+            route.fulfill(json={"data": [], "has_more": False})
+        else:
+            route.fallback()
+
+    page.route("**/v1/sessions?*", session_agents)
     page.route(
         "**/v1/hosts",
         lambda route: route.fulfill(
