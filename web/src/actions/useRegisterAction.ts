@@ -29,7 +29,8 @@ export function useRegisterAction<A extends ActionId>(
         run: (invocation, context) => latest.current.run(invocation, context),
         isEnabled: (context) => latest.current.isEnabled?.(context) !== false,
         isVisible: (context) => latest.current.isVisible?.(context) !== false,
+        acceptsKeybindings: registration.acceptsKeybindings,
       }),
-    [action, actions.registry, scopeId],
+    [action, actions.registry, registration.acceptsKeybindings, scopeId],
   );
 }

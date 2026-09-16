@@ -86,7 +86,8 @@ export function KeybindingDispatcher({
         );
         clearPending(pending);
         for (const rule of secondStroke) {
-          if (!actions.registry.canHandle(rule.action, resolution)) continue;
+          if (!actions.registry.canHandle(rule.action, resolution, { keyboardOnly: true }))
+            continue;
           const result = actions.registry.execute(invocationFor(rule, event), resolution);
           if (result !== HANDLED) continue;
           consume(event, rule);
@@ -96,7 +97,7 @@ export function KeybindingDispatcher({
       }
 
       const candidates = matchingKeybindingRules(rules, event, 0, phase, environment).filter(
-        (rule) => actions.registry.canHandle(rule.action, resolution),
+        (rule) => actions.registry.canHandle(rule.action, resolution, { keyboardOnly: true }),
       );
 
       // A chord prefix intentionally wins over a single-stroke binding with

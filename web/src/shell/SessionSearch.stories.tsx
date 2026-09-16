@@ -1,7 +1,8 @@
 import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
-import { useLocation } from "@/lib/routing";
+import { useLocation, useNavigate } from "@/lib/routing";
+import { ActionsProvider, HANDLED, useRegisterAction } from "@/actions";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { CommandPalette } from "./CommandPalette";
 
@@ -12,6 +13,17 @@ const sessions = [
 ];
 
 function SessionSearch() {
+  const navigate = useNavigate();
+  const go = (path: string) => () => {
+    navigate(path);
+    return HANDLED;
+  };
+  useRegisterAction("session.action.new", { run: go("/") });
+  useRegisterAction("workbench.action.navigateInbox", { run: go("/inbox") });
+  useRegisterAction("workbench.action.navigateAutomations", { run: go("/tasks") });
+  useRegisterAction("workbench.action.navigateSettings", { run: go("/settings") });
+  useRegisterAction("workbench.action.toggleConversationsSidebar", { run: () => HANDLED });
+  useRegisterAction("workbench.action.toggleWorkspaceSidebar", { run: () => HANDLED });
   const activeId = useLocation().pathname.split("/").at(-1);
   const [open, setOpen] = useState(false);
   const [sessionsOnly, setSessionsOnly] = useState(true);
@@ -56,8 +68,6 @@ function SessionSearch() {
         open={open}
         sessionsOnly={sessionsOnly}
         onOpenChange={setOpen}
-        onToggleLeftSidebar={() => undefined}
-        onToggleRightSidebar={() => undefined}
       />
     </main>
   );
@@ -92,7 +102,9 @@ const meta = {
           client.setQueryData(["conversations", "", true], data);
         }}
       >
-        <Story />
+        <ActionsProvider>
+          <Story />
+        </ActionsProvider>
       </StoryQueryRouter>
     ),
   ],

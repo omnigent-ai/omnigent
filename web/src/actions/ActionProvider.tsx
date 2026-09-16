@@ -22,6 +22,8 @@ import type {
   ActionId,
   ActionInvocation,
   ActionResult,
+  ActionSource,
+  ArglessActionId,
   ContextPatch,
   ContextSnapshot,
   KeybindingMode,
@@ -77,6 +79,7 @@ function actionContext(
 
 export interface ActionsApi {
   execute: (invocation: ActionInvocation) => ActionResult;
+  executeAction: (action: ArglessActionId, source: ActionSource) => ActionResult;
 }
 
 interface ActionsRuntime extends ActionsApi {
@@ -117,6 +120,8 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
       registry,
       getResolution,
       execute: (invocation) => registry.execute(invocation, getResolution(invocation.event)),
+      executeAction: (action, source) =>
+        registry.execute({ action, source } as ActionInvocation, getResolution()),
     };
   }, [environment, registry]);
 
@@ -140,6 +145,7 @@ const INERT_ACTIONS: ActionsRuntime = {
   registry: INERT_REGISTRY,
   getResolution: () => ({ context: EMPTY_ACTION_CONTEXT, focusedScopeIds: [] }),
   execute: () => NOT_HANDLED,
+  executeAction: () => NOT_HANDLED,
 };
 
 function useActionRuntime(): ActionsRuntime {
@@ -147,8 +153,8 @@ function useActionRuntime(): ActionsRuntime {
 }
 
 export function useActions(): ActionsApi {
-  const { execute } = useActionRuntime();
-  return useMemo(() => ({ execute }), [execute]);
+  const { execute, executeAction } = useActionRuntime();
+  return useMemo(() => ({ execute, executeAction }), [execute, executeAction]);
 }
 
 export function useAvailableActions(
@@ -165,8 +171,29 @@ export function useAvailableActions(
   return actions.registry.listAvailable(actions.getResolution(), options);
 }
 
-export function usePaletteActions(): readonly AvailableAction[] {
-  return useAvailableActions({ paletteOnly: true });
+const NO_SUBSCRIPTION = () => () => {};
+
+/** Keep palette availability and execution anchored to the focus that opened it. */
+export function usePaletteActions(enabled = true) {
+  const runtime = useActionRuntime();
+  useSyncExternalStore(
+    enabled ? runtime.registry.subscribe : NO_SUBSCRIPTION,
+    runtime.registry.getRevision,
+    runtime.registry.getRevision,
+  );
+  const wasEnabled = useRef(false);
+  const resolution = useRef<ActionResolution | null>(null);
+  if (!resolution.current || !enabled || !wasEnabled.current) {
+    resolution.current = runtime.getResolution();
+  }
+  wasEnabled.current = enabled;
+  const captured = resolution.current;
+  return {
+    actions: runtime.registry.listPaletteActions(captured),
+    executeAction: (action: ArglessActionId) =>
+      // catalog.ts proves every palette action is argless.
+      runtime.registry.execute({ action, source: "palette" } as ActionInvocation, captured),
+  };
 }
 
 export interface ActionScopeProps {
