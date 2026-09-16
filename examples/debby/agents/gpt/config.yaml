@@ -21,15 +21,14 @@ executor:
   config:
     harness: codex
 
-# Declaring ``os_env`` registers the ``sys_os_read`` / ``sys_os_write`` /
-# ``sys_os_edit`` / ``sys_os_shell`` tools (filesystem access comes bundled with
-# a shell). ``sandbox: type: none`` runs unsandboxed in the caller's working
-# directory.
+# Filesystem tools can access the writable workspace, while the platform
+# sandbox keeps the rest of the host filesystem hidden.
 os_env:
   type: caller_process
   cwd: .
   sandbox:
-    type: none
+    write_paths: [.]
+    cwd_allow_hidden: [.git, .github, .venv]
 
 # Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
 # identically: the catastrophic set (force-push, ``rm -rf /``, hard-reset to a
