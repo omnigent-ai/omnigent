@@ -8,10 +8,12 @@ each RPC's URL / headers / body shape is asserted without a real socket.
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -28,6 +30,189 @@ _LSOF_TWO_PORTS = (
 )
 
 _CONVERSATION_ID = "90468e33-38c3-4e48-ae9f-03c843196227"
+
+
+@pytest.fixture
+def authenticated_agy(monkeypatch: pytest.MonkeyPatch) -> dict[int, Mock]:
+    processes = {
+        101: Mock(cmdline=lambda: ["/bin/agy", "--csrf_token=first"], is_running=lambda: True),
+        102: Mock(cmdline=lambda: ["/bin/agy", "--csrf_token", "second"], is_running=lambda: True),
+    }
+    monkeypatch.setattr(rpc, "_list_agy_pids", lambda: list(processes))
+    monkeypatch.setattr(rpc.psutil, "Process", lambda pid: processes[pid])
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: {101: [52548], 102: [52550]}[pid])
+    return processes
+
+
+def test_csrf_token_is_scoped_to_live_port_owner(authenticated_agy: dict[int, Mock]) -> None:
+    assert rpc._csrf_token_for_port(52548) == "first"
+    assert rpc._csrf_token_for_port(52550) == "second"
+    assert rpc._csrf_token_for_port(52549) is None
+    authenticated_agy[101].is_running = lambda: False
+    assert rpc._csrf_token_for_port(52548) is None
+
+
+def _write_launch_log(directory: Path, pid: int, port: int, process: Mock) -> Path:
+    directory.mkdir(mode=0o700)
+    path = directory / "agy.log"
+    path.write_text(
+        "I0916 21:44:59.897510 67 server.go:1568] "
+        f"Starting language server process with pid {pid}\n"
+        "I0916 21:44:59.899314 67 server.go:629] "
+        f"Language server listening on random port at {port} for HTTPS (gRPC)\n"
+    )
+    args = process.cmdline()
+    process.cmdline = lambda: [*args, f"--log-file={path}"]
+    process.create_time = lambda: path.stat().st_mtime - 1
+    return path
+
+
+def test_authenticated_discovery_without_socket_attribution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, authenticated_agy: dict[int, Mock]
+) -> None:
+    for pid, port in [(101, 52548), (102, 52550)]:
+        _write_launch_log(tmp_path / str(pid), pid, port, authenticated_agy[pid])
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: [])
+    monkeypatch.setattr(rpc, "_list_loopback_listen_ports", lambda: [52548, 52549, 52550])
+    seen: list[tuple[int, str | None]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        port = request.url.port
+        token = request.headers.get("x-codeium-csrf-token")
+        seen.append((port, token))
+        if token != {52548: "first", 52550: "second"}.get(port) or token is None:
+            return httpx.Response(401)
+        owner = _CONVERSATION_ID if port == 52550 else "other-conversation"
+        return httpx.Response(200, json={"metadata": {"rootConversationId": owner}})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(respond))
+    monkeypatch.setattr(rpc, "_pane_pid", lambda *_: 101)
+    monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda pid: pid)
+    assert rpc.discover_language_server_port(101) == 52548
+    assert (
+        rpc.resolve_cold_start_agy_rpc_port(tmux_socket=tmp_path / "tmux.sock", tmux_target="main")
+        == 52548
+    )
+    assert rpc.resolve_language_server_port(_CONVERSATION_ID) == 52550
+    assert rpc._csrf_token_for_port(52549) is None
+    assert set(seen) == {(52548, "first"), (52550, "second")}
+
+
+@pytest.mark.parametrize("invalid", ["wrong-pid", "stale", "dead", "shared", "symlink"])
+def test_launch_log_cannot_bind_stale_or_untrusted_ports(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authenticated_agy: dict[int, Mock],
+    invalid: str,
+) -> None:
+    process = authenticated_agy[101]
+    path = _write_launch_log(tmp_path / "private", 101, 52548, process)
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: [])
+    if invalid == "wrong-pid":
+        path.write_text(path.read_text().replace("pid 101", "pid 999"))
+    elif invalid == "stale":
+        process.create_time = lambda: path.stat().st_mtime + 1
+    elif invalid == "dead":
+        process.is_running = lambda: False
+    elif invalid == "shared":
+        path.parent.chmod(0o755)
+    else:
+        target = path.with_suffix(".target")
+        path.rename(target)
+        path.symlink_to(target)
+    assert rpc._csrf_token_for_port(52548) is None
+
+
+def test_launch_log_uses_process_namespace_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, authenticated_agy: dict[int, Mock]
+) -> None:
+    _write_launch_log(tmp_path / "private", 2, 52548, authenticated_agy[101])
+    proc = tmp_path / "proc"
+    (proc / "101").mkdir(parents=True)
+    (proc / "101" / "status").write_text("Name:\tagy\nNSpid:\t101\t2\n")
+    monkeypatch.setattr(rpc, "_PROC_FS", str(proc))
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: [])
+    assert rpc._csrf_token_for_port(52548) == "first"
+
+
+@pytest.mark.parametrize("proxy", ["HTTPS_PROXY", "ALL_PROXY"])
+async def test_loopback_clients_ignore_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch, proxy: str
+) -> None:
+    for key in list(os.environ):
+        if key.lower().endswith("_proxy"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv(proxy, "http://proxy.example:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    url = httpx.URL(rpc._rpc_url(52548, "Heartbeat"))
+    with rpc._sync_client(1) as client:
+        assert client._transport_for_url(url) is client._transport
+    async with rpc._async_client(1) as client:
+        assert client._transport_for_url(url) is client._transport
+
+
+@pytest.mark.parametrize("error", [rpc.psutil.AccessDenied(101), rpc.psutil.NoSuchProcess(101)])
+def test_unreadable_process_does_not_leak_another_token(
+    authenticated_agy: dict[int, Mock], error: Exception
+) -> None:
+    authenticated_agy[101].cmdline = Mock(side_effect=error)
+    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+
+
+@pytest.mark.parametrize("args", [["/bin/agy"], ["/bin/other", "/bin/agy", "--csrf_token=wrong"]])
+def test_legacy_or_unrelated_process_has_no_token(
+    authenticated_agy: dict[int, Mock], args: list[str]
+) -> None:
+    authenticated_agy[101].cmdline = lambda: args
+    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+
+
+def test_all_sync_rpcs_authenticate(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock]
+) -> None:
+    methods = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("x-codeium-csrf-token") != "first":
+            return httpx.Response(401, json={"message": "missing CSRF token"})
+        methods.append(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, json={"metadata": {"rootConversationId": _CONVERSATION_ID}})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(respond))
+    assert rpc.discover_language_server_port(101) == 52548
+    assert rpc._conversation_matches(52548, _CONVERSATION_ID)
+    rpc.get_trajectory_steps(52548, _CONVERSATION_ID)
+    assert rpc.cancel_cascade_steps(52548, _CONVERSATION_ID)
+    rpc.start_cascade(52548, _CONVERSATION_ID)
+    rpc.send_user_cascade_message(52548, _CONVERSATION_ID, text="hello", plan_model="gemini")
+    rpc.get_available_models(52548)
+    rpc.get_all_cascade_trajectories(52548)
+    assert len(set(methods)) == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("socket_attribution", [True, False])
+async def test_stream_authenticates_to_its_own_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authenticated_agy: dict[int, Mock],
+    socket_attribution: bool,
+) -> None:
+    if not socket_attribution:
+        _write_launch_log(tmp_path / "private", 102, 52550, authenticated_agy[102])
+        monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: [])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("x-codeium-csrf-token") != "second":
+            return httpx.Response(401)
+        assert request.headers["content-type"] == "application/connect+json"
+        return httpx.Response(
+            200, content=rpc._encode_connect_envelope({"update": {"done": True}})
+        )
+
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", httpx.MockTransport(respond))
+    updates = [update async for update in rpc.stream_agent_state_updates(52550, _CONVERSATION_ID)]
+    assert updates == [{"done": True}]
 
 
 # ---------------------------------------------------------------------------

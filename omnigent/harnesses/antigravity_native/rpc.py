@@ -29,6 +29,9 @@ How agy exposes a control surface (verified end-to-end; see
   discovered from the loopback socket table — psutil per agy pid (cross-platform
   and already a hard dependency), falling back to ``lsof`` and then to
   ``/proc/net/tcp`` on hosts where the socket cannot be attributed to a pid.
+  Omnigent launches also have a private startup log that identifies the live
+  process and its HTTPS port, allowing authenticated discovery without socket
+  attribution. Environment proxies are disabled for all local RPC traffic.
 * Ownership probe: ``POST .../GetConversationMetadata`` with REQUEST body
   ``{"conversationId": "<id>"}`` returns HTTP 200 whose RESPONSE echoes that id at
   ``metadata.rootConversationId`` for a hosted conversation, and HTTP 500
@@ -54,10 +57,13 @@ them without real subprocesses or sockets.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
 import os
+import re
+import stat
 import struct
 import subprocess
 from collections.abc import AsyncIterator, Iterable
@@ -196,6 +202,94 @@ def _rpc_url(port: int, method: str) -> str:
     return f"https://{_LOOPBACK}:{port}/{_LS_SERVICE}/{method}"
 
 
+def _flag_value(args: list[str], flag: str) -> str | None:
+    value = None
+    for index, arg in enumerate(args[1:], start=1):
+        if arg == "--":
+            break
+        if arg.startswith(f"{flag}="):
+            value = arg.partition("=")[2]
+        elif arg == flag and index + 1 < len(args):
+            value = args[index + 1]
+    return value
+
+
+def _namespace_pid(pid: int) -> int:
+    try:
+        for line in Path(_PROC_FS, str(pid), "status").read_text().splitlines():
+            if line.startswith("NSpid:"):
+                return int(line.split()[-1])
+    except (OSError, ValueError):
+        pass
+    return pid
+
+
+def _logged_rpc_ports(pid: int) -> list[int]:
+    """Read the HTTPS bind announcement from this process's private launch log."""
+    try:
+        process = psutil.Process(pid)
+        args = process.cmdline()
+        if not args or Path(args[0]).name != "agy":
+            return []
+        filename = _flag_value(args, "--log-file")
+        if not filename:
+            return []
+        path = Path(filename)
+        parent = path.parent.stat()
+        if not path.is_absolute() or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
+            return []
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as log:
+            info = os.fstat(log.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime < process.create_time():
+                return []
+            lines = log.read(4096).splitlines()
+        prefix = r"I\d{4} [\d:.]+\s+\d+ server\.go:\d+\] "
+        if not lines or not re.fullmatch(
+            prefix + rf"Starting language server process with pid {_namespace_pid(pid)}", lines[0]
+        ):
+            return []
+        for line in lines[1:]:
+            match = re.fullmatch(
+                prefix + r"Language server listening on random port at (\d+) for HTTPS \(gRPC\)",
+                line,
+            )
+            if match and process.is_running():
+                port = int(match[1])
+                return [port] if 0 < port < 65536 else []
+    except (OSError, psutil.Error):
+        pass
+    return []
+
+
+def _pid_rpc_ports(pid: int) -> list[int]:
+    return _pid_listen_ports(pid) or _logged_rpc_ports(pid)
+
+
+def _csrf_token_for_port(port: int) -> str | None:
+    """Read the token only from the live agy process owning this loopback port."""
+    for pid in _list_agy_pids():
+        try:
+            process = psutil.Process(pid)
+            args = process.cmdline()
+            if not args or Path(args[0]).name != "agy":
+                continue
+            token = _flag_value(args, "--csrf_token")
+            if token and port in _pid_rpc_ports(pid) and process.is_running():
+                return token
+        except (psutil.Error, OSError):
+            continue
+    return None
+
+
+def _rpc_headers(port: int, content_type: str = "application/json") -> dict[str, str]:
+    headers = {"Content-Type": content_type}
+    token = _csrf_token_for_port(port)
+    if token:
+        headers["x-codeium-csrf-token"] = token
+    return headers
+
+
 # httpx transport seam. ``None`` (production) lets httpx use its real loopback
 # TLS transport with cert verification disabled (agy's cert is self-signed and
 # the endpoint is loopback-only). Tests set this to an ``httpx.MockTransport``
@@ -224,7 +318,7 @@ def _sync_client(timeout: float) -> httpx.Client:
     :returns: An ``httpx.Client`` with cert verification disabled (loopback,
         self-signed) and the test transport when one is installed.
     """
-    return httpx.Client(verify=False, timeout=timeout, transport=_HTTP_TRANSPORT)
+    return httpx.Client(verify=False, trust_env=False, timeout=timeout, transport=_HTTP_TRANSPORT)
 
 
 def _async_client(timeout: httpx.Timeout | float) -> httpx.AsyncClient:
@@ -245,7 +339,9 @@ def _async_client(timeout: httpx.Timeout | float) -> httpx.AsyncClient:
     :returns: An ``httpx.AsyncClient`` with cert verification disabled
         (loopback, self-signed) and the test transport when one is installed.
     """
-    return httpx.AsyncClient(verify=False, timeout=timeout, transport=_ASYNC_HTTP_TRANSPORT)
+    return httpx.AsyncClient(
+        verify=False, trust_env=False, timeout=timeout, transport=_ASYNC_HTTP_TRANSPORT
+    )
 
 
 def _run_lsof_listen_ports(pid: int) -> str:
@@ -425,7 +521,7 @@ def _heartbeat_ok(port: int) -> bool:
         with _sync_client(_PROBE_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=b"{}",
             )
     except httpx.HTTPError:
@@ -463,7 +559,7 @@ def _conversation_matches(port: int, conversation_id: str) -> bool:
         with _sync_client(_PROBE_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=json.dumps({"conversationId": conversation_id}).encode("utf-8"),
             )
     except httpx.HTTPError:
@@ -506,7 +602,7 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(port),
             content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -537,7 +633,7 @@ def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
         with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
             )
     except Exception:  # deliberate fail-open: ssl.SSLError etc. outside httpx hierarchy
@@ -584,7 +680,7 @@ def _post_rpc_raising(port: int, method: str, body: dict[str, object]) -> None:
         with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=json.dumps(body).encode("utf-8"),
             )
     except httpx.HTTPError as e:
@@ -783,7 +879,7 @@ def get_available_models(port: int) -> dict[str, object]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(port),
             content=b"{}",
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -856,7 +952,7 @@ def get_all_cascade_trajectories(port: int) -> dict[str, object]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(port),
             content=b"{}",
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -974,12 +1070,13 @@ async def stream_agent_state_updates(
     url = _rpc_url(port, _METHOD_STREAM_AGENT_STATE_UPDATES)
     _assert_loopback_url(url)
     body = _encode_connect_envelope({"conversationId": conversation_id})
+    headers = await asyncio.to_thread(_rpc_headers, port, "application/connect+json")
     async with (
         _async_client(_STREAM_TIMEOUT) as client,
         client.stream(
             "POST",
             url,
-            headers={"Content-Type": "application/connect+json"},
+            headers=headers,
             content=body,
         ) as response,
     ):
@@ -1101,7 +1198,7 @@ def discover_language_server_port(pid: int) -> int | None:
     """
     Resolve the connect-RPC (TLS) port for a known agy pid.
 
-    ``lsof``-es the pid's ``127.0.0.1`` TCP LISTEN ports and returns the first
+    Uses the pid's loopback sockets or private launch log and returns the first
     (lowest) one that answers ``Heartbeat`` with HTTP 200 — agy's lower port is
     the TLS connect-RPC surface and the higher one is plain HTTP that fails the
     probe. Probing lowest-first means the connect-RPC port is found without
@@ -1112,7 +1209,7 @@ def discover_language_server_port(pid: int) -> int | None:
         no loopback listeners or none answer ``Heartbeat`` (e.g. agy has exited
         or has not finished binding).
     """
-    ports = _pid_listen_ports(pid)
+    ports = _pid_rpc_ports(pid)
     for port in ports:
         if _heartbeat_ok(port):
             _logger.debug("agy connect-RPC port resolved: pid=%s port=%s", pid, port)
@@ -1437,8 +1534,7 @@ def resolve_cold_start_agy_rpc_port(
         if _can_attribute_any_agy_port():
             _logger.info(
                 "agy cold-start: pane agy for target=%s has not bound its "
-                "connect-RPC port yet (lsof attributes ports for other agy "
-                "processes, so attribution works here); polling rather than "
+                "connect-RPC port yet (another agy's port is attributable); polling rather than "
                 "binding a foreign agy",
                 tmux_target,
             )
@@ -1480,38 +1576,25 @@ def _can_attribute_any_agy_port() -> bool:
         loopback LISTEN port. ``False`` when no agy is running, or when no
         source can attribute a port to any of them.
     """
-    return any(_pid_listen_ports(pid) for pid in _list_agy_pids())
+    return any(_pid_rpc_ports(pid) for pid in _list_agy_pids())
 
 
 def _candidate_agy_rpc_ports() -> list[int]:
     """
     Return every live agy connect-RPC port, validated by ``Heartbeat``.
 
-    Primary path: ``lsof`` each running agy pid's loopback LISTEN ports (precise
-    — scopes to agy). Fallback: when ``lsof`` attributes no ports — a restricted
-    ``/proc`` where agy's listening socket is not in its pid's fd table (verified
-    on uid-1000 k8s pods, where agy 1.0.10 holds the listener in a backend the
-    agy process does not own as an fd) — enumerate every loopback LISTEN port
-    from ``/proc/net/tcp`` via :func:`_list_loopback_listen_ports`, which needs
-    no fd/ptrace access.
-
-    The fallback fires only when agy IS running but lsof saw none of its ports —
-    not when no agy is running at all — so a turn-injection attempt against a
-    dead session does not heartbeat every unrelated loopback service. The scan is
-    also capped at :data:`_MAX_FALLBACK_PROBE_PORTS` (lowest-first), with the drop
-    logged, to bound the probe count on a host with many loopback listeners.
-
-    Either way the candidates are ``Heartbeat``-filtered, so only agy's TLS
-    connect-RPC port(s) survive (agy's plain-HTTP port and unrelated loopback
-    listeners fail the probe). Callers additionally confirm conversation
-    ownership before injecting, so a stray non-agy port can never be written to.
+    Prefer process-owned sockets, then the process's private startup log.
+    Authenticated probes use only a token bound to the destination by one of
+    these sources. For legacy processes with neither source, scan the loopback
+    socket table without credentials. Callers still confirm conversation
+    ownership before writing to a discovered port.
 
     :returns: Sorted connect-RPC ports that answer ``Heartbeat`` with HTTP 200.
     """
     agy_pids = _list_agy_pids()
     ports: set[int] = set()
     for pid in agy_pids:
-        ports.update(_pid_listen_ports(pid))
+        ports.update(_pid_rpc_ports(pid))
     if agy_pids and not ports:
         loopback = _list_loopback_listen_ports()
         if len(loopback) > _MAX_FALLBACK_PROBE_PORTS:

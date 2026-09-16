@@ -912,6 +912,7 @@ def _spawn_runner_against_external_server(
     # that depend on ``server_pid`` (only valid when this fixture spawns
     # the server too) will KeyError, which is the right failure shape.
     _server_state["runner_id"] = runner_id
+    _server_state["runner_pid"] = proc.pid
     # Exposed so a test whose predecessor killed the shared runner (e.g.
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token

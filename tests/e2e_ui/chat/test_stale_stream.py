@@ -19,40 +19,45 @@ import re
 import signal
 import subprocess
 import time
+from collections.abc import Callable, Iterator
 from urllib.parse import urlparse
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import _server_state, configure_mock_llm
+from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 
-def _find_runner_pids() -> list[int]:
-    """
-    Find all PIDs running the runner entry point
-    (``omnigent.runner._entry``).
+@pytest.fixture(scope="session")
+def _recover_shared_runner(
+    live_server: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Callable[[], None]]:
+    """Keep a recovered runner alive until the shared server is torn down."""
+    recovered: list[subprocess.Popen[bytes]] = []
 
-    The runner is a sibling subprocess of the server (both spawned
-    by the test fixture), so we search by command-line pattern
-    rather than by parent PID.
+    def recover() -> None:
+        runner = _ensure_runner_online(live_server, tmp_path_factory)
+        if runner is not None:
+            recovered.append(runner)
 
-    :returns: List of runner PIDs (may be empty).
-    """
-    result = subprocess.run(
-        ["pgrep", "-f", "omnigent.runner._entry"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return []
-    return [int(line.strip()) for line in result.stdout.strip().splitlines() if line.strip()]
+    try:
+        yield recover
+    finally:
+        for runner in recovered:
+            runner.terminate()
+            try:
+                runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner.kill()
+                runner.wait(timeout=5)
 
 
 @pytest.mark.compat_smoke
 def test_stale_banner_on_runner_crash(
     page: Page,
     seeded_session: tuple[str, str],
+    _recover_shared_runner: Callable[[], None],
 ) -> None:
     """
     Open a pre-created session, send a message, kill the runner while
@@ -91,40 +96,32 @@ def test_stale_banner_on_runner_crash(
         f"Health endpoint should report runner_online=true before kill, got: {health_before}"
     )
 
-    # Kill the runner (sibling of the server, not a child).
-    runner_pids = _find_runner_pids()
-    assert runner_pids, (
-        "No runner processes found. Process tree:\n"
-        + subprocess.run(
-            ["ps", "-ef"],
-            capture_output=True,
-            text=True,
-        ).stdout[:2000]
-    )
-    for pid in runner_pids:
-        os.kill(pid, signal.SIGKILL)
+    # Kill only the runner owned by this pytest session.
+    os.kill(int(_server_state["runner_pid"]), signal.SIGKILL)
+    try:
+        # Poll until the health endpoint reports offline (tunnel teardown
+        # is async — the server's WS route needs to notice the close and
+        # deregister). 10 retries × 0.5 s = 5 s budget.
+        health_after: dict[str, object] = {}
+        for _attempt in range(10):
+            time.sleep(0.5)
+            health_after = httpx.get(
+                f"{live_server}/health?session_id={session_id}",
+                timeout=5,
+            ).json()
+            if health_after.get("session", {}).get("runner_online") is False:
+                break
+        assert health_after.get("session", {}).get("runner_online") is False, (
+            f"Health endpoint should report runner_online=false after kill, got: {health_after}"
+        )
 
-    # Poll until the health endpoint reports offline (tunnel teardown
-    # is async — the server's WS route needs to notice the close and
-    # deregister). 10 retries × 0.5 s = 5 s budget.
-    health_after: dict[str, object] = {}
-    for _attempt in range(10):
-        time.sleep(0.5)
-        health_after = httpx.get(
-            f"{live_server}/health?session_id={session_id}",
-            timeout=5,
-        ).json()
-        if health_after.get("session", {}).get("runner_online") is False:
-            break
-    assert health_after.get("session", {}).get("runner_online") is False, (
-        f"Health endpoint should report runner_online=false after kill, got: {health_after}"
-    )
-
-    # The health poller fires every 10 s. No grace period — the
-    # indicator flips on the next poll. Budget 20 s from the kill.
-    indicator = page.locator('[data-testid="disconnected-indicator"]')
-    expect(indicator).to_be_visible(timeout=20_000)
-    expect(indicator).to_contain_text("disconnected")
+        # The health poller fires every 10 s. No grace period — the
+        # indicator flips on the next poll. Budget 20 s from the kill.
+        indicator = page.locator('[data-testid="disconnected-indicator"]')
+        expect(indicator).to_be_visible(timeout=20_000)
+        expect(indicator).to_contain_text("disconnected")
+    finally:
+        _recover_shared_runner()
 
 
 @pytest.mark.nightly

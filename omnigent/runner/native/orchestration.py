@@ -5527,6 +5527,7 @@ async def _auto_create_antigravity_terminal(
         permission_mode=None,
         headless=False,
         extra_args=terminal_launch_args,
+        log_dir=bridge_dir,
     )
 
     # Wire the Omnigent MCP relay so the wrapped agy gets the sys_* tools

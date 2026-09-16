@@ -23,15 +23,20 @@ from omnigent.process_logging import RedactingLogFormatter
 
 async def _run_watcher(instance: TerminalInstance, threaded: bool, on_exit) -> None:
     if threaded:
-        await asyncio.wait_for(
+        stop = threading.Event()
+        task = asyncio.create_task(
             asyncio.to_thread(
                 instance._idle_watch_loop_threaded,
-                threading.Event(),
+                stop,
                 on_exit=on_exit,
                 poll_interval_s=0.001,
-            ),
-            timeout=1,
+            )
         )
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1)
+        finally:
+            stop.set()
+            await task
     else:
         await asyncio.wait_for(instance._idle_watch_loop(lambda: None, on_exit=on_exit), timeout=1)
 
@@ -176,7 +181,11 @@ async def test_probe_history_resets_on_recovery(
             raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
         if command == "list-panes" or (tick == 3 and command == recovery):
             return subprocess.CompletedProcess(cmd, 0, b"0\n", b"")
-        detail = b"transient failure" if tick <= 3 else b"persistent failure"
+        detail = (
+            b"can't find session: before recovery"
+            if tick <= 3
+            else b"can't find session: after recovery"
+        )
         return subprocess.CompletedProcess(cmd, 1, b"", detail)
 
     _patch_tmux(monkeypatch, run)
@@ -186,7 +195,7 @@ async def test_probe_history_resets_on_recovery(
     record = next(r for r in caplog.records if r.levelno == logging.ERROR)
     failures = json.loads(record.attributes["probe_failures_json"])
     assert len(failures) == 6
-    assert {failure["error"] for failure in failures} == {"persistent failure"}
+    assert {failure["error"] for failure in failures} == {"can't find session: after recovery"}
     assert record.attributes["socket_state"] == "missing"
     assert record.attributes["socket_stat_errno"] == errno.ENOENT
 

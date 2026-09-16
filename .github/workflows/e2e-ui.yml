@@ -254,6 +254,9 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
+      - name: Install Antigravity CLI
+        uses: ./.github/actions/setup-agy
+
       - name: Run UI e2e tests
         # --ui-skip-build: the SPA was built in the previous step.
         # --tracing/--screenshot/--video default to off; retain-on-failure
@@ -270,6 +273,7 @@ jobs:
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
+          OMNIGENT_E2E_ANTIGRAVITY: mock
           # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture
           # uses this instead of running cargo build. Absolute path: the
           # fixture runs with cwd at the repo root but be explicit.
@@ -365,6 +369,8 @@ jobs:
             /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
             /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/server.log
             /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/runner.log
+            /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/server.log
+            /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/runner.log
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
             /tmp/codex-home-dump/**
