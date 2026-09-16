@@ -19,6 +19,7 @@ from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, CallToolResult, ErrorData, ImageContent, TextContent
 from mcp.types import Tool as McpToolDef
 
+from omnigent.debug_logging import SESSION_ID_ENV_VAR
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 from omnigent.tools.mcp import (
     _CIRCUIT_BREAKER_COOLDOWN_SECONDS,
@@ -2615,6 +2616,80 @@ def test_open_stdio_transport_empty_env_inherits_fully() -> None:
     # None tells stdio_client to inherit the parent env as-is —
     # matches its documented behavior.
     assert captured["params"].env is None
+
+
+def test_stdio_env_only_session_stamp_keeps_allowlist_posture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config whose only env entry is the session stamp stays allowlisted.
+
+    The runner stamps ``SESSION_ID_ENV_VAR`` into every stdio config's env
+    overlay (see ``runner/mcp_manager.py``). That stamp must not flip the
+    transport into the full-parent-env branch: a spec author who declared
+    no env gets the SDK allowlist plus the conversation id — and nothing
+    else — so the stamp never widens what the subprocess can read.
+
+    What breaks if this fails: every env-less stdio MCP would silently
+    gain the runner's whole environment the moment a conversation id is
+    disclosed to it.
+    """
+    monkeypatch.setenv("OMNIGENT_TEST_PARENT_MARKER", "must-not-leak")
+    config = _make_stdio_config(env={SESSION_ID_ENV_VAR: "conv_stamp_test"})
+    captured: dict[str, Any] = {}
+
+    def _capture_stdio_client(params: Any) -> Any:
+        captured["params"] = params
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+        return mock_ctx
+
+    conn = McpServerConnection(config=config)
+    with patch("omnigent.tools.mcp.stdio_client", side_effect=_capture_stdio_client):
+        with patch("omnigent.tools.mcp.ClientSession", return_value=_mock_session()):
+            asyncio.run(conn.connect())
+
+    env = captured["params"].env
+    assert env is not None
+    assert env[SESSION_ID_ENV_VAR] == "conv_stamp_test"
+    # Allowlist posture: PATH passes through …
+    assert "PATH" in env
+    # … but the parent env does not.
+    assert "OMNIGENT_TEST_PARENT_MARKER" not in env
+
+
+def test_stdio_env_declared_plus_session_stamp_merges_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declared env keeps the full-parent merge, stamp included.
+
+    An author-declared overlay (e.g. ``GITHUB_TOKEN``) opts the server into
+    the parent-env merge exactly as before; the stamped conversation id
+    rides along with the declared keys.
+    """
+    monkeypatch.setenv("OMNIGENT_TEST_PARENT_MARKER", "parent-visible")
+    config = _make_stdio_config(
+        env={"GITHUB_TOKEN": "ghp_xyz", SESSION_ID_ENV_VAR: "conv_stamp_test"}
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture_stdio_client(params: Any) -> Any:
+        captured["params"] = params
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+        return mock_ctx
+
+    conn = McpServerConnection(config=config)
+    with patch("omnigent.tools.mcp.stdio_client", side_effect=_capture_stdio_client):
+        with patch("omnigent.tools.mcp.ClientSession", return_value=_mock_session()):
+            asyncio.run(conn.connect())
+
+    env = captured["params"].env
+    assert env is not None
+    assert env["GITHUB_TOKEN"] == "ghp_xyz"
+    assert env[SESSION_ID_ENV_VAR] == "conv_stamp_test"
+    assert env["OMNIGENT_TEST_PARENT_MARKER"] == "parent-visible"
 
 
 def _mock_session() -> AsyncMock:

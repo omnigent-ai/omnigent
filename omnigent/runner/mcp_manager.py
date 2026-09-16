@@ -8,14 +8,14 @@ import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import SESSION_ID_ENV_VAR, runner_primary_session_id
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
@@ -121,6 +121,46 @@ class McpSchemasResult:
     schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
+
+
+def _stamp_primary_session_env(
+    configs: list[MCPServerConfig],
+) -> list[MCPServerConfig]:
+    """Expose the runner's primary session id to stdio MCP servers.
+
+    Stdio MCP servers do not inherit the runner's environment: ``env=None``
+    at spawn time hands them the SDK's default allowlist, so a long-lived
+    tool server has no way to learn which conversation it is serving.
+    Stamping ``SESSION_ID_ENV_VAR`` into the stdio env overlay gives such
+    servers (provenance tracking, telemetry, session-scoped caches) a
+    stable conversation attribution — the id the Web UI resolves at
+    ``/c/<id>``.
+
+    Stamping the *config* (rather than the spawn env) is deliberate:
+    ``compute_spec_hash`` and ``compute_server_hash`` both digest
+    ``config.env``, so each primary session owns its own server process
+    and the id is never shared across conversations. The primary
+    (spawn-time) id is used, never a per-subagent turn id: subagent tool
+    calls land on the parent conversation, which is where the attribution
+    belongs. A config that already declares the var keeps its value.
+
+    Applied uniformly at every entry-builder (``prewarm`` /
+    ``schemas_for`` / ``call_tool``) so all paths compute the same hashes
+    and share one stamped connection per conversation. HTTP configs are
+    returned unchanged.
+    """
+    primary = runner_primary_session_id()
+    if not primary:
+        return configs
+    stamped: list[MCPServerConfig] = []
+    for c in configs:
+        if c.transport != "stdio":
+            stamped.append(c)
+            continue
+        env = dict(c.env or {})
+        env.setdefault(SESSION_ID_ENV_VAR, primary)
+        stamped.append(replace(c, env=env))
+    return stamped
 
 
 def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
@@ -406,7 +446,7 @@ class RunnerMcpManager:
         This keeps runner startup cheap when a spec lists many MCPs; the
         first schema lookup or tool call still pays the server cold-start.
         """
-        configs = list(spec.mcp_servers or [])
+        configs = _stamp_primary_session_env(list(spec.mcp_servers or []))
         if not configs:
             return
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
@@ -416,7 +456,7 @@ class RunnerMcpManager:
 
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
         """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
-        configs = list(spec.mcp_servers or [])
+        configs = _stamp_primary_session_env(list(spec.mcp_servers or []))
         if not configs:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
@@ -487,7 +527,7 @@ class RunnerMcpManager:
             an ``InputRequiredResult`` requiring user input before
             the tool can execute.
         """
-        configs = list(spec.mcp_servers or [])
+        configs = _stamp_primary_session_env(list(spec.mcp_servers or []))
         if not configs:
             raise RuntimeError(
                 f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"

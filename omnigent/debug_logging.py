@@ -53,6 +53,16 @@ ENDPOINT_ENV_VAR = "OMNIGENT_DEBUG_LOG_ENDPOINT"
 # runner-level log callsites that have no per-request session id in scope.
 PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 
+# Public conversation-identity contract for child processes. The runner exports
+# the id of the conversation a process serves under this name — to harness
+# children at spawn time and to stdio MCP servers via their env overlay — so
+# long-lived child tooling (provenance, telemetry, session-scoped caches) can
+# attribute its work to the conversation the Web UI resolves at ``/c/<id>``.
+# Distinct from PRIMARY_SESSION_ID_ENV_VAR above: that one is the runner's
+# internal attribution detail (host-set, runner-scoped); this one is the stable
+# name child processes are invited to read.
+SESSION_ID_ENV_VAR = "OMNIGENT_SESSION_ID"
+
 # Authenticated user id (email) attribution. The multi-tenant server sets a
 # request-scoped ContextVar per request; the single-user runner/host set the
 # env var once at startup (a process constant — an env var, not a ContextVar,
