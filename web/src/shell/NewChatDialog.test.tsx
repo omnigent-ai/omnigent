@@ -1647,26 +1647,26 @@ describe("NewChatLandingScreen initial picker loading", () => {
     expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", false);
   });
 
-  it.each([
-    { harness: "cursor-native", label: "Cursor" },
-    { harness: "opencode-native", label: "OpenCode" },
-  ])("does not wait on unrelated model probes for $label", ({ harness, label }) => {
-    mockAgents([
-      {
-        id: "a_no_models",
-        name: `${harness}-ui`,
-        display_name: label,
-        description: null,
-        harness,
-        skills: [],
-      },
-    ]);
-    mockModelQueries(() => pendingModels);
-    renderLanding();
+  it.each([{ harness: "cursor-native", label: "Cursor" }])(
+    "does not wait on unrelated model probes for $label",
+    ({ harness, label }) => {
+      mockAgents([
+        {
+          id: "a_no_models",
+          name: `${harness}-ui`,
+          display_name: label,
+          description: null,
+          harness,
+          skills: [],
+        },
+      ]);
+      mockModelQueries(() => pendingModels);
+      renderLanding();
 
-    expect(expectReadyPicker()).toHaveAccessibleName(new RegExp(label));
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "claude-native", true);
-  });
+      expect(expectReadyPicker()).toHaveAccessibleName(new RegExp(label));
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "claude-native", true);
+    },
+  );
 
   it("waits for project config, pinned agents, and the configured host's model before showing its defaults", () => {
     localStorage.setItem(LAST_AGENT_KEY, "a2");
@@ -3424,10 +3424,13 @@ describe("NewChatLandingScreen", () => {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
 
-      if (["claude", "codex", "pi", "devin"].includes(native.key)) {
+      if (["claude", "codex", "pi", "devin", "opencode"].includes(native.key)) {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
-        expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+        if (native.key !== "opencode") {
+          // opencode's CLI catalog carries no effort ladder — models only.
+          expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+        }
         expect(screen.queryByText("Advanced settings")).toBeNull();
       } else {
         expect(screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`)).toBeNull();
@@ -7125,10 +7128,10 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     mockAgents([
       {
         id: "a_bare",
-        name: "opencode-native-ui",
-        display_name: "OpenCode",
+        name: "goose-native-ui",
+        display_name: "Goose",
         description: null,
-        harness: "opencode-native",
+        harness: "goose-native",
         skills: [],
       },
     ]);

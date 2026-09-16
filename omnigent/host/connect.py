@@ -3080,6 +3080,35 @@ class HostProcess:
                 ),
                 routable_models=[model.id for model in listing.models],
             )
+        if harness == "opencode-native":
+            # Preview the ambient `opencode models` catalog on the host, same
+            # CLI listing the runner serves per session. A probe that cannot
+            # run (no opencode binary / no login) is a failed lookup, not an
+            # empty catalog — mirroring the codex lane.
+            #
+            # The listing runs under a scratch HOME that inherits only the
+            # user's OpenCode credentials (auth.json): user plugins and global
+            # config hooks (which can swallow the CLI's stdout) must not be
+            # able to blank the picker.
+            try:
+                from omnigent.harnesses.opencode_native.app_server import (
+                    list_opencode_cli_model_options_isolated,
+                )
+
+                opencode_models = await asyncio.to_thread(list_opencode_cli_model_options_isolated)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch OpenCode model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve OpenCode model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(opencode_models),
+            )
+
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
