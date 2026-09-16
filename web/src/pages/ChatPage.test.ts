@@ -110,6 +110,38 @@ describe("Composer structural read-only reasons", () => {
     ).toBe("Claude Code sub-agents are read-only");
   });
 
+  it("gives a sealed codex /side child its own reason, not the generic one", () => {
+    // Server seals a dead side chat with omnigent.closed; the "Side chat"
+    // nickname distinguishes it from an ordinary closed codex sub-agent.
+    expect(
+      readOnlyReasonForSessionLabels(
+        {
+          labels: {
+            "omnigent.closed": "true",
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+          },
+        },
+        null,
+      ),
+    ).toBe("This side chat has ended and can't receive new messages");
+  });
+
+  it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {
+    expect(
+      readOnlyReasonForSessionLabels(
+        {
+          labels: {
+            "omnigent.closed": "true",
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "reviewer",
+          },
+        },
+        null,
+      ),
+    ).toBe("This sub-agent session is closed");
+  });
+
   it("returns null for editable sessions without structural labels", () => {
     expect(readOnlyReasonForSessionLabels({ labels: {} }, { labels: {} })).toBeNull();
   });
@@ -1129,6 +1161,23 @@ describe("subAgentComposerLabel", () => {
     expect(subAgentComposerLabel(mkSession({ title: "researcher:auth:v2" }))).toBe("auth:v2");
   });
 
+  it("shows the Codex nickname label instead of the thread-UUID title suffix", () => {
+    // A Codex /side child titles as "codex-native-ui-subagent:<uuid>"; the tray
+    // must show the friendly nickname, never the raw thread UUID.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "codex-native-ui-subagent:01a0a211-5fa2-7922-8b5b-503d8c3dc1a1",
+          subAgentName: "Codex",
+          labels: {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+          },
+        }),
+      ),
+    ).toBe("Side chat");
+  });
+
   it("strips the user-added 'ui:' sentinel before taking the suffix", () => {
     expect(subAgentComposerLabel(mkSession({ title: "ui:claude_code:my-task" }))).toBe("my-task");
   });
@@ -1296,12 +1345,23 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw is gated off by default (claude-native only), so it's excluded here.
+    // /btw (claude-native) and /side (codex-native) are gated off by default,
+    // so both are excluded here.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /side only when showSide is true (codex-native)", () => {
+    // Off by default and when explicitly false — /side is a codex-native
+    // built-in, so it must not leak into other harnesses' menus.
+    expect(buildSlashCommandMap([], true, true)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, true)["/side"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/side"],
+    );
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -1361,9 +1421,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw is gated off by default.
+    // surfaces built-ins above user skills. /btw and /side are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
       "/triage-issues",
       "/mlflow-bug",
     ]);

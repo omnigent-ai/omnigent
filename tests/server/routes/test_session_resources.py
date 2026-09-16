@@ -3700,6 +3700,9 @@ class _FakeStreamCtx:
         """Exit the context without suppressing exceptions."""
         return False
 
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
     async def aiter_text(self) -> AsyncIterator[str]:
         """Yield each configured SSE frame string in order."""
         for frame in self._frames:
@@ -3761,6 +3764,9 @@ class _ScriptedStreamCtx:
     async def __aexit__(self, *exc: object) -> bool:
         """Exit the context without suppressing exceptions."""
         return False
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         """Yield frame steps in order, running callable steps in between."""

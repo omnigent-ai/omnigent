@@ -176,7 +176,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
+from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -187,6 +187,9 @@ from omnigent.tools.builtins.load_skill import (
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+# Allow process termination and forwarder cleanup to finish before DELETE proceeds.
+_SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
@@ -1843,6 +1846,27 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+# Harness whose sub-agents live as threads inside the parent's own app-server.
+_CODEX_NATIVE_HARNESS = "codex-native"
+
+
+def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
+    """
+    Whether a child's wrapper label marks it a codex-native sub-agent.
+
+    Covers both a codex-spawned sub-agent and a ``/side`` side chat: each is a
+    thread inside the parent's own app-server, so codex consumes its result in
+    the thread tree and the parent is never waiting on the Omnigent inbox for it.
+
+    :param wrapper_label: The child's ``omnigent.wrapper`` label, or ``None``.
+    :returns: ``True`` when the child is a codex-native sub-agent.
+    """
+    if wrapper_label is None:
+        return False
+    agent = native_coding_agent_for_harness(_CODEX_NATIVE_HARNESS)
+    return agent is not None and wrapper_label == agent.subagent_wrapper_label
+
+
 def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
     """
     Return the dispatch id of a child turn whose result the parent never drained.
@@ -1859,6 +1883,25 @@ def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None
     if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
         return None
     return dispatch_id
+
+
+def _side_chat_text_from_content(content: object) -> str:
+    """
+    Join user text from message content blocks for a Codex ``/side`` follow-up.
+
+    :param content: A message body's ``content`` list, e.g.
+        ``[{"type": "input_text", "text": "and why?"}]``.
+    :returns: The concatenated text, or ``""`` when there is none.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts).strip()
 
 
 class _SubagentRecoveryReadError(Exception):
@@ -2682,11 +2725,8 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
-# How long a session's discovered skills stay cached before the runner
-# re-walks the filesystem. Short enough that a skill or plugin installed
-# mid-session surfaces in the composer menu without a session restart, long
-# enough to collapse the bursty menu-open + per-invocation resolve calls onto
-# a single walk. Module-level so it can be tuned/patched in one place.
+# Repeated invocations share a filesystem scan; installed skills become
+# resolvable after at most one minute without restarting the runner.
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 _SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
 
@@ -3872,7 +3912,14 @@ def create_runner_app(
                     spec_entry = _sub_entry
                     spec = _unwrap_resolved_spec(_sub_entry)
                     _session_sub_agent_resolved[session_id] = True
-            harness_name = spec.executor.config.get("harness") or spec.executor.type
+            # The session's override outranks the spec: resolving from the spec
+            # alone made init spawn a harness the turns never ask for, evicting
+            # the override's live subprocess (entries are keyed by conversation).
+            harness_name = (
+                _session_harness_overrides.get(session_id)
+                or spec.executor.config.get("harness")
+                or spec.executor.type
+            )
             harness_name = canonicalize_harness(harness_name) or harness_name
 
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
@@ -4531,6 +4578,32 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        # Stop initialization before it can recreate resources during teardown.
+        init_tasks = [
+            task
+            for key, task in list(_session_init_tasks.items())
+            if key[0] == session_id and not task.done()
+        ]
+        for init_task in init_tasks:
+            init_task.cancel()
+        if init_tasks:
+            # Bound cleanup time; log init failures so resource teardown still runs.
+            _finished, pending = await asyncio.wait(
+                set(init_tasks), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+            )
+            if pending:
+                _logger.warning(
+                    "Cancelled session init for %s did not finish within %.0fs",
+                    session_id,
+                    _SESSION_INIT_CANCEL_TIMEOUT_S,
+                )
+            for done_task in _finished:
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    _logger.warning(
+                        "Session init for %s failed while being cancelled: %r",
+                        session_id,
+                        done_task.exception(),
+                    )
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
@@ -4560,6 +4633,8 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
+        # Close any OpenCode server that no forwarder adopted.
+        await _native_runtime.teardown_opencode_native_server(session_id)
 
         if process_manager is not None:
             await process_manager.forward_cancel(session_id)
@@ -5284,6 +5359,28 @@ def create_runner_app(
             )
             return None
         return state
+
+    async def _codex_native_bridge_dir_for_session(conv_id: str) -> Path:
+        """
+        Bridge directory for a codex-native session.
+
+        Same resolution as :func:`_codex_native_bridge_state_for_session` — the
+        bridge id label when present, else the conversation id — so a request
+        written here lands in the directory the forwarder polls.
+
+        :param conv_id: Conversation id, e.g. ``"conv_abc123"``.
+        :returns: The session's bridge directory.
+        """
+        from omnigent.harnesses.codex_native.bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+        )
+
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        return bridge_dir_for_bridge_id(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id)
 
     codex_goal_runner = CodexGoalRunner(
         bridge_state_for_session=_codex_native_bridge_state_for_session,
@@ -7444,6 +7541,16 @@ def create_runner_app(
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
+        # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
+        # thread in the parent's own app-server, so its completion is not the
+        # parent's to collect — waking the parent would inject an inbox notice
+        # into a chat the user is reading. The wrapper label is only set by the
+        # spawn-tool path, so a forwarder-registered child is caught by the
+        # parent's harness instead.
+        if is_codex_native_subagent_wrapper(entry.wrapper_label) or (
+            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
+        ):
+            return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
             return
@@ -7926,8 +8033,14 @@ def create_runner_app(
         instructions: str | None = None
         _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
         if cached_spec is not None:
+            # The session's recorded override outranks the spec (mirrors
+            # _initialize_session): the native terminal forward carries no
+            # per-event harness_override, so resolving from the body alone
+            # dropped a later turn back onto the spec's harness and evicted
+            # the override harness mid-session.
             h = (
-                cast(str | None, msg_body.get("harness_override"))
+                _session_harness_overrides.get(conv)
+                or cast(str | None, msg_body.get("harness_override"))
                 or cached_spec.executor.config.get("harness")
                 or cached_spec.executor.type
             )
@@ -8314,7 +8427,13 @@ def create_runner_app(
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
                     model_override=cast(str | None, body.get("model_override")),
-                    harness_override=cast(str | None, body.get("harness_override")),
+                    # Session-recorded override first (the note above already
+                    # folded in any body value): a body without one must not
+                    # drop the turn back onto the spec's harness.
+                    harness_override=(
+                        _session_harness_overrides.get(conv_id)
+                        or cast(str | None, body.get("harness_override"))
+                    ),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
                 )
@@ -9076,6 +9195,72 @@ def create_runner_app(
             body.get("model_override") if isinstance(body, dict) else None,
             extra={"session_id": conversation_id},
         )
+        _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
+        if _side_thread_id:
+            # Codex /side follow-up: the server redirected a side-chat child's
+            # message here (this endpoint's conversation_id is the PARENT), tagged
+            # with the child Codex thread id. Drive it on that thread via the
+            # parent's bridge, isolated from the parent's turn buffer/active-turn
+            # state on purpose so the main conversation is untouched.
+            from omnigent.harnesses.codex_native import side_chat
+            from omnigent.harnesses.codex_native.app_server import client_for_transport
+
+            _side_text = _side_chat_text_from_content(
+                body.get("content") if isinstance(body, dict) else None
+            )
+            if not _side_text:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "side chat message had no text",
+                    },
+                )
+            _side_state = await _codex_native_bridge_state_for_session(
+                conversation_id, action="side chat turn"
+            )
+            if _side_state is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_no_bridge",
+                        "detail": "Codex /side follow-up requires a loaded parent Codex bridge.",
+                    },
+                )
+            _side_client = client_for_transport(
+                _side_state.socket_path, client_name="omnigent-codex-native-runner"
+            )
+            try:
+                await _side_client.connect()
+                await side_chat.submit_side_turn(_side_client, str(_side_thread_id), _side_text)
+            finally:
+                await _side_client.close()
+            return Response(status_code=202)
+        if body_type == "message" and isinstance(body, dict):
+            # A codex /side command opens a side chat; it must not run a turn
+            # here. Starting one publishes a "running" edge for this session,
+            # and the fork's settling edges belong to the child — idle is
+            # forwarder-owned for codex-native — so nothing would ever clear it
+            # and the chat would sit on "Working…" for good.
+            from omnigent.harnesses.codex_native import side_chat as _side_chat
+
+            _side_question = _side_chat.side_chat_question_from_text(
+                _side_chat_text_from_content(body.get("content"))
+            )
+            if (
+                _side_question is not None
+                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+            ):
+                _side_chat.request_side_chat(
+                    await _codex_native_bridge_dir_for_session(conversation_id),
+                    _side_question,
+                )
+                _logger.info(
+                    "Codex /side recorded without starting a turn: conv=%s",
+                    conversation_id,
+                    extra={"session_id": conversation_id},
+                )
+                return Response(status_code=202)
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
                 return JSONResponse(
@@ -11020,58 +11205,14 @@ def create_runner_app(
         if not roots:
             roots.append(Path.cwd())
 
-        def _discover() -> list[SkillSpec]:
-            merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
-            seen = {s.name for s in spec.skills}
-            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
-            harness = canonicalize_harness(spec.executor.harness_kind)
-            # Claude Code resolves its user scope from $CLAUDE_CONFIG_DIR
-            # (default ~/.claude); the terminal inherits this env, so the
-            # menu must read the same tier or the two surfaces diverge.
-            configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-            # Native Codex honors $CODEX_HOME for its skills; resolve the same
-            # host home the launch seeds from so the menu matches the terminal
-            # (only the native provider reads it — see codex_host_skills).
-            codex_home: Path | None = None
-            if harness is not None and "codex" in harness:
-                from omnigent.inner.codex_executor import _codex_home_config_source_from_env
-
-                codex_home = _codex_home_config_source_from_env()
-            ctx = SkillSourceContext(
-                roots=tuple(roots),
-                home=Path.home(),
-                skills_filter=spec.skills_filter,
-                bundle_dir=_resolved_spec_workdir(entry),
-                claude_config_dir=(
-                    Path(configured_claude_dir).expanduser() if configured_claude_dir else None
-                ),
-                codex_home=codex_home,
-            )
-            for hs in resolve_harness_skills(ctx, harness):
-                if hs.name in seen:
-                    continue
-                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
-                    continue
-                seen.add(hs.name)
-                if hs.skill_dir is not None:
-                    seen_dirs.add(hs.skill_dir.resolve())
-                merged.append(hs)
-            return merged
-
-        skills = await asyncio.to_thread(_discover)
+        skills = await asyncio.to_thread(
+            resolve_session_skills, spec, tuple(roots), _resolved_spec_workdir(entry)
+        )
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
             skills,
         )
         return skills
-
-    @app.get("/v1/sessions/{session_id}/skills")
-    async def get_session_skills(session_id: str) -> JSONResponse:
-        skills = await _resolve_session_skills(session_id)
-        return JSONResponse(
-            status_code=200,
-            content={"skills": [{"name": s.name, "description": s.description} for s in skills]},
-        )
 
     @app.get("/v1/sessions/{session_id}/models")
     async def get_session_models(session_id: str) -> JSONResponse:
@@ -12708,6 +12849,12 @@ def _build_spawn_env_from_spec(
                 return None
     except ImportError:
         return None
+
+    if env is not None:
+        from omnigent.inner.agent_env import desktop_session_passthrough, strip_desktop_session_env
+
+        env = strip_desktop_session_env(env)
+        env.update(desktop_session_passthrough(effective_spec.os_env))
 
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a

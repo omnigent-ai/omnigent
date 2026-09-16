@@ -45,7 +45,6 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
-    SkillSummary,
 )
 from omnigent.spec.types import (
     StateUpdate,
@@ -112,8 +111,11 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
+# "quiesced": the claude-native sub-agent transcript-quiescence badge — a
+# UI signal only, never a terminal edge (the runner must not deliver a
+# parent-inbox completion from it).
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed"}
+    {"idle", "running", "waiting", "failed", "quiesced"}
 )
 
 
@@ -616,21 +618,6 @@ _session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup
 )
 
 
-_runner_skills_cache: WorkspaceScopedCache[str, list[SkillSummary]] = WorkspaceScopedCache()
-
-
-_runner_skills_failed: WorkspaceScopedSet[str] = WorkspaceScopedSet()
-
-
-# Sessions whose cached skills need a re-fetch but should keep serving until it
-# lands. A browser reload asks for one, and dropping the entry outright would
-# empty the composer's slash-command menu for the reload that requested it.
-_runner_skills_stale: WorkspaceScopedSet[str] = WorkspaceScopedSet()
-
-
-_runner_skills_inflight: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
-
-
 _model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
 
 
@@ -1129,9 +1116,6 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
-    "_runner_skills_cache",
-    "_runner_skills_inflight",
-    "_runner_skills_stale",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

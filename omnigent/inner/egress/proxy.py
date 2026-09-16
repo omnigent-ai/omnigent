@@ -28,12 +28,12 @@ import base64
 import binascii
 import contextlib
 import email.policy
-import functools
 import hmac
 import ipaddress
 import logging
 import socket
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass
 from email.message import Message
 from email.parser import BytesParser
@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
+    CredentialSourceUnavailable,
 )
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.rules import (
@@ -115,12 +116,14 @@ class _AuthRewriteResult:
         when a synthetic placeholder matched, otherwise the input bytes
         unchanged.
     :param error: A human-readable reason to reject the request with
-        ``403`` (a placeholder was sent to the wrong host or is unknown),
+        ``403`` (placeholder misuse) or ``502`` (credential source failure),
         or ``None`` when the request may proceed.
+    :param status_code: HTTP error status when ``error`` is set.
     """
 
     headers: bytes
     error: str | None
+    status_code: int = 403
 
 
 # S2 (security): CSP-internal endpoints that present as globally
@@ -255,6 +258,7 @@ class EgressProxy:
         #   placeholder may intentionally serve several configured hosts.
         self._cred_by_host: dict[str, CredentialRewriteRule] = {}
         self._cred_by_synthetic: dict[str, dict[str, CredentialRewriteRule]] = {}
+        self._credential_resolutions: dict[tuple[int, int], asyncio.Future[str]] = {}
         for rule in credential_rewrites or []:
             host = rule.host.lower()
             self._cred_by_host[host] = rule
@@ -807,6 +811,9 @@ class EgressProxy:
             method=method, host=host, headers_raw=headers_raw
         )
         if rewrite.error is not None:
+            if rewrite.status_code == 502:
+                await self._send_bad_gateway(client_writer, rewrite.error)
+                return
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
             )
@@ -962,6 +969,9 @@ class EgressProxy:
             method=method, host=host, headers_raw=headers_raw
         )
         if rewrite.error is not None:
+            if rewrite.status_code == 502:
+                await self._send_bad_gateway(writer, rewrite.error)
+                return
             logger.warning(
                 "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, rewrite.error
             )
@@ -1234,12 +1244,9 @@ class EgressProxy:
         """
         Async wrapper around :meth:`_rewrite_authorization`.
 
-        A refreshing credential source (e.g. a Databricks OAuth profile)
-        may re-mint a token via a blocking SDK/CLI call when its throttle
-        window elapses. That would stall the proxy's event loop, so the
-        rewrite runs in the default executor. The common case — no
-        credential rules configured — short-circuits inline with no
-        executor hop.
+        Resolve matching secrets off-loop. Concurrent requests share one
+        in-flight resolution per provider, including its failure; waiting
+        requests do not occupy executor threads.
 
         :param method: HTTP method (case-insensitive), e.g. ``"GET"``.
         :param host: Upstream request host (case-insensitive).
@@ -1248,16 +1255,63 @@ class EgressProxy:
         """
         if not self._cred_by_host:
             return _AuthRewriteResult(headers=headers_raw, error=None)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            functools.partial(
-                self._rewrite_authorization, method=method, host=host, headers_raw=headers_raw
-            ),
+        pending: dict[int, CredentialRewriteRule] = {}
+
+        def defer_auth(rule: CredentialRewriteRule) -> str:
+            pending[id(rule)] = rule
+            return ""
+
+        result = self._rewrite_authorization(
+            method=method, host=host, headers_raw=headers_raw, format_auth=defer_auth
         )
+        if result.error is not None or not pending:
+            return result
+        try:
+            auth_values = {
+                key: self._format_real_auth(rule, secret=await self._resolve_credential(rule))
+                for key, rule in pending.items()
+            }
+            return self._rewrite_authorization(
+                method=method,
+                host=host,
+                headers_raw=headers_raw,
+                format_auth=lambda rule: auth_values[id(rule)],
+            )
+        except CredentialSourceUnavailable:
+            logger.warning("CREDENTIAL-REFRESH-FAILED %s %s", method, host)
+            return _AuthRewriteResult(
+                headers=b"", error="Credential source unavailable", status_code=502
+            )
+
+    async def _resolve_credential(self, rule: CredentialRewriteRule) -> str:
+        provider = rule.secret_provider
+        if provider is None:
+            return rule.resolve_secret()
+        key = (
+            id(getattr(provider, "__self__", provider)),
+            id(getattr(provider, "__func__", None)),
+        )
+        future = self._credential_resolutions.get(key)
+        if future is None:
+            future = asyncio.get_running_loop().run_in_executor(None, rule.resolve_secret)
+            self._credential_resolutions[key] = future
+
+            def completed(result: asyncio.Future[str]) -> None:
+                if self._credential_resolutions.get(key) is result:
+                    self._credential_resolutions.pop(key)
+                if not result.cancelled():
+                    result.exception()
+
+            future.add_done_callback(completed)
+        return await asyncio.shield(future)
 
     def _rewrite_authorization(
-        self, *, method: str, host: str, headers_raw: bytes
+        self,
+        *,
+        method: str,
+        host: str,
+        headers_raw: bytes,
+        format_auth: Callable[[CredentialRewriteRule], str] | None = None,
     ) -> _AuthRewriteResult:
         """
         Attach the real credential to a bound-host request.
@@ -1302,6 +1356,7 @@ class EgressProxy:
         if not self._cred_by_host:
             return _AuthRewriteResult(headers=headers_raw, error=None)
 
+        format_auth = format_auth or self._format_real_auth
         host_key = host.lower()
         host_rule = self._cred_by_host.get(host_key)
         msg = _parse_http_headers(headers_raw)
@@ -1327,7 +1382,7 @@ class EgressProxy:
                         headers=headers_raw,
                         error="synthetic credential is not allowed for this host",
                     )
-                rewritten.append(self._format_real_auth(rule))
+                rewritten.append(format_auth(rule))
                 changed = True
             if changed:
                 del msg["Authorization"]
@@ -1336,7 +1391,7 @@ class EgressProxy:
         elif host_rule is not None:
             # Swap-on-access: the request reached a bound host with no
             # Authorization header, so attach the real credential now.
-            msg["Authorization"] = self._format_real_auth(host_rule)
+            msg["Authorization"] = format_auth(host_rule)
             changed = True
         if not changed:
             # Nothing matched — forward the client's bytes untouched rather
@@ -1376,7 +1431,7 @@ class EgressProxy:
         return candidate if candidate.startswith(SYNTHETIC_CREDENTIAL_PREFIX) else None
 
     @staticmethod
-    def _format_real_auth(rule: CredentialRewriteRule) -> str:
+    def _format_real_auth(rule: CredentialRewriteRule, *, secret: str | None = None) -> str:
         """
         Format the real ``Authorization`` value for a matched rule.
 
@@ -1393,7 +1448,7 @@ class EgressProxy:
             ``"Basic <base64(username:real)>"``.
         :raises ValueError: If the rule carries an unsupported scheme.
         """
-        real_secret = rule.resolve_secret()
+        real_secret = rule.resolve_secret() if secret is None else secret
         if rule.scheme == "bearer":
             return f"Bearer {real_secret}"
         if rule.scheme == "token":

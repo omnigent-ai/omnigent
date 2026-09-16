@@ -1,3 +1,6 @@
+import { create } from "zustand";
+import type { SkillSummary, SkillsStatus } from "@/lib/types";
+
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -10,7 +13,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore } from "@/store/chatStore";
+import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -114,7 +117,7 @@ import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, shouldQueueSend } from "./ChatPage";
-import type { QueuedMessage } from "@/store/chatStore";
+import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -388,7 +391,7 @@ describe("Composer send shortcut", () => {
   beforeEach(() => {
     localStorage.clear();
     clearSessionDrafts();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_shortcut",
       skills: [{ name: "deslop", description: "Remove AI slop" }],
     });
@@ -563,7 +566,7 @@ describe("Composer slash-command menu", () => {
     // Skills fill the textarea (with a trailing space) on selection rather
     // than executing, which lets us assert the completed value directly
     // without invoking store actions like compact().
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
@@ -721,7 +724,7 @@ describe("Composer slash-command submit routing", () => {
   const realSetModel = useChatStore.getState().setModel;
 
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
@@ -1268,7 +1271,7 @@ describe("Composer cached model labels", () => {
     composerSnapshotHost.id = scope.hostId;
     vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
-    useChatStore.setState({
+    setComposerState({
       conversationId: scope.sessionId,
       sessionHostId: scope.hostId,
       boundAgentId: scope.agentId,
@@ -1394,7 +1397,7 @@ describe("Composer cached model labels", () => {
 
 describe("Composer model/effort label", () => {
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       selectedModel: null,
@@ -1966,7 +1969,7 @@ describe("Composer shared visible controls", () => {
 
 describe("Composer effort slash-command visibility", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
 
   afterEach(() => {
@@ -2068,7 +2071,7 @@ describe("Composer Codex Plan-mode control", () => {
   const realSetCodexPlanMode = useChatStore.getState().setCodexPlanMode;
 
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       codexPlanMode: false,
       skills: [],
@@ -2183,7 +2186,7 @@ describe("rankedSlashCommandNames", () => {
 describe("Composer native skill menu", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_skill_menu",
       sessionHarness: "codex-native",
       skills: [{ name: "review", description: "Review the current change" }],
@@ -2193,7 +2196,7 @@ describe("Composer native skill menu", () => {
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
-    useChatStore.setState({ sessionHarness: null, skills: [], skillsStatus: null });
+    setComposerState({ sessionHarness: null, skills: [], skillsStatus: null });
   });
 
   it.each([
@@ -2253,7 +2256,7 @@ describe("Composer native skill menu", () => {
 describe("Composer asynchronous skills", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_loading_skills",
       skills: [],
       skillsStatus: "loading",
@@ -2263,7 +2266,7 @@ describe("Composer asynchronous skills", () => {
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
-    useChatStore.setState({ skills: [], skillsStatus: null, terminalPending: false });
+    setComposerState({ skills: [], skillsStatus: null, terminalPending: false });
     vi.useRealTimers();
   });
 
@@ -2271,7 +2274,7 @@ describe("Composer asynchronous skills", () => {
     { runnerStarting: true, terminalPending: false },
     { runnerStarting: false, terminalPending: true },
   ])("waits for skills while the session starts: %j", ({ runnerStarting, terminalPending }) => {
-    useChatStore.setState({ skillsStatus: "unavailable", terminalPending });
+    setComposerState({ skillsStatus: "unavailable", terminalPending });
     const props = composerProps({ runnerStarting });
     render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "/review" } });
@@ -2280,7 +2283,7 @@ describe("Composer asynchronous skills", () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).not.toHaveBeenCalled();
     act(() =>
-      useChatStore.setState({
+      setComposerState({
         skills: [{ name: "code-review", description: "Review code" }],
         skillsStatus: "ready",
       }),
@@ -2291,7 +2294,7 @@ describe("Composer asynchronous skills", () => {
   });
 
   it("stops showing startup loading when the runner stays disconnected", () => {
-    useChatStore.setState({ skillsStatus: "unavailable" });
+    setComposerState({ skillsStatus: "unavailable" });
     const props = composerProps({ runnerStarting: true });
     const { rerender } = render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
@@ -2302,7 +2305,7 @@ describe("Composer asynchronous skills", () => {
   });
 
   it("shows discovery errors even when the session is still starting", () => {
-    useChatStore.setState({ skillsStatus: "error" });
+    setComposerState({ skillsStatus: "error" });
     render(<Composer {...composerProps({ runnerStarting: true })} />);
     fireEvent.change(textarea(), { target: { value: "/review" } });
     expect(screen.queryByText("Loading skills…")).toBeNull();
@@ -2319,32 +2322,12 @@ describe("Composer asynchronous skills", () => {
     expect(screen.queryByText("Loading skills…")).toBeNull();
   });
 
-  it("recovers a missed notification once without polling while discovery stays loading", async () => {
-    vi.useFakeTimers();
-    const original = useChatStore.getState().refreshSkills;
-    const refreshSkills = vi.fn(async () => {
-      await Promise.resolve();
-      useChatStore.setState({ skills: [], skillsStatus: "loading" });
-    });
-    useChatStore.setState({ refreshSkills });
-    try {
-      render(<Composer {...composerProps()} />);
-      fireEvent.change(textarea(), { target: { value: "/review" } });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(5_000);
-      });
-      expect(refreshSkills).toHaveBeenCalledExactlyOnceWith(false);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(15_000);
-      });
-      expect(refreshSkills).toHaveBeenCalledOnce();
-      act(() => useChatStore.setState({ skillsStatus: "ready" }));
-      act(() => vi.advanceTimersByTime(5_000));
-      expect(refreshSkills).toHaveBeenCalledOnce();
-    } finally {
-      cleanup();
-      useChatStore.setState({ refreshSkills: original });
-    }
+  it("retries the host catalog directly", () => {
+    setComposerState({ skillsStatus: "error" });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/review" } });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(skillsFixture.getState().refetch).toHaveBeenCalledOnce();
   });
 
   it("preserves the highlighted command when skills arrive", () => {
@@ -2353,7 +2336,7 @@ describe("Composer asynchronous skills", () => {
     fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     const selected = activeRow()?.textContent;
     act(() =>
-      useChatStore.setState({
+      setComposerState({
         skills: [{ name: "review", description: "Review code" }],
         skillsStatus: "ready",
       }),
@@ -2373,7 +2356,7 @@ describe("Composer asynchronous skills", () => {
     expect(props.onSend).not.toHaveBeenCalled();
     expect(textarea()).toHaveValue("/review");
     act(() =>
-      useChatStore.setState({
+      setComposerState({
         skills: [{ name: "code-review", description: "Review code" }],
         skillsStatus: "ready",
       }),
@@ -2467,7 +2450,7 @@ describe("SlashCommandMenu", () => {
 // regression where the WHOLE draft tints (not just the token) is caught.
 describe("Composer slash-command highlight overlay", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
   afterEach(() => cleanup());
 
@@ -2618,7 +2601,7 @@ describe("Composer pending elicitation", () => {
   }
 
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
 
   afterEach(() => {
@@ -2700,7 +2683,7 @@ describe("Composer reply quotes", () => {
   beforeEach(() => {
     clearSessionDrafts();
     localStorage.clear();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       blocks: [],
@@ -3165,6 +3148,91 @@ describe("Composer reply quotes", () => {
   });
 });
 
+describe("Composer startSideChat (text-select → Ask in side chat)", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      queuedMessages: [],
+      sessionHarness: "codex-native",
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    vi.restoreAllMocks();
+  });
+
+  it("adds the selection as a quote card and flags it a side chat", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+
+    act(() => ref.current?.startSideChat("restore the row on failure"));
+
+    // Renders exactly like a reply quote (card + empty tail input), plus the
+    // side-chat hint so the user knows this will fork.
+    expect(textarea()).toHaveValue("");
+    expect(
+      screen.getByTestId("composer-reply-quote").querySelector("blockquote"),
+    ).toHaveTextContent("restore the row on failure");
+    expect(screen.getByTestId("composer-side-chat-hint")).toBeInTheDocument();
+  });
+
+  it("sends as a /side command carrying the quoted selection and the question", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...props} ref={ref} />);
+
+    act(() => ref.current?.startSideChat("restore the row on failure"));
+    fireEvent.change(textarea(), { target: { value: "why is this safe?" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    // Prefixed with /side so the existing pipeline forks it; no reply-draft
+    // snapshot (a side chat keeps no main-chat bubble).
+    expect(props.onSend).toHaveBeenCalledWith(
+      "/side > restore the row on failure\n\nwhy is this safe?",
+      undefined,
+    );
+    expect(textarea()).toHaveValue("");
+  });
+
+  it("falls back to a normal reply when the harness has no side chat", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...props} ref={ref} />);
+
+    act(() => ref.current?.startSideChat("some selection"));
+    fireEvent.change(textarea(), { target: { value: "a question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    // No /side prefix; sends as an ordinary quoted reply with its snapshot.
+    expect(props.onSend).toHaveBeenCalledWith("> some selection\n\na question", undefined, {
+      version: 1,
+      quotes: [{ before: "", text: "some selection" }],
+      text: "a question",
+    });
+  });
+
+  it.each([
+    { disabled: true },
+    { permissionLevel: 1 },
+    { readOnlyReason: "Read-only session" },
+    { unreachable: true },
+  ])("does nothing on a disabled composer: %j", (overrides) => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps(overrides)} ref={ref} />);
+    act(() => ref.current?.startSideChat("selected text"));
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+  });
+});
+
 // Attaching a file via the paperclip button routes through the hidden file
 // <input>, whose click (and the OS file dialog) pulls focus off the composer.
 // The change handler must hand focus back so the user can keep typing the
@@ -3172,7 +3240,7 @@ describe("Composer reply quotes", () => {
 // the next keystroke does nothing until the chat box is clicked again.
 describe("Composer file-attachment focus", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
     // Drafts persist per conversation: without this, a file attached by one
     // test is restored into the next one's composer.
     clearSessionDrafts();
@@ -3298,7 +3366,7 @@ describe("Composer file-attachment focus", () => {
 // sub-agent so the composer reads as messaging the child, not the orchestrator.
 describe("Composer sub-agent tray", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
   });
 
   afterEach(() => {
@@ -3331,6 +3399,22 @@ describe("Composer sub-agent tray", () => {
     expect(screen.getByText("check-account-eligibility")).toBeTruthy();
     expect(screen.getByText(/Chatting with sub-agent/)).toBeTruthy();
   });
+
+  // The sub-agent tray sits directly above the workspace bar, sharing its
+  // column wrapper and inset so their edges line up.
+  it("sits directly above the workspace bar, sharing its column", () => {
+    render(<Composer {...composerProps({ subAgentLabel: "check-account-eligibility" })} />);
+    const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
+    expect(bar).not.toBeNull();
+    expect(tray()?.nextElementSibling).toBe(bar);
+    expect(tray()?.parentElement).toBe(bar?.parentElement);
+  });
+
+  it("keeps the workspace bar's rounded top on a top-level session (no tray)", () => {
+    render(<Composer {...composerProps()} />);
+    const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
+    expect(bar?.className).not.toContain("rounded-t-none");
+  });
 });
 
 // The trays peeking above the composer (queued strip, sub-agent tray) dock
@@ -3355,7 +3439,7 @@ describe("Composer trays dock onto the workspace bar", () => {
   }
 
   it("renders the queued strip inside the workspace bar's column wrapper", () => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
@@ -3369,7 +3453,7 @@ describe("Composer trays dock onto the workspace bar", () => {
   });
 
   it("renders the sub-agent tray inside the workspace bar's column wrapper", () => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    setComposerState({ conversationId: "conv_test", skills: [] });
     render(<Composer {...composerProps({ subAgentLabel: "check-account-eligibility" })} />);
     const tray = document.querySelector('[data-testid="composer-subagent-tray"]');
     expect(tray).not.toBeNull();
@@ -3419,9 +3503,215 @@ describe("Composer — queued-message flush gating", () => {
   });
 });
 
+describe("Composer — ArrowUp edit of a queued message", () => {
+  const CONV = "conv_uparrow_edit";
+  const QUEUED_TEXT = "queued follow-up recalled for editing";
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    // A running turn keeps the flush effect from draining the queue while
+    // the test drives the recall-edit journey.
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [{ queueId: "q_1", text: QUEUED_TEXT, conversationId: CONV }],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ queuedMessages: [] });
+    // Drop the prompt-history keys these tests seeded.
+    for (let i = window.localStorage.length - 1; i >= 0; i--) {
+      const key = window.localStorage.key(i);
+      if (key?.startsWith("omnigent:prompt-history")) window.localStorage.removeItem(key);
+    }
+  });
+
+  it("dequeues the recalled message so re-sending can't duplicate it", async () => {
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    renderWithTooltips(<Composer {...props} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    fireEvent.change(textarea(), { target: { value: `${QUEUED_TEXT} edited` } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: `${QUEUED_TEXT} edited`, conversationId: CONV }),
+    ]);
+  });
+
+  it.each([true, false])(
+    "recalls the remaining queue after clearing the first recall (history present: %s)",
+    (withHistory) => {
+      useChatStore.setState({
+        queuedMessages: [
+          { queueId: "q_first", text: "First follow-up", conversationId: CONV },
+          { queueId: "q_last", text: QUEUED_TEXT, conversationId: CONV },
+          { queueId: "q_other", text: "Other chat", conversationId: "conv_other" },
+        ],
+      });
+      if (withHistory) {
+        appendPromptHistoryEntry("First follow-up", CONV);
+        appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+      }
+      renderWithTooltips(<Composer {...composerProps()} />);
+
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+      expect(textarea()).toHaveValue(QUEUED_TEXT);
+      expect(useChatStore.getState().queuedMessages.map((message) => message.queueId)).toEqual([
+        "q_first",
+        "q_other",
+      ]);
+
+      fireEvent.change(textarea(), { target: { value: "" } });
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+      expect(textarea()).toHaveValue("First follow-up");
+      expect(useChatStore.getState().queuedMessages.map((message) => message.queueId)).toEqual([
+        "q_other",
+      ]);
+    },
+  );
+
+  it("adopts the queued row's attachments so re-sending keeps them", async () => {
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_1", text: QUEUED_TEXT, conversationId: CONV, files: [file] }],
+    });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it("preserves a queued quoted reply and its attachments on re-send", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "Quoted answer" }],
+      text: "Follow-up",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_reply", text, replyDraft, files: [file], conversationId: CONV },
+      ],
+    });
+    appendPromptHistoryEntry(text, CONV, replyDraft);
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted answer");
+    expect(textarea()).toHaveValue("Follow-up");
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith(text, [file], replyDraft);
+  });
+
+  it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
+    useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
+    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    if (quoted) act(() => ref.current?.appendReplyQuote("Quoted answer"));
+    fireEvent.change(textarea(), { target: { value: QUEUED_TEXT } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const original = useChatStore.getState().queuedMessages[0]!;
+    expect(original.text).toContain("[Attached file: src/example.ts]");
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(quoted ? 1 : 0);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: original.text }),
+    ]);
+    expect(useChatStore.getState().queuedMessages[0]?.replyDraft).toEqual(original.replyDraft);
+  });
+
+  it("restores the queued quote metadata even when history has only plain text", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "Quoted answer" }],
+      text: "Follow-up",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_reply", text, replyDraft, conversationId: CONV }],
+    });
+    appendPromptHistoryEntry(text, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(textarea()).toHaveValue("Follow-up");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted answer");
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it("keeps an attachment-only draft when browsing history", () => {
+    const file = new File(["draft"], "draft.txt", { type: "text/plain" });
+    setSessionDraft(CONV, { text: "", files: [file] });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(textarea()).toHaveValue(QUEUED_TEXT);
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith(QUEUED_TEXT, [file]);
+  });
+
+  it("browsing history over a non-empty draft leaves the queued row alone", async () => {
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "half-typed draft" } });
+    ta.setSelectionRange(0, 0);
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+
+  it("leaves another conversation's identically-worded queued row alone", async () => {
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_other", text: QUEUED_TEXT, conversationId: "conv_other" }],
+    });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+});
+
 describe("Composer config gear", () => {
   beforeEach(() => {
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       selectedModel: null,
@@ -4132,4 +4422,42 @@ describe("shouldQueueSend", () => {
     // a direct send can't overtake a still-queued earlier one.
     expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
   });
+
+  it("sends directly for a /side command even while busy or with a queued message", () => {
+    // A codex /side forks its own side chat and is non-interrupting — it must
+    // POST now while the parent turn runs, bypassing both the busy gate and the
+    // main-thread ordering guard.
+    expect(shouldQueueSend("conv_a", "streaming", "running", [], false, true)).toBe(false);
+    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")], false, true)).toBe(false);
+  });
 });
+
+const skillsFixture = create<{
+  skills: SkillSummary[];
+  skillsStatus: SkillsStatus | null;
+  refetch: ReturnType<typeof vi.fn>;
+}>(() => ({ skills: [], skillsStatus: null, refetch: vi.fn() }));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: ({ starting }: { starting: boolean }) => {
+    const state = skillsFixture();
+    return {
+      ...state,
+      skillsStatus:
+        state.skillsStatus === "unavailable" && starting ? "loading" : state.skillsStatus,
+    };
+  },
+}));
+
+beforeEach(() => skillsFixture.setState({ skills: [], skillsStatus: null, refetch: vi.fn() }));
+
+function setComposerState(
+  patch: Partial<ChatState> & { skills?: SkillSummary[]; skillsStatus?: SkillsStatus | null },
+) {
+  const { skills, skillsStatus, ...chat } = patch;
+  useChatStore.setState(chat);
+  skillsFixture.setState({
+    ...(skills === undefined ? {} : { skills }),
+    ...(skillsStatus === undefined ? {} : { skillsStatus }),
+  });
+}

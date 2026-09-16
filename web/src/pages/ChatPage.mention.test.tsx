@@ -63,6 +63,9 @@ vi.mock("@/hooks/useGithub", () => ({
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: () => ({ branchState: "unknown", prCount: 0 }),
 }));
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: () => ({ children: [] }),

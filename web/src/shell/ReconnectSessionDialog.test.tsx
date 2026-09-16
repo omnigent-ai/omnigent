@@ -155,6 +155,46 @@ describe("buildReconnectCommand", () => {
     expect(cmd).toContain("omnigent run path/to/agent.yaml");
     expect(cmd).not.toContain("omnigent claude");
   });
+
+  it("resolves the native verb from the harness when there is no wrapper label", () => {
+    // A pre-native session (e.g. a legacy devin-acp row) carries no wrapper
+    // label. The server canonicalizes its harness to `devin-native`, and that
+    // must still pick the right resume verb instead of the generic run form,
+    // which cannot resume a native session.
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_legacy_devin",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: null,
+      harness: "devin-native",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent devin");
+    expect(cmd).toContain("--resume conv_legacy_devin");
+    expect(cmd).not.toContain("omnigent run");
+  });
+
+  it("prefers the wrapper label over the harness when both are present", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_both",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: "claude-code-native-ui",
+      harness: "devin-native",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent claude");
+    expect(cmd).not.toContain("omnigent devin");
+  });
+
+  it("falls back to the run form when neither wrapper nor harness is native", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_generic",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: null,
+      harness: "openai-agents",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent run path/to/agent.yaml");
+  });
 });
 
 describe("<ReconnectSessionDialog />", () => {

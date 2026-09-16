@@ -60,7 +60,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
@@ -211,10 +211,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _read_explicit_unread,
     _read_last_seen,
-    _runner_skills_cache,
-    _runner_skills_failed,
-    _runner_skills_inflight,
-    _runner_skills_stale,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -270,13 +266,11 @@ from omnigent.server.schemas import (
     SessionResourceListPage,
     SessionResourcePaginatedList,
     SessionSandboxStatusEvent,
-    SessionSkillsEvent,
     SessionStatusEvent,
     SessionSupersededEvent,
     SessionTerminalPendingEvent,
     SessionTitleEvent,
     SessionTodosEvent,
-    SkillSummary,
     ToolOutputDeltaEvent,
 )
 from omnigent.spec.types import (
@@ -1545,6 +1539,7 @@ def _publish_elicitation_resolved_to_ancestors(
         _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action, reason=reason)
 
 
+@restart_on_stale_cursor
 def _descendant_sessions(
     conv_store: ConversationStore,
     session_id: str,
@@ -2589,10 +2584,9 @@ async def _persist_external_permission_mode_change(
     """
     Persist a pane-observed claude-native permission mode as a session label.
 
-    The forwarder posts this when the pane's mode footer differs from what it
-    last reported — i.e. the user pressed shift+tab in the TUI. Unlike the
-    PATCH path this needs no runner confirmation: the pane IS the source, so
-    the mode is already in effect.
+    The forwarder reports startup and observed shifts separately: a saved
+    label can outlive the process that observed it. Unlike the PATCH path,
+    this needs no runner confirmation because the pane is the source.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row for ``session_id`` at the route boundary.
@@ -2616,12 +2610,19 @@ async def _persist_external_permission_mode_change(
             f"{sorted(_CLAUDE_NATIVE_READABLE_PERMISSION_MODES)}; got {mode!r}",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Reflect the switch into terminal_launch_args so a relaunch reopens in this
-    # mode — the launcher reads the mode from launch args, while the label below
-    # is only the web UI's read-back. Rewrites an existing --permission-mode only
-    # (a no-op for a session launched without one); kept ahead of the label
-    # short-circuit so a stale launch arg is fixed even when the label matches.
-    merged_args = _merge_claude_permission_launch_args(conv.terminal_launch_args, mode)
+    # Legacy forwarders omit provenance; their reports may be passive startup
+    # observations, so only explicitly observed transitions add a launch flag.
+    initial_observation = body.data.get("initial_observation", True)
+    if not isinstance(initial_observation, bool):
+        raise OmnigentError(
+            "external_permission_mode_change requires data.initial_observation to be a boolean",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    merged_args = _merge_claude_permission_launch_args(
+        conv.terminal_launch_args,
+        mode,
+        add_if_missing=not initial_observation,
+    )
     if conv.terminal_launch_args != merged_args:
         await asyncio.to_thread(
             conversation_store.update_conversation,
@@ -2769,7 +2770,9 @@ def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], boo
             continue
         if arg == "--permission-mode":
             had_flag = True
-            index += 2  # drop the flag and its separate value token
+            index += 1
+            if index < len(args) and not args[index].startswith("-"):
+                index += 1
             continue
         if arg.startswith("--permission-mode="):
             had_flag = True
@@ -2783,26 +2786,23 @@ def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], boo
 def _merge_claude_permission_launch_args(
     existing_args: list[str] | None,
     mode: str,
+    *,
+    add_if_missing: bool = False,
 ) -> list[str] | None:
-    """Rewrite an existing ``--permission-mode`` in Claude launch args to ``mode``.
+    """Persist a Claude permission mode in the args used for relaunch.
 
-    A runtime mode switch (shift+tab or PATCH) must survive relaunch, and the
-    launcher restores the mode from ``terminal_launch_args`` — not the label.
-    Rewrite the existing ``--permission-mode`` entry (space- or ``=``-joined) to
-    the current mode, preserving other args in order, so a cold resume reopens
-    in the mode the user last chose. A standalone ``--dangerously-skip-permissions``
-    counts as an existing ``--permission-mode bypassPermissions``.
+    Explicit selections and observed live transitions add the flag even if
+    launch used a settings default. An initial footer observation only updates
+    an existing flag, so merely observing startup does not pin that default.
+    Selecting Manual pins ``default`` too: a selection overrides later settings edits.
 
-    Returns ``existing_args`` unchanged when they carry no ``--permission-mode``:
-    a session launched without the flag (manual, or a ``settings.json``
-    ``defaultMode``) must NOT be pinned to an explicit mode by a footer report —
-    the forwarder posts the launch mode on its first poll (see
-    ``claude_native_forwarder``), and pinning it would override the session's
-    settings default on relaunch. Those sessions surface the live mode through
-    the permission-mode label instead.
+    :param existing_args: Current launch args, or ``None``.
+    :param mode: Confirmed permission mode, e.g. ``"auto"``.
+    :param add_if_missing: Whether a mode selection requires adding the flag.
+    :returns: Updated args preserving other flags, or the unchanged input.
     """
     stripped, had_flag = _strip_claude_permission_launch_arg(list(existing_args or ()))
-    if not had_flag:
+    if not had_flag and not add_if_missing:
         return existing_args
     return [*stripped, "--permission-mode", mode]
 
@@ -3269,6 +3269,7 @@ def _parse_external_conversation_item(
     )
 
 
+@restart_on_stale_cursor
 def _find_claude_native_subagent_child(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -3314,6 +3315,7 @@ def _find_claude_native_subagent_child(
         after = page.last_id
 
 
+@restart_on_stale_cursor
 def _find_acp_subagent_child(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -3446,6 +3448,7 @@ async def _persist_external_acp_subagent_start(
     return child.id
 
 
+@restart_on_stale_cursor
 def _find_subagent_child_by_title(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -3770,6 +3773,7 @@ async def _create_and_publish_antigravity_child(
     return child.id
 
 
+@restart_on_stale_cursor
 def _find_codex_native_subagent_child(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -5018,27 +5022,6 @@ def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) 
     session_stream.publish(session_id, event.model_dump())
 
 
-def _publish_runner_skills(session_id: str) -> None:
-    """
-    Publish a typed :class:`SessionSkillsEvent` to the live stream.
-
-    Fired when background skill discovery succeeds or first fails, so a
-    connected client can re-read ``skills`` and ``skills_status`` from
-    the session snapshot. Carries only the conversation id.
-
-    No-op when no client is subscribed (``session_stream`` has no
-    buffer): a client binding later reads the now-warm snapshot directly.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    """
-    event = SessionSkillsEvent(
-        type="session.skills",
-        conversation_id=session_id,
-    )
-    session_stream.publish(session_id, event.model_dump())
-
-
 def _publish_model_options(session_id: str) -> None:
     """
     Publish a typed :class:`SessionModelOptionsEvent` to the live stream.
@@ -5066,16 +5049,9 @@ def _invalidate_runner_backed_snapshot_state(
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    Skills are discovered from the bound runner, so they are marked stale
-    and re-fetched at the next snapshot — but they keep serving until that
-    lands, because the request asking for the refresh is the same one whose
-    response fills the composer's slash-command menu. The native model
-    catalog is marked stale for the same reason, and additionally must
-    outlive runner death so the model picker stays populated (and offline
-    model/effort changes stay possible) while the session is asleep. Runner
-    teardown cancels any in-flight fetch so a dead runner cannot land a late
-    stale value, and drops the skills outright — they belong to the runner
-    that went away.
+    Keep model catalogs visible while refreshing or while the session sleeps.
+    Runner teardown cancels in-flight requests so late results cannot replace
+    catalogs fetched from a newer runner.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -5090,22 +5066,10 @@ def _invalidate_runner_backed_snapshot_state(
     """
     from omnigent.server.smart_routing import invalidate_runner_catalog
 
-    _runner_skills_failed.discard(session_id)
-    # Only worth marking when there is something to keep serving: a session
-    # with no cached skills already re-fetches on the next read, and marking
-    # it would leave an id behind for every cold session ever opened.
-    if session_id in _runner_skills_cache:
-        _runner_skills_stale.add(session_id)
     # Routing's candidate catalog is runner-derived too: a rebind or a relaunch
     # can change which models the session can be switched onto, so it must not
     # keep routing off the previous runner's list.
     invalidate_runner_catalog(session_id)
-    if cancel_inflight:
-        _runner_skills_cache.pop(session_id, None)
-        _runner_skills_stale.discard(session_id)
-        inflight = _runner_skills_inflight.pop(session_id, None)
-        if inflight is not None:
-            inflight.cancel()
     if drop_model_options:
         _model_options_cache.pop(session_id, None)
         _model_options_stale.discard(session_id)
@@ -9697,6 +9661,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"{MANAGED_SANDBOX_LABEL_NAMESPACE}* namespace and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # The codex side-chat child's thread id is what the follow-up path drives
+    # ``turn/start`` on (via the parent's bridge). It is written by the server at
+    # sub-agent registration; a client seed would let a caller repoint a child at
+    # an arbitrary Codex thread on the parent's app-server (the parent's own main
+    # thread, a sibling fork) and inject a turn into it — a turn-injection escape
+    # of the per-conversation boundary. Reserve it so only server internals set it.
+    if _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY!r} is server-internal "
+            f"and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _require_cost_control_label_authority(
@@ -9940,6 +9916,9 @@ async def _notify_runner_of_bundled_child(
     if runner_client is None:
         return
     try:
+        # Bundled children keep the legacy id-only body: bundle creation plumbs
+        # no harness/model override for a session-init envelope to seed. The
+        # create and rebind notifies send the full envelope instead.
         await runner_client.post(
             "/v1/sessions",
             json={
@@ -10614,61 +10593,6 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-async def _load_runner_skills(
-    runner_client: httpx.AsyncClient,
-    session_id: str,
-) -> None:
-    """Background single-flight fetch of a session's runner-owned skills.
-
-    Populates :data:`_runner_skills_cache` on success so subsequent
-    snapshot polls serve skills without a per-poll runner round-trip. Runs
-    off the snapshot's critical path (see :func:`_fetch_runner_skills`).
-    Best-effort: transport errors / non-200 / malformed payloads leave the
-    cache unset so a later poll retries.
-
-    :param runner_client: HTTP client pointed at the bound runner.
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    """
-
-    def failed() -> None:
-        # Notify once per failure streak: the nudge's snapshot read may retry.
-        if session_id not in _runner_skills_failed:
-            _runner_skills_failed.add(session_id)
-            _publish_runner_skills(session_id)
-
-    try:
-        resp = await runner_client.get(
-            f"/v1/sessions/{session_id}/skills",
-            timeout=5.0,
-        )
-    except (httpx.HTTPError, ConnectionError):
-        _logger.debug(
-            "Runner skills query failed for %s", session_id, extra={"session_id": session_id}
-        )
-        failed()
-        return
-    if resp.status_code != 200:
-        failed()
-        return
-    try:
-        raw = resp.json()["skills"]
-        if not isinstance(raw, list):
-            raise ValueError("Expected a skills list")
-        skills = [SkillSummary(name=s["name"], description=s["description"]) for s in raw]
-    except (ValueError, AttributeError, KeyError, TypeError):
-        _logger.debug(
-            "Runner skills payload malformed for %s", session_id, extra={"session_id": session_id}
-        )
-        failed()
-        return
-    _runner_skills_cache[session_id] = skills
-    _runner_skills_stale.discard(session_id)
-    _runner_skills_failed.discard(session_id)
-    # Nudge any subscribed client to re-read the (now-warm) snapshot so
-    # its slash-command menu fills without waiting for the next bind.
-    _publish_runner_skills(session_id)
-
-
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     """
     Validate runner-returned raw native ``model/list`` data.
@@ -11051,7 +10975,6 @@ __all__ = [
     "_load_agent_spec_for_session",
     "_load_model_options",
     "_load_model_options_from_host",
-    "_load_runner_skills",
     "_mcp_error_response",
     "_mcp_input_required_response",
     "_mcp_ok_response",
@@ -11125,7 +11048,6 @@ __all__ = [
     "_publish_permission_mode",
     "_publish_policy_denied",
     "_publish_policy_deny",
-    "_publish_runner_skills",
     "_publish_sandbox_status",
     "_publish_session_created",
     "_publish_session_superseded",

@@ -56,11 +56,12 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  *   {@link getSessionHost}; ``hostId`` is ``null`` when the session hasn't been
  *   loaded yet → send NO key (the modal host would be a wrong guess for a
  *   specific session; a keyless miss re-addresses instead).
+ * - ``/v1/skills`` → the query's ``host_id`` or the host for ``session_id``.
  * - everything else (session lists, ``/v1/sessions/updates``, ``/health``) is a
  *   cross-host / DB-backed read → ``{scoped: false}``, where the modal host is a
  *   legitimate cache-affinity hint.
  *
- * The two host-scoped families are an ALLOWLIST of what exists today (verified:
+ * The host-scoped families are an ALLOWLIST of what exists today (verified:
  * ``/v1/sessions/{id}/agent`` is under the sessions prefix, and
  * ``/v1/runners/{id}`` isn't called from the client). A new host-scoped route
  * must be added here to key by its own host; the regression test pins the known
@@ -68,7 +69,20 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  */
 type UrlHostScope = { scoped: true; hostId: string | null } | { scoped: false };
 
+function skillsParamsForUrl(url: string): URLSearchParams | null {
+  const match = url.match(/\/v1\/skills(?:\?([^#]*))?(?:#.*)?$/);
+  return match ? new URLSearchParams(match[1] ?? "") : null;
+}
+
 function hostScopeForUrl(url: string): UrlHostScope {
+  const skills = skillsParamsForUrl(url);
+  if (skills) {
+    const sessionId = skills.get("session_id");
+    return {
+      scoped: true,
+      hostId: sessionId ? getSessionHost(sessionId) : skills.get("host_id") || null,
+    };
+  }
   const hostMatch = url.match(/\/v1\/hosts\/([^/?#]+)/);
   if (hostMatch) return { scoped: true, hostId: decodeURIComponent(hostMatch[1]) };
   const sessionMatch = url.match(/\/v1\/sessions\/([^/?#]+)/);
@@ -180,6 +194,8 @@ export function resolveSessionHost(sessionId: string): Promise<void> | null {
  * microtask hop (a fetch still dispatches synchronously, as before the gate).
  */
 function beginSessionHostResolve(url: string): Promise<void> | null {
+  const skillsSessionId = skillsParamsForUrl(url)?.get("session_id");
+  if (skillsSessionId) return resolveSessionHost(skillsSessionId);
   const match = url.match(SESSION_SUBPATH_RE);
   if (match === null) return null;
   return resolveSessionHost(decodeURIComponent(match[1]));

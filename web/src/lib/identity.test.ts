@@ -209,6 +209,45 @@ describe("authenticatedFetch", () => {
   });
 
   describe("slice-key routing (host sharding)", () => {
+    it.each([
+      {
+        query: "host_id=host_target&harness=claude-native&path=%2Frepo",
+        mode: "host",
+        expected: "host_target",
+      },
+      { query: "session_id=session-a", mode: "known", expected: "host_target" },
+      { query: "session_id=session-a", mode: "resolve", expected: "host_target" },
+      { query: "session_id=session-a", mode: "unknown", expected: null },
+    ])(
+      "routes unified skill discovery to its own host ($mode)",
+      async ({ query, mode, expected }) => {
+        vi.doUnmock("./sessionHost");
+        const { setSessionHost } = await import("./sessionHost");
+        setSessionHost("other-a", "host_modal");
+        setSessionHost("other-b", "host_modal");
+        if (mode === "known") setSessionHost("session-a", "host_target");
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+        }));
+        const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+        const resolve = vi.fn(async (sessionId: string) => {
+          if (mode === "resolve") setSessionHost(sessionId, "host_target");
+        });
+        setSessionHostResolver(resolve);
+        fetchMock.mockResolvedValueOnce(mockJsonResponse({ skills: [] }));
+        await authenticatedFetch(`/api/2.0/omnigent/v1/skills?${query}`);
+        const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(expected);
+        if (mode === "resolve" || mode === "unknown") {
+          expect(resolve).toHaveBeenCalledExactlyOnceWith("session-a");
+        } else {
+          expect(resolve).not.toHaveBeenCalled();
+        }
+      },
+    );
+
     it("stamps X-Databricks-Omnigent-Slice-Key on host-scoped URLs", async () => {
       // Mock sessionHost module before importing identity
       vi.doMock("./sessionHost", () => ({

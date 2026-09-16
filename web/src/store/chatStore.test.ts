@@ -4753,6 +4753,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
       });
       const state = useChatStore.getState();
+      expect(spy).toHaveBeenCalledWith({ queryKey: ["skills", "conv_sw"] });
       // An in-place switch keeps the SAME session/transcript: the refresh
       // must not rebuild or clear blocks (same array reference — nothing
       // was touched) nor drop un-acked optimistic bubbles.
@@ -5319,201 +5320,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
-  describe("session.skills", () => {
-    /**
-     * Route GET /v1/sessions/{seedId} to a snapshot carrying `skills`;
-     * everything else falls back to the default handler. Skills are
-     * runner-owned, so the snapshot is the only place the web client can
-     * read a fresh, runner-discovered list.
-     */
-    function seedSnapshotSkills(
-      seedId: string,
-      skills: { name: string; description: string }[],
-    ): void {
-      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        if (url.split("?")[0] === `/v1/sessions/${seedId}` && (init?.method ?? "GET") === "GET") {
-          return mockResponse({
-            id: seedId,
-            agent_id: "agent_xyz",
-            status: "idle",
-            created_at: 0,
-            items: [],
-            skills,
-            skills_status: "ready",
-          });
-        }
-        return defaultFetchHandler(input, init);
-      });
-    }
-
-    it("refetches the snapshot and applies the resolved skills to the store", async () => {
-      // The bind-time snapshot served [] because skills are fetched off
-      // the hot path. When the background fetch lands, session.skills
-      // fires; the handler refetches the now-warm snapshot, whose skills
-      // must reach the store so the slash-command menu fills.
-      useChatStore.setState({ conversationId: "conv_abc", skills: [] });
-      seedSnapshotSkills("conv_abc", [{ name: "grill-me", description: "Interview the user" }]);
-
-      handleSessionEvent({
-        type: "session_skills",
-        conversationId: "conv_abc",
-      });
-      await tick();
-
-      expect(useChatStore.getState().skills).toEqual([
-        { name: "grill-me", description: "Interview the user" },
-      ]);
-      expect(useChatStore.getState().skillsStatus).toBe("ready");
-    });
-
-    it.each([{ skills: [] }, { skills: [{ name: "review", description: "Review code" }] }])(
-      "settles skills before an older bind snapshot finishes: %j",
-      async ({ skills }) => {
-        const id = "conv_skills_race";
-        seedSession(id);
-        let resolveInitialSnapshot!: (response: Response) => void;
-        let snapshotCount = 0;
-        const snapshot = { id, agent_id: "agent_xyz", status: "idle", created_at: 0, items: [] };
-        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-          const url = typeof input === "string" ? input : input.toString();
-          if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
-            snapshotCount += 1;
-            if (snapshotCount === 1) {
-              return new Promise<Response>((resolve) => {
-                resolveInitialSnapshot = resolve;
-              });
-            }
-            return mockResponse({ ...snapshot, skills, skills_status: "ready" });
-          }
-          return defaultFetchHandler(input, init);
-        });
-
-        const bind = useChatStore.getState().switchTo(id);
-        await tick();
-        handleSessionEvent({ type: "session_skills", conversationId: id });
-        await tick();
-        const statusBeforeBind = useChatStore.getState().skillsStatus;
-        resolveInitialSnapshot(mockResponse({ ...snapshot, skills: [], skills_status: "loading" }));
-        await bind;
-
-        expect(snapshotCount).toBe(2);
-        expect(statusBeforeBind).toBe("ready");
-        expect(useChatStore.getState().skillsStatus).toBe("ready");
-        expect(useChatStore.getState().skills).toEqual(skills);
-      },
-    );
-
-    it("ignores a skills response superseded by a newer notification", async () => {
-      useChatStore.setState({ conversationId: "conv_abc", skillsStatus: "loading", skills: [] });
-      let resolveOlder!: (response: Response) => void;
-      fetchMock.mockImplementationOnce(
-        () =>
-          new Promise<Response>((resolve) => {
-            resolveOlder = resolve;
-          }),
-      );
-      handleSessionEvent({ type: "session_skills", conversationId: "conv_abc" });
-      seedSnapshotSkills("conv_abc", [{ name: "newer", description: "Latest catalog" }]);
-      handleSessionEvent({ type: "session_skills", conversationId: "conv_abc" });
-      await tick();
-      resolveOlder(mockResponse({ id: "conv_abc", skills: [], skills_status: "error" }));
-      await tick();
-      expect(useChatStore.getState().skillsStatus).toBe("ready");
-      expect(useChatStore.getState().skills).toEqual([
-        { name: "newer", description: "Latest catalog" },
-      ]);
-    });
-
-    it("ignores an event for a conversation that is not live", async () => {
-      // Gated on liveness, not on being on screen: a nudge for a conversation
-      // this tab holds no entry for has nowhere to land, so it must not fetch.
-      useChatStore.setState({
-        conversationId: "conv_open",
-        skills: [{ name: "kept", description: "open session's skill" }],
-      });
-
-      handleSessionEvent({
-        type: "session_skills",
-        conversationId: "conv_not_live",
-      });
-      await tick();
-
-      // Guard short-circuits: no fetch issued, open session's list intact.
-      expect(fetchMock).not.toHaveBeenCalled();
-      expect(useChatStore.getState().skills).toEqual([
-        { name: "kept", description: "open session's skill" },
-      ]);
-    });
-
-    it("applies the refetched skills to a conversation backgrounded mid-flight", async () => {
-      // `session_skills` is a one-shot nudge with no replay, and a live
-      // background conversation is never re-bound on return — so dropping the
-      // result because the user switched away left its slash-command menu empty
-      // for as long as the entry stayed live. It must land on the conversation
-      // it was fetched for, and only there.
-      seedSession("conv_bg_skills", []);
-      seedSession("conv_foreground", []);
-      await useChatStore.getState().switchTo("conv_bg_skills");
-      await useChatStore.getState().switchTo("conv_foreground");
-      seedSnapshotSkills("conv_bg_skills", [
-        { name: "late", description: "resolved in background" },
-      ]);
-
-      handleSessionEvent({
-        type: "session_skills",
-        conversationId: "conv_bg_skills",
-      });
-      await tick();
-
-      // The backgrounded conversation has its skills...
-      expect(conversationRegistry.peek("conv_bg_skills")!.getState().skills).toEqual([
-        { name: "late", description: "resolved in background" },
-      ]);
-      expect(conversationRegistry.peek("conv_bg_skills")!.getState().skillsStatus).toBe("ready");
-      // ...and the visible conversation was not touched.
-      expect(useChatStore.getState().skills).toEqual([]);
-      expect(useChatStore.getState().skillsStatus).toBeNull();
-    });
-
-    it("leaves the existing skills in place when the refetch fails", async () => {
-      // The runner can drop again before the snapshot lands; a failed
-      // fetch is best-effort and must not wipe a populated list.
-      useChatStore.setState({
-        conversationId: "conv_abc",
-        skills: [{ name: "kept", description: "survives the error" }],
-      });
-      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        if (url.split("?")[0] === "/v1/sessions/conv_abc" && (init?.method ?? "GET") === "GET") {
-          return mockResponse(null, { ok: false, status: 503 });
-        }
-        return defaultFetchHandler(input, init);
-      });
-
-      handleSessionEvent({
-        type: "session_skills",
-        conversationId: "conv_abc",
-      });
-      await tick();
-
-      expect(useChatStore.getState().skills).toEqual([
-        { name: "kept", description: "survives the error" },
-      ]);
-      expect(useChatStore.getState().skillsStatus).toBe("error");
-    });
-
-    it("retries failed discovery with a fresh runner snapshot", async () => {
-      useChatStore.setState({ conversationId: "conv_abc", skills: [], skillsStatus: "error" });
-      seedSnapshotSkills("conv_abc", []);
-      await useChatStore.getState().refreshSkills();
-      expect(fetchMock.mock.calls.some(([url]) => String(url).includes("refresh_state=true"))).toBe(
-        true,
-      );
-      expect(useChatStore.getState().skillsStatus).toBe("ready");
-    });
-  });
-
   describe("refreshSessionState", () => {
     it("retains an optimistic model through a snapshot without a native report", async () => {
       useChatStore.setState({
@@ -5555,7 +5361,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
       useChatStore.setState({
         conversationId: "conv_codex",
-        skills: [],
         codexModelOptions: [],
         terminalPending: false,
       });
@@ -5572,7 +5377,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
             labels: { "omnigent.wrapper": "codex-native-ui" },
             llm_model: "gpt-5.5",
             harness: "codex",
-            skills: [{ name: "inspect", description: "Read session state" }],
             model_options: [
               {
                 id: "gpt-5.5",
@@ -5605,7 +5409,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         llmModel: "gpt-5.5",
         sessionHarness: "codex",
         terminalPending: true,
-        skills: [{ name: "inspect", description: "Read session state" }],
         codexModelOptions: [
           {
             id: "gpt-5.5",
@@ -6638,8 +6441,104 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("codex /side send", () => {
+    it("neither bubbles in the parent nor latches it into Working", async () => {
+      // The command is forked into a side chat, so this session runs nothing:
+      // a bubble would sit unanswered and a "streaming" latch would never clear.
+      seedSession("conv_codex_side", []);
+      await useChatStore.getState().switchTo("conv_codex_side");
+      useChatStore.setState({ sessionHarness: "codex-native", awaitingSideChatFor: null });
+
+      await useChatStore.getState().send("/side what was my last message?", "agent_xyz");
+
+      const after = useChatStore.getState();
+      expect(after.pendingUserMessages).toHaveLength(0);
+      expect(after.status).not.toBe("streaming");
+      // armed, so the fork's session.created moves the user into it
+      expect(after.awaitingSideChatFor).toBe("conv_codex_side");
+    });
+
+    it("still bubbles and latches for an ordinary message", async () => {
+      seedSession("conv_codex_plain", []);
+      await useChatStore.getState().switchTo("conv_codex_plain");
+      useChatStore.setState({ sessionHarness: "codex-native", awaitingSideChatFor: null });
+
+      await useChatStore.getState().send("hello", "agent_xyz");
+
+      const after = useChatStore.getState();
+      expect(after.pendingUserMessages).toHaveLength(1);
+      expect(after.awaitingSideChatFor).toBeNull();
+    });
+  });
+
   describe("session.created", () => {
+    it("opens the side chat the user asked for with /side", () => {
+      // `awaitingSideChatFor` is set when the command is sent; the fork's
+      // session.created then moves the user into it and reveals the rail.
+      useChatStore.setState({
+        conversationId: "conv_parent",
+        awaitingSideChatFor: "conv_parent",
+        redirectToConversationId: null,
+        sideChatRailRequest: null,
+      });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_parent",
+        childSessionId: "conv_side",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_parent",
+      } as SessionCreatedEvent);
+
+      const after = useChatStore.getState();
+      expect(after.redirectToConversationId).toBe("conv_side");
+      expect(after.sideChatRailRequest).toBe("conv_side");
+      // one-shot: a later spawn must not move the user again
+      expect(after.awaitingSideChatFor).toBeNull();
+    });
+
+    it("does not move the user for an agent-spawned sub-agent", () => {
+      // awaitingSideChatFor is conversation-scoped, so bind a fresh conversation
+      // to start it clean; sideChatRailRequest + redirectToConversationId are
+      // app-global, so reset and read them globally.
+      bindConversationForTest("conv_agent_spawn", { awaitingSideChatFor: null });
+      useChatStore.setState({ redirectToConversationId: null, sideChatRailRequest: null });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_agent_spawn",
+        childSessionId: "conv_child",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_agent_spawn",
+      } as SessionCreatedEvent);
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      expect(useChatStore.getState().sideChatRailRequest).toBeNull();
+    });
+
+    it("opens the awaited side chat on the /side latch", () => {
+      // The child arriving under the parent the user armed with /side is
+      // revealed and followed.
+      const parent = bindConversationForTest("conv_race", { awaitingSideChatFor: "conv_race" });
+      useChatStore.setState({ redirectToConversationId: null, sideChatRailRequest: null });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_race",
+        childSessionId: "conv_side",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_race",
+      } as SessionCreatedEvent);
+
+      // redirect + rail request are app-global; awaitingSideChatFor is the
+      // conversation-scoped latch (read from the entry).
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_side");
+      expect(useChatStore.getState().sideChatRailRequest).toBe("conv_side");
+      expect(parent.get().awaitingSideChatFor).toBeNull();
+    });
+
     it("is a no-op (sub-agent rendering is future work — R8)", () => {
+      useChatStore.setState({ awaitingSideChatFor: null });
       const before = useChatStore.getState();
       const event: SessionCreatedEvent = {
         type: "session_created",

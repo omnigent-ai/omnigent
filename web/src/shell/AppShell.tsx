@@ -78,6 +78,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
+  nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -1535,6 +1536,21 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
+  // A `/side` fork the user just opened: reveal it in the Agents rail on the
+  // SIDE CHAT itself, and leave the main chat's rail untouched. `ChatPage`
+  // navigates off `redirectToConversationId`; the rail tab is per-conversation,
+  // so we wait until the router has actually landed on the child
+  // (`conversationId === sideChatRailRequest`) before switching the tab —
+  // otherwise the tab would persist onto the main chat we're leaving.
+  const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
+  const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
+  useEffect(() => {
+    if (sideChatRailRequest === null) return;
+    if (conversationId !== sideChatRailRequest) return;
+    handleRightRailTabChange("subagents");
+    clearSideChatRailRequest();
+  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange, conversationId]);
+
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
@@ -1831,7 +1847,13 @@ export function AppShell() {
     typeof createdAtS === "number" &&
     createdAtS > 0 &&
     Date.now() / 1000 - createdAtS < STARTING_GRACE_S;
+  // A native sub-agent mirror — a codex `/side` side chat, or a sub-agent codex
+  // spawned — is a thread inside the parent's CLI and never gets a terminal of
+  // its own, so this spinner would spin forever instead of resolving.
+  const isNativeSubagentMirror =
+    nativeCodingAgentForSubagentWrapper(sessionLabels[WRAPPER_LABEL_KEY]) !== undefined;
   const terminalStartingUp =
+    !isNativeSubagentMirror &&
     !terminalsAvailable &&
     (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
     (livenessRowPending ||

@@ -20,6 +20,8 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name> | default",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
+  "/side":
+    "Start a side chat: an ephemeral fork opened as its own sub-agent chat, kept out of this conversation",
   "/help": "Show available slash commands",
 };
 
@@ -102,6 +104,8 @@ interface SlashCommandMenuProps {
   commands: Record<string, string>;
   /** Absent for menus without asynchronous skill discovery. */
   skillsStatus?: SkillsStatus | null;
+  /** Context-specific guidance when discovery cannot run yet. */
+  skillsUnavailableMessage?: string;
   onRetrySkills?: () => void;
 }
 
@@ -175,6 +179,7 @@ export function SlashCommandMenu({
   onSelect,
   commands,
   skillsStatus,
+  skillsUnavailableMessage = "Skills unavailable while disconnected.",
   onRetrySkills,
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query);
@@ -246,7 +251,7 @@ export function SlashCommandMenu({
           )}
           {skillsStatus === "unavailable" && (
             <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-              Skills unavailable while disconnected.
+              {skillsUnavailableMessage}
             </div>
           )}
           {skillsStatus === "ready" && skillRows.length === 0 && (

@@ -169,7 +169,7 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install ripgrep + bubblewrap + tmux
+      - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
         # needs it. tmux: the integration-mock shard spawns harness terminals.
         # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
@@ -177,6 +177,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep bubblewrap tmux
+          if [ "${{ matrix.group }}" = "inner-rest" ]; then
+            sudo apt-get install -y --no-install-recommends dbus-daemon gnome-keyring
+          fi
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv

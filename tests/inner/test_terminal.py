@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import logging
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -482,7 +484,7 @@ def test_capture_probe_logs_command_return_code_and_stderr(
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
-        socket_path=tmp_path / "tmux.sock",
+        socket_path=tmp_path / 'tmux "quoted"\npath.sock',
         private_dir=tmp_path,
         running=True,
     )
@@ -493,7 +495,7 @@ def test_capture_probe_logs_command_return_code_and_stderr(
         lambda *args, **kwargs: SimpleNamespace(
             returncode=17,
             stdout=b"",
-            stderr=b"fork failed: resource temporarily unavailable",
+            stderr=b'fork failed: "resource unavailable"\ninvalid byte: \xff',
         ),
     )
 
@@ -501,11 +503,25 @@ def test_capture_probe_logs_command_return_code_and_stderr(
         snapshot = instance._capture_pane_for_idle_or_none()
 
     assert snapshot is None
-    message = caplog.text
+    message = caplog.records[-1].getMessage()
     assert "rc=17" in message
-    assert str(instance.socket_path) in message
-    assert "capture-pane -t main -p -e" in message
-    assert "fork failed: resource temporarily unavailable" in message
+    assert "\n" not in message
+    payload = json.loads(message.split("(rc=17): ", 1)[1])
+    assert payload == {
+        "cmd": [
+            "tmux",
+            "-S",
+            str(instance.socket_path),
+            "-f",
+            terminal_mod._TMUX_CONFIG_PATH,
+            "capture-pane",
+            "-t",
+            "main",
+            "-p",
+            "-e",
+        ],
+        "detail": 'fork failed: "resource unavailable"\ninvalid byte: \ufffd',
+    }
 
 
 def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
@@ -1672,6 +1688,53 @@ async def test_launch_strips_runner_binding_token_from_tmux_child(
     # pane — the unsandboxed tmux server's run-shell would otherwise be
     # one ``tmux -S <sock>`` away for the agent payload in the pane.
     assert "OMNIGENT_TMUX_SOCK" not in spawned_env
+
+
+@pytest.mark.parametrize("inherit_env", [False, True])
+@pytest.mark.parametrize("sandbox_active", [False, True])
+async def test_terminal_desktop_session_follows_sandbox_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inherit_env: bool, sandbox_active: bool
+) -> None:
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr("os.environ", {**session_env, "PATH": "/usr/bin:/bin"})
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(create_subprocess_exec=spawn, subprocess=terminal_mod.asyncio.subprocess),
+    )
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
+    instance = TerminalInstance(
+        name="bash",
+        session_key="test-keyring",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        inherit_env=inherit_env,
+        env={**session_env, "XDG_CONFIG_HOME": "/home/test/.config"},
+        sandbox_policy=SandboxPolicy(
+            backend_type="none",
+            active=sandbox_active,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+
+    await instance.launch(cwd=tmp_path)
+
+    spawn.assert_awaited_once()
+    env = spawn.call_args.kwargs["env"]
+    if sandbox_active:
+        assert session_env.keys().isdisjoint(env)
+    else:
+        assert {name: env[name] for name in session_env} == session_env
+    assert env["XDG_CONFIG_HOME"] == "/home/test/.config"
 
 
 @pytest.mark.asyncio

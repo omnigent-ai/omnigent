@@ -92,6 +92,9 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._content_type import (
     require_json_or_multipart_content_type,
 )
+from omnigent.server.routes._errors import (
+    STALE_CURSOR_RESPONSE,
+)
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
@@ -640,10 +643,11 @@ def register_core_routes(
         if _rc is not None and conv is not None:
             # Send the full session-init envelope (not the legacy id-only body)
             # so the runner seeds the first spawn from current session state —
-            # notably the persisted /model override — rather than relying on a
-            # best-effort reverse GET whose failure would silently reintroduce
-            # the first-turn respawn. Older runners ignore the extra
-            # ``session_init`` key and still read the top-level id fields.
+            # notably the persisted /model override and a cross-harness
+            # harness_override — rather than relying on a best-effort reverse
+            # GET whose failure would silently reintroduce the first-turn
+            # respawn. Older runners ignore the extra ``session_init`` key and
+            # still read the top-level id fields.
             # A session not yet bound to an agent keeps the id-only body: the
             # envelope builder requires an agent_id.
             init_body: dict[str, Any] = {
@@ -653,7 +657,14 @@ def register_core_routes(
             }
             if conv.agent_id is not None:
                 try:
-                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                    # ``initial_items`` are already persisted and forwarded by
+                    # now, so suppress the runner's recovery turn or they run
+                    # twice.
+                    init_body = build_runner_session_init_payload(
+                        conv,
+                        server_version=VERSION,
+                        suppress_recovery_turn=True,
+                    )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
                     # seeded override — surface it instead of silently
@@ -1110,7 +1121,7 @@ def register_core_routes(
     @router.get(
         "/sessions",
         response_model=None,
-        responses={200: {"model": SessionList}},
+        responses={200: {"model": SessionList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_sessions(
         request: Request,
@@ -2298,15 +2309,20 @@ def register_core_routes(
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
-                if _runner_client is not None and conv is not None:
+                if _runner_client is not None and conv is not None and conv.agent_id is not None:
+                    # The versioned payload's snapshot carries harness_override,
+                    # so a rebind after a cross-harness create initializes the
+                    # override harness — a bare body left the runner resolving
+                    # from the spec, and the recovery turn that executes seeded
+                    # initial_items ran on the spec's harness. Recovery stays
+                    # enabled: on rebind it is what runs the pending kickoff.
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
-                            json={
-                                "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
-                            },
+                            json=build_runner_session_init_payload(
+                                conv,
+                                server_version=VERSION,
+                            ),
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:
