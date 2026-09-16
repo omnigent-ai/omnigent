@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import traceback
@@ -113,3 +114,40 @@ def test_file_backend_does_not_access_keyring(monkeypatch: pytest.MonkeyPatch) -
     assert resolve_secret("keychain:openrouter") == "test-file-key"
     with pytest.raises(OmnigentError, match="no stored secret named 'absent'"):
         resolve_secret("keychain:absent")
+
+
+@pytest.mark.parametrize("file_failure", ["corrupt", "unreadable"])
+def test_keyring_and_file_failure_does_not_expose_backend_details(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, file_failure: str
+) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+
+    def get_password(service: str, username: str) -> str:
+        raise keyring.errors.KeyringError("private backend details")
+
+    monkeypatch.setattr(keyring, "get_password", get_password)
+    if file_failure == "corrupt":
+        (tmp_path / "secrets.json").write_text("invalid JSON")
+        expected_error = json.JSONDecodeError
+    else:
+
+        def read_file() -> dict[str, str]:
+            raise PermissionError("file unreadable")
+
+        monkeypatch.setattr(secrets, "_read_secrets_file", read_file)
+        expected_error = PermissionError
+
+    with pytest.raises(expected_error) as raised:
+        resolve_secret("keychain:openrouter")
+
+    assert "private backend details" not in "".join(traceback.format_exception(raised.value))
+
+
+def test_working_keyring_does_not_read_corrupt_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+    monkeypatch.setattr(keyring, "get_password", lambda service, username: "test-keyring-key")
+    (tmp_path / "secrets.json").write_text("invalid JSON")
+
+    assert resolve_secret("keychain:openrouter") == "test-keyring-key"

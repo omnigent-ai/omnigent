@@ -43,6 +43,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
+from omnigent.inner.agent_env import DESKTOP_SESSION_ENV_VARS
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
@@ -505,7 +506,7 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
 
     Inherits the runner's ``os.environ`` (PATH / HOME / PYTHONPATH /
     provider creds), layers the caller's per-spawn overrides on top, then
-    strips the runner-auth secrets: the harness runs the agent's
+    strips desktop-session variables and runner-auth secrets: the harness runs the agent's
     (potentially untrusted) payload and must never see the tunnel binding
     token. Always returns an explicit dict — ``env=None`` to
     ``create_subprocess_exec`` would inherit the full env and re-leak the
@@ -514,9 +515,11 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
     :param env: Per-spawn overrides merged over ``os.environ`` (caller
         keys win), e.g. ``{"HARNESS_CLAUDE_SDK_MODEL": "claude-opus-4-6"}``.
         ``None`` means no overrides.
-    :returns: The harness subprocess environment, runner-auth secrets removed.
+    :returns: The harness environment without desktop-session variables or runner-auth secrets.
     """
     merged = {**os.environ, **env} if env else dict(os.environ)
+    for name in DESKTOP_SESSION_ENV_VARS:
+        merged.pop(name, None)
     return strip_runner_auth_secrets(merged)
 
 

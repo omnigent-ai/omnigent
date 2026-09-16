@@ -189,6 +189,32 @@ def test_real_builders_pass_ssh_auth_sock(monkeypatch):
         assert build().get("SSH_AUTH_SOCK") == sock, harness
 
 
+def test_real_builders_strip_desktop_session(monkeypatch):
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr("os.environ", {**session_env, "XDG_CONFIG_HOME": "/home/test/.config"})
+
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert session_env.keys().isdisjoint(env), harness
+        assert env["XDG_CONFIG_HOME"] == "/home/test/.config", harness
+
+
+def test_desktop_session_cannot_be_readmitted_by_cli_allowlist():
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+
+    env = clean_agent_env(
+        allow_prefixes=("DBUS_", "XDG_"), extra_allowed=session_env, source=session_env
+    )
+
+    assert not env
+
+
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))
 def test_no_harness_inherits_unrelated_secrets(harness, hostile_env):
     env = clean_agent_env(allow_prefixes=HARNESS_PREFIXES[harness], source=hostile_env)

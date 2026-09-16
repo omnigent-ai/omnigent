@@ -202,23 +202,24 @@ def load_secret(name: str) -> str | None:
         when the selected backend is accessible but has no secret under *name*.
     :raises OmnigentError: If the keyring is inaccessible and no file secret exists.
     """
+    keyring_error_name: str | None = None
     if _use_keyring():
         try:
             stored: str | None = keyring.get_password(_KEYRING_SERVICE, name)
             return stored
         except _KEYRING_ERRORS as exc:
-            stored = _read_secrets_file().get(name)
-            if stored is not None:
-                return stored
-            raise OmnigentError(
-                f"could not read secret {name!r} from the OS keyring "
-                f"({type(exc).__name__}); no file-backed secret is available. "
-                "Check that a keyring backend is available and unlocked, then restart "
-                "the Omnigent host from the same desktop session. On Linux, check "
-                "DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR.",
-                code=ErrorCode.INVALID_INPUT,
-            ) from None
-    return _read_secrets_file().get(name)
+            keyring_error_name = type(exc).__name__
+    stored = _read_secrets_file().get(name)
+    if stored is None and keyring_error_name is not None:
+        raise OmnigentError(
+            f"could not read secret {name!r} from the OS keyring "
+            f"({keyring_error_name}); no file-backed secret is available. "
+            "Check that a keyring backend is available and unlocked, then restart "
+            "the Omnigent host from the same desktop session. On Linux, check "
+            "DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from None
+    return stored
 
 
 def delete_secret(name: str) -> None:

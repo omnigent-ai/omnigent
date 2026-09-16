@@ -26,6 +26,11 @@ from collections.abc import Iterable, Mapping
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 
+# Desktop keyring access stays in the host and runner.
+DESKTOP_SESSION_ENV_VARS: frozenset[str] = frozenset(
+    {"DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"}
+)
+
 # Categories every POSIX CLI needs regardless of vendor: where the user's
 # config lives, how to reach the network, how to format output, where to put
 # temp files, and the "you are inside Omnigent" marker.
@@ -95,12 +100,12 @@ def clean_agent_env(
         for an agent that authenticates from a variable outside its own family.
     :param source: Environment to filter. Defaults to ``os.environ``; injectable
         for tests.
-    :returns: A new dict. Never mutates *source*.
+    :returns: A new dict without desktop-session variables. Never mutates *source*.
     """
     env_source = os.environ if source is None else source
     prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
     exact = BASE_ALLOW_EXACT | set(allow_exact) | set(extra_allowed)
-    denied = set(deny_exact)
+    denied = set(deny_exact) | DESKTOP_SESSION_ENV_VARS
     return {
         key: value
         for key, value in env_source.items()
