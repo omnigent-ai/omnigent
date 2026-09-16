@@ -5,11 +5,12 @@
 import { StrictMode } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Database, File as FileIcon, FileCode2, FileImage, FileSpreadsheet } from "lucide-react";
 
 vi.mock("@/lib/host", () => ({ getEmbedRoot: () => null }));
 
 import { ImageLightboxProvider } from "./ImageLightbox";
-import { ComposerAttachments, formatFileSize } from "./ComposerAttachments";
+import { ComposerAttachments, formatFileSize, iconForFile } from "./ComposerAttachments";
 
 const revoke = vi.fn();
 
@@ -94,5 +95,16 @@ describe("formatFileSize", () => {
     expect(formatFileSize(512)).toBe("512 B");
     expect(formatFileSize(2048)).toBe("2 KB");
     expect(formatFileSize(6_815_744)).toBe("6.5 MB");
+  });
+});
+
+describe("iconForFile", () => {
+  it("matches by extension, then MIME prefix, then falls back to generic", () => {
+    expect(iconForFile(new File([], "q.csv", { type: "text/csv" }))).toBe(FileSpreadsheet);
+    expect(iconForFile(new File([], "app.ts", { type: "" }))).toBe(FileCode2);
+    expect(iconForFile(new File([], "data.sqlite", { type: "" }))).toBe(Database);
+    // No matching extension, so the image/* MIME wins (image without preview).
+    expect(iconForFile(new File([], "photo.heic", { type: "image/heic" }))).toBe(FileImage);
+    expect(iconForFile(new File([], "mystery", { type: "" }))).toBe(FileIcon);
   });
 });

@@ -1,15 +1,31 @@
 import { useEffect, useState } from "react";
-import { FileTextIcon, XIcon } from "lucide-react";
+import {
+  Database,
+  File as FileIcon,
+  FileArchive,
+  FileAudio,
+  FileCode2,
+  FileImage,
+  FileJson,
+  FileSpreadsheet,
+  FileText,
+  FileType,
+  FileVideo,
+  Presentation,
+  XIcon,
+  type LucideIcon,
+} from "lucide-react";
 
 import { attachmentKey } from "@/lib/attachments";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { cn } from "@/lib/utils";
 
 /**
- * Pending (pre-send) attachments shown under the composer textarea. Images
- * render as square thumbnails you can click to view full-screen (via the
- * shared lightbox); other files render as a card showing the name with its
- * type and size. Shared by the chat composer and the new-chat dialog.
+ * Pending (pre-send) attachments shown under the composer textarea. A supported
+ * image renders as a square thumbnail you can click to view full-screen (via
+ * the shared lightbox); anything else — and an image whose thumbnail fails to
+ * load — renders as a card with a file-type icon, the filename, and a
+ * "TYPE · SIZE" line. Shared by the chat composer and the new-chat dialog.
  */
 export function ComposerAttachments({
   files,
@@ -38,6 +54,66 @@ export function formatFileSize(bytes: number): string {
   return `${(kb / 1024).toFixed(1)} MB`;
 }
 
+// Lowercase extension -> Lucide icon. Grouped to match the design spec.
+const EXTENSION_ICONS: Record<string, LucideIcon> = {
+  pdf: FileText,
+  doc: FileText,
+  docx: FileText,
+  txt: FileText,
+  md: FileText,
+  rtf: FileText,
+  xls: FileSpreadsheet,
+  xlsx: FileSpreadsheet,
+  csv: FileSpreadsheet,
+  tsv: FileSpreadsheet,
+  ppt: Presentation,
+  pptx: Presentation,
+  key: Presentation,
+  zip: FileArchive,
+  rar: FileArchive,
+  "7z": FileArchive,
+  tar: FileArchive,
+  gz: FileArchive,
+  json: FileJson,
+  jsonl: FileJson,
+  js: FileCode2,
+  jsx: FileCode2,
+  ts: FileCode2,
+  tsx: FileCode2,
+  py: FileCode2,
+  rb: FileCode2,
+  go: FileCode2,
+  rs: FileCode2,
+  java: FileCode2,
+  html: FileCode2,
+  css: FileCode2,
+  xml: FileCode2,
+  yaml: FileCode2,
+  yml: FileCode2,
+  toml: FileCode2,
+  sql: Database,
+  db: Database,
+  sqlite: Database,
+  sqlite3: Database,
+  ttf: FileType,
+  otf: FileType,
+  woff: FileType,
+  woff2: FileType,
+};
+
+/** Icon for a file: match by extension first, then MIME prefix, else generic. */
+export function iconForFile(file: File): LucideIcon {
+  const name = file.name || "";
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+  if (ext && EXTENSION_ICONS[ext]) return EXTENSION_ICONS[ext];
+  const type = file.type || "";
+  if (type.startsWith("image/")) return FileImage;
+  if (type.startsWith("video/")) return FileVideo;
+  if (type.startsWith("audio/")) return FileAudio;
+  return FileIcon;
+}
+
 /** Blob URL for an image preview, created and revoked inside one effect so the
  *  URL the committed <img> points at is never revoked early (StrictMode double
  *  mount) and never leaks. Guarded: jsdom (tests) lacks createObjectURL. */
@@ -56,61 +132,59 @@ function useObjectUrl(file: File | null): string | undefined {
 }
 
 function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }) {
-  const isImage = file.type.startsWith("image/");
+  // An image whose blob can't decode falls back to the file card (spec rule 4).
+  const [thumbFailed, setThumbFailed] = useState(false);
+  const showThumb = file.type.startsWith("image/") && !thumbFailed;
   // Pasted screenshots have no filename; the composer sends them as image.png.
   const name = file.name || "image.png";
-  const url = useObjectUrl(isImage ? file : null);
+  const url = useObjectUrl(showThumb ? file : null);
 
-  if (isImage) {
+  if (showThumb) {
     return (
-      <div className="relative size-16 shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
-        <ZoomableImage src={url} alt={name} className="size-16 object-cover" />
-        <RemoveButton
-          name={name}
-          onRemove={onRemove}
-          className="absolute top-0.5 right-0.5 rounded-full bg-background/80 p-0.5 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
-        />
+      <div className="relative shrink-0">
+        <div className="size-14 overflow-hidden rounded-xl border border-border bg-muted">
+          <ZoomableImage
+            src={url}
+            alt={name}
+            className="size-14 object-cover"
+            onError={() => setThumbFailed(true)}
+          />
+        </div>
+        <RemoveButton name={name} onRemove={onRemove} />
       </div>
     );
   }
 
-  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toUpperCase() : "FILE";
-  const meta = `${ext} · ${formatFileSize(file.size)}`;
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot + 1).toUpperCase() : "";
+  const meta = ext ? `${ext} · ${formatFileSize(file.size)}` : formatFileSize(file.size);
+  const Icon = iconForFile(file);
   return (
-    <span className="flex h-16 max-w-[18rem] items-center gap-2.5 rounded-lg border border-border bg-background px-2.5">
-      <span className="grid size-9 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
-        <FileTextIcon className="size-4" />
-      </span>
-      <span className="flex min-w-0 flex-col">
-        <span className="truncate text-sm font-medium text-foreground">{name}</span>
-        <span className="text-xs text-muted-foreground">{meta}</span>
-      </span>
-      <RemoveButton
-        name={name}
-        onRemove={onRemove}
-        className="ml-1 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
-      />
-    </span>
+    <div className="relative shrink-0">
+      <div className="flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2">
+        <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
+          <Icon className="size-5" />
+        </span>
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate text-sm font-medium text-foreground">{name}</span>
+          <span className="truncate text-xs text-muted-foreground">{meta}</span>
+        </span>
+      </div>
+      <RemoveButton name={name} onRemove={onRemove} />
+    </div>
   );
 }
 
-function RemoveButton({
-  name,
-  onRemove,
-  className,
-}: {
-  name: string;
-  onRemove: () => void;
-  className?: string;
-}) {
+/** The 24px circular remove control, overlapping the tile's top-right corner. */
+function RemoveButton({ name, onRemove }: { name: string; onRemove: () => void }) {
   return (
     <button
       type="button"
       onClick={onRemove}
       aria-label={`Remove ${name}`}
-      className={cn("cursor-pointer", className)}
+      className="absolute -top-1 -right-1 grid size-6 cursor-pointer place-items-center rounded-full border border-border bg-background text-muted-foreground shadow-sm hover:text-foreground"
     >
-      <XIcon className="size-3" />
+      <XIcon className="size-3.5" />
     </button>
   );
 }
