@@ -7029,6 +7029,10 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "clear":
+            if _session_harness_name(conversation_id) == "claude-native":
+                return await _handle_claude_native_clear(conversation_id)
+            if _session_harness_name(conversation_id) == "codex-native":
+                return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
             return Response(status_code=204)
@@ -7335,6 +7339,7 @@ def create_runner_app(
     )
     _codex_native_model_options = _native_controls.codex_native_model_options
     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
+    _handle_claude_native_clear = _native_controls.handle_claude_native_clear
     _handle_claude_native_compact = _native_controls.handle_claude_native_compact
     _handle_claude_native_cost_popup = _native_controls.handle_claude_native_cost_popup
     _handle_claude_native_effort_change = _native_controls.handle_claude_native_effort_change
@@ -7346,6 +7351,7 @@ def create_runner_app(
     _handle_codex_native_approval_mode_change = (
         _native_controls.handle_codex_native_approval_mode_change
     )
+    _handle_codex_native_clear = _native_controls.handle_codex_native_clear
     _handle_codex_native_compact = _native_controls.handle_codex_native_compact
     _handle_codex_native_cost_popup = _native_controls.handle_codex_native_cost_popup
     _handle_codex_native_plan_mode_change = _native_controls.handle_codex_native_plan_mode_change

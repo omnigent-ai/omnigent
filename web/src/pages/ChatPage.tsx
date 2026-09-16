@@ -2015,6 +2015,20 @@ interface ComposerProps {
 }
 
 /**
+ * Harnesses whose runner dispatch knows how to start a new conversation.
+ *
+ * The vendor command differs per harness, so the mapping lives in the runner
+ * and the composer offers one ``/clear`` for all of them. A harness absent
+ * here has no handler, and the server would reject the event — so it must not
+ * be offered in the menu.
+ */
+export const CLEAR_CAPABLE_HARNESSES: ReadonlySet<string> = new Set([
+  "claude-native",
+  "codex-native",
+  "opencode-native",
+]);
+
+/**
  * Build the full slash-command map for the composer: built-ins
  * first (so they top the menu), then one entry per session skill
  * keyed by the session's skill prefix and name. Insertion order matters — the
@@ -2038,6 +2052,7 @@ export function buildSlashCommandMap(
   skillPrefix: "/" | "$" = "/",
   supportsModelReset = false,
   showMcp = false,
+  showClear = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2045,6 +2060,9 @@ export function buildSlashCommandMap(
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
     if (name === "/mcp" && !showMcp) continue;
+    // /clear rotates the vendor session, so it needs a harness the runner
+    // knows the vendor command for.
+    if (name === "/clear" && !showClear) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2812,6 +2830,10 @@ function ComposerImpl(
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
   const showSide = supportsSideChat(sessionHarness);
+  // /clear maps to each vendor's own "new conversation" command in the runner
+  // (`/clear` for Claude Code, `/new` for Codex, a session reset for OpenCode),
+  // so offer it only on the harnesses that dispatch has a handler for.
+  const showClear = CLEAR_CAPABLE_HARNESSES.has(sessionHarness ?? "");
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -2824,6 +2846,7 @@ function ComposerImpl(
         skillPrefix,
         supportsModelReset,
         composerSessionId !== null,
+        showClear,
       ),
     [
       skills,
@@ -2835,6 +2858,7 @@ function ComposerImpl(
       skillPrefix,
       supportsModelReset,
       composerSessionId,
+      showClear,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -3100,6 +3124,23 @@ function ComposerImpl(
           });
         return true;
       }
+      case "/clear":
+        if (!showClear) {
+          setCommandError("/clear is not supported for this agent type");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        void useChatStore
+          .getState()
+          .clearConversation()
+          .catch((err: unknown) => {
+            setCommandError(
+              err instanceof Error ? err.message : "Starting a new conversation failed",
+            );
+          });
+        return true;
       case "/effort": {
         if (!showEffort) return false;
         const valid = [...effortLevels, "default"];

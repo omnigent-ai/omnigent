@@ -12,6 +12,7 @@ import {
 import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
+  CLEAR_CAPABLE_HARNESSES,
   buildSlashCommandMap,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
@@ -1387,7 +1388,7 @@ describe("buildSlashCommandMap", () => {
     // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
       Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp"].includes(name),
+        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
       ),
     );
     // Spot-check a built-in description survives the spread.
@@ -1419,6 +1420,32 @@ describe("buildSlashCommandMap", () => {
     expect(buildSlashCommandMap([], true, true, true, false, false, "/", false, true)["/mcp"]).toBe(
       BUILTIN_SLASH_COMMANDS["/mcp"],
     );
+  });
+
+  it("includes /clear only when showClear is true", () => {
+    // Off by default and when explicitly false — a harness the runner has no
+    // new-conversation handler for would have the server reject the event, so
+    // the command must not be offered.
+    expect(buildSlashCommandMap([], true, true)["/clear"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false)["/clear"],
+    ).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/clear"],
+    );
+  });
+
+  it("gates /clear on the harnesses the runner can start a new conversation on", () => {
+    // The set is the client half of the runner's `body_type == "clear"`
+    // dispatch. A harness listed here with no runner handler would offer a
+    // command that always errors.
+    expect(CLEAR_CAPABLE_HARNESSES.has("claude-native")).toBe(true);
+    expect(CLEAR_CAPABLE_HARNESSES.has("codex-native")).toBe(true);
+    expect(CLEAR_CAPABLE_HARNESSES.has("opencode-native")).toBe(true);
+    // In-process and SDK harnesses rotate no vendor terminal.
+    expect(CLEAR_CAPABLE_HARNESSES.has("claude-sdk")).toBe(false);
+    expect(CLEAR_CAPABLE_HARNESSES.has("cursor-native")).toBe(false);
+    expect(CLEAR_CAPABLE_HARNESSES.has("")).toBe(false);
   });
 
   it("omits /effort when effort controls are hidden", () => {
@@ -1471,7 +1498,7 @@ describe("buildSlashCommandMap", () => {
     // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
       ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp"].includes(name),
+        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
       ),
       "/triage-issues",
       "/mlflow-bug",
