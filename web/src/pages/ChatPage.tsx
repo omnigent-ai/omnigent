@@ -35,6 +35,7 @@ import {
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
 import { useNavigate, useParams } from "@/lib/routing";
+import { useNavigateToSession } from "@/lib/sessionNavigation";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -401,7 +402,7 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
   // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
   // the session exists. `switchTo` still gets the raw `urlConvId`.
   const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
-  const navigate = useNavigate();
+  const navigateToSession = useNavigateToSession();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
@@ -460,16 +461,14 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
   // switchTo fetches history asynchronously; the store's loading/error
   // fields drive the hydration gates below.
   useEffect(() => {
-    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
-    // conversation is gone) has no forward path: landing is URL-keyed, so the
-    // page would sit on a permanently read-only phantom chat. Redirect to
-    // landing instead of binding a nonexistent session.
+    // A reloaded temp selection has no server session to bind. Clear it
+    // through the host rather than leaving a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
-      navigate("/", { replace: true });
+      navigateToSession(null, { replace: true });
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate]);
+  }, [urlConvId, navigateToSession]);
 
   // Server-driven redirect: when the active conversation is superseded
   // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
@@ -482,10 +481,10 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
   useEffect(() => {
     if (!redirectToConversationId) return;
     if (redirectToConversationId !== urlConvId) {
-      navigate(`/c/${redirectToConversationId}`, { replace: true });
+      navigateToSession(redirectToConversationId, { replace: true });
     }
     useChatStore.setState({ redirectToConversationId: null });
-  }, [redirectToConversationId, urlConvId, navigate]);
+  }, [redirectToConversationId, urlConvId, navigateToSession]);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay
@@ -953,7 +952,7 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
           // conversation's id, promote `/` → `/c/:newId`. Replace (not
           // push) so the back button takes the user wherever they came
           // from rather than to a stale `/`.
-          navigate(`/c/${newId}`, { replace: true });
+          navigateToSession(newId, { replace: true });
         },
       });
     },
@@ -964,7 +963,7 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
       isUnboundFork,
       canResumeOnLocalHost,
       isUnreachable,
-      navigate,
+      navigateToSession,
     ],
   );
 
@@ -983,7 +982,7 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
         onConversationCreated: (newId) => {
-          navigate(`/c/${newId}`, { replace: true });
+          navigateToSession(newId, { replace: true });
         },
       });
     },
@@ -994,7 +993,7 @@ export function ChatSession({ conversationId: urlConvId }: { conversationId: str
       isUnboundFork,
       canResumeOnLocalHost,
       isUnreachable,
-      navigate,
+      navigateToSession,
     ],
   );
 

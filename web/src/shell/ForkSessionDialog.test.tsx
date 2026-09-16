@@ -8,6 +8,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SessionNavigationTestHost } from "@/lib/sessionNavigation.test-utils";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
+import { useSearchParams } from "@/lib/routing";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -143,6 +146,22 @@ function setAgents(available: AvailableAgent[], sourceHarness: string | null): v
   } as unknown as ReturnType<typeof useSessionAgent>);
 }
 
+function CanvasQueryControl() {
+  const [params, setParams] = useSearchParams();
+  return (
+    <>
+      <output data-testid="host-query">{params.toString()}</output>
+      <button
+        type="button"
+        data-testid="change-host-query"
+        onClick={() => setParams({ canvas: "other", session: "source", o: "456" })}
+      >
+        Change host query
+      </button>
+    </>
+  );
+}
+
 function renderDialog(
   props: {
     sourceTitle?: string | null;
@@ -150,6 +169,7 @@ function renderDialog(
     sourceHostId?: string | null;
     sourceGitBranch?: string | null;
     upToResponseId?: string | null;
+    canvasSearch?: string;
     // Server capabilities the dialog reads. Omitted leaves the context on
     // "loading", which fails the sandbox gate closed — the world every
     // pre-sandbox case here was written against.
@@ -170,15 +190,26 @@ function renderDialog(
       onOpenChange={vi.fn()}
     />
   );
+  const hostedDialog =
+    props.canvasSearch === undefined ? (
+      dialog
+    ) : (
+      <SessionNavigationTestHost resolveHref={canvasSessionHref}>
+        {dialog}
+        <CanvasQueryControl />
+      </SessionNavigationTestHost>
+    );
   const utils = render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <MemoryRouter>
+        <MemoryRouter
+          initialEntries={[props.canvasSearch === undefined ? "/" : `/canvas${props.canvasSearch}`]}
+        >
           {props.info === undefined ? (
-            dialog
+            hostedDialog
           ) : (
             <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...props.info }}>
-              {dialog}
+              {hostedDialog}
             </CapabilitiesProvider>
           )}
         </MemoryRouter>
@@ -297,6 +328,48 @@ describe("ForkSessionDialog", () => {
     // refetch too — otherwise a filed fork stays missing from its folder.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+  });
+
+  it("selects the new fork inside the Canvas host rather than leaving the board", async () => {
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    const { invalidateSpy } = renderDialog({
+      canvasSearch:
+        "?canvas=board&session=source&file=old.txt&diff=1&comment=c1&view=terminal&o=123",
+    });
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith(
+        "/canvas?canvas=board&o=123&session=conv_fork&view=chat",
+      ),
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+  });
+
+  it("keeps host query updates made while a fork request is pending", async () => {
+    type Fork = Awaited<ReturnType<typeof forkSession>>;
+    let finish: (fork: Fork) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise<Fork>((resolve) => {
+        finish = resolve;
+      }),
+    );
+    renderDialog({ canvasSearch: "?canvas=board&session=source&o=123" });
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    // Simulate a host URL update outside the modal's focus scope.
+    fireEvent.click(screen.getByTestId("change-host-query"));
+    expect(screen.getByTestId("host-query")).toHaveTextContent("canvas=other&session=source&o=456");
+
+    finish({ id: "conv_fork" } as Fork);
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith(
+        "/canvas?canvas=other&o=456&session=conv_fork&view=chat",
+      ),
+    );
   });
 
   it("spins the submit button while the fork is in flight", async () => {

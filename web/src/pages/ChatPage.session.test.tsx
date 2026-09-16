@@ -12,6 +12,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAgents, useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
 import { useLocation, useNavigate } from "@/lib/routing";
+import { SessionNavigationProvider } from "@/lib/sessionNavigation";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { ChatPage, ChatSession } from "./ChatPage";
@@ -55,11 +57,37 @@ function RouteControls() {
   const navigate = useNavigate();
   return (
     <>
-      <output data-testid="location">{location.pathname}</output>
+      <output data-testid="location">{location.pathname + location.search}</output>
       <button type="button" onClick={() => navigate("/c/route-b")}>
         Next session
       </button>
     </>
+  );
+}
+
+function CanvasChatHost() {
+  const { search } = useLocation();
+  const sessionId = new URLSearchParams(search).get("session");
+  return (
+    <SessionNavigationProvider resolveHref={(id) => canvasSessionHref(id, search)}>
+      {sessionId ? <ChatSession conversationId={sessionId} /> : <div>Canvas board</div>}
+    </SessionNavigationProvider>
+  );
+}
+
+function ReviewChatHost() {
+  const { search } = useLocation();
+  const sessionId = new URLSearchParams(search).get("thread");
+  const resolveHref = (id: string | null) => {
+    const params = new URLSearchParams(search);
+    params.delete("thread");
+    if (id !== null) params.set("thread", id);
+    return `/review?${params.toString()}`;
+  };
+  return (
+    <SessionNavigationProvider resolveHref={resolveHref}>
+      {sessionId ? <ChatSession conversationId={sessionId} /> : <div>Review overview</div>}
+    </SessionNavigationProvider>
   );
 }
 
@@ -71,6 +99,7 @@ function routed(ui: ReactElement, path = "/c/route-a") {
         <Route path="/c/:conversationId" element={ui} />
         <Route path="/" element={ui} />
         <Route path="/canvas" element={ui} />
+        <Route path="/review" element={ui} />
       </Routes>
     </MemoryRouter>
   );
@@ -130,6 +159,54 @@ describe("ChatPage route adapter", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/c/replacement");
     expect(switchTo).toHaveBeenLastCalledWith("replacement");
     expect(useChatStore.getState().redirectToConversationId).toBeNull();
+  });
+});
+
+describe("ChatSession custom host navigation", () => {
+  it("uses a non-Canvas host for server-driven session replacement", () => {
+    render(routed(<ReviewChatHost />, "/review?workspace=team&thread=source"));
+    act(() => useChatStore.setState({ redirectToConversationId: "replacement" }));
+
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/review?workspace=team&thread=replacement",
+    );
+    expect(switchTo).toHaveBeenLastCalledWith("replacement");
+    expect(useChatStore.getState().redirectToConversationId).toBeNull();
+  });
+
+  it("lets a non-Canvas host choose the destination for a cleared stale selection", () => {
+    render(routed(<ReviewChatHost />, "/review?workspace=team&thread=temp:missing"));
+
+    expect(switchTo).not.toHaveBeenCalledWith("temp:missing");
+    expect(screen.getByTestId("location")).toHaveTextContent("/review?workspace=team");
+    expect(screen.getByText("Review overview")).toBeInTheDocument();
+  });
+});
+
+describe("ChatSession Canvas navigation", () => {
+  it("replaces a superseded selection inside the same Canvas board", () => {
+    render(
+      routed(
+        <CanvasChatHost />,
+        "/canvas?canvas=board&session=source&file=a&diff=1&comment=c1&view=terminal&o=123",
+      ),
+    );
+    act(() => useChatStore.setState({ redirectToConversationId: "replacement" }));
+
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/canvas?canvas=board&o=123&session=replacement&view=chat",
+    );
+    expect(switchTo).toHaveBeenLastCalledWith("replacement");
+    expect(useChatStore.getState().redirectToConversationId).toBeNull();
+  });
+
+  it("clears a stale temporary selection without navigating to the landing page", () => {
+    render(routed(<CanvasChatHost />, "/canvas?canvas=board&session=temp:missing&view=chat&o=123"));
+
+    expect(switchTo).not.toHaveBeenCalledWith("temp:missing");
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=board&o=123");
+    expect(screen.getByText("Canvas board")).toBeInTheDocument();
+    expect(screen.queryByText("New chat landing")).not.toBeInTheDocument();
   });
 });
 

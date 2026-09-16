@@ -20,6 +20,8 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { SessionNavigationTestHost } from "@/lib/sessionNavigation.test-utils";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -396,7 +398,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
-function renderShell(path: string, info?: ServerInfo) {
+function renderShell(path: string, info?: ServerInfo, canvas = false) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -405,7 +407,17 @@ function renderShell(path: string, info?: ServerInfo) {
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
           <Routes>
-            <Route element={<AppShell />}>
+            <Route
+              element={
+                canvas ? (
+                  <SessionNavigationTestHost resolveHref={canvasSessionHref}>
+                    <AppShell />
+                  </SessionNavigationTestHost>
+                ) : (
+                  <AppShell />
+                )
+              }
+            >
               <Route
                 index
                 element={
@@ -2464,44 +2476,51 @@ describe("Subagents tab", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toBeInTheDocument();
   });
 
-  it("keeps the back-to-parent header link when the parent title is unresolved", () => {
-    // Parent is outside the loaded sidebar window and its snapshot has no
-    // title yet. The header used to hide the whole breadcrumb (and the only
-    // in-header climb-out) until a title resolved. The parent id is enough.
-    mockConversations([]);
-    useSessionMock.mockImplementation((id) => {
-      if (id === "conv_child") {
-        return {
-          session: {
-            id: "conv_child",
-            agentId: "ag_child",
-            agentName: null,
-            runnerId: null,
-            status: "idle",
-            createdAt: 0,
-            title: null,
-            labels: {},
-            items: [],
-            pendingElicitations: [],
-            permissionLevel: 4,
-            parentSessionId: "conv_parent",
-            subAgentName: null,
-            kind: "sub_agent",
-          },
-          isLoading: false,
-          error: null,
-        };
-      }
-      return { session: null, isLoading: false, error: null };
-    });
+  it.each([false, true])(
+    "keeps the back-to-parent header link when the parent title is unresolved (canvas=%s)",
+    (canvas) => {
+      // Parent is outside the loaded sidebar window and its snapshot has no
+      // title yet. The header used to hide the whole breadcrumb (and the only
+      // in-header climb-out) until a title resolved. The parent id is enough.
+      mockConversations([]);
+      useSessionMock.mockImplementation((id) => {
+        if (id === "conv_child") {
+          return {
+            session: {
+              id: "conv_child",
+              agentId: "ag_child",
+              agentName: null,
+              runnerId: null,
+              status: "idle",
+              createdAt: 0,
+              title: null,
+              labels: {},
+              items: [],
+              pendingElicitations: [],
+              permissionLevel: 4,
+              parentSessionId: "conv_parent",
+              subAgentName: null,
+              kind: "sub_agent",
+            },
+            isLoading: false,
+            error: null,
+          };
+        }
+        return { session: null, isLoading: false, error: null };
+      });
 
-    renderShell("/c/conv_child");
+      renderShell(
+        canvas ? "/c/conv_child?canvas=board&session=conv_child&o=123" : "/c/conv_child",
+        undefined,
+        canvas,
+      );
 
-    expect(screen.getByRole("link", { name: "Back to parent session" })).toHaveAttribute(
-      "href",
-      "/c/conv_parent",
-    );
-  });
+      expect(screen.getByRole("link", { name: "Back to parent session" })).toHaveAttribute(
+        "href",
+        canvas ? "/canvas?canvas=board&o=123&session=conv_parent&view=chat" : "/c/conv_parent",
+      );
+    },
+  );
 });
 
 describe("FilesPanel visibility", () => {

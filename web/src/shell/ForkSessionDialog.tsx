@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useNavigate } from "@/lib/routing";
+import { useNavigateToSession } from "@/lib/sessionNavigation";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
@@ -701,7 +701,7 @@ export function ForkSessionForm({
   upToResponseId?: string | null;
   onClose: () => void;
 }) {
-  const navigate = useNavigate();
+  const navigateToSession = useNavigateToSession();
   const queryClient = useQueryClient();
   // Name is optional — left blank, the server derives "Fork of <source
   // title>" (shown as the input's placeholder). So the field starts empty.
@@ -1256,7 +1256,7 @@ export function ForkSessionForm({
       // the fork active.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       onClose();
-      navigate(`/c/${fork.id}`);
+      navigateToSession(fork.id);
     } catch (e) {
       // forkSession failed — nothing created, so inputs stay editable for a resubmit.
       setError(e instanceof Error ? e.message : "Couldn't clone the session. Try again.");

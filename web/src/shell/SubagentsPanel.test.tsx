@@ -15,6 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { SessionNavigationTestHost } from "@/lib/sessionNavigation.test-utils";
+import { canvasSessionHref } from "@/canvas/canvasNavigation";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -66,10 +68,18 @@ function renderPanel({
   conversationId = "conv_parent",
   rootSessionId = "conv_parent",
   initialEntries,
-}: RenderOptions & { initialEntries?: string[] } = {}) {
+  canvas = false,
+}: RenderOptions & { initialEntries?: string[]; canvas?: boolean } = {}) {
+  const panel = <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />;
   return render(
     <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+      {canvas ? (
+        <SessionNavigationTestHost resolveHref={canvasSessionHref}>
+          {panel}
+        </SessionNavigationTestHost>
+      ) : (
+        panel
+      )}
     </MemoryRouter>,
   );
 }
@@ -1328,7 +1338,7 @@ describe("SubagentsPanel", () => {
       // Simulate stale session-scoped params carried over from the
       // previous session — the bug condition the fix targets. All four
       // are listed so any regression that drops a key from
-      // SESSION_SCOPED_PARAMS surfaces here.
+      // the shared session-view parameter list surfaces here.
       initialEntries: ["/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed"],
     });
 
@@ -1363,6 +1373,26 @@ describe("SubagentsPanel", () => {
 
     const child = screen.getByTestId("subagent-row");
     expect(child.getAttribute("href")).toBe("/c/conv_child_a?debug=1");
+  });
+
+  it("keeps parent and child links inside the Canvas host with clean session state", () => {
+    mockChildTree({ conv_root: [childInfo({ id: "conv_child_a", tool: "researcher" })] });
+    renderPanel({
+      rootSessionId: "conv_root",
+      canvas: true,
+      initialEntries: [
+        "/canvas?canvas=project-a&session=old&file=foo&diff=1&comment=c1&view=terminal&debug=1&o=123",
+      ],
+    });
+
+    expect(screen.getByTestId("subagent-main-row")).toHaveAttribute(
+      "href",
+      "/canvas?canvas=project-a&debug=1&o=123&session=conv_root&view=chat",
+    );
+    expect(screen.getByTestId("subagent-row")).toHaveAttribute(
+      "href",
+      "/canvas?canvas=project-a&debug=1&o=123&session=conv_child_a&view=chat",
+    );
   });
 
   it.each(ICON_CASES)("maps agent type %s to its category icon", (tool, expected) => {
