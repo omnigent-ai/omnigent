@@ -25,6 +25,7 @@ struct WebShellView: View {
           initialURL: initialURL,
           model: model,
           settings: settings,
+          databricksInternalFeaturesEnabled: managedConfiguration.databricksInternalFeaturesEnabled,
           loadFailed: loadFailed,
           loadSucceeded: loadSucceeded,
           pushServerPicker: pushServerPicker,
