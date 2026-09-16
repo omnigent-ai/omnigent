@@ -82,7 +82,10 @@ def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
             return
         error = completed.exception()
         if error is not None:
-            _logger.warning("Detached runner launch cleanup failed", exc_info=error)
+            _logger.warning(
+                "Detached runner launch cleanup failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     task.add_done_callback(_done)
 
@@ -963,7 +966,8 @@ def create_hosts_router(
                     body.session_id,
                     exc_info=True,
                 )
-            await _rollback_worktree()
+            finally:
+                await _rollback_worktree()
 
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
