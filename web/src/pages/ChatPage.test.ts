@@ -1485,6 +1485,24 @@ describe("dispatchInitialPrompt", () => {
     // an empty array here means first-message attachments silently vanish.
     expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
   });
+
+  it("dispatches an image-only draft (blank text) through the plain path with its files", () => {
+    // The server-first create path queues { text: "", files: [image] }.
+    // Dispatch must hand the blank text plus the real File objects to
+    // send() — send() omits the input_text block for blank text, so the
+    // first message goes out as input_image blocks alone.
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    const file = new File(["x"], "screenshot.png", { type: "image/png" });
+    dispatchInitialPrompt(
+      { text: "", skill: null, files: [file] },
+      "ag_abc123",
+      send,
+      sendSlashCommand,
+    );
+    expect(send).toHaveBeenCalledWith("", "ag_abc123", [file]);
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
 });
 
 describe("shouldSendInitialPrompt", () => {
@@ -1494,6 +1512,7 @@ describe("shouldSendInitialPrompt", () => {
   // dropped in the effect, the matching case flips.
   const ready = {
     initialPrompt: "read the README",
+    initialPromptFileCount: 0,
     promptConversationId: "conv_abc",
     sentForConversationId: null,
     conversationId: "conv_abc",
@@ -1517,9 +1536,24 @@ describe("shouldSendInitialPrompt", () => {
     ["empty string", ""],
   ] as const)("does not send when there is no carried prompt (%s)", (_label, initialPrompt) => {
     // null = user left the field blank (common case); "" = a
-    // manipulated router state. Both are falsy and must never
-    // auto-send — a failure would post an empty/garbage message.
+    // manipulated router state. Both are falsy and — with no files —
+    // must never auto-send: a failure would post an empty/garbage
+    // message.
     expect(shouldSendInitialPrompt({ ...ready, initialPrompt })).toBe(false);
+  });
+
+  it.each([
+    ["null", null],
+    ["empty string", ""],
+  ] as const)("sends an image-only prompt (%s text, files attached)", (_label, initialPrompt) => {
+    // The landing composer's submit gate counts attachments as content,
+    // so the auto-send gate must too: an image-only first message queued
+    // by the server-first create path carries blank text plus files. A
+    // failure here means the session is created but the attached image
+    // is silently dropped — the exact bug the composer fix exposed.
+    expect(shouldSendInitialPrompt({ ...ready, initialPrompt, initialPromptFileCount: 1 })).toBe(
+      true,
+    );
   });
 
   it("does not send twice for the same conversation (once-guard)", () => {

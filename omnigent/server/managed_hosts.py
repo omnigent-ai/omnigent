@@ -182,6 +182,7 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -3851,7 +3852,9 @@ async def resume_managed_host(
         runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
         from scratch, so the classifier is not carried over by the resume: the
         caller re-derives it through the same built-in gate a launch uses.
-    :raises HTTPException: 502 when the resume or host restart fails.
+    :raises SandboxGoneError: When the sandbox generation definitively no
+        longer exists, allowing the caller to create a fresh one.
+    :raises HTTPException: 502 when the resume or host restart otherwise fails.
     """
     if config is None:
         return
@@ -3931,6 +3934,8 @@ async def resume_managed_host(
                 agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
+        except SandboxGoneError:
+            raise
         except Exception as exc:
             # An ordinary failed wake must NOT tear the sandbox down (the volume
             # is the user's); just surface it. Full teardown is handled above.

@@ -4973,6 +4973,24 @@ HarnessStreamEvent = (
 # ── Projects ──────────────────────────────────────────────────────
 
 
+class ProjectOrderRequest(BaseModel):
+    """Rank owned project IDs; unranked projects append in discovery order.
+
+    Null selects alphabetical mode without erasing the remembered manual IDs.
+    """
+
+    ordered_project_ids: (
+        list[Annotated[str, Field(min_length=32, max_length=32, pattern="^[0-9a-f]{32}$")]] | None
+    ) = Field(..., max_length=10000)
+
+
+class ProjectOrderResponse(BaseModel):
+    """Current sorting mode and the manual order retained in either mode."""
+
+    sort_mode: Literal["alphabetical", "manual"]
+    ordered_project_ids: list[str] | None
+
+
 class ProjectObject(BaseModel):
     """
     A first-class project (see ``designs/PROJECTS_PRD.md``).

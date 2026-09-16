@@ -983,6 +983,35 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("enables Send for a file-only draft and creates the session without text", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+
+    // An attached image alone is a sendable draft: the send path omits the
+    // input_text block for blank text, so nothing downstream needs typing.
+    const file = new File(["x"], "screenshot.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: "",
+        skill: null,
+        files: [file],
+      }),
+    );
+  });
+
   it("hands a bundled-skill first message off as a structured invocation", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

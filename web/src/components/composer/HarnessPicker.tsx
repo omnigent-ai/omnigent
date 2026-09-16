@@ -1,5 +1,6 @@
 import {
   type ComponentProps,
+  type KeyboardEvent,
   type ReactNode,
   type SyntheticEvent,
   createContext,
@@ -57,7 +58,14 @@ function useMenuInteractionProps(configOpen = false) {
       interaction.onPointerInteraction();
       if (configOpen && event.currentTarget.contains(event.target as Node)) event.preventDefault();
     },
-    onKeyDownCapture: interaction.onKeyboardInteraction,
+    onKeyDownCapture: (event: KeyboardEvent<HTMLElement>) => {
+      interaction.onKeyboardInteraction();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        interaction.closeMenu();
+      }
+    },
   };
 }
 
