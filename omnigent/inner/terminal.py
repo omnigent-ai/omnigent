@@ -748,15 +748,19 @@ def _process_alive(pid: int) -> bool:
 
 def _terminals_tmp_root() -> Path:
     """
-    Return the directory scanned for terminal instance dirs.
+    Choose a parent for terminal instance dirs and their orphan sweep.
 
     Indirection point so tests can retarget the orphan sweep at a
     scratch directory without monkeypatching the process-wide
     ``tempfile`` module (see omnigent-testing rule 14).
 
-    :returns: The system temp directory, e.g. ``Path("/tmp")``.
+    :returns: The configured temp directory, or ``/tmp`` when its path
+        would make the tmux socket exceed the portable Unix socket limit.
     """
-    return Path(tempfile.gettempdir())
+    root = Path(tempfile.gettempdir())
+    # mkdtemp adds eight random characters; macOS allows 103 path bytes.
+    socket_template = root / f"{_TERMINAL_DIR_PREFIX}xxxxxxxx" / "tmux.sock"
+    return root if len(os.fsencode(socket_template)) <= 103 else Path("/tmp")
 
 
 def reap_orphaned_terminals() -> int:
@@ -2332,7 +2336,7 @@ def create_terminal_instance(
     _require_supported_tmux()
 
     # Create the instance's private directory.
-    private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))
+    private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX, dir=_terminals_tmp_root()))
     socket_path = private_dir / "tmux.sock"
     # Record the owning process so a later startup can reap this tmux
     # server if we die without graceful shutdown (SIGKILL, harness
