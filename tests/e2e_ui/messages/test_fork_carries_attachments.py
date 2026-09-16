@@ -44,12 +44,13 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.process_logging import process_log_dir
 from tests.e2e_ui.conftest import (
     _bind_session_runner,
     _server_state,
     _temp_omnigent_mock_config,
-    set_fallback_mock_llm,
+    seed_committed_items,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -106,21 +107,31 @@ def _upload_image(base_url: str, session_id: str) -> str:
     return str(resp.json()["id"])
 
 
-def _send_image_message(base_url: str, session_id: str, file_id: str) -> None:
-    """Post a user message with an ``input_image`` block referencing *file_id*."""
-    body = {
-        "type": "message",
-        "data": {
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": _USER_PROMPT},
-                {"type": "input_image", "file_id": file_id},
-            ],
-        },
-    }
-    resp = httpx.post(f"{base_url}/v1/sessions/{session_id}/events", json=body, timeout=30.0)
-    resp.raise_for_status()
-    assert "item_id" in resp.json(), f"events endpoint did not queue a turn: {resp.json()}"
+def _seed_image_message(session_id: str, file_id: str) -> None:
+    """Persist a user message with an ``input_image`` block straight into the store.
+
+    Seeds the pre-resolution item directly (no ``POST /events``) so no runner
+    turn is dispatched. The source and fork share one runner; a source turn
+    left running would keep that runner busy when the fork binds and launches
+    Claude Code. The journey only needs the raw ``file_id`` block persisted —
+    which is exactly what a real send would leave behind before resolution.
+    """
+    seed_committed_items(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_attach",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_text", "text": _USER_PROMPT},
+                        {"type": "input_image", "file_id": file_id},
+                    ],
+                ),
+            )
+        ],
+    )
 
 
 def _wait_persisted_file_id_block(base_url: str, session_id: str, file_id: str) -> None:
@@ -240,13 +251,11 @@ def test_fork_into_claude_native_carries_image_attachment(
     runner_id = str(_server_state["runner_id"])
     target_agent_id = _agent_id_by_name(base_url, _CLAUDE_NATIVE_TARGET)
 
-    # Keep the SDK source's turn from hanging on an empty mock queue; we only
-    # need the user item persisted, not a meaningful reply.
-    set_fallback_mock_llm(mock_llm_server_url, "gpt-4o-mini", "ok")
-
-    # 1) User uploads an image and sends it in the SDK chat.
+    # 1) User uploads an image and sends it in the SDK chat. (Seeded straight
+    #    into the store — see _seed_image_message — so no source turn occupies
+    #    the shared runner before the fork launches Claude Code.)
     source_file_id = _upload_image(base_url, source_id)
-    _send_image_message(base_url, source_id, source_file_id)
+    _seed_image_message(source_id, source_file_id)
     _wait_persisted_file_id_block(base_url, source_id, source_file_id)
     image_bytes = _TEST_IMAGE_PATH.read_bytes()
 
@@ -275,22 +284,6 @@ def test_fork_into_claude_native_carries_image_attachment(
     )
     assert source_content.status_code == 200
     assert source_content.content == image_bytes
-
-    # -- The fork SHARES the source's blob (no bytes copied), so deleting the
-    #    source session must not delete the bytes out from under the fork.
-    #    Reference-counted blob deletion is what keeps the fork servable here;
-    #    without it, deleting the source resurrects the original 404.
-    del_resp = httpx.delete(f"{base_url}/v1/sessions/{source_id}", timeout=30.0)
-    assert del_resp.status_code in (200, 204), del_resp.text
-    fork_content_after = httpx.get(
-        f"{base_url}/v1/sessions/{fork_id}/resources/files/{fork_file_id}/content",
-        timeout=30.0,
-    )
-    assert fork_content_after.status_code == 200, (
-        "fork's attachment must survive the source session's deletion — the "
-        f"shared blob was reference-counted, got {fork_content_after.status_code}"
-    )
-    assert fork_content_after.content == image_bytes
 
     # -- The fork's labels still select the runner's rebuild-from-items path
     #    (the journey being guarded: rebuild must re-resolve the attachment).
@@ -344,3 +337,84 @@ def test_fork_into_claude_native_carries_image_attachment(
         _open_view(page, "Chat view")
         _wait_attachment_loaded(page, fork_file_id)
         page.wait_for_timeout(1500)
+
+    # -- Refcount proof, run LAST: the fork SHARES the source's blob (no bytes
+    #    copied), so deleting the source session must not delete the bytes out
+    #    from under the fork. Reference-counted blob deletion is what keeps the
+    #    fork servable here; without it, deleting the source resurrects the
+    #    original 404. Deliberately after the launch above — the source and fork
+    #    share one runner, so deleting the source mid-launch would wedge it.
+    del_resp = httpx.delete(f"{base_url}/v1/sessions/{source_id}", timeout=30.0)
+    assert del_resp.status_code in (200, 204), del_resp.text
+    fork_content_after = httpx.get(
+        f"{base_url}/v1/sessions/{fork_id}/resources/files/{fork_file_id}/content",
+        timeout=30.0,
+    )
+    assert fork_content_after.status_code == 200, (
+        "fork's attachment must survive the source session's deletion — the "
+        f"shared blob was reference-counted, got {fork_content_after.status_code}"
+    )
+    assert fork_content_after.content == image_bytes
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(180)
+def test_fork_shared_attachment_renders_in_forked_chat(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The web-surface proof of the blob-sharing fork, without a native launch.
+
+    Same-agent (SDK) fork of a chat that has an uploaded image: the forked
+    chat must render the attachment (its own file row points at the source's
+    shared blob, so the fork's content endpoint serves the bytes), and it must
+    keep rendering after the SOURCE session is deleted (reference-counted blob
+    deletion keeps the shared bytes alive for the fork). This is the same fix
+    the native journey exercises, on the surface a user watches, and it needs
+    no Claude Code launch — so it records anywhere the browser does.
+    """
+    base_url, source_id = seeded_session
+    runner_id = str(_server_state["runner_id"])
+
+    # 1) Upload an image and persist the user message (seeded, no turn).
+    source_file_id = _upload_image(base_url, source_id)
+    _seed_image_message(source_id, source_file_id)
+    _wait_persisted_file_id_block(base_url, source_id, source_file_id)
+    image_bytes = _TEST_IMAGE_PATH.read_bytes()
+
+    # 2) Plain fork (same SDK agent) — carries the attachment via a fork-owned
+    #    row that shares the source's blob.
+    resp = httpx.post(
+        f"{base_url}/v1/sessions/{source_id}/fork",
+        json={"title": "Fork with attachment"},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    fork_id = resp.json()["id"]
+    assert fork_id != source_id
+
+    fork_file_id = _fork_attachment_file_id(base_url, fork_id)
+    fork_content = httpx.get(
+        f"{base_url}/v1/sessions/{fork_id}/resources/files/{fork_file_id}/content",
+        timeout=30.0,
+    )
+    assert fork_content.status_code == 200, (
+        f"fork must serve the shared attachment, got {fork_content.status_code}"
+    )
+    assert fork_content.content == image_bytes
+
+    # 3) Open the forked chat — the attachment renders (survived the fork).
+    _bind_session_runner(base_url, fork_id, runner_id)
+    page.goto(f"{base_url}/c/{fork_id}")
+    expect(page.get_by_text(_USER_PROMPT).first).to_be_visible(timeout=60_000)
+    _wait_attachment_loaded(page, fork_file_id)
+    page.wait_for_timeout(2500)  # hold on the rendered attachment (recording)
+
+    # 4) Delete the SOURCE, reload the fork — the attachment STILL renders
+    #    (reference-counted blob deletion kept the shared bytes alive).
+    del_resp = httpx.delete(f"{base_url}/v1/sessions/{source_id}", timeout=30.0)
+    assert del_resp.status_code in (200, 204), del_resp.text
+    page.reload()
+    expect(page.get_by_text(_USER_PROMPT).first).to_be_visible(timeout=60_000)
+    _wait_attachment_loaded(page, fork_file_id)
+    page.wait_for_timeout(3000)  # hold on the surviving attachment (recording)
