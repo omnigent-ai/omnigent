@@ -481,6 +481,59 @@ async def test_launch_runner_cancellation_during_host_bind_rolls_back(
     assert conv.git_branch is None
 
 
+async def test_launch_runner_cancellation_during_reservation_rolls_back(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation waits for the reservation CAS, then clears only its token."""
+    reserve_started = threading.Event()
+    release_reserve = threading.Event()
+    cleanup_finished = threading.Event()
+    original_set_runner_id = SqlAlchemyConversationStore.set_runner_id
+    original_clear_if_matches = SqlAlchemyConversationStore.clear_runner_id_if_matches
+
+    def _delayed_set_runner_id(*args: Any, **kwargs: Any) -> bool:
+        reserve_started.set()
+        assert release_reserve.wait(timeout=2.0)
+        return original_set_runner_id(*args, **kwargs)
+
+    def _tracked_clear_if_matches(*args: Any, **kwargs: Any) -> bool:
+        try:
+            return original_clear_if_matches(*args, **kwargs)
+        finally:
+            cleanup_finished.set()
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_runner_id", _delayed_set_runner_id)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "clear_runner_id_if_matches",
+        _tracked_clear_if_matches,
+    )
+    cap = register_host()
+    session_id = await _bare_session(client, "wt-reserve-cancel-agent")
+
+    launch_task = asyncio.create_task(
+        _launch(client, session_id, git={"branch_name": "feature/b"})
+    )
+    assert await asyncio.to_thread(reserve_started.wait, 2.0)
+    launch_task.cancel()
+    release_reserve.set()
+    with pytest.raises(asyncio.CancelledError):
+        await launch_task
+
+    assert await asyncio.to_thread(cleanup_finished.wait, 2.0)
+    assert cap.create == []
+    assert cap.launch == []
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is None
+    assert conv.host_id is None
+    assert conv.workspace is None
+    assert conv.git_branch is None
+
+
 async def test_launch_runner_post_commit_host_bind_failure_rolls_back(
     register_host: RegisterHost,
     client: httpx.AsyncClient,

@@ -840,26 +840,43 @@ def create_hosts_router(
         # Later launch requests fail instead of binding it elsewhere.
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
-        bound = await asyncio.to_thread(
-            conversation_store.set_runner_id,
-            body.session_id,
-            runner_id,
+
+        async def _rollback_runner_claim() -> None:
+            await asyncio.to_thread(
+                conversation_store.clear_runner_id_if_matches,
+                body.session_id,
+                runner_id,
+            )
+
+        reserve_task = asyncio.create_task(
+            asyncio.to_thread(
+                conversation_store.set_runner_id,
+                body.session_id,
+                runner_id,
+            )
         )
+        try:
+            bound = await asyncio.shield(reserve_task)
+        except BaseException as exc:
+
+            async def _rollback_reservation() -> None:
+                with contextlib.suppress(BaseException):
+                    await reserve_task
+                await _rollback_runner_claim()
+
+            cleanup_task = asyncio.create_task(_rollback_reservation())
+            if isinstance(exc, asyncio.CancelledError):
+                _track_runner_launch_cleanup(cleanup_task)
+            else:
+                with contextlib.suppress(BaseException):
+                    await cleanup_task
+            raise
+
         if not bound:
             raise HTTPException(
                 status_code=400,
                 detail="session already has a runner bound",
             )
-
-        async def _rollback_runner_claim() -> None:
-            try:
-                await asyncio.to_thread(conversation_store.clear_runner_id, body.session_id)
-            except ConversationNotFoundError:
-                _logger.warning(
-                    "Failed to release runner reservation for session %s",
-                    body.session_id,
-                    exc_info=True,
-                )
 
         # Resolve the harness while only the runner reservation is held.
         harness: str | None = None

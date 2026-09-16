@@ -1306,6 +1306,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def clear_runner_id_if_matches(self, conversation_id: str, runner_id: str) -> bool:
+        """Clear ``runner_id`` only when it still matches the expected value.
+
+        :param conversation_id: Conversation to update.
+        :param runner_id: Runner id owned by the caller.
+        :returns: Whether the matching runner id was cleared.
+        """
+        ...
+
+    @abstractmethod
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         """
         Stamp ``runner_last_seen`` for every session bound to these runners.
