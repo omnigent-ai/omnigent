@@ -85,6 +85,7 @@ logger = logging.getLogger(__name__)
 # Not Databricks-specific: the same fallback applies to any gateway producer
 # (Databricks AI gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
+_GATEWAY_AUTH_TIMEOUT_MS = 15_000
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped Codex App Server boundaries
@@ -1900,7 +1901,7 @@ def _databricks_codex_config_overrides(
             f"base_url={json.dumps(base_url)},"
             'auth={command="sh",'
             f'args=["-c",{auth_command_json}],'
-            "timeout_ms=5000,"
+            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
@@ -1961,7 +1962,7 @@ def _provider_codex_config_overrides(
         f"base_url={json.dumps(base_url)},"
         'auth={command="sh",'
         f'args=["-c",{auth_command_json}],'
-        "timeout_ms=5000,"
+        f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
         f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
         "},"
         f'wire_api="{effective_wire_api}"}}'
