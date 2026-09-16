@@ -34,7 +34,7 @@ stores into ``create_app``):
 
        sandbox:
          # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|
-         # kubernetes|microsandbox
+         # kubernetes|microsandbox|gensee
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -112,9 +112,15 @@ stores into ``create_app``):
            network: host                     # host (default)|public-only|all
            host_ports: [8317]                # extra guest-to-host ports (the
                                              # server_url port is always allowed)
+         gensee:                 # optional block (provider: gensee)
+           endpoint: https://sandbox.gensee.ai
+           api_token_env: GENSEE_CONTROLLER_API_TOKEN
+           workspace_root: /mnt/gensee-tclone/workspaces
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
 
    Most providers default to a public prebaked host image, so
-   ``provider`` + ``server_url`` is a complete config. Registry-backed
+   ``provider`` + ``server_url`` is a complete config. Gensee instead starts a
+   provider-managed runtime. Registry-backed
    providers use ``ghcr.io/omnigent-ai/omnigent-host:latest`` (see
    :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE`); Blaxel uses
    ``blaxel/omnigent-host:latest``, which adds its required ``sandbox-api``.
@@ -126,7 +132,9 @@ stores into ``create_app``):
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. The Blaxel launcher reads ``BL_WORKSPACE``
+   server process environment. Gensee reads the environment variable named by
+   ``sandbox.gensee.api_token_env`` (``GENSEE_CONTROLLER_API_TOKEN`` by
+   default). The Blaxel launcher reads ``BL_WORKSPACE``
    and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
    launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
@@ -174,6 +182,7 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -203,6 +212,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "cwsandbox",
         "islo",
         "e2b",
+        "gensee",
         "openshell",
         "kubernetes",
         "microsandbox",
@@ -218,6 +228,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "cwsandbox",
         "islo",
         "e2b",
+        "gensee",
         "openshell",
         "kubernetes",
         "microsandbox",
@@ -1432,6 +1443,36 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # outlives the (operator-overridable) sandbox lifetime — mirrors
         # the cwsandbox path.
         token_ttl_s = managed_token_ttl_s()
+    elif provider == "gensee":
+        from omnigent.onboarding.sandboxes.gensee import MANAGED_TOKEN_TTL_S
+
+        section = _parse_provider_section(raw, "gensee")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {
+                    "endpoint",
+                    "api_token_env",
+                    "workspace_root",
+                    "operation_timeout_s",
+                    "poll_interval_s",
+                    "request_timeout_s",
+                    "retry_timeout_s",
+                    "env",
+                },
+                "sandbox.gensee",
+            )
+        launcher_factory = _gensee_launcher_factory(
+            endpoint=_parse_provider_string(raw, "gensee", "endpoint"),
+            api_token_env=_parse_provider_string(raw, "gensee", "api_token_env"),
+            workspace_root=_parse_provider_string(raw, "gensee", "workspace_root"),
+            operation_timeout_s=_parse_provider_positive_int(raw, "gensee", "operation_timeout_s"),
+            poll_interval_s=_parse_provider_positive_int(raw, "gensee", "poll_interval_s"),
+            request_timeout_s=_parse_provider_positive_int(raw, "gensee", "request_timeout_s"),
+            retry_timeout_s=_parse_provider_nonnegative_int(raw, "gensee", "retry_timeout_s"),
+            env=_parse_provider_env(raw, "gensee"),
+        )
+        token_ttl_s = MANAGED_TOKEN_TTL_S
     elif provider == "openshell":
         launcher_factory = _openshell_launcher_factory(
             image=_parse_provider_image(raw, "openshell"),
@@ -2084,6 +2125,50 @@ def _e2b_launcher_factory(
     return _build
 
 
+def _gensee_launcher_factory(
+    *,
+    endpoint: str | None,
+    api_token_env: str | None,
+    workspace_root: str | None,
+    operation_timeout_s: int | None,
+    poll_interval_s: int | None,
+    request_timeout_s: int | None,
+    retry_timeout_s: int | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: gensee`` path."""
+    from omnigent.onboarding.sandboxes.gensee import (
+        API_TOKEN_ENV_VAR,
+        DEFAULT_OPERATION_TIMEOUT_S,
+        DEFAULT_POLL_INTERVAL_S,
+        DEFAULT_REQUEST_TIMEOUT_S,
+        DEFAULT_RETRY_TIMEOUT_S,
+        DEFAULT_WORKSPACE_ROOT,
+        GenseeSandboxLauncher,
+    )
+
+    def _build() -> SandboxHostLauncher:
+        return GenseeSandboxLauncher(
+            endpoint=endpoint,
+            api_token_env=api_token_env or API_TOKEN_ENV_VAR,
+            workspace_root=workspace_root or DEFAULT_WORKSPACE_ROOT,
+            operation_timeout_s=operation_timeout_s or DEFAULT_OPERATION_TIMEOUT_S,
+            poll_interval_s=poll_interval_s or DEFAULT_POLL_INTERVAL_S,
+            request_timeout_s=request_timeout_s or DEFAULT_REQUEST_TIMEOUT_S,
+            retry_timeout_s=(
+                retry_timeout_s if retry_timeout_s is not None else DEFAULT_RETRY_TIMEOUT_S
+            ),
+            env=env,
+        )
+
+    try:
+        _build()
+    except ValueError as exc:
+        raise ValueError(f"server config 'sandbox.gensee' is invalid: {exc}") from exc
+
+    return _build
+
+
 def _parse_e2b_template(raw: dict[str, object]) -> str | None:
     """
     Extract and validate the e2b template from the ``sandbox`` dict.
@@ -2488,6 +2573,21 @@ def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a positive integer")
+    return value
+
+
+def _parse_provider_nonnegative_int(raw: dict[str, object], provider: str, key: str) -> int | None:
+    """Extract an optional non-negative integer provider field."""
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            f"server config 'sandbox.{provider}.{key}' must be a non-negative integer"
+        )
     return value
 
 
@@ -3701,6 +3801,7 @@ def host_sandbox_is_running(
 # replica, else two host processes flap the tunnel registration. Reused across a
 # host's many idle-stop/resume cycles, so not reaped — a .pop() could also race
 # a resume still holding it; one idle Lock per host woken is negligible.
+# custom-lint: disable-next=workspace-scoped-cache -- host_id lock; collision only serializes
 _resume_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -3709,6 +3810,7 @@ async def resume_managed_host(
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
     *,
+    repos: Sequence[RepoWorkspace] = (),
     force: bool = False,
     on_stage: Callable[[str], None] | None = None,
     agent_name: str | None = None,
@@ -3718,7 +3820,7 @@ async def resume_managed_host(
 
     The send-message relaunch path calls this when a host-bound session has no
     live runner. If the host is a *resumable* managed host — a provider whose
-    sandbox idle-stops but retains its persistent volume
+    sandbox idle-stops but retains its identity
     (:attr:`SandboxLauncher.can_resume`) — and is currently offline, this
     resumes the sandbox under the SAME sandbox id, re-arms its launch token,
     re-execs ``omnigent host``, and waits for it to re-register. The caller's
@@ -3739,6 +3841,8 @@ async def resume_managed_host(
     :param host_store: Persistent host registrations (cross-replica liveness).
     :param config: The deployment's managed-sandbox config, or ``None`` when
         the ``sandbox:`` section has been removed since launch.
+    :param repos: Recorded repositories to restore when an agent-sandbox wake
+        recreates its Pod with ephemeral HOME. Existing clones are kept.
     :param force: Skip the DB-liveness no-op gate when the caller has local
         evidence that the tunnel is gone.
     :param on_stage: Progress observer forwarded to the launcher's
@@ -3751,7 +3855,9 @@ async def resume_managed_host(
         runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
         from scratch, so the classifier is not carried over by the resume: the
         caller re-derives it through the same built-in gate a launch uses.
-    :raises HTTPException: 502 when the resume or host restart fails.
+    :raises SandboxGoneError: When the sandbox generation definitively no
+        longer exists, allowing the caller to create a fresh one.
+    :raises HTTPException: 502 when the resume or host restart otherwise fails.
     """
     if config is None:
         return
@@ -3770,11 +3876,13 @@ async def resume_managed_host(
         if host is None:
             return
         # Provider-matched launcher (None if config dropped / provider changed).
-        # Resume needs a reattachable volume; others (e.g. Modal) fall through
-        # to the caller's fresh relaunch path.
+        # Non-resumable providers (e.g. Modal) fall through to a fresh relaunch.
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
+        # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
+        # providers retain their filesystem and do not need workspace prep.
+        workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -3825,12 +3933,14 @@ async def resume_managed_host(
                 host_id=host.host_id,
                 host_name=host.name,
                 server_url=entry.server_url,
-                repos=(),  # the persistent volume already holds the workspace
+                repos=workspace_repos,
                 host_config=entry.host_config,
                 on_stage=on_stage,
                 agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
+        except SandboxGoneError:
+            raise
         except Exception as exc:
             # An ordinary failed wake must NOT tear the sandbox down (the volume
             # is the user's); just surface it. Full teardown is handled above.

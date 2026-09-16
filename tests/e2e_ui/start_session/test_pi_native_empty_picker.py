@@ -16,6 +16,7 @@ from playwright.async_api import Route, async_playwright, expect
 
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
+    _expect_model_menu_without_advanced_settings,
     _open_entry_models,
     _pi_native_agents_body,
     _register_common_routes,
@@ -96,6 +97,7 @@ async def _drive_empty_pi_picker(base_url: str, session_id: str) -> None:
             )
 
             await _open_entry_models(page, "ag_pi_e2e")
+            await _expect_model_menu_without_advanced_settings(page)
             models = page.get_by_test_id("new-chat-landing-agent-models")
             await expect(models).to_be_visible()
             await expect(models).to_contain_text("Models unavailable")
@@ -103,6 +105,10 @@ async def _drive_empty_pi_picker(base_url: str, session_id: str) -> None:
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-model-search")
             ).to_be_visible()
+            await expect(page.get_by_test_id("new-chat-landing-agent-efforts")).to_contain_text(
+                "Thinking level"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-agent-effort-high")).to_be_visible()
             await expect(page.get_by_test_id("new-chat-landing-config-modal")).to_have_count(0)
         finally:
             # Close the context first so the recorded video is flushed to disk,

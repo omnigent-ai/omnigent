@@ -1127,11 +1127,13 @@ def _resolve_gateway_env(
     command + a refresh TTL. When the gateway base URL and auth command are
     supplied directly (the generic-provider producer, or ucode), they are
     used verbatim. When only a Databricks profile is supplied (no override
-    values), the Databricks-specific fallback derives both from
-    ``~/.databrickscfg``:
-      1. ~/.databrickscfg profile credentials
-      2. ~/.databrickscfg (explicit profile, DEFAULT, or first valid section)
-    Returns an empty dict if no credentials are available.
+    values), the Databricks-specific fallback derives both from the profile's
+    workspace **host** (see
+    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`).
+    Only the host is needed: the bearer token is minted at request time by
+    the generated auth command, so OAuth U2M profiles (``auth_type =
+    databricks-cli``, no static ``token`` field) resolve too. Returns an
+    empty dict if no workspace host can be resolved.
 
     The bearer token itself is not returned. Claude Code receives an
     invocation-local ``apiKeyHelper`` setting and refresh TTL instead, so
@@ -1171,16 +1173,22 @@ def _resolve_gateway_env(
             _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
         }
     if host is None:
+        # Only the workspace host is needed here: the auth command mints the
+        # bearer at request time. Resolving the host (rather than a static
+        # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
+        # — they carry a ``host`` but no ``token`` field, so a token-requiring
+        # lookup would fail even though ``databricks auth token`` succeeds.
+        # Same derivation the codex gateway path uses.
         try:
-            from .databricks_executor import _read_databrickscfg
+            from .databricks_executor import _databricks_gateway_host
 
-            creds = _read_databrickscfg(profile)
+            host = _databricks_gateway_host(profile)
         except ImportError:
-            creds = None
+            host = None
 
-        if creds is None:
+        if not host:
             return {}
-        host = creds.host.rstrip("/")
+        host = host.rstrip("/")
         base_url = (
             base_url_override if base_url_override is not None else f"{host}/ai-gateway/anthropic"
         )

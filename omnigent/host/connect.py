@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, SupportsIndex, SupportsInt, cast
 
+import httpx
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
@@ -82,6 +83,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -147,10 +150,6 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import (
-    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-)
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
@@ -160,6 +159,10 @@ from omnigent.runtime.websocket_metrics import (
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.tunnel_limits import (
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -447,6 +450,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TMPDIR",
+        # The daemon and runner resolve OS-keyring credentials in the user's session.
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
         "TZ",
         "TERM",
         "TERMINFO",
@@ -477,6 +483,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # executor.profile propagated into the daemon's env).
         "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_CONFIG_FILE",
+        # Discovery and invocation must read the same harness config directories.
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]
@@ -1006,6 +1015,9 @@ class HostProcess:
         if not self._interactive_shells:
             self._interactive_shells = ["bash"]
         self._runners: dict[str, _RunnerHandle] = {}
+        from omnigent.host.skills import HostSkillDiscovery
+
+        self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -2844,6 +2856,67 @@ class HostProcess:
             payload=payload,
         )
 
+    def _handle_skills(self, frame: HostSkillsFrame) -> HostSkillsResultFrame:
+        """Discover directory or session skills in a worker thread."""
+        from pathlib import Path
+
+        try:
+            if not frame.path or "\x00" in frame.path:
+                raise ValueError("path must be an absolute or tilde-prefixed directory")
+            root = Path(frame.path).expanduser()
+            if not root.is_absolute():
+                raise ValueError("path must be an absolute or tilde-prefixed directory")
+            if not root.is_dir():
+                return HostSkillsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error_code="not_directory",
+                    error="skill discovery directory does not exist on host or is not a directory",
+                )
+            root = root.resolve()
+        except (ValueError, RuntimeError) as exc:
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="invalid_path",
+                error=str(exc),
+            )
+        except OSError as exc:
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="discovery_failed",
+                error=str(exc),
+            )
+
+        try:
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                skills=self._skill_discovery.discover(frame, root),
+                session_id=frame.session_id,
+                agent_id=frame.agent_id,
+            )
+        except Exception:
+            _logger.exception("Skill discovery failed for %r", frame.harness)
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="discovery_failed",
+                error="skill discovery failed; see the host log",
+            )
+
+    def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
+        """Read the bound session bundle using this host's existing credentials."""
+        from urllib.parse import quote
+
+        path = quote(frame.session_id or "", safe="")
+        return httpx.get(
+            f"{self._server_url}/v1/sessions/{path}/agent/contents",
+            headers=self._build_connect_headers(),
+            timeout=10.0,
+        )
+
     async def _prewarm_model_options(self) -> None:
         """
         Fill the on-disk model catalogs for the probing harnesses at boot.
@@ -2960,6 +3033,28 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(pi_models),
+            )
+
+        if harness == "devin-native":
+            # devin authenticates through its own CLI login; the host shells
+            # ``devin models list`` (list_devin_cli_model_options) to preview the
+            # family catalog before a session exists. Effort is a separate axis
+            # the runner recombines at launch, so the families are the picker rows.
+            try:
+                from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
+
+                devin_models = await asyncio.to_thread(list_devin_cli_model_options)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Devin model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Devin model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(devin_models),
             )
 
         if is_claude_sdk_harness_name(harness):
@@ -4228,6 +4323,9 @@ class HostProcess:
             # gh/git writes can block; run off the event loop and reply back.
             fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
             await ws.send(encode_host_frame(fs_write_result))
+        elif isinstance(frame, HostSkillsFrame):
+            skills_result = await asyncio.to_thread(self._handle_skills, frame)
+            await ws.send(encode_host_frame(skills_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall
@@ -4333,9 +4431,9 @@ def run_host_process(
 
     telemetry.init("omni-host")
 
-    from omnigent.host.identity import CONFIG_PATH
+    from omnigent.host.identity import host_config_path
 
-    path = config_path or CONFIG_PATH
+    path = host_config_path(config_path)
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:

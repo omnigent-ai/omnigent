@@ -69,6 +69,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
@@ -104,6 +105,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
@@ -122,12 +124,12 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
-    _merge_claude_permission_launch_args,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
+    _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
     _prune_session_read_state,
     _publish_codex_approval_mode,
@@ -186,6 +188,7 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionResponse,
     SessionSwitchAgentRequest,
+    SessionTodosEvent,
     UpdateSessionRequest,
 )
 from omnigent.stores import AgentStore, ConversationStore
@@ -217,6 +220,23 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+
+async def _reset_runner_and_clear_todos_after_switch(
+    session_id: str, conversation_store: ConversationStore
+) -> None:
+    """Finish retiring the old runner, then clear and broadcast its Plan."""
+    try:
+        await _reset_runner_resources_after_switch(session_id)
+    finally:
+        # Connected clients keep the old agent's Plan until teardown finishes, so
+        # clear after: a late old-runner Plan POST cannot survive this clear.
+        cleared = await asyncio.to_thread(conversation_store.set_session_todos, session_id, [])
+        if cleared:
+            from omnigent.server.routes import sessions as facade
+
+            event = SessionTodosEvent(type="session.todos", conversation_id=session_id, todos=[])
+            facade.session_stream.publish(session_id, event.model_dump())
 
 
 def register_core_routes(
@@ -516,7 +536,7 @@ def register_core_routes(
     )
     async def create_session(
         request: Request,
-    ) -> SessionResponse | CreatedSessionResponse | dict[str, Any]:
+    ) -> SessionResponse | CreatedSessionResponse:
         """
         Create a session.
 
@@ -539,18 +559,11 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            result, project_warnings = await _create_bundled_session_from_multipart(
-                request, user_id
-            )
+            result = await _create_bundled_session_from_multipart(request, user_id)
             # Surface the freshly-minted session id (the request path has no
             # {session_id} on create); the middleware promotes a bag session_id
             # to the audit row's session_id column.
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
-            if project_warnings:
-                return {
-                    **result.model_dump(mode="json"),
-                    "warnings": list(project_warnings),
-                }
             return result
 
         try:
@@ -584,7 +597,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
-        resp, project_warnings = await _create_session_from_existing_agent(
+        resp = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -627,10 +640,11 @@ def register_core_routes(
         if _rc is not None and conv is not None:
             # Send the full session-init envelope (not the legacy id-only body)
             # so the runner seeds the first spawn from current session state —
-            # notably the persisted /model override — rather than relying on a
-            # best-effort reverse GET whose failure would silently reintroduce
-            # the first-turn respawn. Older runners ignore the extra
-            # ``session_init`` key and still read the top-level id fields.
+            # notably the persisted /model override and a cross-harness
+            # harness_override — rather than relying on a best-effort reverse
+            # GET whose failure would silently reintroduce the first-turn
+            # respawn. Older runners ignore the extra ``session_init`` key and
+            # still read the top-level id fields.
             # A session not yet bound to an agent keeps the id-only body: the
             # envelope builder requires an agent_id.
             init_body: dict[str, Any] = {
@@ -640,7 +654,14 @@ def register_core_routes(
             }
             if conv.agent_id is not None:
                 try:
-                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                    # ``initial_items`` are already persisted and forwarded by
+                    # now, so suppress the runner's recovery turn or they run
+                    # twice.
+                    init_body = build_runner_session_init_payload(
+                        conv,
+                        server_version=VERSION,
+                        suppress_recovery_turn=True,
+                    )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
                     # seeded override — surface it instead of silently
@@ -720,17 +741,12 @@ def register_core_routes(
                 resp.host_id = launch_host_id
 
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
-        if project_warnings:
-            return {
-                **resp.model_dump(mode="json"),
-                "warnings": list(project_warnings),
-            }
         return resp
 
     async def _create_bundled_session_from_multipart(
         request: Request,
         user_id: str | None,
-    ) -> tuple[CreatedSessionResponse, tuple[dict[str, str], ...]]:
+    ) -> CreatedSessionResponse:
         """
         Handle multipart ``POST /v1/sessions`` with inline agent upload.
 
@@ -887,7 +903,7 @@ def register_core_routes(
                 workspace=parsed_metadata.workspace,
                 harness=canonicalize_harness(raw_harness) or raw_harness,
             )
-        return result, project_resolution.warnings
+        return result
 
     # ── GET /sessions/projects ────────────────────────────────────
     #
@@ -901,8 +917,7 @@ def register_core_routes(
         request: Request,
     ) -> list[SessionProjectSummary]:
         """
-        Return the caller's projects as ``{"id", "name"}`` pairs, ordered
-        alphabetically by name.
+        Return the caller's project summaries in their preferred display order.
 
         Dual-reads both project representations and unions them by name:
         - **First-class projects** (``project_store``) — carry an ``id`` and
@@ -917,7 +932,7 @@ def register_core_routes(
         their owned rows) — a project shared to them but owned by another user
         does not surface as one of their own folders.
 
-        :returns: List of :class:`SessionProjectSummary` ordered by name.
+        :returns: Project summaries in custom order, or alphabetical order by default.
         """
         user_id = _require_user(request, auth_provider)
 
@@ -933,9 +948,17 @@ def register_core_routes(
                         icon=icon if isinstance(icon, str) else None,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
-            for name in conversation_store.list_projects(owned_by=user_id):
+            for name in sorted(conversation_store.list_projects(owned_by=user_id)):
                 by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
-            return [by_name[name] for name in sorted(by_name)]
+            from omnigent.stores.project_store import apply_project_order
+
+            order = project_store.get_order(user_id=user_id) if project_store is not None else None
+            return apply_project_order(
+                list(by_name.values()),
+                order,
+                project_id=lambda p: p.id,
+                project_name=lambda p: p.name,
+            )
 
         return await asyncio.to_thread(_list_union)
 
@@ -1827,6 +1850,55 @@ def register_core_routes(
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
     @router.post(
+        "/sessions/{session_id}/agent-title",
+        response_model=AutomaticSessionRenameResponse,
+    )
+    async def rename_session_from_agent(
+        request: Request,
+        session_id: str,
+        body: AutomaticSessionRenameRequest,
+    ) -> AutomaticSessionRenameResponse:
+        """Apply title requirements to an agent proposal before a guarded rename."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.parent_conversation_id is not None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="not_top_level")
+
+        title = " ".join(body.title.split())
+        if "\n" in body.title or "\r" in body.title or len(title) < 2:
+            raise OmnigentError(
+                "title must be a single non-empty line",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if background_title_coordinator is not None:
+            title = await background_title_coordinator.format_agent_title(
+                BackgroundTitleRequest(
+                    session_id=session_id,
+                    prompt=title,
+                    agent_id=conv.agent_id,
+                    harness_override=conv.harness_override,
+                    model_override=conv.model_override,
+                    sub_agent_name=conv.sub_agent_name,
+                )
+            )
+            if title is None:
+                return AutomaticSessionRenameResponse(renamed=False, reason="generation_failed")
+        updated = await asyncio.to_thread(
+            conversation_store.rename_conversation_if_title_matches,
+            session_id,
+            conv.title or "",
+            title,
+        )
+        if updated is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
+
+    @router.post(
         "/sessions/{session_id}/auto-title",
         response_model=AutomaticSessionRenameResponse,
     )
@@ -2049,16 +2121,11 @@ def register_core_routes(
                 )
             requested_codex_collaboration_mode = body.collaboration_mode
         permission_mode_requested = "permission_mode" in body.model_fields_set
-        requested_claude_permission_mode: str | None = None
+        requested_permission_mode: str | None = None
         if permission_mode_requested:
             if body.permission_mode is None:
                 raise OmnigentError(
                     "permission_mode must be a non-empty string",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            if body.permission_mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
-                raise OmnigentError(
-                    f"permission_mode must be one of {sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             conv_for_permission_mode = await asyncio.to_thread(
@@ -2067,15 +2134,30 @@ def register_core_routes(
             )
             if conv_for_permission_mode is None:
                 raise _session_not_found()
-            if (
-                conv_for_permission_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-            ):
+            # The mode lives in the harness's own TUI, so both the eligible wrapper
+            # and the vocabulary are per harness — Devin's rungs are not Claude's,
+            # and validating one against the other would reject a valid switch.
+            wrapper_for_permission_mode = conv_for_permission_mode.labels.get(
+                _CLAUDE_NATIVE_WRAPPER_LABEL_KEY
+            )
+            if wrapper_for_permission_mode == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+                allowed_permission_modes: tuple[str, ...] = tuple(_CLAUDE_NATIVE_PERMISSION_MODES)
+            elif wrapper_for_permission_mode == _DEVIN_NATIVE_WRAPPER_LABEL_VALUE:
+                from omnigent.harnesses.devin_native.bridge import DEVIN_PERMISSION_MODES
+
+                allowed_permission_modes = DEVIN_PERMISSION_MODES
+            else:
                 raise OmnigentError(
-                    "permission_mode is only supported for claude-native sessions",
+                    "permission_mode is only supported for claude-native and "
+                    "devin-native sessions",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            requested_claude_permission_mode = body.permission_mode
+            if body.permission_mode not in allowed_permission_modes:
+                raise OmnigentError(
+                    f"permission_mode must be one of {sorted(allowed_permission_modes)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            requested_permission_mode = body.permission_mode
         approval_mode_requested = "approval_mode" in body.model_fields_set
         requested_codex_approval_mode: str | None = None
         if approval_mode_requested:
@@ -2224,15 +2306,20 @@ def register_core_routes(
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
-                if _runner_client is not None and conv is not None:
+                if _runner_client is not None and conv is not None and conv.agent_id is not None:
+                    # The versioned payload's snapshot carries harness_override,
+                    # so a rebind after a cross-harness create initializes the
+                    # override harness — a bare body left the runner resolving
+                    # from the spec, and the recovery turn that executes seeded
+                    # initial_items ran on the spec's harness. Recovery stays
+                    # enabled: on rebind it is what runs the pending kickoff.
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
-                            json={
-                                "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
-                            },
+                            json=build_runner_session_init_payload(
+                                conv,
+                                server_version=VERSION,
+                            ),
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:
@@ -2385,30 +2472,31 @@ def register_core_routes(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        if requested_claude_permission_mode is not None and live_forward:
+        if requested_permission_mode is not None and live_forward:
             _mode_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {
                     "type": "permission_mode_change",
-                    "permission_mode": requested_claude_permission_mode,
+                    "permission_mode": requested_permission_mode,
                 },
             )
             # Raises unless the runner confirms the switch, so the label can
             # never claim a mode Claude isn't in. Stores the mode it reached.
             _confirmed_permission_mode = _require_permission_mode_forward(
                 session_id,
-                requested_claude_permission_mode,
+                requested_permission_mode,
                 _mode_result,
             )
             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
             # The launcher restores the mode from terminal_launch_args, not the
-            # label above, so reflect the confirmed mode there too — otherwise a
-            # relaunch reverts to the launch --permission-mode. Merge against
-            # ``updated`` (the post-write row), not the pre-update snapshot, so a
-            # combined PATCH that also set terminal_launch_args keeps those. Only
-            # rewrites an existing --permission-mode; mirrors the shift+tab path.
-            _merged_permission_args = _merge_claude_permission_launch_args(
+            # label above, so pin the confirmed mode there too — otherwise a
+            # relaunch reopens in the launch mode, which is Claude's default
+            # (manual) for a session created without --permission-mode. Merge
+            # against ``updated`` (the post-write row), not the pre-update
+            # snapshot, so a combined PATCH that also set terminal_launch_args
+            # keeps those.
+            _merged_permission_args = _pin_claude_permission_launch_args(
                 updated.terminal_launch_args,
                 _confirmed_permission_mode,
             )
@@ -2838,10 +2926,7 @@ def register_core_routes(
 
         # Keep the fork filed in the source's first-class project, but route
         # that inherited (not caller-requested) decision through the same
-        # ownership/default chokepoint as a direct create. The fork never asked
-        # for a project, so a source whose agent mismatches its project emits
-        # no warnings here and is never strict-rejected — the mismatch belongs
-        # to the source session, not this request. Forks do not inherit
+        # ownership/default chokepoint as a direct create. Forks do not inherit
         # workspace or worktree settings, so explicit nulls preserve those fork
         # semantics. A shared source's foreign project retains the historical
         # terminal behavior: silently leave the fork unfiled.
@@ -2870,7 +2955,6 @@ def register_core_routes(
                 body=fork_create_body,
                 user_id=user_id,
                 project_store=project_store,
-                warn_on_mismatch=False,
             )
         except OmnigentError as exc:
             if source.project_id is None or exc.code != ErrorCode.NOT_FOUND:
@@ -3202,7 +3286,9 @@ def register_core_routes(
         # (doing it mid-turn would wedge the turn); the next access
         # re-materializes from the new agent's spec, preserving the workspace /
         # worktree (cwd comes from the runner workspace).
-        background_tasks.add_task(_reset_runner_resources_after_switch, session_id)
+        background_tasks.add_task(
+            _reset_runner_and_clear_todos_after_switch, session_id, conversation_store
+        )
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
         level = await _get_permission_level(user_id, session_id, permission_store)

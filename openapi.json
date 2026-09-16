@@ -126,7 +126,7 @@
             "type": "array"
           },
           "skills": {
-            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
+            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session exists. `GET /skills` discovers host skills and, when given `session_id`, merges the session's bundled skills. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -172,7 +172,7 @@
       },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
-        "description": "Request body for the current-agent automatic rename endpoint.",
+        "description": "Proposed title for a framework or agent-initiated rename.",
         "properties": {
           "title": {
             "maxLength": 100,
@@ -196,7 +196,8 @@
                 "enum": [
                   "not_top_level",
                   "no_seed",
-                  "title_changed"
+                  "title_changed",
+                  "generation_failed"
                 ],
                 "type": "string"
               },
@@ -3751,6 +3752,67 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "ProjectOrderRequest": {
+        "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.",
+        "properties": {
+          "ordered_project_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 32,
+                  "minLength": 32,
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                "maxItems": 10000,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ordered Project Ids"
+          }
+        },
+        "required": [
+          "ordered_project_ids"
+        ],
+        "title": "ProjectOrderRequest",
+        "type": "object"
+      },
+      "ProjectOrderResponse": {
+        "description": "Current sorting mode and the manual order retained in either mode.",
+        "properties": {
+          "ordered_project_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ordered Project Ids"
+          },
+          "sort_mode": {
+            "enum": [
+              "alphabetical",
+              "manual"
+            ],
+            "title": "Sort Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sort_mode",
+          "ordered_project_ids"
+        ],
+        "title": "ProjectOrderResponse",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -4677,7 +4739,6 @@
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
-            "session.skills": "#/components/schemas/SessionSkillsEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
@@ -4731,9 +4792,6 @@
           },
           {
             "$ref": "#/components/schemas/SessionMcpStartupEvent"
-          },
-          {
-            "$ref": "#/components/schemas/SessionSkillsEvent"
           },
           {
             "$ref": "#/components/schemas/SessionModelOptionsEvent"
@@ -6781,14 +6839,6 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
-          "skills": {
-            "description": "Skills the bound agent has access to \u2014 the merged result of the agent spec's bundled `skills` and the host-scope skills discovered along the agent workdir / `~/.claude/skills/` (subject to the spec's `skills_filter`). Mirrors what the TUI passes to the runner at startup. Empty list when the agent spec cannot be loaded, or when bundled + host discovery yields nothing.",
-            "items": {
-              "$ref": "#/components/schemas/SkillSummary"
-            },
-            "title": "Skills",
-            "type": "array"
-          },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
@@ -6858,7 +6908,7 @@
             "title": "Title"
           },
           "todos": {
-            "description": "Current Claude Code todo list items for `omnigent claude` sessions, as raw dicts from Claude's todo JSON file. Each dict has `content`, `status`, and `activeForm` keys. Empty list for non-claude-native sessions or when no todos have been reported yet. Sourced from the Omnigent server's in-memory `_session_todos_cache`.",
+            "description": "Current native Plan items reported by a harness. Each has `content`, `status`, and `activeForm`. Persisted in conversation metadata; empty before the first report or after an explicit clear.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -6989,41 +7039,6 @@
           "stage"
         ],
         "title": "SessionSandboxStatusEvent",
-        "type": "object"
-      },
-      "SessionSkillsEvent": {
-        "description": "Signal that a session's runner-owned skills have resolved.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` field (now cache-backed) stays the source of truth.",
-        "properties": {
-          "conversation_id": {
-            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed the menu from the session snapshot's `skills` field, which is populated by the runner-skills cache at snapshot build time.",
-            "title": "Conversation Id",
-            "type": "string"
-          },
-          "sequence_number": {
-            "anyOf": [
-              {
-                "format": "int64",
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Sequence Number"
-          },
-          "type": {
-            "const": "session.skills",
-            "description": "Always `\"session.skills\"`.",
-            "title": "Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "type",
-          "conversation_id"
-        ],
-        "title": "SessionSkillsEvent",
         "type": "object"
       },
       "SessionStatusEvent": {
@@ -7330,7 +7345,7 @@
         "type": "object"
       },
       "SessionTodosEvent": {
-        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
+        "description": "Plan/TODO update from a native terminal-backed session.\n\nEmitted after an `external_session_todos` POST from a native\nharness forwarder, which captures structured Plan updates from\nClaude or Codex and forwards them to the Omnigent server. Lets web\nrender a live todo panel in the right column without polling.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -7351,7 +7366,7 @@
             "title": "Sequence Number"
           },
           "todos": {
-            "description": "Current todo items read from Claude's todo file. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, the gerund form) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is populated by `_session_todos_cache` at snapshot build time.",
+            "description": "Current native Plan/TODO items from a harness. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, display activity) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is restored from persisted metadata at snapshot build time.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -7667,6 +7682,23 @@
           "description"
         ],
         "title": "SkillSummary",
+        "type": "object"
+      },
+      "SkillsResponse": {
+        "description": "User-invocable skill metadata discovered on a host.",
+        "properties": {
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills"
+        ],
+        "title": "SkillsResponse",
         "type": "object"
       },
       "SlashCommandData": {
@@ -10387,6 +10419,68 @@
         ]
       }
     },
+    "/v1/projects/order": {
+      "get": {
+        "description": "Read the caller's custom order.",
+        "operationId": "get_project_order_v1_projects_order_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOrderResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Project Order",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Save the caller's order and notify their connected clients.",
+        "operationId": "save_project_order_v1_projects_order_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOrderResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Project Order",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}": {
       "delete": {
         "description": "Delete one of the caller's projects.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`).\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
@@ -10909,7 +11003,7 @@
     },
     "/v1/sessions/projects": {
       "get": {
-        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** List of `SessionProjectSummary` ordered by name.",
+        "description": "Return the caller's project summaries in their preferred display order.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** Project summaries in custom order, or alphabetical order by default.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
         "responses": {
           "200": {
@@ -11206,6 +11300,59 @@
           }
         },
         "summary": "Update Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent-title": {
+      "post": {
+        "description": "Apply title requirements to an agent proposal before a guarded rename.",
+        "operationId": "rename_session_from_agent_v1_sessions__session_id__agent_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Session From Agent",
         "tags": [
           "sessions"
         ]
@@ -14850,6 +14997,125 @@
         "summary": "Set Sharing",
         "tags": [
           "sharing"
+        ]
+      }
+    },
+    "/v1/skills": {
+      "get": {
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.",
+        "operationId": "get_skills_v1_skills_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Skills",
+        "tags": [
+          "skills"
         ]
       }
     },

@@ -2,8 +2,8 @@
 Harness-aware host/plugin skill discovery for the web composer's
 slash-command menu.
 
-The runner's ``_resolve_session_skills`` unions a session's bundled
-skills with the *extra* skills its harness surfaces in its own terminal.
+The host previews skills before launch; the runner unions the same
+discovery results with a session's bundled skills.
 "What a harness exposes" differs per vendor (Claude Code plugins, Codex
 ``~/.codex/skills``, Cursor ``~/.cursor``), so resolution dispatches to a
 per-family provider. Unknown harnesses fall back to the generic host walk
@@ -14,18 +14,20 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+import os
+import subprocess
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
-from omnigent.spec.types import SkillSpec
+from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
 
-_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity"})
+_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity", "devin"})
 
 # The bare ``antigravity`` harness is the in-process Gemini SDK executor, NOT the
 # agy CLI. It never launches agy, so ~/.gemini plugin/builtin skills are not its
@@ -71,9 +73,8 @@ class SkillSourceContext:
     """
     Inputs a per-harness skill provider needs.
 
-    :param roots: Host-discovery roots in priority order — the session
-        workspace, then the agent bundle workdir (the same roots
-        ``_resolve_session_skills`` already computes).
+    :param roots: Discovery roots in priority order — the selected host
+        directory, or the session workspace followed by the agent bundle workdir.
     :param home: The user home directory (``Path.home()``); injected so
         tests can pin it.
     :param skills_filter: The spec's ``skills:`` filter
@@ -102,6 +103,33 @@ class SkillSourceContext:
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
+
+
+def skill_source_context_from_env(
+    *,
+    roots: tuple[Path, ...],
+    harness: str | None,
+    skills_filter: str | list[str] = "all",
+    bundle_dir: Path | None = None,
+) -> SkillSourceContext:
+    """Use the same ambient harness configuration for host and runner discovery."""
+    configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    codex_home: Path | None = None
+    if _harness_family(harness) == "codex":
+        from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+        # Nested runners can inherit a private Codex home; use its original source.
+        codex_home = _codex_home_config_source_from_env()
+    return SkillSourceContext(
+        roots=roots,
+        home=Path.home(),
+        skills_filter=skills_filter,
+        bundle_dir=bundle_dir,
+        claude_config_dir=(
+            Path(configured_claude_dir).expanduser() if configured_claude_dir else None
+        ),
+        codex_home=codex_home,
+    )
 
 
 def _dedup(specs: list[SkillSpec]) -> list[SkillSpec]:
@@ -192,7 +220,7 @@ def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list[SkillSpec]:
     """
-    Return the extra (non-bundled) skills the session's harness exposes.
+    Return the extra (non-bundled) skills the selected harness exposes.
 
     Dispatches by harness family. An unknown/other family falls back to
     the generic host walk so behavior is unchanged for harnesses without
@@ -215,6 +243,31 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
     # harnesses on their pre-scoping behavior (see ``claude_host_skills``).
     native_ctx = replace(ctx, is_native=is_native_harness(harness))
     return [s for s in _dedup(provider(native_ctx)) if s.user_invocable]
+
+
+def resolve_session_skills(
+    spec: AgentSpec, roots: tuple[Path, ...], bundle_dir: Path | None
+) -> list[SkillSpec]:
+    """Use identical precedence and filters for menu discovery and invocation."""
+    from omnigent.harness_aliases import canonicalize_harness
+
+    merged = [s for s in spec.skills if s.user_invocable]
+    seen = {s.name for s in spec.skills}
+    seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+    harness = canonicalize_harness(spec.executor.harness_kind)
+    ctx = skill_source_context_from_env(
+        roots=roots, harness=harness, skills_filter=spec.skills_filter, bundle_dir=bundle_dir
+    )
+    for skill in resolve_harness_skills(ctx, harness):
+        if skill.name in seen:
+            continue
+        if skill.skill_dir is not None and skill.skill_dir.resolve() in seen_dirs:
+            continue
+        seen.add(skill.name)
+        if skill.skill_dir is not None:
+            seen_dirs.add(skill.skill_dir.resolve())
+        merged.append(skill)
+    return merged
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -642,6 +695,68 @@ def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return []
 
 
+def devin_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """Devin skills: whatever ``devin skills list`` reports as user-invocable.
+
+    Devin loads slash-command skills from its own dirs (``~/.config/devin/skills``,
+    ``~/.agents/skills``, ``.devin/skills``, …) *and* from Claude Code's
+    ``.claude/skills`` for compatibility, with its own precedence — more than any
+    single dir walk here would faithfully reproduce. So the menu is sourced
+    authoritatively from the CLI itself, matching exactly the ``/`` commands the
+    Devin terminal offers.
+
+    Native only (the wrap types ``/name`` into the real Devin TUI). Best-effort:
+    a missing CLI, a non-zero exit, a timeout, or unparseable output yields no
+    host skills rather than raising — the bundled skills still show.
+
+    :param ctx: Session discovery context; the first root is the CLI's cwd.
+    :returns: One :class:`SkillSpec` per user-invocable Devin skill.
+    """
+    if not ctx.is_native:
+        return []
+    root = ctx.roots[0] if ctx.roots else ctx.home
+    try:
+        proc = subprocess.run(
+            ["devin", "skills", "list", "--json", "--trigger", "user"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # best-effort discovery
+        _log.debug("devin skills list failed to run: %s", exc)
+        return []
+    if proc.returncode != 0:
+        _log.debug("devin skills list exited %d: %s", proc.returncode, proc.stderr[:200])
+        return []
+    try:
+        entries = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    out: list[SkillSpec] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        description = entry.get("description")
+        base_dir = entry.get("base_dir")
+        out.append(
+            SkillSpec(
+                name=name,
+                description=description if isinstance(description, str) else "",
+                content="",
+                skill_dir=Path(base_dir) if isinstance(base_dir, str) and base_dir else None,
+                user_invocable=True,
+            )
+        )
+    return out
+
+
 # Keyed by harness family (see _harness_family). A harness with no entry
 # (qwen, openai-agents, the in-process antigravity SDK, …) falls through to
 # _generic_host_skills in resolve_harness_skills — the ~/.claude/skills walk,
@@ -662,6 +777,7 @@ _SKILL_SOURCES: dict[str | None, SkillSource] = {
     "claude": claude_host_skills,
     "codex": codex_host_skills,
     "cursor": cursor_host_skills,
+    "devin": devin_host_skills,
     "pi": pi_host_skills,
     "antigravity": antigravity_host_skills,
 }

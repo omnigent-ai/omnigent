@@ -42,6 +42,7 @@ from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
+    DEVIN_KEY,
     GOOSE_KEY,
     HERMES_KEY,
     KIMI_KEY,
@@ -145,6 +146,14 @@ _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"
 # ``hermes model``); the headless ``hermes`` harness gates on the same binary.
 _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
 
+# Native Devin harnesses boot the resident ``devin`` TUI (``omni devin``). Devin
+# owns its own auth (``devin auth login`` writes a credential file it reads back
+# at spawn), so there is no Omnigent-managed key to gate on and readiness is
+# binary presence — like the other native CLI harnesses. Without these entries
+# they'd fail open like an unknown harness, letting a binary-less launch die
+# inside the executor.
+_DEVIN_NATIVE_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
+
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
 # to the same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``
@@ -232,6 +241,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(GOOSE_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
         return _installer_only_availability(HERMES_KEY)
+    if canonical in _DEVIN_NATIVE_HARNESSES:
+        return _installer_only_availability(DEVIN_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -556,6 +567,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
+    spellings.update(_DEVIN_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)

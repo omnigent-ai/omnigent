@@ -24,7 +24,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -93,8 +93,9 @@ async def test_publish_without_subscriber_is_silent_noop() -> None:
     session_stream.publish("conv_unknown", {"type": "x", "i": 1})
     # If publish were silently creating a slot, the registry would
     # have grown. The contract: only ``subscribe`` adds slots.
-    assert session_stream._subscribers == {}, (
-        f"publish must NOT create subscriber slots. State: {session_stream._subscribers!r}"
+    assert session_stream._subscribers.all_values() == [], (
+        f"publish must NOT create subscriber slots. "
+        f"State: {session_stream._subscribers.all_values()!r}"
     )
 
 
@@ -275,6 +276,31 @@ async def test_has_subscribers_tracks_live_subscription() -> None:
     session_stream.publish("conv_probe", {"type": "a"})
     await asyncio.wait_for(task, timeout=2.0)
     assert session_stream.has_subscribers("conv_probe") is False
+
+
+@pytest.mark.asyncio
+async def test_subscribers_are_isolated_across_workspaces() -> None:
+    """The same conversation id in two workspaces has independent subscribers.
+
+    Regression for OMNI-7361: conversation ids collide across workspaces
+    (imported sessions), so a subscriber registered in one tenant's workspace
+    must not be seen — or fed — by a publish in another's, even for the same id.
+    """
+    from omnigent.db.db_models import workspace_scope
+
+    conv = "conv_shared"
+    with workspace_scope(1):
+        task = asyncio.create_task(_collect(conv, expected=1))
+        await asyncio.sleep(0)  # let the subscriber register under workspace 1
+        assert session_stream.has_subscribers(conv) is True
+    with workspace_scope(2):
+        # Same id, other workspace: no subscriber, and a publish reaches nobody.
+        assert session_stream.has_subscribers(conv) is False
+        assert session_stream.publish(conv, {"type": "ws2-only"}) == 0
+    with workspace_scope(1):
+        assert session_stream.publish(conv, {"type": "ws1-only"}) == 1
+    events = await asyncio.wait_for(task, timeout=2.0)
+    assert events == [{"type": "ws1-only"}]
 
 
 @pytest.mark.asyncio
@@ -934,3 +960,73 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
         "error_impact": "blocking",
         "error_phase": "turn",
     }
+
+
+@pytest.mark.parametrize("legacy_error", [False, True])
+@pytest.mark.parametrize("source", ["llm", "execution", "tool", "harness"])
+def test_failed_event_logs_nested_error_code_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_error: bool,
+    source: Literal["llm", "execution", "tool", "harness"],
+) -> None:
+    """Typed harness failures retain their code in both diagnostic streams."""
+    from omnigent.server.schemas import ErrorDetail, FailedEvent, ResponseObject
+
+    event = FailedEvent(
+        type="response.failed",
+        source=source,
+        response=ResponseObject(
+            id="resp_failed",
+            status="failed",
+            model="test-agent",
+            created_at=1,
+            error=ErrorDetail(code="runner_error", message="private failure detail"),
+            output=[{"text": "private assistant output"}],
+        ),
+    ).model_dump(mode="json", exclude_none=True)
+    if legacy_error:
+        event["error"] = {
+            "code": "legacy_error",
+            "source": "execution",
+            "message": "private legacy detail",
+        }
+    expected_code = "legacy_error" if legacy_error else "runner_error"
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
+        session_stream._log_sse_event("conv_failed", event)
+
+    assert len(sse_records) == len(audit_records) == 1
+    assert sse_records[0].attributes == {
+        "response_id": "resp_failed",
+        "error_code": expected_code,
+        "error_source": source,
+    }
+    assert audit_records[0].attributes == {
+        "outcome": "failed",
+        "response_id": "resp_failed",
+        "error_code": expected_code,
+        "error_source": source,
+        "error_impact": "blocking",
+        "error_phase": "turn",
+    }
+    for record in [*sse_records, *audit_records]:
+        assert record.session_id == "conv_failed"
+        assert record.levelno == logging.WARNING
+        assert "private" not in record.getMessage()
+
+
+@pytest.mark.parametrize("source", [None, "private provider text", {"private": "data"}, []])
+def test_failed_event_logs_omit_unrecognized_sources(
+    monkeypatch: pytest.MonkeyPatch, source: object
+) -> None:
+    """Unvalidated source data must not enter diagnostics or suppress the failure log."""
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
+        session_stream._log_sse_event(
+            "conv_failed",
+            {"type": "response.failed", "source": source, "error": {"code": "failed"}},
+        )
+    assert len(sse_records) == len(audit_records) == 1
+    for record in [*sse_records, *audit_records]:
+        assert record.attributes["error_code"] == "failed"
+        assert "error_source" not in record.attributes

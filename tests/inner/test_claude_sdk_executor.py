@@ -555,7 +555,10 @@ class TestConstructor(unittest.TestCase):
         # Proves the selector is --profile, not --host. A regression to --host
         # makes a two-profiles-one-host workspace yield an empty token → 401.
         self.assertIn('databricks auth token --profile "oss"', helper)
-        self.assertNotIn("--host", helper)
+        # Scope to the CLI mint: it selects by --profile. The sdk fallback
+        # separately passes --host for its own workspace guard (identity is
+        # still pinned by --profile), so assert on the mint, not the whole helper.
+        self.assertNotIn("databricks auth token --host", helper)
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
         # stays behind a `--help` capability probe — an older CLI rejects the
         # unknown flag and yields an empty token → silent 401.
@@ -1506,9 +1509,45 @@ class TestResolveGatewayEnv(unittest.TestCase):
         with (
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.databricks_executor._read_databrickscfg", return_value=None),
+            # Host derivation no longer needs a static token, so "no creds"
+            # must also mean no host is resolvable from ~/.databrickscfg.
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg_host",
+                return_value=None,
+            ),
         ):
             env = _resolve_gateway_env()
             self.assertEqual(env, {})
+
+    def test_oauth_profile_without_token_resolves_from_host(self):
+        """An OAuth U2M profile (host, no static token) must resolve.
+
+        The SDK resolver returns ``None`` when it cannot mint a bearer
+        (e.g. no Databricks CLI OAuth state on this machine), but the
+        profile's ``host`` is always present — and the generated auth
+        command mints the bearer at request time — so the gateway env
+        must still resolve instead of failing with "requires gateway
+        credentials".
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("omnigent.inner.databricks_executor._read_databrickscfg", return_value=None),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg_host",
+                return_value="https://adb-12345.azuredatabricks.net",
+            ),
+        ):
+            env = _resolve_gateway_env("my-oauth-profile")
+        self.assertEqual(
+            env["ANTHROPIC_BASE_URL"],
+            "https://adb-12345.azuredatabricks.net/ai-gateway/anthropic",
+        )
+        self.assertIn(
+            'databricks auth token --profile "my-oauth-profile"',
+            env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
+        )
 
     def test_host_override_skips_profile_lookup(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env

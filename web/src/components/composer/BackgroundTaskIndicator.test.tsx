@@ -52,6 +52,7 @@ describe("BackgroundTaskIndicator", () => {
     setBackground(1, [{ description: "Only task" }]);
     render(<BackgroundTaskIndicator />);
     expect(badge("1 background task still running")).toHaveTextContent("1");
+    expect(badge()).toHaveClass("px-0", "md:px-2");
   });
 
   it("shows the count on the badge with a plural accessible name", () => {

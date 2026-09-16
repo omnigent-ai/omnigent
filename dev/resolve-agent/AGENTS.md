@@ -71,6 +71,22 @@ make the reader work harder so the writer can perform, and they are imprecise,
 because a metaphor drags in connotations you did not choose and cannot control. When
 a literal phrase is available, use it: say what you mean.
 
+## Code comments
+
+Default to no added comments. Add one only to explain a non-obvious constraint
+or reason the code cannot express clearly. Use one short sentence, normally one
+line and at most two. Do not narrate setup, operations, or assertions; repeat
+test names; or duplicate nearby explanations. Keep investigation history in the
+handoff or PR description. Apply the same standard to test docstrings.
+
+Code changes rapidly. Omit comments likely to become misleading as the
+implementation evolves. Keep necessary comments next to the code they describe,
+and update or remove them in the same change whenever that code's behavior or
+assumptions change.
+
+Before handing off or committing, remove redundant or stale comments from the
+deliverable, including tests carried over from repro.
+
 ## Input contract
 
 You are invoked with exactly one work source:
@@ -571,9 +587,6 @@ Fix the root cause, not the symptom. Change the code the bug lives in, matching
 surrounding conventions, as small as the root cause allows. Do not touch the test
 to make it pass; the *code* must change to satisfy it.
 
-Keep code comments short. Prefer a single line; only write a longer comment
-when the complexity genuinely requires it.
-
 ### 2B.4 — Add targeted tests at the layer you changed
 
 The reproduction test is a full end-to-end journey — slow, one layer above your
@@ -630,47 +643,35 @@ diff touches env-derived defaults; note it in the handoff (`hermetic_check`).
 If any live facet can't be made to pass with a real fix, say so honestly rather
 than shipping a hollow green.
 
-**Record the after-fix journey — always, whether or not the upstream run left any
-footage.** The after-fix clip is *yours* to produce: you have the reproduction
-test at `test_path` and the journey, which is everything the recorder needs. Do
-**not** gate this on the repro handoff carrying `recordings` — a missing
-before-clip is common (the repro run may have skipped recording, or its
-worktree/artifacts are gone) and is **not** a reason to skip the after-clip.
+**Record the result after the fix.** Use the recovered reproduction test and
+journey to prepare the recording, even if the earlier run left no video.
+See [`dev/recording-lanes.md`](../recording-lanes.md) for setup and recording
+steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 
-**See [`dev/recording-lanes.md`](../recording-lanes.md) for the full how-to** —
-standing the recorder's server up (build the SPA first, strip leaked runner env),
-recording via `OMNIGENT_E2E_RECORD_DIR` (not the no-op `--video on`), and the
-per-surface mechanics for `web` / `mobile` / `terminal` / `cli` / `desktop`, plus the
-empty-recordings and caption rules. This step states only *which clip resolve
-produces*:
+- Record the user action and the corrected product behavior. Tests may drive
+  and verify the interaction, but the clip must show the product, not pytest,
+  assertions, debug logs, or test source.
+- For CLI or terminal output, record the real command and its output, even if
+  only an error message changes. For example, run `omnigent host` with an
+  expired login and capture the corrected error message.
+- Record your fix on the author path, or the reviewed PR head on the review
+  path. Save the clip as `recordings/<slug>/after-<facet>.<ext>` with
+  `kind: "after"`, and include it in the PR Demo section and handoff.
+- Keep any recovered before-clip unchanged. A missing before-clip is not a
+  reason to skip the after-clip; note the missing before-clip in your evidence.
+- For internal/API-only results with no visible user interaction, written
+  evidence is enough. Set `recordings: []` and describe the before/after result
+  in your evidence and the PR Demo section.
+- If recording is blocked by missing tools or an environment that cannot run
+  the journey, set `recordings: []` and name the specific blocker in
+  `recording_unavailable_reason`. Do not block the fix or PR because footage is
+  missing or rejected; explain the gap and continue. Only report clips you
+  actually produced.
 
-- After the fix, use the recovered test on the fixed tree to drive and verify the
-  passing journey; the **after-fix clip** (`kind: "after"`) must show only the
-  product surface and corrected user-visible behavior, never pytest, assertions,
-  logs, or test source. Move it to a stable
-  `recordings/<slug>/after-<facet>.<ext>`.
-- If the repro handoff carried a **before** clip (recover it from the repro
-  session's `workspace` or the CI artifact bundle), carry it through unchanged
-  alongside your after clip; when it carried none, produce the after clip anyway and
-  note that no before-clip was available upstream — a missing upstream before-clip
-  is **never** a reason to omit the after clip.
-- You produce the after clip on **every** run (author path and review path — on the
-  review path, film the reviewed PR head). It goes in the PR's Demo section (Step 3)
-  and the handoff (`recordings`). Omit it **only** for the genuine environmental
-  blockers named in `dev/recording-lanes.md` (tooling missing, server won't come
-  online, `api`-surface facet with nothing to film) — and then say which, with the
-  evidence; never report an after-clip you didn't actually produce.
-- A clip must show a **live action producing the corrected outcome** — a command
-  runs and the pane prints it, a screen changes — never static text asserting the
-  fix works. When the fixed outcome is just a static line, value, or the absence
-  of an error with nothing to watch, do **not** film a video of text: keep
-  `recordings: []` for that facet and state the corrected text in your evidence
-  and the PR Demo section, per `dev/recording-lanes.md`. When you run
-  inside a server-spawned runner (`OMNIGENT_RUNNER_ID` is set), a recorder
-  `online: false` is **not** an environmental blocker until you have stripped the
-  leaked runner/host env vars per `dev/recording-lanes.md`; an un-stripped
-  `online: false` is your own env and must be re-run with the `env -u` prefix, not
-  filed as "runner won't come online."
+Build the SPA before starting the recorder. If you are inside a server-spawned
+runner (`OMNIGENT_RUNNER_ID` is set), strip the inherited runner/host variables
+as described in `dev/recording-lanes.md`. If the recorder reports `online: false`,
+retry with those variables removed before reporting an environment blocker.
 
 ## Step 3 — Commit, push, and open the pull request (author path only)
 
@@ -773,12 +774,11 @@ Once the set is genuinely green:
    before/after recordings in the **Demo** section: upload the files when your
    environment can attach media to the PR; otherwise link where they live (the
    CI run's artifact bundle, or the repro session) so reviewers can watch the
-   failure and the fix. When a facet's outcome is purely textual (nothing to
-   film), put the observed before/after text in the **Demo** section in place of a
-   video, so the section is never left empty or padded with a video of text. When
-   the bug is a Linear ticket and a Linear key is available, also attach both
-   recordings to the ticket (GraphQL `fileUpload` + `attachmentCreate`) so the
-   ticket carries the visual before/after.
+   failure and the fix. For internal/API-only results with no visible user
+   interaction, put the written before/after evidence in **Demo**. If recording
+   was blocked, explain why and include the available evidence. When the bug
+   is a Linear ticket and a Linear key is available, also attach both recordings
+   to the ticket (GraphQL `fileUpload` + `attachmentCreate`).
 5. **Emit an interim handoff now — the moment the PR is open.** As soon as
    `gh pr create` succeeds, print the full handoff json block (the Output schema)
    with `pr_url` set and `outcome` at its current best assessment, *before* you
@@ -1378,28 +1378,23 @@ Field meanings:
   `outcome` and a `test_transition` (the fail→pass proof, or why it was skipped).
 - `tests` — `e2e` is the (possibly rewritten) repro test path; `added` is the list
   of targeted tests you wrote (empty in review mode).
-- `recordings` — your after-fix footage (`kind: "after"`), plus any before-fix
-  footage carried through from the repro handoff, same
-  `{surface, kind, path, format, capture_mode, caption}` shape as repro-agent's
-  field. You
-  produce an `after` clip on **every** author/review run — it is driven off the
-  reproduction test, not off an upstream file, so it does not depend on the repro
-  handoff carrying footage. When a before clip was recovered, carry its `caption`
-  through unchanged; when none was, that's fine — still include the `after` clip
-  and note the missing before in prose. Write a `caption` for every `after` clip:
-  the ordered actions that clip performs, ending in the corrected behavior. In
-  review mode, the "after" entries are the drivers recorded against the reviewed
-  PR head. The list is empty **only** when recording is genuinely blocked — the
-  recorder tooling is missing, or the fixture can't come online after the SPA
-  build — or when the outcome is purely textual with nothing to watch; never
-  merely because the upstream run left no footage.
-- `recording_unavailable_reason` — empty when every expected clip is present;
-  otherwise name the concrete blocker. For purely textual evidence — an `api`
-  facet, or a facet whose fixed outcome is just a static line or value — say it is
-  textual and carry the observed text in the PR Demo section; `recordings: []` is
-  correct and not a blocker. Missing or rejected footage never blocks the fix or
-  PR, and must never be replaced with a synthetic fallback or a video of the test
-  runner.
+- `recordings` — your after-fix clips (`kind: "after"`) and any recovered
+  before-clips, using `{surface, kind, path, format, capture_mode, caption}`.
+  Follow the recording rules in Step 2B.5 on both author and review runs; in
+  review mode, record the reviewed PR head. Keep recovered before-clips and
+  captions unchanged. Each after-clip's caption lists the actions shown, ending
+  with the corrected behavior. A missing before-clip is not a reason to skip
+  the after-clip. Use `[]` only for internal/API-only results with no visible
+  user interaction, or when recording is blocked as described above.
+- `recording_unavailable_reason` — leave empty when every expected clip is
+  present. Otherwise explain each missing clip:
+
+  - For internal/API-only results, say there is no visible user interaction
+    and put the written before/after evidence in the PR Demo section.
+  - For a recording failure, name the missing tool or the environment problem.
+    Text-only CLI output is not a reason to skip recording.
+  - Do not substitute a video of test output or a made-up demonstration.
+    Missing or rejected footage must not block the fix or PR.
 - `test_audit` — the result of the Step 2B.1 audit (author mode). In review mode,
   note whether the repro test was behavioral as-is.
 - `hermetic_check` — the result of the Step 2B.5 hostile-env re-run when the diff
