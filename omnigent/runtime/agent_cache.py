@@ -16,7 +16,6 @@ from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore
 
-
 _logger = logging.getLogger(__name__)
 
 
