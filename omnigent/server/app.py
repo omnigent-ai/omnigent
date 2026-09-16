@@ -122,7 +122,11 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
-from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    SessionConnectivity,
+    runner_seen_is_fresh,
+)
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -1976,6 +1980,51 @@ def create_app(
             error_phase=ErrorPhase.REQUEST.value,
         )
         return await request_validation_exception_handler(request, exc)
+
+    @app.exception_handler(ConversationNotFoundError)
+    async def _handle_conversation_not_found(
+        request: Request,
+        exc: ConversationNotFoundError,
+    ) -> JSONResponse:
+        """
+        Map a missing conversation row to 404 rather than an unhandled 500.
+
+        Stores raise this when absence is not a benign no-op — creating a child
+        under a parent that is gone, for example. With no handler it reached the
+        catch-all and was booked as ``internal_error``, so a caller referencing
+        a deleted conversation read as a server fault and counted against the
+        mid-session error rate.
+
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
+        :param exc: The store's not-found error.
+        :returns: A 404 JSON response with the ``not_found`` code.
+        """
+        add_audit_attrs(
+            code=str(ErrorCode.NOT_FOUND),
+            http_status="404",
+            error_category=ErrorCategory.USER.value,
+            error_impact=ErrorImpact.BENIGN.value,
+            error_phase=ErrorPhase.REQUEST.value,
+        )
+        # Keep a trace: usually a caller referencing a deleted row, but this
+        # branch would otherwise mask a server-side id-threading defect. The
+        # audit extra carries the operation and session id, so a 404 that is
+        # really our bug stays queryable.
+        _logger.info(
+            "Conversation not found, mapped to 404: %s",
+            exc,
+            extra=_error_audit_extra(
+                request,
+                phase="not_found",
+                code=str(ErrorCode.NOT_FOUND),
+                http_status="404",
+            ),
+        )
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
+        )
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
