@@ -1,6 +1,6 @@
 """Live browser journey through the server, runner, tmux, and real Antigravity.
 
-Run after signing in with ``agy``::
+Run with ``GEMINI_API_KEY`` or an existing ``agy`` login::
 
     OMNIGENT_E2E_ANTIGRAVITY=1 uv run --no-sync pytest \
         tests/e2e_ui/shells/test_antigravity_tmux_recovery.py -v \
@@ -48,7 +48,7 @@ from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIAL
 pytestmark = [
     pytest.mark.skipif(
         os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "1",
-        reason="opt in with OMNIGENT_E2E_ANTIGRAVITY=1; requires a real agy login",
+        reason="opt in with OMNIGENT_E2E_ANTIGRAVITY=1; requires a Gemini key or agy login",
     ),
     pytest.mark.timeout(600),
 ]
@@ -262,7 +262,7 @@ def antigravity_session(
 ) -> Iterator[AntigravitySession]:
     assert not request.config.getoption("--ui-base-url"), "this test requires its own server"
     assert shutil.which("agy"), "install agy before running this test"
-    assert gemini_auth_has_credential(), "run `agy` and sign in, then rerun this test"
+    assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
     request.getfixturevalue("built_spa")
     with _antigravity_stack(tmp_path) as session:
         yield session
@@ -279,10 +279,10 @@ def test_antigravity_survives_probe_outage_then_detects_exit(
     expect(terminal).to_have_attribute("data-state", "connected", timeout=120_000)
 
     def send_and_expect_reply() -> None:
-        token = f"AGY_E2E_{uuid.uuid4().hex}"
+        token = f"agy-e2e-{uuid.uuid4().hex[:8]}"
         page.get_by_test_id("view-mode-chat").click()
         composer = page.get_by_placeholder("Send a message…")
-        composer.fill(f"Reply with exactly {token}. Do not use tools or modify files.")
+        composer.fill(f"Reply {token}. No tools.")
         page.get_by_role("button", name="Send", exact=True).click()
         reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
         expect(reply.filter(has_text=token)).to_have_count(1, timeout=180_000)
