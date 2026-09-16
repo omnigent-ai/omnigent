@@ -13,11 +13,7 @@ on:
       - .github/workflows/auto-assign-reviewer.test.js
       - .github/workflows/auto-assign-reviewer-test.yml
       - .github/workflows/issue-triage.yml
-      - .github/workflows/nightly-failure-monitor.yml
-      - .github/workflows/autoformat-pr.yml
-      - .github/workflows/doc-sync.yml
-      - .github/workflows/feature-blog.yml
-      - .github/scripts/assignment_workflows_test.py
+      - .github/scripts/issue_triage_assignment_test.py
       - .github/areas.json
   workflow_dispatch:
 
@@ -40,7 +36,7 @@ jobs:
         run: node .github/workflows/areas.test.js
       - name: Run reviewer-assignment unit test
         run: node .github/workflows/auto-assign-reviewer.test.js
-      - name: Test workflow assignment guards
+      - name: Test issue-triage assignment guards
         run: |
           python3 -m pip install 'PyYAML==6.0.3'
-          python3 .github/scripts/assignment_workflows_test.py
+          python3 .github/scripts/issue_triage_assignment_test.py

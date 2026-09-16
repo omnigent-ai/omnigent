@@ -10,7 +10,6 @@ import urllib.error
 from datetime import UTC, datetime
 from email.message import Message
 from typing import Any
-from unittest.mock import patch
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("waiting_on_author.py")
 SPEC = importlib.util.spec_from_file_location("waiting_on_author", SCRIPT_PATH)
@@ -270,24 +269,6 @@ class WaitingOnAuthorTest(unittest.TestCase):
 
 
 class WaitingForReviewTest(unittest.TestCase):
-    def test_handoff_excludes_paused_assignees_and_reviewers(self) -> None:
-        api = FakeAPI()
-        pull = pr(assignees=["paused", "active"], requested_reviewers=["PAUSED"])
-        with patch.object(
-            waiting_on_author.Path, "read_text", return_value='{"assignment_paused":["Paused"]}'
-        ):
-            waiting_on_author.hand_off_to_reviewer(api, pull, "author replied")
-        self.assertEqual(api.review_requests, [(12, ["active"])])
-
-    def test_handoff_with_every_owner_paused_still_updates_label(self) -> None:
-        api = FakeAPI()
-        with patch.object(
-            waiting_on_author.Path, "read_text", return_value='{"assignment_paused":["paused"]}'
-        ):
-            waiting_on_author.hand_off_to_reviewer(api, pr(assignees=["PAUSED"]), "author replied")
-        self.assertEqual(api.review_requests, [])
-        self.assertEqual(api.added, [(12, waiting_on_author.REVIEW_LABEL)])
-
     def test_author_reply_hands_off_to_reviewer(self) -> None:
         api = FakeAPI(pull=pr(author="alice", assignees=["maintainer1"]))
         waiting_on_author.clear_on_author_activity(

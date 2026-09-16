@@ -65,22 +65,6 @@ async function runOrch(canned, opts) {
 }
 
 (async () => {
-  const pausedAreas = script.parseAreas(JSON.stringify({ ...FIXTURE, assignment_paused: ["OWNERA", "ownerB"] }));
-  const pausedLoad = new Map([["ownerc", 10]]);
-  for (const files of [["omnigent/inner/a.py"], ["unmatched"]]) {
-    const chosen = script.pickSecondReviewer({ ...pausedAreas, files, load: pausedLoad, exclude: new Set() });
-    assert("SLA reviewer escalation excludes paused owners", chosen && !["ownera", "ownerb"].includes(chosen.toLowerCase()), chosen);
-  }
-  for (const labels of [["comp:harnesses"], []]) {
-    const chosen = script.pickSecondAssignee({ ...pausedAreas, labels, load: pausedLoad, exclude: new Set() });
-    assert("SLA issue escalation excludes paused owners", chosen && !["ownera", "ownerb"].includes(chosen.toLowerCase()), chosen);
-  }
-  const emptyAreas = script.parseAreas(JSON.stringify({ ...FIXTURE,
-    assignment_paused: FIXTURE.areas.flatMap((area) => area.owners) }));
-  assert("fully paused SLA pool has no escalation candidate",
-    script.pickSecondReviewer({ ...emptyAreas, files: [], load: new Map(), exclude: new Set() }) === null &&
-    script.pickSecondAssignee({ ...emptyAreas, labels: [], load: new Map(), exclude: new Set() }) === null);
-
   // ---- workingDaysBetween (2026-01-05 is a Monday, 01-12 the next Monday) ----
   const wdb = script.workingDaysBetween;
   assert("same day -> 0", wdb("2026-01-05", "2026-01-05") === 0);

@@ -12,7 +12,6 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from email.message import Message
-from pathlib import Path
 from typing import Any
 
 LABEL = "waiting-on-author"
@@ -246,8 +245,6 @@ def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> N
         print(f"Added {REVIEW_LABEL} to #{number}: {reason}")
 
     author = (pull.get("user") or {}).get("login", "").lower()
-    config = json.loads(Path(__file__).resolve().parents[1].joinpath("areas.json").read_text())
-    paused = {login.casefold() for login in config.get("assignment_paused", [])}
     # Assignees are the durable owner record; requested_reviewers empties out on
     # every submitted review. Never re-request the author's own review.
     owners = [
@@ -256,7 +253,7 @@ def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> N
             (person or {}).get("login")
             for person in (pull.get("assignees") or []) + (pull.get("requested_reviewers") or [])
         )
-        if login and login.lower() != author and login.casefold() not in paused
+        if login and login.lower() != author
     ]
     queued = api.request_review(number, sorted(set(owners))) if owners else 0
     if not queued:

@@ -1250,13 +1250,7 @@ approval is only an indicator; a human maintainer's approval is always what merg
    `closing_issue_number` issue's assignee — often the same person, since the
    mirror is assigned to whoever owns the Linear ticket.
 
-Before requesting review, read `assignment_paused` from `.github/areas.json`
-on the target repo's trusted default branch. Exclude matching logins
-(case-insensitive), including owners read from Linear. If no eligible assignee
-remains, leave the PR ready for a maintainer without requesting or tagging a
-paused person. If the policy cannot be read, skip the review request.
-
-Read the chosen assignee and request their review only if eligible:
+Read the chosen assignee and request their review:
 
 ```
 # Linear ticket → its assignee (authoritative); else the mirrored issue's assignee
@@ -1269,7 +1263,7 @@ gh pr edit <pr> --add-reviewer <login>
 recover the token as shown there and retry; don't record a "read-only/expired
 token" excuse.
 
-- If there are **multiple assignees**, request all eligible, unpaused assignees.
+- If there are **multiple assignees**, request all of them.
 - If there is **no assignee on the Linear ticket and no `closing_issue_number`**
   (so there's no assignee to read anywhere), the
   assignee **is the PR author** (you can't request review from the author — common

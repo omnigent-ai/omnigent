@@ -2,7 +2,7 @@
 // FORK PRs authored by a NON-maintainer, preferring the owners of the area(s)
 // the PR touches.
 //
-// `assignment_paused` excludes logins from every new automatic assignment.
+// `assignment_paused` excludes logins from this workflow's reviews and assignments.
 // Ownership comes from .github/areas.json (a custom, non-magic path -- NOT
 // .github/CODEOWNERS -- so GitHub's native CODEOWNERS auto-request never fires;
 // this action is the sole assigner). The candidate pool is the union of owners

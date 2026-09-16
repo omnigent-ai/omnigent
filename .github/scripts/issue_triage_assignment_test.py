@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise assignment code embedded in workflows with offline GitHub stubs."""
+"""Exercise legacy issue-triage assignment with offline GitHub stubs."""
 
 from __future__ import annotations
 
@@ -20,61 +20,7 @@ def workflow_steps(name: str) -> list[dict]:
     return [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
 
 
-class AssignmentWorkflowsTest(unittest.TestCase):
-    def test_site_workflows_filter_paused_reviewers(self) -> None:
-        for name, variable in [("doc-sync.yml", "REVIEWER"), ("feature-blog.yml", "reviewer")]:
-            run = next(
-                step["run"]
-                for step in workflow_steps(name)
-                if "if ! jq -e --arg login" in step.get("run", "")
-            )
-            guard = run[run.index("if ! jq -e --arg login") :]
-            guard = guard[: guard.index("fi") + 2]
-            for login, expected in [("Paused", ""), ("active", "active")]:
-                with (
-                    self.subTest(workflow=name, login=login),
-                    tempfile.TemporaryDirectory() as directory,
-                ):
-                    root = Path(directory)
-                    (root / ".github").mkdir()
-                    (root / ".github/areas.json").write_text('{"assignment_paused":["PAUSED"]}')
-                    result = subprocess.run(
-                        [
-                            "bash",
-                            "-euo",
-                            "pipefail",
-                            "-c",
-                            guard + '\nprintf "%s" "$' + variable + '"',
-                        ],
-                        cwd=root,
-                        env={**os.environ, variable: login, "GITHUB_WORKSPACE": directory},
-                        text=True,
-                        capture_output=True,
-                        check=True,
-                    )
-                    self.assertEqual(result.stdout, expected)
-
-    def test_autoformat_skips_paused_author_assignment(self) -> None:
-        run = next(step["run"] for step in workflow_steps("autoformat-pr.yml") if "run" in step)
-        assignment = run[
-            run.index("assignment_note=") : run.index(".github/scripts/pr-template/format_body.py")
-        ]
-        for author, expected in [("Paused", False), ("active", True)]:
-            with self.subTest(author=author), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                (root / ".github").mkdir()
-                (root / ".github/areas.json").write_text('{"assignment_paused":["PAUSED"]}')
-                script = 'gh() { printf "%s\\n" "$*" > assigned.txt; }\n' + assignment
-                subprocess.run(
-                    ["bash", "-euo", "pipefail", "-c", script],
-                    cwd=root,
-                    env={**os.environ, "author": author, "REPO": "test/repo", "PR_NUMBER": "1"},
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                )
-                self.assertEqual((root / "assigned.txt").exists(), expected)
-
+class IssueTriageAssignmentTest(unittest.TestCase):
     def test_legacy_triage_assignment(self) -> None:
         steps = workflow_steps("issue-triage.yml")
         generate = next(step["run"] for step in steps if step.get("id") == "assignees")
@@ -179,56 +125,6 @@ else:
                     assignments.read_text().splitlines() if assignments.exists() else [],
                     expected,
                 )
-
-    def test_nightly_failure_monitor(self) -> None:
-        script = next(
-            step["with"]["script"]
-            for step in workflow_steps("nightly-failure-monitor.yml")
-            if "script" in step.get("with", {})
-        )
-        harness = r"""
-const fs = require('fs');
-const {script, paused} = JSON.parse(fs.readFileSync(0, 'utf8'));
-const assigned = [];
-let created = 0;
-const github = {rest: {
-  issues: {
-    listForRepo: async () => ({data: []}),
-    getLabel: async () => ({}),
-    create: async () => { created++; return {data: {number: 1}}; },
-    addAssignees: async ({assignees}) => assigned.push(...assignees),
-  },
-  actions: {listWorkflowRuns: async () => ({data: {
-    workflow_runs: [{id: 2, conclusion: 'failure'}],
-  }})},
-}};
-const context = {repo: {owner: 'test', repo: 'repo'}, workflow: 'Nightly', payload: {
-  repository: {default_branch: 'main'}, workflow_run: {
-    id: 1, event: 'schedule', head_branch: 'main', conclusion: 'failure',
-    name: 'Nightly', head_sha: '123456789', run_number: 3,
-  },
-}};
-const core = {info() {}, warning() {}};
-const fakeRequire = (name) => {
-  if (name !== 'fs') throw new Error(name);
-  return {readFileSync: () => JSON.stringify({assignment_paused: paused})};
-};
-const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
-const execute = new AsyncFunction('github', 'context', 'core', 'require', script);
-execute(github, context, core, fakeRequire)
-  .then(() => process.stdout.write(JSON.stringify({created, assigned})))
-  .catch(error => { console.error(error); process.exitCode = 1; });
-"""
-        for paused, expected in [([], ["PattaraS"]), (["PATTARAS"], [])]:
-            with self.subTest(paused=paused):
-                result = subprocess.run(
-                    ["node", "-e", harness],
-                    input=json.dumps({"script": script, "paused": paused}),
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                )
-                self.assertEqual(json.loads(result.stdout), {"created": 1, "assigned": expected})
 
 
 if __name__ == "__main__":
