@@ -43,41 +43,14 @@ _AGY_STARTUP_TIMEOUT = 25.0
 _NAMED_HOOKS_RE = re.compile(r"loaded (\d+) named hooks", re.IGNORECASE)
 
 
-def _write_user_policy_hook(gemini_dir: Path) -> None:
+def _write_user_hook(gemini_dir: Path) -> None:
     (gemini_dir / "config").mkdir(mode=0o700, parents=True, exist_ok=True)
     (gemini_dir / "hooks").mkdir(mode=0o700, parents=True, exist_ok=True)
-    script = gemini_dir / "hooks" / "deny-no-verify.sh"
-    script.write_text(
-        "#!/usr/bin/env bash\n"
-        'input="$(cat)"\n'
-        "printf '%s' \"$input\" | grep -q -- '--no-verify' "
-        '&& echo \'{"decision":"deny","reason":"Policy gate: '
-        "git commit --no-verify is not allowed\"}' "
-        '|| echo \'{"decision":"allow"}\'\n',
-        encoding="utf-8",
-    )
-    os.chmod(script, 0o755)
+    script = gemini_dir / "hooks" / "example.sh"
+    script.write_text("#!/bin/sh\nprintf '{}\\n'\n", encoding="utf-8")
+    script.chmod(0o700)
     (gemini_dir / "config" / "hooks.json").write_text(
-        json.dumps(
-            {
-                "no-verify-gate": {
-                    "PreToolUse": [
-                        {
-                            "matcher": "run_command",
-                            "hooks": [
-                                {
-                                    "type": "command",
-                                    "command": str(script),
-                                    "timeout": 10,
-                                }
-                            ],
-                        }
-                    ]
-                }
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps({"example": {"PreInvocation": [{"command": "../hooks/example.sh"}]}}),
         encoding="utf-8",
     )
 
@@ -105,25 +78,20 @@ def _agy_named_hook_count(gemini_dir: Path, *, cwd: Path) -> int:
                     return int(m.group(1))
             time.sleep(0.5)
     finally:
-        try:
-            child.kill(15)
-            time.sleep(0.5)
-            child.kill(9)
-        except Exception:
-            pass
+        child.close(force=True)
     raise AssertionError(
         f"agy wrote no hooks-manager startup line under {log_glob} within {_AGY_STARTUP_TIMEOUT}s"
     )
 
 
-def test_dispatched_agy_session_keeps_user_hooks(
+def test_dispatched_agy_session_loads_user_hooks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_home = tmp_path / "home"
     real_gemini = fake_home / ".gemini"
     real_gemini.mkdir(mode=0o700, parents=True)
-    _write_user_policy_hook(real_gemini)
+    _write_user_hook(real_gemini)
     monkeypatch.setenv("HOME", str(fake_home))
 
     bridge_dir = tmp_path / "bridge"
@@ -145,18 +113,16 @@ def test_dispatched_agy_session_keeps_user_hooks(
     dispatched_hooks = _agy_named_hook_count(iso_gemini, cwd=dispatched_ws)
 
     assert interactive_hooks >= 1, (
-        "interactive agy did not load the user's policy hook — fixture invalid "
+        "interactive agy did not load the fixture hook — fixture invalid "
         f"(loaded {interactive_hooks} named hooks)"
     )
 
     assert (iso_gemini / "config" / "hooks.json").is_file(), (
-        "isolated --gemini_dir is missing config/hooks.json: the dispatched agy "
-        "session silently drops the user's hook-based policy gates"
+        "isolated --gemini_dir is missing config/hooks.json"
     )
 
     assert dispatched_hooks == interactive_hooks, (
         "dispatched agy loaded a different number of named hooks than the "
         f"interactive one (dispatched={dispatched_hooks}, "
-        f"interactive={interactive_hooks}): the user's policy gates were dropped "
-        "by the isolated --gemini_dir seed"
+        f"interactive={interactive_hooks})"
     )

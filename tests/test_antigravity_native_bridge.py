@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shlex
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1868,8 +1871,12 @@ def test_seed_isolated_agy_home_hooks_are_copied_not_linked(
 
     iso_hooks = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
     assert not iso_hooks.is_symlink()
+    other_bridge = tmp_path / "other-bridge"
+    seed_isolated_agy_home(other_bridge)
     iso_hooks.write_text('{"session-edit": {}}', encoding="utf-8")
     assert real_hooks.read_text(encoding="utf-8") == '{"gate": {}}'
+    other_hooks = agy_gemini_dir(other_bridge) / "config" / "hooks.json"
+    assert json.loads(other_hooks.read_text()) == {"gate": {}}
 
 
 def test_seed_isolated_agy_home_tolerates_absent_hooks(
@@ -1886,6 +1893,159 @@ def test_seed_isolated_agy_home_tolerates_absent_hooks(
     iso_config = agy_gemini_dir(bridge_dir) / "config"
     assert not (iso_config / "hooks.json").exists()
     assert (iso_config / ".migrated").is_file()
+
+
+@pytest.fixture
+def global_hooks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home with spaces ' $HOME"
+    hooks = home / ".gemini" / "config" / "hooks.json"
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text('{"example": {}}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+    return hooks
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("event", ["PreToolUse", "PreInvocation"])
+@pytest.mark.parametrize("script_path", ["../hooks/check.sh", "./scripts/check.sh", "absolute"])
+def test_seed_isolated_agy_hooks_preserves_command_behavior(
+    tmp_path: Path, global_hooks: Path, event: str, script_path: str
+) -> None:
+    script = global_hooks.parent / ("check.sh" if script_path == "absolute" else script_path)
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(
+        "#!/bin/sh\ncat message.txt\ncat\nprintf 'diagnostic' >&2\nexit 23\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    (global_hooks.parent / "message.txt").write_text("relative data\n", encoding="utf-8")
+    script_command = str(script) if script_path == "absolute" else script_path
+    command = f"printf 'prefix: '; {shlex.quote(script_command)}"
+    handler = {"command": command, "timeout": 10}
+    handlers = (
+        [handler] if event == "PreInvocation" else [{"matcher": "run_command", "hooks": [handler]}]
+    )
+    source = json.dumps({"example": {"enabled": True, event: handlers}})
+    global_hooks.write_text(source, encoding="utf-8")
+    bridge = tmp_path / "bridge"
+
+    seed_isolated_agy_home(bridge)
+    isolated = agy_gemini_dir(bridge) / "config" / "hooks.json"
+    copied = json.loads(isolated.read_text())
+    seeded_handler = copied["example"][event][0]
+    if event == "PreToolUse":
+        seeded_handler = seeded_handler["hooks"][0]
+    for cwd, shell_command in (
+        (global_hooks.parent, command),
+        (isolated.parent, seeded_handler["command"]),
+    ):
+        result = subprocess.run(
+            ["sh", "-c", shell_command],
+            cwd=cwd,
+            input="stdin payload",
+            text=True,
+            capture_output=True,
+        )
+        assert (result.returncode, result.stdout, result.stderr) == (
+            23,
+            "prefix: relative data\nstdin payload",
+            "diagnostic",
+        )
+    assert global_hooks.read_text() == source
+    original_copy = isolated.read_text()
+    seed_isolated_agy_home(bridge)
+    assert isolated.read_text() == original_copy
+    seeded_handler["command"] = command
+    assert copied == json.loads(source)
+
+
+def test_seed_isolated_agy_hooks_removes_deleted_source(
+    tmp_path: Path, global_hooks: Path
+) -> None:
+    bridge = tmp_path / "bridge"
+    seed_isolated_agy_home(bridge)
+    isolated = agy_gemini_dir(bridge) / "config" / "hooks.json"
+    assert isolated.is_file()
+
+    global_hooks.unlink()
+    seed_isolated_agy_home(bridge)
+
+    assert not isolated.exists()
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("source_exists", [True, False])
+def test_seed_isolated_agy_hooks_does_not_follow_destination_symlink(
+    tmp_path: Path, global_hooks: Path, source_exists: bool
+) -> None:
+    bridge = tmp_path / "bridge"
+    seed_isolated_agy_home(bridge)
+    isolated = agy_gemini_dir(bridge) / "config" / "hooks.json"
+    target = tmp_path / "unrelated-file"
+    target.write_text("keep this content", encoding="utf-8")
+    target.chmod(0o640)
+    isolated.unlink()
+    isolated.symlink_to(target)
+    if not source_exists:
+        global_hooks.unlink()
+
+    seed_isolated_agy_home(bridge)
+
+    assert target.read_text() == "keep this content"
+    assert target.stat().st_mode & 0o777 == 0o640
+    assert not isolated.is_symlink()
+    assert isolated.exists() == source_exists
+    if source_exists:
+        assert isolated.stat().st_mode & 0o777 == 0o600
+        assert json.loads(isolated.read_text()) == {"example": {}}
+
+
+@pytest.mark.parametrize("failure", ["read", "parse", "write", "replace"])
+def test_seed_isolated_agy_hooks_keeps_previous_copy_on_refresh_error(
+    tmp_path: Path,
+    global_hooks: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    bridge = tmp_path / "bridge"
+    seed_isolated_agy_home(bridge)
+    isolated = agy_gemini_dir(bridge) / "config" / "hooks.json"
+    previous = isolated.read_bytes()
+    global_hooks.write_text('{"updated": {}}', encoding="utf-8")
+    if failure == "read":
+        read_text = Path.read_text
+
+        def unreadable(path: Path, *args, **kwargs):
+            if path == global_hooks:
+                raise PermissionError("source unreadable")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", unreadable)
+    elif failure == "parse":
+        global_hooks.write_text("{invalid json", encoding="utf-8")
+    elif failure == "write":
+
+        def interrupted_write(payload, stream, **kwargs):
+            stream.write('{"partial":')
+            raise OSError("write interrupted")
+
+        monkeypatch.setattr(_mod.json, "dump", interrupted_write)
+    else:
+        replace = os.replace
+
+        def failed_replace(src, dst):
+            if dst == isolated:
+                raise OSError("replace failed")
+            return replace(src, dst)
+
+        monkeypatch.setattr(_mod.os, "replace", failed_replace)
+
+    seed_isolated_agy_home(bridge)
+
+    assert isolated.read_bytes() == previous
+    assert not list(isolated.parent.glob("hooks.json.*"))
+    assert "Could not refresh Antigravity hooks" in caplog.text
 
 
 def test_seed_isolated_agy_home_exposes_user_skill_dirs(

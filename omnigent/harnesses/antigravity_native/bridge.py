@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -692,15 +693,37 @@ def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
 
 
 def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
-    """Refresh a separate copy of global hooks on each seed; ignore copy failures."""
+    """Refresh session hooks while preserving each command's original working directory."""
     real_hooks = real_home / ".gemini" / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
-    if not real_hooks.is_file():
-        return
     iso_hooks = iso_gemini / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
-    with contextlib.suppress(OSError):
+
+    def preserve_cwd(value: dict[str, object]) -> dict[str, object]:
+        command = value.get("command")
+        if isinstance(command, str) and command and value.get("type", "command") == "command":
+            # agy runs hook commands from the directory containing hooks.json.
+            value["command"] = (
+                f"cd {shlex.quote(str(real_hooks.parent))} && exec sh -c {shlex.quote(command)}"
+            )
+        return value
+
+    try:
+        try:
+            content = real_hooks.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            iso_hooks.unlink(missing_ok=True)
+            return
+        hooks = json.loads(content, object_hook=preserve_cwd)
         iso_hooks.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        iso_hooks.write_bytes(real_hooks.read_bytes())
-        os.chmod(iso_hooks, 0o600)
+        fd, tmp_name = tempfile.mkstemp(prefix="hooks.json.", dir=iso_hooks.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(hooks, stream)
+                stream.write("\n")
+            os.replace(tmp_name, iso_hooks)
+        finally:
+            Path(tmp_name).unlink(missing_ok=True)
+    except (OSError, ValueError):
+        _logger.warning("Could not refresh Antigravity hooks at %s", iso_hooks, exc_info=True)
 
 
 def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
