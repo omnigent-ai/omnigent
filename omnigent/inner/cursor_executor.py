@@ -886,29 +886,29 @@ class CursorExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         session_key = self._session_key(messages)
-        model = _resolve_model((config.model if config else None) or self._model_override)
+        requested_model = _resolve_model(
+            (config.model if config else None) or self._model_override
+        )
+        model = requested_model
         tools_fp = _tools_fingerprint(tools)
         state = self._session_states.setdefault(session_key, _CursorSessionState())
 
-        # System prompt, model, and tool set are all fixed at agent creation, so
-        # a change to any of them means a fresh agent (otherwise a changed tool
-        # set would leave the initial custom_tools stale for the conversation).
-        if state.agent is not None and (
-            state.system_prompt != system_prompt
-            or model not in (state.requested_model, state.model)
-            or state.tools_fingerprint != tools_fp
-        ):
-            await self._close_state(state)
-            state = _CursorSessionState()
-            self._session_states[session_key] = state
-        is_first_turn = not state.has_sent_prompt
-        state.system_prompt = system_prompt
-        if state.agent is None:
-            state.requested_model = model
-        state.tools_fingerprint = tools_fp
-
         try:
+            if state.agent is not None and model not in (state.requested_model, state.model):
+                model = await _resolve_model_against_catalog(state.client, model, self._api_key)
+            if state.agent is not None and (
+                state.system_prompt != system_prompt
+                or model not in (state.requested_model, state.model)
+                or state.tools_fingerprint != tools_fp
+            ):
+                await self._close_state(state)
+                state = _CursorSessionState()
+                self._session_states[session_key] = state
+            is_first_turn = not state.has_sent_prompt
+            state.system_prompt = system_prompt
+            state.tools_fingerprint = tools_fp
             await self._ensure_session(state, model, tools)
+            state.requested_model = requested_model
         except UnresolvableCursorModelError as exc:
             await self.close_session(session_key)
             yield ExecutorError(message=str(exc))

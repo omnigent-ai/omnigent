@@ -645,21 +645,34 @@ async def test_model_selection_through_spawn_env_and_harness_request(
     assert state["create_api_keys"] == ["crsr_test"]
 
 
+@pytest.mark.parametrize("start_with_valid_model", [False, True])
 async def test_rejected_model_closes_bridge_and_same_session_recovers(
     monkeypatch: pytest.MonkeyPatch,
+    start_with_valid_model: bool,
 ) -> None:
     from omnigent.inner.executor import ExecutorConfig
 
-    state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    scripts = [
+        {"messages": [_assistant("ok")], "result": "ok"} for _ in range(1 + start_with_valid_model)
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
     executor = CursorExecutor(api_key="crsr_x")
     try:
+        if start_with_valid_model:
+            initial = [
+                event
+                async for event in executor.run_turn(
+                    [_user("hello")], [], "SYS", config=ExecutorConfig(model="Composer")
+                )
+            ]
+            assert any(isinstance(event, TurnComplete) for event in initial)
         errors = [
             event
             async for event in executor.run_turn(
                 [_user("hi")], [], "SYS", config=ExecutorConfig(model="composr-2.5")
             )
         ]
-        assert state["create_models"] == []
+        assert state["create_models"] == ["composer-2.5"] * start_with_valid_model
         assert state["client_closed"] == 1
         assert len(errors) == 1
         assert isinstance(errors[0], ExecutorError)
@@ -672,13 +685,13 @@ async def test_rejected_model_closes_bridge_and_same_session_recovers(
                 [_user("try again")], [], "SYS", config=ExecutorConfig(model="Composer")
             )
         ]
-        assert state["create_models"] == ["composer-2.5"]
+        assert state["create_models"] == ["composer-2.5"] * (1 + start_with_valid_model)
         assert not any(isinstance(event, ExecutorError) for event in recovered)
         assert any(isinstance(event, TurnComplete) for event in recovered)
     finally:
         await executor.close()
     assert state["client_closed"] == 2
-    assert state["agent_closed"] == 1
+    assert state["agent_closed"] == 1 + start_with_valid_model
 
 
 async def test_usage_attributed_to_resolved_id_not_display_label(
@@ -713,42 +726,29 @@ async def test_usage_attributed_to_resolved_id_not_display_label(
     assert completes[0].usage["model"] == "composer-2.5"
 
 
-async def test_resolved_id_on_next_turn_reuses_agent(
+async def test_equivalent_model_selections_reuse_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both the original label and resolved id reuse the same agent."""
     from omnigent.inner.executor import ExecutorConfig
 
-    scripts = [
-        {"messages": [_assistant("one")], "result": "one"},
-        {"messages": [_assistant("two")], "result": "two"},
-        {"messages": [_assistant("three")], "result": "three"},
-    ]
+    selections = ["Composer", "Composer 2.5", "COMPOSER-2.5", "composer-2.5", "Composer"]
+    scripts = [{"messages": [_assistant("ok")], "result": "ok"} for _ in selections]
     state = _install_fake_sdk(monkeypatch, scripts)
     executor = CursorExecutor(api_key="crsr_x")
     try:
-        _ = [
-            e
-            async for e in executor.run_turn(
-                [_user("first")], [], "SYS", config=ExecutorConfig(model="Composer")
-            )
-        ]
-        _ = [
-            e
-            async for e in executor.run_turn(
-                [_user("second")], [], "SYS", config=ExecutorConfig(model="composer-2.5")
-            )
-        ]
-        _ = [
-            e
-            async for e in executor.run_turn(
-                [_user("third")], [], "SYS", config=ExecutorConfig(model="Composer")
-            )
-        ]
+        for model in selections:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [_user("hi")], [], "SYS", config=ExecutorConfig(model=model)
+                )
+            ]
+            assert not any(isinstance(event, ExecutorError) for event in events)
+            assert any(isinstance(event, TurnComplete) for event in events)
     finally:
         await executor.close()
     assert state["create_models"] == ["composer-2.5"]
-    assert len(state["sent"]) == 3
+    assert len(state["sent"]) == len(selections)
 
 
 async def test_session_restart_on_model_change(monkeypatch: pytest.MonkeyPatch) -> None:
