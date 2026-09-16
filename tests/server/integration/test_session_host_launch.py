@@ -56,7 +56,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
-from tests.budgets import budget
+from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -222,9 +222,11 @@ async def _serve_one_launch(
         callers can assert on its fields (e.g. ``harness``).
     """
     # Bounded so a routing bug can't hang the test: stat + launch are
-    # 2 frames, the rest of the budget absorbs interleaved pings.
+    # 2 frames, the rest of the budget absorbs interleaved pings. One deadline
+    # for the whole exchange — a per-receive budget would multiply by 40.
+    deadline = Deadline(20.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=budget(3.0))
+        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -278,8 +280,9 @@ async def _serve_one_stop(comm: ApplicationCommunicator) -> str:
         runner (the regression this guards against).
     """
     # Bounded so a missing stop frame fails fast instead of hanging.
+    deadline = Deadline(20.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=budget(3.0))
+        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -1170,7 +1173,9 @@ async def test_host_reports_runner_unknown_skips_connect_grace(
     from omnigent.server.routes import sessions as sessions_module
 
     # Long grace: a blind wait would take this long; the verdict must beat it.
-    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 5.0)
+    # Scaled with the budget below so the 2:5 margin that detects a blind wait
+    # survives on a slow runner — scaling only the budget would erase it.
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", budget(5.0))
 
     comm = await _connect_host(app)
     session = await _inline_launch_session(client, comm)
@@ -1855,8 +1860,9 @@ async def _serve_fs_requests(
     from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
     reader = WorkspaceReader(Path(workspace_root))
+    deadline = Deadline(30.0)
     for _ in range(max_frames):
-        output = await comm.receive_output(timeout=budget(3.0))
+        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -2390,10 +2396,11 @@ async def test_relaunch_stops_the_superseded_runner(
     try:
         # The stop is a detached task, so the stop and launch frames can
         # arrive in either order; collect until both are seen.
+        deadline = Deadline(20.0)
         for _ in range(40):
             if launch_frame is not None and stop_frame is not None:
                 break
-            output = await comm.receive_output(timeout=budget(3.0))
+            output = await comm.receive_output(timeout=deadline.next_wait(3.0))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -2472,9 +2479,10 @@ async def test_concurrent_relaunches_are_single_flight(
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.
+        drain = Deadline(20.0)
         with contextlib.suppress(asyncio.TimeoutError):
             for _ in range(40):
-                output = await comm.receive_output(timeout=budget(2.0))
+                output = await comm.receive_output(timeout=drain.next_wait(2.0))
                 if output["type"] != "websocket.send":
                     continue
                 frame = decode_host_frame(output["text"])
@@ -2559,9 +2567,10 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
     async def _serve_refusals() -> int:
         """Answer every launch with a refusal (and ack stops) for a while."""
         served = 0
+        drain = Deadline(20.0)
         with contextlib.suppress(asyncio.TimeoutError):
             for _ in range(40):
-                output = await comm.receive_output(timeout=budget(2.0))
+                output = await comm.receive_output(timeout=drain.next_wait(2.0))
                 if output["type"] != "websocket.send":
                     continue
                 frame = decode_host_frame(output["text"])
@@ -2606,8 +2615,10 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
         )
 
     # Both must complete promptly (the rider must not dead-end in a 30s
-    # connect wait after losing the refusal).
-    first, second = await asyncio.wait_for(asyncio.gather(_post(), _post()), timeout=budget(15.0))
+    # connect wait after losing the refusal). Deliberately unscaled: the bound
+    # only means something below _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S (30s),
+    # which this test does not patch, so scaling it would admit the regression.
+    first, second = await asyncio.wait_for(asyncio.gather(_post(), _post()), timeout=15.0)
     responder.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await responder

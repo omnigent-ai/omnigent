@@ -301,8 +301,11 @@ async def _forward_requests_to_runner(
             # assistant message, and the test fails with "no assistant
             # text in session snapshot". 60s is well above any
             # plausible per-frame interval but still bounded so a
-            # genuinely stuck test fails rather than hangs.
-            output = await communicator.receive_output(timeout=budget(60.0))
+            # genuinely stuck test fails rather than hangs. Deliberately
+            # unscaled: 60s already carries the headroom scaling would add, and
+            # this sits in an unbounded relay loop where a scaled wait would
+            # outlast the lane's own suite timeout.
+            output = await communicator.receive_output(timeout=60.0)
             if output["type"] == "websocket.close":
                 return
             if output["type"] != "websocket.send":
