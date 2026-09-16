@@ -284,8 +284,13 @@ def _csrf_token_from_process(port: int, process: psutil.Process) -> str | None:
         token = _flag_value(args, "--csrf_token")
         if token and port in _pid_rpc_ports(process.pid) and process.is_running():
             return token
-    except (psutil.Error, OSError):
-        pass
+    except (psutil.Error, OSError) as exc:
+        _logger.debug(
+            "Cannot inspect agy RPC owner: pid=%s port=%s error=%s",
+            process.pid,
+            port,
+            type(exc).__name__,
+        )
     return None
 
 

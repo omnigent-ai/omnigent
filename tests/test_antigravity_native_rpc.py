@@ -335,12 +335,22 @@ async def test_loopback_clients_ignore_environment_proxies(
         assert client._transport_for_url(url) is client._transport
 
 
-@pytest.mark.parametrize("error", [rpc.psutil.AccessDenied(101), rpc.psutil.NoSuchProcess(101)])
+@pytest.mark.parametrize(
+    "error",
+    [
+        rpc.psutil.AccessDenied(101),
+        rpc.psutil.NoSuchProcess(101),
+        OSError("cannot inspect --csrf_token=sensitive-token"),
+    ],
+)
 def test_unreadable_process_does_not_leak_another_token(
-    authenticated_agy: dict[int, Mock], error: Exception
+    authenticated_agy: dict[int, Mock], error: Exception, caplog: pytest.LogCaptureFixture
 ) -> None:
     authenticated_agy[101].cmdline = Mock(side_effect=error)
-    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+    with caplog.at_level("DEBUG", logger=rpc.__name__):
+        assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+    assert f"pid=101 port=52548 error={type(error).__name__}" in caplog.text
+    assert "sensitive-token" not in caplog.text
 
 
 @pytest.mark.parametrize("args", [["/bin/agy"], ["/bin/other", "/bin/agy", "--csrf_token=wrong"]])
