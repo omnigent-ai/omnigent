@@ -1,6 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
 import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
@@ -154,6 +155,18 @@ export const ComposerMicButton = ({
   // Lets the mount-time Web Speech error handler start the fallback take
   // without closing over toggleServer's identity.
   const toggleServerRef = useRef<() => Promise<void>>(async () => {});
+  // Latest server partial for the current take, so a crash can preserve what
+  // was spoken instead of blanking it. Set on each partial, cleared on final,
+  // and reset when a take starts so a stale partial can't resurrect.
+  const interimRef = useRef("");
+
+  // Surface a failure both in the button (tooltip + red tint) and as a toast,
+  // so a failed take is an explained error rather than a silent flash back to
+  // the idle mic. Stable identity: only setError/showToast, both stable.
+  const reportError = useCallback((message: string) => {
+    setError(message);
+    showToast(message);
+  }, []);
 
   // Written via .style.transform from rAF — avoids 60Hz React re-renders.
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
@@ -201,9 +214,9 @@ export const ComposerMicButton = ({
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
       if (err === "not-allowed" || err === "service-not-allowed") {
-        setError("Microphone permission denied");
+        reportError("Microphone access denied. Allow access and try again.");
       } else if (err && err !== "no-speech" && err !== "aborted") {
-        setError("Dictation unavailable");
+        reportError("Voice input isn't available on this device.");
       }
       setIsListening(false);
     };
@@ -237,7 +250,7 @@ export const ComposerMicButton = ({
       recognition.stop();
       recognitionRef.current = null;
     };
-  }, [Ctor, lang]);
+  }, [Ctor, lang, reportError]);
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
@@ -361,14 +374,19 @@ export const ComposerMicButton = ({
     try {
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
+      interimRef.current = "";
       onVoiceStartRef.current?.();
       const next = await DictationSession.start({
         onPartial: (text) => {
           // Drop late partials after an Esc discard — they'd repopulate the
           // composer the parent just reverted.
-          if (!disabledRef.current && !discardingRef.current) onInterimRef.current?.(text);
+          if (!disabledRef.current && !discardingRef.current) {
+            interimRef.current = text;
+            onInterimRef.current?.(text);
+          }
         },
         onFinal: (text) => {
+          interimRef.current = "";
           const trimmed = text.trim();
           if (trimmed && !disabledRef.current && !discardingRef.current) {
             onTranscriptRef.current(trimmed);
@@ -376,26 +394,35 @@ export const ComposerMicButton = ({
         },
         onError: () => {
           sessionRef.current = null;
-          setError("Dictation unavailable");
+          // Preserve anything spoken but not yet finalized: pin the pending
+          // partial as a final rather than blanking it, so a crash mid-take
+          // doesn't discard the user's words.
+          const pending = interimRef.current.trim();
+          interimRef.current = "";
+          if (pending && !disabledRef.current && !discardingRef.current) {
+            onTranscriptRef.current(pending);
+          } else {
+            onInterimRef.current?.("");
+          }
+          reportError("Voice input failed. Please try again.");
           setIsListening(false);
-          onInterimRef.current?.("");
         },
       });
       sessionRef.current = next;
       setError(null);
       setIsListening(true);
     } catch (startError) {
-      setError(
+      reportError(
         startError instanceof DictationBusyError
-          ? "Dictation is busy — try again shortly"
+          ? "Voice input is busy. Please try again shortly."
           : isPermissionError(startError)
-            ? "Microphone permission denied"
-            : "Dictation unavailable",
+            ? "Microphone access denied. Allow access and try again."
+            : "Voice input isn't available on this device.",
       );
       setIsListening(false);
     }
     serverBusyRef.current = false;
-  }, []);
+  }, [reportError]);
   toggleServerRef.current = toggleServer;
 
   const toggle = useCallback(() => {
