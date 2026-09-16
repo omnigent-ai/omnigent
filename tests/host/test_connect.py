@@ -6200,3 +6200,60 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+async def test_registration_publishes_capabilities_after_startup_probe() -> None:
+    """Hello registers with readiness unknown, then the map is pushed.
+
+    Capability discovery is deferred off the pre-registration path so hello
+    can go out immediately, without waiting on the serial harness-CLI probes.
+    The readiness loop must still publish the filled-in map once that deferred
+    probe lands, so a client never stays stuck on unknown readiness.
+    """
+    host = _make_host_process()
+
+    async def _deferred_probe() -> None:
+        host._configured_harnesses = {"pi": True}
+        host._gateway_inference = {"codex": True}
+
+    host._capability_init_task = asyncio.create_task(_deferred_probe())
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws, publish_deferred_startup=True))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    published = decode_host_frame(ws.sent[0])
+    assert isinstance(published, HostHarnessReadinessFrame)
+    assert published.configured_harnesses == {"pi": True}
+    assert published.gateway_inference == {"codex": True}
+    _cleanup_host(host)
+
+
+async def test_capability_discovery_waits_for_the_zygote_warm() -> None:
+    """The capability probe runs only after the zygote import finishes.
+
+    The probe shells out to harness CLIs; running those subprocesses while the
+    zygote is still importing the runner graph steals CPU/IO from that import,
+    which gates the first launch. So discovery must await the in-flight zygote
+    prestart before probing.
+    """
+    host = _make_host_process()
+    order: list[str] = []
+
+    async def _prestart() -> None:
+        await asyncio.sleep(0.05)
+        order.append("zygote")
+
+    async def _init_capabilities() -> None:
+        order.append("capabilities")
+
+    host._zygote_prestart_task = asyncio.create_task(_prestart())
+    host._initialize_capabilities = _init_capabilities  # type: ignore[method-assign]
+
+    await host._discover_capabilities_after_zygote()
+
+    assert order == ["zygote", "capabilities"]
+    _cleanup_host(host)

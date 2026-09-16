@@ -1121,6 +1121,9 @@ class HostProcess:
         # Warms the zygote at daemon start so the first launch doesn't pay
         # its one-time import; see run().
         self._zygote_prestart_task: asyncio.Task[ZygoteManager | None] | None = None
+        # Discovers harness capabilities off the pre-registration path; see
+        # run(). Hello registers with readiness unknown until this lands.
+        self._capability_init_task: asyncio.Task[None] | None = None
         # Inbound frames are handled on their own tasks (see
         # _start_frame_task) so one slow handler — a model-options CLI exec,
         # an npm install — can't head-of-line block a launch or a stat behind
@@ -3423,6 +3426,21 @@ class HostProcess:
                 )
             return None
 
+    async def _discover_capabilities_after_zygote(self) -> None:
+        """Probe capabilities once the runner zygote has finished warming.
+
+        The probe shells out to several harness CLIs; letting those subprocesses
+        run while the zygote is still importing the runner graph steals CPU/IO
+        from that import, which gates the first launch. Capabilities are
+        advisory and published via the readiness frame after hello, so deferring
+        them behind the warm adds nothing to the connect critical path.
+        """
+        prestart = self._zygote_prestart_task
+        if prestart is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await prestart
+        await self._initialize_capabilities()
+
     async def _initialize_capabilities(self) -> None:
         """Build the initial capability snapshot once, before any handshake."""
         if self._capabilities_initialized:
@@ -3528,10 +3546,27 @@ class HostProcess:
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
-        # Capability probes may shell out or inspect local config, so perform
-        # them once during daemon initialization. They are advisory: a broken
-        # harness is reported as unknown and must not prevent registration.
-        await self._initialize_capabilities()
+        # Warm the runner zygote first: start() blocks on its one-time import
+        # of the runner graph (~1-2s), which otherwise lands inside the first
+        # session launch of the daemon's life. Starting it before capability
+        # discovery lets it warm concurrently with the connect handshake.
+        # Best-effort — a failure latches the same direct-Popen fallback the
+        # launch path uses.
+        if self._zygote is not None and not self._zygote_disabled:
+            self._zygote_prestart_task = asyncio.create_task(
+                asyncio.to_thread(self._ensure_zygote_started),
+                name="host-zygote-prestart",
+            )
+        # Discover harness capabilities in the background. The probes shell out
+        # to several CLIs (~seconds serially), but the result is advisory
+        # metadata: a broken harness is reported as unknown and must never
+        # block registration. Keeping it off the pre-registration path lets
+        # hello go out immediately — the launcher's time-to-online no longer
+        # waits on these probes. Hello registers with readiness unknown until
+        # the probe lands; _serve_frames then publishes the filled-in map.
+        self._capability_init_task = asyncio.create_task(
+            self._discover_capabilities_after_zygote(), name="host-capability-init"
+        )
 
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
@@ -3564,15 +3599,6 @@ class HostProcess:
             self._lifecycle_lock.acquire()
             self._lifecycle_task = asyncio.create_task(
                 self._lifecycle_monitor_loop(), name="host-lifecycle-monitor"
-            )
-        # Warm the runner zygote now: start() blocks on its one-time import
-        # of the runner graph (~1-2s), which otherwise lands inside the first
-        # session launch of the daemon's life. Best-effort — a failure
-        # latches the same direct-Popen fallback the launch path uses.
-        if self._zygote is not None and not self._zygote_disabled:
-            self._zygote_prestart_task = asyncio.create_task(
-                asyncio.to_thread(self._ensure_zygote_started),
-                name="host-zygote-prestart",
             )
         backoff = _RECONNECT_BASE_S
         try:
@@ -3772,6 +3798,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._zygote_prestart_task
                 self._zygote_prestart_task = None
+            if self._capability_init_task is not None:
+                self._capability_init_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._capability_init_task
+                self._capability_init_task = None
             for watcher in list(self._watcher_tasks):
                 watcher.cancel()
             for watcher in list(self._watcher_tasks):
@@ -4083,7 +4114,11 @@ class HostProcess:
         # status``) must not delay ``ws.recv()`` or the inline keepalive pong
         # the server's watchdog counts as liveness, or it closes the tunnel
         # with ``4003 ping timeout``.
-        readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        readiness_task = asyncio.create_task(
+            self._harness_readiness_loop(
+                ws, publish_deferred_startup=hello.configured_harnesses is None
+            )
+        )
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
         # waiting on a harness probe. Cache-fresh reconnects are a no-op.
@@ -4117,11 +4152,45 @@ class HostProcess:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
 
-    async def _harness_readiness_loop(
+    async def _publish_startup_capabilities(
         self,
         ws: websockets.asyncio.client.ClientConnection,
     ) -> None:
+        """Await the deferred startup probe and publish its result once.
+
+        Hello registered this host with readiness unknown because the startup
+        capability probe hadn't landed. Wait on that single in-flight probe and
+        push the map as soon as it finishes, so the server holds "unknown" only
+        for the probe's own duration — not a full refresh interval, and without
+        re-running the same CLI execs the periodic loop would otherwise repeat.
+        """
+        task = self._capability_init_task
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        configured = self._configured_harnesses
+        if configured is None:
+            # Probe failed or timed out; leave readiness unknown and let the
+            # periodic refresh below retry it.
+            return
+        with contextlib.suppress(Exception):
+            await ws.send(
+                encode_host_frame(
+                    HostHarnessReadinessFrame(
+                        configured_harnesses=configured,
+                        gateway_inference=self._gateway_inference,
+                    )
+                )
+            )
+
+    async def _harness_readiness_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        publish_deferred_startup: bool = False,
+    ) -> None:
         """Refresh advisory capabilities without endangering the tunnel."""
+        if publish_deferred_startup:
+            await self._publish_startup_capabilities(ws)
         configured = self._configured_harnesses
         gateway = self._gateway_inference
         loop = asyncio.get_running_loop()

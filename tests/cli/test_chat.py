@@ -4627,3 +4627,105 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+async def _run_prepare_daemon_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    resume_conversation_id: str | None,
+) -> tuple[_DaemonChatSession, dict[str, object], list[tuple[str, str]]]:
+    """Drive ``_prepare_chat_session_via_daemon`` with the launch helpers stubbed.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param resume_conversation_id: Passed through; ``None`` creates a fresh session.
+    :returns: ``(result, launch_kwargs, bind_calls)`` where ``launch_kwargs`` records
+        the ``fresh`` flag the launch endpoint received and ``bind_calls`` records
+        every follow-up PATCH bind.
+    """
+    launch_kwargs: dict[str, object] = {}
+    bind_calls: list[tuple[str, str]] = []
+
+    class _FakeSessions:
+        async def create(self, bundle: bytes, *, filename: str, workspace: str) -> object:
+            return SimpleNamespace(id="sess_fresh")
+
+        async def fork(self, session_id: str) -> dict[str, str]:
+            return {"id": "sess_fork"}
+
+    class _FakeSDK:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            self.sessions = _FakeSessions()
+
+        async def __aenter__(self) -> "_FakeSDK":
+            return self
+
+        async def __aexit__(self, *_a: object) -> bool:
+            return False
+
+    class _FakeClient:
+        async def __aenter__(self) -> "_FakeClient":
+            return self
+
+        async def __aexit__(self, *_a: object) -> bool:
+            return False
+
+    async def _online(*_a: object, **_k: object) -> None:
+        return None
+
+    async def _launch(
+        _client: object, *, host_id: str, session_id: str, workspace: str, fresh: bool
+    ) -> str:
+        launch_kwargs["fresh"] = fresh
+        launch_kwargs["session_id"] = session_id
+        return "runner_x"
+
+    async def _bind(_client: object, session_id: str, runner_id: str) -> None:
+        bind_calls.append((session_id, runner_id))
+
+    monkeypatch.setattr("omnigent_client.OmnigentClient", _FakeSDK)
+    monkeypatch.setattr(chat_module, "set_session_host", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "omnigent.host.daemon_launch.open_daemon_client", lambda *_a, **_k: _FakeClient()
+    )
+    monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_host_online", _online)
+    monkeypatch.setattr("omnigent.host.daemon_launch.launch_or_reuse_daemon_runner", _launch)
+    monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_runner_online", _online)
+    monkeypatch.setattr("omnigent.native.native_terminal.bind_session_runner", _bind)
+
+    result = await _prepare_chat_session_via_daemon(
+        base_url="http://server.example",
+        headers={},
+        auth=None,
+        host_id="host_1",
+        bundle=b"bundle",
+        resume_conversation_id=resume_conversation_id,
+        fork_session_id=None,
+        workspace="/work",
+    )
+    return result, launch_kwargs, bind_calls
+
+
+async def test_fresh_daemon_session_skips_redundant_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh session is bound atomically by the launch endpoint, so the
+    follow-up PATCH bind — a full extra server round trip that costs seconds at
+    WAN RTT — must be skipped."""
+    result, launch_kwargs, bind_calls = await _run_prepare_daemon_session(
+        monkeypatch, resume_conversation_id=None
+    )
+    assert (result.session_id, result.runner_id) == ("sess_fresh", "runner_x")
+    assert launch_kwargs["fresh"] is True
+    assert bind_calls == []
+
+
+async def test_resumed_daemon_session_rebinds_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed session still needs the PATCH bind to clear the stopped marker."""
+    result, launch_kwargs, bind_calls = await _run_prepare_daemon_session(
+        monkeypatch, resume_conversation_id="conv_old"
+    )
+    assert (result.session_id, result.runner_id) == ("conv_old", "runner_x")
+    assert launch_kwargs["fresh"] is False
+    assert bind_calls == [("conv_old", "runner_x")]

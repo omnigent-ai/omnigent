@@ -1760,7 +1760,12 @@ async def _prepare_chat_session_via_daemon(
             # clear the ``omnigent.stopped`` marker on resumed sessions. Must run
             # AFTER wait_for_runner_online — a freshly launched runner isn't
             # registered until then, and replace_runner_id 400s on an unregistered id.
-            await bind_session_runner(client, session_id, runner_id)
+            # A freshly-created session was already bound atomically by the launch
+            # endpoint and carries no stopped marker, so this PATCH would be pure
+            # redundant latency — a full extra server round trip that costs seconds
+            # at WAN RTT. Only resumed sessions need it.
+            if not fresh_session:
+                await bind_session_runner(client, session_id, runner_id)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
         # No connection was ever established — a stopped local server, a wrong
         # --server URL, or a proxy refusing the tunnel. These three are
