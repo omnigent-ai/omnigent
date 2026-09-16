@@ -32,6 +32,10 @@ from omnigent.harnesses.opencode_native.app_server import (
     find_opencode_cli,
 )
 from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
+from omnigent.session_import.hermes import (
+    list_recent_hermes_sessions,
+    load_hermes_session,
+)
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
@@ -355,6 +359,11 @@ def _recent_local_sessions_with_recency(
                 continue
             candidates.append((path, session_id))
         return _recent_unique_sessions_with_recency(candidates, limit=limit)
+
+    if source == "hermes":
+        # SQLite-backed store rather than transcript files; recency is the
+        # session's last_activity_at in epoch seconds.
+        return list_recent_hermes_sessions(limit=limit)
 
     raise ValueError(f"Unsupported import source: {source}")
 
@@ -1535,6 +1544,8 @@ def load_local_session(source: ImportSource, session_id: str) -> LocalSessionImp
         return load_kimi_session(session_id)
     if source == "opencode":
         return load_opencode_session(session_id)
+    if source == "hermes":
+        return load_hermes_session(session_id)
     raise ValueError(f"Unsupported import source: {source}")
 
 
@@ -1542,6 +1553,7 @@ __all__ = [
     "list_recent_local_session_ids",
     "load_claude_session",
     "load_codex_session",
+    "load_hermes_session",
     "load_kimi_session",
     "load_kiro_session",
     "load_local_session",
