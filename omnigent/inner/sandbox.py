@@ -20,6 +20,7 @@ from typing import Protocol, cast
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.util.json_types import JsonValue
 
+from .agent_env import DESKTOP_SESSION_ENV_VARS
 from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
 
 logger = logging.getLogger(__name__)
@@ -910,6 +911,14 @@ def create_private_tmpdir() -> Path:
     return Path(tempfile.mkdtemp(prefix="omnigent-osenv-"))
 
 
+def set_sandbox_env(env: MutableMapping[str, str], tmpdir: Path) -> None:
+    """Give sandboxed tools private scratch/runtime storage and no host desktop bus."""
+    for key in DESKTOP_SESSION_ENV_VARS:
+        env.pop(key, None)
+    set_temp_env(env, tmpdir)
+    env["XDG_RUNTIME_DIR"] = str(tmpdir)
+
+
 def set_temp_env(env: MutableMapping[str, str], tmpdir: Path) -> None:
     tmp_value = str(tmpdir)
     for key in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
@@ -995,7 +1004,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         host_tmpdir = create_private_tmpdir()
         try:
             sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
-            set_temp_env(os.environ, host_tmpdir)
+            set_sandbox_env(os.environ, host_tmpdir)
             encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
@@ -1056,13 +1065,13 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # case the env prune stripped it; do NOT mint a second dir
             # (that one wouldn't be in the baked profile).
             tmpdir = Path(inherited)
-            set_temp_env(os.environ, tmpdir)
+            set_sandbox_env(os.environ, tmpdir)
         else:
             # Single-pass active backends (no spawn-time re-exec, e.g.
             # ``windows_jobobject``): mint + grant + surface here.
             tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [tmpdir])
-            set_temp_env(os.environ, tmpdir)
+            set_sandbox_env(os.environ, tmpdir)
     # Checkpoints around activate + spawn so a hang in either step is
     # visible in the wrapper's stderr (the wrapper template enables INFO).
     logger.info(

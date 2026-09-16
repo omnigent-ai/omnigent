@@ -202,17 +202,42 @@ def test_real_builders_strip_desktop_session(monkeypatch):
         assert env["XDG_CONFIG_HOME"] == "/home/test/.config", harness
 
 
-def test_desktop_session_cannot_be_readmitted_by_cli_allowlist():
+@pytest.mark.parametrize("explicit", [False, True])
+def test_desktop_session_requires_explicit_cli_passthrough(explicit):
     session_env = {
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
         "XDG_RUNTIME_DIR": "/run/user/1000",
     }
 
     env = clean_agent_env(
-        allow_prefixes=("DBUS_", "XDG_"), extra_allowed=session_env, source=session_env
+        allow_prefixes=("DBUS_", "XDG_"),
+        allow_exact=session_env,
+        extra_allowed=session_env if explicit else (),
+        source=session_env,
     )
 
-    assert not env
+    assert env == (session_env if explicit else {})
+
+
+def test_goose_receives_declared_desktop_session(monkeypatch):
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.goose_executor import GooseExecutor
+
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr("os.environ", session_env)
+    executor = _bare(
+        GooseExecutor,
+        _provider_env=dict,
+        _os_env=OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="none", env_passthrough=list(session_env)),
+        ),
+    )
+
+    assert executor._build_spawn_env() == session_env
 
 
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))

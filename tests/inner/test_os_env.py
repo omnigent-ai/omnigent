@@ -124,18 +124,26 @@ def test_build_helper_env_active_passes_omnigent_session_marker() -> None:
     assert env[OMNIGENT_SESSION_ENV_VAR] == OMNIGENT_SESSION_ENV_VALUE
 
 
-def test_build_helper_env_active_excludes_desktop_session() -> None:
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_build_helper_env_desktop_session_policy(active: bool, explicit: bool) -> None:
     parent = {
         "PATH": "/usr/bin",
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
         "XDG_RUNTIME_DIR": "/run/user/1000",
     }
 
-    env = build_helper_env(parent, _active_policy())
+    policy = _active_policy() if active else _inactive_policy()
+    if explicit:
+        policy.env_passthrough = ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]
+    env = build_helper_env(parent, policy)
 
     assert env["PATH"] == "/usr/bin"
-    assert "DBUS_SESSION_BUS_ADDRESS" not in env
-    assert "XDG_RUNTIME_DIR" not in env
+    if active:
+        assert "DBUS_SESSION_BUS_ADDRESS" not in env
+        assert "XDG_RUNTIME_DIR" not in env
+    else:
+        assert env == parent
 
 
 # ---------------------------------------------------------------------------

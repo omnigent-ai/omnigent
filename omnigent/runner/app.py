@@ -12866,6 +12866,12 @@ def _build_spawn_env_from_spec(
     except ImportError:
         return None
 
+    if env is not None:
+        from omnigent.inner.agent_env import desktop_session_passthrough, strip_desktop_session_env
+
+        env = strip_desktop_session_env(env)
+        env.update(desktop_session_passthrough(effective_spec.os_env))
+
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a
     # codex executor beneath a claude session never sees the codex router vars

@@ -195,7 +195,10 @@ def test_build_harness_spawn_env_keeps_desktop_session_in_runner(
 
     env = _build_harness_spawn_env(overrides if with_overrides else None)
 
-    assert session_env.keys().isdisjoint(env)
+    if with_overrides:
+        assert {name: env[name] for name in session_env} == session_env
+    else:
+        assert session_env.keys().isdisjoint(env)
     assert env["XDG_CONFIG_HOME"] == "/home/test/.config"
     assert {name: os.environ[name] for name in session_env} == session_env
     assert {name: overrides[name] for name in session_env} == session_env
