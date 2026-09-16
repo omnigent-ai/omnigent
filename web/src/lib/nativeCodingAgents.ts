@@ -35,6 +35,29 @@ export function claudeNativeSubagentLabel(
   return agentType.slice(agentType.lastIndexOf(":") + 1) || agentType;
 }
 
+/** Wrapper stamped on a child row that tracks a Codex sub-agent (incl. `/side` forks). */
+export const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
+/** Friendly nickname forwarded onto a Codex sub-agent child, e.g. `"Side chat"`. */
+export const CODEX_NATIVE_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname";
+
+/**
+ * Human-readable label for a Codex sub-agent session (including `/side` forks).
+ *
+ * A Codex child's title is `"codex-native-ui-subagent:{threadId}"`, whose suffix
+ * is an opaque thread UUID — useless to show. The friendly name rides the
+ * `agent_nickname` label instead (e.g. `"Side chat"`).
+ *
+ * @param labels - Session-scoped labels from the child row.
+ * @returns The nickname, or `null` when the row is not a Codex sub-agent or
+ *   carries no nickname, leaving the caller's own fallbacks in charge.
+ */
+export function codexNativeSubagentLabel(
+  labels: Record<string, string> | undefined,
+): string | null {
+  if (labels?.[WRAPPER_LABEL_KEY] !== CODEX_NATIVE_SUBAGENT_WRAPPER) return null;
+  return labels[CODEX_NATIVE_NICKNAME_LABEL_KEY]?.trim() || null;
+}
+
 export type NativeCodingAgentIconKind =
   | "claude"
   | "codex"

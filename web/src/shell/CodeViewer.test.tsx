@@ -388,6 +388,32 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(container.textContent).toContain("🚀");
   });
 
+  it("renders $$…$$ math as KaTeX, not literal TeX (issue #7503)", () => {
+    // Math rendered fine in chat but showed raw `$$…$$`/`\frac` in the file
+    // preview; the preview now runs the same remark-math + rehype-katex the
+    // chat surface does. A `.katex` node proves the formula rendered.
+    const { container } = renderMd("$$\\text{Speedup} = \\frac{1}{(1-P) + \\frac{P}{N}}$$");
+    expect(container.querySelector(".katex")).not.toBeNull();
+    // The rendered MathML carries the formula's text (the `\text{Speedup}` run).
+    expect(container.textContent).toContain("Speedup");
+  });
+
+  it("renders explicit \\(…\\) TeX delimiters, matching chat", () => {
+    // Agents emit `\(…\)` / `\[…\]`; normalizeExplicitMathDelimiters rewrites
+    // them to `$$…$$` so the preview renders them like the chat surface.
+    const { container } = renderMd("Euler's identity: \\(e^{i\\pi} + 1 = 0\\).");
+    expect(container.querySelector(".katex")).not.toBeNull();
+  });
+
+  it("leaves single-$ prose (currency) as text, not math", () => {
+    // Single `$` is prose far more often than math (currency, shell vars), so
+    // it must not pair up and render the span between as math (chat parity).
+    const { container } = renderMd("It costs $5 to make and $10 to ship.");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toContain("$5");
+    expect(container.textContent).toContain("$10");
+  });
+
   it("renders embedded raw HTML that GitHub supports", () => {
     // Markdown routinely embeds raw HTML (collapsible sections, sub/superscript,
     // keyboard keys, line breaks). Without rehype-raw these render as escaped
