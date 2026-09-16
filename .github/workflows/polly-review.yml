@@ -520,6 +520,7 @@ jobs:
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OMNIGENT_POLLY_HARNESS: ${{ vars.OMNIGENT_CI_POLLY_HARNESS || 'codex' }}
           OMNIGENT_POLLY_MODEL: ${{ vars.OMNIGENT_CI_POLLY_MODEL || vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
           set -euo pipefail
@@ -530,7 +531,7 @@ jobs:
           # one turn, prints the assistant response, and exits.
           # --no-session: ephemeral run, no persistent session state.
           uv run omnigent run examples/polly/ \
-            --harness codex --model "$OMNIGENT_POLLY_MODEL" \
+            --harness "$OMNIGENT_POLLY_HARNESS" --model "$OMNIGENT_POLLY_MODEL" \
             -p "$prompt" \
             --no-session \
             2>polly-stderr.log \
