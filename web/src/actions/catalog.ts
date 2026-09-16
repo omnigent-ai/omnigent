@@ -1,4 +1,4 @@
-import type { ActionDefinition, ActionId } from "./types";
+import type { ActionDefinition, ActionId, ArglessActionId } from "./types";
 
 const definitions = [
   {
@@ -16,6 +16,7 @@ const definitions = [
     keywords: ["keybindings", "hotkeys"],
     icon: "Keyboard",
     palette: true,
+    paletteOrder: 70,
   },
   {
     id: "workbench.action.navigateInbox",
@@ -24,6 +25,7 @@ const definitions = [
     keywords: ["notifications", "comments", "needs response"],
     icon: "Inbox",
     palette: true,
+    paletteOrder: 20,
   },
   {
     id: "workbench.action.navigateAutomations",
@@ -32,22 +34,25 @@ const definitions = [
     keywords: ["scheduled", "recurring", "tasks", "cron"],
     icon: "CalendarClock",
     palette: true,
+    paletteOrder: 30,
   },
   {
     id: "workbench.action.navigateSettings",
     title: "Go to Settings",
     category: "Navigation",
-    keywords: ["preferences", "configuration"],
+    keywords: ["preferences", "configuration", "account"],
     icon: "Settings",
     palette: true,
+    paletteOrder: 40,
   },
   {
     id: "workbench.action.toggleConversationsSidebar",
     title: "Toggle conversations sidebar",
     category: "View",
-    keywords: ["panel", "left", "sessions"],
+    keywords: ["panel", "left", "sessions", "sessions list"],
     icon: "PanelLeft",
     palette: true,
+    paletteOrder: 50,
   },
   {
     id: "workbench.action.toggleWorkspaceSidebar",
@@ -56,14 +61,16 @@ const definitions = [
     keywords: ["panel", "right", "files", "terminal"],
     icon: "PanelRight",
     palette: true,
+    paletteOrder: 60,
   },
   {
     id: "session.action.new",
-    title: "New session",
+    title: "New chat",
     category: "General",
-    keywords: ["chat", "compose", "start"],
+    keywords: ["chat", "compose", "start", "new session"],
     icon: "SquarePen",
     palette: true,
+    paletteOrder: 10,
   },
   {
     id: "session.action.openPrevious",
@@ -243,8 +250,12 @@ const definitions = [
 ] as const satisfies readonly ActionDefinition[];
 
 type MissingCatalogId = Exclude<ActionId, (typeof definitions)[number]["id"]>;
+type PaletteCatalogId = Extract<(typeof definitions)[number], { palette: true }>["id"];
+type InvalidPaletteAction = Exclude<PaletteCatalogId, ArglessActionId>;
 const CATALOG_IS_COMPLETE: MissingCatalogId extends never ? true : never = true;
+const PALETTE_ACTIONS_ARE_ARGLESS: InvalidPaletteAction extends never ? true : never = true;
 void CATALOG_IS_COMPLETE;
+void PALETTE_ACTIONS_ARE_ARGLESS;
 
 export const ACTION_CATALOG: readonly ActionDefinition[] = definitions;
 export const ACTIONS_BY_ID: ReadonlyMap<ActionId, ActionDefinition> = new Map(
