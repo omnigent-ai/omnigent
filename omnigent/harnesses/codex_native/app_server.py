@@ -3520,7 +3520,9 @@ async def preload_codex_thread_for_resume(
     injection: a new app-server can reject ``turn/start`` with
     ``thread not found`` until some client has resumed the thread. This
     helper runs the lightweight ``thread/resume`` call before bridge
-    state is exposed to the web-message executor.
+    state is exposed to the web-message executor. If the saved provider
+    no longer exists, retry once with the app-server's configured provider
+    while preserving the thread and its permission overrides.
 
     :param transport: App-server transport, e.g. ``"ws://127.0.0.1:9876"``
         or ``"/tmp/app-server.sock"``.
@@ -3539,14 +3541,39 @@ async def preload_codex_thread_for_resume(
     retained = False
     try:
         await client.connect()
-        await client.request(
-            "thread/resume",
-            {
-                "threadId": thread_id,
-                "excludeTurns": True,
-                **_codex_resume_permission_params(terminal_launch_args),
-            },
-        )
+        params: CodexParams = {
+            "threadId": thread_id,
+            "excludeTurns": True,
+            **_codex_resume_permission_params(terminal_launch_args),
+        }
+        try:
+            await client.request("thread/resume", params)
+        except CodexAppServerResponseError as exc:
+            missing_provider = re.fullmatch(
+                r"failed to load configuration: Model provider `([^`]*)` not found",
+                exc.message or "",
+            )
+            if exc.code != -32600 or missing_provider is None:
+                raise
+            # Read effective config from Codex so CLI overrides and config layers
+            # resolve exactly as they did for this app-server's launch.
+            response = await client.request("config/read", {"includeLayers": False})
+            result = response.get("result")
+            config = result.get("config") if isinstance(result, dict) else None
+            if not isinstance(config, dict) or "model_provider" not in config:
+                raise
+            provider = config["model_provider"]
+            if provider is None:
+                provider = "openai"  # Codex's built-in default when unset.
+            if not isinstance(provider, str) or not provider or provider == missing_provider[1]:
+                raise
+            _logger.info(
+                "Resuming Codex thread %s with configured provider %s; "
+                "saved provider is unavailable",
+                thread_id,
+                provider,
+            )
+            await client.request("thread/resume", {**params, "modelProvider": provider})
         if retain_client:
             retained = True
             return client
