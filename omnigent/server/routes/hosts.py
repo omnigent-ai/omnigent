@@ -948,14 +948,14 @@ def create_hosts_router(
 
                 async def _settle_and_rollback() -> None:
                     with contextlib.suppress(BaseException):
-                        await persist_task
+                        _ = await persist_task
                     await _rollback_failed_launch()
 
-                cleanup_task = asyncio.create_task(_settle_and_rollback())
                 if isinstance(exc, asyncio.CancelledError):
+                    cleanup_task = asyncio.create_task(_settle_and_rollback())
                     _track_runner_launch_cleanup(cleanup_task)
                 else:
-                    await cleanup_task
+                    await _settle_and_rollback()
                 raise
 
         request_id = secrets.token_hex(8)

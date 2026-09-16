@@ -423,7 +423,7 @@ async def test_cancellation_waits_for_host_binding_before_rollback(
     launch_task.cancel()
     release_bind.set()
     with pytest.raises(asyncio.CancelledError):
-        await launch_task
+        _ = await launch_task
 
     await asyncio.wait_for(cap.remove_started.wait(), timeout=1.0)
     assert len(cap.remove) == 1
