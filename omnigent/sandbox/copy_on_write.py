@@ -130,12 +130,9 @@ class CopyOnWriteEnvironment:
                     "--",
                     sys.executable,
                     "-u",
-                    "-c",
-                    "import os,sys,tempfile; "
-                    "probe=tempfile.TemporaryFile(dir=sys.argv[1]); "
-                    "os.setxattr(probe.fileno(), 'user.omnigent_cow_probe', b'1'); "
-                    "probe.close(); "
-                    "print(os.getpid(), flush=True); sys.stdin.buffer.read()",
+                    "-m",
+                    "omnigent.sandbox.copy_on_write",
+                    "--keeper",
                     probe_dir,
                 ]
             )
@@ -210,6 +207,14 @@ def wrap_shared_namespace(argv: list[str], policy: SandboxPolicy) -> list[str]:
     ]
 
 
+def _run_keeper(probe_dir: str) -> None:
+    """Publish readiness only after tmpfs xattrs work, then wait for owner EOF."""
+    with tempfile.TemporaryFile(dir=probe_dir) as probe:
+        os.setxattr(probe.fileno(), "user.omnigent_cow_probe", b"1")
+    print(os.getpid(), flush=True)
+    sys.stdin.buffer.read()
+
+
 def parse_namespace(namespace: object) -> tuple[int, int, int]:
     """Validate the runtime handle at every serialization boundary."""
     if (
@@ -249,4 +254,7 @@ def _enter(namespace: object, argv: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    _enter(json.loads(sys.argv[1]), sys.argv[2:])
+    if sys.argv[1] == "--keeper":
+        _run_keeper(sys.argv[2])
+    else:
+        _enter(json.loads(sys.argv[1]), sys.argv[2:])

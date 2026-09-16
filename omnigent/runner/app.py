@@ -9104,7 +9104,16 @@ def create_runner_app(
                 spawn_env = dict(spawn_env or {})
                 spawn_env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
             except ValueError as exc:
-                return JSONResponse(status_code=400, content={"error": str(exc)})
+                _logger.warning("copy_on_write setup failed for %s", conv_id, exc_info=True)
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "copy_on_write_setup_failed",
+                        "detail": _client_safe_error_detail(exc, context="copy_on_write setup"),
+                        "hint": "Use executor.harness=openai-agents; start a new session after "
+                        "changing copy_on_write paths.",
+                    },
+                )
 
         if spawn_env is None:
             spawn_env = await _resolve_native_spawn_env(

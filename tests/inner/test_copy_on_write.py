@@ -334,20 +334,39 @@ def test_keeper_checks_tmpfs_xattrs_before_reporting_ready(
     tmp_path, monkeypatch, mount_process, capsys
 ):
     import os
-    import sys
+
+    from omnigent.sandbox.copy_on_write import _run_keeper
 
     process, _ = mount_process
     environment = CopyOnWriteEnvironment([tmp_path])
     with pytest.raises(OSError):
         environment.prepare(_policy(tmp_path))
-    script = process.argv[process.argv.index("-c") + 1]
-    monkeypatch.setattr(sys, "argv", ["-c", str(tmp_path)])
+    assert process.argv[-3:-1] == ["omnigent.sandbox.copy_on_write", "--keeper"]
     xattr = Mock(side_effect=OSError("tmpfs user xattrs unavailable"))
     monkeypatch.setattr(os, "setxattr", xattr, raising=False)
     with pytest.raises(OSError, match="tmpfs user xattrs unavailable"):
-        exec(script, {})
+        _run_keeper(str(tmp_path))
     xattr.assert_called_once()
     assert capsys.readouterr().out == ""
+
+
+def test_keeper_entrypoint_reports_ready_and_exits_on_owner_eof(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    if not hasattr(os, "setxattr"):
+        pytest.skip("Extended attributes required")
+    result = subprocess.run(
+        [sys.executable, "-u", "-m", "omnigent.sandbox.copy_on_write", "--keeper", str(tmp_path)],
+        input="",
+        capture_output=True,
+        text=True,
+        env={"PATH": os.defpath},
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert int(result.stdout.strip()) > 0
 
 
 def test_working_kernel_backport_is_accepted(tmp_path, monkeypatch, mount_process):

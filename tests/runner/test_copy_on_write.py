@@ -190,7 +190,10 @@ async def test_cached_cow_still_rejects_host_io_when_spec_unavailable(spec, tmp_
 
 
 @pytest.mark.asyncio
-async def test_stream_harness_selection_preserves_cow_restriction(spec):
+@pytest.mark.parametrize("harness", ["codex", "openai-agents"])
+async def test_stream_setup_errors_are_sanitized_before_spawn(
+    spec, tmp_path, monkeypatch, harness
+):
     from omnigent.runner import create_runner_app
     from omnigent.spec.types import AgentSpec, ExecutorSpec
     from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
@@ -206,9 +209,16 @@ async def test_stream_harness_selection_preserves_cow_restriction(spec):
     async def resolver(agent_id, session_id=None):
         return agent
 
+    registry = SessionResourceRegistry(runner_workspace=tmp_path)
+    environment = Mock(sandbox=object())
+    environment.prepare_sandbox.side_effect = ValueError("private diagnostic sentinel")
+    monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=environment))
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=manager, spec_resolver=resolver, server_client=NullServerClient()
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=NullServerClient(),
+        resource_registry=registry,
     )
     async with _runner_client(app) as client:
         response = await client.post(
@@ -216,13 +226,15 @@ async def test_stream_harness_selection_preserves_cow_restriction(spec):
             json={
                 "type": "message",
                 "role": "user",
-                "harness": "codex",
+                "harness": harness,
                 "agent_id": "agent",
                 "content": [{"type": "input_text", "text": "Read the workspace"}],
             },
         )
     assert response.status_code == 400, response.text
     assert "openai-agents" in response.text
+    assert response.json()["error"] == "copy_on_write_setup_failed"
+    assert "private diagnostic sentinel" not in response.text
     assert not manager.get_client_calls
 
 
