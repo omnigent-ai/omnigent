@@ -57,10 +57,10 @@ async def test_skills_proxy_cleans_up_unanswered_requests(
         await asyncio.wait_for(conn.outbound_queue.get(), timeout=1)
         assert conn.pending_skills
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    (result,) = await asyncio.gather(task, return_exceptions=True)
+    if outcome == "cancel":
+        assert isinstance(result, asyncio.CancelledError)
     else:
-        with pytest.raises(HTTPException) as exc:
-            await task
-        assert exc.value.status_code == status
+        assert isinstance(result, HTTPException)
+        assert result.status_code == status
     assert conn.pending_skills == {}

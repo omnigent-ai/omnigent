@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, Route, expect
@@ -208,6 +208,87 @@ def test_read_only_composer_skips_discovery_until_edit_access(
     expect(composer).to_be_enabled()
     composer.fill("/")
     expect(page.get_by_test_id("slash-menu-item-review")).to_be_visible()
+
+
+@pytest.mark.parametrize("harness,prefix", [("claude-sdk", "/"), ("codex-native", "$")])
+def test_new_session_menu_uses_the_selected_agents_effective_catalog(
+    page: Page, seeded_session: tuple[str, str], harness: str, prefix: str
+) -> None:
+    """The host request includes the agent, and its result replaces cached suggestions."""
+    base_url, session_id = seeded_session
+    pending: list[Route] = []
+    page.route(
+        "**/v1/hosts",
+        lambda route: route.fulfill(
+            json={
+                "hosts": [
+                    {
+                        "host_id": "preview-host",
+                        "name": "Preview host",
+                        "owner": "local",
+                        "status": "online",
+                    }
+                ]
+            }
+        ),
+    )
+    page.route(
+        "**/v1/agents",
+        lambda route: route.fulfill(
+            json={
+                "data": [
+                    {
+                        "id": "preview-agent",
+                        "name": "preview-agent",
+                        "harness": harness,
+                        "skills": [{"name": "obsolete", "description": "Old bundled suggestion"}],
+                    }
+                ],
+                "has_more": False,
+            }
+        ),
+    )
+    page.route(
+        "**/v1/hosts/preview-host/harnesses/*/model-options*",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+
+    def discover(route: Route) -> None:
+        if "host_id" in parse_qs(urlparse(route.request.url).query):
+            pending.append(route)
+        else:
+            route.fallback()
+
+    page.route("**/v1/skills?*", discover)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
+    page.evaluate("""() => localStorage.setItem(
+        'omnigent:recent-workspaces', JSON.stringify({'preview-host': ['/tmp']})
+    )""")
+    page.get_by_test_id("new-chat-button").click()
+    composer = page.get_by_test_id("new-chat-landing-input")
+    composer.fill("Hello")
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
+    composer.fill("/allow")
+    expect(page.get_by_text("Loading skills…", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+    composer.press("Tab")
+    expect(composer).to_have_value("/allow")
+    assert len(pending) == 1
+    assert parse_qs(urlparse(pending[0].request.url).query) == {
+        "host_id": ["preview-host"],
+        "harness": [harness],
+        "path": ["/tmp"],
+        "agent_id": ["preview-agent"],
+    }
+    pending[0].fulfill(json={"skills": [{"name": "allowed", "description": "Permitted skill"}]})
+    expect(page.get_by_test_id("slash-menu-item-allowed")).to_have_text(f"{prefix}allowed")
+    composer.fill("/")
+    expect(page.get_by_test_id("slash-menu-item-obsolete")).not_to_be_visible()
+    composer.fill("/allow")
+    composer.press("Tab")
+    expect(composer).to_have_value(f"{prefix}allowed ")
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
 
 
 def test_slash_menu_stops_loading_when_sandbox_launch_fails(

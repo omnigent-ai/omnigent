@@ -963,6 +963,7 @@ class HostSkillsFrame:
     agent_id: str | None = None
     agent_version: str | None = None
     sub_agent_name: str | None = None
+    skills_filter: str | list[str] = "all"
 
 
 @dataclass
@@ -975,6 +976,7 @@ class HostSkillsResultFrame:
     error: str | None = None
     error_code: str | None = None
     session_id: str | None = None
+    agent_id: str | None = None
 
 
 @dataclass
@@ -1491,6 +1493,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_id": frame.agent_id,
                 "agent_version": frame.agent_version,
                 "sub_agent_name": frame.sub_agent_name,
+                "skills_filter": frame.skills_filter,
             }
         )
     if isinstance(frame, HostSkillsResultFrame):
@@ -1503,6 +1506,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
                 "error_code": frame.error_code,
                 "session_id": frame.session_id,
+                "agent_id": frame.agent_id,
             }
         )
     if isinstance(frame, HostImportLocalFrame):
@@ -1680,6 +1684,14 @@ def _decode_known_host_frame(
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
         case HostFrameKind.SKILLS:
+            raw_filter = msg.get("skills_filter", "all")
+            skills_filter: str | list[str]
+            if isinstance(raw_filter, list):
+                skills_filter = _optional_str_list(msg, "skills_filter")
+            elif isinstance(raw_filter, str) and raw_filter in ("all", "none"):
+                skills_filter = raw_filter
+            else:
+                raise ValueError("skills_filter must be all, none, or a list of names")
             return HostSkillsFrame(
                 request_id=_required_str(msg, "request_id"),
                 harness=_required_str(msg, "harness"),
@@ -1688,6 +1700,7 @@ def _decode_known_host_frame(
                 agent_id=_optional_nullable_str(msg, "agent_id"),
                 agent_version=_optional_nullable_str(msg, "agent_version"),
                 sub_agent_name=_optional_nullable_str(msg, "sub_agent_name"),
+                skills_filter=skills_filter,
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)
@@ -2266,6 +2279,7 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
+        agent_id=_optional_nullable_str(msg, "agent_id"),
     )
 
 

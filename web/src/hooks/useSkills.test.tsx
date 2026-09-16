@@ -33,6 +33,7 @@ describe("useSkills", () => {
     expectTypeOf<Omit<typeof target, "harness">>().not.toExtend<SkillsTarget>();
     expectTypeOf<Omit<typeof target, "path">>().not.toExtend<SkillsTarget>();
     expectTypeOf<typeof target & { sessionId: string }>().not.toExtend<SkillsTarget>();
+    expectTypeOf<{ sessionId: string; agentId: string }>().not.toExtend<SkillsTarget>();
     expectTypeOf<{ hostId: null; harness: string; path: string }>().not.toExtend<SkillsTarget>();
   });
 
@@ -103,6 +104,17 @@ describe("useSkills", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/skills?session_id=session-a");
   });
 
+  it("requests the selected agent's pre-session catalog", async () => {
+    fetchMock.mockResolvedValue(response());
+    const { result } = renderHook(() => useSkills({ target: { ...target, agentId: "filtered" } }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
+    expect(new URL(fetchMock.mock.calls[0][0], "http://test").searchParams.get("agent_id")).toBe(
+      "filtered",
+    );
+  });
+
   it("waits for a sandbox host binding and starts when it arrives", async () => {
     fetchMock.mockResolvedValue(response());
     const { result, rerender } = renderHook(
@@ -131,6 +143,7 @@ describe("useSkills", () => {
     { initial: target, next: { ...target, hostId: "other" } },
     { initial: target, next: { ...target, harness: "codex-native" } },
     { initial: target, next: { ...target, path: "/other" } },
+    { initial: { ...target, agentId: "agent-a" }, next: { ...target, agentId: "agent-b" } },
     { initial: { sessionId: "session-a" }, next: { sessionId: "session-b" } },
     ...[
       { hostId: "other" },

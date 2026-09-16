@@ -3273,6 +3273,7 @@ def create_app(
                 host_store,
                 conversation_store,
                 agent_store=agent_store,
+                agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
             ),

@@ -123,6 +123,58 @@ def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> N
     ]
 
 
+@pytest.mark.parametrize(
+    "harness,variable,subdir",
+    [
+        ("claude-native", "CLAUDE_CONFIG_DIR", "skills"),
+        ("codex-native", "CODEX_HOME", "skills"),
+    ],
+)
+def test_host_and_runner_discover_the_same_custom_config_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    variable: str,
+    subdir: str,
+) -> None:
+    from omnigent.host.connect import _build_runner_env
+
+    config_dir = tmp_path / "custom-config"
+    directory = config_dir / subdir / "custom"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(_skill("custom"))
+    monkeypatch.setenv(variable, str(config_dir))
+    discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+    frame = HostSkillsFrame("request", harness, str(tmp_path))
+    host_catalog = discovery.discover(frame, tmp_path)
+    env = _build_runner_env(
+        {variable: str(config_dir)},
+        server_url="http://server",
+        runner_id="runner",
+        binding_token="token",
+        workspace=str(tmp_path),
+        parent_pid=1,
+    )
+    assert env[variable] == str(config_dir)
+    monkeypatch.setenv(variable, env[variable])
+    bundle = _bundle({}, executor={"config": {"harness": harness}})
+    spec = load(bundle, dest=tmp_path / "runner-bundle", expand_env=False)
+    resolved = resolve_session_skills(spec, (tmp_path,), None)
+    assert host_catalog == [{"name": s.name, "description": s.description} for s in resolved]
+    assert "custom" in {s["name"] for s in host_catalog}
+
+
+def test_directory_cache_separates_agent_filters(tmp_path: Path) -> None:
+    directory = tmp_path / ".claude" / "skills" / "local"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(_skill("local"))
+    discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+    frame = HostSkillsFrame("request", "claude-sdk", str(tmp_path))
+    assert discovery.discover(frame, tmp_path)
+    assert discovery.discover(replace(frame, skills_filter="none"), tmp_path) == []
+    assert discovery.discover(replace(frame, skills_filter=["local"]), tmp_path)
+
+
 def test_host_cache_expires_and_keys_by_directory_and_agent_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

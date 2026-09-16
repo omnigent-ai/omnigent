@@ -10,11 +10,14 @@ from pydantic import BaseModel
 
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
+from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -34,6 +37,7 @@ def create_skills_router(
     conversation_store: ConversationStore,
     *,
     agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
 ) -> APIRouter:
@@ -47,19 +51,23 @@ def create_skills_router(
         host_id: str | None = Query(None, min_length=1),
         harness: str | None = Query(None, min_length=1),
         path: str | None = Query(None, min_length=1),
+        agent_id: str | None = Query(None, min_length=1),
     ) -> SkillsResponse:
         """Discover skills using a session or an explicit host, harness, and directory.
 
         ``session_id`` requires session edit access and uses the saved host,
         workspace, and agent bundle, including its filters and sub-agent scope.
         Otherwise, supply ``host_id``, ``harness``, and ``path``; host ownership
-        is required. The two forms cannot be combined.
+        is required. Optional ``agent_id`` applies the selected agent's filter
+        and bundled skills, with the same access check as session creation.
+        The two forms cannot be combined.
         """
         user_id = require_user(request, auth_provider)
-        agent_id = agent_version = sub_agent_name = None
+        agent_version = sub_agent_name = None
+        spec: AgentSpec | None = None
         host = None
         if session_id is not None:
-            if any(value is not None for value in (host_id, harness, path)):
+            if any(value is not None for value in (host_id, harness, path, agent_id)):
                 raise HTTPException(
                     status_code=422,
                     detail="Provide session_id alone, or host_id, harness, and path",
@@ -96,6 +104,25 @@ def create_skills_router(
                 resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
             )
             harness = canonicalize_harness(harness) or harness
+            if agent_id is not None:
+                if agent_store is None or agent_cache is None:
+                    raise HTTPException(
+                        status_code=503, detail="agent discovery is not configured"
+                    )
+                agent = await validate_session_agent(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    conversation_store=conversation_store,
+                )
+                loaded = await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                spec, agent_version = loaded.spec, str(agent.version)
 
         conn = host_registry.get(host_id)
         if conn is None:
@@ -113,6 +140,7 @@ def create_skills_router(
             agent_id=agent_id,
             agent_version=agent_version,
             sub_agent_name=sub_agent_name,
+            skills_filter=spec.skills_filter if spec is not None else "all",
         )
         if result.status != "ok":
             raise HTTPException(
@@ -125,9 +153,18 @@ def create_skills_router(
             raise HTTPException(
                 status_code=502, detail="update the host to discover session skills"
             )
-        return SkillsResponse(
-            skills=[SkillSummary.model_validate(skill) for skill in result.skills]
-        )
+        if spec is not None and result.agent_id != agent_id:
+            raise HTTPException(status_code=502, detail="update the host to discover agent skills")
+        skills = [SkillSummary.model_validate(skill) for skill in result.skills]
+        if spec is not None:
+            # Hidden bundled skills also reserve their names against host collisions.
+            reserved = {skill.name for skill in spec.skills}
+            skills = [
+                SkillSummary(name=skill.name, description=skill.description)
+                for skill in spec.skills
+                if skill.user_invocable
+            ] + [skill for skill in skills if skill.name not in reserved]
+        return SkillsResponse(skills=skills)
 
     return router
 
@@ -142,6 +179,7 @@ async def request_host_skills(
     agent_id: str | None = None,
     agent_version: str | None = None,
     sub_agent_name: str | None = None,
+    skills_filter: str | list[str] = "all",
 ) -> HostSkillsResultFrame:
     """Request skill metadata over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -159,6 +197,7 @@ async def request_host_skills(
                     agent_id=agent_id,
                     agent_version=agent_version,
                     sub_agent_name=sub_agent_name,
+                    skills_filter=skills_filter,
                 )
             ),
         )

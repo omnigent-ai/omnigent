@@ -480,6 +480,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # executor.profile propagated into the daemon's env).
         "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_CONFIG_FILE",
+        # Discovery and invocation must read the same harness config directories.
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]
@@ -2889,6 +2892,7 @@ class HostProcess:
                 status="ok",
                 skills=self._skill_discovery.discover(frame, root),
                 session_id=frame.session_id,
+                agent_id=frame.agent_id,
             )
         except Exception:
             _logger.exception("Skill discovery failed for %r", frame.harness)

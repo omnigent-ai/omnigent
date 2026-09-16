@@ -135,6 +135,12 @@ def test_import_local_frames_round_trip() -> None:
     "frame",
     [
         HostSkillsFrame(request_id="req_skills", harness="claude-native", path="~/my project"),
+        HostSkillsFrame(
+            request_id="filtered", harness="claude-sdk", path="/repo", skills_filter=["review"]
+        ),
+        HostSkillsFrame(
+            request_id="hermetic", harness="claude-sdk", path="/repo", skills_filter="none"
+        ),
         HostSkillsResultFrame(
             request_id="req_skills",
             status="ok",
@@ -150,6 +156,7 @@ def test_import_local_frames_round_trip() -> None:
             sub_agent_name="child",
         ),
         HostSkillsResultFrame(request_id="session", status="ok", session_id="conv"),
+        HostSkillsResultFrame(request_id="filtered", status="ok", agent_id="agent"),
         HostSkillsResultFrame(request_id="req_skills", status="ok"),
         HostSkillsResultFrame(
             request_id="req_skills",

@@ -20,7 +20,7 @@ export interface AvailableAgent {
   // by kind rather than by name slug.
   harness: string | null;
   // Skills bundled in the agent spec (name + one-line description).
-  // The landing composer merges these with the selected host's skill catalog.
+  // Shown while discovery loads; the skills endpoint returns the effective catalog.
   // Empty on older servers without the field.
   skills: { name: string; description: string }[];
   // Server-seeded built-in (deterministic, name-derived id) vs a

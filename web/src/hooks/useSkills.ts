@@ -8,6 +8,7 @@ export type SkillsTarget =
       hostId?: never;
       harness?: never;
       path?: never;
+      agentId?: never;
       /** Cache dependencies for the scope derived by the server. */
       scope?: Pick<Session, "hostId" | "harness" | "workspace" | "agentId" | "subAgentName">;
     }
@@ -16,6 +17,7 @@ export type SkillsTarget =
       hostId: string;
       harness: string;
       path: string;
+      agentId?: string;
       scope?: never;
     };
 
@@ -25,6 +27,7 @@ async function fetchSkills(target: SkillsTarget, signal: AbortSignal): Promise<S
     target.sessionId !== undefined
       ? new URLSearchParams({ session_id: target.sessionId })
       : new URLSearchParams({ host_id: target.hostId, harness: target.harness, path: target.path });
+  if (target.agentId !== undefined) params.set("agent_id", target.agentId);
   const response = await authenticatedFetch(`/v1/skills?${params}`, { signal });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   const body = (await response.json()) as { skills?: SkillSummary[] };

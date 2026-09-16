@@ -1,3 +1,4 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSkills } from "@/hooks/useSkills";
 
 vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
@@ -10,7 +11,6 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -1139,7 +1139,10 @@ function setupLandingMocks() {
   vi.mocked(useSkills).mockImplementation(
     ({ target, enabled = true, starting = false }) =>
       ({
-        skills: [],
+        skills:
+          useAvailableAgentsMock().data?.find(
+            (agent: AvailableAgent) => agent.id === target?.agentId,
+          )?.skills ?? [],
         skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
       }) as ReturnType<typeof useSkills>,
@@ -5997,6 +6000,7 @@ describe("NewChatLandingScreen skills menu", () => {
   }
 
   function typeMessage(text: string) {
+    fireEvent.focus(screen.getByTestId("new-chat-landing-input"));
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: text },
     });
@@ -6034,6 +6038,7 @@ describe("NewChatLandingScreen skills menu", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     fireEvent.keyDown(input, { key: "Tab" });
     expect(input).toHaveValue("/review");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
     expect(authenticatedFetchMock.mock.calls[0]![0]).toContain(
       "/v1/skills?host_id=host_1&harness=claude-native&path=%2FUsers%2Fcorey%2Frepo",
@@ -6052,10 +6057,11 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
     fireEvent.keyDown(input, { key: "Tab" });
     expect(input).toHaveValue("/review-host ");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("preserves bundled skills while host discovery loads and gives them precedence", () => {
+  it("shows bundled skills while loading, then uses the server's effective catalog", () => {
     mockAgents([skilledAgent()]);
     mockSkills({ skillsStatus: "loading" });
     renderLanding();
@@ -6064,15 +6070,17 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
     mockSkills({
       skills: [
-        { name: "review-pr", description: "Host duplicate" },
+        { name: "review-pr", description: "Current bundled description" },
         { name: "host-review", description: "Host-only skill" },
       ],
     });
     typeMessage("/review");
     expect(screen.getAllByTestId("slash-menu-item-review-pr")).toHaveLength(1);
     expect(screen.getByTestId("slash-menu-item-host-review")).toBeInTheDocument();
-    expect(screen.getByText("Review a pull request")).toBeInTheDocument();
-    expect(screen.queryByText("Host duplicate")).not.toBeInTheDocument();
+    expect(screen.getByText("Current bundled description")).toBeInTheDocument();
+    expect(screen.queryByText("Review a pull request")).not.toBeInTheDocument();
+    typeMessage("/");
+    expect(screen.queryByTestId("slash-menu-item-cross-review")).not.toBeInTheDocument();
   });
 
   it("shows Retry for discovery failures and an empty state after successful retry", () => {
@@ -6114,6 +6122,7 @@ describe("NewChatLandingScreen skills menu", () => {
           hostId: "host_1",
           harness: "claude-sdk",
           path: "/Users/corey/repo",
+          agentId: "ag_skilled",
         },
         enabled: false,
       }),

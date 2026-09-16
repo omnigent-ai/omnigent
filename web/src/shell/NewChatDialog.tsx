@@ -4300,15 +4300,17 @@ export function NewChatLandingScreen() {
     : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
   const skillsUnavailableMessage = sandboxSelected
     ? "Host skills will be available after the sandbox starts."
-    : !selectedHostId
-      ? "Choose a host to discover skills."
-      : selectedHost?.status !== "online"
-        ? "Skills unavailable while the host is offline."
-        : !workspaceValid
-          ? "Choose a working directory to discover skills."
-          : !skillsHarness
-            ? "Choose a harness to discover host skills."
-            : undefined;
+    : selectedAgent?.id === PENDING_AGENT_ID
+      ? "Skills will be available after this session starts."
+      : !selectedHostId
+        ? "Choose a host to discover skills."
+        : selectedHost?.status !== "online"
+          ? "Skills unavailable while the host is offline."
+          : !workspaceValid
+            ? "Choose a working directory to discover skills."
+            : !skillsHarness
+              ? "Choose a harness to discover host skills."
+              : undefined;
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
@@ -4317,41 +4319,46 @@ export function NewChatLandingScreen() {
   } = useSkills({
     target:
       selectedHostId && skillsHarness && workspaceTrimmed
-        ? { hostId: selectedHostId, harness: skillsHarness, path: workspaceTrimmed }
+        ? {
+            hostId: selectedHostId,
+            harness: skillsHarness,
+            path: workspaceTrimmed,
+            agentId: selectedAgent?.id,
+          }
         : null,
     enabled: canDiscoverHostSkills,
     starting: !sandboxSelected && (hostsLoading || agentsLoading),
   });
-  const availableSkills = useMemo(() => {
-    // Bundled skills take precedence, as they do in the runner's session catalog.
-    const skills = new Map((selectedAgent?.skills ?? []).map((skill) => [skill.name, skill]));
-    if (canDiscoverHostSkills) {
-      for (const skill of hostSkills) {
-        if (!skills.has(skill.name)) skills.set(skill.name, skill);
-      }
-    }
-    return [...skills.values()];
-  }, [selectedAgent?.skills, canDiscoverHostSkills, hostSkills]);
+  const availableSkills = useMemo(
+    () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
+    [skillsStatus, hostSkills, selectedAgent?.skills],
+  );
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
+  const skillPrefix = skillsHarness === "codex-native" ? "$" : "/";
   const skillCommands = useMemo(
-    () => Object.fromEntries(availableSkills.map((skill) => [`/${skill.name}`, skill.description])),
-    [availableSkills],
+    () =>
+      Object.fromEntries(
+        availableSkills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description]),
+      ),
+    [availableSkills, skillPrefix],
   );
   const trimmedMessage = message.trimStart();
-  const slashMenuOpen =
-    inputFocused &&
-    trimmedMessage.startsWith("/") &&
+  const skillNameOnly =
+    (trimmedMessage.startsWith("/") || trimmedMessage.startsWith(skillPrefix)) &&
     !trimmedMessage.slice(1).includes("/") &&
     !trimmedMessage.includes(" ");
-  const slashMenuQuery = slashMenuOpen ? trimmedMessage.slice(1) : "";
+  const slashMenuOpen = inputFocused && skillNameOnly;
+  const slashMenuQuery = skillNameOnly ? trimmedMessage.slice(1) : "";
   // Kept in sync with what SlashCommandMenu renders so keyboard nav
   // indexes into the same list.
-  const slashMenuMatches = slashMenuOpen
+  const slashMenuMatches = skillNameOnly
     ? rankedSlashCommandNames(skillCommands, slashMenuQuery)
     : [];
+  const pendingSkillCompletion =
+    skillNameOnly && skillsStatus === "loading" && slashMenuMatches.length === 0;
   // New queries select the first match; async arrivals retain the selected name.
   // Track the previous render in state so discarded renders cannot consume an update.
   const [previousSlashMatches, setPreviousSlashMatches] = useState<{
@@ -4561,6 +4568,7 @@ export function NewChatLandingScreen() {
     (message.trim().length > 0 || files.length > 0) &&
     !pickerLoading &&
     !workspaceLoading &&
+    !pendingSkillCompletion &&
     pickerSelectionError === null &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
@@ -4572,25 +4580,27 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : pickerLoading || workspaceLoading
-      ? "Loading session configuration…"
-      : pickerSelectionError
-        ? pickerSelectionError
-        : sandboxSelected && sandboxRepoOverCap
-          ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-              maxSandboxRepos === 1 ? "repository" : "repositories"
-            } — remove the extras`
-          : sandboxSelected && !sandboxRepoValid
-            ? "Please enter a valid repository URL"
-            : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-              ? "Selected host is unavailable. Reconnect it or choose another host."
-              : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                ? "Please choose a host and working directory"
-                : configuredAgentUnavailable && selectedAgent == null
-                  ? "This project's configured agent is unavailable — pick an agent to continue"
-                  : message.trim().length === 0 && files.length === 0
-                    ? "Enter a message to get started"
-                    : null;
+    : pendingSkillCompletion
+      ? "Loading skills…"
+      : pickerLoading || workspaceLoading
+        ? "Loading session configuration…"
+        : pickerSelectionError
+          ? pickerSelectionError
+          : sandboxSelected && sandboxRepoOverCap
+            ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+                maxSandboxRepos === 1 ? "repository" : "repositories"
+              } — remove the extras`
+            : sandboxSelected && !sandboxRepoValid
+              ? "Please enter a valid repository URL"
+              : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                ? "Selected host is unavailable. Reconnect it or choose another host."
+                : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                  ? "Please choose a host and working directory"
+                  : configuredAgentUnavailable && selectedAgent == null
+                    ? "This project's configured agent is unavailable — pick an agent to continue"
+                    : message.trim().length === 0 && files.length === 0
+                      ? "Enter a message to get started"
+                      : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =

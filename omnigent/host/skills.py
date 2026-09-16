@@ -45,9 +45,9 @@ class HostSkillDiscovery:
     def __init__(self, fetch_bundle: Callable[[HostSkillsFrame], httpx.Response]) -> None:
         self._fetch_bundle = fetch_bundle
         self._lock = threading.Lock()
-        self._cache: OrderedDict[tuple[str | None, ...], tuple[float, list[dict[str, str]]]] = (
-            OrderedDict()
-        )
+        self._cache: OrderedDict[
+            tuple[str | tuple[str, ...] | None, ...], tuple[float, list[dict[str, str]]]
+        ] = OrderedDict()
 
     def discover(self, frame: HostSkillsFrame, root: Path) -> list[dict[str, str]]:
         """Return metadata for the exact launch target or effective session bundle."""
@@ -58,6 +58,9 @@ class HostSkillDiscovery:
             frame.agent_id,
             frame.agent_version,
             frame.sub_agent_name,
+            tuple(frame.skills_filter)
+            if isinstance(frame.skills_filter, list)
+            else frame.skills_filter,
         )
         with self._lock:
             cached = self._cache.get(key)
@@ -65,7 +68,9 @@ class HostSkillDiscovery:
                 self._cache.move_to_end(key)
                 return list(cached[1])
             if frame.session_id is None:
-                ctx = skill_source_context_from_env(roots=(root,), harness=frame.harness)
+                ctx = skill_source_context_from_env(
+                    roots=(root,), harness=frame.harness, skills_filter=frame.skills_filter
+                )
                 skills = resolve_harness_skills(ctx, frame.harness)
             else:
                 response = self._fetch_bundle(frame)

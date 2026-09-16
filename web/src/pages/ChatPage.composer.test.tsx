@@ -2185,7 +2185,7 @@ describe("rankedSlashCommandNames", () => {
 describe("Composer native skill menu", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_skill_menu",
       sessionHarness: "codex-native",
       skills: [{ name: "review", description: "Review the current change" }],
@@ -2195,7 +2195,7 @@ describe("Composer native skill menu", () => {
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
-    useChatStore.setState({ sessionHarness: null, skills: [], skillsStatus: null });
+    setComposerState({ sessionHarness: null, skills: [], skillsStatus: null });
   });
 
   it.each([
@@ -3151,7 +3151,7 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
   beforeEach(() => {
     clearSessionDrafts();
     localStorage.clear();
-    useChatStore.setState({
+    setComposerState({
       conversationId: "conv_test",
       skills: [],
       blocks: [],

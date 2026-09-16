@@ -15002,7 +15002,7 @@
     },
     "/v1/skills": {
       "get": {
-        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. The two forms cannot be combined.",
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.",
         "operationId": "get_skills_v1_skills_get",
         "parameters": [
           {
@@ -15071,6 +15071,23 @@
                 }
               ],
               "title": "Path"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
             }
           }
         ],
