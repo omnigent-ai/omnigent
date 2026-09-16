@@ -769,3 +769,59 @@ def test_replace_keeps_live_bundle_when_backup_rename_fails(
     assert previous.workdir.is_dir()
     assert cache.load("agent", "agent/v1").spec is previous.spec
     assert not any((cache_dir / ".staging").iterdir())
+
+
+@pytest.mark.parametrize("failed_cleanup", ["bundle", "backup"])
+def test_cleanup_failure_is_logged_without_breaking_publication(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failed_cleanup: str,
+) -> None:
+    bundle = _store_bundle(artifact_store, "agent/v1")
+    cache = AgentCache(artifact_store, cache_dir)
+    cache.load("agent", "agent/v1")
+    real_rmtree = agent_cache_module.shutil.rmtree
+    leftover: list[Path] = []
+
+    def fail_cleanup(path, *args, **kwargs):
+        path = Path(path)
+        if path.name.startswith(f"{failed_cleanup}-"):
+            if failed_cleanup == "bundle":
+                # Published staging paths no longer exist; don't warn for those.
+                raise FileNotFoundError(path)
+            leftover.append(path)
+            raise PermissionError("cleanup denied")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(agent_cache_module.shutil, "rmtree", fail_cleanup)
+    loaded = cache.replace("agent", "agent/v2", bundle)
+    assert loaded.workdir.is_dir()
+    assert cache.load("agent", "agent/v2").spec is loaded.spec
+    if failed_cleanup == "backup":
+        assert len(leftover) == 1
+        assert (leftover[0] / "previous" / "config.yaml").is_file()
+        assert str(leftover[0]) in caplog.text and "cleanup denied" in caplog.text
+    else:
+        assert not caplog.records
+
+
+def test_cleanup_warning_preserves_original_validation_error(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _store_bundle(artifact_store, "agent/invalid", {"config.yaml": "[]"})
+    cache = AgentCache(artifact_store, cache_dir)
+
+    def fail_cleanup(path):
+        raise PermissionError("cleanup denied")
+
+    monkeypatch.setattr(agent_cache_module.shutil, "rmtree", fail_cleanup)
+    with pytest.raises(OmnigentError, match=r"config\.yaml must be a YAML mapping"):
+        cache.load("agent", "agent/invalid")
+    assert "Could not clean agent cache staging directory" in caplog.text
+    assert "cleanup denied" in caplog.text
+    assert not (cache_dir / "agent").exists()

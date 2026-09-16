@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import logging
 import os
 import shutil
 import tempfile
@@ -14,6 +15,18 @@ from omnigent.entities import LoadedAgent
 from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _cleanup_staging_dir(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass  # Successful publication moved this staging directory into the cache.
+    except OSError as exc:
+        _logger.warning("Could not clean agent cache staging directory %s: %s", path, exc)
 
 
 class AgentCache:
@@ -186,11 +199,12 @@ class AgentCache:
                     raise
                 published = True
             finally:
-                # Keep the backup available for recovery if rollback also failed.
+                # A failed rollback retains its backup for manual recovery/cleanup.
+                # Crash remnants also need manual cleanup; no automatic reaper runs.
                 if backup_dir is not None and (
                     published or not (backup_dir / "previous").exists()
                 ):
-                    shutil.rmtree(backup_dir, ignore_errors=True)
+                    _cleanup_staging_dir(backup_dir)
         self._specs[agent_id] = spec
         return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -220,7 +234,7 @@ class AgentCache:
         try:
             yield staging_dir
         finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            _cleanup_staging_dir(staging_dir)
 
     def _extract_and_cache(
         self,
