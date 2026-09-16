@@ -62,27 +62,25 @@ function ConfigChoices({ choices }: { choices: readonly ComposerConfigChoice[] }
 export function ComposerConfigSections({
   models,
   efforts,
+  extra,
 }: {
   models?: ComposerConfigSection;
   efforts?: ComposerConfigSection;
+  // Additional sections rendered after Models/Effort — e.g. Devin Fusion's
+  // Lead / Effort / Sidekick selectors. Each gets its own separator + header.
+  extra?: readonly ComposerConfigSection[];
 }) {
+  const sections = [...(models ? [models] : []), ...(efforts ? [efforts] : []), ...(extra ?? [])];
   return (
     <>
-      {models && (
-        <div data-testid={models.testId}>
-          <PickerSectionHeader>{models.header}</PickerSectionHeader>
-          {models.leading}
-          <ConfigChoices choices={models.choices} />
+      {sections.map((section, index) => (
+        <div key={section.testId} data-testid={section.testId}>
+          {index > 0 && <DropdownMenuSeparator />}
+          <PickerSectionHeader>{section.header}</PickerSectionHeader>
+          {section.leading}
+          <ConfigChoices choices={section.choices} />
         </div>
-      )}
-      {efforts && (
-        <div data-testid={efforts.testId}>
-          {models && <DropdownMenuSeparator />}
-          <PickerSectionHeader>{efforts.header}</PickerSectionHeader>
-          {efforts.leading}
-          <ConfigChoices choices={efforts.choices} />
-        </div>
-      )}
+      ))}
     </>
   );
 }

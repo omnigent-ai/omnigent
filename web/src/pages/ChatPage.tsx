@@ -210,6 +210,8 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { buildFusionSections } from "@/components/composer/fusionSections";
+import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
@@ -4641,6 +4643,18 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
+  // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
+  // baked in, so it carries no separate reasoning effort.
+  const composerFusion = fusionOption(modelOptions)?.fusion;
+  const fusionSelected = composerFusion !== undefined && isFusionModelUid(pickerSelectedModel);
+  const selectFusionModel = (modelUid: string) =>
+    void apply(async () => {
+      const store = useChatStore.getState();
+      const sourceSessionId = store.conversationId;
+      await store.setModel(modelUid, { expectConfirmation: false });
+      if (useChatStore.getState().conversationId !== sourceSessionId) return;
+      if (selectedEffort !== null) await store.setEffort(null);
+    });
   const modelContent = (
     <>
       {costRoutingEligible && showModels && (
@@ -4683,15 +4697,21 @@ function SessionHarnessPicker({
                     label: nativeModelLabel(model),
                     checked:
                       !routingOn &&
-                      (model.id === pickerSelectedModel ||
-                        (pickerSelectedModel === null && model.isDefault === true)),
+                      (model.fusion !== undefined
+                        ? isFusionModelUid(pickerSelectedModel)
+                        : model.id === pickerSelectedModel ||
+                          (pickerSelectedModel === null && model.isDefault === true)),
                     disabled: busy || pendingModelChange !== null,
-                    onSelect: () => selectModel(model.isDefault ? null : model.id),
+                    onSelect: () =>
+                      model.fusion !== undefined
+                        ? selectFusionModel(model.fusion.default)
+                        : selectModel(model.isDefault ? null : model.id),
                     testId: `composer-agent-model-${model.id}`,
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
                   })),
                   ...(pickerSelectedModel &&
+                  !isFusionModelUid(pickerSelectedModel) &&
                   !modelOptions.some((model) => model.id === pickerSelectedModel)
                     ? [
                         {
@@ -4706,6 +4726,17 @@ function SessionHarnessPicker({
                     : []),
                 ],
               }
+            : undefined
+        }
+        extra={
+          composerFusion !== undefined && fusionSelected && !routingOn
+            ? buildFusionSections({
+                descriptor: composerFusion,
+                modelUid: pickerSelectedModel ?? composerFusion.default,
+                testIdPrefix: "composer-agent",
+                onChange: selectFusionModel,
+                disabled: busy || pendingModelChange !== null,
+              })
             : undefined
         }
       />

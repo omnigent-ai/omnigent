@@ -19,6 +19,7 @@ import {
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { buildFusionSections } from "@/components/composer/fusionSections";
 import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   codexCreateApprovalOptions,
@@ -264,6 +265,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useConversations,
@@ -3516,6 +3518,20 @@ export function NewChatLandingScreen() {
       rememberPickerOptions(selectedNativeHarness, { routing: "on", model: "", effort: "" });
       return;
     }
+    // Picking the Fusion family lands on its default combo id, which the Lead /
+    // Effort / Sidekick selectors then refine.
+    const fusionDescriptor = fusionOption(pickerModelOptions)?.fusion;
+    if (fusionDescriptor !== undefined && model === fusionOption(pickerModelOptions)?.id) {
+      setPickedModel(fusionDescriptor.default);
+      setPickedEffort("");
+      setCostControlMode(null);
+      rememberPickerOptions(selectedNativeHarness, {
+        model: fusionDescriptor.default,
+        effort: "",
+        routing: "off",
+      });
+      return;
+    }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
     const effort =
       selectedNativeHarness === "codex-native" &&
@@ -3534,6 +3550,18 @@ export function NewChatLandingScreen() {
     if (!selectedNativeHarness) return;
     setPickedEffort(effort);
     rememberPickerOptions(selectedNativeHarness, { effort });
+  };
+  // Devin Fusion: the composed `fusion-…` variant id IS the model, so it lands
+  // in pickedModel with no separate effort (the lead effort is baked in).
+  const pickerFusion = fusionOption(pickerModelOptions)?.fusion;
+  const fusionSelected = pickerFusion !== undefined && isFusionModelUid(pickedModel);
+  const selectFusionModel = (modelUid: string) => {
+    if (!selectedNativeHarness) return;
+    userPickedModelRef.current = true;
+    setPickedModel(modelUid);
+    setPickedEffort("");
+    setCostControlMode(null);
+    rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
@@ -3613,8 +3641,10 @@ export function NewChatLandingScreen() {
                         label: visibleModelLabel(nativeModelLabel(option)),
                         checked:
                           !routingOn &&
-                          (pickedModel === option.id ||
-                            (pickedModel === "" && option.isDefault === true)),
+                          (option.fusion !== undefined
+                            ? isFusionModelUid(pickedModel)
+                            : pickedModel === option.id ||
+                              (pickedModel === "" && option.isDefault === true)),
                         onSelect: () =>
                           selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
                         testId: `new-chat-landing-agent-model-${option.id}`,
@@ -3639,6 +3669,16 @@ export function NewChatLandingScreen() {
                     testId: `new-chat-landing-agent-effort-${option.value}`,
                   })),
                 }
+              : undefined
+          }
+          extra={
+            pickerFusion !== undefined && fusionSelected && !routingOn
+              ? buildFusionSections({
+                  descriptor: pickerFusion,
+                  modelUid: pickedModel,
+                  testIdPrefix: "new-chat-landing-agent",
+                  onChange: selectFusionModel,
+                })
               : undefined
           }
         />
