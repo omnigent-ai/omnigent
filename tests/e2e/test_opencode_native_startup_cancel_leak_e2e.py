@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -20,8 +21,8 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("opencode") is None,
-    reason="opencode-native startup-cancel e2e needs an `opencode` binary on PATH",
+    sys.platform != "linux" or shutil.which("opencode") is None,
+    reason="opencode-native startup-cancel e2e requires Linux /proc and opencode on PATH",
 )
 
 _SERVE_APPEAR_TIMEOUT_S = 120.0
