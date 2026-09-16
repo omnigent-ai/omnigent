@@ -903,6 +903,24 @@ def test_wrap_launcher_argv_target_none_no_extra_binds(
     )
 
 
+@pytest.mark.parametrize("target", ["/bin/bash", "/sbin/tool", "/workspace/tool"])
+def test_covered_executable_does_not_expose_parent_directories(target: str) -> None:
+    assert (
+        bwrap_sandbox._interpreter_chain_binds(
+            [target], [Path("/bin"), Path("/sbin"), Path("/workspace")]
+        )
+        == []
+    )
+
+
+def test_shallow_executable_never_exposes_the_host_root() -> None:
+    assert bwrap_sandbox._interpreter_chain_binds(["/opt/tool"], [Path("/usr")]) == [
+        "--ro-bind-try",
+        "/opt",
+        "/opt",
+    ]
+
+
 def test_wrap_launcher_argv_target_already_in_default_mounts(
     tmp_path: Path,
 ) -> None:
