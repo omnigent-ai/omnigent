@@ -71,6 +71,9 @@ model = args[args.index("--model") + 1] if "--model" in args else None
 alias = model if model in ALIASES else "sonnet"
 mid, label = ALIASES[alias]
 if "--input-format" in args:
+    if {legacy}:
+        print("unsupported initialize request", file=sys.stderr)
+        raise SystemExit(2)
     print(json.dumps({{
         "type": "control_response",
         "response": {{
@@ -120,6 +123,17 @@ async def _serve(listen_url):
             if "id" not in msg:
                 continue  # notification (e.g. "initialized")
             method = msg.get("method")
+            if {legacy} and (
+                method == "config/read"
+                or (method == "model/list" and "includeHidden" in msg.get("params", {{}}))
+            ):
+                error = (
+                    {{"code": -32600, "message": "unknown variant `config/read`"}}
+                    if method == "config/read"
+                    else {{"code": -32602, "message": "unknown field `includeHidden`"}}
+                )
+                await ws.send(json.dumps({{"id": msg["id"], "error": error}}))
+                continue
             if method == "initialize":
                 result = {{"serverInfo": {{"name": "fake-codex",
                                            "version": "{marker}"}}}}
@@ -147,17 +161,21 @@ else:
 """
 
 
-def _write_fake_claude(path: Path, *, version: str, marker: str, gen: int) -> None:
+def _write_fake_claude(
+    path: Path, *, version: str, marker: str, gen: int, legacy: bool = False
+) -> None:
     """(Re)write the fake ``claude`` binary in place, like an auto-update.
 
     :param path: The installed CLI path (constant across builds).
     :param version: The build's ``--version`` answer, e.g. ``"2.1.247"``.
     :param marker: Build marker carried in every model name (``OLD``/``NEW``).
     :param gen: Model generation this build ships, e.g. ``5``.
+    :param legacy: Reject control initialization, exposing only /model help.
     """
     path.write_text(
         _FAKE_CLAUDE_TEMPLATE.format(
             version=version,
+            legacy=legacy,
             sonnet_model=f"claude-sonnet-{gen}-20250929",
             sonnet_label=f"Sonnet {gen} {marker}",
             opus_model=f"claude-opus-{gen}",
@@ -167,13 +185,16 @@ def _write_fake_claude(path: Path, *, version: str, marker: str, gen: int) -> No
     path.chmod(0o755)
 
 
-def _write_fake_codex(path: Path, *, marker: str) -> None:
+def _write_fake_codex(path: Path, *, marker: str, legacy: bool = False) -> None:
     """(Re)write the fake ``codex`` binary in place, like an auto-update.
 
     :param path: The installed CLI path (constant across builds).
     :param marker: Build marker carried in every model name (``OLD``/``NEW``).
+    :param legacy: Reject the optional discovery fields and config/read method.
     """
-    path.write_text(_FAKE_CODEX_TEMPLATE.format(python=sys.executable, marker=marker))
+    path.write_text(
+        _FAKE_CODEX_TEMPLATE.format(python=sys.executable, marker=marker, legacy=legacy)
+    )
     path.chmod(0o755)
 
 
@@ -415,7 +436,8 @@ def _assert_upgrade_refreshed(before: list[str], after: list[str], harness: str)
 
 
 @pytest.mark.timeout(400)
-def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path, legacy: bool) -> None:
     """A Claude Code upgrade must re-probe the claude-native model catalog.
 
     Journey: host boots with claude 2.1.247 (models named ``… OLD``) and the
@@ -426,7 +448,7 @@ def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     claude = bin_dir / "claude"
-    _write_fake_claude(claude, version="2.1.247", marker="OLD", gen=5)
+    _write_fake_claude(claude, version="2.1.247", marker="OLD", gen=5, legacy=legacy)
 
     with _booted_rig(tmp_path / "rig", bin_dir, {}) as rig:
         rig.start_host()
@@ -446,7 +468,8 @@ def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
 
 
 @pytest.mark.timeout(400)
-def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path, legacy: bool) -> None:
     """A Codex CLI upgrade must re-probe the codex-native model catalog.
 
     Same journey as the claude twin — ``codex_catalog_fingerprint`` keys on
@@ -455,7 +478,7 @@ def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     codex = bin_dir / "codex"
-    _write_fake_codex(codex, marker="OLD")
+    _write_fake_codex(codex, marker="OLD", legacy=legacy)
 
     with _booted_rig(tmp_path / "rig", bin_dir, {"OMNIGENT_CODEX_PATH": str(codex)}) as rig:
         rig.start_host()

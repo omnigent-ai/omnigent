@@ -812,6 +812,13 @@ class CodexAppServerClient:
             await self._events.put(message)
 
 
+def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -> bool:
+    """Recognize both JSON-RPC and serde errors from older parameter schemas."""
+    return exc.code == -32602 or (
+        exc.code == -32600 and f"unknown field `{field}`" in (exc.message or "")
+    )
+
+
 async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
     """Read every visible model from an initialized Codex app-server client.
 
@@ -821,11 +828,21 @@ async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonOb
     """
     options: list[_JsonObject] = []
     cursor: str | None = None
+    include_hidden_supported = True
     while True:
-        params: CodexParams = {"includeHidden": False}
+        params: CodexParams = {"includeHidden": False} if include_hidden_supported else {}
         if cursor is not None:
             params["cursor"] = cursor
-        response = await client.request("model/list", params)
+        try:
+            response = await client.request("model/list", params)
+        except CodexAppServerResponseError as exc:
+            if not include_hidden_supported or not _codex_rejects_request_field(
+                exc, "includeHidden"
+            ):
+                raise
+            # Older servers list visible models by default but reject this field.
+            include_hidden_supported = False
+            continue
         result = response.get("result")
         if not isinstance(result, dict):
             raise ValueError("Codex model/list result must be an object")
@@ -1175,18 +1192,35 @@ async def probe_codex_model_options(
         await client.connect()
         rows = await list_codex_model_options(client)
         if pinned_model is None:
-            response = await client.request("config/read", {"includeLayers": False})
-            result = response.get("result")
-            config = result.get("config") if isinstance(result, dict) else None
-            model = config.get("model") if isinstance(config, dict) else None
-            if isinstance(model, str) and model:
-                pinned_model = model
+            pinned_model = await _read_codex_probe_default(client, codex_home)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
         await _stop_codex_model_discovery_process(discovery)
     return mark_launch_default(rows, pinned_model)
+
+
+async def _read_codex_probe_default(client: CodexAppServerClient, codex_home: Path) -> str | None:
+    """Prefer effective config, then the probe's config or the CLI's default row."""
+    try:
+        try:
+            response = await client.request("config/read", {"includeLayers": False})
+        except CodexAppServerResponseError as exc:
+            if not _codex_rejects_request_field(exc, "includeLayers"):
+                raise
+            response = await client.request("config/read", {})
+    except CodexAppServerResponseError as exc:
+        if exc.code not in {-32601, -32602} and not (
+            exc.code == -32600 and "unknown variant `config/read`" in (exc.message or "")
+        ):
+            raise
+        _logger.info("Codex config/read unavailable; keeping the configured or model/list default")
+        return _codex_picker_config(codex_home).get("model")
+    result = response.get("result")
+    config = result.get("config") if isinstance(result, dict) else None
+    model = config.get("model") if isinstance(config, dict) else None
+    return model if isinstance(model, str) and model else None
 
 
 def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | None = None) -> str:

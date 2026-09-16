@@ -1113,22 +1113,14 @@ def _parse_claude_picker_models(stdout: str) -> list[dict[str, Any]] | None:
     return None
 
 
-async def probe_claude_model_options(
+async def _run_claude_model_probe(
     claude_config: ClaudeNativeUcodeConfig | None,
-) -> ClaudeModelProbe | None:
-    """
-    Ask Claude Code itself which models it would offer, and its default.
-
-    The control-protocol initialize response uses the interactive picker's
-    options and availability rules. The /model usage text lists syntax aliases
-    even when they are hidden or disabled, so it cannot enumerate the catalog.
-    A client-side /model request in the same run reports the actual default.
-
-    :param claude_config: The resolved native launch config, or ``None``.
-    :returns: The probe result, or ``None`` when availability cannot be read.
-    """
+    *,
+    stream_input: bool,
+) -> str | None:
+    """Run a bounded client-side probe, with or without control initialization."""
     command, launch_args, env = _claude_model_probe_invocation(
-        claude_config, ("--output-format", "stream-json", "--verbose"), stream_input=True
+        claude_config, ("--output-format", "stream-json", "--verbose"), stream_input=stream_input
     )
     requests = [
         {
@@ -1143,14 +1135,18 @@ async def probe_claude_model_options(
             "session_id": "default",
         },
     ]
-    probe_input = "".join(json.dumps(request) + "\n" for request in requests).encode()
+    probe_input = (
+        "".join(json.dumps(request) + "\n" for request in requests).encode()
+        if stream_input
+        else None
+    )
     try:
         process = await asyncio.create_subprocess_exec(
             command,
             *launch_args,
             cwd=str(Path.home()),
             env=env,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if stream_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1169,18 +1165,65 @@ async def probe_claude_model_options(
             raise
         _logger.warning("Claude model probe timed out")
         return None
+    text = stdout.decode(errors="replace")
     if process.returncode != 0:
         _logger.warning(
             "Claude model probe exited %s: %s",
             process.returncode,
             stderr.decode(errors="replace").strip()[-500:],
         )
-        return None
-    text = stdout.decode(errors="replace")
-    models = _parse_claude_picker_models(text)
+        if not stream_input or _parse_claude_picker_models(text) is None:
+            return None
+    return text
+
+
+def _parse_claude_legacy_models(stdout: str) -> list[dict[str, Any]]:
+    """Read aliases from /model help only when structured discovery is unavailable."""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "result" or event.get("is_error"):
+            continue
+        result = event.get("result")
+        if not isinstance(result, str):
+            continue
+        for text_line in result.splitlines():
+            _, marker, tail = text_line.partition("Available:")
+            if marker:
+                return [
+                    {"value": token}
+                    for entry in tail.split(",")
+                    if (token := entry.strip().rstrip(".").strip("`"))
+                    and not any(char.isspace() for char in token)
+                ]
+    return []
+
+
+async def probe_claude_model_options(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> ClaudeModelProbe | None:
+    """Read the CLI picker, falling back to /model for older Claude releases.
+
+    Structured options are authoritative, including empty or disabled-only
+    lists. Older CLIs expose only help aliases; resolve those through the CLI
+    using the same launch environment, without adding managed or static rows.
+
+    :param claude_config: The resolved native launch config, or ``None``.
+    :returns: The probe result, or ``None`` when both discovery methods fail.
+    """
+    text = await _run_claude_model_probe(claude_config, stream_input=True)
+    models = _parse_claude_picker_models(text) if text is not None else None
     if models is None:
-        _logger.warning("Claude model probe returned no structured picker options")
-        return None
+        _logger.info("Claude structured model picker unavailable; falling back to /model")
+        text = await _run_claude_model_probe(claude_config, stream_input=False)
+        if text is None:
+            return None
+        models = _parse_claude_legacy_models(text)
+        if not models and not _parse_claude_current_model(text).get("model"):
+            return None
+    assert text is not None
     default_resolution = _parse_claude_current_model(text)
     disabled_models = frozenset(
         value

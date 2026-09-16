@@ -3395,3 +3395,110 @@ def test_codex_catalog_fingerprint_tracks_configured_catalog(
         config.write_text('model = "second"\nmodel_catalog_json = "models.json"\n')
 
     assert app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable) != before
+
+
+@pytest.mark.parametrize("code", [-32600, -32602])
+async def test_old_codex_model_list_retries_without_include_hidden_and_paginates(
+    code: int,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    client = AsyncMock(spec=CodexAppServerClient)
+    first = {"id": "first", "isDefault": True}
+    second = {"id": "second"}
+    client.request.side_effect = [
+        CodexAppServerResponseError({"code": code, "message": "unknown field `includeHidden`"}),
+        {"result": {"data": [first], "nextCursor": "page2"}},
+        {"result": {"data": [second], "nextCursor": None}},
+    ]
+
+    assert await app_server.list_codex_model_options(client) == [first, second]
+    assert [call.args for call in client.request.await_args_list] == [
+        ("model/list", {"includeHidden": False}),
+        ("model/list", {}),
+        ("model/list", {"cursor": "page2"}),
+    ]
+
+
+@pytest.mark.parametrize("code", [-32600, -32601, -32602, -32603])
+async def test_codex_model_list_does_not_hide_failures_or_retry_forever(code: int) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    client = AsyncMock(spec=CodexAppServerClient)
+    client.request.side_effect = CodexAppServerResponseError({"code": code})
+    with pytest.raises(CodexAppServerResponseError):
+        await app_server.list_codex_model_options(client)
+    assert client.request.await_count == (2 if code == -32602 else 1)
+
+
+@pytest.mark.parametrize("config_text", [None, "", 'model = "second"\n'])
+@pytest.mark.parametrize("config_error", [-32600, -32601, -32602])
+async def test_codex_without_custom_catalog_keeps_models_and_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str | None,
+    config_error: int,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    source = tmp_path / "source"
+    source.mkdir()
+    if config_text is not None:
+        (source / "config.toml").write_text(config_text)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    client = AsyncMock(spec=CodexAppServerClient)
+
+    async def request(method: str, params: object) -> dict[str, object]:
+        if method == "config/read":
+            raise CodexAppServerResponseError(
+                {"code": config_error, "message": "unknown variant `config/read`"}
+            )
+        assert method == "model/list"
+        return {"result": {"data": [{"id": "first", "isDefault": True}, {"id": "second"}]}}
+
+    client.request.side_effect = request
+    monkeypatch.setattr(app_server, "CodexAppServerClient", lambda **kwargs: client)
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", AsyncMock())
+    monkeypatch.setattr(app_server, "_wait_for_discovery_listener", AsyncMock())
+    stop = AsyncMock()
+    monkeypatch.setattr(app_server, "_stop_codex_model_discovery_process", stop)
+
+    rows = await app_server.probe_codex_model_options(
+        codex_path="/test/codex", launch=NativeCodexLaunch([], None, None)
+    )
+    expected = [{"id": "first"}, {"id": "second"}]
+    expected[1 if config_text else 0]["isDefault"] = True
+    assert rows == expected
+    probe_home = app_server._probe_codex_home([])
+    config_path = probe_home / "config.toml"
+    config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+    assert "model_catalog_json" not in config
+    client.close.assert_awaited_once()
+    stop.assert_awaited_once()
+
+
+@pytest.mark.parametrize("code", [-32600, -32602])
+async def test_codex_config_read_retries_legacy_params(tmp_path: Path, code: int) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    client = AsyncMock(spec=CodexAppServerClient)
+    client.request.side_effect = [
+        CodexAppServerResponseError({"code": code, "message": "unknown field `includeLayers`"}),
+        {"result": {"config": {"model": "configured"}}},
+    ]
+    assert await app_server._read_codex_probe_default(client, tmp_path) == "configured"
+    assert [call.args for call in client.request.await_args_list] == [
+        ("config/read", {"includeLayers": False}),
+        ("config/read", {}),
+    ]
+
+
+async def test_codex_config_read_preserves_unrelated_errors(tmp_path: Path) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    client = AsyncMock(spec=CodexAppServerClient)
+    client.request.side_effect = CodexAppServerResponseError({"code": -32603})
+    with pytest.raises(CodexAppServerResponseError):
+        await app_server._read_codex_probe_default(client, tmp_path)
+    client.request.assert_awaited_once()
