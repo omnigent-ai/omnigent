@@ -472,7 +472,7 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Codex skills: ``<bundle>/skills`` + the host codex skills dir under the filter.
+    Codex bundle, standalone, and enabled plugin skills under the filter.
 
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
@@ -488,14 +488,19 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     terminal. The in-process ``codex`` (SDK) harness has no such terminal, so it
     keeps the ``~/.codex`` host dir it used before this scoping.
 
-    Names are surfaced by **directory name** (the selector's key), not the
+    Standalone names use the **directory name** (the selector's key), not the
     frontmatter ``name``. Codex registers a skill's slash command under its
     directory, and the executor symlinks under that dir name — so when the
     two differ, the menu label must match the directory (mirrors the Cursor
     provider). The lazy import keeps the Codex-specific dependency out of
     ``omnigent.spec``'s module-load path.
+
+    Plugins are loaded directly by Codex from its cache, outside the symlinked
+    standalone sources. Discover their active versions separately so plugin
+    namespaces survive and disabled or stale cached skills stay hidden.
     """
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
+    from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
 
     host_override = ctx.codex_home if ctx.is_native else None
     sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
@@ -506,6 +511,8 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         except (OmnigentError, OSError):  # best-effort discovery
             continue
         out.append(replace(spec, name=name))
+    codex_home = host_override if host_override is not None else ctx.home / ".codex"
+    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter))
     return out
 
 
