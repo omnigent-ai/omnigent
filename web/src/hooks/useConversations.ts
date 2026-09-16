@@ -2382,6 +2382,26 @@ export function useUpdateProjectConfig() {
       const projectId = id ?? (await apiCreateProject(name)).id;
       return apiUpdateProjectConfig(projectId, config);
     },
+    // Seed the cache at mutate time: writers PATCH the whole blob built by
+    // spreading this cache, so a save racing this still-in-flight write would
+    // spread the pre-write snapshot and silently revert it. Rolled back on
+    // error; a label-only folder (null id) has no cache row to seed yet.
+    onMutate: async ({ id, config }) => {
+      if (id === null) return {};
+      await queryClient.cancelQueries({ queryKey: ["project-config", id] });
+      const previous = queryClient.getQueryData<ProjectConfig>(["project-config", id]);
+      queryClient.setQueryData<ProjectConfig>(["project-config", id], config);
+      return { id, previous };
+    },
+    onError: (_error, _variables, context) => {
+      if (!context?.id) return;
+      if (context.previous !== undefined) {
+        queryClient.setQueryData<ProjectConfig>(["project-config", context.id], context.previous);
+      } else {
+        // Nothing to restore — drop the seeded entry so a reader refetches.
+        queryClient.removeQueries({ queryKey: ["project-config", context.id] });
+      }
+    },
     onSuccess: (project) => {
       // Seed the fresh config into the cache (not just invalidate) so the
       // composer's prefill reads the just-saved defaults on the very next visit

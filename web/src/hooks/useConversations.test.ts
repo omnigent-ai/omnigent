@@ -2009,6 +2009,41 @@ describe("useUpdateProjectConfig cache seeding", () => {
     // The projects list now resolves "Work" → the promoted first-class id.
     expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
   });
+
+  it("seeds the cache at mutate time so a concurrent save can't spread the pre-write config", async () => {
+    // Writers PATCH the whole blob built from this cache, so an in-flight
+    // write must already be visible to a racing reader — otherwise a settings
+    // save spreads the pre-write snapshot and reverts it (a just-picked icon).
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["project-config", "p_1"], {});
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    // The PATCH never settles — the write stays in flight, as on a slow uplink.
+    fetchMock.mockReturnValueOnce(new Promise(() => {}));
+
+    const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+    result.current.mutate({ id: "p_1", name: "Work", config: { icon: "🔥" } });
+
+    await waitFor(() =>
+      expect(queryClient.getQueryData(["project-config", "p_1"])).toEqual({ icon: "🔥" }),
+    );
+  });
+
+  it("rolls the mutate-time seed back when the write fails", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["project-config", "p_1"], { host_id: "h_1" });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+
+    const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+    result.current.mutate({ id: "p_1", name: "Work", config: { host_id: "h_1", icon: "🔥" } });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(queryClient.getQueryData(["project-config", "p_1"])).toEqual({ host_id: "h_1" });
+  });
 });
 
 describe("useProjectConfig", () => {
