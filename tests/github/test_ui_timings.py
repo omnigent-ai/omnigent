@@ -129,3 +129,39 @@ def test_new_run_replaces_previous_timing_file(
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert [r["type"] for r in records] == ["plan", "phase", "phase", "phase", "finish"]
     assert records[-1] == {"type": "finish", "exitstatus": 0}
+
+
+def test_plan_records_final_shard_selection(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _configure(pytester, monkeypatch)
+    pytester.makeconftest("""
+import pytest
+from tests.e2e_ui.timings import pytest_addoption as timing_options, pytest_configure
+
+def pytest_addoption(parser):
+    timing_options(parser)
+    parser.addoption('--splits', type=int)
+    parser.addoption('--group', type=int)
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    items[:] = items[config.getoption('--group') - 1::config.getoption('--splits')]
+""")
+    pytester.makepyfile(
+        test_cases="""
+import pytest
+@pytest.mark.parametrize('case', range(4))
+def test_case(case):
+    pass
+"""
+    )
+    result = pytester.runpytest_subprocess(
+        "-q", "--splits=2", "--group=2", f"--ui-timing-output={path}"
+    )
+    result.assert_outcomes(passed=2)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    plan = records[0]
+    assert plan["splits"] == 2 and plan["group"] == 2
+    assert plan["nodeids"] == ["test_cases.py::test_case[1]", "test_cases.py::test_case[3]"]
+    assert [r["nodeid"] for r in records if r.get("when") == "call"] == plan["nodeids"]
