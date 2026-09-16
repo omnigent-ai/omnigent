@@ -280,6 +280,28 @@ os_env:
 Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
+### Refreshing proxy credentials
+
+File and command credential sources can opt into renewal with
+`refresh_interval_seconds`. The trusted parent re-reads the source on the first
+request after that interval; sandbox placeholders stay the same. For example,
+a local token broker can mint replacement GitHub App tokens before they expire:
+
+```yaml
+credential_proxy:
+  - type: gh_basic
+    source:
+      command: "curl --fail --silent --max-time 20 --unix-socket /private/broker.sock http://localhost/token"
+      refresh_interval_seconds: 60
+```
+
+Keep the broker socket and its private key outside sandbox read/write paths.
+Choose an interval shorter than the minimum remaining lifetime of tokens
+returned by the source. A failed refresh fails the request; it does not reuse
+an old credential. Without this setting, sources resolve once at startup.
+Environment sources cannot refresh because a running process inherits a fixed
+environment.
+
 ## Tools
 
 Tools are declared under `tools` by name.

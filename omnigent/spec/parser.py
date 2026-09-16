@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
@@ -1345,6 +1352,8 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         secret, e.g. ``"~/.config/tokens/github_pat.txt"``.
     :param command: Shell command whose stdout is the secret, e.g.
         ``"gh auth token"``.
+    :param refresh_interval_seconds: Optional positive cache lifetime for
+        file or command sources, in seconds.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1352,6 +1361,9 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     env: str | None = None
     file: str | None = None
     command: str | None = None
+    refresh_interval_seconds: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False, strict=True
+    )
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> _CredentialSourceModel:
@@ -1376,6 +1388,8 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
             raise ValueError("source 'file' must be a non-empty path")
         if self.command is not None and not self.command.strip():
             raise ValueError("source 'command' must be a non-empty command")
+        if self.refresh_interval_seconds is not None and self.env is not None:
+            raise ValueError("refresh_interval_seconds requires a file or command source")
         return self
 
     def to_spec(self) -> CredentialSourceSpec:
@@ -1389,9 +1403,17 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         if self.env is not None:
             return CredentialSourceSpec(kind="env", env=self.env)
         if self.file is not None:
-            return CredentialSourceSpec(kind="file", path=self.file.strip())
+            return CredentialSourceSpec(
+                kind="file",
+                path=self.file.strip(),
+                refresh_interval_seconds=self.refresh_interval_seconds,
+            )
         assert self.command is not None
-        return CredentialSourceSpec(kind="command", command=self.command.strip())
+        return CredentialSourceSpec(
+            kind="command",
+            command=self.command.strip(),
+            refresh_interval_seconds=self.refresh_interval_seconds,
+        )
 
 
 class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]

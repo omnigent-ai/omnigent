@@ -82,7 +82,7 @@ class CredentialRewriteRule:
         e.g. ``"x-access-token"``. ``None`` for ``bearer`` / ``token``.
     :param real_secret: A static real credential. Used when
         :attr:`secret_provider` is ``None`` (the ``env`` / ``file`` /
-        ``command`` sources resolve once at helper start).
+        ``command`` sources default to resolving once at helper start).
     :param secret_provider: A zero-arg callable returning the *current*
         real credential, re-resolved on each swap. Used for sources whose
         secret expires and must be refreshed for long sessions (e.g. a
@@ -196,7 +196,14 @@ def prepare_credential_proxy_runtime(
 
     synthetic_by_env: dict[str, str] = {}
     for entry in spec.entries:
-        real_secret = _resolve_secret(entry.source, parent_env=parent_env)
+        secret_provider: Callable[[], str] | None = None
+        if entry.source.refresh_interval_seconds is not None:
+            provider = RefreshingSecretProvider(entry.source, parent_env=parent_env)
+            provider.resolve()
+            secret_provider = provider.resolve
+            real_secret = None
+        else:
+            real_secret = _resolve_secret(entry.source, parent_env=parent_env)
         # Mint a placeholder only when the entry injects an env var. The
         # placeholder is what the cross-host leak guard keys on; pure
         # swap-on-access entries put nothing in the sandbox, so there is
@@ -225,9 +232,46 @@ def prepare_credential_proxy_runtime(
                 real_secret=real_secret,
                 synthetic=synthetic,
                 username=entry.username,
+                secret_provider=secret_provider,
             )
         )
     return runtime
+
+
+class RefreshingSecretProvider:
+    """Cache a parent-side file or command secret until its next refresh."""
+
+    def __init__(
+        self,
+        source: CredentialSourceSpec,
+        *,
+        parent_env: dict[str, str],
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        interval = source.refresh_interval_seconds
+        if (
+            source.kind not in ("file", "command")
+            or interval is None
+            or not 0 < interval < float("inf")
+        ):
+            raise ValueError(
+                "credential refresh requires a file or command and a finite positive interval"
+            )
+        self._source = source
+        self._parent_env = dict(parent_env)
+        self._interval = interval
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._secret: str | None = None
+        self._next_refresh = 0.0
+
+    def resolve(self) -> str:
+        """Refresh on access; a failed refresh never falls back to an old token."""
+        with self._lock:
+            if self._secret is None or self._clock() >= self._next_refresh:
+                self._secret = _resolve_secret(self._source, parent_env=self._parent_env)
+                self._next_refresh = self._clock() + self._interval
+            return self._secret
 
 
 def _resolve_secret(source: CredentialSourceSpec, *, parent_env: dict[str, str]) -> str:
