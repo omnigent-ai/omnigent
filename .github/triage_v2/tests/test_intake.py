@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -8,6 +9,56 @@ from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
 from issue_prioritization.domain import Impact, IssueType
 from issue_prioritization.intake import plan_intake
+
+
+def test_paused_assignments_cover_area_fallback_and_maintainer_authors(tmp_path) -> None:
+    config = tmp_path / "areas.json"
+    config.write_text(
+        json.dumps(
+            {
+                "issue_assignment_paused": ["Paused"],
+                "areas": [
+                    {
+                        "key": "runner",
+                        "label": "comp:runner",
+                        "weight": 1.2,
+                        "owners": ["PAUSED", "active"],
+                    }
+                ],
+            }
+        )
+    )
+    areas = AreaCatalog.from_json(config)
+    assert areas.owners_for(("runner",)) == ("active",)
+    assert areas.owners_for(()) == ("active",)
+    for author in ("community", "pAuSeD"):
+        plan = plan_intake(
+            _issue(author),
+            _classification(),
+            areas,
+            (),
+            (),
+            (),
+            ("PAUSED",),
+            {"active": 10, "PAUSED": 0},
+            close_duplicates=False,
+            post_duplicate_comments=False,
+        )
+        assert plan.assignee == "active"
+
+    existing = plan_intake(
+        _issue(),
+        _classification(),
+        areas,
+        (),
+        (),
+        ("PAUSED",),
+        ("PAUSED",),
+        {},
+        close_duplicates=False,
+        post_duplicate_comments=False,
+    )
+    assert existing.assignee is None
 
 
 def _issue(author: str = "community") -> BronzeIssue:

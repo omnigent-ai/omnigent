@@ -124,7 +124,7 @@ jobs:
         run: |
           # Derive everything downstream needs from the single source of truth,
           # .github/areas.json:
-          #   /tmp/owners.json   -- flat allowlist of every area owner (the ONLY
+          #   /tmp/owners.json   -- flat allowlist of active area owners (the ONLY
           #                         logins the assignment step may ever pick).
           #   /tmp/components.json -- the set of comp:* labels the validator allows.
           #   /tmp/areas_prompt.txt -- the AREAS block injected into the triage
@@ -132,16 +132,19 @@ jobs:
           python3 <<'PYEOF'
           import json, pathlib
 
-          areas = json.loads(pathlib.Path(".github/areas.json").read_text())["areas"]
+          config = json.loads(pathlib.Path(".github/areas.json").read_text())
+          areas = config["areas"]
+          paused = {login.casefold() for login in config.get("issue_assignment_paused", [])}
 
           owners, components, lines = [], set(), []
           for a in areas:
-              for o in a.get("owners", []):
+              active_owners = [o for o in a.get("owners", []) if o.casefold() not in paused]
+              for o in active_owners:
                   if o not in owners:
                       owners.append(o)
               components.add(a["label"])
               lines.append(
-                  f"- {a['key']}: {a['definition']} Owners: {', '.join(a.get('owners', []))}."
+                  f"- {a['key']}: {a['definition']} Owners: {', '.join(active_owners)}."
               )
 
           pathlib.Path("/tmp/owners.json").write_text(json.dumps(owners))
@@ -676,10 +679,13 @@ jobs:
           # issue is later reopened — triage only fires on `opened`, so a
           # reopened issue would otherwise come back unassigned.
 
-          # If the issue was filed by a maintainer, assign it to them directly.
+          # Assign maintainer authors directly unless their issue assignments are paused.
           author=$(jq -r '.author.login // empty' /tmp/issue.json)
           maintainer_assigned=false
-          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
+          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER && \
+            jq -e --arg author "$author" \
+              '[(.issue_assignment_paused // [])[] | ascii_downcase] | index($author | ascii_downcase) == null' \
+              .github/areas.json > /dev/null; then
             echo "Issue filed by maintainer $author — assigning to author"
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
             maintainer_assigned=true

@@ -104,7 +104,10 @@ def _choose_assignee(
 ) -> str | None:
     if current_assignees:
         return None
-    maintainers_by_key = {login.casefold(): login for login in maintainers}
+    paused = {login.casefold() for login in areas.issue_assignment_paused}
+    maintainers_by_key = {
+        login.casefold(): login for login in maintainers if login.casefold() not in paused
+    }
     if author.casefold() in maintainers_by_key:
         return maintainers_by_key[author.casefold()]
     candidates = areas.owners_for(area_keys)
