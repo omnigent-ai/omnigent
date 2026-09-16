@@ -17,40 +17,15 @@ from __future__ import annotations
 import os
 import re
 import signal
-import subprocess
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
-
-
-@pytest.fixture(scope="session")
-def _recover_shared_runner(
-    live_server: str, tmp_path_factory: pytest.TempPathFactory
-) -> Iterator[Callable[[], None]]:
-    """Keep a recovered runner alive until the shared server is torn down."""
-    recovered: list[subprocess.Popen[bytes]] = []
-
-    def recover() -> None:
-        runner = _ensure_runner_online(live_server, tmp_path_factory)
-        if runner is not None:
-            recovered.append(runner)
-
-    try:
-        yield recover
-    finally:
-        for runner in recovered:
-            runner.terminate()
-            try:
-                runner.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                runner.kill()
-                runner.wait(timeout=5)
+from tests.e2e_ui.conftest import _server_state, configure_mock_llm
 
 
 @pytest.mark.compat_smoke
