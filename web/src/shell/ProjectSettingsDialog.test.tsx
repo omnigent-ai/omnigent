@@ -290,6 +290,42 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).not.toHaveBeenCalled();
   });
 
+  it("offers a named native agent under Custom agents and saves its id", async () => {
+    availableAgentsMock.mockReturnValue({
+      data: [
+        pickerAgent({
+          id: "ag_opencode",
+          name: "opencode-native-ui",
+          display_name: "OpenCode",
+          harness: "opencode-native",
+          builtin: true,
+        }),
+        pickerAgent({
+          id: "ag_score",
+          name: "tg-thread-score-v1",
+          display_name: "tg-thread-score-v1",
+          harness: "opencode-native",
+          builtin: false,
+        }),
+      ],
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_score"));
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+      "tg-thread-score-v1",
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_score",
+      }),
+    );
+  });
+
   it("offers the same agent set as the composer picker (hidden agents excluded)", async () => {
     // Filter parity with the new-session composer (selectableSessionAgents):
     // if this picker offered an agent the composer hides, a project could pin

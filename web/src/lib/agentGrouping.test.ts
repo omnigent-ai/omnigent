@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
   isAcpHarnessAgent,
+  isHarnessPickerAgent,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -91,5 +92,43 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: "claude-native" })).toBe(false); // native harness
     expect(isAcpHarnessAgent({ harness: null })).toBe(false);
     expect(isAcpHarnessAgent(null)).toBe(false);
+  });
+});
+
+describe("isHarnessPickerAgent", () => {
+  it.each([false, undefined])("keeps named native agents in Agents (builtin=%s)", (builtin) => {
+    for (const harness of ["opencode-native", "claude-native", "codex-native", "kiro-native"]) {
+      expect(isHarnessPickerAgent(agent({ name: "my-reviewer", harness, builtin }))).toBe(false);
+    }
+  });
+
+  it("keeps seeded launchers and legacy launcher forks in Harnesses", () => {
+    expect(
+      isHarnessPickerAgent(
+        agent({ name: "opencode-native-ui", harness: "opencode-native", builtin: true }),
+      ),
+    ).toBe(true);
+    expect(
+      isHarnessPickerAgent(
+        agent({ name: "opencode-native-ui (fork ag_old)", harness: "opencode-native" }),
+      ),
+    ).toBe(true);
+    expect(isHarnessPickerAgent(agent({ name: "kiro-naitive", harness: "kiro-native" }))).toBe(
+      true,
+    );
+    expect(
+      isHarnessPickerAgent(
+        agent({ name: "opencode-native-ui", harness: "opencode-native", builtin: false }),
+      ),
+    ).toBe(false);
+  });
+
+  it("preserves the ACP and SDK grouping", () => {
+    expect(
+      isHarnessPickerAgent(agent({ name: "my-acp", harness: "acp:my-cli", builtin: false })),
+    ).toBe(true);
+    expect(
+      isHarnessPickerAgent(agent({ name: "polly", harness: "claude-sdk", builtin: true })),
+    ).toBe(false);
   });
 });

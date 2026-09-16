@@ -201,7 +201,7 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
-  isAcpHarnessAgent,
+  isHarnessPickerAgent,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -2222,18 +2222,11 @@ export function NewChatLandingScreen() {
     [agents, agentsLoading, cachedPickerOptions],
   );
 
-  // Split the picker into "Harnesses" (harness-backed picks — the native
-  // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
-  // and "Agents" (composed SDK / bundle agents like Polly & Debby plus custom
-  // user-registered agents). Harness-backed vs composed, NOT the builtins/customs
-  // split: Polly & Debby are built-ins but are composed agents, so they stay
-  // under "Agents". ACP agents aren't native, so they fold into "More".
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
-    [agentList],
-  );
+  // Native launcher and ACP rows belong under Harnesses. Named native bundles
+  // stay in Agents while retaining their native execution capabilities.
+  const harnessEntries = useMemo(() => agentList.filter(isHarnessPickerAgent), [agentList]);
   const agentEntries = useMemo(
-    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+    () => agentList.filter((a) => !isHarnessPickerAgent(a)),
     [agentList],
   );
 

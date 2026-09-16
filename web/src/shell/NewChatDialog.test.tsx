@@ -6750,6 +6750,67 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
 
+  it.each([false, undefined])(
+    "puts named native agents in Custom agents (builtin=%s)",
+    async (builtin) => {
+      mockAgents([
+        {
+          id: "ag_opencode",
+          name: "opencode-native-ui",
+          display_name: "OpenCode",
+          description: null,
+          harness: "opencode-native",
+          skills: [],
+          builtin: true,
+        },
+        {
+          id: "ag_score",
+          name: "tg-thread-score-v1",
+          display_name: "tg-thread-score-v1",
+          description: null,
+          harness: "opencode-native",
+          skills: [],
+          builtin,
+        },
+        {
+          id: "ag_summary",
+          name: "tg-thread-summary-v1",
+          display_name: "tg-thread-summary-v1",
+          description: null,
+          harness: "opencode-native",
+          skills: [],
+          builtin,
+        },
+      ]);
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_score" }),
+      } as Response);
+      renderLanding();
+      openPicker();
+      fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+      expect(screen.getByTestId("new-chat-landing-agent-ag_score")).toHaveTextContent(
+        "tg-thread-score-v1",
+      );
+      expect(screen.getByTestId("new-chat-landing-agent-ag_summary")).toHaveTextContent(
+        "tg-thread-summary-v1",
+      );
+      expect(screen.queryByTestId("new-chat-landing-agent-ag_opencode")).toBeNull();
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_score"));
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+        "tg-thread-score-v1",
+      );
+      const { body } = await submitAndReadBody("Score this thread");
+      expect(body.agent_id).toBe("ag_score");
+      expect(body.labels).toEqual(
+        expect.objectContaining({
+          "omnigent.ui": "terminal",
+          "omnigent.wrapper": "opencode-native-ui",
+        }),
+      );
+    },
+  );
+
   it("keeps harness configuration in one menu on narrow screens", () => {
     renderLanding();
     openPicker();
