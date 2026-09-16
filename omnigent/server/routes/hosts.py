@@ -17,6 +17,7 @@ from the DB so a host connected to replica B reads back as
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 from typing import Any
@@ -61,10 +62,30 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import ConversationNotFoundError
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
+
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_runner_launch_cleanup_tasks: set[asyncio.Task[None]] = set()
+
+
+def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
+    """Keep detached launch cleanup alive and report failures."""
+    _runner_launch_cleanup_tasks.add(task)
+
+    def _done(completed: asyncio.Task[None]) -> None:
+        _runner_launch_cleanup_tasks.discard(completed)
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error is not None:
+            _logger.warning("Detached runner launch cleanup failed", exc_info=error)
+
+    task.add_done_callback(_done)
+
 
 _LAUNCH_RESULT_TIMEOUT_S = 30.0
 # Per-call timeout for host.list_dir round-trips. Listing is a single
@@ -831,7 +852,23 @@ def create_hosts_router(
             )
 
         async def _rollback_runner_claim() -> None:
-            await asyncio.to_thread(conversation_store.clear_runner_id, body.session_id)
+            try:
+                await asyncio.to_thread(conversation_store.clear_runner_id, body.session_id)
+            except ConversationNotFoundError:
+                _logger.warning(
+                    "Failed to release runner reservation for session %s",
+                    body.session_id,
+                    exc_info=True,
+                )
+
+        # Resolve the harness while only the runner reservation is held.
+        harness: str | None = None
+        if agent_store is not None and agent_cache is not None:
+            try:
+                harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+            except BaseException:
+                await _rollback_runner_claim()
+                raise
 
         # Create the requested worktree before storing the final workspace.
         git_branch: str | None = None
@@ -904,28 +941,8 @@ def create_hosts_router(
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
 
-        # Store the final host, workspace, and optional branch together.
-        try:
-            await asyncio.to_thread(
-                conversation_store.set_host_id,
-                body.session_id,
-                host_id,
-                workspace,
-                git_branch,
-            )
-        except Exception:
-            await _rollback_runner_claim()
-            await _rollback_worktree()
-            raise
-
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
-        conn.pending_launches[request_id] = future
-
-        # Let the host reject an unconfigured harness before spawning.
-        harness: str | None = None
-        if agent_store is not None and agent_cache is not None:
-            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -935,7 +952,44 @@ def create_hosts_router(
                 harness=harness,
             )
         )
+
+        # Store the final host, workspace, and optional branch together.
+        persist_task = asyncio.create_task(
+            asyncio.to_thread(
+                conversation_store.set_host_id,
+                body.session_id,
+                host_id,
+                workspace,
+                git_branch,
+            )
+        )
         try:
+            await asyncio.shield(persist_task)
+        except BaseException as exc:
+
+            async def _rollback_persist_failure() -> None:
+                with contextlib.suppress(BaseException):
+                    await persist_task
+                persisted = (
+                    persist_task.done()
+                    and not persist_task.cancelled()
+                    and persist_task.exception() is None
+                )
+                if persisted:
+                    await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+                else:
+                    await _rollback_runner_claim()
+                await _rollback_worktree()
+
+            cleanup_task = asyncio.create_task(_rollback_persist_failure())
+            if isinstance(exc, asyncio.CancelledError):
+                _track_runner_launch_cleanup(cleanup_task)
+            else:
+                await cleanup_task
+            raise
+
+        try:
+            conn.pending_launches[request_id] = future
             host_registry.send_text(conn, launch_frame)
         except ConnectionError:
             conn.pending_launches.pop(request_id, None)
@@ -944,6 +998,10 @@ def create_hosts_router(
                 status_code=409,
                 detail="host connection was replaced",
             ) from None
+        except BaseException:
+            conn.pending_launches.pop(request_id, None)
+            await _rollback_failed_launch()
+            raise
 
         try:
             result = await asyncio.wait_for(
