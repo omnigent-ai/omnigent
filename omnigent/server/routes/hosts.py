@@ -17,6 +17,7 @@ from the DB so a host connected to replica B reads back as
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import weakref
@@ -67,12 +68,30 @@ from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
 
-# Host-scoped requests are routed to one replica, so this closes the local
-# create-worktree-before-bind race while the database CAS remains the fallback.
+# Managed `/hosts/{host_id}` requests are slice-keyed to the host-owning replica;
+# self-hosted servers are single-replica. The database CAS remains the fallback.
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _runner_launch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_runner_launch_cleanup_tasks: set[asyncio.Task[None]] = set()
+
+
+def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
+    """Keep detached launch cleanup alive and report failures."""
+    _runner_launch_cleanup_tasks.add(task)
+
+    def _done(completed: asyncio.Task[None]) -> None:
+        _runner_launch_cleanup_tasks.discard(completed)
+        if not completed.cancelled() and (error := completed.exception()) is not None:
+            _logger.warning(
+                "Detached runner launch cleanup failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_done)
+
 
 _LAUNCH_RESULT_TIMEOUT_S = 30.0
 # Per-call timeout for host.list_dir round-trips. Listing is a single
@@ -869,7 +888,9 @@ def create_hosts_router(
                     conversation_store.get_conversation,
                     body.session_id,
                 )
-                if current is None or current.runner_id is not None:
+                if current is None:
+                    raise HTTPException(status_code=404, detail="session not found")
+                if current.runner_id is not None:
                     raise HTTPException(
                         status_code=400,
                         detail="session already has a runner bound",
@@ -912,16 +933,29 @@ def create_hosts_router(
                     status_code=400,
                     detail="session already has a runner bound",
                 )
-            try:
-                await asyncio.to_thread(
+            persist_task = asyncio.create_task(
+                asyncio.to_thread(
                     conversation_store.set_host_id,
                     body.session_id,
                     host_id,
                     workspace,
                     git_branch,
                 )
-            except BaseException:
-                await _rollback_failed_launch()
+            )
+            try:
+                await asyncio.shield(persist_task)
+            except BaseException as exc:
+
+                async def _settle_and_rollback() -> None:
+                    with contextlib.suppress(BaseException):
+                        await persist_task
+                    await _rollback_failed_launch()
+
+                cleanup_task = asyncio.create_task(_settle_and_rollback())
+                if isinstance(exc, asyncio.CancelledError):
+                    _track_runner_launch_cleanup(cleanup_task)
+                else:
+                    await cleanup_task
                 raise
 
         request_id = secrets.token_hex(8)

@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -39,6 +41,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
+from omnigent.server.routes import hosts as hosts_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -109,6 +112,7 @@ class _HostCapture:
     launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
     create_started: asyncio.Event = field(default_factory=asyncio.Event)
+    remove_started: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # register(*, create_status=, create_error=, launch_status=) -> _HostCapture
@@ -223,6 +227,7 @@ async def register_host(
                         )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
+                    cap.remove_started.set()
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
@@ -352,10 +357,21 @@ async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A source-directory launch cannot bind while worktree creation is pending."""
     create_gate = asyncio.Event()
     cap = register_host(create_gate=create_gate)
+    source_harness_resolved = asyncio.Event()
+    original_resolve = hosts_routes._resolve_agent_harness
+
+    async def _resolve_and_signal(*args: object, **kwargs: object) -> str | None:
+        harness = await original_resolve(*args, **kwargs)  # type: ignore[arg-type]
+        if cap.create_started.is_set():
+            source_harness_resolved.set()
+        return harness
+
+    monkeypatch.setattr(hosts_routes, "_resolve_agent_harness", _resolve_and_signal)
     session_id = await _bare_session(client, "wt-race-agent")
 
     worktree_launch = asyncio.create_task(
@@ -364,7 +380,7 @@ async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     await asyncio.wait_for(cap.create_started.wait(), timeout=1.0)
 
     source_launch = asyncio.create_task(_launch(client, session_id, git=None))
-    await asyncio.sleep(0)
+    await asyncio.wait_for(source_harness_resolved.wait(), timeout=1.0)
     create_gate.set()
 
     worktree_response, source_response = await asyncio.gather(worktree_launch, source_launch)
@@ -378,6 +394,46 @@ async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     assert conv is not None
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-b"
     assert conv.git_branch == "feature/b"
+
+
+async def test_cancellation_waits_for_host_binding_before_rollback(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot race rollback against the host-binding write."""
+    bind_started = threading.Event()
+    release_bind = threading.Event()
+    original_set_host_id = SqlAlchemyConversationStore.set_host_id
+
+    def _delayed_set_host_id(*args: Any, **kwargs: Any) -> Any:
+        bind_started.set()
+        assert release_bind.wait(timeout=2.0)
+        return original_set_host_id(*args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_host_id", _delayed_set_host_id)
+    cap = register_host()
+    session_id = await _bare_session(client, "wt-bind-cancel-agent")
+
+    launch_task = asyncio.create_task(
+        _launch(client, session_id, git={"branch_name": "feature/cancel"})
+    )
+    assert await asyncio.to_thread(bind_started.wait, 2.0)
+    launch_task.cancel()
+    release_bind.set()
+    with pytest.raises(asyncio.CancelledError):
+        await launch_task
+
+    await asyncio.wait_for(cap.remove_started.wait(), timeout=1.0)
+    assert len(cap.remove) == 1
+    assert cap.launch == []
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is None
+    assert conv.host_id is None
+    assert conv.workspace is None
+    assert conv.git_branch is None
 
 
 async def test_launch_runner_with_existing_worktree_persists_without_creating(
