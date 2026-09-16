@@ -91,17 +91,42 @@ def isolated_config(tmp_path, monkeypatch):
         "CURSOR_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
-    # Redirect CLI-detected credential homes so a developer's real
-    # ~/.claude / ~/.codex logins don't leak into ambient detection.
-    monkeypatch.setenv("HOME", str(tmp_path))
-    # Stub out the two ambient-detection helpers that read real machine
-    # state regardless of HOME / env-var isolation:
-    # - _ollama_reachable: TCP-probes localhost:11434; a running Ollama
-    #   would otherwise add an entry to the harness menu and shift option
-    #   numbers, making input sequences non-deterministic.
-    # - _claude_login_detected: on macOS falls back to `claude auth status`
-    #   which reads the Keychain (not HOME), so a real Claude subscription
-    #   leaks through even with HOME redirected to tmp_path.
+    # Redirect only owned vendor paths, keeping HOME and CODEX_HOME unchanged.
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient._claude_credentials_path",
+        lambda: tmp_path / ".claude/.credentials.json",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient._codex_auth_path", lambda: tmp_path / ".codex/auth.json"
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient._codex_config_path", lambda: tmp_path / ".codex/config.toml"
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.hermes_auth.hermes_config_path",
+        lambda: tmp_path / ".hermes/config.yaml",
+    )
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / ".kimi-code"))
+    monkeypatch.setattr("omnigent._platform._cli_fallback_dirs", lambda: ())
+    monkeypatch.setattr(
+        "omnigent.onboarding.openclaw_config.default_config_paths",
+        lambda: (tmp_path / ".acpx/config.json", tmp_path / ".openclaw/openclaw.json"),
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_cleanup._default_codex_config_path",
+        lambda: tmp_path / ".codex/config.toml",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_cleanup._default_ucode_sidecar_paths",
+        lambda: [
+            tmp_path / ".codex/ucode.config.toml",
+            tmp_path / ".claude/ucode-settings.json",
+        ],
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_cleanup._default_claude_user_config_path",
+        lambda: tmp_path / ".claude.json",
+    )
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
     monkeypatch.setattr("omnigent.onboarding.ambient._claude_login_detected", lambda: False)
     return tmp_path
@@ -342,6 +367,117 @@ def test_configure_models_readd_key_does_not_drop_default(isolated_config) -> No
     # The re-added entry carries a default (the catalog's), not a missing one.
     assert "models" in entry["anthropic"], "re-add dropped the models block"
     assert entry["anthropic"]["models"]["default"] == default_chat_model("anthropic")
+    assert entry["anthropic"]["api_key_ref"] == "keychain:anthropic"
+    assert secrets.load_secret("anthropic") == "sk-ant-new-key"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_cli_replaces_ui_staged_key_and_cleans_only_unreferenced_secret(
+    isolated_config, shared: bool
+) -> None:
+    old_slot = "openai-" + "a" * 32
+    old_ref = f"keychain:{old_slot}"
+    config = {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key_ref": old_ref,
+                    "models": {"default": "gpt-5.5"},
+                },
+            }
+        }
+    }
+    if shared:
+        config["custom"] = {"credential_ref": old_ref}
+    (isolated_config / "config.yaml").write_text(yaml.safe_dump(config))
+    secrets.store_secret(old_slot, "old-secret")
+
+    stdin = "\n".join(["2", "2", "1", "new-secret", "", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    providers = _config_yaml(isolated_config)["providers"]
+    assert list(providers) == ["openai"]
+    assert providers["openai"]["openai"]["api_key_ref"] == "keychain:openai"
+    assert secrets.load_secret("openai") == "new-secret"
+    assert secrets.load_secret(old_slot) == ("old-secret" if shared else None)
+
+
+def test_cli_keeps_previous_secret_when_config_save_fails(isolated_config, monkeypatch) -> None:
+    old_slot = "openai-" + "a" * 32
+    old_ref = f"keychain:{old_slot}"
+    config = {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key_ref": old_ref,
+                },
+            }
+        }
+    }
+    (isolated_config / "config.yaml").write_text(yaml.safe_dump(config))
+    secrets.store_secret(old_slot, "old-secret")
+
+    def fail_save(_settings):
+        raise OSError("fixture save failure")
+
+    monkeypatch.setattr("omnigent.cli_config._save_global_config", fail_save)
+    stdin = "\n".join(["2", "2", "1", "new-secret", "", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code != 0
+    assert _config_yaml(isolated_config) == config
+    assert secrets.load_secret(old_slot) == "old-secret"
+
+
+def test_cli_reports_cleanup_failure_after_replacement_saved(isolated_config, monkeypatch) -> None:
+    from omnigent.onboarding import interactive
+
+    old_slot = "openai-" + "a" * 32
+    old_ref = f"keychain:{old_slot}"
+    config = {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key_ref": old_ref,
+                },
+            }
+        }
+    }
+    (isolated_config / "config.yaml").write_text(yaml.safe_dump(config))
+    secrets.store_secret(old_slot, "old-secret")
+    original_delete = secrets.delete_secret
+
+    def fail_old_slot(name: str) -> None:
+        if name == old_slot:
+            raise OSError("fixture cleanup failure")
+        original_delete(name)
+
+    monkeypatch.setattr(secrets, "delete_secret", fail_old_slot)
+    original_select = interactive.select
+    statuses: list[str] = []
+
+    def capture_status(*args, **kwargs):
+        if kwargs.get("status"):
+            statuses.append(kwargs["status"])
+        return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(interactive, "select", capture_status)
+    stdin = "\n".join(["2", "2", "1", "new-secret", "", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert any("stored secret cleanup did not complete" in status for status in statuses)
+    saved_ref = _config_yaml(isolated_config)["providers"]["openai"]["openai"]["api_key_ref"]
+    assert saved_ref == "keychain:openai"
+    assert secrets.load_secret("openai") == "new-secret"
+    assert secrets.load_secret(old_slot) == "old-secret"
 
 
 def test_configure_models_add_gateway_openrouter_chat_wire(isolated_config) -> None:
@@ -651,9 +787,12 @@ def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
         "Requires the Databricks extra — select for the install command."
     )
 
-    # With the SDK present (the dev/CI env — no patch), the description
-    # explains the routing instead of demanding an install.
-    monkeypatch.undo()
+    # With the SDK present, the description explains the routing instead of
+    # demanding an install.
+    monkeypatch.setattr(
+        "omnigent.onboarding.configure_models.databricks_sdk_installed",
+        lambda: True,
+    )
     options = add_menu_options()
     databricks = next(o for o in options if o.label.endswith("Databricks — workspace"))
     assert "Unity AI Gateway" in databricks.description
@@ -902,9 +1041,8 @@ def test_remove_databricks_cleans_ucode_wiring_without_asking(isolated_config) -
     Cleanup is the removal's expected behavior, so there is NO extra confirm:
     the stdin below carries no confirm digit, and an unexpected prompt would
     consume the trailing ``q``s and leave the entry in place (failing the
-    config assertion). Exercises the real cleanup against files under the
-    isolated tmp HOME — no stubs — so it also proves the default-path
-    resolution (``~/.codex/...``) and the user-key preservation.
+    config assertion). Exercises the real cleanup against the isolated owned
+    Codex paths, preserving the user's unrelated key.
     """
     _write_databricks_provider(isolated_config)
     codex_dir = isolated_config / ".codex"
@@ -1927,8 +2065,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
-    assert "~/.acpx/config.json" in result.output
-    assert "1 agent" in result.output
+    assert "1 agent found automatically" in result.output
     assert "Import coding agents from OpenClaw?" in result.output
     assert "Imported 1 OpenClaw/acpx agent" in result.output
     assert _config_yaml(isolated_config)["acp"] == {
@@ -2065,8 +2202,8 @@ def test_overview_hermes_row_reflects_configured_model(isolated_config, monkeypa
     * a finished ``hermes model`` run (a concrete ``provider`` + ``default``
       model) reads a green ✓ with ``"<provider> / <model>"``.
 
-    HOME is the isolated tmp dir (``isolated_config``), so the probe reads the
-    config written here, not the developer's real ``~/.hermes``. The probe
+    The isolated fixture redirects the Hermes config path, so the probe reads
+    the config written here, not the developer's real ``~/.hermes``. The probe
     binds ``harness_cli_installed`` at import, so patch the ``hermes_auth``
     symbol it actually calls rather than relying on the install fixture.
     """
@@ -2686,10 +2823,9 @@ command = "jq"
 
 
 def _write_codex_config_toml(home) -> None:
-    """Write an isaac-style ``~/.codex/config.toml`` under the test HOME.
+    """Write an isaac-style Codex config under the test's owned path.
 
-    :param home: The tmp HOME directory (the ``isolated_config`` fixture
-        redirects ``$HOME`` there).
+    :param home: The isolated fixture directory used by the Codex-path stub.
     """
     codex_dir = home / ".codex"
     codex_dir.mkdir(exist_ok=True)

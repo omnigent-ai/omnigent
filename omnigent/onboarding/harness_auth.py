@@ -23,8 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
-from typing import Literal, NamedTuple, Protocol
+from typing import Literal, NamedTuple
 
 from omnigent.onboarding.configure_models import (
     build_gateway_provider_entry,
@@ -34,8 +33,6 @@ from omnigent.onboarding.configure_models import (
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     OPENAI_FAMILY,
-    load_config,
-    provider_entry_settings,
 )
 
 _logger = logging.getLogger(__name__)
@@ -63,96 +60,6 @@ class StoreCredentialResult(NamedTuple):
     reason: str | None
 
 
-class _ConfigSaver(Protocol):
-    def __call__(
-        self,
-        settings: dict[str, object],
-        *,
-        deep_merge_providers: bool,
-    ) -> None: ...
-
-
-def _config_writer() -> tuple[Callable[[], dict[str, object]], _ConfigSaver]:
-    """Return a ``(load, save)`` pair for the global config on this host.
-
-    Isolated so the daemon writes to the same ``~/.omnigent/config.yaml`` the
-    readiness layer reads, without importing the CLI. ``save`` deep-merges the
-    ``providers:`` block (adds/updates one entry without dropping siblings),
-    matching ``omnigent setup``'s writer.
-    """
-    import yaml
-
-    from omnigent.onboarding.provider_config import _config_path
-
-    def _load() -> dict[str, object]:
-        return load_config()
-
-    def _save(settings: dict[str, object], *, deep_merge_providers: bool) -> None:
-        path = _config_path()
-        cfg = _load()
-        for key, value in settings.items():
-            if deep_merge_providers and key == "providers" and isinstance(value, dict):
-                existing = cfg.get("providers")
-                merged = dict(existing) if isinstance(existing, dict) else {}
-                merged.update(value)
-                cfg["providers"] = merged
-            else:
-                cfg[key] = value
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
-
-    return _load, _save
-
-
-def _pin_defaults_after_write(
-    name: str,
-    family: str,
-    load: Callable[[], dict[str, object]],
-    save: _ConfigSaver,
-) -> None:
-    """Point the right defaults at a just-written provider entry *name*.
-
-    Two pins, each only when nothing already claims the slot (so we never
-    silently re-route something the user configured):
-
-    1. The family default, when the family has none yet — the entry becomes
-       what claude/codex/pi resolve for that family.
-    2. Pi's own default, when Pi still can't resolve a provider. Pi consumes the
-       anthropic/openai families but has no CLI login, so it depends entirely on
-       an omnigent-managed provider. When the family default is a kind Pi can't
-       use — a subscription CLI login or bedrock — Pi's resolver skips it and
-       (unlike codex, which has a runtime route-around) finds nothing, leaving
-       Pi stuck at "needs-auth" even though the user just added a usable key. A
-       ``PI_SURFACE``-scoped default fixes that without touching the family's own
-       default (claude keeps its subscription). Applies to any pi-capable family
-       write; the guard makes it a no-op when the family default already serves
-       pi (the clean-config case).
-
-    ``set_default_provider`` rewrites the whole providers block (it clears
-    sibling default flags a deep-merge can't reach), so each pin re-reads first.
-    """
-    from omnigent.onboarding.provider_config import (
-        PI_SURFACE,
-        default_provider_for_harness,
-        get_default_provider,
-        set_default_provider,
-    )
-
-    def _pin(scope: str, resolved: object | None) -> None:
-        if resolved is not None:
-            return
-        block = load().get("providers")
-        if isinstance(block, dict):
-            save(
-                {"providers": set_default_provider(block, name, scope)},
-                deep_merge_providers=False,
-            )
-
-    _pin(family, get_default_provider(load(), family))
-    _pin(PI_SURFACE, default_provider_for_harness(load(), PI_SURFACE))
-
-
 def store_harness_credential(
     *,
     family: str,
@@ -164,11 +71,10 @@ def store_harness_credential(
 ) -> StoreCredentialResult:
     """Write a provider credential for a harness family, non-interactively.
 
-    Stores *secret* in the secret store under a family-derived name, then writes
-    a ``providers:`` entry (``key`` or ``gateway``) referencing it as
-    ``keychain:<name>`` — never the raw secret — and makes it the family default
-    when no default is set yet. This is the prompt-free equivalent of the
-    ``omnigent setup`` "add a key / gateway" path.
+    Stores *secret* with :func:`setup_operations.store_setup_credential`, then
+    writes a ``providers:`` entry (``key`` or ``gateway``) referencing the stored
+    slot — never the raw secret. Default assignment uses the shared
+    :func:`setup_operations.provider_add_settings` rules.
 
     The secret is passed by value and handed straight to the secret store; it is
     never logged, echoed, or written to ``config.yaml``.
@@ -198,19 +104,16 @@ def store_harness_credential(
                 False, None, "a gateway base_url must start with http:// or https://"
             )
 
-    from omnigent.onboarding import secrets as secret_store
-
-    # The entry name is the family for a key (one canonical vendor key per
-    # family), or "<family>-gateway" for a gateway, so a re-add updates in place
-    # rather than piling up duplicates. Keychain slot == entry name.
+    # Stable entry names let this quick-setup form replace its prior connection.
     name = family if kind == "key" else f"{family}-gateway"
     try:
-        secret_store.store_secret(name, secret.strip())
-    except Exception as exc:  # pragma: no cover - keychain/file backend failure
-        _logger.debug("store_harness_credential: secret store failed", exc_info=True)
-        return StoreCredentialResult(False, None, f"could not store the credential: {exc}")
+        from omnigent.onboarding.setup_operations import store_setup_credential
 
-    api_key_ref = f"keychain:{name}"
+        api_key_ref = store_setup_credential(name, secret.strip())
+    except Exception:  # pragma: no cover - keychain/file backend failure
+        _logger.debug("store_harness_credential: secret store failed")
+        return StoreCredentialResult(False, None, "could not store the credential")
+
     if kind == "key":
         entry = build_key_provider_entry(
             family=family,
@@ -228,15 +131,13 @@ def store_harness_credential(
             models={family: default_model} if default_model else None,
         )
 
-    _load, _save = _config_writer()
     try:
-        # Add/update the one provider entry (deep-merge keeps siblings), then
-        # point the family default (and, when needed, Pi's own default) at it.
-        _save(provider_entry_settings(name, entry, make_default=False), deep_merge_providers=True)
-        _pin_defaults_after_write(name, family, _load, _save)
-    except Exception as exc:  # pragma: no cover - config write failure
-        _logger.debug("store_harness_credential: config write failed", exc_info=True)
-        return StoreCredentialResult(False, None, f"could not write provider config: {exc}")
+        from omnigent.onboarding.setup_operations import persist_provider
+
+        persist_provider(name, entry)
+    except Exception:  # pragma: no cover - config write failure
+        _logger.debug("store_harness_credential: config write failed")
+        return StoreCredentialResult(False, None, "could not write provider config")
 
     return StoreCredentialResult(True, name, None)
 
@@ -341,11 +242,11 @@ def adopt_env_credential(*, family: str, env_var: str) -> StoreCredentialResult:
         api_key_ref=f"env:{env_var.strip()}",
         default_model=None,
     )
-    _load, _save = _config_writer()
     try:
-        _save(provider_entry_settings(name, entry, make_default=False), deep_merge_providers=True)
-        _pin_defaults_after_write(name, family, _load, _save)
-    except Exception as exc:  # pragma: no cover - config write failure
-        _logger.debug("adopt_env_credential: config write failed", exc_info=True)
-        return StoreCredentialResult(False, None, f"could not write provider config: {exc}")
+        from omnigent.onboarding.setup_operations import persist_provider
+
+        persist_provider(name, entry)
+    except Exception:  # pragma: no cover - config write failure
+        _logger.debug("adopt_env_credential: config write failed")
+        return StoreCredentialResult(False, None, "could not write provider config")
     return StoreCredentialResult(True, name, None)

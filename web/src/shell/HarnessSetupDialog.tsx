@@ -189,9 +189,9 @@ export function HarnessSetupDialog({
 
 /** Past-tense confirmation shown under a completed step, replacing the
  *  server's future-tense "we'll do X" detail once X is done. */
-function doneDetail(kind: string): string {
+export function setupStepDoneDetail(kind: string): string {
   if (kind === "install") return "Installed on the host.";
-  if (kind === "auth") return "Signed in on the host.";
+  if (kind === "auth") return "Authentication is configured locally on the host.";
   return "Done.";
 }
 
@@ -240,7 +240,7 @@ function SetupStepRow({
   // The server's detail is future-tense ("We'll install …") — right for a
   // pending step, wrong under a green check. Show a past-tense confirmation
   // once done instead of the stale promise.
-  const detail = done ? doneDetail(step.kind) : step.detail;
+  const detail = done ? setupStepDoneDetail(step.kind) : step.detail;
 
   return (
     <li className="flex flex-col gap-2" data-testid={`harness-setup-step-${step.kind}`}>

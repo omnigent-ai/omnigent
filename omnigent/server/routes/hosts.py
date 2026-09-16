@@ -1610,4 +1610,14 @@ def create_hosts_router(
 
         return {"object": "list", "data": worktrees}
 
+    from omnigent.server.routes.host_setup import create_host_setup_router
+
+    router.include_router(
+        create_host_setup_router(
+            host_registry,
+            host_store,
+            auth_provider=auth_provider,
+            flags=flags,
+        )
+    )
     return router

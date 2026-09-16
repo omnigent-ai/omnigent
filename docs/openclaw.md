@@ -30,6 +30,13 @@ detected registry, and confirm the agents to import. Each imported agent appears
 as `acp:<slug>` in Omnigent's harness picker and keeps its own authentication.
 Omnigent stores the launch command, not the agent's credentials.
 
+In [Settings → Providers](../README.md#3-choose--switch-models), select the
+execution computer and open **Advanced provider tools → Import ACP agents**.
+Use **Find existing configuration**, or provide an OpenClaw/acpx path on that
+computer, then preview and select the agents to import. Browser previews hide
+command arguments because they may contain secrets. Saving an import registers
+the launch commands; it does not execute them.
+
 For a one-off run without changing Omnigent's config, address an agent by its
 OpenClaw/acpx registry name:
 

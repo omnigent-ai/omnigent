@@ -141,6 +141,21 @@ def unescape_control_output(value: bytes) -> bytes:
     return _OCTAL_ESCAPE_RE.sub(lambda m: bytes([int(m.group(1), 8)]), value)
 
 
+def _trim_trailing_blank_capture_rows(capture: bytes) -> bytes:
+    """Remove unused rows from a captured pane before replaying it.
+
+    The seed clears the browser grid first, so blank rows below the pane's last
+    visible cell carry no information. Replaying them can scroll useful rows
+    away when the pane has not yet resized to a shorter browser viewport.
+    """
+    rows = capture.split(b"\n")
+    if rows and rows[-1] == b"":
+        rows.pop()
+    while rows and not rows[-1].strip(b" \t\r"):
+        rows.pop()
+    return b"\n".join(rows)
+
+
 async def _read_tmux_buffer(
     tmux: str,
     socket_path: str,
@@ -234,7 +249,12 @@ def _hex_send_keys_commands(target: str, data: bytes) -> list[bytes]:
     return commands
 
 
-async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
+async def _run_tmux_capture(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    include_scrollback: bool = True,
+) -> bytes | None:
     """Capture the current pane screen (with escapes) to seed the browser view.
 
     A control client only receives ``%output`` produced after it attaches, so
@@ -276,6 +296,10 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
       lines that were never part of the app's UI — corrupting the seed. tmux's
       ``#{alternate_on}`` distinguishes the two.
 
+    Current-screen-only seeds omit trailing blank rows because the clear
+    prelude already supplies them. This keeps a pre-resize pane from scrolling
+    useful output away in a shorter browser viewport.
+
     **Screen/input modes** (alt screen, mouse tracking, DECCKM) are replayed
     around the content via :func:`_mode_restore_escapes` — capture-pane records
     cells only, and a TUI that enabled these before this client attached would
@@ -283,6 +307,9 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
 
     :param socket_path: tmux server socket path.
     :param tmux_target: The ``-t`` target, e.g. ``"main"``.
+    :param include_scrollback: Include primary-screen history in addition to
+        the current visible pane. Alternate-screen history is always excluded;
+        false also omits unused trailing rows.
     :returns: The captured bytes to write into xterm, or ``None`` on failure
         (the caller proceeds without a seed rather than aborting the attach).
     """
@@ -294,7 +321,7 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     # alternate screen ``-S -`` leaks stale primary history (see docstring).
     # ``-J`` joins soft-wrapped rows into logical lines (see docstring).
     capture_args = ["capture-pane", "-e", "-p", "-J", "-t", tmux_target]
-    if meta is not None and not meta.alternate_on:
+    if include_scrollback and meta is not None and not meta.alternate_on:
         capture_args += ["-S", "-"]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -310,13 +337,14 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
         return None
     if proc.returncode != 0:
         return None
-    # ``capture-pane -p`` emits one LF per row — INCLUDING a trailing LF after
-    # the final row. Writing that trailing separator paints the last row and
-    # then advances the cursor past it, which on a full-height pane scrolls the
-    # whole screen up by one line (the "extra line" / off-by-one). Strip the
-    # single trailing newline so the last row is painted with no line break
-    # after it; the cursor-restore escape then lands on the correct row.
-    body = stdout[:-1] if stdout.endswith(b"\n") else stdout
+    if include_scrollback:
+        # Preserve the established full-history seed byte-for-byte apart from
+        # its final delimiter, which would scroll a full-height pane one row.
+        body = stdout[:-1] if stdout.endswith(b"\n") else stdout
+    else:
+        # Current-screen setup attaches can precede the first browser resize.
+        # Omit unused rows so a taller pane cannot scroll its prompt away.
+        body = _trim_trailing_blank_capture_rows(stdout)
     # Normalize the remaining bare-LF row separators to CRLF (see docstring) and
     # paint onto a cleared screen from the home cursor so the seed can't
     # staircase.
@@ -502,6 +530,7 @@ async def bridge_tmux_control_to_websocket(
     socket_path: str,
     tmux_target: str,
     read_only: bool,
+    seed_scrollback: bool = True,
     on_client_interaction: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
@@ -517,6 +546,7 @@ async def bridge_tmux_control_to_websocket(
     :param tmux_target: The ``-t`` target string identifying the session.
     :param read_only: When ``True``, attach with ``-r`` *and* drop inbound
         binary input frames at the application layer (defense in depth).
+    :param seed_scrollback: Whether the seed includes primary-screen history.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -543,7 +573,11 @@ async def bridge_tmux_control_to_websocket(
     # Seed the browser terminal with the current screen BEFORE attaching so no
     # pre-attach content is missing. Failure is non-fatal — a live pane redraw
     # will repaint it shortly.
-    seed = await _run_tmux_capture(socket_path, tmux_target)
+    seed = await _run_tmux_capture(
+        socket_path,
+        tmux_target,
+        include_scrollback=seed_scrollback,
+    )
     if seed:
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_bytes(seed)

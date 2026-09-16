@@ -100,6 +100,19 @@ describe("settingsNavGroups", () => {
     expect(withAccount[0]).toBe("account");
   });
 
+  it("includes Providers in General for every mode", () => {
+    for (const groups of [
+      settingsNavGroups(false, false),
+      settingsNavGroups(true, false),
+      settingsNavGroups(false, true, true),
+      settingsNavGroups(false, false, true, true),
+    ]) {
+      const general = groups.find((group) => group.title === "General");
+      expect(general?.items.map((item) => item.id)).toContain("providers");
+      expect(general?.items.find((item) => item.id === "providers")?.label).toBe("Providers");
+    }
+  });
+
   it("includes the Local CLI section only in the desktop shell", () => {
     const ids = (isDesktop: boolean) =>
       settingsNavGroups(false, isDesktop)
@@ -385,6 +398,10 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/updates")).toEqual({
       inSettings: true,
       section: "updates",
+    });
+    expect(routeHook("/settings/providers")).toEqual({
+      inSettings: true,
+      section: "providers",
     });
     expect(routeHook("/settings")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/not-a-section")).toEqual({

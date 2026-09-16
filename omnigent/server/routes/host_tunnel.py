@@ -46,6 +46,8 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSetupResultFrame,
+    HostSetupTerminalFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -133,6 +135,9 @@ def create_host_tunnel_router(
     allow_host_id_reown = (
         local_single_user if local_single_user is not None else local_single_user_enabled()
     )
+    from omnigent.host.setup_logging import install_setup_server_log_filter
+
+    install_setup_server_log_filter()
     router = APIRouter()
 
     @router.websocket("/hosts/{host_id}/tunnel")
@@ -718,6 +723,31 @@ async def _receive_loop(
                         "error": frame.error,
                     }
                 )
+            continue
+
+        if isinstance(frame, HostSetupResultFrame):
+            setup_future = conn.pending_setup.pop(frame.request_id, None)
+            if setup_future is not None and not setup_future.done():
+                setup_future.set_result(
+                    {
+                        "payload": frame.payload,
+                        "error_status": frame.error_status,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostSetupTerminalFrame):
+            attachment = conn.setup_attachments.get(frame.attachment_id)
+            if attachment is not None and attachment[0] == frame.operation_id:
+                queue = attachment[1]
+                if queue.full():
+                    # Slow consumers are detached; never retain a transcript.
+                    while not queue.empty():
+                        queue.get_nowait()
+                    queue.put_nowait(None)
+                else:
+                    queue.put_nowait(frame.secret_payload)
             continue
 
         if isinstance(frame, HostInstallHarnessResultFrame):

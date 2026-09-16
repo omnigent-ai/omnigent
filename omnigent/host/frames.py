@@ -87,6 +87,9 @@ def classify_launch_refusal(
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
+    SETUP_REQUEST = "host.setup_request"
+    SETUP_RESULT = "host.setup_result"
+    SETUP_TERMINAL = "host.setup_terminal"
     HELLO = "host.hello"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
@@ -169,6 +172,7 @@ class HostHelloFrame:
     interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    setup_protocol_version: int = 0
 
 
 @dataclass
@@ -1039,8 +1043,55 @@ class HostImportLocalDoneFrame:
     failed: int = 0
 
 
+class SetupMethod(str, Enum):
+    """Fixed host setup operations; no shell or filesystem RPC."""
+
+    INVENTORY = "inventory"
+    ACTION = "action"
+    DETECT = "detect"
+    START = "start"
+    GET = "get"
+    VERIFY = "verify"
+    CANCEL = "cancel"
+    ATTACH = "attach"
+    DETACH = "detach"
+
+
+@dataclass
+class HostSetupRequestFrame:
+    """Owner-authorized setup request; payload must never enter telemetry."""
+
+    request_id: str
+    method: SetupMethod
+    secret_payload: _JsonObject = field(default_factory=dict, repr=False)
+    operation_id: str = ""
+    attachment_id: str = ""
+
+
+@dataclass
+class HostSetupResultFrame:
+    """Correlated sanitized setup response."""
+
+    request_id: str
+    payload: _JsonObject = field(default_factory=dict)
+    error_status: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostSetupTerminalFrame:
+    """Ephemeral terminal bytes/control, scoped to one attachment."""
+
+    operation_id: str
+    attachment_id: str
+    secret_payload: _JsonObject = field(default_factory=dict, repr=False)
+
+
 HostFrame = (
     HostHelloFrame
+    | HostSetupRequestFrame
+    | HostSetupResultFrame
+    | HostSetupTerminalFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
@@ -1116,6 +1167,38 @@ def encode_host_frame(frame: HostFrame) -> str:
     :returns: JSON string for the WebSocket text message.
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
+    # Setup may carry credentials or vendor output. Exclude the entire envelope
+    # from content capture rather than relying on recursive field redaction.
+    if isinstance(frame, HostSetupRequestFrame):
+        return json.dumps(
+            {
+                "kind": HostFrameKind.SETUP_REQUEST.value,
+                "request_id": frame.request_id,
+                "method": frame.method.value,
+                "secret_payload": frame.secret_payload,
+                "operation_id": frame.operation_id,
+                "attachment_id": frame.attachment_id,
+            }
+        )
+    if isinstance(frame, HostSetupResultFrame):
+        return json.dumps(
+            {
+                "kind": HostFrameKind.SETUP_RESULT.value,
+                "request_id": frame.request_id,
+                "payload": frame.payload,
+                "error_status": frame.error_status,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostSetupTerminalFrame):
+        return json.dumps(
+            {
+                "kind": HostFrameKind.SETUP_TERMINAL.value,
+                "operation_id": frame.operation_id,
+                "attachment_id": frame.attachment_id,
+                "secret_payload": frame.secret_payload,
+            }
+        )
     if isinstance(frame, HostHelloFrame):
         return _encode_payload(
             {
@@ -1129,6 +1212,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "setup_protocol_version": frame.setup_protocol_version,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1554,6 +1638,40 @@ def _decode_known_host_frame(
     :returns: The typed host frame dataclass.
     :raises ValueError: If the kind is unexpectedly unhandled.
     """
+    if kind in (
+        HostFrameKind.SETUP_REQUEST,
+        HostFrameKind.SETUP_RESULT,
+        HostFrameKind.SETUP_TERMINAL,
+    ):
+        payload_key = "payload" if kind == HostFrameKind.SETUP_RESULT else "secret_payload"
+        payload = msg.get(payload_key, {})
+        if not isinstance(payload, dict):
+            raise ValueError("setup payload must be an object")
+        if kind == HostFrameKind.SETUP_REQUEST:
+            return HostSetupRequestFrame(
+                request_id=_required_str(msg, "request_id"),
+                method=SetupMethod(_required_str(msg, "method")),
+                secret_payload=payload,
+                operation_id=_required_str(msg, "operation_id"),
+                attachment_id=_required_str(msg, "attachment_id"),
+            )
+        if kind == HostFrameKind.SETUP_RESULT:
+            error_status = msg.get("error_status")
+            if error_status is not None and (
+                type(error_status) is not int or not 400 <= error_status <= 599
+            ):
+                raise ValueError("invalid setup error status")
+            return HostSetupResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                payload=payload,
+                error_status=error_status,
+                error=_optional_nullable_str(msg, "error"),
+            )
+        return HostSetupTerminalFrame(
+            operation_id=_required_str(msg, "operation_id"),
+            attachment_id=_required_str(msg, "attachment_id"),
+            secret_payload=payload,
+        )
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
@@ -1656,6 +1774,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         ),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        setup_protocol_version=1 if msg.get("setup_protocol_version") == 1 else 0,
     )
 
 

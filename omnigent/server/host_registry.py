@@ -308,6 +308,10 @@ class HostConnection:
     pending_credential_detects: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_setup: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
+    setup_attachments: dict[str, tuple[str, asyncio.Queue[dict[str, Any] | None]]] = field(
+        default_factory=dict
+    )
     credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
@@ -321,6 +325,19 @@ class HostConnection:
     pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
         default_factory=dict,
     )
+
+
+def _close_setup_channels(conn: HostConnection) -> None:
+    """Fail pending setup calls and discard ephemeral terminal output."""
+    for future in conn.pending_setup.values():
+        if not future.done():
+            future.set_exception(ConnectionError("host disconnected"))
+    conn.pending_setup.clear()
+    for _, queue in conn.setup_attachments.values():
+        while not queue.empty():
+            queue.get_nowait()
+        queue.put_nowait(None)
+    conn.setup_attachments.clear()
 
 
 class HostRegistry:
@@ -402,6 +419,7 @@ class HostRegistry:
                     host_id,
                 )
                 old.outbound_queue.put_nowait(None)
+                _close_setup_channels(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -443,6 +461,7 @@ class HostRegistry:
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
+        _close_setup_channels(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

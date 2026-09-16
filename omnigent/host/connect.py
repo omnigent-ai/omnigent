@@ -82,6 +82,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSetupRequestFrame,
+    HostSetupTerminalFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -1006,6 +1008,9 @@ class HostProcess:
         if not self._interactive_shells:
             self._interactive_shells = ["bash"]
         self._runners: dict[str, _RunnerHandle] = {}
+        from omnigent.host.setup_transport import HostSetupDispatcher
+
+        self._setup_dispatcher = HostSetupDispatcher()
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -3667,6 +3672,7 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            await self._setup_dispatcher.shutdown()
             # Await the cancellations: a bare cancel() leaves the tasks
             # pending at loop close ("Task was destroyed but it is pending!").
             if self._reaper_task is not None:
@@ -3786,10 +3792,13 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        from omnigent.host.setup_logging import setup_host_wire_logger
+
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
+                logger=setup_host_wire_logger(),
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -3847,6 +3856,7 @@ class HostProcess:
             # between connections park in _unreported_exits instead of
             # racing a half-closed socket.
             self._ws = None
+            await self._setup_dispatcher.disconnect()
             # Close the tunnel context whether the serve loop returned
             # normally or raised (disconnect → reconnect). Mirrors the
             # ``async with`` this replaced; the manual enter is only so the
@@ -3980,6 +3990,7 @@ class HostProcess:
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
+            setup_protocol_version=1,
             configured_harnesses=self._configured_harnesses,
             gateway_inference=self._gateway_inference,
             interactive_shells=self._interactive_shells,
@@ -4165,6 +4176,9 @@ class HostProcess:
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
             return
+        if isinstance(frame, (HostSetupRequestFrame, HostSetupTerminalFrame)):
+            await self._dispatch_host_frame(ws, frame)
+            return
         # Handle the frame inside a CONSUMER span parented on the trace
         # context the server stamped into the frame envelope, so the
         # host's work (and the result frame it sends back) nests under
@@ -4199,7 +4213,16 @@ class HostProcess:
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.
             self._raise_connection_error(frame)
-        if isinstance(frame, HostLaunchRunnerFrame):
+        if isinstance(frame, HostSetupRequestFrame):
+
+            async def send_setup(event: HostSetupTerminalFrame) -> None:
+                await ws.send(encode_host_frame(event))
+
+            result = await self._setup_dispatcher.request(frame, send_setup)
+            await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostSetupTerminalFrame):
+            await self._setup_dispatcher.terminal(frame)
+        elif isinstance(frame, HostLaunchRunnerFrame):
             # Frames run on concurrent tasks, but launch/stop must keep their
             # arrival order relative to each other (a stop for a session must
             # not overtake the launch it targets). The lock is this task's
@@ -4223,12 +4246,28 @@ class HostProcess:
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
-            install_result = await asyncio.to_thread(self._handle_install_harness, frame)
+            async with self._setup_dispatcher.write_lock:
+                if self._setup_dispatcher.has_active_operation():
+                    install_result = HostInstallHarnessResultFrame(
+                        request_id=frame.request_id,
+                        status="failed",
+                        error="another setup operation is running",
+                    )
+                else:
+                    install_result = await asyncio.to_thread(self._handle_install_harness, frame)
             await ws.send(encode_host_frame(install_result))
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
-            secret_result = await asyncio.to_thread(self._handle_store_secret, frame)
+            async with self._setup_dispatcher.write_lock:
+                if self._setup_dispatcher.has_active_operation():
+                    secret_result = HostStoreSecretResultFrame(
+                        request_id=frame.request_id,
+                        status="failed",
+                        error="another setup operation is running",
+                    )
+                else:
+                    secret_result = await asyncio.to_thread(self._handle_store_secret, frame)
             await ws.send(encode_host_frame(secret_result))
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it
