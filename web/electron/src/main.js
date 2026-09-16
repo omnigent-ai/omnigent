@@ -2026,6 +2026,22 @@ function notificationSoundEnabled() {
   return loadSettings().notification_sound_enabled === true;
 }
 
+function currentNotificationMode() {
+  return loadSettings().notification_mode === "always" ? "always" : "when-away";
+}
+
+function setNotificationMode(mode) {
+  const normalized = mode === "always" ? "always" : "when-away";
+  const settings = loadSettings();
+  settings.notification_mode = normalized;
+  saveSettings(settings);
+  for (const [win, state] of windows) {
+    if (state.origin && !win.isDestroyed()) {
+      win.webContents.send("omnigent:notification-mode-changed", normalized);
+    }
+  }
+}
+
 /**
  * The currently-selected system sound name, validated against what's installed.
  * Falls back to the default (then the first available) when the saved value is
@@ -2253,35 +2269,36 @@ function buildMenu() {
     template.push({ label: "Help", submenu: [aboutItem] });
   }
 
-  // Consolidate non-production affordances behind one top-level menu. It is
-  // always present in development and can be explicitly enabled in a packaged
-  // macOS app through the DeveloperMode user default. Restart-to-update stays
-  // in the production Server menu because it is a normal install path.
-  if (developerModeEnabled()) {
-    /** @type {Electron.MenuItemConstructorOptions[]} */
-    const debugSubmenu = [];
-
-    // macOS notification-sound settings: an on/off switch plus a picker of
-    // system sounds. Selections persist in settings.json and are read live by
-    // the notify handler, so a change applies to the next notification without
-    // a relaunch. macOS-only because playback uses `afplay`.
-    if (isMac) {
-      /** @type {Electron.MenuItemConstructorOptions[]} */
-      const soundChoices = systemSoundNames().map((name) => ({
-        id: `notification_sound_${name}`,
-        label: name,
-        type: "radio",
-        checked: currentNotificationSoundName() === name,
-        click: () => {
-          const settings = loadSettings();
-          settings.notification_sound_name = name;
-          saveSettings(settings);
-          // Pick-to-preview: play the choice immediately so the user hears it,
-          // even when the sound is currently toggled off.
-          playSystemSound(name);
+  if (isMac) {
+    const soundChoices = systemSoundNames().map((name) => ({
+      id: `notification_sound_${name}`,
+      label: name,
+      type: "radio",
+      checked: currentNotificationSoundName() === name,
+      click: () => {
+        const settings = loadSettings();
+        settings.notification_sound_name = name;
+        saveSettings(settings);
+        playSystemSound(name);
+      },
+    }));
+    template.push({
+      label: "Notifications",
+      submenu: [
+        {
+          id: "notification_mode_when_away",
+          label: "When Away from Conversation",
+          type: "radio",
+          checked: currentNotificationMode() === "when-away",
+          click: () => setNotificationMode("when-away"),
         },
-      }));
-      debugSubmenu.push(
+        {
+          id: "notification_mode_always",
+          label: "Always (Even When Focused)",
+          type: "radio",
+          checked: currentNotificationMode() === "always",
+          click: () => setNotificationMode("always"),
+        },
         { type: "separator" },
         {
           id: "notification_sound_enabled",
@@ -2295,8 +2312,17 @@ function buildMenu() {
           },
         },
         { label: "Sound", submenu: soundChoices },
-      );
-    }
+      ],
+    });
+  }
+
+  // Consolidate non-production affordances behind one top-level menu. It is
+  // always present in development and can be explicitly enabled in a packaged
+  // macOS app through the DeveloperMode user default. Restart-to-update stays
+  // in the production Server menu because it is a normal install path.
+  if (developerModeEnabled()) {
+    /** @type {Electron.MenuItemConstructorOptions[]} */
+    const debugSubmenu = [];
 
     debugSubmenu.push({ type: "separator" }, { role: "toggleDevTools" });
 
@@ -2475,6 +2501,10 @@ function browserRegistryForSender(event) {
 }
 
 function registerIpc() {
+  ipcMain.handle("omnigent:get-notification-mode", (event) => {
+    if (!isPinnedOriginSender(event)) return "when-away";
+    return currentNotificationMode();
+  });
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.

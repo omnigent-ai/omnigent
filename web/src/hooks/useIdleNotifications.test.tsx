@@ -20,6 +20,8 @@ vi.mock("@/lib/browserNotifications", () => ({
 // "running inside the desktop shell" discriminator without a real Electron env.
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: vi.fn(),
+  getNativeNotificationMode: vi.fn().mockResolvedValue("when-away"),
+  onNativeNotificationModeChanged: vi.fn().mockReturnValue(() => {}),
   setBadgeCount: vi.fn().mockResolvedValue(undefined),
   // Returns an unsubscribe fn; tests that exercise native click routing
   // capture the registered callback via this mock's calls.
@@ -44,7 +46,13 @@ import {
   requestNotificationPermission,
   showNotification,
 } from "@/lib/browserNotifications";
-import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
+import {
+  getNativeNotificationMode,
+  isNativeShell,
+  onNativeNotificationActivated,
+  onNativeNotificationModeChanged,
+  setBadgeCount,
+} from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
   resetReadStateForTests,
@@ -58,6 +66,8 @@ const getPermMock = vi.mocked(getNotificationPermission);
 const requestPermMock = vi.mocked(requestNotificationPermission);
 const showMock = vi.mocked(showNotification);
 const isNativeMock = vi.mocked(isNativeShell);
+const getNativeNotificationModeMock = vi.mocked(getNativeNotificationMode);
+const onNativeNotificationModeChangedMock = vi.mocked(onNativeNotificationModeChanged);
 const onNativeActivatedMock = vi.mocked(onNativeNotificationActivated);
 const setBadgeMock = vi.mocked(setBadgeCount);
 const fetchPreviewMock = vi.mocked(fetchLastAssistantText);
@@ -130,6 +140,8 @@ beforeEach(() => {
   fetchPreviewMock.mockResolvedValue(undefined);
   getPermMock.mockReturnValue("granted");
   isNativeMock.mockReturnValue(false);
+  getNativeNotificationModeMock.mockResolvedValue("when-away");
+  onNativeNotificationModeChangedMock.mockReturnValue(() => {});
   // Default: window NOT focused, so attention events surface (the common
   // "user looked away" case). Focus-specific tests override this.
   setWindowFocused(false);
@@ -280,6 +292,20 @@ describe("useIdleNotifications turn-end transitions", () => {
 });
 
 describe("useIdleNotifications elicitation transitions", () => {
+  it("notifies a focused active conversation in native always mode", async () => {
+    setWindowFocused(true);
+    isNativeMock.mockReturnValue(true);
+    getNativeNotificationModeMock.mockResolvedValue("always");
+    setConversations([conv("a", "running", 0)]);
+    const { rerender } = renderHook(() => useIdleNotifications("a"));
+    await flushPreview();
+
+    setConversations([conv("a", "running", 1)]);
+    rerender();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
   it("notifies when pending_elicitations_count increases (0 -> 1)", () => {
     setConversations([conv("a", "running", 0)]);
     const { rerender } = renderHook(() => useIdleNotifications());
@@ -407,6 +433,73 @@ describe("useIdleNotifications re-notification dedup (one beep until viewed)", (
 });
 
 describe("useIdleNotifications active-view suppression", () => {
+  it("preserves a focused completion until the native notification mode loads", async () => {
+    setWindowFocused(true);
+    isNativeMock.mockReturnValue(true);
+    let resolveMode!: (mode: "when-away" | "always") => void;
+    getNativeNotificationModeMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveMode = resolve;
+      }),
+    );
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications("a"));
+
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await act(async () => {
+      resolveMode("always");
+      await Promise.resolve();
+    });
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a newer native mode event when the initial getter resolves later", async () => {
+    setWindowFocused(true);
+    isNativeMock.mockReturnValue(true);
+    let resolveMode!: (mode: "when-away" | "always") => void;
+    let modeChanged!: (mode: "when-away" | "always") => void;
+    getNativeNotificationModeMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveMode = resolve;
+      }),
+    );
+    onNativeNotificationModeChangedMock.mockImplementation((callback) => {
+      modeChanged = callback;
+      return () => {};
+    });
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications("a"));
+
+    act(() => modeChanged("always"));
+    await act(async () => {
+      resolveMode("when-away");
+      await Promise.resolve();
+    });
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("notifies a focused active conversation when native mode is always", async () => {
+    setWindowFocused(true);
+    isNativeMock.mockReturnValue(true);
+    getNativeNotificationModeMock.mockResolvedValue("always");
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications("a"));
+    await flushPreview();
+
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
   it("does NOT notify a turn end for the conversation actively viewed (focused + active)", () => {
     setWindowFocused(true);
     setConversations([conv("a", "running")]);
@@ -701,6 +794,7 @@ describe("useIdleNotifications gating", () => {
     getPermMock.mockReturnValue("default");
     setConversations([conv("a", "running")]);
     const { rerender } = renderHook(() => useIdleNotifications());
+    await flushPreview();
     setConversations([conv("a", "idle")]);
     rerender();
     await settle();
