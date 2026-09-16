@@ -9,6 +9,8 @@ import httpx
 
 from omnigent.entities import Conversation
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runtime import get_caps
+from omnigent.server.routing_backend import routing_available
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -59,6 +61,7 @@ class RunnerSessionInitializer:
                         conversation,
                         server_version=self._server_version,
                         suppress_recovery_turn=suppress_recovery_turn,
+                        smart_routing_available=routing_available(get_caps()),
                     ),
                     timeout=timeout,
                 ),
