@@ -73,6 +73,7 @@ function actionContext(
     inputFocus: isInputLike(element),
     terminalFocus: Boolean(element?.closest(".xterm")),
     monacoFocus: Boolean(element?.closest(".monaco-editor")),
+    commandPaletteFocus: Boolean(element?.closest("[cmdk-input]")),
     eventMeta: event?.metaKey ?? false,
   };
 }
