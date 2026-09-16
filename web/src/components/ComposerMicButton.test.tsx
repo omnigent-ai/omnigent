@@ -392,6 +392,35 @@ describe("ComposerMicButton (server dictation)", () => {
     );
   });
 
+  it("shows a connecting state during the handshake, then flips to listening", async () => {
+    // Hold the handshake open so the connecting window is observable (the real
+    // first take cold-loads the model for up to ~40s).
+    let resolveStart!: (s: SessionStub) => void;
+    sessionStartMock = vi.fn((events: DictationSessionEvents) => {
+      sessionEvents = events;
+      return new Promise<SessionStub>((resolve) => {
+        resolveStart = resolve;
+      });
+    });
+    renderServerMode();
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    // Handshake in flight: busy, not yet pressed (no audio is flowing).
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(button).toHaveAttribute("title", "Starting voice input…");
+
+    await act(async () => {
+      resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
+    });
+    // Ready: the take is live and the spinner is gone.
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(button).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("routes partials to onInterim and finals to onTranscript", async () => {
     const onTranscript = vi.fn();
     const onInterim = vi.fn();

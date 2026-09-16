@@ -7,7 +7,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
-import { MicIcon, SquareIcon } from "lucide-react";
+import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
@@ -123,6 +123,10 @@ export const ComposerMicButton = ({
   const serverAvailableRef = useRef(serverAvailable);
   serverAvailableRef.current = serverAvailable;
   const [isListening, setIsListening] = useState(false);
+  // Server-path only: the take has started but audio isn't flowing yet (the
+  // first take cold-loads the model, up to ~40s). Shows a spinner so the click
+  // isn't a dead-looking button until it flips to listening.
+  const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const sessionRef = useRef<DictationSession | null>(null);
@@ -375,6 +379,7 @@ export const ComposerMicButton = ({
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
       interimRef.current = "";
+      setConnecting(true);
       onVoiceStartRef.current?.();
       const next = await DictationSession.start({
         onPartial: (text) => {
@@ -421,6 +426,9 @@ export const ComposerMicButton = ({
       );
       setIsListening(false);
     }
+    // Reached only by the start path (the stop branch returns earlier), so this
+    // clears the handshake spinner on both success and failure.
+    setConnecting(false);
     serverBusyRef.current = false;
   }, [reportError]);
   toggleServerRef.current = toggleServer;
@@ -507,7 +515,7 @@ export const ComposerMicButton = ({
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.
   const a11yLabel = "Voice dictation";
-  const tooltip = error ?? a11yLabel;
+  const tooltip = error ?? (connecting ? "Starting voice input…" : a11yLabel);
 
   return (
     <Button
@@ -517,6 +525,7 @@ export const ComposerMicButton = ({
       disabled={disabled}
       onClick={toggle}
       aria-pressed={isListening}
+      aria-busy={connecting}
       aria-label={a11yLabel}
       title={tooltip}
       className={cn(
@@ -527,7 +536,9 @@ export const ComposerMicButton = ({
         className,
       )}
     >
-      {isListening ? (
+      {connecting ? (
+        <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
+      ) : isListening ? (
         // Bars fade out and stop icon fades in on hover OR keyboard focus,
         // so keyboard users get the stop affordance without needing hover.
         <span className="relative flex size-4 items-center justify-center" aria-hidden>
