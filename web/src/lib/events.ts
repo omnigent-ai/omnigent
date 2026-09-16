@@ -322,6 +322,8 @@ export interface MessageDone {
   content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
+  /** Native live-preview stream finalized by this item. */
+  messageId?: string;
 }
 
 /**

@@ -513,13 +513,12 @@ Fields:
     already carry the message in `items`.
 
   todos (array, default `[]`)
-    Current Claude Code todo list for `omnigent claude` sessions.
+    Current native Plan/TODO list reported by a harness.
     Each item: `{content: string, status: "pending"|"in_progress"|"completed",
     activeForm: string}` where `activeForm` is the gerund form of the
-    current activity (e.g. `"Running tests"`). Sourced from the
-    server's in-memory todo cache (updated by `external_session_todos`
-    events). Empty for non-claude-native sessions or before the first
-    turn creates todos.
+    current activity (e.g. `"Running tests"`). Stored under a reserved
+    key in the existing compressed session-state metadata and updated by
+    `external_session_todos` events. Empty before the first Plan update.
 
   terminal_pending (boolean, default `false`)
     `true` while the runner is auto-creating the terminal for a
@@ -973,16 +972,15 @@ Request body matches `SessionEventInput`:
                                   `{status: "in_progress" | "completed" |
                                   "failed"}`.
       - "external_session_todos"
-                                — internal terminal-observed todo-list
-                                  update from the claude-native forwarder.
-                                  Caches the list in memory (used by the
-                                  snapshot `todos` field) and publishes a
-                                  `session.todos` SSE event. Payload:
+                                — internal native Plan update from a harness.
+                                  Stores the validated snapshot under a reserved
+                                  key in existing compressed `session_state`
+                                  metadata and publishes `session.todos`. Payload:
                                   `{todos: [{content: str, status:
                                   "pending"|"in_progress"|"completed",
                                   activeForm: string}]}`.
-                                  Malformed items are silently dropped
-                                  before caching/broadcasting.
+                                  Malformed items are dropped; item/text/byte
+                                  bounds fail the request with 400.
     The route validates `type` against the conversation entity's item
     discriminator map plus the documented control/internal event types.
     Unknown values fail loud with 400 — they are NOT silently enqueued.

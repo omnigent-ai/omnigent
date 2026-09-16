@@ -2,21 +2,18 @@
 
 Journey (all through real product code): a web user message starts native
 Codex turn 1 (``turn/start``; the bridge records it as active). Codex then
-moves on to its own next turn — the user drives the embedded Codex TUI pane
-directly, or Codex starts an internal follow-on turn — while Omnigent's
-bridge state still records turn 1. The next web message steers the recorded
-turn (``turn/steer`` with ``expectedTurnId=turn_1``); the app-server rejects
-it with its JSON-RPC ``-32600`` mismatch (``expected active turn id turn_1
-but found turn_2``), which is not the retryable ``no active turn to steer``
-idle semantic, so the web turn dies abnormally. The adapter's abnormal-exit
-cleanup then interrupts the abandoned inner session with the same stale
-recorded turn id, the app-server rejects that too, and ``_safe_interrupt``
+moves on to its own next turn - the user drives the embedded Codex TUI pane
+directly, or Codex starts an internal follow-on turn - while Omnigent's
+bridge state still records turn 1. The next web message dies abnormally on an
+unrelated app-server rejection, which leaves the stale turn id recorded, so
+the adapter's abnormal-exit cleanup interrupts the abandoned inner session
+with it. The app-server rejects that with its JSON-RPC ``-32600`` mismatch
+(``expected active turn id turn_1 but found turn_2``) and ``_safe_interrupt``
 logs the ERROR::
 
     abnormal-exit interrupt of inner session <key> failed or timed out
 
-with a ``CodexAppServerResponseError`` traceback. One staleness thus produces
-both a failed user turn and a failed cleanup.
+with a ``CodexAppServerResponseError`` traceback.
 
 The test drives the REAL ``ExecutorAdapter`` -> ``CodexNativeExecutor`` ->
 ``CodexAppServerClient`` stack over a real loopback WebSocket. Only the
@@ -29,10 +26,10 @@ does not match the active turn with the production ``-32600`` error message.
 
 The assertions state the *correct* post-fix contract, so the test FAILS on
 the buggy build (reproducing the failure) and PASSES once the abnormal-exit
-cleanup tolerates Codex having moved past the bridge-recorded turn — the
+cleanup tolerates Codex having moved past the bridge-recorded turn - the
 recorded turn is no longer active, so there is nothing left for the cleanup
-to interrupt, and that expected condition must not surface as the
-ERROR-level failure signature.
+to interrupt, that expected condition must not surface as the ERROR-level
+failure signature, and the stale record must be dropped.
 """
 
 from __future__ import annotations
@@ -77,6 +74,8 @@ class _FakeCodexAppServer:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.active_turn: str | None = None
+        #: One-shot unrelated ``turn/steer`` rejection, set by the test.
+        self.steer_failure: dict[str, Any] | None = None
         self._turn_seq = 0
         self._server: Server | None = None
         self.url = ""
@@ -125,7 +124,9 @@ class _FakeCodexAppServer:
                 result = {"turn": {"id": self.active_turn}}
             elif method == "turn/steer":
                 expected = params.get("expectedTurnId")
-                if self.active_turn is None:
+                if self.steer_failure is not None:
+                    error, self.steer_failure = self.steer_failure, None
+                elif self.active_turn is None:
                     error = {"code": -32600, "message": "no active turn to steer"}
                 elif expected != self.active_turn:
                     error = {
@@ -215,8 +216,10 @@ async def test_abnormal_exit_interrupt_tolerates_codex_moving_past_recorded_turn
             fake.advance_to_next_turn()
             assert fake.active_turn == "turn_2"
 
-            # Web message 2: steering the recorded turn_1 is rejected with the
-            # -32600 mismatch, so the web turn dies abnormally.
+            # Web message 2 dies abnormally on an unrelated app-server
+            # rejection, which leaves the stale turn_1 recorded (a stale-steer
+            # mismatch would instead be recovered by retargeting the live turn).
+            fake.steer_failure = {"code": -32603, "message": "internal error"}
             with pytest.raises(RuntimeError, match="inner executor error"):
                 await adapter.run_turn(_request("follow up"), _ctx("resp_2"))
 
@@ -228,11 +231,15 @@ async def test_abnormal_exit_interrupt_tolerates_codex_moving_past_recorded_turn
             )
             reaped = await asyncio.wait_for(asyncio.shield(cleanup), timeout=15)
 
-        # Positive controls: the journey really drove the stale-steer mismatch
-        # through the wire, and the reap itself succeeded.
-        steers = [params for method, params in fake.requests if method == "turn/steer"]
-        assert steers and steers[0]["expectedTurnId"] == "turn_1", (
-            f"expected a stale steer of turn_1; requests={fake.requests!r}"
+        # Positive controls: the cleanup really interrupted the stale turn_1
+        # over the wire (which the fake rejected), and the reap succeeded.
+        interrupts = [
+            params
+            for method, params in fake.requests
+            if method == "turn/interrupt" and params.get("turnId")
+        ]
+        assert interrupts and interrupts[0]["turnId"] == "turn_1", (
+            f"expected a stale interrupt of turn_1; requests={fake.requests!r}"
         )
         assert reaped is True, "abandoned-executor reap (close_session/close) must succeed"
 
@@ -251,6 +258,10 @@ async def test_abnormal_exit_interrupt_tolerates_codex_moving_past_recorded_turn
             "bridge-recorded turn (the recorded turn is no longer active, so "
             "there is nothing left to interrupt); instead it failed:\n"
             f"{failures[0].getMessage()}\n{failures[0].exc_text or ''}"
+        )
+        state = read_bridge_state(tmp_path)
+        assert state is not None and state.active_turn_id is None, (
+            f"the superseded turn record must be cleared; bridge={state!r}"
         )
     finally:
         await fake.stop()

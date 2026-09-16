@@ -2100,12 +2100,9 @@ class SessionResponse(BaseModel):
         sessions are hidden from the default sidebar listing and
         surface only behind the "Show archived" toggle. ``False``
         for normal sessions. Toggled via ``PATCH /v1/sessions/{id}``.
-    :param todos: Current Claude Code todo list items for
-        ``omnigent claude`` sessions, as raw dicts from Claude's
-        todo JSON file. Each dict has ``content``, ``status``,
-        and ``activeForm`` keys. Empty list for non-claude-native
-        sessions or when no todos have been reported yet. Sourced
-        from the Omnigent server's in-memory ``_session_todos_cache``.
+    :param todos: Current native Plan items reported by a harness. Each has
+        ``content``, ``status``, and ``activeForm``. Persisted in conversation
+        metadata; empty before the first report or after an explicit clear.
     :param skills: Skills the bound agent has access to — the
         merged result of the agent spec's bundled ``skills``
         and the host-scope skills discovered along the agent
@@ -2114,6 +2111,8 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
+    :param skills_status: Skill discovery state. A ready catalog may be empty;
+        errors and disconnected runners must not leave clients loading.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
         each model's supported reasoning efforts. Empty while unavailable.
@@ -2200,6 +2199,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
+    skills_status: Literal["loading", "ready", "error", "unavailable"] = "unavailable"
     model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
@@ -2349,7 +2349,7 @@ class UpdateSessionRequest(BaseModel):
 
 
 class AutomaticSessionRenameRequest(BaseModel):
-    """Request body for the current-agent automatic rename endpoint."""
+    """Proposed title for a framework or agent-initiated rename."""
 
     title: str = Field(min_length=2, max_length=DEFAULT_GENERATED_TITLE_MAX_CHARS)
 
@@ -2361,7 +2361,7 @@ class AutomaticSessionRenameResponse(BaseModel):
 
     renamed: bool
     title: str | None = None
-    reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
+    reason: Literal["not_top_level", "no_seed", "title_changed", "generation_failed"] | None = None
 
 
 class ResetSessionModelOverrideRequest(BaseModel):
@@ -3328,27 +3328,26 @@ class SessionAgentChangedEvent(_SSEEventBase):
 
 class SessionTodosEvent(_SSEEventBase):
     """
-    Todo-list update from a Claude Code terminal-backed session.
+    Plan/TODO update from a native terminal-backed session.
 
-    Emitted after an ``external_session_todos`` POST from the
-    ``omnigent claude`` transcript forwarder, which captures todo
-    updates via ``PostToolUse``/``TodoWrite`` hook events from Claude
-    Code and forwards them to the Omnigent server. Lets web render a
-    live todo panel in the right column without polling.
+    Emitted after an ``external_session_todos`` POST from a native
+    harness forwarder, which captures structured Plan updates from
+    Claude or Codex and forwards them to the Omnigent server. Lets web
+    render a live todo panel in the right column without polling.
 
     :param type: Always ``"session.todos"``.
     :param conversation_id: Session identifier,
         e.g. ``"conv_abc123"``.
-    :param todos: Current todo items read from Claude's todo file.
+    :param todos: Current native Plan/TODO items from a harness.
         Each entry is a raw dict with ``content`` (str),
         ``status`` (``"pending"`` | ``"in_progress"`` |
-        ``"completed"``), and ``activeForm`` (str, the gerund form)
+        ``"completed"``), and ``activeForm`` (str, display activity)
         keys, e.g. ``[{"content": "Fix the bug", "status":
         "in_progress", "activeForm": "Fixing the bug"}]``.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
     the panel from the session snapshot's ``todos`` field, which is
-    populated by ``_session_todos_cache`` at snapshot build time.
+    restored from persisted metadata at snapshot build time.
     """
 
     type: Literal["session.todos"]
@@ -3470,14 +3469,14 @@ class SessionMcpStartupEvent(_SSEEventBase):
 
 class SessionSkillsEvent(_SSEEventBase):
     """
-    Signal that a session's runner-owned skills have resolved.
+    Signal that a session's runner-owned skill discovery has settled.
 
     Skills are discovered against the bound runner's filesystem and
     fetched off the session-snapshot hot path: the snapshot kicks a
     single background fetch (``_load_runner_skills`` in
     ``omnigent/server/routes/sessions.py``) and serves ``[]`` until
     it lands. This event fires the moment that background fetch
-    populates the per-session skills cache, so a connected web client
+    populates the per-session skills cache or first fails, so a connected web client
     can re-read the snapshot and fill its slash-command menu instead
     of waiting for the next bind.
 
@@ -3485,7 +3484,7 @@ class SessionSkillsEvent(_SSEEventBase):
     are ready, re-read the snapshot" nudge, mirroring the
     invalidate-then-refetch shape used by
     :class:`SessionChangedFilesInvalidatedEvent`. The snapshot's
-    ``skills`` field (now cache-backed) stays the source of truth.
+    ``skills`` and ``skills_status`` fields stay the source of truth.
 
     :param type: Always ``"session.skills"``.
     :param conversation_id: Session identifier,
@@ -4972,6 +4971,24 @@ HarnessStreamEvent = (
 
 
 # ── Projects ──────────────────────────────────────────────────────
+
+
+class ProjectOrderRequest(BaseModel):
+    """Rank owned project IDs; unranked projects append in discovery order.
+
+    Null selects alphabetical mode without erasing the remembered manual IDs.
+    """
+
+    ordered_project_ids: (
+        list[Annotated[str, Field(min_length=32, max_length=32, pattern="^[0-9a-f]{32}$")]] | None
+    ) = Field(..., max_length=10000)
+
+
+class ProjectOrderResponse(BaseModel):
+    """Current sorting mode and the manual order retained in either mode."""
+
+    sort_mode: Literal["alphabetical", "manual"]
+    ordered_project_ids: list[str] | None
 
 
 class ProjectObject(BaseModel):

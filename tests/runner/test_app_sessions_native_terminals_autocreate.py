@@ -220,6 +220,86 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_pi_terminal_keeps_tmux_alive_after_pi_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pi:main terminal must keep its tmux server alive past a pi exit.
+
+    Without ``keep_alive_after_exit``, tmux's defaults (``exit-empty on`` +
+    ``remain-on-exit off``) destroy the lone-pane server the instant the
+    ``pi`` CLI exits or crashes, so the idle watcher's capture-pane probes
+    fail and it can only log the generic "tmux unavailable after N
+    consecutive probes for terminal pi:main" instead of reporting a
+    diagnosable pane-dead exit with the pane's last output. The launch spec
+    must opt in (parity with the claude terminal) so a dead pane persists
+    and the exit is reported deterministically.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    # The launch spec — not the binary or credentials — is under test.
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_pi_terminal(
+        "8b1f2c3d4e5f60718293a4b5c6d7e8f9",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert captured["spec"].keep_alive_after_exit is True
+
+
+@pytest.mark.asyncio
 async def test_auto_create_pi_terminal_surfaces_credential_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

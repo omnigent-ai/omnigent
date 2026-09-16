@@ -907,6 +907,9 @@ export function useArchiveConversation() {
     },
     onSuccess: (updated, { archived }, context) => {
       markConversationSeen(updated.id, updated.updated_at);
+      queryClient.setQueryData<Session>(["session", updated.id], (old) =>
+        old ? { ...old, archived } : old,
+      );
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
       }
@@ -1804,8 +1807,8 @@ export interface ProjectSummary {
 export function useProjects() {
   return useQuery<ProjectSummary[]>({
     queryKey: ["projects"],
-    queryFn: async () => {
-      const res = await authenticatedFetch("/v1/sessions/projects");
+    queryFn: async ({ signal }) => {
+      const res = await authenticatedFetch("/v1/sessions/projects", { signal });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return (await res.json()) as ProjectSummary[];
     },
@@ -1899,7 +1902,7 @@ export function useArchivedProjectNames() {
  * see no existing project and both POST; the second gets a 409. Treat that as
  * benign — re-list and return the id the winner created.
  */
-async function resolveOrCreateProjectId(name: string): Promise<string> {
+export async function resolveOrCreateProjectId(name: string): Promise<string> {
   const projects = await apiListProjects();
   const existing = projects.find((p) => p.name === name);
   if (existing) return existing.id;

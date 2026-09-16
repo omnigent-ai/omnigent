@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -559,6 +560,53 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
         "code": "required_terminal_exited",
         "message": "Required terminal exited unexpectedly",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED",
+        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
+        "HTTP 429: billing_hard_limit_reached",
+        "API Error: 429: Your credit balance is too low to access the API.",
+    ],
+)
+@pytest.mark.parametrize(
+    ("stored_code", "expected_code"),
+    [
+        ("native_turn_error", "rate_limit_exceeded"),
+        ("codex_turn_error", "rate_limit_exceeded"),
+        ("codex_reauth_required", "codex_reauth_required"),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
+    message: str,
+    stored_code: str,
+    expected_code: str,
+) -> None:
+    """Failures saved without a rate-limit code become retryable on reload."""
+    session_id = "319c3d34a4ab4e6d983872bf898a19b4"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": stored_code,
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_rate_limit", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == stored_code
 
 
 @pytest.mark.asyncio
@@ -1898,8 +1946,12 @@ async def test_session_snapshot_retries_503_model_options(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "skills", [[], [{"name": "triage-issues", "description": "Triage issues."}]]
+)
 async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     monkeypatch: pytest.MonkeyPatch,
+    skills: list[dict[str, str]],
 ) -> None:
     """
     The background runner-skills fetch publishes ``session.skills`` once
@@ -1925,9 +1977,7 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     class _FakeRunnerClient:
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             if url.endswith("/skills"):
-                return _FakeResponse(
-                    {"skills": [{"name": "triage-issues", "description": "Triage issues."}]}
-                )
+                return _FakeResponse({"skills": skills})
             return _FakeResponse({"status": "idle"})
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
@@ -1951,6 +2001,7 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     # First poll serves [] and kicks the background fetch.
     first = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
     assert first.skills == []
+    assert first.skills_status == "loading"
     await _drain_runner_skills("38aed2dc1dc1b08dbbaa1cf9592d7ae5")
 
     # Exactly one session.skills event for this session was published when
@@ -1967,6 +2018,9 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
         f"Expected exactly 1 session.skills publish on fetch resolve, "
         f"got {len(skills_events)}: {published}"
     )
+    ready = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
+    assert ready.skills_status == "ready"
+    assert [s.model_dump() for s in ready.skills] == skills
 
 
 @pytest.mark.asyncio
@@ -1997,6 +2051,7 @@ async def test_session_snapshot_skills_empty_without_runner(
     )
 
     assert snapshot.skills == []
+    assert snapshot.skills_status == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -2625,3 +2680,105 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
         "code": "runner_error",
         "message": "turn setup failed",
     }
+
+
+def _side_chat_child(
+    *,
+    runner_id: str | None,
+    parent_id: str | None = "parent",
+    nickname: str = "Side chat",
+    wrapper: str = "codex-native-ui-subagent",
+    kind: str = "sub_agent",
+) -> Any:
+    """A conversation row shaped like a codex ``/side`` child."""
+    labels: dict[str, str] = {"omnigent.wrapper": wrapper}
+    if nickname:
+        labels["omnigent.codex_native.agent_nickname"] = nickname
+    return SimpleNamespace(
+        kind=kind,
+        labels=labels,
+        parent_conversation_id=parent_id,
+        runner_id=runner_id,
+    )
+
+
+class _ParentStore:
+    """A conversation store that returns one canned parent row."""
+
+    def __init__(self, parent: Any) -> None:
+        self._parent = parent
+
+    def get_conversation(self, conversation_id: str) -> Any:
+        return self._parent
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_sealed_on_runner_divergence() -> None:
+    """A resumed/relaunched host gives the parent a fresh ``runner_id`` while the
+    side-chat child keeps its birth one. The divergence means the ephemeral fork's
+    owning runner is gone, so the child seals read-only."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    child = _side_chat_child(runner_id="runner-birth")
+    store = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
+    assert await _codex_side_chat_fork_sealed(child, store) is True  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_not_sealed_when_runner_matches() -> None:
+    """A plain page reload keeps the same live runner, so parent and child agree
+    and the still-reachable fork stays sendable."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    child = _side_chat_child(runner_id="runner-birth")
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
+    assert await _codex_side_chat_fork_sealed(child, store) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_seal_only_applies_to_side_chats() -> None:
+    """The seal is gated to the ``/side`` nickname. An ordinary codex sub-agent
+    (durable, not an ephemeral fork) with a diverged runner must NOT be sealed —
+    and a non-codex row is ignored entirely."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    diverged = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert await _codex_side_chat_fork_sealed(ordinary, diverged) is False  # type: ignore[arg-type]
+
+    not_codex = _side_chat_child(
+        runner_id="runner-birth", wrapper="claude-code-native-ui-subagent"
+    )
+    assert await _codex_side_chat_fork_sealed(not_codex, diverged) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_not_sealed_without_reliable_signal() -> None:
+    """Missing signals can't prove the fork is gone, so the child stays sendable:
+    a child with no runner_id, no parent link, or a parent that has no runner_id
+    (never diverged) is not sealed."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    live_parent = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
+
+    no_child_runner = _side_chat_child(runner_id=None)
+    assert await _codex_side_chat_fork_sealed(no_child_runner, live_parent) is False  # type: ignore[arg-type]
+
+    no_parent_link = _side_chat_child(runner_id="runner-birth", parent_id=None)
+    assert await _codex_side_chat_fork_sealed(no_parent_link, live_parent) is False  # type: ignore[arg-type]
+
+    parent_no_runner = _ParentStore(SimpleNamespace(runner_id=None))
+    child = _side_chat_child(runner_id="runner-birth")
+    assert await _codex_side_chat_fork_sealed(child, parent_no_runner) is False  # type: ignore[arg-type]
+
+    missing_parent = _ParentStore(None)
+    assert await _codex_side_chat_fork_sealed(child, missing_parent) is False  # type: ignore[arg-type]

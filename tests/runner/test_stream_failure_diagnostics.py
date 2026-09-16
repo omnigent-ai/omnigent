@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -74,10 +75,17 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
             raise httpx.ReadError(self._cause)
 
 
-def _make_app(*, cause: str, terminal_registry: TerminalRegistry | None = None) -> Any:
+def _make_app(
+    *,
+    cause: str,
+    terminal_registry: TerminalRegistry | None = None,
+    frames: list[str] | None = None,
+) -> Any:
     """Build a runner app whose harness stream drops with *cause* mid-turn."""
     harness_client = _StreamErrorHarnessClient(
-        [_sse({"type": "response.created", "response": {"id": "resp_drop"}})],
+        frames
+        if frames is not None
+        else [_sse({"type": "response.created", "response": {"id": "resp_drop"}})],
         cause=cause,
     )
     pm = _FakeProcessManager(harness_client)
@@ -133,6 +141,32 @@ async def _failed_event_message(app: Any, conv_id: str) -> tuple[dict[str, Any],
     message = failed[0].get("error", {}).get("message", "")
     assert isinstance(message, str)
     return failed[0], message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_id", [None, "resp_drop"])
+async def test_stream_failure_logs_harness_and_response(
+    response_id: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Failures identify their response only when the harness supplied one."""
+    frames = (
+        [_sse({"type": "response.created", "response": {"id": response_id}})]
+        if response_id is not None
+        else []
+    )
+    app = _make_app(cause="private transport detail", frames=frames)
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        failed, _ = await _failed_event_message(app, _CONV_ID)
+
+    records = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "harness_stream_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.session_id == _CONV_ID
+    assert record.attributes == {"harness": "openai-agents", "response_id": response_id}
+    assert record.exc_info is not None
+    assert failed["error"]["code"] == "connection_error"
 
 
 @pytest.mark.asyncio

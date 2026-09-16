@@ -147,10 +147,6 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import (
-    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-)
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
@@ -160,6 +156,10 @@ from omnigent.runtime.websocket_metrics import (
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.tunnel_limits import (
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -2962,6 +2962,28 @@ class HostProcess:
                 models=with_source(pi_models),
             )
 
+        if harness == "devin-native":
+            # devin authenticates through its own CLI login; the host shells
+            # ``devin models list`` (list_devin_cli_model_options) to preview the
+            # family catalog before a session exists. Effort is a separate axis
+            # the runner recombines at launch, so the families are the picker rows.
+            try:
+                from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
+
+                devin_models = await asyncio.to_thread(list_devin_cli_model_options)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Devin model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Devin model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(devin_models),
+            )
+
         if is_claude_sdk_harness_name(harness):
             # SDK-mode Claude is a pass-through client with no model catalog
             # of its own, so the endpoint listing IS the harness truth — the
@@ -4333,9 +4355,9 @@ def run_host_process(
 
     telemetry.init("omni-host")
 
-    from omnigent.host.identity import CONFIG_PATH
+    from omnigent.host.identity import host_config_path
 
-    path = config_path or CONFIG_PATH
+    path = host_config_path(config_path)
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:

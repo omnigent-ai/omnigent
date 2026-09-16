@@ -145,6 +145,9 @@ importers:
       '@dnd-kit/core':
         specifier: ^6.3.1
         version: 6.3.1(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+      '@dnd-kit/sortable':
+        specifier: ^10.0.0
+        version: 10.0.0(@dnd-kit/core@6.3.1(react-dom@18.3.1(react@18.3.1))(react@18.3.1))(react@18.3.1)
       '@emoji-mart/data':
         specifier: ^1.2.1
         version: 1.2.1
@@ -224,6 +227,9 @@ importers:
         specifier: 3.30.5
         version: 3.30.5(@tiptap/pm@3.30.5)
       '@tiptap/extension-blockquote':
+        specifier: 3.30.5
+        version: 3.30.5(@tiptap/core@3.30.5(@tiptap/pm@3.30.5))(@tiptap/pm@3.30.5)
+      '@tiptap/extension-code-block':
         specifier: 3.30.5
         version: 3.30.5(@tiptap/core@3.30.5(@tiptap/pm@3.30.5))(@tiptap/pm@3.30.5)
       '@tiptap/extension-image':
@@ -404,6 +410,9 @@ importers:
       '@testing-library/react':
         specifier: ^16.3.2
         version: 16.3.2(@testing-library/dom@10.4.1)(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+      '@testing-library/user-event':
+        specifier: ^14.6.3
+        version: 14.6.5(@testing-library/dom@10.4.1)
       '@types/node':
         specifier: ^24.12.2
         version: 24.13.3

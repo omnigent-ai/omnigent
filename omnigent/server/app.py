@@ -39,7 +39,14 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    is_cancelled_rpc_error,
+)
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
     ResolvedBundle,
@@ -271,6 +278,15 @@ _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
+
+# The exact message Starlette's BaseHTTPMiddleware.call_next raises when the
+# downstream app sent nothing and raised no Exception — which only a bare
+# CancelledError escaping a cancelled in-flight handler produces.
+_NO_RESPONSE_RETURNED = "No response returned."
+
+# Nginx's nonstandard "client closed request" status: the request was torn
+# down before a response could be sent.
+_HTTP_CLIENT_CLOSED_REQUEST = 499
 
 
 def _session_id_from_request(request: Request) -> str | None:
@@ -1769,6 +1785,27 @@ def create_app(
             status_code = response.status_code
             response.headers["X-Request-Id"] = request_id
             return response
+        except RuntimeError as exc:
+            if str(exc) != _NO_RESPONSE_RETURNED:
+                failed = True
+                raise
+            # The downstream app was cancelled mid-flight (client disconnect /
+            # request teardown) before sending anything: BaseHTTPMiddleware
+            # captures every Exception it raises, so an empty response stream
+            # means a bare CancelledError escaped. A client-gone teardown, not
+            # a server fault — book a benign 499 instead of letting the
+            # catch-all log it as an unhandled UNKNOWN 500.
+            status_code = _HTTP_CLIENT_CLOSED_REQUEST
+            _logger.info(
+                "Request cancelled before a response was sent "
+                "(client disconnect / request teardown): %s %s",
+                request.method,
+                request.url.path,
+            )
+            return Response(
+                status_code=_HTTP_CLIENT_CLOSED_REQUEST,
+                headers={"X-Request-Id": request_id},
+            )
         except Exception:
             failed = True
             raise
@@ -2016,6 +2053,31 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        if is_cancelled_rpc_error(exc):
+            # A peer-cancelled backing call (upstream teardown/restart) is an
+            # expected, retryable condition, not a fault: attribute it as
+            # transient upstream at WARNING — keeping the ERROR stream for real
+            # 500s — and answer with the coded 499 via the standard handler.
+            cancelled = OmnigentError(
+                "The backing service cancelled the call; please retry.",
+                code=ErrorCode.UPSTREAM_CANCELLED,
+            )
+            _logger.warning(
+                "Upstream call cancelled by its peer: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="cancelled",
+                    code=str(cancelled.code),
+                    http_status=str(cancelled.http_status),
+                    error_category=cancelled.category.value,
+                    error_impact=cancelled.impact.value,
+                    error_phase=cancelled.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, cancelled)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real

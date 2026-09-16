@@ -1687,6 +1687,18 @@ async def _call_tool_with_reconnect(
                 attempt + 1,
                 total_tries,
                 delay,
+                exc_info=True,
+                extra={
+                    "session_id": session_id,
+                    "event_name": "mcp_tool_reconnect",
+                    "attributes": {
+                        "transport_error_type": (
+                            type(conn._transport_error).__name__
+                            if conn._transport_error is not None
+                            else None
+                        ),
+                    },
+                },
             )
             await _sleep(delay)
 

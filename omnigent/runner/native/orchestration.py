@@ -52,6 +52,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
@@ -65,6 +66,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
+    DEVIN_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
     KIMI_NATIVE_TERMINAL_ROLE,
@@ -777,37 +779,141 @@ def _kiro_session_workspace(session_workspace: str | None) -> Path:
     return Path(raw.strip()).expanduser().resolve()
 
 
+# A runner->server ``GET /v1/sessions/<id>`` launch-config read that times out
+# under load is a transient upstream condition, not an Omnigent defect. Left
+# un-retried it fails Codex terminal launch, ensure, and the next turn from one
+# blip; a bounded retry rides it out (the read is idempotent) before surfacing
+# a hard error, so genuinely-broken cases still fail loud.
+_LAUNCH_CONFIG_FETCH_TIMEOUT_S = 10.0
+_LAUNCH_CONFIG_FETCH_ATTEMPTS = 3
+_LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S = 0.5
+_LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S = 4.0
+_LAUNCH_CONFIG_RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
+
+
+def _launch_config_fetch_is_transient(exc: httpx.HTTPError) -> bool:
+    """Whether a launch-config fetch HTTP error is a transient, retryable condition.
+
+    :param exc: The ``httpx`` error raised by the snapshot GET.
+    :returns: ``True`` for read/connect/protocol failures that a retry may
+        clear (the deployed ``httpx.ReadTimeout`` among them); ``False`` for
+        anything else, which is surfaced immediately.
+    """
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ),
+    )
+
+
+async def _launch_config_retry_sleep(delay: float) -> None:
+    """Sleep between launch-config fetch attempts (patched to a no-op in tests)."""
+    await asyncio.sleep(delay)
+
+
+async def _fetch_native_launch_snapshot(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    runtime_label: str,
+) -> dict[str, Any]:
+    """Fetch and validate a session snapshot for a native-terminal launch config.
+
+    Reads ``GET /v1/sessions/<id>`` and returns the parsed snapshot object.
+    A transient runner->server condition (a read/connect timeout, or a
+    ``429``/``502``/``503``/``504``) is retried with bounded exponential
+    backoff so one blip under load does not tear through native terminal
+    launch, ensure, and the next turn. A non-transient status, a persistent
+    transient failure, or a malformed body still raises ``RuntimeError`` so
+    genuinely-broken launches fail loud.
+
+    :param server_client: Runner's Omnigent server HTTP client.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param runtime_label: Human-readable harness name for error text, e.g.
+        ``"Codex"``.
+    :returns: The snapshot mapping.
+    :raises RuntimeError: If the client is missing, the fetch cannot be
+        completed, or the response is not a JSON object.
+    """
+    if server_client is None:
+        raise RuntimeError(
+            f"server_client is required for runner-owned {runtime_label} terminals."
+        )
+    path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
+    resp: httpx.Response | None = None
+    for attempt in range(1, _LAUNCH_CONFIG_FETCH_ATTEMPTS + 1):
+        last_attempt = attempt == _LAUNCH_CONFIG_FETCH_ATTEMPTS
+        try:
+            resp = await server_client.get(path, timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S)
+        except httpx.HTTPError as exc:
+            if last_attempt or not _launch_config_fetch_is_transient(exc):
+                raise RuntimeError(
+                    f"Could not fetch {runtime_label} launch config for {session_id!r}."
+                ) from exc
+            _logger.warning(
+                "Transient %s launch-config fetch error (attempt %d/%d) for "
+                "session=%s; retrying: %s",
+                runtime_label,
+                attempt,
+                _LAUNCH_CONFIG_FETCH_ATTEMPTS,
+                session_id,
+                type(exc).__name__,
+                extra={"session_id": session_id},
+            )
+        else:
+            if resp.status_code == 200:
+                break
+            if last_attempt or resp.status_code not in _LAUNCH_CONFIG_RETRYABLE_STATUS:
+                raise RuntimeError(
+                    f"Could not fetch {runtime_label} launch config for {session_id!r}: "
+                    f"GET /v1/sessions returned {resp.status_code}."
+                )
+            _logger.warning(
+                "Transient %s launch-config fetch status %d (attempt %d/%d) for "
+                "session=%s; retrying",
+                runtime_label,
+                resp.status_code,
+                attempt,
+                _LAUNCH_CONFIG_FETCH_ATTEMPTS,
+                session_id,
+                extra={"session_id": session_id},
+            )
+        backoff = min(
+            _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S * (2 ** (attempt - 1)),
+            _LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S,
+        )
+        await _launch_config_retry_sleep(backoff)
+    assert resp is not None  # loop either broke on 200 or raised
+    try:
+        snapshot = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not fetch {runtime_label} launch config for {session_id!r}: invalid JSON."
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(
+            f"Could not fetch {runtime_label} launch config for {session_id!r}: "
+            "snapshot was not a JSON object."
+        )
+    return snapshot
+
+
 async def _kiro_native_launch_config(
     *,
     session_id: str,
     server_client: httpx.AsyncClient | None,
 ) -> _KiroNativeLaunchConfig:
     """Fetch and validate persisted Kiro launch config for a session."""
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned Kiro terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch Kiro launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch Kiro launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch Kiro launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch Kiro launch config for {session_id!r}: "
-            "snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="Kiro",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)
@@ -858,30 +964,11 @@ async def _pi_native_launch_config(
     :param server_client: Runner Omnigent server client.
     :returns: Parsed launch config.
     """
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned Pi terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch Pi launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch Pi launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch Pi launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch Pi launch config for {session_id!r}: snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="Pi",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)
@@ -960,31 +1047,11 @@ async def _codex_native_launch_config(
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
     """
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned Codex terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch Codex launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch Codex launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch Codex launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch Codex launch config for {session_id!r}: "
-            "snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="Codex",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)
@@ -1126,31 +1193,11 @@ async def _opencode_native_launch_config(
     :returns: Parsed launch config.
     :raises RuntimeError: If the snapshot or required runner env is missing.
     """
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned OpenCode terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch OpenCode launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch OpenCode launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch OpenCode launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch OpenCode launch config for {session_id!r}: "
-            "snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="OpenCode",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)
@@ -2344,6 +2391,14 @@ async def _auto_create_pi_terminal(
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
+            # Keep the private tmux server alive if the `pi` CLI exits. Without
+            # this, tmux (exit-empty on, remain-on-exit off) reaps the lone-pane
+            # server the instant pi exits, the idle watcher's probes fail with
+            # "tmux unavailable", and the exit is undiagnosable. With it, the
+            # dead pane persists (last output capturable) and the watcher
+            # reports the exit deterministically via `#{pane_dead}` — parity
+            # with the claude terminal.
+            keep_alive_after_exit=True,
         ),
     )
     publish_event(
@@ -3339,6 +3394,203 @@ async def _auto_create_kiro_terminal(
     return terminal_view
 
 
+async def _auto_create_devin_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """Auto-create the Devin TUI terminal for a devin-native session.
+
+    Writes the session-scoped Devin config (which registers Omnigent's
+    lifecycle hooks and so is what makes policy, elicitation and the transcript
+    mirror work), launches the TUI in a runner-owned tmux pane, then starts the
+    hook forwarder.
+
+    :param agent_spec: The session's resolved agent spec. A custom agent's
+        ``instructions`` are delivered to Devin as an always-on Windsurf rule in
+        the workspace (Devin's only per-turn system-prompt channel).
+    """
+    from omnigent.harnesses.devin_native.bridge import (
+        DEVIN_NATIVE_ENV_UNSET,
+        build_devin_native_terminal_env,
+        export_path,
+        prepare_bridge_dir,
+        session_config_path,
+        write_agent_instructions_preamble,
+        write_devin_agent_rule,
+        write_devin_mcp_config,
+        write_devin_workspace_hint,
+        write_fork_preamble,
+        write_hook_wrapper,
+        write_tmux_target,
+    )
+    from omnigent.harnesses.devin_native.main import build_devin_launch, resolve_devin_launch_model
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args + model_override); reused here, not
+    # Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace_path = launch_config.workspace
+    if not workspace_path.exists():
+        raise RuntimeError(f"Devin workspace does not exist for session {session_id!r}.")
+    workspace = str(workspace_path)
+    bridge_dir = prepare_bridge_dir(session_id)
+
+    # Deliver a custom agent's instructions as an always-on Windsurf rule (the
+    # only channel Devin applies to every turn); a plain agent clears any stale
+    # rule a prior custom-agent launch left in this workspace. Where that rule
+    # would not be session-scoped — a home-directory workspace Devin reads from
+    # every cwd, or one another agent's live rule already owns — the instructions
+    # ride the first message instead, which is weaker but stays in this session.
+    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
+    rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
+    if raw_instructions and not rule_is_live:
+        write_agent_instructions_preamble(bridge_dir, raw_instructions)
+    elif rule_is_live:
+        # Record the workspace so the SessionEnd hook can remove this rule when
+        # the session ends, rather than leaving it to load into a later Devin run.
+        write_devin_workspace_hint(bridge_dir, workspace_path)
+
+    # Register Omnigent's MCP relay before the TUI starts — Devin reads its MCP
+    # servers at launch, from a project-local file (its user config carries none).
+    write_devin_mcp_config(workspace_path, bridge_dir)
+
+    # Replay prior turns as a preamble on the first injected message whenever
+    # there is history but no Devin session to reattach to: a forked clone, or a
+    # conversation whose `--resume` id is absent (an ACP-era row, or one predating
+    # the native wrap). Devin's own store is read-only to us, so text replay is the
+    # only carry-over available. Costs one items GET on a launch without a resume
+    # id; the assistant-turn check keeps a brand-new session from replaying its own
+    # pending prompt. Best-effort — a failure just starts without the context.
+    if server_client is not None and (
+        launch_config.fork_carry_history or not launch_config.external_session_id
+    ):
+        try:
+            from omnigent.harnesses.claude_native.main import (
+                _fetch_all_session_items_for_claude_resume,
+            )
+
+            carried_items = await _fetch_all_session_items_for_claude_resume(
+                server_client, session_id
+            )
+            if launch_config.fork_carry_history or _devin_has_replayable_history(carried_items):
+                write_fork_preamble(bridge_dir, _cursor_fork_history_preamble(carried_items))
+        except Exception:  # noqa: BLE001 — context carry-over is best-effort
+            _logger.warning(
+                "devin-native: could not carry prior history for %s",
+                session_id,
+                exc_info=True,
+            )
+
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    # The hook wrapper carries a one-shot Omnigent bearer, so it must be written
+    # before the TUI starts — Devin reads its hook config once at launch.
+    hook_command = write_hook_wrapper(bridge_dir, server_url=server_url, session_id=session_id)
+    from omnigent.harnesses.devin_native.bridge import write_devin_session_config
+
+    # Devin has no --effort flag: a (model, effort) pick from the New Chat dialog
+    # composes into one variant id here, the same way the CLI's --model/--effort
+    # pair does, so both entry points land on the same Devin model.
+    launch_model = await asyncio.to_thread(
+        resolve_devin_launch_model,
+        launch_config.model_override,
+        launch_config.reasoning_effort,
+    )
+    write_devin_session_config(
+        bridge_dir,
+        hook_command=str(hook_command),
+        model=launch_model,
+    )
+
+    devin_launch = build_devin_launch(
+        launch_config.terminal_launch_args or [],
+        bridge_dir=bridge_dir,
+        config_path=session_config_path(bridge_dir),
+        export_file=export_path(bridge_dir),
+        model=launch_model,
+        resume_id=launch_config.external_session_id,
+    )
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="devin",
+        session_key="main",
+        resource_role=DEVIN_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=devin_launch.executable,
+            args=devin_launch.argv[1:],
+            env=build_devin_native_terminal_env(session_id),
+            env_unset=list(DEVIN_NATIVE_ENV_UNSET),
+            inherit_env=False,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "devin", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+                requires_forwarder_ready=launch_config.external_session_id is not None,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Start the Omnigent builtin-tool relay so Devin's MCP-declared Omnigent
+    # tools route back through the session's policy/elicitation gate.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    from omnigent.harnesses.devin_native.forwarder import supervise_devin_forwarder
+
+    _forwarder_task = asyncio.create_task(
+        supervise_devin_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="devin-native-ui",
+            auth=_runner_auth,
+            # A cold resume replays the prior hook log; skip to its end so
+            # history is not re-published as new conversation items.
+            start_at_end=launch_config.external_session_id is not None,
+        ),
+        name=f"devin-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created devin terminal + hook forwarder for session %s; task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
 async def _persist_qwen_external_session_id(
     server_client: httpx.AsyncClient | None,
     session_id: str,
@@ -3967,6 +4219,7 @@ async def _auto_create_codex_terminal(
         apply_codex_thread_effort,
         build_codex_native_server,
         build_codex_remote_args,
+        codex_remote_resume_omits_permission_args,
         codex_session_meta_model_provider,
         codex_terminal_env,
         is_unreadable_thread_error,
@@ -3974,10 +4227,12 @@ async def _auto_create_codex_terminal(
         resolve_native_codex_launch,
     )
     from omnigent.harnesses.codex_native.bridge import (
+        CodexNativeBridgeState,
         clear_bridge_state,
         codex_home_for_bridge_dir,
         prepare_bridge_dir,
         socket_path_for_bridge_dir,
+        write_bridge_state,
     )
     from omnigent.inner.codex_executor import codex_extended_catalog_env
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -4431,20 +4686,21 @@ async def _auto_create_codex_terminal(
         ws_url=codex_ws_url,
         client_name="omnigent-codex-native-auto",
     )
+    retained_resume_client: CodexAppServerClient | None = None
     if launch_config.external_session_id is not None:
-        from omnigent.harnesses.codex_native.bridge import (
-            CodexNativeBridgeState,
-            write_bridge_state,
-        )
-
         try:
-            await preload_codex_thread_for_resume(
+            retained_resume_client = await preload_codex_thread_for_resume(
                 codex_ws_url,
                 launch_config.external_session_id,
                 terminal_launch_args=launch_config.terminal_launch_args,
+                retain_client=codex_remote_resume_omits_permission_args(
+                    app_server.codex_cli_version
+                ),
             )
-        except Exception as exc:
-            if not is_unreadable_thread_error(exc):
+            if retained_resume_client is not None:
+                event_client = retained_resume_client
+        except BaseException as exc:
+            if not isinstance(exc, Exception) or not is_unreadable_thread_error(exc):
                 # The app-server started above must not outlive a refused resume:
                 # without this close, every retry stacked another live codex
                 # process (and only the newest stayed tracked for teardown).
@@ -4472,7 +4728,43 @@ async def _auto_create_codex_terminal(
                 session_id=session_id, server_client=server_client, codex_error=codex_error
             )
             launch_config = dataclasses.replace(launch_config, external_session_id=None)
-        else:
+    if launch_config.external_session_id is None:
+        try:
+            # Connect the listener BEFORE launching the TUI so it observes the
+            # ``thread/started`` the TUI emits on startup (the client buffers
+            # notifications, so there is no created-before-listening race).
+            await event_client.connect()
+        except BaseException:
+            # connect() may have half-opened the ws before the initialize
+            # handshake failed, so close the listener too — not just the
+            # app-server.
+            with contextlib.suppress(Exception):
+                await event_client.close()
+            await app_server.close()
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            raise
+
+    # Register the Codex TUI as a streamable terminal resource attached to
+    # the app-server started above (``--remote`` over its loopback ws
+    # endpoint). Without this the session can have a working chat path
+    # (driven by the forwarder) but no terminal to attach to, unlike
+    # claude-native, whose terminal IS the agent process. On failure, close
+    # the listener and app-server here: the background forwarder task (which
+    # otherwise owns their teardown) has not been created yet.
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+    # and ``parent_os_env`` below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+    # Fresh sessions pass no thread id so the TUI creates the thread and the
+    # background task adopts it. Resume sessions pass the persisted
+    # external_session_id so the runner-owned TUI reopens the existing
+    # app-server thread.
+    # The app-server and event client are live by this point, so the pre-launch
+    # setup (arg build + config resolve) shares the terminal launch's teardown
+    # below: a raise here must still close them and drop the
+    # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
+    try:
+        if launch_config.external_session_id is not None:
             write_bridge_state(
                 bridge_dir,
                 CodexNativeBridgeState(
@@ -4504,43 +4796,7 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
-    if launch_config.external_session_id is None:
-        try:
-            # Connect the listener BEFORE launching the TUI so it observes the
-            # ``thread/started`` the TUI emits on startup (the client buffers
-            # notifications, so there is no created-before-listening race).
-            await event_client.connect()
-        except Exception:
-            # connect() may have half-opened the ws before the initialize
-            # handshake failed, so close the listener too — not just the
-            # app-server.
-            with contextlib.suppress(Exception):
-                await event_client.close()
-            await app_server.close()
-            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-            raise
-
-    # Register the Codex TUI as a streamable terminal resource attached to
-    # the app-server started above (``--remote`` over its loopback ws
-    # endpoint). Without this the session can have a working chat path
-    # (driven by the forwarder) but no terminal to attach to, unlike
-    # claude-native, whose terminal IS the agent process. On failure, close
-    # the listener and app-server here: the background forwarder task (which
-    # otherwise owns their teardown) has not been created yet.
-    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
-    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
-    # and ``parent_os_env`` below, launch_terminal falls back to
-    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    agent_os_env = _agent_os_env_from_spec(agent_spec)
-    # Fresh sessions pass no thread id so the TUI creates the thread and the
-    # background task adopts it. Resume sessions pass the persisted
-    # external_session_id so the runner-owned TUI reopens the existing
-    # app-server thread.
-    # The app-server and event client are live by this point, so the pre-launch
-    # setup (arg build + config resolve) shares the terminal launch's teardown
-    # below: a raise here must still close them and drop the
-    # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
-    try:
+        agent_os_env = _agent_os_env_from_spec(agent_spec)
         codex_remote_args = build_codex_remote_args(
             codex_args=tuple(launch_config.terminal_launch_args or ()),
             thread_id=launch_config.external_session_id,
@@ -4552,6 +4808,7 @@ async def _auto_create_codex_terminal(
             # built-in (which would force the first-run login screen and block
             # thread creation).
             config_overrides=tuple(app_server.config_overrides),
+            codex_cli_version=app_server.codex_cli_version,
             # Omnigent provisions the private CODEX_HOME and vets hook sources
             # itself; skip the interactive trust prompt that headless sub-agents
             # can never answer.
@@ -4632,9 +4889,11 @@ async def _auto_create_codex_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
-    except Exception:
-        await event_client.close()
-        await app_server.close()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await event_client.close()
+        with contextlib.suppress(Exception):
+            await app_server.close()
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
@@ -4660,6 +4919,7 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
+                client=retained_resume_client,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4918,6 +5178,7 @@ async def _codex_forward_known_thread(
     bridge_dir: Path,
     codex_ws_url: str,
     thread_id: str,
+    client: CodexAppServerClient | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4930,6 +5191,7 @@ async def _codex_forward_known_thread(
         ``"ws://127.0.0.1:9876"``.
     :param thread_id: Existing Codex app-server thread id, e.g.
         ``"thread_abc123"``.
+    :param client: Retained preload subscription, owned and closed by this forwarder.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4944,11 +5206,11 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
-    server_url = _required_runner_env("RUNNER_SERVER_URL")
-    auth_factory = _make_auth_token_factory()
-    auth_token = auth_factory() if auth_factory is not None else None
-    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     try:
+        server_url = _required_runner_env("RUNNER_SERVER_URL")
+        auth_factory = _make_auth_token_factory()
+        auth_token = auth_factory() if auth_factory is not None else None
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
         await supervise_forwarder(
             base_url=server_url,
             headers=headers,
@@ -4956,9 +5218,13 @@ async def _codex_forward_known_thread(
             bridge_dir=bridge_dir,
             app_server_url=codex_ws_url,
             thread_id=thread_id,
+            client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
         )
     finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
@@ -5964,6 +6230,26 @@ def _cursor_message_item_text(content: object) -> str:
 _CURSOR_FORK_ROLE_LABELS = {"user": "You", "assistant": "Assistant"}
 
 
+def _devin_has_replayable_history(items: list[_JsonObject]) -> bool:
+    """Whether *items* hold a finished exchange worth replaying to Devin.
+
+    A launch with no Devin session to reattach to covers two very different
+    cases: a brand-new session, whose items may already include the prompt being
+    dispatched (replaying that would prepend the message to itself), and a session
+    with real history and no resumable id — an ACP-era row, say. An assistant turn
+    is what separates them.
+
+    :param items: Committed Omnigent items, chronological.
+    :returns: ``True`` when at least one assistant message carries text.
+    """
+    return any(
+        item.get("type") == "message"
+        and item.get("role") == "assistant"
+        and _cursor_message_item_text(item.get("content"))
+        for item in items
+    )
+
+
 def _cursor_fork_history_preamble(items: list[_JsonObject]) -> str:
     """Render copied fork items as a readable conversation transcript.
 
@@ -6228,6 +6514,29 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         their safe message directly; other causes point to the runner log.
     """
     error_id = f"err_{uuid.uuid4().hex}"
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+        # Expected session-lifecycle condition: the session's agent was deleted
+        # or rebound, so its bundle no longer resolves. This is not a
+        # terminal-startup defect — log it without a stack and surface a
+        # distinct code plus a client-safe message (never the internal
+        # resolver text) so KPI/error attribution reflects the lifecycle event
+        # rather than a generic runner startup fault.
+        _logger.warning(
+            "Native %s terminal skipped; session agent unavailable; error_id=%s: %s",
+            runtime_name,
+            error_id,
+            exc,
+            extra={"session_id": runner_primary_session_id(), "error_id": error_id},
+        )
+        return {
+            "code": ErrorCode.SESSION_AGENT_MISSING,
+            "error_id": error_id,
+            "message": (
+                "This session's agent is no longer available; it was deleted "
+                "or replaced. Recreate the agent or start a new session, then "
+                f"retry. Error ID: {error_id}."
+            ),
+        }
     _logger.warning(
         "Native %s terminal start failed; error_id=%s: %s",
         runtime_name,
@@ -7985,6 +8294,18 @@ async def _launch_kiro(ctx: NativeLaunchContext) -> SessionResourceView:
     )
 
 
+async def _launch_devin(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the devin-native terminal from a launch context."""
+    return await _auto_create_devin_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+    )
+
+
 async def _launch_opencode(ctx: NativeLaunchContext) -> SessionResourceView:
     """Adapter: build the opencode-native terminal from a launch context."""
     return await _auto_create_opencode_terminal(
@@ -8297,12 +8618,24 @@ async def _ensure_native_terminal(
                 ctx = await build_context(ctx)
             view = await adapter(ctx)
         except Exception as exc:
-            _logger.exception(
-                "%s terminal ensure failed for session=%s",
-                agent.display_name,
-                ctx.session_id,
-                extra={"session_id": ctx.session_id},
-            )
+            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+                # Expected lifecycle event (agent deleted/rebound), not an
+                # ensure defect: log without a stack so it stays out of the
+                # terminal-startup error signal.
+                _logger.warning(
+                    "%s terminal ensure skipped; session %s agent unavailable: %s",
+                    agent.display_name,
+                    ctx.session_id,
+                    exc,
+                    extra={"session_id": ctx.session_id},
+                )
+            else:
+                _logger.exception(
+                    "%s terminal ensure failed for session=%s",
+                    agent.display_name,
+                    ctx.session_id,
+                    extra={"session_id": ctx.session_id},
+                )
             return _native_terminal_start_error_response(exc, agent.display_name)
         return respond(view)
 

@@ -315,6 +315,16 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       }
     };
 
+    let projectsDirty = false;
+    const refreshProjects = () => {
+      if (!projectsDirty || queryClient.isMutating({ mutationKey: ["project-order"] }) > 0) return;
+      projectsDirty = false;
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-order"] });
+    };
+    // Replay changes after all saves, including their settlement refetches, finish.
+    const unsubscribeMutations = queryClient.getMutationCache().subscribe(refreshProjects);
+
     const unsubscribeFrames = sessionUpdatesSocket.subscribe((frame: SessionUpdatesFrame) => {
       switch (frame.type) {
         case "heartbeat":
@@ -327,7 +337,8 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           // Another client created/renamed/deleted a project (or changed its
           // config/icon). Only the mutating client invalidates locally, so
           // refresh the project-row caches here to converge without a reload.
-          void queryClient.invalidateQueries({ queryKey: ["projects"] });
+          projectsDirty = true;
+          refreshProjects();
           void queryClient.invalidateQueries({ queryKey: ["project-config"] });
           return;
         case "removed":
@@ -412,6 +423,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
 
     return () => {
       unsubscribeFrames();
+      unsubscribeMutations();
       unsubscribeCache();
       if (invalidateTimer !== null) clearTimeout(invalidateTimer);
       if (watchTimer !== null) clearTimeout(watchTimer);

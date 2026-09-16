@@ -18,7 +18,7 @@ That composition is what keeps a vendor liftable. Everything vendor-specific is
 one package plus one ``create_app()`` — the same shape as a community harness
 plugin under ``omnigent.community.harness.<name>`` — so moving a vendor out of
 core is a directory move plus an entry point, not a rewrite. See
-:mod:`omnigent.inner.devin` for the worked example.
+an extension is composed from a name plus its sources.
 
 **Adding a capability is additive**: give :class:`AcpExtension` a field with a
 neutral default, read it at the one place in the executor where it applies, and

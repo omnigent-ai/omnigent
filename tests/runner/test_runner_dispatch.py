@@ -11012,6 +11012,7 @@ def _fake_entry(harness: str, model: str | None, returncode: int | None = None) 
 
     class _FakeProc:
         def __init__(self, rc: int | None) -> None:
+            self.pid = 12345
             self.returncode = rc
 
     return _SubprocessEntry(

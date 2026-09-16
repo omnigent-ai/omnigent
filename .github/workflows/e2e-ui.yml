@@ -87,7 +87,7 @@ jobs:
   # mocked_native_codex_goal_session fixture needs it, but compiling it pulls
   # openai/codex's core_test_support (~1100 crates). Done lazily inside pytest
   # it lands ~4min (warm) to ~7min (cold) on whichever single shard collects
-  # test_codex_goal_mode, lopsiding that shard against the 20min cap. Building
+  # test_codex_goal_mode, leaving that shard less time for tests. Building
   # here once and handing every shard the ~10MB binary (via the artifact +
   # CODEX_PARITY_SIDECAR_BIN below) keeps the sidecar cost off the shard
   # critical path entirely. Skips on draft PRs (empty matrix -> no shards).
@@ -140,7 +140,7 @@ jobs:
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false

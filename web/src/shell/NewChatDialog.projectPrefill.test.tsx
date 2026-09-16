@@ -41,7 +41,11 @@ vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: vi.fn(),
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
@@ -134,9 +138,32 @@ function setRepoIsGit(): void {
 }
 
 function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    enabled_connections: [],
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: { harness_install: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   function Wrapper({ children }: { children: ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+      </QueryClientProvider>
+    );
   }
   const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
   return { rerender, unmount };
@@ -175,10 +202,7 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
   return { rerender };
 }
 
-/** Render with Smart Routing enabled server-side, so a routing-eligible
- *  native agent can actually turn routing on (the plain renderLanding has no
- *  CapabilitiesProvider, so its server info stays "loading" and routing is
- *  never eligible). Returns rerender so a test can re-drive the same mount. */
+/** Render with Smart Routing enabled so a routing-eligible native agent can turn it on. */
 function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
   const info: ServerInfo = {
     accounts_enabled: false,
@@ -222,7 +246,8 @@ function selectAgent(agentId: string): void {
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
-  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "Escape" });
+  const selectedRow = screen.queryByTestId(`new-chat-landing-agent-${agentId}`);
+  if (selectedRow) fireEvent.keyDown(selectedRow, { key: "Escape" });
 }
 
 async function submitAndReadBody(): Promise<Record<string, unknown>> {
@@ -802,7 +827,7 @@ describe("NewChatLandingScreen project prefill", () => {
     // Commit "Sonnet" through the agent-config modal (the user's explicit pick).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
-    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
 
@@ -833,7 +858,7 @@ describe("NewChatLandingScreen project prefill", () => {
     // unmounting (submittedRef stays false → landingDraft keeps routing "on").
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
-    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     unmount();
@@ -995,11 +1020,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
     localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
 
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    function Wrapper({ children }: { children: ReactNode }) {
-      return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
-    }
-    const first = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+    const first = renderLanding();
     await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
 
     // Leave the composer (draft preserved), turn the global default off, come
@@ -1007,7 +1028,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     // retraction effect must clear it now that the default is off.
     first.unmount();
     localStorage.removeItem(ALWAYS_WORKTREE_KEY);
-    render(<NewChatLandingScreen />, { wrapper: Wrapper });
+    renderLanding();
 
     await waitFor(() => expect(branchLabel()).toBe("New worktree"));
     const body = await submitAndReadBody();

@@ -308,6 +308,15 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
     """
 
 
+class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
+    """Raised when a sandbox generation definitively no longer exists.
+
+    Resumable providers use this only for a definitive absence, never for a
+    timeout, connectivity failure, or unknown state. The managed-host wake path
+    catches it and provisions a fresh sandbox generation instead.
+    """
+
+
 @dataclass
 class RemoteCommandResult:
     """
@@ -584,6 +593,8 @@ class SandboxLifecycle(ABC):
             ``"sb-a1b2c3"``.
         :raises SandboxCapabilityError: When the provider cannot resume a
             stopped sandbox (ephemeral sandboxes / no persistent volume).
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
         :raises click.ClickException: If the resume fails.
         """
         raise self._capability_error("resume a stopped sandbox")
@@ -808,8 +819,9 @@ class SandboxHostLauncher(SandboxLifecycle):
     Every managed-host provider — exec-model or entrypoint-as-host — implements
     this. :meth:`start_host` is abstract here; the exec-model default lives on
     :class:`ExecModelHostLauncher`. Entrypoint-as-host providers (e.g.
-    Kubernetes) inherit this class directly and override :meth:`start_host`
-    without needing any exec transport.
+    Kubernetes) and provider-native host launchers (e.g. Gensee) inherit this
+    class directly and override :meth:`start_host` without needing any exec
+    transport.
     """
 
     def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
@@ -861,7 +873,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     managed-host bootstrap. A provider that only needs to change how the
     repository is obtained overrides :meth:`materialize_workspace` alone.
 
-    Entrypoint-as-host providers (e.g. Kubernetes) inherit
+    Entrypoint-as-host and provider-native host launchers inherit
     :class:`SandboxHostLauncher` directly and do NOT need ``run()`` or any
     exec transport.
     """
