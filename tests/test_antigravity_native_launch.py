@@ -154,6 +154,19 @@ def fake_agy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
 class TestBuildAgyLaunch:
     """Tests for :func:`build_agy_launch`."""
 
+    def test_launch_logs_are_unique(self, fake_agy: str, tmp_path: Path) -> None:
+        paths = []
+        for _ in range(2):
+            argv, _ = build_agy_launch(
+                conversation_id=None, model=None, resume=False, log_dir=tmp_path
+            )
+            path = Path(
+                next(arg.partition("=")[2] for arg in argv if arg.startswith("--log-file="))
+            )
+            assert path.parent == tmp_path
+            paths.append(path)
+        assert paths[0] != paths[1]
+
     def test_each_launch_has_a_fresh_csrf_token(self, fake_agy: str) -> None:
         from omnigent.process_logging import redact_log_text
 
