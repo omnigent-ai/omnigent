@@ -2458,9 +2458,10 @@ def register_events_routes(
             )
         if runner_client is not None:
             try:
+                # Allow initialization, forwarder, and resource cleanup to finish.
                 await runner_client.delete(
                     f"/v1/sessions/{session_id}",
-                    timeout=10.0,
+                    timeout=60.0,
                 )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(

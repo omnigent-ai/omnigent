@@ -188,8 +188,8 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
-# Bound on how long DELETE waits for a cancelled session init to unwind.
-_SESSION_INIT_CANCEL_TIMEOUT_S = 10.0
+# Allow process termination and forwarder cleanup to finish before DELETE proceeds.
+_SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay

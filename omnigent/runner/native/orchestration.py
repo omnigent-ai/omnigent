@@ -162,8 +162,8 @@ def _publish_tmux_target_for_bridge(
 # forwarder on terminal re-create (else both mirror, double-posting items).
 _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
 
-# Bound how long terminal (re)creation waits for a cancelled forwarder.
-_AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
+# Include the child's 10-second termination grace and forced-exit cleanup.
+_AUTO_FORWARDER_CANCEL_TIMEOUT_S = 15.0
 
 # Delegated runner bearers last 30 minutes and refresh five minutes before
 # expiry. A one-minute cadence allows several retries without giving the child
