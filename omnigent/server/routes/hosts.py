@@ -804,34 +804,42 @@ def create_hosts_router(
                 body.session_id,
             )
 
-        # Optional git worktree: when the caller asks to branch, create a
-        # worktree off the validated source repo and bind the runner to
-        # the worktree path instead (the fork-resume path; mirrors
-        # POST /v1/sessions). Created BEFORE the atomic runner bind so a
-        # lost CAS or a failed launch can roll it back, leaving no orphan
-        # worktree on the host.
-        git_branch: str | None = None
-        # CreatedWorktree | None — set ONLY when Omnigent creates a worktree
-        # (create mode). Left None in bind mode so the rollback below never
-        # force-removes the user's pre-existing worktree.
-        worktree = None
         if body.git is not None:
             from omnigent.host.git_worktree import (
                 WorktreeError,
                 validate_branch_name,
             )
 
-            # Shared by both modes — the host never runs git in bind mode, so
-            # the server is the only gate on the name there.
             try:
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
 
+        # Atomically reserve the session before creating the worktree.
+        # Later launch requests fail instead of binding it elsewhere.
+        binding_token = secrets.token_urlsafe(32)
+        runner_id = token_bound_runner_id(binding_token)
+        bound = await asyncio.to_thread(
+            conversation_store.set_runner_id,
+            body.session_id,
+            runner_id,
+        )
+        if not bound:
+            raise HTTPException(
+                status_code=400,
+                detail="session already has a runner bound",
+            )
+
+        async def _rollback_runner_claim() -> None:
+            await asyncio.to_thread(conversation_store.clear_runner_id, body.session_id)
+
+        # Create the requested worktree before storing the final workspace.
+        git_branch: str | None = None
+        # Set only for worktrees created by this request.
+        worktree = None
+        if body.git is not None:
             if body.git.existing_worktree:
-                # Binding to a pre-existing worktree: no worktree is created,
-                # but record its branch so the sidebar shows it and the opt-in
-                # delete flow can offer to remove it.
+                # Record the branch without creating or owning the worktree.
                 git_branch = body.git.branch_name
             else:
                 from omnigent.server.routes._host_worktree import (
@@ -850,29 +858,23 @@ def create_hosts_router(
                         existing_branch=body.git.existing_branch,
                     )
                 except WorktreeHostUnavailableError as exc:
-                    # Host offline / unresponsive — infra, not user input.
+                    await _rollback_runner_claim()
                     raise HTTPException(status_code=409, detail=exc.message) from exc
                 except WorktreeProxyError as exc:
-                    # Host-reported git failure (dup branch, bad base, not a
-                    # repo) — user-correctable input.
+                    await _rollback_runner_claim()
                     raise HTTPException(status_code=400, detail=exc.message) from exc
+                except BaseException:
+                    await _rollback_runner_claim()
+                    raise
                 workspace = worktree.worktree_path
                 git_branch = worktree.branch
 
         async def _rollback_worktree() -> None:
             """
-            Best-effort removal of the worktree created above.
+            Remove a worktree created by this request.
 
-            Called when the runner bind or launch fails after the
-            worktree was created, so a failed request leaves no orphan
-            worktree (and no orphan branch) on the host. Never raises —
-            a cleanup failure is logged and the original error still
-            propagates.
-
-            A recreated worktree (``existing_branch``) checks out a branch
-            that predates this request — the directory is ours to remove,
-            but the branch (and its unpushed commits) is the user's, so it
-            must survive the rollback.
+            Cleanup is best-effort. Recreated branches are preserved because
+            they existed before this request.
             """
             if worktree is None:
                 return
@@ -898,65 +900,29 @@ def create_hosts_router(
                 )
 
         async def _rollback_failed_launch() -> None:
-            """
-            Undo a failed launch *after* the runner was atomically bound.
-
-            Fully unbinds the session — NULLs ``runner_id`` plus the
-            ``host_id`` / ``workspace`` / ``git_branch`` persisted by the
-            ``set_host_id`` call below — and rolls back any worktree
-            created for this launch. Clearing the binding (not just
-            ``runner_id``) keeps the DB consistent with the host's actual
-            state: the worktree is gone, so the row must not keep pointing
-            at it, and a retry that omits a worktree starts from a clean
-            slate rather than inheriting a stale ``git_branch`` (which
-            ``set_host_id`` cannot clear). ``POST /hosts/{id}/runners`` only
-            binds a previously-unbound clone (the fork-resume picker), so a
-            full unbind restores the true pre-call state. Used only on the
-            post-bind failure paths; the lost-CAS path must NOT clear the
-            binding because it belongs to the concurrent winner, not us.
-            """
+            """Clear the binding and worktree after a failed runner launch."""
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
 
-        binding_token = secrets.token_urlsafe(32)
-        runner_id = token_bound_runner_id(binding_token)
-
-        # Atomic bind (UPDATE ... WHERE runner_id IS NULL): only one
-        # concurrent launch can bind an unbound session; a second (or an
-        # already-bound session) gets False. Closes the TOCTOU.
-        bound = await asyncio.to_thread(
-            conversation_store.set_runner_id,
-            body.session_id,
-            runner_id,
-        )
-        if not bound:
-            await _rollback_worktree()
-            raise HTTPException(
-                status_code=400,
-                detail="session already has a runner bound",
+        # Store the final host, workspace, and optional branch together.
+        try:
+            await asyncio.to_thread(
+                conversation_store.set_host_id,
+                body.session_id,
+                host_id,
+                workspace,
+                git_branch,
             )
-        # Persist the validated, canonical workspace (the worktree path
-        # when a worktree was created) alongside host_id, plus git_branch
-        # when branching, so the conversation row satisfies
-        # ck_conversations_workspace_required_for_host. ``workspace`` is the
-        # realpath returned by validate_workspace (W6), or body.workspace
-        # verbatim only in non-production wiring without an agent cache.
-        await asyncio.to_thread(
-            conversation_store.set_host_id,
-            body.session_id,
-            host_id,
-            workspace,
-            git_branch,
-        )
+        except Exception:
+            await _rollback_runner_claim()
+            await _rollback_worktree()
+            raise
 
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
 
-        # Resolve the agent's harness so the host can refuse an
-        # unconfigured one before spawning (mirrors POST /v1/sessions).
-        # None — no agent cache wired, or no resolvable agent — skips
-        # the host-side check.
+        # Let the host reject an unconfigured harness before spawning.
         harness: str | None = None
         if agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
