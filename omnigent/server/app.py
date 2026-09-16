@@ -319,6 +319,11 @@ def _error_audit_extra(
     """
     route = request.scope.get("route")
     operation = getattr(route, "name", None) or "unmatched"
+    attributes.setdefault("method", request.method)
+    attributes.setdefault("route", getattr(route, "path", None) or "<unmatched>")
+    request_id = getattr(request.state, "audit_request_id", None)
+    if isinstance(request_id, str):
+        attributes.setdefault("request_id", request_id)
     return debug_event(
         operation,
         session_id=_session_id_from_request(request),
@@ -1734,6 +1739,7 @@ def create_app(
         :returns: The downstream route response.
         """
         request_id = uuid.uuid4().hex
+        request.state.audit_request_id = request_id
         set_request_id_for_access_log(request_id)
         set_request_user_agent_for_access_log(
             request.headers.get("user-agent"),
@@ -2096,8 +2102,10 @@ def create_app(
                 error_type=type(exc).__name__,
             ),
         )
+        request_id = getattr(request.state, "audit_request_id", None)
         return JSONResponse(
             status_code=500,
+            headers={"X-Request-Id": request_id} if isinstance(request_id, str) else None,
             content={
                 "error": {
                     "code": ErrorCode.INTERNAL_ERROR,

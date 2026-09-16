@@ -46,7 +46,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import phase_scope, runner_primary_session_id
+from omnigent.debug_logging import debug_event, phase_scope, runner_primary_session_id
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -5287,6 +5287,8 @@ def create_runner_app(
         conv_id: str,
         status: str,
         error: Mapping[str, object] | None = None,
+        *,
+        source_error: Mapping[str, object] | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -5310,6 +5312,14 @@ def create_runner_app(
         if error is not None:
             event["error"] = error
         if status == "failed":
+            source = source_error if source_error is not None else (error or {})
+            dimensions: dict[str, str] = {}
+            for key in ("code", "type", "status"):
+                value = source.get(key)
+                if (isinstance(value, int) and not isinstance(value, bool)) or (
+                    isinstance(value, str) and re.fullmatch(r"[\w.:-]{1,128}", value)
+                ):
+                    dimensions[f"source_{key}"] = str(value)
             # Canonical broken-turn signal: every failed turn shown in the UI
             # funnels through here, so log once at ERROR for the dashboard.
             _logger.error(
@@ -5317,7 +5327,12 @@ def create_runner_app(
                 conv_id,
                 harness,
                 error,
-                extra={"session_id": conv_id},
+                extra=debug_event(
+                    "runner_turn_failed",
+                    session_id=conv_id,
+                    harness=harness,
+                    **dimensions,
+                ),
             )
         _publish_event(conv_id, event)
 
@@ -7105,7 +7120,9 @@ def create_runner_app(
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
             if not _suppress_status:
-                _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
+                _publish_turn_status(
+                    conv_id, "failed", error=_normalize_turn_error(error), source_error=error
+                )
         else:
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
