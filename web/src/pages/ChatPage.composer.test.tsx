@@ -3546,6 +3546,39 @@ describe("Composer — ArrowUp edit of a queued message", () => {
     ]);
   });
 
+  it.each([true, false])(
+    "recalls the remaining queue after clearing the first recall (history present: %s)",
+    (withHistory) => {
+      useChatStore.setState({
+        queuedMessages: [
+          { queueId: "q_first", text: "First follow-up", conversationId: CONV },
+          { queueId: "q_last", text: QUEUED_TEXT, conversationId: CONV },
+          { queueId: "q_other", text: "Other chat", conversationId: "conv_other" },
+        ],
+      });
+      if (withHistory) {
+        appendPromptHistoryEntry("First follow-up", CONV);
+        appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+      }
+      renderWithTooltips(<Composer {...composerProps()} />);
+
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+      expect(textarea()).toHaveValue(QUEUED_TEXT);
+      expect(useChatStore.getState().queuedMessages.map((message) => message.queueId)).toEqual([
+        "q_first",
+        "q_other",
+      ]);
+
+      fireEvent.change(textarea(), { target: { value: "" } });
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+      expect(textarea()).toHaveValue("First follow-up");
+      expect(useChatStore.getState().queuedMessages.map((message) => message.queueId)).toEqual([
+        "q_other",
+      ]);
+    },
+  );
+
   it("adopts the queued row's attachments so re-sending keeps them", async () => {
     const file = new File(["notes"], "notes.txt", { type: "text/plain" });
     useChatStore.setState({
@@ -3614,7 +3647,7 @@ describe("Composer — ArrowUp edit of a queued message", () => {
     expect(useChatStore.getState().queuedMessages[0]?.replyDraft).toEqual(original.replyDraft);
   });
 
-  it("leaves a queued row with different quote provenance alone", () => {
+  it("restores the queued quote metadata even when history has only plain text", () => {
     const replyDraft: StoredReplyDraft = {
       version: 1,
       quotes: [{ before: "", text: "Quoted answer" }],
@@ -3629,9 +3662,9 @@ describe("Composer — ArrowUp edit of a queued message", () => {
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
 
-    expect(textarea()).toHaveValue(text);
-    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
-    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    expect(textarea()).toHaveValue("Follow-up");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted answer");
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
   });
 
   it("keeps an attachment-only draft when browsing history", () => {
