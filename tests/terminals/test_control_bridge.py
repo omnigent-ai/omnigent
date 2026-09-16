@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from fastapi import WebSocketDisconnect
 
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
@@ -235,6 +236,63 @@ async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
         # return value is discarded but the wait is the point.
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+class _DisconnectedOnCloseWebSocket(_FakeWebSocket):
+    """A client that vanished: every ``close()`` raises like starlette does.
+
+    Starlette turns uvicorn's ``ClientDisconnected`` (an ``OSError``) into
+    ``WebSocketDisconnect(1006)``, so the bridge's close attempt raises rather
+    than returning.
+    """
+
+    def __init__(self, inbound: list[dict[str, object]] | None = None) -> None:
+        super().__init__(inbound=inbound or [])
+        self.close_attempts = 0
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.close_attempts += 1
+        raise WebSocketDisconnect(code=1006)
+
+
+@pytest.mark.asyncio
+async def test_close_after_client_disconnect_does_not_escape_early_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gone client must not turn the tmux-missing bail-out into an ASGI error."""
+    monkeypatch.setattr("omnigent.terminals.control_bridge.shutil.which", lambda _: None)
+    ws = _DisconnectedOnCloseWebSocket()
+
+    # Must return normally: an escaping WebSocketDisconnect reaches uvicorn as
+    # "Exception in ASGI application" and marks the whole session errored.
+    await bridge_tmux_control_to_websocket(
+        ws, socket_path="/nonexistent/tmux.sock", tmux_target="main", read_only=False
+    )
+
+    assert ws.close_attempts == 1, "the bridge never tried to close the socket"
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_close_after_client_disconnect_does_not_escape_teardown() -> None:
+    """The teardown close is best-effort when the browser already went away."""
+    sock, target = await _new_private_tmux("cat")
+    ws = _DisconnectedOnCloseWebSocket()
+
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await asyncio.sleep(0.6)
+    # Killing the server ends the control client, so the bridge runs its
+    # ``finally`` teardown — which closes the (already gone) websocket.
+    await _kill_tmux(sock)
+
+    # The task must complete, not fail: teardown swallows the disconnect.
+    await asyncio.wait_for(task, timeout=5)
+    assert task.exception() is None
+    assert ws.close_attempts >= 1, "teardown never attempted a close"
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
