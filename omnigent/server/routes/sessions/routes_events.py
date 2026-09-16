@@ -2457,13 +2457,15 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
-        # Session file cleanup.
+        # Session file cleanup. delete_all_for_session returns only the blob
+        # keys that became orphaned — a blob still shared by a fork in another
+        # session is not returned, so the fork's attachment survives.
         if file_store is not None and artifact_store is not None:
-            deleted_file_ids = await asyncio.to_thread(
+            orphaned_blob_keys = await asyncio.to_thread(
                 file_store.delete_all_for_session, session_id
             )
-            for fid in deleted_file_ids:
-                await asyncio.to_thread(artifact_store.delete, fid)
+            for blob_key in orphaned_blob_keys:
+                await asyncio.to_thread(artifact_store.delete, blob_key)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)

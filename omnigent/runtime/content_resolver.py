@@ -337,7 +337,8 @@ def extract_text_attachments(
         if not _is_text_like_attachment(content_type, file_meta.filename):
             continue
         try:
-            raw = artifact_store.get(file_id)
+            # Bytes live under blob_key (a fork copy shares the source's blob).
+            raw = artifact_store.get(file_meta.blob_key or file_id)
         except Exception:  # best-effort scan; never break message delivery
             continue
         if not raw:
@@ -521,10 +522,12 @@ def _resolve_file_id_block(
         )
 
     # Use cached base64 if available; otherwise fetch, encode, and cache.
+    # Bytes live under blob_key (a fork copy shares the source's blob); the
+    # cache stays keyed by file_id so distinct rows keep independent entries.
     if cache is not None and file_id in cache:
         encoded = cache[file_id]
     else:
-        content_bytes = artifact_store.get(file_id)
+        content_bytes = artifact_store.get(file_meta.blob_key or file_id)
         encoded = base64.b64encode(content_bytes).decode("ascii")
         if cache is not None:
             cache[file_id] = encoded

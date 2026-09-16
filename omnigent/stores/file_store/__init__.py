@@ -40,6 +40,7 @@ class FileStore(ABC):
         content_type: str | None = None,
         session_id: str | None = None,
         file_id: str | None = None,
+        blob_key: str | None = None,
     ) -> StoredFile:
         """
         Record a new file. Generates a unique file_id unless given one.
@@ -55,7 +56,27 @@ class FileStore(ABC):
             pre-allocates ids so the copied conversation items can
             reference the copies it creates afterwards. ``None``
             (default) generates a fresh id.
+        :param blob_key: Artifact-store key for the row's bytes. A fork
+            copy passes the source row's blob so it shares the bytes
+            instead of duplicating them; ``None`` (default) points the
+            row at its own ``file_id`` (an independent blob).
         :returns: The newly created :class:`StoredFile`.
+        """
+        ...
+
+    @abstractmethod
+    def is_blob_key_orphaned(self, blob_key: str) -> bool:
+        """
+        Whether no file row references *blob_key* any more.
+
+        A blob is shared when a fork copies a file row without copying its
+        bytes, so the artifact-store blob must only be deleted once the last
+        referencing row is gone. Callers delete the row first, then consult
+        this before removing the blob.
+
+        :param blob_key: The artifact-store key to test.
+        :returns: ``True`` when the blob has no remaining referrers and is
+            safe to delete.
         """
         ...
 
@@ -132,10 +153,12 @@ class FileStore(ABC):
         """
         Delete all file metadata for a session.
 
-        Returns the list of deleted file ids so callers can
-        clean up artifact bytes.
+        Returns only the artifact-store keys that became **orphaned** by the
+        deletion (no surviving row references them), so the caller cleans up
+        exactly those bytes. A blob still shared by a fork in another session
+        is not returned and therefore survives.
 
         :param session_id: Owning session/conversation id.
-        :returns: List of deleted file ids.
+        :returns: The now-orphaned artifact-store keys to clean up.
         """
         ...

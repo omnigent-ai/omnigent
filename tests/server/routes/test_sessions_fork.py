@@ -389,15 +389,18 @@ class _FileStore:
         content_type: str | None = None,
         session_id: str | None = None,
         file_id: str | None = None,
+        blob_key: str | None = None,
     ) -> StoredFile:
         """
-        Record a new file row, honoring a caller-chosen id.
+        Record a new file row, honoring a caller-chosen id and blob_key.
 
         :param filename: Original filename.
         :param bytes: File size in bytes.
         :param content_type: MIME type.
         :param session_id: Owning session id.
         :param file_id: Caller-chosen id, or ``None`` to derive one.
+        :param blob_key: Artifact-store key for the bytes (a fork copy
+            shares the source's blob); defaults to the row's own id.
         :returns: The newly created StoredFile.
         """
         new_id = file_id or f"gen{len(self.files):029d}"
@@ -408,6 +411,7 @@ class _FileStore:
             bytes=bytes,
             content_type=content_type,
             session_id=session_id,
+            blob_key=blob_key if blob_key is not None else new_id,
         )
         self.files[new_id] = stored
         return stored
@@ -686,14 +690,13 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_session_copies_source_files_into_fork() -> None:
-    """A fork copies the source's file resources and hands the store the
-    old→new id map so copied items reference the fork's own files.
+async def test_fork_session_shares_source_file_blob_without_copying_bytes() -> None:
+    """A fork creates its own file rows but SHARES the source's blob.
 
-    Without the copy the fork's session-scoped file endpoints 404 for
-    every attachment the copied items reference — the web transcript
-    shows broken attachments and a native transcript rebuild receives
-    the file_id unresolved.
+    The store gets the old→new id map so copied items reference the fork's
+    rows; each fork row's blob_key points at the source's blob, so no bytes
+    are duplicated. Without a fork-owned row the fork's session-scoped file
+    endpoints 404 for every attachment the copied items reference.
     """
     source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
     src_file_id = "aa11bb22cc33dd44ee55ff6677889900"
@@ -711,6 +714,7 @@ async def test_fork_session_copies_source_files_into_fork() -> None:
                 bytes=4,
                 content_type="image/png",
                 session_id=source_id,
+                blob_key=src_file_id,
             ),
         }
     )
@@ -730,17 +734,20 @@ async def test_fork_session_copies_source_files_into_fork() -> None:
     new_file_id = file_id_map[src_file_id]
     assert new_file_id != src_file_id
 
-    # The copy is fork-owned under the mapped id, metadata preserved.
+    # The fork row is its own (fork-scoped, fresh id) but points at the
+    # SOURCE's blob — metadata preserved, no bytes duplicated.
     copied = file_store.files[new_file_id]
     assert copied.session_id == fork_id
     assert copied.filename == "photo.png"
     assert copied.bytes == 4
     assert copied.content_type == "image/png"
-    assert artifact_store.blobs[new_file_id] == b"\x89PNG"
+    assert copied.blob_key == src_file_id
 
-    # The source's file row and blob are untouched.
-    assert file_store.files[src_file_id].session_id == source_id
+    # No new blob was written: the artifact store still holds exactly the
+    # one source blob, and both the source row and blob are untouched.
+    assert set(artifact_store.blobs) == {src_file_id}
     assert artifact_store.blobs[src_file_id] == b"\x89PNG"
+    assert file_store.files[src_file_id].session_id == source_id
 
 
 @pytest.mark.asyncio

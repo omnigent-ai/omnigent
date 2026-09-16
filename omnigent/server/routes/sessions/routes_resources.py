@@ -1655,10 +1655,15 @@ def register_resources_routes(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        # Content is immutable per file id, so a still-valid cached copy can be
-        # answered before ever touching the artifact store. Transcripts re-render
-        # the same attachments on every load, and the originals run to megabytes.
-        etag = _file_content_etag(stored.id)
+        # The bytes live under blob_key (== id for own uploads; the source's
+        # blob for a fork copy that shares it). Content is immutable per blob,
+        # so a still-valid cached copy can be answered before ever touching the
+        # artifact store — and keying the ETag on the blob lets a fork and its
+        # source share the browser cache for the same bytes. Transcripts
+        # re-render the same attachments on every load, and originals run to
+        # megabytes.
+        blob_key = stored.blob_key or stored.id
+        etag = _file_content_etag(blob_key)
         if _if_none_match_matches(request.headers.get("if-none-match"), etag):
             return Response(
                 status_code=304,
@@ -1667,7 +1672,7 @@ def register_resources_routes(
                     "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
                 },
             )
-        content = await asyncio.to_thread(artifact_store.get, stored.id)
+        content = await asyncio.to_thread(artifact_store.get, blob_key)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
         # The filename and bytes are fully user-controlled. Serving the
         # content inline lets a browser navigating directly to this URL
@@ -1710,12 +1715,26 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        if not file_store.delete(file_id, session_id=session_id):
+        # Learn the blob this row points at BEFORE deleting the row — a fork
+        # copy shares the source's blob (blob_key != id), so we can't assume
+        # the blob lives under file_id.
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
+        if stored is None:
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        artifact_store.delete(file_id)
+        blob_key = stored.blob_key or stored.id
+        if not await asyncio.to_thread(file_store.delete, file_id, session_id=session_id):
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        # Delete the bytes only once no surviving row (e.g. a fork sharing this
+        # blob) still references them — otherwise the fork's attachment would
+        # 404 after the source deletes its copy.
+        if await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key):
+            await asyncio.to_thread(artifact_store.delete, blob_key)
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.deleted",
@@ -1812,7 +1831,9 @@ def register_resources_routes(
         total_bytes = 0
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
-            if stored is None or not artifact_store.exists(stored.id):
+            # The source row may itself share a blob (blob_key != id), so probe
+            # existence under the effective blob key, not the row id.
+            if stored is None or not artifact_store.exists(stored.blob_key or stored.id):
                 raise OmnigentError(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
@@ -1833,7 +1854,7 @@ def register_resources_routes(
         copied: list[StoredFile] = []
         try:
             for stored in sources:
-                content = artifact_store.get(stored.id)
+                content = artifact_store.get(stored.blob_key or stored.id)
                 new = file_store.create(
                     session_id=session_id,
                     filename=stored.filename,

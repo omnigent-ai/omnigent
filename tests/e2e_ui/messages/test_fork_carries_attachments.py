@@ -276,6 +276,22 @@ def test_fork_into_claude_native_carries_image_attachment(
     assert source_content.status_code == 200
     assert source_content.content == image_bytes
 
+    # -- The fork SHARES the source's blob (no bytes copied), so deleting the
+    #    source session must not delete the bytes out from under the fork.
+    #    Reference-counted blob deletion is what keeps the fork servable here;
+    #    without it, deleting the source resurrects the original 404.
+    del_resp = httpx.delete(f"{base_url}/v1/sessions/{source_id}", timeout=30.0)
+    assert del_resp.status_code in (200, 204), del_resp.text
+    fork_content_after = httpx.get(
+        f"{base_url}/v1/sessions/{fork_id}/resources/files/{fork_file_id}/content",
+        timeout=30.0,
+    )
+    assert fork_content_after.status_code == 200, (
+        "fork's attachment must survive the source session's deletion — the "
+        f"shared blob was reference-counted, got {fork_content_after.status_code}"
+    )
+    assert fork_content_after.content == image_bytes
+
     # -- The fork's labels still select the runner's rebuild-from-items path
     #    (the journey being guarded: rebuild must re-resolve the attachment).
     snap = httpx.get(f"{base_url}/v1/sessions/{fork_id}", timeout=30.0)

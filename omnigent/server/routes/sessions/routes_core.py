@@ -2885,8 +2885,11 @@ def register_core_routes(
         # endpoints would 404, so the web transcript shows broken
         # attachments and a native transcript rebuild receives the file_id
         # unresolved. Pre-allocate a fork-owned id per copyable source file;
-        # the store rewrites the copied items to those ids, and the copies
-        # themselves are materialized right after the fork commits.
+        # the store rewrites the copied items to those ids, and a fork-owned
+        # row per id is created right after the fork commits. The row points
+        # at the SOURCE's blob (blob_key), so the fork shares the bytes and
+        # copies nothing — reference-counted deletion keeps that blob alive
+        # until every referencing row is gone.
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
         if file_store is not None and artifact_store is not None:
@@ -2900,10 +2903,11 @@ def register_core_routes(
                     order="asc",
                 )
                 for stored_file in files_page.data:
-                    # A file whose blob is already gone can't be copied;
+                    # A file whose blob is already gone can't be shared;
                     # leaving its references on the source id degrades the
                     # same way the source session already does.
-                    if await asyncio.to_thread(artifact_store.exists, stored_file.id):
+                    blob_key = stored_file.blob_key or stored_file.id
+                    if await asyncio.to_thread(artifact_store.exists, blob_key):
                         fork_source_files.append(stored_file)
                         fork_file_id_map[stored_file.id] = generate_file_id()
                 if not files_page.has_more or not files_page.data:
@@ -2959,17 +2963,17 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
-        # Materialize the fork-owned file copies the rewritten items now
-        # reference — before the fork is announced or returned, so no reader
-        # sees the ids dangling. One file at a time keeps peak memory at a
-        # single blob. A failed copy is logged and skipped: that one
-        # attachment degrades exactly as a missing file already does.
+        # Create the fork-owned rows the rewritten items now reference —
+        # before the fork is announced or returned, so no reader sees the ids
+        # dangling. Each row points at the SOURCE's blob (blob_key), so no
+        # bytes move: the fork shares the source's artifact and both sessions
+        # resolve the same content independently. A failed row create is
+        # logged and skipped — nothing to roll back since no blob was written,
+        # and that one attachment degrades exactly as a missing file does.
         if file_store is not None and artifact_store is not None:
             for stored_file in fork_source_files:
                 copied_file_id = fork_file_id_map[stored_file.id]
                 try:
-                    file_content = await asyncio.to_thread(artifact_store.get, stored_file.id)
-                    await asyncio.to_thread(artifact_store.put, copied_file_id, file_content)
                     await asyncio.to_thread(
                         file_store.create,
                         filename=stored_file.filename,
@@ -2977,17 +2981,16 @@ def register_core_routes(
                         content_type=stored_file.content_type,
                         session_id=new_conv.id,
                         file_id=copied_file_id,
+                        blob_key=stored_file.blob_key or stored_file.id,
                     )
                 except Exception:
                     _logger.warning(
-                        "failed to copy file %s into fork %s of session %s",
-                        stored_file.id,
+                        "failed to create fork file row %s in fork %s of session %s",
+                        copied_file_id,
                         new_conv.id,
                         source_id,
                         exc_info=True,
                     )
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(artifact_store.delete, copied_file_id)
 
         # Grant ownership BEFORE scheduling the managed launch, mirroring
         # both create paths: a managed-guard failure (misconfigured server,
