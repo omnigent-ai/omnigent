@@ -53,11 +53,9 @@ describe("default keybindings", () => {
       (rule) => rule.action === "session.action.openPinned",
     );
     expect(pinned).toHaveLength(20);
+    expect(pinned.filter((rule) => serializeKeybinding(rule.sequence) === "mod+1")).toHaveLength(1);
     expect(
-      pinned.filter((rule) => serializeKeybinding(rule.sequence) === "primary+1"),
-    ).toHaveLength(1);
-    expect(
-      pinned.filter((rule) => serializeKeybinding(rule.sequence) === "primary+alt+[Digit1]"),
+      pinned.filter((rule) => serializeKeybinding(rule.sequence) === "mod+alt+[Digit1]"),
     ).toHaveLength(1);
     expect(new Set(pinned.map((rule) => JSON.stringify(rule.args))).size).toBe(10);
   });
@@ -80,8 +78,6 @@ describe("default keybindings", () => {
     );
     expect(repeatedActions).toEqual(
       new Set([
-        "session.action.openPrevious",
-        "session.action.openNext",
         "session.action.openPinned",
         "chat.action.openPreviousMessage",
         "chat.action.openNextMessage",
@@ -112,6 +108,7 @@ describe("default keybindings", () => {
     expect(captureActions).toEqual(
       new Set([
         "workbench.action.showCommands",
+        "workbench.action.showSessionSearch",
         "chat.action.acceptApproval",
         "composer.action.commitDictation",
         "composer.action.cancelDictation",

@@ -9,6 +9,7 @@ interface BaseRuleOptions {
   phase?: KeybindingRule["phase"];
   priority?: number;
   allowRepeat?: boolean;
+  allowDefaultPrevented?: boolean;
   preventDefault?: boolean;
   stopPropagation?: boolean;
 }
@@ -35,6 +36,7 @@ function rule<A extends ActionId>(
     phase: options.phase ?? "bubble",
     priority: options.priority,
     allowRepeat: options.allowRepeat,
+    allowDefaultPrevented: options.allowDefaultPrevented,
     preventDefault: options.preventDefault ?? true,
     stopPropagation: options.stopPropagation ?? false,
   } as KeybindingRule<A>;
@@ -48,13 +50,18 @@ const notInputFocus = not(when(CONTEXT_KEYS.inputFocus));
 const notMonacoFocus = not(when(CONTEXT_KEYS.monacoFocus));
 const notTerminalFocus = not(when(CONTEXT_KEYS.terminalFocus));
 const paletteFocusAllowed = and(notMonacoFocus, or(notTerminalFocus, when(CONTEXT_KEYS.eventMeta)));
+const sessionNavigationFocusAllowed = and(
+  notMonacoFocus,
+  notTerminalFocus,
+  not(when(CONTEXT_KEYS.commandPaletteFocus)),
+);
 const dictationFocusAllowed = and(notMonacoFocus, notTerminalFocus);
 
 const pinnedRules: KeybindingRule[] = [];
 for (let slot = 0; slot < 10; slot += 1) {
   const digit = slot === 9 ? "0" : String(slot + 1);
   pinnedRules.push(
-    rule(`session.openPinned.native.${digit}`, "session.action.openPinned", `primary+${digit}`, {
+    rule(`session.openPinned.native.${digit}`, "session.action.openPinned", `mod+${digit}`, {
       args: { slot },
       when: when(CONTEXT_KEYS.isNativeShell),
       allowRepeat: true,
@@ -62,7 +69,7 @@ for (let slot = 0; slot < 10; slot += 1) {
     rule(
       `session.openPinned.browser.${digit}`,
       "session.action.openPinned",
-      `primary+alt+[Digit${digit}]`,
+      `mod+alt+[Digit${digit}]`,
       {
         args: { slot },
         when: notNativeShell,
@@ -74,47 +81,58 @@ for (let slot = 0; slot < 10; slot += 1) {
 
 /** The product defaults. User customizations are layered over these rules. */
 export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
-  // New session is the one legacy action that requires the platform modifier
-  // exactly; other migrated hooks historically accepted either Ctrl or Meta.
-  rule("session.new", "session.action.new", "mod+n", { when: notEmbedded }),
-  rule("workbench.showCommands", "workbench.action.showCommands", "primary+k", {
+  rule("session.new", "session.action.new", "mod+n", {
+    when: notEmbedded,
+    allowDefaultPrevented: true,
+    stopPropagation: true,
+  }),
+  rule("workbench.showCommands", "workbench.action.showCommands", "mod+k", {
     phase: "capture",
     stopPropagation: true,
     when: paletteFocusAllowed,
   }),
-  rule("workbench.openKeyboardShortcuts", "workbench.action.openKeyboardShortcuts", "primary+/"),
+  rule("workbench.showSessionSearch", "workbench.action.showSessionSearch", "mod+alt+[KeyS]", {
+    phase: "capture",
+    stopPropagation: true,
+    when: paletteFocusAllowed,
+  }),
+  rule("workbench.openKeyboardShortcuts", "workbench.action.openKeyboardShortcuts", "mod+/", {
+    allowDefaultPrevented: true,
+  }),
   rule(
     "workbench.toggleConversationsSidebar",
     "workbench.action.toggleConversationsSidebar",
-    "primary+alt+[BracketLeft]",
-    { stopPropagation: true },
+    "mod+alt+[BracketLeft]",
+    { allowDefaultPrevented: true, stopPropagation: true },
   ),
   rule(
     "workbench.toggleWorkspaceSidebar",
     "workbench.action.toggleWorkspaceSidebar",
-    "primary+alt+[BracketRight]",
-    { stopPropagation: true },
+    "mod+alt+[BracketRight]",
+    { allowDefaultPrevented: true, stopPropagation: true },
   ),
   // Approval and send intentionally keep repeat disabled: a held Enter must
   // not accept multiple prompts or enqueue repeated messages.
-  rule("chat.acceptApproval", "chat.action.acceptApproval", "primary+enter", {
+  rule("chat.acceptApproval", "chat.action.acceptApproval", "mod+enter", {
     phase: "capture",
     stopPropagation: true,
   }),
-  rule("session.openPrevious", "session.action.openPrevious", "primary+arrowup", {
-    allowRepeat: true,
+  rule("session.openPrevious", "session.action.openPrevious", "mod+[BracketLeft]", {
+    stopPropagation: true,
+    when: sessionNavigationFocusAllowed,
   }),
-  rule("session.openNext", "session.action.openNext", "primary+arrowdown", {
-    allowRepeat: true,
+  rule("session.openNext", "session.action.openNext", "mod+[BracketRight]", {
+    stopPropagation: true,
+    when: sessionNavigationFocusAllowed,
   }),
   ...pinnedRules,
-  rule("chat.openPreviousMessage", "chat.action.openPreviousMessage", "primary+alt+arrowup", {
+  rule("chat.openPreviousMessage", "chat.action.openPreviousMessage", "mod+alt+arrowup", {
     allowRepeat: true,
   }),
-  rule("chat.openNextMessage", "chat.action.openNextMessage", "primary+alt+arrowdown", {
+  rule("chat.openNextMessage", "chat.action.openNextMessage", "mod+alt+arrowdown", {
     allowRepeat: true,
   }),
-  rule("composer.toggleDictation", "composer.action.toggleDictation", "primary+alt+[KeyV]", {
+  rule("composer.toggleDictation", "composer.action.toggleDictation", "mod+alt+[KeyV]", {
     stopPropagation: true,
     when: dictationFocusAllowed,
   }),

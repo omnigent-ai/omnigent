@@ -65,6 +65,7 @@ export function matchingKeybindingRules(
   return rules
     .map((rule, index) => ({ rule, index }))
     .filter(({ rule }) => (rule.phase ?? "bubble") === phase)
+    .filter(({ rule }) => rule.allowDefaultPrevented === true || !event.defaultPrevented)
     .filter(({ rule }) => rule.allowRepeat === true || !event.repeat)
     .filter(({ rule }) => rule.sequence[strokeIndex] !== undefined)
     .filter(({ rule }) =>
