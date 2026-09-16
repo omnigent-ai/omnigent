@@ -113,11 +113,13 @@ def _build_orchestrator_bundle(
         return buf.getvalue()
 
 
+@pytest.mark.parametrize("worker_delay", [0.0, 12.0], ids=["immediate-worker", "slow-worker"])
 def test_headless_prompt_reconciles_saved_final_response_after_missed_completion(
     http_client: httpx.Client,
     live_runner_id: str,
     mock_llm_server_url: str | None,
     monkeypatch: pytest.MonkeyPatch,
+    worker_delay: float,
 ) -> None:
     """Headless ``-p`` must not drop a saved final response on a missed event.
 
@@ -137,10 +139,8 @@ def test_headless_prompt_reconciles_saved_final_response_after_missed_completion
     marker = f"SYNTH_FINAL_{uid}"
 
     reset_mock_llm(mock_llm_server_url)
-    # Parent turn 1: dispatch the worker (tool call), then an empty text
-    # response that ends the turn with no assistant text so the session parks.
-    # Auto-woken turn: emit the completed synthesis. The fallback also returns
-    # the marker so the auto-wake turn is covered regardless of iteration count.
+    # Hold synthesis until the drain loop starts, so the initial transcript
+    # check cannot recover it before the missed-completion path is exercised.
     configure_mock_llm(
         mock_llm_server_url,
         [
@@ -156,12 +156,14 @@ def test_headless_prompt_reconciles_saved_final_response_after_missed_completion
                 ]
             },
             {"text": ""},
-            {"text": marker},
+            {"text": marker, "block": True},
         ],
         key=parent_model,
     )
     set_fallback_mock_llm(mock_llm_server_url, parent_model, marker)
-    configure_mock_llm(mock_llm_server_url, [{"text": "WORKER_DONE"}], key=child_model)
+    configure_mock_llm(
+        mock_llm_server_url, [{"text": "WORKER_DONE", "delay": worker_delay}], key=child_model
+    )
     set_fallback_mock_llm(mock_llm_server_url, child_model, "WORKER_DONE")
 
     bundle = _build_orchestrator_bundle(
@@ -171,14 +173,33 @@ def test_headless_prompt_reconciles_saved_final_response_after_missed_completion
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
     )
 
-    # Inject the reported trigger: the drain-loop subscription misses the final
-    # turn's completion event and collects no text (as when it sees only the
-    # idle status). Turn 1 completes promptly, so only the drain loop calls
-    # await_turn; refresh() below still reads real status from the live server.
+    gate_released = False
+
+    # Miss the completion event while still waiting for the real session to
+    # finish. Returning every poll would exhaust the CLI's 30-turn guard.
     async def _await_turn_missing_completion(
         self: SessionsChat, *, timeout: float | None = 1200.0
     ) -> QueryResult:
-        await asyncio.sleep(0.2)
+        nonlocal gate_released
+        try:
+            async with asyncio.timeout(timeout):
+                async with httpx.AsyncClient(base_url=mock_llm_server_url) as gate_client:
+                    while True:
+                        if not gate_released:
+                            pending = await gate_client.get("/gate/pending")
+                            pending.raise_for_status()
+                            if pending.json()["pending"]:
+                                released = await gate_client.post("/gate/release")
+                                released.raise_for_status()
+                                assert released.json()["released"]
+                                gate_released = True
+                        await self.refresh()
+                        assert self.status != "failed", "orchestrator failed before synthesis"
+                        if gate_released and self.status == "idle":
+                            break
+                        await asyncio.sleep(0.2)
+        except TimeoutError:
+            pass  # Match await_turn's empty result when its wait budget expires.
         return QueryResult(text="", files=[])
 
     monkeypatch.setattr(SessionsChat, "await_turn", _await_turn_missing_completion)
@@ -202,6 +223,7 @@ def test_headless_prompt_reconciles_saved_final_response_after_missed_completion
             )
 
     result = asyncio.run(_one_shot())
+    assert gate_released, "the drain loop never reached the gated synthesis"
 
     session_id = captured.get("id")
     assert session_id, "headless run never reported a session id"
