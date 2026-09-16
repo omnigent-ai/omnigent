@@ -363,7 +363,7 @@ def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
 # Unrecognized failures leave liveness unknown and are retried.
 _TMUX_TARGET_GONE_STDERR_MARKERS = (
     "no server running on",
-    "server exited unexpectedly",
+    "server exited",
     "lost server",
     "can't find session",
     "can't find window",
@@ -1435,6 +1435,9 @@ class TerminalInstance:
         keys: str = "Enter",
     ) -> TerminalResult:
         """Send keystrokes to the terminal.
+
+        An error may follow partial delivery. Inspect the terminal before
+        retrying; replaying the request can duplicate text or key presses.
 
         Args:
             text: Literal text to type.  Sent via ``tmux send-keys -l`` so

@@ -695,6 +695,7 @@ def test_tmux_process_start_error_keeps_permanent_failure_non_transient(
         (b"can't find window: main", False),
         (b"can't find pane: main", False),
         (b"no current target", False),
+        (b"server exited", False),
         (b"server exited unexpectedly", False),
         (b"lost server", False),
         (b"session not found", False),
