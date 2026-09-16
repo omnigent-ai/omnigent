@@ -609,6 +609,33 @@ async def test_run_turn_materializes_image_to_bridge_dir(
 
 
 @pytest.mark.asyncio
+async def test_resize_notice_uses_hidden_hook_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Claude terminal input excludes the framework notice."""
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    async for _ in executor.run_turn(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect this"}],
+            },
+            {"role": "developer", "content": "downscaled"},
+        ],
+        [],
+        "",
+    ):
+        pass
+
+    assert sent[0]["content"] == "inspect this"
+    assert (tmp_path / "pending_framework_context.txt").read_text() == "downscaled"
+
+
+@pytest.mark.asyncio
 async def test_run_turn_image_only_no_text_still_injects(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

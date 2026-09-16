@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 
-from omnigent.entities import ConversationItem, FunctionCallOutputData
+from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
 from omnigent.runner.app import _format_subagent_wake_notice
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
@@ -57,6 +57,32 @@ def _output_item(output: str) -> ConversationItem:
         type="function_call_output",
         data=FunctionCallOutputData(call_id="c1", output=output),
     )
+
+
+def test_framework_notice_is_developer_context_not_user_text() -> None:
+    """Transient image metadata becomes a separate developer message."""
+    item = ConversationItem(
+        id="i1",
+        status="completed",
+        response_id="r1",
+        created_at=1,
+        type="message",
+        data=MessageData(
+            role="user",
+            content=[
+                {"type": "input_text", "text": "inspect this"},
+                {"type": "_omnigent_framework_notice", "text": "downscaled"},
+            ],
+        ),
+    )
+
+    assert history_to_input_items([item]) == [
+        {"role": "user", "content": [{"type": "input_text", "text": "inspect this"}]},
+        {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "downscaled"}],
+        },
+    ]
 
 
 def test_history_replay_strips_inline_base64_image() -> None:

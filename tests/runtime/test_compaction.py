@@ -522,7 +522,7 @@ def test_resolver_parameterized_image_is_cleared_before_token_counting() -> None
             assert file_id == stored.id
             return payload
 
-    resolved = _resolve_file_id_block(
+    resolved, _ = _resolve_file_id_block(
         {"type": "input_image", "file_id": stored.id, "filename": stored.filename},
         _FileStore(),  # type: ignore[arg-type]
         _ArtifactStore(),  # type: ignore[arg-type]

@@ -1958,6 +1958,19 @@ def build_hook_settings(
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
     command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
+    framework_context_parts = [
+        python,
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.hook",
+        "framework-context",
+        "--bridge-dir",
+        str(bridge_dir),
+    ]
+    framework_context_hook = {
+        "type": "command",
+        "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
+    }
     session_start_hook = {
         "type": "command",
         "command": command,
@@ -1985,7 +1998,7 @@ def build_hook_settings(
         # (web-UI message via tmux send-keys, or direct keystrokes
         # into the embedded terminal). The transcript forwarder
         # translates it into ``session.status: running``.
-        "UserPromptSubmit": [{"hooks": [hook]}],
+        "UserPromptSubmit": [{"hooks": [hook, framework_context_hook]}],
         # ``TaskCreated`` fires when Claude creates a new native task
         # (shown with ``□`` in the TUI). The payload carries ``task_id``
         # and ``task_subject``; the forwarder converts all current tasks

@@ -47,6 +47,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
     unresolved_attachment_marker,
@@ -413,6 +415,7 @@ class CodexNativeExecutor(Executor):
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
+        notices = _latest_framework_notices(messages)
         goal_objective = goal_objective_from_content(latest_user_content)
         if goal_objective is not None:
             # Reject over-long objectives here so the app-server's raw
@@ -426,6 +429,8 @@ class CodexNativeExecutor(Executor):
             if goal_objective is not None
             else _content_to_input_items(latest_user_content, self._bridge_dir)
         )
+        for notice in notices:
+            _apply_resize_notice_to_latest_image(input_items, notice)
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
             return
@@ -610,6 +615,36 @@ def _latest_user_content(messages: list[Message]) -> object:
     return None
 
 
+def _latest_framework_notices(messages: list[Message]) -> list[str]:
+    """Return framework context attached to the latest user turn."""
+    latest_user = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        None,
+    )
+    if latest_user is None:
+        return []
+    notices: list[str] = []
+    for message in messages[latest_user + 1 :]:
+        if message.get("role") not in {"developer", "system"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            notices.append(content)
+        elif isinstance(content, list):
+            notices.extend(
+                text
+                for block in content
+                if isinstance(block, dict)
+                and isinstance((text := block.get("text")), str)
+                and text
+            )
+    return notices
+
+
 def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
     """
     Normalize executor content into Codex app-server input items.
@@ -637,6 +672,11 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             if block is None:
                 continue
             block_type = block.get("type")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                text = block.get("text")
+                if isinstance(text, str):
+                    _apply_resize_notice_to_latest_image(items, text)
+                continue
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
                 if isinstance(text, str) and text:
@@ -655,6 +695,20 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+
+def _apply_resize_notice_to_latest_image(
+    items: list[dict[str, object]],
+    notice: str,
+) -> None:
+    """Attach resize metadata to the preceding Codex image path."""
+    for item in reversed(items):
+        if item.get("type") != "localImage":
+            continue
+        path = item.get("path")
+        if isinstance(path, str):
+            item["path"] = str(codex_resize_metadata_path(Path(path), notice))
+        return
 
 
 def _file_block_to_input_item(

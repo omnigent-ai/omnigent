@@ -338,6 +338,8 @@ class SqlFile(OmnigentBase):
     bytes: Mapped[int] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Opaque JSON metadata about the original upload; never SQL-filtered.
+    source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # Files are only ever listed per session (WHERE session_id = ?),

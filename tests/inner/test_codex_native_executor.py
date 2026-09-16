@@ -457,6 +457,52 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
     )
 
 
+def test_resize_notice_is_encoded_in_model_visible_image_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex receives resize metadata without adding user-visible text."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        async for _ in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                        {"type": "input_text", "text": "inspect this"},
+                    ],
+                },
+                {
+                    "role": "developer",
+                    "content": "Note: the attached image was downscaled from 4600×3400 px.",
+                },
+            ],
+            [],
+            "",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    start = next(
+        params for method, params in _FakeCodexNativeClient.requests if method == "turn/start"
+    )
+    image = start["input"][0]
+    assert image["type"] == "localImage"
+    assert "downscaled-from-4600x3400" in image["path"]
+    assert start["input"][1] == {"type": "text", "text": "inspect this"}
+    assert len(start["input"]) == 2
+
+
 def test_input_file_text_is_inlined_as_a_text_item(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

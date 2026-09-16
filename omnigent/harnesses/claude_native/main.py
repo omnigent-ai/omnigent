@@ -5404,7 +5404,11 @@ async def _resolve_session_item_file_references(
     :returns: The same items with resolvable attachment blocks rewritten
         to carry ``image_url`` / ``file_data`` data URIs.
     """
-    from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
+    from omnigent.inner.native_attachments import (
+        framework_notice_block,
+        has_unresolved_file_id,
+        resolve_file_id_block,
+    )
 
     for item in items:
         content = item.get("content")
@@ -5414,14 +5418,18 @@ async def _resolve_session_item_file_references(
         for block in content:
             parsed_block = _json_object(block)
             if parsed_block is not None and has_unresolved_file_id(parsed_block):
-                resolved_content.append(
-                    await resolve_file_id_block(
-                        parsed_block,
-                        session_id=session_id,
-                        client=client,
-                    )
-                    or parsed_block
+                result = await resolve_file_id_block(
+                    parsed_block,
+                    session_id=session_id,
+                    client=client,
                 )
+                if result is None:
+                    resolved_content.append(parsed_block)
+                else:
+                    new_block, notice = result
+                    resolved_content.append(new_block)
+                    if notice is not None:
+                        resolved_content.append(framework_notice_block(notice))
             else:
                 resolved_content.append(block)
         item["content"] = resolved_content

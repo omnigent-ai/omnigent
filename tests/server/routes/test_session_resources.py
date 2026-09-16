@@ -2267,6 +2267,37 @@ async def test_copy_files_from_direct_parent(
 
 
 @pytest.mark.asyncio
+async def test_copy_files_carries_source_metadata(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A copied downscaled image keeps its source_metadata for the subagent."""
+    source = file_store.create(
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        filename="shot.webp",
+        bytes=3,
+        content_type="image/webp",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    artifact_store.put(source.id, b"abc")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": [source.id],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][source.id]["new_id"]
+
+    copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
+    assert copied is not None
+    assert copied.source_metadata == {"width": 6000, "height": 4000}
+
+
+@pytest.mark.asyncio
 async def test_copy_files_rejects_empty_file_ids(
     file_client: httpx.AsyncClient,
 ) -> None:

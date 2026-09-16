@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import PagedList, StoredFile
 
@@ -39,6 +40,7 @@ class FileStore(ABC):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
         Record a new file. Generates a unique file_id.
@@ -50,6 +52,10 @@ class FileStore(ABC):
             e.g. ``"application/pdf"``.
         :param session_id: Owning session/conversation id. When
             set, the file is session-scoped; ``None`` for global.
+        :param source_metadata: Optional opaque JSON-able dict of
+            metadata about the original upload before any server-side
+            transform (e.g. ``{"width", "height"}`` for a downscaled
+            image), or ``None`` when there is nothing to record.
         :returns: The newly created :class:`StoredFile`.
         """
         ...

@@ -38,7 +38,12 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.inner.native_attachments import (
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    attachment_reference_line,
+    framework_notices,
+)
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
@@ -159,6 +164,7 @@ class ClaudeNativeExecutor(Executor):
             )
             return
         text = _latest_user_text(messages, self._bridge_dir)
+        notices = _latest_framework_notices(messages)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
@@ -203,6 +209,11 @@ class ClaudeNativeExecutor(Executor):
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
+                    context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+                    if notices:
+                        context_path.write_text("\n\n".join(notices), encoding="utf-8")
+                    else:
+                        context_path.unlink(missing_ok=True)
                     if wanted_model_arg is not None:
                         # Accepted trade-off: ``/model <id>`` also saves the
                         # pick as the person's global default for new Claude
@@ -466,6 +477,8 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type", "")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                continue
             if block_type == "input_text":
                 text = block.get("text")
                 if isinstance(text, str):
@@ -475,3 +488,33 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""
+
+
+def _latest_framework_notices(messages: list[Message]) -> list[str]:
+    """Return framework context attached to the latest user turn."""
+    latest_user = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        None,
+    )
+    if latest_user is None:
+        return []
+    notices = framework_notices(messages[latest_user].get("content"))
+    for message in messages[latest_user + 1 :]:
+        if message.get("role") not in {"developer", "system"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            notices.append(content)
+        elif isinstance(content, list):
+            notices.extend(
+                text
+                for block in content
+                if isinstance(block, dict)
+                and isinstance((text := block.get("text")), str)
+                and text
+            )
+    return notices

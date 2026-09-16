@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import builtins
+import json
+from typing import Any
 
 from sqlalchemy import and_, asc, desc, or_, select
 from sqlalchemy.orm import Session
@@ -34,6 +36,9 @@ def _to_entity(row: SqlFile) -> StoredFile:
         bytes=row.bytes,
         content_type=row.content_type,
         session_id=row.session_id,
+        source_metadata=(
+            json.loads(row.source_metadata) if row.source_metadata is not None else None
+        ),
     )
 
 
@@ -70,6 +75,7 @@ class SqlAlchemyFileStore(FileStore):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
         Record a new file in the database.
@@ -79,10 +85,14 @@ class SqlAlchemyFileStore(FileStore):
         :param content_type: MIME type.
         :param session_id: Owning session id, or ``None`` for
             global files.
+        :param source_metadata: Opaque JSON-able dict of metadata about
+            the original upload before any server-side transform, or
+            ``None`` when there is nothing to record.
         :returns: The newly created :class:`StoredFile`.
         """
         file_id = generate_file_id()
         created_at = now_epoch()
+        encoded_metadata = json.dumps(source_metadata) if source_metadata is not None else None
 
         def write(session: Session) -> StoredFile:
             row = SqlFile(
@@ -92,6 +102,7 @@ class SqlAlchemyFileStore(FileStore):
                 bytes=bytes,
                 content_type=content_type,
                 session_id=session_id,
+                source_metadata=encoded_metadata,
             )
             session.add(row)
             return _to_entity(row)

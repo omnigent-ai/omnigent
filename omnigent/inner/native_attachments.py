@@ -32,6 +32,9 @@ _logger = logging.getLogger(__name__)
 # marker line for the consumers that regex-match it (forwarders, title
 # seeding): brackets end the match early, newlines break the line shape.
 _MARKER_UNSAFE = re.compile(r"[\[\]\r\n]")
+FRAMEWORK_NOTICE_BLOCK_TYPE = "_omnigent_framework_notice"
+CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+_RESIZE_NOTICE_DIMS = re.compile(r"downscaled from (\d+)×(\d+) px")
 
 # Maps a data-URI MIME type to the file extension used when no filename
 # is supplied, e.g. ``"image/png"`` -> ``".png"``.
@@ -212,12 +215,78 @@ def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
     return not (isinstance(data_uri, str) and data_uri.startswith("data:"))
 
 
+def resize_notice(source_metadata: Mapping[str, object] | None) -> str | None:
+    """
+    Model-facing note that an uploaded image was downscaled, or ``None``.
+
+    The single source of truth for the resize-notice wording, shared by
+    every attachment-resolution path (the in-process resolver in
+    ``omnigent.runtime.content_resolver`` and the runner/native-harness
+    resolver in :func:`resolve_file_id_block`) so the two never drift.
+
+    :param source_metadata: A stored file's ``source_metadata`` dict (see
+        :class:`omnigent.entities.file.StoredFile`). A downscaled image
+        carries the pre-downscale ``width`` / ``height``.
+    :returns: The notice text when the image was downscaled, else ``None``
+        (passthrough images, non-images, or absent metadata).
+    """
+    if not source_metadata:
+        return None
+    width = source_metadata.get("width")
+    height = source_metadata.get("height")
+    if not width or not height:
+        return None
+    return (
+        f"Note: the attached image was downscaled from {width}×{height} px to fit "
+        "size limits, so you are viewing a lower-resolution version. Ask the user "
+        "for a crop of the original if you need finer detail — re-uploading the whole "
+        "image would be downscaled the same way."
+    )
+
+
+def framework_notice_block(text: str) -> dict[str, object]:
+    """Build transient model context that must not become user text."""
+    return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "text": text}
+
+
+def framework_notices(content: object) -> list[str]:
+    """Extract transient framework notices from structured content."""
+    if not isinstance(content, list):
+        return []
+    notices: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE:
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            notices.append(text)
+    return notices
+
+
+def codex_resize_metadata_path(path: Path, notice: str) -> Path:
+    """Encode resize metadata in Codex's model-visible image path."""
+    match = _RESIZE_NOTICE_DIMS.search(notice)
+    if match is None:
+        return path
+    width, height = match.groups()
+    alias = path.with_name(
+        f"{path.stem}__omnigent-downscaled-from-{width}x{height}"
+        f"-request-crop-for-fine-detail{path.suffix}"
+    )
+    try:
+        path.replace(alias)
+    except OSError:
+        _logger.warning("Failed to add resize metadata to Codex image path", exc_info=True)
+        return path
+    return alias
+
+
 async def resolve_file_id_block(
     block: Mapping[str, object],
     *,
     session_id: str,
     client: httpx.AsyncClient,
-) -> dict[str, object] | None:
+) -> tuple[dict[str, object], str | None] | None:
     """
     Fetch a ``file_id`` attachment's bytes and inline them as a data URI.
 
@@ -231,9 +300,11 @@ async def resolve_file_id_block(
         is true.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
-    :returns: The rebuilt block without ``file_id``, or ``None`` when the
-        fetch failed — callers keep the original block so a visible
-        marker can surface downstream.
+    :returns: ``(rebuilt_block, notice)`` — the block without ``file_id``,
+        and a resize notice (see :func:`resize_notice`) to emit as a
+        sibling text block when the image was downscaled, else ``None``.
+        Returns ``None`` (not a tuple) when the fetch failed, so callers
+        keep the original block and a visible marker can surface downstream.
     """
     file_id = str(block.get("file_id"))
     base = (
@@ -275,8 +346,12 @@ async def resolve_file_id_block(
     content_type = content_type.split(";", 1)[0]
     encoded = base64.b64encode(content_resp.content).decode("ascii")
     new_block = {k: v for k, v in block.items() if k != "file_id"}
+    notice: str | None = None
     if block.get("type") == "input_image":
         new_block["image_url"] = f"data:{content_type};base64,{encoded}"
+        source_metadata = meta.get("source_metadata")
+        if isinstance(source_metadata, Mapping):
+            notice = resize_notice(source_metadata)
     else:
         new_block["file_data"] = f"data:{content_type};base64,{encoded}"
-    return new_block
+    return new_block, notice
