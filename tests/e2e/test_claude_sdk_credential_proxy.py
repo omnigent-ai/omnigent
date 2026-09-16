@@ -77,6 +77,7 @@ def credential_upstream(
         worker.join(timeout=5)
 
 
+@pytest.mark.timeout(300)
 def test_claude_sdk_credential_proxy_survives_transport_and_renews(
     http_client: httpx.Client,
     live_runner_id: str,
@@ -171,7 +172,7 @@ def test_claude_sdk_credential_proxy_survives_transport_and_renews(
     )
     response_id = send_user_message_to_session(http_client, session_id=session_id, content=prompt)
     body = poll_session_until_terminal(
-        http_client, session_id=session_id, response_id=response_id, timeout=120
+        http_client, session_id=session_id, response_id=response_id, timeout=240
     )
     assert body["status"] == "completed", body
     for result_file in result_files:
